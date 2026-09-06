@@ -839,6 +839,13 @@ mod tests {
     /// `hasMoreChanges: true` with an unmoved `newState` never terminates.
     /// This stream is worse off than a change walk, because the engine
     /// drives it for the life of the account - the spin is permanent.
+    ///
+    /// Ablation shape, for this test and its oscillating sibling: asserting
+    /// only the error KIND does not bite, because the scripted transport's
+    /// exhaustion reply also classifies `Protocol(ContractViolation)`, so an
+    /// unguarded loop that spins into the empty script fails the same way.
+    /// The recorded REQUEST COUNT is what tells a guarded walk from a
+    /// spinning one.
     #[tokio::test]
     async fn a_stuck_lifecycle_state_terminates_instead_of_looping() {
         let (mut stream, shutdown, states, requests) = lifecycle_stream_with_limit(

@@ -2,12 +2,13 @@
 
 ## Structural rulings from the 2026-09-04 bug-hunt round
 
-The nine `notes/bugs-*.md` hunts of 2026-09-04 closed every defect-shaped
-item except google 3 (needs a live-API probe). What they left were structural
-proposals and product calls. Each was presented to the repository owner and
-ruled on 2026-09-04. Execution order is as listed; items 1 through 5 touch
-disjoint crates and may run in parallel, 6 and 7 run alone with a cold review
-between them.
+The nine bug-hunt ledgers of 2026-09-04 (since closed out and deleted; their
+open tail is under "Open items folded in from the third bug-hunt wave" below)
+closed every defect-shaped item except google-C3, which needs a live-API
+probe. What they left were structural proposals and product calls. Each was
+presented to the repository owner and ruled on 2026-09-04. Execution order is
+as listed; items 1 through 5 touch disjoint crates and may run in parallel, 6
+and 7 run alone with a cold review between them.
 
 1. **DONE 2026-09-04. sync: split `engine.rs` into modules. PROCEED.**
    Attach, backfill orchestrator, ack writer, reattach and bulk pipeline
@@ -126,7 +127,11 @@ between them.
    multigets only its members. Page order stays href order (the only key
    the listing carries and the only one an update cannot move). No
    consumers exist, so the offset codec is replaced outright with no legacy
-   lane. Closes `dav-B8` below.
+   lane. Closed `dav-B8`, whose filtering-lane residual was then closed the
+   same day: `events_in_range`, text `event_search` and text `contact_search`
+   filter on the server (`bifrost_dav_core::query`), slice candidate hrefs
+   at the watermark and multiget only the page; see the "filtered query"
+   sections of `reference/caldav.md` and `reference/carddav.md`.
 10. **DONE 2026-09-06. graph: split `push.rs` into modules along its natural
     seams.** Landed as `account/push/` - `dispatch` (the two doors, the
     poll-only split, `PushMode` dispatch), `common`, `webhook` (subscribe
@@ -143,41 +148,87 @@ between them.
     transport error; and `subscribe_graph` emits `WatchEvent::Reconnected`
     on the very first subscribe, costing one redundant account-wide
     reconcile.
-11. **sync: an explicit observer subscription on the change stream.** Ruled
-    2026-09-06 alongside item 8: `account_changes_stream` supports any number
-    of receivers with exactly one acknowledger, and until this lands the
-    acknowledging receiver must subscribe FIRST. The subscriber gate is a raw
-    receiver count, so an observer that subscribes before the acknowledger
-    satisfies it, takes delivery of pages it never acknowledges, and parks
-    cold start at the bound until it leaves or a lag fires; the acknowledger
-    joins at the ring's tail and cannot see those pages. The fix is a second
-    subscription method returning an UNNUMBERED receiver - the shape
-    `ChangesReceiver::new` already has behind `cfg(test)` - that counts for
-    neither the gate nor the bound, with `wait_for_real_subscriber` counting
-    numbered receivers instead of raw ones. Small and contained; deliberately
-    not folded into the lane landing.
-12. **sync: the teardown window in the completion guarantee.** Recorded with
-    the guarantee's landing (2026-09-06), not fixed. A receiver dropped
-    between `detach`'s drain of the outstanding discard requests and the slot
-    being dropped records a request nobody can act on, because the writer is
-    already gone. Staging: a walk loses pages, teardown takes and settles the
-    outstanding requests, and only then does a consumer still holding an
-    earlier page depart; the sweep records the loss into a set no drain will
-    visit again. The cost is the ordinary one for an unrepaired loss on an
-    `OpenPages` scope: the next attach resumes past the hole. Closing it means
-    either draining again after the last receiver can no longer exist (the
-    slot drop, which is not an async context) or refusing the sweep's record
-    once teardown has begun; neither is obviously right, and it wants a ruling
-    before either is built.
-13. **sync: findings from the bounded-lane cold review (2026-09-06), filed
-    under the stopping rule.** The review's one P2 was the acknowledgement
-    window: a consumer that defers acknowledgements by more than
-    `lane_capacity` publications deadlocks with the parked producer where it
-    used to risk a lag. The contract half is fixed in `reference/sync.md` and
-    on `BackfillConfig::lane_capacity`. What wants a RULING is whether the
-    engine should also defend against such a consumer: a `Warning` on the
-    stream when the producer parks, a time-bounded park that falls back to
-    the ring, or nothing. Everything below is P3 or P4; verify against the
+Items 11 through 13 were ruled on 2026-09-06 and are sequenced 13, 11, 12:
+the receipt bound reshapes the accounting the other two touch, so they are
+written against the final shape. Each lands alone, with one scoped cold
+review under the stopping rule in `AGENTS.md`.
+
+11. **sync: an explicit observer subscription on the change stream. RULED
+    2026-09-06: PROCEED, as a separate method.** `account_changes_stream`
+    supports any number of receivers with exactly one acknowledger, and until
+    this lands the acknowledging receiver must subscribe FIRST, because three
+    places in the engine see only a raw receiver count. The subscriber gate
+    opens on an observer, which then takes pages it never acknowledges while
+    the acknowledger joins at the ring's tail and cannot see them. "Reached a
+    real subscriber" on each send counts an observer too, so once the
+    acknowledger departs mid-walk every later page is judged delivered, stays
+    charged, and can never be answered for. And an observer's lag abandons
+    every registration on the account, which under the completion guarantee
+    voids every in-flight walk. The build: a second public method returning an
+    UNNUMBERED receiver, the shape `ChangesReceiver::new` already has behind
+    `cfg(test)`, and three touch points that follow from it - the gate counts
+    numbered receivers; a send that reached no numbered receiver counts as
+    reaching nobody, decided by the delivery gate under its own lock since it
+    holds the live set; an observer receiver carries no control handle, so its
+    lag warns without abandoning. Once item 13 lands, an observer's read must
+    NOT mark a page received. Observers are documented as never acknowledging.
+    A separate method rather than a flag on the existing one, because the two
+    are different roles and a flag lets a call site flip one into the other.
+    The "subscribe first" sentence leaves `reference/sync.md` with this.
+12. **sync: the teardown window in the completion guarantee. RULED
+    2026-09-06: close by contract, no durable record.** A receiver dropped
+    after `detach`'s drain of the outstanding discard requests records a
+    request nobody can act on, because the writer is gone; a receiver dropped
+    after `detach` returns runs no sweep at all, because its weak handle no
+    longer upgrades. Same outcome either way, and it bites only when the
+    consumer ends the attachment holding a page it received and never
+    acknowledged while the completion marker is already durable - the same
+    case as a consumer that crashes with pages in hand. The engine's guarantee
+    repairs holes its own mechanics create, a receiver replaced INSIDE an
+    attachment; the only full closure would be a durable "scope lost pages"
+    row, a new method on the `CheckpointStore` trait every downstream store
+    implements, bought for a consumer already outside the persist-then-
+    acknowledge contract. The build: one contract line in `reference/sync.md`
+    (a page delivered but unacknowledged at detach is the consumer's to have
+    persisted or to forfeit, exactly as at a crash); a teardown flag that makes
+    the departure sweep inert once `detach` has begun, so a drop in the window
+    behaves like a drop after it; and the drain's writer awaits clamped to
+    `detach_timeout`, which is the cold review's P3 in the same ten lines. THE
+    OWNER'S CONDITION: the ruling must be documented at the code, a doc comment
+    at the sweep's teardown check and at the drain that states the window, why
+    it is the consumer's contract and not a defect, and what the closing
+    alternative would have cost, so a later review reads the ruling there
+    rather than re-filing the window as a bug.
+13. **sync: replace the acknowledgement bound with a receipt bound. RULED
+    2026-09-06: PROCEED; the cheap version (an accessor surfacing the
+    maximum) is REJECTED.** The cold review's one P2 was that a consumer
+    deferring acknowledgements by more than `lane_capacity` publications
+    deadlocks with the parked producer, where before the bound it risked a
+    lag. The contract was written down as an interim, but the maximum exists
+    only because ruling 8 chose the acknowledgement as the permit, and an
+    acknowledgement is a promise about durability while what overruns a ring
+    is pages nobody has READ. The engine observes reading without consumer
+    cooperation: `ChangesReceiver::recv` and `try_recv` are engine code and
+    the event carries its publication id. The build: a received bit per page
+    (on the entry and on each subsumed tuple), set from the receiver's read
+    path for numbered receivers, with `backfill_in_flight` summing unread
+    pages instead of unacknowledged ones and receipt pulsing the capacity
+    wake. The producer then runs exactly as far ahead as the consumer reads,
+    a consumer may acknowledge on any schedule, ring protection is unchanged,
+    and the completion guarantee is unchanged (a receiver departing with
+    read-but-unacknowledged pages is still a recorded loss, the conservative
+    reading it has now). What is given up: the bound no longer limits the
+    consumer's unpersisted backlog, which becomes its own trade-off as on any
+    channel. Departs from the letter of ruling 8 ("the existing backfill acks
+    are the permit signal") and not its purpose. The cost is in the tests:
+    about a dozen integration tests stage a parked producer by reading to the
+    bound without acknowledging, and under a receipt bound reading is what
+    frees it, so their staging becomes "hold the pages unread". Mechanical,
+    but on the file that took seventeen rounds, and it wants its own scoped
+    review. When it lands, the acknowledgement-window paragraph in
+    `reference/sync.md` and on `BackfillConfig::lane_capacity` shrinks to the
+    receipt rule, and the "should the engine defend" question below is moot.
+    Everything below is P3 or P4 from the same review; verify against the
     code before working any of it.
     - P3: a discard request recorded by a departure sweep after attempt 1 ended
       on a transient failure is never cleared by attempt 2 walking whole. That
@@ -1180,15 +1231,6 @@ prerequisite for the small local fixes above.
   labels ships a several-KB body per batch. The engine's read-back guard
   already fetches current state, so this is the site that would benefit
   most from read-back-then-diff.
-- **dav-B8 (residual).** The match-all lanes are closed by ruling 9
-  (2026-09-06): empty-query `event_search`, `contacts_list` and empty-query
-  `contact_search` list, slice at the href watermark and multiget only the
-  page. What remains O(collection) per page is the FILTERING lanes -
-  `events_in_range`, text `event_search` and text `contact_search` - which
-  need bodies to decide membership and so still hydrate the whole result set
-  before the watermark slice. Bounding those needs a server-side filter
-  (calendar-query time-range, addressbook-query text match) carrying the
-  page, which is a separate design.
 - **jmap-B1.** Three near-identical query/get/advance loops in the sync layer;
   `imap` has four copies of the untagged-response dispatch loop. Recorded for
   completeness with the other duplication findings; same standing as the above.
@@ -1375,6 +1417,68 @@ backlog. The same category labels and the PUBLISHED SURFACE fence apply.
   double.** [C3] The reusable `StubAccount` seam now lives in
   `crates/sync/tests/common/mod.rs` and is the model for new tests. Migrating
   the older test onto it is optional cleanup, explicitly not owed.
+
+## Open items folded in from the third bug-hunt wave (2026-09-04)
+
+The nine `bugs-*.md` ledgers of the 2026-09-04 hunt (`dav`, `google`,
+`graph`, `imap-sasl`, `jmap-protocol`, `jmap-sync`, `net-types`, `smtp`,
+`sync`) were closed out and deleted on 2026-09-06, the same convention as the
+two close-outs above. Every fixed finding is described in the `reference/`
+doc for its crate; every rejected or withdrawn finding, and every test whose
+bite has a known limit, carries an inline comment at the code. What is below
+is the deferred tail. The same category labels and the PUBLISHED SURFACE
+fence apply.
+
+- **google-C3. `events_in_range` combines `orderBy=startTime` with
+  `showDeleted=true`.** [C2, needs a live probe] `crates/google/src/account/
+  calendar.rs`. Google's docs bless `showDeleted=true` with
+  `singleEvents=true`, and `orderBy=startTime` requires `singleEvents=true`,
+  but there are long-standing reports of the live API answering 400 "The
+  requested ordering is not available for the particular query" for some
+  `showDeleted` + `orderBy` combinations, and cancelled instances have no
+  `start` to order by (only `originalStartTime`, which the projection
+  substitutes). The hermetic suite cannot catch a live refusal. One live
+  probe settles it; if Google rejects the combination, every production
+  range read fails, a top-severity defect hiding behind a green suite. The
+  only ledger item of the wave left open as a possible defect.
+
+- **jmap-C1. `ByteTally` meters only `/jmap/api` responses.** [C3] Documented
+  in `reference/jmap.md`, but it means a metered stream that also
+  `download`s (raw RFC822, sieve script bodies) under-reports, and blob
+  bytes are typically the BULK of the traffic those paths cause. Extending
+  the tally to the download door is a metering-contract change; decide
+  whether consumers want the blob bytes counted on the same accumulator.
+
+- **jmap-C2. The SSE stream tears down on one malformed event payload.** [C4]
+  `crates/jmap/src/event_source/stream.rs` (`break 'events`). SSE's design
+  intent is skip-and-continue; the crate reconnects and replays from
+  `lastEventId` instead, on the argument that an undecodable state-change
+  payload means the push contract is broken and dropping it would lose the
+  change it carried. Defensible either way. The comment at the loop records
+  the choice; this item is the decision to revisit it.
+
+- **jmap-C3. Generic requests fall back to the lowest-capability primary
+  account.** [C4] `Session::default_account_id` picks the lowest capability
+  URI in `primaryAccounts`, so a session advertising only calendars serves a
+  mail-shaped generic request off the calendar account. The empty-id half
+  (no `primaryAccounts` at all) is refused before the wire; narrowing the
+  fallback itself is a product decision, recorded at the function.
+
+- **imap-A2. Audit boundary of the 2026-09-04 hunt.** (not a defect) The hunt
+  read the driver, wire framing, pool, push/IDLE, auth, change strategies,
+  mutations, inventory, hydration, blob, cursor envelope and folder registry
+  in depth. It did NOT read `pim.rs`'s long tail, `sieve.rs`, `factory.rs`,
+  `scopes.rs`, the codec internals, or the pipeline; those remain unaudited.
+  Same shape as `gmail-A1`, listed so a future auditor knows where coverage
+  stops.
+
+- **imap-T6. The IDLE resubscribe loop is pinned only at its decision.**
+  (coverage) `resubscribe_action` is pure and tested; the loop that acts on
+  it in `account/push.rs` takes its connection from `pool.dial_idle()`, a
+  real dial, so the same-folder re-IDLE wiring (keep the connection, publish
+  the round's event, re-issue `NOTIFY SET`) rests on review. Pinning it needs
+  a dial seam in the pool, the same machinery `imap-T5` ruled heavier than
+  the risk it retires. Revisit together.
 
 ## Rules for agents working bug-hunt items
 

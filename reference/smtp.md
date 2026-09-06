@@ -530,7 +530,12 @@ and not retired), `a_rejected_pipelined_mail_from_restores_the_stream_at_the_gro
 (`Ok` plus retired) exist in both halves. Each was confirmed to bite by breaking
 the adapter's handling of the op it targets - dropping the `Op::Abort` arm,
 dropping the `Ok` restore in `finish_reply_group`, and ignoring `restore_ok` -
-rather than only by reverting the core.
+rather than only by reverting the core. One limit of that observable is worth
+knowing before trusting it: asserting `has_broken()` after an abort does NOT
+bite against removing `abort()`'s own `set_state(Broken)`, because the
+shutdown it also performs sets `Closed`, which fails `verify()` just as well.
+It is sharp only against the adapter dropping the op entirely, which is the
+thing worth pinning.
 
 `test_support::Transcript` is the in-process scripted peer both connection
 drivers test against; it replaced the socket-listener tests, which were neither

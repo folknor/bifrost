@@ -481,6 +481,16 @@ impl Session {
 
     /// Stable fallback account selection for generic request construction.
     /// Capability-specific callers should select their own primary account.
+    ///
+    /// The fallback is the lowest capability URI in `primaryAccounts`, so a
+    /// session advertising only calendars serves a mail-shaped generic
+    /// request off the calendar account. That is documented behaviour, not a
+    /// defect: narrowing it (refusing a generic request whose implied
+    /// capability the session does not name) is a product decision the
+    /// 2026-09-04 bug hunt raised and left open. What IS refused is an
+    /// EMPTY id - a session with no `primaryAccounts` at all - which
+    /// `Request::call` reports as `NoPrimaryAccount` naming the method's
+    /// own capability rather than shipping `"accountId": ""`.
     pub(crate) fn default_account_id(&self) -> Option<&str> {
         self.primary_accounts()
             .min_by_key(|(capability, _)| *capability)

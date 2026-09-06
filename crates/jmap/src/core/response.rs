@@ -39,6 +39,12 @@ impl Response {
     /// handles read afterwards. The vector holds at most
     /// `maxCallsInRequest` entries, so the shift is not worth an ordering
     /// hazard.
+    ///
+    /// Multiplicity is deliberately not modelled beyond this: a `get_all`
+    /// returning every response for a handle was considered and not built,
+    /// because no method this crate wires produces more than one response
+    /// per call id, and an accessor nothing calls is dead surface. The
+    /// generic envelope only has to not scramble.
     pub(crate) fn get<M: JmapMethod>(
         &mut self,
         handle: &CallHandle<M>,

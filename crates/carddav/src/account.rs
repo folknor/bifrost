@@ -1674,6 +1674,13 @@ fn worse_recovery_option(
 /// lanes would make a consumer count it twice and treat a contact it can
 /// display as lost. The sort and dedup finish the job for ids that failed
 /// in more than one REPORT.
+///
+/// `bifrost-caldav` has a function of the same name and shape, and the two
+/// were deliberately NOT collapsed into `bifrost-dav-core` when the propstat
+/// machine and the snapshot layer were: this one filters against the
+/// `native_id` of the parsed cards, the CalDAV twin against a materialized
+/// href set, so they share only their outline and a shared version would
+/// need a projection each side supplies anyway.
 fn one_outcome_per_id(failed_ids: &mut Vec<String>, cards: &[ContactCard]) {
     let materialized = cards
         .iter()

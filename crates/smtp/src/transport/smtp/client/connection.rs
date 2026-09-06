@@ -2147,6 +2147,12 @@ mod transcript_tests {
         let mut connection =
             SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Lmtp).unwrap();
         assert!(connection.send_lmtp(&envelope, b"body").is_err());
+        // `has_broken()` after an abort is sharp against the adapter
+        // dropping the `Op::Abort` arm entirely, and only that: it does NOT
+        // bite against removing `abort()`'s own `set_state(Broken)`, because
+        // the shutdown `abort()` also performs sets `Closed`, which fails
+        // `verify()` just as well. The same holds for every abort assertion
+        // in both transcript suites.
         assert!(connection.has_broken());
         transcript.assert_exhausted();
     }

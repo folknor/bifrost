@@ -75,6 +75,14 @@ impl<T: HttpTransport + SseTransport> Client<T> {
 
         let mut parser = EventParser::default();
 
+        // One undecodable event payload ends the stream (`break 'events`)
+        // rather than being skipped. SSE's design intent is skip-and-continue,
+        // and a stream that tears down costs a reconnect plus a replay from
+        // `lastEventId`; the teardown is kept because a state-change payload
+        // this crate cannot decode means the server and the client disagree
+        // about the push contract, and quietly dropping it would lose the
+        // state change it carried. Whether to skip instead is an open
+        // product decision, not a robustness tweak to make here in passing.
         Ok(Box::pin(async_stream::stream! {
             'events: loop {
                 for event_result in parser.by_ref() {

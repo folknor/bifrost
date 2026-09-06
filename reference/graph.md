@@ -234,7 +234,13 @@ of passing quietly - the pattern the foreign delta walks, the thread-keyed
 doors, and the mailbox-aware search cursor tests all use. When a test's
 account-wide request legitimately goes to the primary (`delete_thread`'s
 `/$batch` POST), the primary is armed with EXACTLY that one response, so a
-misrouted lookup consumes it and the next primary request panics.
+misrouted lookup consumes it and the next primary request panics. The same
+applies to every `$batch` POST: `message_reactions` and `get_stream` hydration
+always post through the primary client, correctly, because `/$batch` is
+account-global on Graph, while their subrequest URLs carry the `/users/{owner}`
+prefixes. On those surfaces the routing evidence is subrequest-level only, so
+a test asserting owner routing has to read the batch body, not the client the
+POST went to.
 
 Two smaller funnels sit beside the REST one, for the wire paths that are not
 Graph REST JSON calls. Both now share the REST dispatcher:

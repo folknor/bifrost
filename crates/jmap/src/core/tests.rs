@@ -424,6 +424,12 @@ fn set_response_deserializes() {
 /// `swap_remove` moved the LAST entry into the vacated slot, so the second
 /// read under a repeated call id returned whichever response happened to
 /// sit at the end - and it reordered unrelated handles read afterwards too.
+///
+/// Four same-id responses, not two: the first shape of this test used two
+/// and PASSED against the `swap_remove` code by coincidence, since swapping
+/// the last of two into slot zero is the order a second read wants anyway.
+/// With four, the swapped-in tail is observable - the ablation fails with
+/// "fourth" where "second" is due.
 #[test]
 fn repeated_call_ids_are_read_in_the_order_the_server_sent_them() {
     let raw = json!({

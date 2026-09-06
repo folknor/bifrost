@@ -562,7 +562,10 @@ enum ResubscribeAction {
 /// and it forces a coarse `Unknown` invalidation for a window a same-folder
 /// re-IDLE on the same connection never loses.
 ///
-/// Pure so the decision is pinnable without a live server.
+/// Pure so the decision is pinnable without a live server. Only the
+/// decision is pinned: the loop around it takes its connection from
+/// `pool.dial_idle()`, a real dial, so the re-IDLE wiring above is not
+/// hermetically testable and rests on review.
 fn resubscribe_action(
     current: &crate::types::MailboxName,
     chosen: Option<&crate::types::MailboxName>,

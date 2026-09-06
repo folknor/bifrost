@@ -18,6 +18,16 @@
 //! The partition is pure and generic over the per-site URL builder, so the
 //! rule itself is pinnable here; the round trip the routable half then
 //! makes is pinned at each call site through the `GraphClient` REST seam.
+//!
+//! What is deliberately NOT shared: the per-item lane discipline downstream
+//! of this partition - the `reconcile_*` readers and `BatchOutcomeBuilder`
+//! use - exists four times (hydration, the mutation funnel, reactions, push),
+//! and `resolve_batch_responses` / `reconcile_hydration_responses` each carry
+//! their own invalid-index and duplicate-index rules. A validated `$batch`
+//! projection type replacing those copies was proposed in the 2026-09-04
+//! bug hunt and ruled NOT approved by the repository owner: one recorded
+//! drift between the four is thin evidence for restructuring four working
+//! lanes. Re-raise it if a second drift between them is ever found.
 
 use bifrost_types::ObjectId;
 

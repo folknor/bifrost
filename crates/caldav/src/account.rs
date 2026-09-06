@@ -1449,6 +1449,13 @@ fn event_calendar_url(event_url: &str) -> Option<String> {
 /// both lanes would make a consumer count it twice and treat an event it
 /// can display as lost. The sort and dedup finish the job for ids that
 /// failed in more than one REPORT.
+///
+/// `bifrost-carddav` has a function of the same name and shape, and the two
+/// were deliberately NOT collapsed into `bifrost-dav-core` when the propstat
+/// machine and the snapshot layer were: this one filters against a
+/// materialized href set, the CardDAV twin against the `native_id` of the
+/// parsed cards, so they share only their outline and a shared version
+/// would need a projection each side supplies anyway.
 fn one_outcome_per_id(failed: &mut Vec<String>, materialized: &HashSet<String>) {
     failed.retain(|href| !materialized.contains(href));
     failed.sort_unstable();

@@ -105,6 +105,12 @@ pub(crate) fn repair_inventory(
         while let Some(request) = requests.next().await {
             let attempt = request.attempt;
             let bifrost_types::InventoryRepairTarget::Object { id, .. } = &request.target else {
+                // Deliberately still `inventory()` (resource `Message`,
+                // scope `Cursor(Account)`), unlike the label-refresh
+                // terminators above and in `get_stream`, which moved to
+                // `repair_labels()` / `hydrate_labels()`: this refusal IS
+                // about the inventory cursor scope - Gmail has no region
+                // lane - so the cursor coordinate is the truthful one.
                 let account_error = error::into_account_error(
                     crate::error::Error::unsupported(AccountOperation::SyncInventory),
                     error::GmailErrorContext::inventory(),
