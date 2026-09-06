@@ -78,7 +78,7 @@ async fn run_raw(
     message: ObjectId,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
 ) -> Result<(), BlobError> {
-    let decoded = decode_object_id(&message)?;
+    let decoded = decode_object_id(&message, AccountOperation::OpenRawRfc822)?;
     let attr = FetchAttr::BodySection {
         peek: true,
         section: None,

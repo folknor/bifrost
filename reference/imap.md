@@ -189,6 +189,26 @@ leak past `uid_set_from_u32`'s silent zero-filtering into fabricated
 `Succeeded(Applied)` mutation outcomes, ids with no outcome at all, and an
 empty-but-successful `open_raw_rfc822` stream.
 
+Every locally-malformed `AccountError` the account layer mints carries the
+operation of the call that produced it. `envelope::malformed` (id decode) and
+`pim::pim_malformed` (mailbox-name validation, UIDVALIDITY drift, operand
+refusal, search-criteria assembly, page-cursor parsing) both take an
+`AccountOperation`, and the private helpers between them and their public
+entry points thread it down rather than guessing: `decode_object_id`,
+`decode_thread_id`, `decoded_targets`, `pim_operand`, `valid_uids`,
+`folder_from_container`, `search_plan` and its criteria combinators,
+`page_from_items`, `child_name`, `renamed_sibling`,
+`parse_draft_for_submission`. The recovery class is `ClientBug` on all of
+them and does not depend on the operation; what the threading buys is
+telemetry that attributes a client bug to the lane that hit it. It also
+removes three hardcodings that were outright wrong: `merge_folder`,
+`or_folder_restriction_error`, and `criteria_from_filter`'s unsupported-filter
+arm stamped `SearchMessages` (or `Search`) regardless of which of the two
+search surfaces was calling, and `child_name`'s missing-delimiter refusal
+stamped `ContainerCreate` even when reached from `container_move`.
+`envelope::schema_incompatible` keeps its fixed `EstablishCursor`: a cursor
+that will not decode is a cursor-establishment fault whichever call noticed.
+
 ### One outcome per id (`account/targets.rs`)
 
 The one-outcome-per-id contract the sync engine holds is enforced by a type,
@@ -533,7 +553,9 @@ Admission is per scope, under the same lock as the insert, so two concurrent sub
 
 Workers are woken by a `watch` generation counter rather than a `Notify`. With several workers, `notify_one` would wake one and leave the rest on a stale assignment, and `notify_waiters` stores nothing, so a worker in the window between finding no folder and awaiting the wake would park forever. The `watch` generation latches; each worker marks it seen *before* reading the scope set, so a change landing in that window still wakes it.
 
-IDLE alone reports only the SELECTed mailbox. On NOTIFY servers, `NOTIFY SET` (RFC 5465 Section 3) extends that one session to every accepted folder: `(selected (MessageNew MessageExpunge FlagChange))` plus the same events under a `mailboxes` filter naming every other watched folder. Events on those arrive as STATUS responses (Section 4), which `map_idle_event` turns into per-folder invalidations. The registration asks for no fetch attributes and no initial STATUS snapshot. Servers without NOTIFY use the bounded worker pool above. A server that advertises NOTIFY has its whole requested scope list admitted - the budget does not apply, because one session covers all of it - so a runtime `NOTIFY SET` rejection leaves the account with one worker and push for the selected mailbox only, while `push_subscribe` has already reported every scope as succeeded. `register_notify` logs a warning naming how many folders that leaves unpushed; those folders are still polled, since polling is never suppressed on push coverage, but they are reported as pushed. Narrowing that window would mean re-reporting subscription coverage after the fact, which the `Account` surface has no channel for.
+IDLE alone reports only the SELECTed mailbox. On NOTIFY servers, `NOTIFY SET` (RFC 5465 Section 3) extends that one session to every accepted folder: `(selected (MessageNew MessageExpunge FlagChange))` plus the same events under a `mailboxes` filter naming every other watched folder. Events on those arrive as STATUS responses (Section 4), which `map_idle_event` turns into per-folder invalidations. The registration asks for no fetch attributes and no initial STATUS snapshot. Servers without NOTIFY use the bounded worker pool above. A server that advertises NOTIFY has its whole requested scope list admitted - the budget does not apply, because one session covers all of it - so a runtime `NOTIFY SET` rejection leaves the account with one worker and push for the selected mailbox only, while `push_subscribe` has already reported every scope as succeeded.
+
+That report cannot be retracted - `BatchOutcome` is settled and returned before the first dial, and the `Account` surface has no per-scope demotion event - so the collapse is handled the way `reference/sync.md` requires a missed push to be handled: it degrades to a coarser invalidation rather than to silence. `register_notify` returns whether the registration took, and `signal_notify_coverage_loss` turns a `false` on a NOTIFY-advertising account into one account-wide `HintPayload::Unknown`. Registration is re-attempted on every redial and on every resubscribe-interrupted round, so the uncovered folders keep receiving a coarse invalidation at the IDLE cadence instead of nothing. It is gated on the account-level NOTIFY capability deliberately: without NOTIFY the account runs one worker per admitted folder and a `false` means only "this worker had no others to fold in", so firing there would invalidate the whole account once per IDLE round on every non-NOTIFY server. `register_notify` still logs the warning naming how many folders the rejection leaves unpushed, and those folders remain polled, since polling is never suppressed on push coverage.
 
 A scope-set change cancels the in-flight IDLE round through a child token so the folder choice can be re-evaluated. `ImapConnection::idle` gives cancellation strict priority over queued server events, so the round returns `Cancelled` while events may still be queued. The DONE drain itself does not throw those away - `drain_idle_responses` emits them to the event sink and they survive into the next `idle()` round - so what loses them is dropping the connection, not the cancellation.
 

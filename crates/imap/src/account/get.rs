@@ -39,7 +39,7 @@ pub(crate) fn get_stream(
         let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
         let mut buffered = 0usize;
         while let Some(id) = ids.next().await {
-            match decode_object_id(&id) {
+            match decode_object_id(&id, AccountOperation::Hydrate) {
                 Ok(decoded) => {
                     grouped
                         .entry(decoded.folder.as_str().to_owned())
@@ -545,11 +545,16 @@ mod tests {
         // that `decode_object_id` produces - if that classification
         // changes, the lane's `AccountError` changes with it.
         let bad = ObjectId("not-a-valid-imap-id".into());
-        let err = super::super::decode_object_id(&bad).expect_err("invalid id should not decode");
+        let err = super::super::decode_object_id(&bad, AccountOperation::Hydrate)
+            .expect_err("invalid id should not decode");
         assert!(matches!(
             err.kind(),
             AccountErrorKind::Request(RequestErrorKind::Malformed)
         ));
+        // The hydration lane's own operation rides the error, so a
+        // malformed id is attributable to the lane that saw it rather
+        // than landing as an operation-less ClientBug.
+        assert_eq!(err.operation(), Some(AccountOperation::Hydrate));
     }
 
     #[test]

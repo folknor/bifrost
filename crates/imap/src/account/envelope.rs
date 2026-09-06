@@ -1,6 +1,6 @@
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, Cause, ChangeCursor, CursorScope,
-    DiagnosticText, ObjectId, OpaqueChangeState, Protocol, ProtocolKind, RequestCause,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ChangeCursor,
+    CursorScope, DiagnosticText, ObjectId, OpaqueChangeState, Protocol, ProtocolKind, RequestCause,
     RequestErrorKind, SyncStateErrorKind, ThreadId,
 };
 
@@ -292,13 +292,16 @@ pub(crate) fn encode_object_id(folder: &MailboxName, uidvalidity: u32, uid: u32)
     ))
 }
 
-pub(crate) fn decode_object_id(id: &ObjectId) -> Result<DecodedObjectId, AccountError> {
-    let (folder, rest) = decode_len_prefixed("imap1", &id.0)?;
+pub(crate) fn decode_object_id(
+    id: &ObjectId,
+    op: AccountOperation,
+) -> Result<DecodedObjectId, AccountError> {
+    let (folder, rest) = decode_len_prefixed("imap1", &id.0, op)?;
     let mut parts = rest.split(':');
-    let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP object id uidvalidity")?;
-    let uid = parse_nonzero_u32(parts.next(), "IMAP object id uid")?;
+    let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP object id uidvalidity", op)?;
+    let uid = parse_nonzero_u32(parts.next(), "IMAP object id uid", op)?;
     if parts.next().is_some() {
-        return Err(malformed("invalid IMAP object id"));
+        return Err(malformed("invalid IMAP object id", op));
     }
     Ok(DecodedObjectId {
         folder,
@@ -325,25 +328,28 @@ pub(crate) fn encode_thread_id(folder: &MailboxName, uidvalidity: u32, uids: &[u
     ))
 }
 
-pub(crate) fn decode_thread_id(id: &ThreadId) -> Result<DecodedThreadId, AccountError> {
-    let (folder, rest) = decode_len_prefixed("imapthread1", &id.0)?;
+pub(crate) fn decode_thread_id(
+    id: &ThreadId,
+    op: AccountOperation,
+) -> Result<DecodedThreadId, AccountError> {
+    let (folder, rest) = decode_len_prefixed("imapthread1", &id.0, op)?;
     let mut parts = rest.splitn(2, ':');
-    let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP thread id uidvalidity")?;
+    let uidvalidity = parse_nonzero_u32(parts.next(), "IMAP thread id uidvalidity", op)?;
     let uid_part = parts
         .next()
-        .ok_or_else(|| malformed("missing IMAP thread uid set"))?;
+        .ok_or_else(|| malformed("missing IMAP thread uid set", op))?;
     let mut uids = Vec::new();
     for uid in uid_part.split(',').filter(|part| !part.is_empty()) {
         let uid = uid
             .parse::<u32>()
-            .map_err(|_| malformed("invalid IMAP thread uid"))?;
+            .map_err(|_| malformed("invalid IMAP thread uid", op))?;
         if uid == 0 {
-            return Err(malformed("invalid IMAP thread uid"));
+            return Err(malformed("invalid IMAP thread uid", op));
         }
         uids.push(uid);
     }
     if uids.is_empty() {
-        return Err(malformed("empty IMAP thread uid set"));
+        return Err(malformed("empty IMAP thread uid set", op));
     }
     Ok(DecodedThreadId {
         folder,
@@ -352,33 +358,37 @@ pub(crate) fn decode_thread_id(id: &ThreadId) -> Result<DecodedThreadId, Account
     })
 }
 
-fn decode_len_prefixed(prefix: &str, value: &str) -> Result<(MailboxName, String), AccountError> {
+fn decode_len_prefixed(
+    prefix: &str,
+    value: &str,
+    op: AccountOperation,
+) -> Result<(MailboxName, String), AccountError> {
     let value = value
         .strip_prefix(prefix)
         .and_then(|v| v.strip_prefix(':'))
-        .ok_or_else(|| malformed("invalid IMAP id prefix"))?;
+        .ok_or_else(|| malformed("invalid IMAP id prefix", op))?;
     let Some((len, rest)) = value.split_once(':') else {
-        return Err(malformed("invalid IMAP id length"));
+        return Err(malformed("invalid IMAP id length", op));
     };
     let len = len
         .parse::<usize>()
-        .map_err(|_| malformed("invalid IMAP id length"))?;
+        .map_err(|_| malformed("invalid IMAP id length", op))?;
     let folder = rest
         .get(..len)
-        .ok_or_else(|| malformed("invalid IMAP id folder length"))?;
+        .ok_or_else(|| malformed("invalid IMAP id folder length", op))?;
     let after = rest
         .get(len..)
         .and_then(|v| v.strip_prefix(':'))
-        .ok_or_else(|| malformed("invalid IMAP id separator"))?;
-    let folder = MailboxName::new(folder.to_owned()).map_err(|e| malformed(&e.to_string()))?;
+        .ok_or_else(|| malformed("invalid IMAP id separator", op))?;
+    let folder = MailboxName::new(folder.to_owned()).map_err(|e| malformed(&e.to_string(), op))?;
     Ok((folder, after.to_owned()))
 }
 
-fn parse_u32(value: Option<&str>) -> Result<u32, AccountError> {
+fn parse_u32(value: Option<&str>, op: AccountOperation) -> Result<u32, AccountError> {
     value
-        .ok_or_else(|| malformed("missing IMAP id field"))?
+        .ok_or_else(|| malformed("missing IMAP id field", op))?
         .parse::<u32>()
-        .map_err(|_| malformed("invalid IMAP id integer"))
+        .map_err(|_| malformed("invalid IMAP id integer", op))
 }
 
 /// UIDs and UIDVALIDITY are RFC 9051 `nz-number`s: this crate never mints
@@ -389,10 +399,14 @@ fn parse_u32(value: Option<&str>) -> Result<u32, AccountError> {
 /// group so its ids get no outcome at all. The operand layer refuses a 0
 /// independently (`UidOperand` reports it as excluded, and the callers turn
 /// that into a failure), so neither boundary depends on the other.
-fn parse_nonzero_u32(value: Option<&str>, what: &str) -> Result<u32, AccountError> {
-    let parsed = parse_u32(value)?;
+fn parse_nonzero_u32(
+    value: Option<&str>,
+    what: &str,
+    op: AccountOperation,
+) -> Result<u32, AccountError> {
+    let parsed = parse_u32(value, op)?;
     if parsed == 0 {
-        return Err(malformed(&format!("{what} must be nonzero")));
+        return Err(malformed(&format!("{what} must be nonzero"), op));
     }
     Ok(parsed)
 }
@@ -401,13 +415,13 @@ fn parse_nonzero_u32(value: Option<&str>, what: &str) -> Result<u32, AccountErro
 /// cursor decode failures. These are caller-side invalid inputs (the
 /// object id was not produced by this crate or was corrupted in transit).
 ///
-/// Operation is left unset here because malformed-id detection happens
-/// outside any specific account-trait call site. Callers that decode
-/// an id while servicing a specific operation thread the operation via
-/// their own `ImapErrorContext`; this builder is only reached for
-/// `decode_object_id` / `decode_cursor` from contexts where the op
-/// isn't known.
-fn malformed(detail: &str) -> AccountError {
+/// The operation is threaded in from the caller: `decode_object_id` and
+/// `decode_thread_id` are always reached while servicing one specific
+/// account-trait call (hydration, a mutation lane, a blob open, a PIM
+/// primitive), so the op is known at every call site and the resulting
+/// error carries it. The recovery class is `ClientBug` either way; the
+/// operation is what makes the telemetry attributable to a lane.
+fn malformed(detail: &str, op: AccountOperation) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
         Cause::Request(RequestCause::Malformed {
@@ -415,6 +429,7 @@ fn malformed(detail: &str) -> AccountError {
         }),
     )
     .protocol(Protocol::Imap)
+    .operation(op)
     .try_build()
     .expect("valid account error classification")
 }
@@ -424,7 +439,7 @@ fn malformed(detail: &str) -> AccountError {
 /// unrecognizable, which triggers the `SchemaIncompatible` engine
 /// directive to clear cursor state and re-establish from inventory.
 fn schema_incompatible(detail: &str) -> AccountError {
-    use bifrost_types::{AccountOperation, StateCause};
+    use bifrost_types::StateCause;
     AccountErrorBuilder::new(
         AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
         Cause::State(StateCause::SchemaIncompatible),
@@ -590,7 +605,7 @@ mod tests {
     fn object_ids_tolerate_colons_in_folder_names() {
         let folder = MailboxName::new("Work:Clients").expect("valid folder");
         let id = encode_object_id(&folder, 10, 42);
-        let decoded = decode_object_id(&id).expect("object id");
+        let decoded = decode_object_id(&id, AccountOperation::Hydrate).expect("object id");
         assert_eq!(decoded.folder, folder);
         assert_eq!(decoded.uidvalidity, 10);
         assert_eq!(decoded.uid, 42);
@@ -600,7 +615,7 @@ mod tests {
     fn thread_id_tolerates_colons_in_folder_names() {
         let folder = MailboxName::new("Work:Clients").expect("valid folder");
         let id = encode_thread_id(&folder, 10, &[3, 1, 3]);
-        let decoded = decode_thread_id(&id).expect("thread id");
+        let decoded = decode_thread_id(&id, AccountOperation::HydrateThread).expect("thread id");
         assert_eq!(decoded.folder, folder);
         assert_eq!(decoded.uidvalidity, 10);
         assert_eq!(decoded.uids, vec![1, 3]);
@@ -615,17 +630,29 @@ mod tests {
     /// Rejecting at the decode boundary closes them all at once.
     #[test]
     fn object_and_thread_ids_reject_uid_zero_and_uidvalidity_zero() {
-        let err = decode_object_id(&ObjectId("imap1:5:INBOX:7:0".into()))
-            .expect_err("uid 0 must be rejected");
+        let err = decode_object_id(
+            &ObjectId("imap1:5:INBOX:7:0".into()),
+            AccountOperation::Hydrate,
+        )
+        .expect_err("uid 0 must be rejected");
         assert!(is_malformed(&err), "kind: {:?}", err.kind());
-        let err = decode_object_id(&ObjectId("imap1:5:INBOX:0:7".into()))
-            .expect_err("uidvalidity 0 must be rejected");
+        let err = decode_object_id(
+            &ObjectId("imap1:5:INBOX:0:7".into()),
+            AccountOperation::Hydrate,
+        )
+        .expect_err("uidvalidity 0 must be rejected");
         assert!(is_malformed(&err), "kind: {:?}", err.kind());
-        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX:7:1,0,3".into()))
-            .expect_err("thread uid 0 must be rejected");
+        let err = decode_thread_id(
+            &ThreadId("imapthread1:5:INBOX:7:1,0,3".into()),
+            AccountOperation::HydrateThread,
+        )
+        .expect_err("thread uid 0 must be rejected");
         assert!(is_malformed(&err), "kind: {:?}", err.kind());
-        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX:0:1,3".into()))
-            .expect_err("thread uidvalidity 0 must be rejected");
+        let err = decode_thread_id(
+            &ThreadId("imapthread1:5:INBOX:0:1,3".into()),
+            AccountOperation::HydrateThread,
+        )
+        .expect_err("thread uidvalidity 0 must be rejected");
         assert!(is_malformed(&err), "kind: {:?}", err.kind());
     }
 
@@ -712,7 +739,7 @@ mod tests {
             "imap1:5:INBOX:notanumber:2",
             "imap1:5:INBOX:1",
         ] {
-            let err = decode_object_id(&ObjectId(bad.to_owned()))
+            let err = decode_object_id(&ObjectId(bad.to_owned()), AccountOperation::Hydrate)
                 .err()
                 .unwrap_or_else(|| panic!("{bad} must not decode"));
             assert!(is_malformed(&err), "{bad}: kind {:?}", err.kind());
@@ -725,7 +752,8 @@ mod tests {
         // pure ASCII must still slice back out on a char boundary.
         let folder = MailboxName::new("Ünread/Läst").expect("valid folder");
         let id = encode_object_id(&folder, 3, 9);
-        let decoded = decode_object_id(&id).expect("multibyte folder decodes");
+        let decoded =
+            decode_object_id(&id, AccountOperation::Hydrate).expect("multibyte folder decodes");
         assert_eq!(decoded.folder, folder);
         assert_eq!(decoded.uidvalidity, 3);
         assert_eq!(decoded.uid, 9);
@@ -733,16 +761,25 @@ mod tests {
 
     #[test]
     fn thread_id_decode_rejects_empty_and_non_numeric_uid_sets() {
-        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX:10:".to_owned()))
-            .expect_err("empty uid set");
+        let err = decode_thread_id(
+            &ThreadId("imapthread1:5:INBOX:10:".to_owned()),
+            AccountOperation::HydrateThread,
+        )
+        .expect_err("empty uid set");
         assert!(is_malformed(&err));
 
-        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX:10:1,x".to_owned()))
-            .expect_err("non-numeric uid");
+        let err = decode_thread_id(
+            &ThreadId("imapthread1:5:INBOX:10:1,x".to_owned()),
+            AccountOperation::HydrateThread,
+        )
+        .expect_err("non-numeric uid");
         assert!(is_malformed(&err));
 
-        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX".to_owned()))
-            .expect_err("missing uid field");
+        let err = decode_thread_id(
+            &ThreadId("imapthread1:5:INBOX".to_owned()),
+            AccountOperation::HydrateThread,
+        )
+        .expect_err("missing uid field");
         assert!(is_malformed(&err));
     }
 }

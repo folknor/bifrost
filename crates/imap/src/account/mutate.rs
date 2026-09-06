@@ -118,7 +118,7 @@ pub(super) fn mutation_stream(
         let mut undecodable = Vec::new();
         let mut buffered = 0usize;
         while let Some(id) = targets.next().await {
-            match decode_object_id(&id) {
+            match decode_object_id(&id, mutation_operation(&kind)) {
                 Ok(decoded) => {
                     grouped
                         .entry(decoded.folder.as_str().to_owned())

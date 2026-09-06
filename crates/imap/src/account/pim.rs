@@ -62,8 +62,8 @@ pub(crate) fn add_to_container(
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let destination = folder_from_container(&container)?;
-        let ids = decoded_targets(&target)?;
+        let destination = folder_from_container(&container, AccountOperation::AddToContainer)?;
+        let ids = decoded_targets(&target, AccountOperation::AddToContainer)?;
         copy_messages(
             &account,
             ids,
@@ -85,8 +85,8 @@ pub(crate) fn remove_from_container(
                 AccountOperation::RemoveFromContainer,
             ));
         }
-        let source = folder_from_container(&container)?;
-        let ids = decoded_targets(&target)?
+        let source = folder_from_container(&container, AccountOperation::RemoveFromContainer)?;
+        let ids = decoded_targets(&target, AccountOperation::RemoveFromContainer)?
             .into_iter()
             .filter(|id| id.folder == source)
             .collect::<Vec<_>>();
@@ -110,7 +110,7 @@ pub(crate) fn set_keyword(
             return Err(super::error::unsupported(AccountOperation::SetKeyword));
         }
         let flag = imap_flag_for_keyword(&keyword);
-        let ids = decoded_targets(&target)?;
+        let ids = decoded_targets(&target, AccountOperation::SetKeyword)?;
         set_flag(&account, ids, flag, value, AccountOperation::SetKeyword).await
     })
 }
@@ -124,7 +124,7 @@ pub(crate) fn set_is_read(
         if !account.capabilities.pim_methods.set_is_read {
             return Err(super::error::unsupported(AccountOperation::SetIsRead));
         }
-        let ids = decoded_targets(&target)?;
+        let ids = decoded_targets(&target, AccountOperation::SetIsRead)?;
         set_flag(
             &account,
             ids,
@@ -149,7 +149,7 @@ pub(crate) fn set_importance(
             return Err(super::error::unsupported(AccountOperation::SetImportance));
         }
         let important = importance_sets_important_keyword(level);
-        let ids = decoded_targets(&target)?;
+        let ids = decoded_targets(&target, AccountOperation::SetImportance)?;
         set_flag(
             &account,
             ids,
@@ -295,7 +295,8 @@ pub(crate) fn send_raw_message(
         // the envelope (From/Sender drive MAIL FROM; To/Cc/Bcc drive RCPT
         // TO) out of the MIME headers and strip the Bcc header from the
         // transmitted body, exactly as draft_send does for a saved draft.
-        let parsed = parse_draft_for_submission(&raw, submission.default_from())?;
+        let parsed =
+            parse_draft_for_submission(&raw, submission.default_from(), AccountOperation::Send)?;
         submission
             .send_rfc5322(&parsed.envelope, &parsed.body, None)
             .await
@@ -319,14 +320,18 @@ pub(crate) fn draft_send(
             return Err(super::error::unsupported(AccountOperation::DraftSend));
         };
 
-        let decoded = decode_object_id(&ObjectId(draft.0.clone()))?;
+        let decoded = decode_object_id(&ObjectId(draft.0.clone()), AccountOperation::DraftSend)?;
         let raw = fetch_full_message(&account, &decoded).await?;
 
         // Parse the draft headers to build the envelope: To/Cc/Bcc drive
         // RCPT TO, From/Sender drive MAIL FROM. The Bcc header is folded
         // into recipients and stripped from the transmitted body so blind
         // recipients are delivered but never disclosed.
-        let parsed = parse_draft_for_submission(&raw, submission.default_from())?;
+        let parsed = parse_draft_for_submission(
+            &raw,
+            submission.default_from(),
+            AccountOperation::DraftSend,
+        )?;
         submission
             .send_rfc5322(&parsed.envelope, &parsed.body, None)
             .await
@@ -439,10 +444,10 @@ async fn fetch_full_message(
         .select_folder(&mut conn, &decoded.folder, None, true)
         .await
         .map_err(err)?;
-    let operand = pim_operand([decoded.uid])?;
+    let operand = pim_operand([decoded.uid], AccountOperation::DraftSend)?;
     let uids = operand
         .uid_set()
-        .ok_or_else(|| pim_malformed("draft object id has no UID"))?;
+        .ok_or_else(|| pim_malformed(AccountOperation::DraftSend, "draft object id has no UID"))?;
     let responses = conn
         .connection()
         .uid_fetch_full_messages(uids, DRAFT_FETCH_BUDGET, account.command_timeout())
@@ -458,7 +463,12 @@ async fn fetch_full_message(
                 .find(|section| section.section.is_empty())
                 .and_then(|section| section.data)
         })
-        .ok_or_else(|| pim_malformed("draft message body not returned by FETCH"))
+        .ok_or_else(|| {
+            pim_malformed(
+                AccountOperation::DraftSend,
+                "draft message body not returned by FETCH",
+            )
+        })
 }
 
 #[derive(Debug)]
@@ -475,6 +485,7 @@ struct ParsedDraft {
 fn parse_draft_for_submission(
     raw: &[u8],
     default_from: &bifrost_types::Address,
+    op: AccountOperation,
 ) -> Result<ParsedDraft, AccountError> {
     // Operate on bytes end-to-end: the transmitted body must be the
     // verbatim draft octets. Decoding through `from_utf8_lossy` would
@@ -498,7 +509,7 @@ fn parse_draft_for_submission(
     recipients.extend(addresses_for(&headers, "cc"));
     recipients.extend(addresses_for(&headers, "bcc"));
     if recipients.is_empty() {
-        return Err(pim_malformed("draft has no recipients"));
+        return Err(pim_malformed(op, "draft has no recipients"));
     }
 
     let message_id = header_value(&headers, "message-id")
@@ -782,7 +793,7 @@ pub(crate) fn draft_discard(
         if !account.capabilities.pim_methods.draft_discard {
             return Err(super::error::unsupported(AccountOperation::DraftDiscard));
         }
-        let id = decode_object_id(&ObjectId(draft.0))?;
+        let id = decode_object_id(&ObjectId(draft.0), AccountOperation::DraftDiscard)?;
         delete_messages(&account, vec![id], AccountOperation::DraftDiscard).await
     })
 }
@@ -796,7 +807,7 @@ pub(crate) fn search(
             return Err(super::error::unsupported(AccountOperation::Search));
         }
         let err = op_err(AccountOperation::Search);
-        let plan = search_plan(&request)?;
+        let plan = search_plan(&request, AccountOperation::Search)?;
         let mut threads = Vec::new();
         for folder in search_folders(&account, plan.folder.as_ref()) {
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
@@ -804,10 +815,9 @@ pub(crate) fn search(
                 .select_folder(&mut conn, &folder, None, true)
                 .await
                 .map_err(err)?;
-            let uidvalidity = selected
-                .mailbox
-                .uid_validity
-                .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
+            let uidvalidity = selected.mailbox.uid_validity.ok_or_else(|| {
+                pim_malformed(AccountOperation::Search, "SELECT missing UIDVALIDITY")
+            })?;
             let roots = conn
                 .connection()
                 .uid_thread(
@@ -826,7 +836,7 @@ pub(crate) fn search(
                 }
             }
         }
-        page_from_items(threads, &request)
+        page_from_items(threads, &request, AccountOperation::Search)
     })
 }
 
@@ -839,7 +849,7 @@ pub(crate) fn search_messages(
             return Err(super::error::unsupported(AccountOperation::SearchMessages));
         }
         let err = op_err(AccountOperation::SearchMessages);
-        let plan = search_plan(&request)?;
+        let plan = search_plan(&request, AccountOperation::SearchMessages)?;
         let mut messages = Vec::new();
         for folder in search_folders(&account, plan.folder.as_ref()) {
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
@@ -847,10 +857,12 @@ pub(crate) fn search_messages(
                 .select_folder(&mut conn, &folder, None, true)
                 .await
                 .map_err(err)?;
-            let uidvalidity = selected
-                .mailbox
-                .uid_validity
-                .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
+            let uidvalidity = selected.mailbox.uid_validity.ok_or_else(|| {
+                pim_malformed(
+                    AccountOperation::SearchMessages,
+                    "SELECT missing UIDVALIDITY",
+                )
+            })?;
             let result = conn
                 .connection()
                 .uid_search(&plan.criteria, account.command_timeout())
@@ -863,7 +875,7 @@ pub(crate) fn search_messages(
                     .map(|uid| encode_object_id(&folder, uidvalidity, uid)),
             );
         }
-        page_from_items(messages, &request)
+        page_from_items(messages, &request, AccountOperation::SearchMessages)
     })
 }
 
@@ -889,7 +901,12 @@ pub(crate) fn container_create(
         if !matches!(kind, ContainerKind::Folder) {
             return Err(super::error::unsupported(AccountOperation::ContainerCreate));
         }
-        let full_name = child_name(&account, parent.as_ref(), &name)?;
+        let full_name = child_name(
+            &account,
+            parent.as_ref(),
+            &name,
+            AccountOperation::ContainerCreate,
+        )?;
         let err = op_err(AccountOperation::ContainerCreate);
         let conn = account.pool.checkout_any().await.map_err(err)?;
         conn.connection()
@@ -914,8 +931,9 @@ pub(crate) fn container_rename(
     _style: Option<bifrost_types::ContainerStyle>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let folder = folder_from_container(&container)?;
-        let new_name = renamed_sibling(&account, &folder, &name)?;
+        let folder = folder_from_container(&container, AccountOperation::ContainerRename)?;
+        let new_name =
+            renamed_sibling(&account, &folder, &name, AccountOperation::ContainerRename)?;
         let err = op_err(AccountOperation::ContainerRename);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
@@ -944,9 +962,14 @@ pub(crate) fn container_move(
     new_parent: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let folder = folder_from_container(&container)?;
+        let folder = folder_from_container(&container, AccountOperation::ContainerMove)?;
         let leaf = leaf_name(&account, &folder);
-        let new_name = child_name(&account, new_parent.as_ref(), &leaf)?;
+        let new_name = child_name(
+            &account,
+            new_parent.as_ref(),
+            &leaf,
+            AccountOperation::ContainerMove,
+        )?;
         let err = op_err(AccountOperation::ContainerMove);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
@@ -969,7 +992,7 @@ pub(crate) fn container_delete(
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let folder = folder_from_container(&container)?;
+        let folder = folder_from_container(&container, AccountOperation::ContainerDelete)?;
         let err = op_err(AccountOperation::ContainerDelete);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
@@ -985,7 +1008,10 @@ pub(crate) fn container_delete(
             .iter()
             .any(|item| matches!(item, StatusItem::Messages(count) if *count > 0));
         if non_empty {
-            return Err(pim_malformed("refusing to delete non-empty IMAP mailbox"));
+            return Err(pim_malformed(
+                AccountOperation::ContainerDelete,
+                "refusing to delete non-empty IMAP mailbox",
+            ));
         }
         conn.connection()
             .delete(folder.as_str(), account.command_timeout())
@@ -1058,7 +1084,7 @@ pub(crate) fn thread_hydrate(
         if !account.capabilities.pim_methods.thread_hydrate {
             return Err(super::error::unsupported(AccountOperation::HydrateThread));
         }
-        let decoded = decode_thread_id(&thread)?;
+        let decoded = decode_thread_id(&thread, AccountOperation::HydrateThread)?;
         let messages = hydrate_decoded(
             &account,
             decoded
@@ -1087,7 +1113,7 @@ pub(crate) fn message_hydrate(
     projection: HydrationProjection,
 ) -> AccountFuture<Result<Message, AccountError>> {
     Box::pin(async move {
-        let decoded = decode_object_id(&message)?;
+        let decoded = decode_object_id(&message, AccountOperation::HydrateMessage)?;
         let mut messages = hydrate_decoded(
             &account,
             vec![decoded],
@@ -1095,9 +1121,12 @@ pub(crate) fn message_hydrate(
             AccountOperation::HydrateMessage,
         )
         .await?;
-        messages
-            .pop()
-            .ok_or_else(|| pim_malformed("message was not returned by IMAP FETCH"))
+        messages.pop().ok_or_else(|| {
+            pim_malformed(
+                AccountOperation::HydrateMessage,
+                "message was not returned by IMAP FETCH",
+            )
+        })
     })
 }
 
@@ -1128,7 +1157,7 @@ pub(crate) fn delete_thread(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         if let Some(current) = current {
-            let folder = folder_from_container(&current)?;
+            let folder = folder_from_container(&current, AccountOperation::BulkMove)?;
             let entry = account.folders.get(&folder);
             let attributes = entry
                 .as_deref()
@@ -1183,8 +1212,8 @@ async fn copy_messages(
         let uidvalidity = selected
             .mailbox
             .uid_validity
-            .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
-        let operand = pim_operand(valid_uids(ids, uidvalidity)?)?;
+            .ok_or_else(|| pim_malformed(op, "SELECT missing UIDVALIDITY"))?;
+        let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
         let Some(uid_set) = operand.uid_set() else {
             continue;
         };
@@ -1215,8 +1244,8 @@ async fn delete_messages(
         let uidvalidity = selected
             .mailbox
             .uid_validity
-            .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
-        let operand = pim_operand(valid_uids(ids, uidvalidity)?)?;
+            .ok_or_else(|| pim_malformed(op, "SELECT missing UIDVALIDITY"))?;
+        let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
         let Some(uid_set) = operand.uid_set() else {
             continue;
         };
@@ -1267,8 +1296,8 @@ async fn set_flag(
         let uidvalidity = selected
             .mailbox
             .uid_validity
-            .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
-        let operand = pim_operand(valid_uids(ids, uidvalidity)?)?;
+            .ok_or_else(|| pim_malformed(op, "SELECT missing UIDVALIDITY"))?;
+        let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
         let Some(uid_set) = operand.uid_set() else {
             continue;
         };
@@ -1306,8 +1335,8 @@ async fn hydrate_decoded(
         let uidvalidity = selected
             .mailbox
             .uid_validity
-            .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
-        let operand = pim_operand(valid_uids(ids, uidvalidity)?)?;
+            .ok_or_else(|| pim_malformed(op, "SELECT missing UIDVALIDITY"))?;
+        let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
         let Some(uid_set) = operand.uid_set() else {
             continue;
         };
@@ -1330,11 +1359,14 @@ async fn hydrate_decoded(
     Ok(messages)
 }
 
-fn decoded_targets(target: &MutationTarget) -> Result<Vec<DecodedObjectId>, AccountError> {
+fn decoded_targets(
+    target: &MutationTarget,
+    op: AccountOperation,
+) -> Result<Vec<DecodedObjectId>, AccountError> {
     match target {
-        MutationTarget::Message(id) => Ok(vec![decode_object_id(id)?]),
+        MutationTarget::Message(id) => Ok(vec![decode_object_id(id, op)?]),
         MutationTarget::Thread(thread) => {
-            let decoded = decode_thread_id(thread)?;
+            let decoded = decode_thread_id(thread, op)?;
             Ok(decoded
                 .uids
                 .into_iter()
@@ -1346,6 +1378,7 @@ fn decoded_targets(target: &MutationTarget) -> Result<Vec<DecodedObjectId>, Acco
                 .collect())
         }
         _ => Err(pim_malformed(
+            op,
             "unsupported MutationTarget variant for IMAP per-message operation",
         )),
     }
@@ -1371,29 +1404,43 @@ fn group_by_folder(ids: Vec<DecodedObjectId>) -> Vec<(MailboxName, Vec<DecodedOb
 /// nowhere to be reported. Refuse the command instead of sending an operand
 /// narrower than the caller asked for, which would report success for a
 /// message the server never saw.
-fn pim_operand<I: IntoIterator<Item = u32>>(uids: I) -> Result<UidOperand, AccountError> {
+fn pim_operand<I: IntoIterator<Item = u32>>(
+    uids: I,
+    op: AccountOperation,
+) -> Result<UidOperand, AccountError> {
     let operand = UidOperand::build(uids);
     if !operand.excluded().is_empty() {
         return Err(pim_malformed(
+            op,
             "message id could not be placed in an IMAP UID operand",
         ));
     }
     Ok(operand)
 }
 
-fn valid_uids(ids: Vec<DecodedObjectId>, uidvalidity: u32) -> Result<Vec<u32>, AccountError> {
+fn valid_uids(
+    ids: Vec<DecodedObjectId>,
+    uidvalidity: u32,
+    op: AccountOperation,
+) -> Result<Vec<u32>, AccountError> {
     let mut uids = Vec::new();
     for id in ids {
         if id.uidvalidity != uidvalidity {
-            return Err(pim_malformed("UIDVALIDITY changed before IMAP operation"));
+            return Err(pim_malformed(
+                op,
+                "UIDVALIDITY changed before IMAP operation",
+            ));
         }
         uids.push(id.uid);
     }
     Ok(uids)
 }
 
-fn folder_from_container(container: &ContainerId) -> Result<MailboxName, AccountError> {
-    MailboxName::new(container.0.clone()).map_err(|e| pim_malformed(e.to_string()))
+fn folder_from_container(
+    container: &ContainerId,
+    op: AccountOperation,
+) -> Result<MailboxName, AccountError> {
+    MailboxName::new(container.0.clone()).map_err(|e| pim_malformed(op, e.to_string()))
 }
 
 fn imap_flag_for_keyword(keyword: &str) -> Flag {
@@ -1416,9 +1463,9 @@ struct SearchPlan {
     folder: Option<MailboxName>,
 }
 
-fn search_plan(request: &SearchRequest) -> Result<SearchPlan, AccountError> {
+fn search_plan(request: &SearchRequest, op: AccountOperation) -> Result<SearchPlan, AccountError> {
     let mut plan = match &request.filter {
-        Some(filter) => criteria_from_filter(filter)?,
+        Some(filter) => criteria_from_filter(filter, op)?,
         None => CriteriaPart {
             criteria: "ALL".to_owned(),
             folder: None,
@@ -1429,7 +1476,7 @@ fn search_plan(request: &SearchRequest) -> Result<SearchPlan, AccountError> {
         .as_deref()
         .filter(|raw| !raw.trim().is_empty())
     {
-        validate_provider_query(raw)?;
+        validate_provider_query(raw, op)?;
         if plan.criteria == "ALL" {
             plan.criteria = raw.trim().to_owned();
         } else {
@@ -1446,7 +1493,7 @@ fn search_plan(request: &SearchRequest) -> Result<SearchPlan, AccountError> {
     })
 }
 
-fn validate_provider_query(raw: &str) -> Result<(), AccountError> {
+fn validate_provider_query(raw: &str, op: AccountOperation) -> Result<(), AccountError> {
     let bytes = raw.as_bytes();
     let mut depth = 0usize;
     let mut quoted = false;
@@ -1473,7 +1520,7 @@ fn validate_provider_query(raw: &str) -> Result<(), AccountError> {
             b')' => {
                 depth = depth
                     .checked_sub(1)
-                    .ok_or_else(|| pim_malformed("provider query has an unmatched ')'"))?;
+                    .ok_or_else(|| pim_malformed(op, "provider query has an unmatched ')'"))?;
             }
             b'{' => {
                 let mut end = pos + 1;
@@ -1487,6 +1534,7 @@ fn validate_provider_query(raw: &str) -> Result<(), AccountError> {
                     }
                     if bytes.get(end) == Some(&b'}') {
                         return Err(pim_malformed(
+                            op,
                             "provider query must not contain an IMAP literal",
                         ));
                     }
@@ -1499,11 +1547,12 @@ fn validate_provider_query(raw: &str) -> Result<(), AccountError> {
 
     if quoted {
         return Err(pim_malformed(
+            op,
             "provider query has an unterminated quoted string",
         ));
     }
     if depth != 0 {
-        return Err(pim_malformed("provider query has an unmatched '('"));
+        return Err(pim_malformed(op, "provider query has an unmatched '('"));
     }
     Ok(())
 }
@@ -1514,63 +1563,72 @@ struct CriteriaPart {
     folder: Option<MailboxName>,
 }
 
-fn criteria_from_filter(filter: &SearchFilter) -> Result<CriteriaPart, AccountError> {
+fn criteria_from_filter(
+    filter: &SearchFilter,
+    op: AccountOperation,
+) -> Result<CriteriaPart, AccountError> {
     match filter {
-        SearchFilter::From(value) => leaf(SearchCriteria::new().from(value)),
-        SearchFilter::To(value) => leaf(SearchCriteria::new().to(value)),
-        SearchFilter::Subject(value) => leaf(SearchCriteria::new().subject(value)),
+        SearchFilter::From(value) => leaf(SearchCriteria::new().from(value), op),
+        SearchFilter::To(value) => leaf(SearchCriteria::new().to(value), op),
+        SearchFilter::Subject(value) => leaf(SearchCriteria::new().subject(value), op),
         SearchFilter::Body(value) | SearchFilter::Has(value) => {
-            leaf(SearchCriteria::new().body(value))
+            leaf(SearchCriteria::new().body(value), op)
         }
         SearchFilter::In(container) => Ok(CriteriaPart {
             criteria: "ALL".to_owned(),
-            folder: Some(folder_from_container(container)?),
+            folder: Some(folder_from_container(container, op)?),
         }),
-        SearchFilter::Labeled(LabelId(label)) => leaf(SearchCriteria::new().keyword(label)),
+        SearchFilter::Labeled(LabelId(label)) => leaf(SearchCriteria::new().keyword(label), op),
         SearchFilter::DateRange { after, before } => {
             let mut criteria = SearchCriteria::new();
             if let Some(after) = after {
                 criteria = criteria
                     .sent_since(&imap_date(*after))
-                    .map_err(|e| pim_malformed(e.to_string()))?;
+                    .map_err(|e| pim_malformed(op, e.to_string()))?;
             }
             if let Some(before) = before {
                 criteria = criteria
                     .sent_before(&imap_date(*before))
-                    .map_err(|e| pim_malformed(e.to_string()))?;
+                    .map_err(|e| pim_malformed(op, e.to_string()))?;
             }
             Ok(CriteriaPart {
                 criteria: empty_to_all(criteria.as_str()),
                 folder: None,
             })
         }
-        SearchFilter::And(filters) => combine_and(filters),
-        SearchFilter::Or(filters) => combine_or(filters),
+        SearchFilter::And(filters) => combine_and(filters, op),
+        SearchFilter::Or(filters) => combine_or(filters, op),
         SearchFilter::Not(filter) => {
-            let inner = criteria_from_filter(filter)?;
+            let inner = criteria_from_filter(filter, op)?;
             Ok(CriteriaPart {
                 criteria: format!("NOT ({})", inner.criteria),
                 folder: inner.folder,
             })
         }
-        _ => Err(super::error::unsupported(AccountOperation::Search)),
+        _ => Err(super::error::unsupported(op)),
     }
 }
 
-fn leaf(result: Result<SearchCriteria, crate::Error>) -> Result<CriteriaPart, AccountError> {
-    let criteria = result.map_err(|e| pim_malformed(e.to_string()))?;
+fn leaf(
+    result: Result<SearchCriteria, crate::Error>,
+    op: AccountOperation,
+) -> Result<CriteriaPart, AccountError> {
+    let criteria = result.map_err(|e| pim_malformed(op, e.to_string()))?;
     Ok(CriteriaPart {
         criteria: empty_to_all(criteria.as_str()),
         folder: None,
     })
 }
 
-fn combine_and(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
+fn combine_and(
+    filters: &[SearchFilter],
+    op: AccountOperation,
+) -> Result<CriteriaPart, AccountError> {
     let mut criteria = Vec::new();
     let mut folder = None;
     for filter in filters {
-        let part = criteria_from_filter(filter)?;
-        folder = merge_folder(folder, part.folder)?;
+        let part = criteria_from_filter(filter, op)?;
+        folder = merge_folder(folder, part.folder, op)?;
         if part.criteria != "ALL" {
             criteria.push(part.criteria);
         }
@@ -1585,7 +1643,10 @@ fn combine_and(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
     })
 }
 
-fn combine_or(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
+fn combine_or(
+    filters: &[SearchFilter],
+    op: AccountOperation,
+) -> Result<CriteriaPart, AccountError> {
     if filters.is_empty() {
         return Ok(CriteriaPart {
             criteria: "ALL".to_owned(),
@@ -1594,7 +1655,7 @@ fn combine_or(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
     }
     let mut parts = Vec::new();
     for filter in filters {
-        let part = criteria_from_filter(filter)?;
+        let part = criteria_from_filter(filter, op)?;
         // A folder restriction (`In`) nested inside an `Or` cannot be
         // expressed in a single-mailbox IMAP SEARCH: SEARCH runs against
         // the currently-selected mailbox, so hoisting the `In` folder to
@@ -1604,7 +1665,7 @@ fn combine_or(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
         // conjunction); the OR case is not, so reject it explicitly
         // rather than leak the restriction.
         if part.folder.is_some() {
-            return Err(or_folder_restriction_error());
+            return Err(or_folder_restriction_error(op));
         }
         parts.push(part.criteria);
     }
@@ -1621,6 +1682,7 @@ fn combine_or(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
 fn merge_folder(
     current: Option<MailboxName>,
     next: Option<MailboxName>,
+    op: AccountOperation,
 ) -> Result<Option<MailboxName>, bifrost_types::AccountError> {
     match (current, next) {
         (Some(a), Some(b)) if a != b => {
@@ -1641,7 +1703,7 @@ fn merge_folder(
                 }),
             )
             .protocol(Protocol::Imap)
-            .operation(bifrost_types::AccountOperation::SearchMessages)
+            .operation(op)
             .try_build()
             .expect("valid account error classification"))
         }
@@ -1653,7 +1715,7 @@ fn merge_folder(
 
 /// A folder restriction (`SearchFilter::In`) nested inside an `Or` has no
 /// faithful single-mailbox IMAP SEARCH encoding (see `combine_or`).
-fn or_folder_restriction_error() -> AccountError {
+fn or_folder_restriction_error(op: AccountOperation) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
         Cause::Request(RequestCause::InvalidArgument {
@@ -1666,7 +1728,7 @@ fn or_folder_restriction_error() -> AccountError {
         }),
     )
     .protocol(Protocol::Imap)
-    .operation(AccountOperation::SearchMessages)
+    .operation(op)
     .try_build()
     .expect("valid account error classification")
 }
@@ -1726,12 +1788,13 @@ fn search_folders(account: &ImapAccount, restriction: Option<&MailboxName>) -> V
 fn page_from_items<T: Clone>(
     items: Vec<T>,
     request: &SearchRequest,
+    op: AccountOperation,
 ) -> Result<Page<T>, AccountError> {
     let offset = match &request.page_cursor {
         Some(cursor) => std::str::from_utf8(cursor)
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .ok_or_else(|| pim_malformed("invalid IMAP page cursor"))?,
+            .ok_or_else(|| pim_malformed(op, "invalid IMAP page cursor"))?,
         None => 0,
     };
     let limit = usize::try_from(request.limit.unwrap_or(500)).unwrap_or(usize::MAX);
@@ -1936,37 +1999,39 @@ fn child_name(
     account: &ImapAccount,
     parent: Option<&ContainerId>,
     leaf: &str,
+    op: AccountOperation,
 ) -> Result<MailboxName, AccountError> {
     let Some(parent) = parent else {
-        return MailboxName::new(leaf.to_owned()).map_err(|e| pim_malformed(e.to_string()));
+        return MailboxName::new(leaf.to_owned()).map_err(|e| pim_malformed(op, e.to_string()));
     };
-    let parent_folder = folder_from_container(parent)?;
+    let parent_folder = folder_from_container(parent, op)?;
     let delimiter = account
         .folders
         .get(&parent_folder)
         .and_then(|entry| entry.delimiter())
-        .ok_or_else(|| super::error::unsupported(AccountOperation::ContainerCreate))?;
+        .ok_or_else(|| super::error::unsupported(op))?;
     MailboxName::new(format!("{}{delimiter}{leaf}", parent_folder.as_str()))
-        .map_err(|e| pim_malformed(e.to_string()))
+        .map_err(|e| pim_malformed(op, e.to_string()))
 }
 
 fn renamed_sibling(
     account: &ImapAccount,
     folder: &MailboxName,
     new_leaf: &str,
+    op: AccountOperation,
 ) -> Result<MailboxName, AccountError> {
     let delimiter = account
         .folders
         .get(folder)
         .and_then(|entry| entry.delimiter());
     let Some(delimiter) = delimiter else {
-        return MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(e.to_string()));
+        return MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(op, e.to_string()));
     };
     if let Some((parent, _)) = folder.as_str().rsplit_once(delimiter) {
         MailboxName::new(format!("{parent}{delimiter}{new_leaf}"))
-            .map_err(|e| pim_malformed(e.to_string()))
+            .map_err(|e| pim_malformed(op, e.to_string()))
     } else {
-        MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(e.to_string()))
+        MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(op, e.to_string()))
     }
 }
 
@@ -2209,12 +2274,13 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
 /// Build a `Request(Malformed)` `AccountError` for local PIM failures
 /// where the caller provided invalid or internally inconsistent state.
 ///
-/// Operation is intentionally absent: `pim_malformed` is used from
-/// helpers (decode_thread_id, mailbox-name validation, container-id
-/// shape) that may be reached from multiple PIM ops. Each public PIM
-/// surface threads its operation through `op_err` on wire errors;
-/// these locally-malformed cases land in `ClientBug` regardless of op.
-fn pim_malformed(detail: impl Into<String>) -> AccountError {
+/// The operation is threaded in from the caller. Helpers reachable from
+/// more than one PIM surface (id decode, mailbox-name validation,
+/// search-criteria assembly, page-cursor parsing) take the op as a
+/// parameter rather than guessing, so a locally-malformed request is
+/// attributable to the PIM call that produced it. The recovery class is
+/// `ClientBug` for all of them; the operation is the telemetry.
+fn pim_malformed(op: AccountOperation, detail: impl Into<String>) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
         Cause::Request(RequestCause::Malformed {
@@ -2222,6 +2288,7 @@ fn pim_malformed(detail: impl Into<String>) -> AccountError {
         }),
     )
     .protocol(Protocol::Imap)
+    .operation(op)
     .try_build()
     .expect("valid account error classification")
 }
@@ -2255,12 +2322,95 @@ mod tests {
         )
     }
 
+    // imap-F2: the locally-malformed helpers used to build an
+    // operation-less `Request(Malformed)`, so every PIM lane's client-bug
+    // errors arrived indistinguishable in telemetry. Each helper now takes
+    // the operation its caller is servicing. The recovery class was already
+    // `ClientBug` and is unchanged; what this pins is that the operation
+    // rides along, and that it is the *caller's* operation rather than a
+    // hardcoded one.
+    #[test]
+    fn locally_malformed_pim_errors_carry_the_calling_operation() {
+        // Id / cursor / mailbox-name decode.
+        let err = folder_from_container(
+            &ContainerId("INBOX\r\nNOOP".to_owned()),
+            AccountOperation::BulkMove,
+        )
+        .expect_err("a CRLF-bearing mailbox name is not valid");
+        assert_eq!(err.operation(), Some(AccountOperation::BulkMove));
+
+        let err = decoded_targets(
+            &MutationTarget::Message(ObjectId("not-an-imap-id".to_owned())),
+            AccountOperation::SetIsRead,
+        )
+        .expect_err("a foreign object id must not decode");
+        assert_eq!(err.operation(), Some(AccountOperation::SetIsRead));
+
+        let Err(err) = pim_operand([0u32], AccountOperation::UpdateFlags) else {
+            panic!("uid 0 cannot ride an operand");
+        };
+        assert_eq!(err.operation(), Some(AccountOperation::UpdateFlags));
+
+        let err = valid_uids(
+            vec![DecodedObjectId {
+                folder: MailboxName::new("INBOX").expect("valid mailbox"),
+                uidvalidity: 2,
+                uid: 5,
+            }],
+            3,
+            AccountOperation::BulkDestroy,
+        )
+        .expect_err("a UIDVALIDITY change is refused");
+        assert_eq!(err.operation(), Some(AccountOperation::BulkDestroy));
+
+        // The search lane is the one that had two operations to confuse:
+        // `search` and `search_messages` share every helper below, and the
+        // criteria/folder-merge builders used to stamp `SearchMessages`
+        // unconditionally. Drive each through `Search` so a reverted
+        // threading shows up as the wrong op, not merely as `None`.
+        let err = search_plan(
+            &SearchRequest::provider("(UNSEEN"),
+            AccountOperation::Search,
+        )
+        .expect_err("unbalanced provider query");
+        assert_eq!(err.operation(), Some(AccountOperation::Search));
+
+        let err = combine_and(
+            &[
+                SearchFilter::In(ContainerId("Archive".to_owned())),
+                SearchFilter::In(ContainerId("Sent".to_owned())),
+            ],
+            AccountOperation::Search,
+        )
+        .expect_err("a two-folder conjunction is refused");
+        assert_eq!(err.operation(), Some(AccountOperation::Search));
+
+        let err = combine_or(
+            &[
+                SearchFilter::In(ContainerId("Archive".to_owned())),
+                SearchFilter::From("a@b.test".to_owned()),
+            ],
+            AccountOperation::Search,
+        )
+        .expect_err("a folder restriction inside an Or is refused");
+        assert_eq!(err.operation(), Some(AccountOperation::Search));
+
+        let err = page_from_items(
+            vec![1u32],
+            &search_request(None, Some("not-a-number")),
+            AccountOperation::Search,
+        )
+        .expect_err("a page cursor this crate did not mint");
+        assert_eq!(err.operation(), Some(AccountOperation::Search));
+    }
+
     // The PIM primitives answer for the whole request, so they have nowhere
     // to report a per-id exclusion. Sending the narrowed operand anyway
     // would return `Ok(())` for messages the server was never asked about.
     #[test]
     fn a_pim_operand_refuses_a_uid_it_cannot_carry_instead_of_narrowing() {
-        let Err(refused) = super::pim_operand([4u32, 0, 6]) else {
+        let Err(refused) = super::pim_operand([4u32, 0, 6], AccountOperation::SearchMessages)
+        else {
             panic!("a dropped UID must be refused, not silently narrowed");
         };
         assert!(matches!(
@@ -2268,7 +2418,8 @@ mod tests {
             AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         ));
 
-        let operand = super::pim_operand([4u32, 6]).expect("carryable UIDs");
+        let operand = super::pim_operand([4u32, 6], AccountOperation::SearchMessages)
+            .expect("carryable UIDs");
         assert_eq!(operand.uids(), &[4, 6]);
         assert_eq!(
             operand
@@ -2281,7 +2432,8 @@ mod tests {
 
         // An empty group is not an exclusion: nothing was asked for, so
         // there is no command to send and nothing to refuse.
-        let empty = super::pim_operand([]).expect("an empty request is not malformed");
+        let empty = super::pim_operand([], AccountOperation::SearchMessages)
+            .expect("an empty request is not malformed");
         assert!(empty.uid_set().is_none());
     }
 
@@ -2484,7 +2636,8 @@ Message-ID: <draft-123@sender.test>\r\n\
 \r\n\
 body text\r\n";
         let default_from = bifrost_types::Address::bare("fallback@sender.test");
-        let parsed = parse_draft_for_submission(raw, &default_from).expect("parses");
+        let parsed = parse_draft_for_submission(raw, &default_from, AccountOperation::DraftSend)
+            .expect("parses");
 
         // Bcc addresses are folded into the envelope recipients.
         let recipients: Vec<&str> = parsed
@@ -2519,12 +2672,14 @@ body text\r\n";
 
         // No From header: reverse path falls back to default_from.
         let raw = b"To: ann@to.test\r\n\r\nhi\r\n";
-        let parsed = parse_draft_for_submission(raw, &default_from).expect("parses");
+        let parsed = parse_draft_for_submission(raw, &default_from, AccountOperation::DraftSend)
+            .expect("parses");
         assert_eq!(parsed.envelope.from.address, "fallback@sender.test");
 
         // No recipients at all: malformed.
         let raw = b"From: me@sender.test\r\n\r\nhi\r\n";
-        let err = parse_draft_for_submission(raw, &default_from).expect_err("no recipients");
+        let err = parse_draft_for_submission(raw, &default_from, AccountOperation::DraftSend)
+            .expect_err("no recipients");
         assert_eq!(
             *err.kind(),
             AccountErrorKind::Request(RequestErrorKind::Malformed)
@@ -2539,7 +2694,8 @@ body text\r\n";
         let mut raw = b"From: me@sender.test\r\nTo: ann@to.test\r\n\r\n".to_vec();
         raw.extend_from_slice(&[0xFF, 0x00, 0xFE, b'\r', b'\n']);
         let default_from = bifrost_types::Address::bare("fallback@sender.test");
-        let parsed = parse_draft_for_submission(&raw, &default_from).expect("parses");
+        let parsed = parse_draft_for_submission(&raw, &default_from, AccountOperation::DraftSend)
+            .expect("parses");
 
         // Body retains the verbatim 8-bit octets; no U+FFFD substitution.
         assert!(parsed.body.ends_with(&[0xFF, 0x00, 0xFE, b'\r', b'\n']));
@@ -2552,7 +2708,8 @@ body text\r\n";
         // body must not gain a stray CRLF separator (no mixed endings).
         let raw = b"From: me@sender.test\nTo: ann@to.test\nBcc: blind@bcc.test\n\nbody line\n";
         let default_from = bifrost_types::Address::bare("fallback@sender.test");
-        let parsed = parse_draft_for_submission(raw, &default_from).expect("parses");
+        let parsed = parse_draft_for_submission(raw, &default_from, AccountOperation::DraftSend)
+            .expect("parses");
 
         let body = parsed.body;
         // Bcc folded into recipients.
@@ -2579,7 +2736,8 @@ body text\r\n";
         // still built from the headers.
         let raw = b"From: me@sender.test\r\nTo: ann@to.test\r\n";
         let default_from = bifrost_types::Address::bare("fallback@sender.test");
-        let parsed = parse_draft_for_submission(raw, &default_from).expect("parses");
+        let parsed = parse_draft_for_submission(raw, &default_from, AccountOperation::DraftSend)
+            .expect("parses");
         assert_eq!(parsed.envelope.recipients[0].address, "ann@to.test");
         // Header block ends with CRLF + a synthesized blank line, then no body.
         let text = String::from_utf8(parsed.body).expect("ascii");
@@ -2610,7 +2768,7 @@ body text\r\n";
             SearchFilter::In(ContainerId("Archive".to_owned())),
             SearchFilter::From("a@b.test".to_owned()),
         ]);
-        let err = match criteria_from_filter(&filter) {
+        let err = match criteria_from_filter(&filter, AccountOperation::SearchMessages) {
             Err(err) => err,
             Ok(_) => panic!("OR with In must be rejected"),
         };
@@ -2625,7 +2783,7 @@ body text\r\n";
             SearchFilter::In(ContainerId("Archive".to_owned())),
             SearchFilter::From("a@b.test".to_owned()),
         ]);
-        let part = match criteria_from_filter(&filter) {
+        let part = match criteria_from_filter(&filter, AccountOperation::SearchMessages) {
             Ok(part) => part,
             Err(_) => panic!("AND with In is accepted"),
         };
@@ -2798,27 +2956,45 @@ body text\r\n";
     fn page_from_items_walks_an_offset_cursor_to_exhaustion() {
         let items: Vec<u32> = (0..5).collect();
 
-        let first = page_from_items(items.clone(), &search_request(Some(2), None)).expect("page");
+        let first = page_from_items(
+            items.clone(),
+            &search_request(Some(2), None),
+            AccountOperation::SearchMessages,
+        )
+        .expect("page");
         assert_eq!(first.items, vec![0, 1]);
         assert_eq!(first.next_cursor.as_deref(), Some(b"2".as_slice()));
         assert_eq!(first.estimated_total, Some(5));
 
-        let last =
-            page_from_items(items.clone(), &search_request(Some(2), Some("4"))).expect("page");
+        let last = page_from_items(
+            items.clone(),
+            &search_request(Some(2), Some("4")),
+            AccountOperation::SearchMessages,
+        )
+        .expect("page");
         assert_eq!(last.items, vec![4]);
         assert_eq!(last.next_cursor, None, "the final page ends the walk");
 
         // A cursor at or past the end yields an empty final page rather
         // than an error or a panic on the slice.
-        let past = page_from_items(items, &search_request(Some(2), Some("99"))).expect("page");
+        let past = page_from_items(
+            items,
+            &search_request(Some(2), Some("99")),
+            AccountOperation::SearchMessages,
+        )
+        .expect("page");
         assert!(past.items.is_empty());
         assert_eq!(past.next_cursor, None);
     }
 
     #[test]
     fn page_from_items_rejects_a_cursor_it_did_not_mint() {
-        let err = page_from_items(vec![1u32], &search_request(None, Some("not-a-number")))
-            .expect_err("garbage cursor");
+        let err = page_from_items(
+            vec![1u32],
+            &search_request(None, Some("not-a-number")),
+            AccountOperation::SearchMessages,
+        )
+        .expect_err("garbage cursor");
         assert_eq!(
             *err.kind(),
             AccountErrorKind::Request(RequestErrorKind::Malformed)
@@ -2838,13 +3014,15 @@ body text\r\n";
 
     #[test]
     fn search_plan_defaults_to_all_and_carries_the_folder_restriction() {
-        let plan = search_plan(&SearchRequest::default()).expect("plan");
+        let plan =
+            search_plan(&SearchRequest::default(), AccountOperation::SearchMessages).expect("plan");
         assert_eq!(plan.criteria, "ALL");
         assert!(plan.folder.is_none());
 
-        let plan = search_plan(&SearchRequest::filter(SearchFilter::In(ContainerId(
-            "Archive".to_owned(),
-        ))))
+        let plan = search_plan(
+            &SearchRequest::filter(SearchFilter::In(ContainerId("Archive".to_owned()))),
+            AccountOperation::SearchMessages,
+        )
         .expect("plan");
         assert_eq!(plan.criteria, "ALL", "In contributes no criteria");
         assert_eq!(
@@ -2855,9 +3033,10 @@ body text\r\n";
 
     #[test]
     fn search_plan_quotes_filter_operands() {
-        let plan = search_plan(&SearchRequest::filter(SearchFilter::Subject(
-            "quarterly \"report\"".to_owned(),
-        )))
+        let plan = search_plan(
+            &SearchRequest::filter(SearchFilter::Subject("quarterly \"report\"".to_owned())),
+            AccountOperation::SearchMessages,
+        )
         .expect("plan");
         assert_eq!(plan.criteria, "SUBJECT \"quarterly \\\"report\\\"\"");
     }
@@ -2865,36 +3044,53 @@ body text\r\n";
     #[test]
     fn search_plan_substitutes_or_conjoins_the_provider_query() {
         // With no structured filter the raw query replaces the ALL.
-        let plan = search_plan(&SearchRequest::provider("  UNSEEN  ")).expect("plan");
+        let plan = search_plan(
+            &SearchRequest::provider("  UNSEEN  "),
+            AccountOperation::SearchMessages,
+        )
+        .expect("plan");
         assert_eq!(plan.criteria, "UNSEEN", "the raw query is trimmed");
 
         // With a structured filter the two are juxtaposed, which is
         // IMAP's implicit AND (RFC 3501 Section 6.4.4).
         let mut request = SearchRequest::filter(SearchFilter::From("a@b.test".to_owned()));
         request.provider_query = Some("UNSEEN".to_owned());
-        let plan = search_plan(&request).expect("plan");
+        let plan = search_plan(&request, AccountOperation::SearchMessages).expect("plan");
         assert_eq!(plan.criteria, "FROM \"a@b.test\" UNSEEN");
 
         // A whitespace-only raw query is ignored entirely.
-        let plan = search_plan(&SearchRequest::provider("   ")).expect("plan");
+        let plan = search_plan(
+            &SearchRequest::provider("   "),
+            AccountOperation::SearchMessages,
+        )
+        .expect("plan");
         assert_eq!(plan.criteria, "ALL");
     }
 
     #[test]
     fn search_plan_rejects_structurally_unsafe_provider_queries() {
         for raw in [")", "(UNSEEN", "SUBJECT \"unterminated", "BODY {4}"] {
-            let err = search_plan(&SearchRequest::provider(raw)).expect_err("malformed query");
+            let err = search_plan(
+                &SearchRequest::provider(raw),
+                AccountOperation::SearchMessages,
+            )
+            .expect_err("malformed query");
             assert_eq!(
                 *err.kind(),
                 AccountErrorKind::Request(RequestErrorKind::Malformed)
             );
         }
-        let plan = search_plan(&SearchRequest::provider(
-            "OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")",
-        ))
+        let plan = search_plan(
+            &SearchRequest::provider("OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")"),
+            AccountOperation::SearchMessages,
+        )
         .expect("balanced query");
         assert_eq!(plan.criteria, "OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")");
-        let plan = search_plan(&SearchRequest::provider("FROM")).expect("plan");
+        let plan = search_plan(
+            &SearchRequest::provider("FROM"),
+            AccountOperation::SearchMessages,
+        )
+        .expect("plan");
         assert_eq!(
             plan.criteria, "FROM",
             "the structural guard does not attempt operand-arity parsing"
@@ -2903,16 +3099,22 @@ body text\r\n";
 
     #[test]
     fn and_and_or_combinators_produce_the_expected_criteria_shapes() {
-        let and = combine_and(&[
-            SearchFilter::From("a@b.test".to_owned()),
-            SearchFilter::Subject("hi".to_owned()),
-        ])
+        let and = combine_and(
+            &[
+                SearchFilter::From("a@b.test".to_owned()),
+                SearchFilter::Subject("hi".to_owned()),
+            ],
+            AccountOperation::SearchMessages,
+        )
         .expect("and");
         assert_eq!(and.criteria, "FROM \"a@b.test\" SUBJECT \"hi\"");
 
         // An `In`-only conjunction degenerates to ALL plus the folder.
-        let folder_only =
-            combine_and(&[SearchFilter::In(ContainerId("Archive".to_owned()))]).expect("and");
+        let folder_only = combine_and(
+            &[SearchFilter::In(ContainerId("Archive".to_owned()))],
+            AccountOperation::SearchMessages,
+        )
+        .expect("and");
         assert_eq!(folder_only.criteria, "ALL");
         assert_eq!(
             folder_only.folder.as_ref().map(MailboxName::as_str),
@@ -2921,28 +3123,39 @@ body text\r\n";
 
         // RFC 3501 OR takes exactly two search-keys, so a three-way OR
         // has to nest.
-        let or = combine_or(&[
-            SearchFilter::From("a@b.test".to_owned()),
-            SearchFilter::From("c@d.test".to_owned()),
-            SearchFilter::From("e@f.test".to_owned()),
-        ])
+        let or = combine_or(
+            &[
+                SearchFilter::From("a@b.test".to_owned()),
+                SearchFilter::From("c@d.test".to_owned()),
+                SearchFilter::From("e@f.test".to_owned()),
+            ],
+            AccountOperation::SearchMessages,
+        )
         .expect("or");
         assert_eq!(
             or.criteria,
             "OR (OR (FROM \"a@b.test\") (FROM \"c@d.test\")) (FROM \"e@f.test\")"
         );
 
-        assert_eq!(combine_or(&[]).expect("empty or").criteria, "ALL");
+        assert_eq!(
+            combine_or(&[], AccountOperation::SearchMessages)
+                .expect("empty or")
+                .criteria,
+            "ALL"
+        );
     }
 
     #[test]
     fn and_across_two_folders_is_rejected_rather_than_silently_narrowed() {
         // IMAP SEARCH runs against one selected mailbox, so a filter
         // naming two folders has no faithful single-command encoding.
-        let err = combine_and(&[
-            SearchFilter::In(ContainerId("Archive".to_owned())),
-            SearchFilter::In(ContainerId("Sent".to_owned())),
-        ])
+        let err = combine_and(
+            &[
+                SearchFilter::In(ContainerId("Archive".to_owned())),
+                SearchFilter::In(ContainerId("Sent".to_owned())),
+            ],
+            AccountOperation::SearchMessages,
+        )
         .expect_err("two folders");
         assert_eq!(
             *err.kind(),
@@ -2950,20 +3163,26 @@ body text\r\n";
         );
         // The same folder twice is not a conflict.
         assert!(
-            combine_and(&[
-                SearchFilter::In(ContainerId("Archive".to_owned())),
-                SearchFilter::In(ContainerId("Archive".to_owned())),
-            ])
+            combine_and(
+                &[
+                    SearchFilter::In(ContainerId("Archive".to_owned())),
+                    SearchFilter::In(ContainerId("Archive".to_owned())),
+                ],
+                AccountOperation::SearchMessages,
+            )
             .is_ok()
         );
     }
 
     #[test]
     fn not_wraps_its_inner_criteria_and_keeps_the_folder() {
-        let part = criteria_from_filter(&SearchFilter::Not(Box::new(SearchFilter::And(vec![
-            SearchFilter::In(ContainerId("Archive".to_owned())),
-            SearchFilter::From("a@b.test".to_owned()),
-        ]))))
+        let part = criteria_from_filter(
+            &SearchFilter::Not(Box::new(SearchFilter::And(vec![
+                SearchFilter::In(ContainerId("Archive".to_owned())),
+                SearchFilter::From("a@b.test".to_owned()),
+            ]))),
+            AccountOperation::SearchMessages,
+        )
         .expect("not");
         assert_eq!(part.criteria, "NOT (FROM \"a@b.test\")");
         assert_eq!(

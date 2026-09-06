@@ -397,7 +397,8 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                 .expect("push scopes lock poisoned");
             subscribed_idle_folders(&scopes)
         };
-        register_notify(&conn, &folder, &watched, account.command_timeout()).await;
+        let registered = register_notify(&conn, &folder, &watched, account.command_timeout()).await;
+        signal_notify_coverage_loss(&account.push, registered);
         if was_disconnected {
             let _ = account.push.tx.send(WatchEvent::Reconnected);
             was_disconnected = false;
@@ -504,7 +505,9 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken, slot: usize)
                             .expect("push scopes lock poisoned");
                         subscribed_idle_folders(&scopes)
                     };
-                    register_notify(&conn, &folder, &watched, account.command_timeout()).await;
+                    let registered =
+                        register_notify(&conn, &folder, &watched, account.command_timeout()).await;
+                    signal_notify_coverage_loss(&account.push, registered);
                 }
                 Ok(event) => {
                     if absorb_idle_event(&account, &folder, uidvalidity, &event).is_err() {
@@ -656,8 +659,11 @@ fn subscribed_idle_folders(
 ///
 /// Returns whether every watched folder is covered. A server without
 /// NOTIFY, or one that rejects the registration, leaves the loop watching
-/// only the selected mailbox - the pre-NOTIFY behaviour - and that is worth
-/// a log line, because the silence is otherwise invisible.
+/// only the selected mailbox - the pre-NOTIFY behaviour. The caller feeds
+/// that answer to `signal_notify_coverage_loss`, which turns a collapse on
+/// a NOTIFY-advertising account into a coarse invalidation rather than
+/// silence, because the subscribe outcome already reported those folders
+/// pushed and cannot be retracted.
 /// The `NOTIFY SET` registration for one IDLE round: message events on the
 /// selected mailbox, the same events on the other watched mailboxes.
 ///
@@ -736,6 +742,38 @@ async fn register_notify(
 /// not, and unsolicited events can name other mailboxes.
 fn signal_idle_interrupt_loss(push: &PushState) {
     let _ = push.tx.send(invalidated(HintPayload::Unknown));
+}
+
+/// Cover the folders a runtime `NOTIFY SET` rejection leaves unwatched.
+///
+/// Admission in `push_subscribe` accepts every folder scope unconditionally
+/// on a NOTIFY server, because NOTIFY folds them all onto one session; the
+/// account then runs a single IDLE worker. That bet is only settled later,
+/// when `register_notify` actually issues `NOTIFY SET` on the dialed
+/// connection. If the server refuses it - `[BADEVENT]`, an unsupported
+/// mailbox filter, or a connection whose post-redial CAPABILITY no longer
+/// advertises NOTIFY - coverage collapses to the one SELECTed mailbox while
+/// every other subscribed folder was already reported `Succeeded`.
+///
+/// The subscribe outcome cannot be retracted: `BatchOutcome` is settled and
+/// returned before the first dial, and there is no per-scope demotion event
+/// in the watch stream. What is available is the contract `reference/sync.md`
+/// states for a missed push - degrade to a coarser invalidation, never to
+/// silence. So an unregistered round emits one account-wide `Unknown`, and
+/// because registration is re-attempted on every redial and every
+/// resubscribe-interrupted round, the uncovered folders keep getting a
+/// coarse invalidation at the IDLE cadence instead of nothing at all.
+///
+/// Gated on the account-level NOTIFY capability on purpose. Without it the
+/// account runs `idle_connection_budget` workers and admission caps the
+/// subscribed set at that many folders, so every folder has its own SELECTed
+/// session and a `false` here means only "this worker has no others to fold
+/// in" - not a coverage gap. Firing there would invalidate the whole account
+/// once per round on every non-NOTIFY server.
+fn signal_notify_coverage_loss(push: &PushState, registered: bool) {
+    if push.supports_notify && !registered {
+        let _ = push.tx.send(invalidated(HintPayload::Unknown));
+    }
 }
 
 fn absorb_idle_event(
@@ -852,6 +890,56 @@ mod tests {
                 }
             }
         ));
+    }
+
+    /// `push_subscribe` admits every folder scope on a NOTIFY-advertising
+    /// account and reports them `Succeeded` before any connection exists,
+    /// betting that one session's `NOTIFY SET` will cover them all. When the
+    /// server refuses that registration at runtime the account is left
+    /// watching one mailbox while bifrost-sync believes all of them are
+    /// pushed. The outcome cannot be retracted, so the round must at least
+    /// degrade to a coarse invalidation instead of going silent.
+    #[tokio::test]
+    async fn a_rejected_notify_registration_degrades_instead_of_going_silent() {
+        let push = PushState::new(true, 1);
+        let mut rx = push.tx.subscribe();
+
+        signal_notify_coverage_loss(&push, true);
+        assert!(
+            rx.try_recv().is_err(),
+            "a registration that took must not invalidate anything",
+        );
+
+        signal_notify_coverage_loss(&push, false);
+        let event = rx
+            .try_recv()
+            .expect("a collapsed NOTIFY registration must invalidate");
+        assert!(matches!(
+            event,
+            WatchEvent::Invalidated {
+                hint: InvalidationHint {
+                    payload: HintPayload::Unknown,
+                    ..
+                }
+            }
+        ));
+    }
+
+    /// Without NOTIFY the account runs one worker per admitted folder, so
+    /// `register_notify` answering `false` means only "nothing to fold in",
+    /// not a coverage gap. Invalidating there would fire an account-wide
+    /// reconcile once per IDLE round on every non-NOTIFY server.
+    #[tokio::test]
+    async fn a_non_notify_account_does_not_invalidate_on_a_missing_registration() {
+        let push = PushState::new(false, 4);
+        let mut rx = push.tx.subscribe();
+
+        signal_notify_coverage_loss(&push, false);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "per-folder IDLE workers already cover every admitted folder",
+        );
     }
 
     /// The unchanged-assignment case must NOT redial. Every subscribe and
