@@ -10,6 +10,20 @@ pub(crate) trait ChangesObject: Object {
     type ChangesResponse: DeserializeOwned;
 }
 
+/// A generated `*/changes` method struct, constructible from the two
+/// arguments every paginated changes walk supplies.
+///
+/// `define_changes_method!` gives each such struct an identical inherent
+/// `new` / `max_changes` pair, but inherent methods are not reachable
+/// from a generic caller. This trait is that reach: it lets one walk
+/// drive `Email/changes` and `Mailbox/changes` (and any future
+/// `*/changes`) without a per-object copy of the loop, with `NAME`
+/// supplying the diagnostic method name the forward-progress guard
+/// reports.
+pub(crate) trait ChangesMethod: super::method::JmapMethod {
+    fn since(since_state: String, max_changes: NonZeroUsize) -> Self;
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ChangesRequest {
     #[serde(rename = "accountId")]

@@ -95,32 +95,22 @@ fn foreign_email_inventory<T: HttpTransport>(
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     let filter =
         (!mailbox_id.is_empty()).then(|| crate::email::query::Filter::in_mailbox(mailbox_id));
-    email_inventory_loop(
-        mail,
-        scope,
-        filter,
-        InventoryOwner::Foreign(owner),
-        InventoryWindow::Full {
-            limit: limits.max_objects_in_get.max(1),
-        },
-    )
+    email_inventory_loop(mail, scope, filter, owner, limits.max_objects_in_get.max(1))
 }
 
-enum InventoryOwner {
-    Primary,
-    Foreign(Option<TypesMailboxId>),
-}
-
-enum InventoryWindow {
-    Full { limit: usize },
-}
-
+/// The paged `Email/query` + `Email/get` inventory walk, shared by the
+/// primary `Type(Email)` scope and every foreign (shared/delegate)
+/// account scope. The only thing that varies is `owner`: `Some(accountId)`
+/// for a foreign scope, which both qualifies the emitted ids and
+/// memberships into the owning account's namespace and routes a permission
+/// denial into a per-scope quarantine; `None` for the primary walk, where
+/// `shared_scope_error` reduces to the plain JMAP error mapping.
 fn email_inventory_loop<T: HttpTransport>(
     mail: MailAccount<T>,
     scope: CursorScope,
     filter: Option<crate::email::query::Filter>,
-    owner: InventoryOwner,
-    window: InventoryWindow,
+    owner: Option<TypesMailboxId>,
+    full_limit: usize,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
         // One accumulator for the paged walk. Each page is a `Query`
@@ -128,7 +118,6 @@ fn email_inventory_loop<T: HttpTransport>(
         // and clears the accumulator, so a batch's `bytes_in` covers
         // both requests of its page.
         let (mail, tally) = mail.metered();
-        let InventoryWindow::Full { limit: full_limit } = window;
 
         let mut anchor: Option<String> = None;
         let mut query_state: Option<String> = None;
@@ -157,26 +146,15 @@ fn email_inventory_loop<T: HttpTransport>(
             let query_response = match query_response {
                 Ok(response) => response,
                 Err(err) => {
-                    match &owner {
-                        InventoryOwner::Primary => yield super::error::terminated_from_jmap(
-                            err,
-                            super::error::JmapErrorContext::cursor(
-                                bifrost_types::AccountOperation::SyncInventory,
-                                scope.clone(),
-                            ),
+                    yield super::error::terminated(super::error::shared_scope_error(
+                        err,
+                        &scope,
+                        owner.as_ref(),
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncInventory,
+                            scope.clone(),
                         ),
-                        InventoryOwner::Foreign(owner) => yield super::error::terminated(
-                            super::error::shared_scope_error(
-                                err,
-                                &scope,
-                                owner.as_ref(),
-                                super::error::JmapErrorContext::cursor(
-                                    bifrost_types::AccountOperation::SyncInventory,
-                                    scope.clone(),
-                                ),
-                            ),
-                        ),
-                    }
+                    ));
                     return;
                 }
             };
@@ -233,26 +211,15 @@ fn email_inventory_loop<T: HttpTransport>(
             let get_response = match get_response {
                 Ok(response) => response,
                 Err(err) => {
-                    match &owner {
-                        InventoryOwner::Primary => yield super::error::terminated_from_jmap(
-                            err,
-                            super::error::JmapErrorContext::cursor(
-                                bifrost_types::AccountOperation::SyncInventory,
-                                scope.clone(),
-                            ),
+                    yield super::error::terminated(super::error::shared_scope_error(
+                        err,
+                        &scope,
+                        owner.as_ref(),
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncInventory,
+                            scope.clone(),
                         ),
-                        InventoryOwner::Foreign(owner) => yield super::error::terminated(
-                            super::error::shared_scope_error(
-                                err,
-                                &scope,
-                                owner.as_ref(),
-                                super::error::JmapErrorContext::cursor(
-                                    bifrost_types::AccountOperation::SyncInventory,
-                                    scope.clone(),
-                                ),
-                            ),
-                        ),
-                    }
+                    ));
                     return;
                 }
             };
@@ -266,7 +233,7 @@ fn email_inventory_loop<T: HttpTransport>(
                 // addition to its native mailbox memberships, so the
                 // consumer maps the item to its shared-account owner (the
                 // A5c-established owner-tag pattern).
-                if let InventoryOwner::Foreign(Some(owner)) = &owner {
+                if let Some(owner) = &owner {
                     qualify_foreign_memberships(&mut entry.memberships, owner);
                     qualify_foreign_ids(&mut entry, owner);
                 }
@@ -366,10 +333,8 @@ fn email_inventory<T: HttpTransport>(
         mail,
         CursorScope::Type(ObjectType::Email),
         None,
-        InventoryOwner::Primary,
-        InventoryWindow::Full {
-            limit: limits.max_objects_in_get.max(1),
-        },
+        None,
+        limits.max_objects_in_get.max(1),
     )
 }
 

@@ -203,6 +203,12 @@ macro_rules! define_changes_method {
             }
         }
 
+        impl $crate::core::changes::ChangesMethod for $name {
+            fn since(since_state: String, max_changes: std::num::NonZeroUsize) -> Self {
+                Self::new(since_state).max_changes(max_changes)
+            }
+        }
+
         impl std::ops::Deref for $name {
             type Target = $crate::core::changes::ChangesRequest;
             fn deref(&self) -> &Self::Target {

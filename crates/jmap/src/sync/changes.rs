@@ -6,7 +6,7 @@ use bifrost_types::{
     MailboxId as TypesMailboxId, ObjectChange, ObjectChangeKind, ObjectId, PageBoundary, SyncEvent,
 };
 
-use crate::core::changes::ChangesObject;
+use crate::core::changes::{ChangesMethod, ChangesObject, ChangesResponse};
 use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailChanges};
 use crate::mailbox::{Mailbox, MailboxChanges};
@@ -87,7 +87,7 @@ pub(crate) fn stream<T: HttpTransport>(
     };
 
     match scope {
-        JmapScopeRepr::Email => email_changes(
+        JmapScopeRepr::Email => changes_walk::<T, EmailChanges, Email>(
             mail,
             account_id,
             limits,
@@ -96,12 +96,15 @@ pub(crate) fn stream<T: HttpTransport>(
             None,
             email_states,
         ),
-        JmapScopeRepr::Mailbox => mailbox_changes(
+        JmapScopeRepr::Mailbox => changes_walk::<T, MailboxChanges, Mailbox>(
             mail,
             account_id,
             limits,
             cursor.scope.clone(),
             state_string,
+            // A Mailbox scope is never foreign: shared-account mailboxes
+            // are reached through the account-level `Folder` scope below.
+            None,
             mailbox_states,
         ),
         // Thread cursor inventory is derived from Email inventory and is
@@ -123,7 +126,7 @@ pub(crate) fn stream<T: HttpTransport>(
         // needed). A legacy per-mailbox `Folder` cursor still lands here
         // and still advances correctly; it just is not seeded or
         // discovered anymore.
-        JmapScopeRepr::Folder { .. } => email_changes(
+        JmapScopeRepr::Folder { .. } => changes_walk::<T, EmailChanges, Email>(
             mail,
             account_id,
             limits,
@@ -135,16 +138,56 @@ pub(crate) fn stream<T: HttpTransport>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn email_changes<T: HttpTransport>(
+/// The paginated `*/changes` walk, shared by every state-based change
+/// scope this crate drives.
+///
+/// `Email/changes` and `Mailbox/changes` ran as two hand-copied loops
+/// whose only real differences are the three this signature takes:
+///
+/// - the METHOD (`M`), which also supplies the diagnostic name
+///   `ChangeWalkGuard` reports via `M::NAME`;
+/// - `owner`, `Some(accountId)` only for a foreign (shared/delegate)
+///   scope. It does two things at once, and both are why the parameter
+///   exists rather than a flag: it qualifies every emitted change id into
+///   the owning account's namespace (matching what the foreign inventory
+///   mints - otherwise hydrating a changed foreign email routes through
+///   the primary account), and it turns a permission denial into a
+///   quarantine of this scope alone instead of a terminal account error.
+///   With `owner: None` the error lane is exactly `into_account_error`,
+///   which is what the primary walks always did;
+/// - the per-`accountId` state cache (`states`) the scope advances -
+///   Email and Mailbox states are separate JMAP `(accountId, type)`
+///   positions and must not share a map.
+///
+/// The third walk over `*/changes` in this crate,
+/// `discover::scope_lifecycle`, is deliberately NOT folded in here: it
+/// emits `ScopeLifecycleEvent`s rather than `SyncEvent<Change>`, reads
+/// each changed object back with a follow-up `Mailbox/get`, never
+/// checkpoints, and lives for the account rather than for one walk. It
+/// shares the part that is genuinely common - `ChangeWalkGuard` - and
+/// nothing more. The inventory walk in `inventory.rs` is a different
+/// shape again (query-then-get, anchored rather than state-based, with
+/// its own re-served-anchor and superseded-`queryState` exits that end
+/// WITHOUT a `Done`), so it too stays separate.
+fn changes_walk<T, M, O>(
     mail: MailAccount<T>,
     account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
     mut since_state: String,
     owner: Option<TypesMailboxId>,
-    email_states: StateMap,
-) -> AccountStream<SyncEvent<Change>> {
+    states: StateMap,
+) -> AccountStream<SyncEvent<Change>>
+where
+    T: HttpTransport,
+    O: ChangesObject + Send + 'static,
+    O::Id: ToString + Send,
+    O::ChangesResponse: Send,
+    // `Sync` is not implied by `JmapMethod`: `Request::send_single` holds
+    // a `&CallHandle<M>` across its await, so the call future is only
+    // `Send` when `M` is `Sync`. Every generated `*/changes` struct is.
+    M: ChangesMethod<Response = ChangesResponse<O>> + Sync + 'static,
+{
     Box::pin(async_stream::stream! {
         // One accumulator for the whole paged walk; each emitted page
         // takes and clears it, so consecutive pages partition the
@@ -156,7 +199,7 @@ fn email_changes<T: HttpTransport>(
         loop {
             let started = Instant::now();
             let response = mail
-                .call(EmailChanges::new(since_state.clone()).max_changes(max_changes))
+                .call(M::since(since_state.clone(), max_changes))
                 .await;
 
             let response = match response {
@@ -186,106 +229,22 @@ fn email_changes<T: HttpTransport>(
                 yield super::error::terminated_contract_violation(
                     bifrost_types::AccountOperation::SyncChanges,
                     Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    fault.describe("Email/changes"),
+                    fault.describe(M::NAME),
                 );
                 break;
             }
-            // A foreign (shared/delegate) scope's change ids are qualified
-            // with the owning accountId, matching what the foreign
-            // inventory mints - otherwise hydrating a changed foreign email
-            // would route through the primary account.
             let qualify = owner.as_ref().map(|owner| owner.0.clone());
-            let changes = object_changes::<Email>(response.created(), ObjectChangeKind::Created, qualify.as_deref())
+            let changes = object_changes::<O>(response.created(), ObjectChangeKind::Created, qualify.as_deref())
                 .into_iter()
-                .chain(object_changes::<Email>(response.updated(), ObjectChangeKind::Updated, qualify.as_deref()))
-                .chain(object_changes::<Email>(
+                .chain(object_changes::<O>(response.updated(), ObjectChangeKind::Updated, qualify.as_deref()))
+                .chain(object_changes::<O>(
                     response.destroyed(),
                     ObjectChangeKind::Destroyed,
                     qualify.as_deref(),
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            state_cache::advance(&email_states, &account_id, Some(&since_state), new_state.clone()).await;
-
-            yield SyncEvent::Batch(Batch {
-                items: changes,
-                page_boundary: PageBoundary::Page,
-                server_latency: started.elapsed(),
-                bytes_in: tally.take(),
-                checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
-            });
-
-            since_state = new_state;
-            if !response.has_more_changes() {
-                yield SyncEvent::Done(Some(Checkpoint::Change(checkpoint)));
-                break;
-            }
-        }
-    })
-}
-
-fn mailbox_changes<T: HttpTransport>(
-    mail: MailAccount<T>,
-    account_id: String,
-    limits: CoreLimits,
-    scope: CursorScope,
-    mut since_state: String,
-    mailbox_states: StateMap,
-) -> AccountStream<SyncEvent<Change>> {
-    Box::pin(async_stream::stream! {
-        // See `email_changes`: one accumulator for the paged walk.
-        let (mail, tally) = mail.metered();
-        let max_changes = nonzero(limits.max_objects_in_get);
-        // See `email_changes`: forward-progress + cycle guard.
-        let mut guard = ChangeWalkGuard::new(&since_state);
-        loop {
-            let started = Instant::now();
-            let response = mail
-                .call(MailboxChanges::new(since_state.clone()).max_changes(max_changes))
-                .await;
-
-            let response = match response {
-                Ok(response) => response,
-                Err(err) => {
-                    yield super::error::terminated_from_jmap(
-                        err,
-                        super::error::JmapErrorContext::cursor(
-                            bifrost_types::AccountOperation::SyncChanges,
-                            scope.clone(),
-                        ),
-                    );
-                    break;
-                }
-            };
-
-            let new_state = response.new_state().to_string();
-            if let Some(fault) = guard.observe(
-                &since_state,
-                &new_state,
-                response.has_more_changes(),
-            ) {
-                yield super::error::terminated_contract_violation(
-                    bifrost_types::AccountOperation::SyncChanges,
-                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
-                    fault.describe("Mailbox/changes"),
-                );
-                break;
-            }
-            let changes = object_changes::<Mailbox>(response.created(), ObjectChangeKind::Created, None)
-                .into_iter()
-                .chain(object_changes::<Mailbox>(
-                    response.updated(),
-                    ObjectChangeKind::Updated,
-                    None,
-                ))
-                .chain(object_changes::<Mailbox>(
-                    response.destroyed(),
-                    ObjectChangeKind::Destroyed,
-                    None,
-                ))
-                .collect::<Vec<_>>();
-            let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            state_cache::advance(&mailbox_states, &account_id, Some(&since_state), new_state.clone()).await;
+            state_cache::advance(&states, &account_id, Some(&since_state), new_state.clone()).await;
 
             yield SyncEvent::Batch(Batch {
                 items: changes,
@@ -383,10 +342,11 @@ impl WalkFault {
 /// every state it has resumed from: a conforming `newState` names a point
 /// the server has passed and therefore never repeats within one walk.
 ///
-/// Every `*/changes` loop in this crate shares this one mechanism -
-/// `email_changes`, `mailbox_changes`, and `discover::scope_lifecycle`,
-/// which paginates the same method on its own loop and needs the same
-/// bound for the same reason.
+/// Every `*/changes` loop in this crate shares this one mechanism - the
+/// generic `changes_walk` (which serves the Email, Mailbox and foreign
+/// `Folder` scopes) and `discover::scope_lifecycle`, which paginates the
+/// same method on its own loop and needs the same bound for the same
+/// reason.
 pub(super) struct ChangeWalkGuard {
     seen: std::collections::HashSet<String>,
 }
