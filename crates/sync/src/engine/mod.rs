@@ -681,6 +681,13 @@ impl SyncEngine {
     /// A paused account is quiescent by contract, so this call waits for
     /// `resume_account` (or `Control::resume`) before opening a replacement.
     /// Shutdown while waiting returns `Error::ShuttingDown`.
+    ///
+    /// This is also the entry a consumer drives to pick up shares granted
+    /// after the last open, paired with
+    /// `capabilities().reopen_discovers_foreign_namespaces`. The CADENCE is
+    /// consumer policy and the engine will never schedule speculative
+    /// reopens; see `reference/sync.md`, the `reopen` paragraph, for the
+    /// ruling and the alternatives that were rejected.
     pub async fn reopen(&self, account_id: &AccountId) -> Result<(), Error> {
         let slot = self
             .accounts

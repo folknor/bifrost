@@ -932,7 +932,11 @@ impl Account for GoogleAccount {
         // detach sheds; a caller that drops the future mid-call leaves a
         // Gmail-side watch that expires on its own within seven days, and
         // never an account that is marked closed while its renewer, streams,
-        // or rate-limiter registration are still live.
+        // or rate-limiter registration are still live. That surviving remote
+        // half is an ACCEPTED residual, not an open defect: retrying the stop
+        // would need the transport this close has already shed, and the only
+        // closure would be a detached task outliving the account handle. The
+        // watch expires on its own.
         self.shutdown.cancel();
         let client = Arc::clone(&self.client);
         let pubsub = Arc::clone(&self.pubsub);

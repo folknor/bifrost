@@ -350,6 +350,15 @@ The TLS backend matrix (rustls, boring-tls, rustls provider/verifier) has been r
 
 Display-name encoding emits RFC 5322 phrase text when the name is atom-shaped, RFC 2047 encoded-word otherwise. Avoids DKIM-breaking quoted-string rewrites at relays.
 
+Header folding is space-driven, so an unbreakable all-ASCII token (no spaces,
+hundreds of characters) is written verbatim and its line can exceed 78 octets:
+the crate deliberately misses the RFC 5322 Section 2.1.1 SHOULD-78 in that one
+shape and stays well inside the 998-octet MUST. Folding inside an atom would
+change the value, and RFC 2047 covers non-ASCII text only, so encoding an
+all-ASCII word to force a fold would be outside that mechanism's remit. Long
+non-ASCII display names are unaffected - encoded words are individually short
+and the writer folds between them.
+
 `MultiPart` kinds: `Mixed`, `Alternative`, `Related`, `Signed`, `Encrypted`, `Report { report_type }`. `Mixed` is the default for `MultiPart::builder().build()`.
 
 Multipart builders ensure a `boundary` is present even when a caller supplies a boundary-less multipart `Content-Type`. `try_boundary`, `try_encrypted`, and `try_signed` are the fallible validation entry points; the infallible `boundary`, `MultiPart::encrypted`, and `MultiPart::signed` keep their signatures and panic on values that would break out of the MIME parameter (a deliberate runtime behavior change for callers passing unvalidated strings); default boundaries use OS randomness, and a caller-supplied boundary is regenerated if it appears at a MIME delimiter position in an added part.

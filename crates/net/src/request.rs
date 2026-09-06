@@ -1408,6 +1408,16 @@ async fn final_response_from_response(
     })
 }
 
+/// Drain a terminal-status body up to `STATUS_BODY_CAP`, so the error the
+/// caller reconstitutes can carry the server's explanation.
+///
+/// Accepted limit: the read timeout is applied PER CHUNK, not to the whole
+/// drain, so a server trickling one byte per interval can stretch this to
+/// roughly `STATUS_BODY_CAP` intervals. The cap is 4 KB, which bounds the
+/// worst case to something a consumer can wait out, and the body is
+/// diagnostic text rather than payload; a second, whole-drain deadline
+/// would be another timer on a path whose only job is to say why a request
+/// failed. Revisit if the cap ever grows to payload size.
 async fn read_capped_response_body(
     response: reqwest::Response,
     account: &AccountNet,

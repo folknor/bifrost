@@ -422,6 +422,14 @@ impl ByteBucket {
 /// loop forever, which is why this is fallible at all. The threshold matches
 /// `codec::decode::literal`, so a buffer this accepts is one the decoder can
 /// still reject on its own terms, never the reverse.
+///
+/// Covered by example-based tests only. If property coverage is ever wanted
+/// in this crate, this function is the strongest candidate: generate
+/// well-formed response streams (including multi-literal FETCH bodies) and
+/// assert the generator never lands on the `Err` lane, since a false
+/// "never" here is connection-fatal on traffic a real server sends. Judged
+/// not worth the dependency so far, because the fatal lane is guarded by an
+/// explicit threshold rather than by inference.
 pub(super) fn buffer_may_contain_complete_response(buf: &[u8]) -> Result<bool, Error> {
     // Fast path: no \r\n means definitely incomplete.
     let Some(first_crlf) = buf.windows(2).position(|w| w == b"\r\n") else {

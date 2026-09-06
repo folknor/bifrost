@@ -121,6 +121,18 @@ async fn partition_ews_ids(
 /// request per item (EWS `GetItem` takes an id list, but each id can sit in
 /// a different public folder with a different routing header pair, so the
 /// per-folder routing is what forces the fan-out).
+///
+/// ACCEPTED for now, with a known fix shape: ids that share a public folder
+/// share a routing header pair, so they could be grouped and sent as a single
+/// `<m:ItemIds>` list, cutting a 20-id chunk drawn from one folder to one
+/// round trip. It is not done because it buys nothing at the sizes this lane
+/// currently sees - public folders are opt-in and pinned explicitly, so a
+/// chunk is typically a handful of items - and grouping costs a second
+/// per-item reconciliation (EWS answers a multi-id `GetItem` with a response
+/// message per id, which then has to be mapped back onto the submitted order
+/// to keep the one-outcome-per-id contract this function already satisfies
+/// trivially). Do it when a consumer pins a genuinely large public folder and
+/// the per-item round trips show up as hydration latency.
 async fn fetch_ews_outcomes(
     account: &GraphAccount,
     ids: &[(ObjectId, FolderId)],

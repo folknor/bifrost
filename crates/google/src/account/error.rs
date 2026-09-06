@@ -12,6 +12,10 @@
 //! interpretation (Gmail JSON error reason, history-id staleness,
 //! cursor envelope failure), this module builds directly with
 //! `AccountErrorBuilder` and attaches `WireCause::Gmail(signal)`.
+//!
+//! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
+//! module; it was skipped as already test-dense. A later auditor should read
+//! it fresh rather than assuming that sweep covered it.
 
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,

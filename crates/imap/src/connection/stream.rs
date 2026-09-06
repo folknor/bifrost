@@ -396,6 +396,15 @@ impl ImapStream {
             #[cfg(test)]
             // Memory streams cannot upgrade to TLS: STARTTLS tests must
             // use the real transport.
+            //
+            // Accepted limit, ruled deliberately: this `None` is why the
+            // STARTTLS upgrade path has no hermetic test. Covering it would
+            // mean a fake TLS handshake over the in-memory duplex - a second
+            // transport implementation plus a scripted handshake - which was
+            // judged heavier machinery than the risk it retires, since the
+            // upgrade is a stream swap around a single `TlsConnector` call and
+            // its failure modes are structural rather than protocol-shaped.
+            // Revisit only if the upgrade grows real logic of its own.
             Self::Memory(_) => Option::None,
         }
     }

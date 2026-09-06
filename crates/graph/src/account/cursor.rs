@@ -121,6 +121,20 @@ pub(crate) enum GraphCursorKind {
 /// every checkpoint, so an unbounded vector would be a steady write-
 /// amplification tax. Above the cap the folder degrades to additions-
 /// only (no deletion reconcile) and stores an empty snapshot.
+///
+/// Nothing is broken in that degraded mode: additions-only is correct for
+/// what it emits and is covered by tests. It is a capability ceiling, not a
+/// defect - a folder above the cap simply stops reporting deletions (and
+/// in-place edits, since `live_versions` empties with the snapshot).
+/// Restoring reconcile for huge folders means moving the baseline OUT of the
+/// cursor and into a durable side table, which bifrost does not have: the
+/// engine's checkpoint store is engine-held, is never handed to an `Account`
+/// impl, exposes only change cursors and backfill checkpoints keyed by
+/// account/scope, and is not even nameable from this crate. Raising the cap
+/// instead is not the fix - the snapshot rides in the opaque cursor the
+/// consumer re-persists on every checkpoint, so the cap IS the write-
+/// amplification bound. Do not schedule this until a generic side-table
+/// surface exists and a handle to it is threaded into account open.
 pub(crate) const PUBLIC_FOLDER_LIVE_IDS_CAP: usize = 10_000;
 
 /// How long to wait between full-id deletion reconcile scans, in

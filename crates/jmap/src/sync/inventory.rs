@@ -273,6 +273,23 @@ fn email_inventory_loop<T: HttpTransport>(
                 items.push(entry);
             }
 
+            // A page that materialized nothing does NOT end the walk: only an
+            // empty `Email/query` answer does. So a run of ids the `Email/get`
+            // could not answer (destroyed between the query and the get, or
+            // returned without an id) is walked through silently, emitting no
+            // batch, and the walk overshoots by however many such pages it
+            // meets. That overshoot is unbounded in principle - nothing here
+            // caps how far a barren stretch may run - and in practice ends at
+            // the first surviving message, since the ids come from a query the
+            // server just answered.
+            //
+            // Accepted rather than bounded, because a cap would have to choose
+            // between two wrong answers: ending the walk early reports
+            // coverage the walk does not have (the same error the superseded
+            // and re-served-anchor exits refuse to make), and terminating
+            // without `Done` restarts a scope that is behaving correctly. The
+            // real cost is wasted round trips against a mailbox being emptied
+            // underneath the walk, not lost or duplicated coverage.
             if !items.is_empty() {
                 yield SyncEvent::Batch(Batch {
                     items,

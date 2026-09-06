@@ -1,3 +1,11 @@
+//! Translation of `bifrost-net` transport outcomes into the shared
+//! `AccountError` contract.
+//!
+//! Audit boundary: the 2026-07 google+net bug sweep exercised this module
+//! only through its integration suite, not by a line audit; the same is
+//! true of `trace.rs` beyond its construction-level invariants. Listed so a
+//! future auditor knows where that sweep's coverage stopped.
+
 use std::time::{Duration, SystemTime};
 
 use bifrost_types::{

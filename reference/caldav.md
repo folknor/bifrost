@@ -71,16 +71,17 @@ not a root-discovery fallback trigger.
   principal and a calendar home on different hosts of one service is a real
   deployment shape. Discovery stages these origins without changing trust;
   they are admitted only after the complete authenticated discovery succeeds,
-  before the account is shared or a home request starts. Redirects split into
-  two paths. Same-origin hops (exact scheme, host, effective port) are
-  followed inside reqwest, which preserves `Authorization` under exactly that
-  condition. Cross-origin hops are never followed inside reqwest - it strips
-  `Authorization` on any origin change and a redirect policy cannot restore
-  it - so the policy stops them and `send_raw_request` re-dispatches the hop
-  manually with fresh credentials, gated by the same admitted-origin set the
-  credential gate reads. A `Location` naming an unadmitted origin fails
-  locally without a request going out; a 303 is not followed. Both the
-  reqwest chain and the manual hops are bounded by bifrost-net's hop cap.
+  before the account is shared or a home request starts. Redirects are
+  disabled in the transport (`FollowRedirects::Disabled`) and EVERY hop,
+  same-origin or not, is walked by `send_raw_request` in `bifrost-dav-core`:
+  each hop re-mints the credential for the origin it is about to address,
+  gated by the same admitted-origin set the credential gate reads, so a
+  `Location` naming an unadmitted origin fails locally without a request
+  going out. Walking same-origin hops too costs nothing (the credential is
+  the same one) and removed the earlier split where reqwest followed those
+  internally, which stripped `Authorization` on any origin change with no
+  way to restore it. A 303 is not followed, and the walk is bounded by
+  bifrost-net's `DEFAULT_MAX_HOPS`.
 - `parse.rs` - XML response parsers for calendar discovery, event
   listing, multiget hydration, and nested href properties. Calendar
   collection metadata and href-valued discovery properties are staged per
@@ -818,12 +819,15 @@ consumers receive - so both stayed local.
 
 ## This crate and bifrost-carddav are near-duplicates, and drift is the defect
 
-The transport, credential and error halves are now shared through
-`bifrost-dav-core` and can no longer drift. What remains hand-mirrored between
-the two crates is the layer above it: the whole `ResponseParts` propstat state
-machine, href resolution, multiget classification, the cursor codec, the
-snapshot diff, `put_condition`, URL comparison, and the `Unsupported` stubs each
-crate carries for the other's domain.
+The transport, credential gate, error ladder, 207 parser and polling cursor are
+all shared through `bifrost-dav-core` now and can no longer drift - that
+includes the `ResponseParts` propstat state machine, href resolution, multiget
+classification, the cursor codec and the snapshot diff, all of which this
+section used to list as hand-mirrored. What remains duplicated is a much smaller
+remainder: the query bodies and property constants, the per-domain projections
+(`ical.rs` / `vcard.rs`), the discovery walk's shape, the account-level
+orchestration around the shared pieces, and the `Unsupported` stubs each crate
+carries for the other's domain.
 
 Nothing compares the two copies, so divergence is silent. Five separate defects
 in one hardening arc were exactly that: `escape_xml` quoting, the immediate
@@ -834,7 +838,15 @@ collection as a phantom card).
 
 **Any fix to shared-shape code in one crate must be checked against the other.**
 Where the asymmetry is real - CardDAV has no `sync-collection` path and
-discovers one property - it is design, not oversight. Collapsing the two into a
-shared `bifrost-dav` has been proposed and is a repository-owner decision about
-the published surface, not an engineering conclusion the duplication count can
-settle; it is tracked in `notes/todo.md`.
+discovers one property - it is design, not oversight. Where the fix is to
+something both crates route through, it belongs in `bifrost-dav-core` rather
+than in one `account.rs`.
+
+Collapsing the two published crates outright into a single `bifrost-dav`
+parameterized over the collection kind was considered and NOT taken. It would
+remove the remaining duplication, but it reshapes two published pre-1.0
+surfaces whose consumers are outside this workspace by definition, and the
+duplication count is not an argument that can settle a published-surface
+question. The private shared crate was taken instead, on the `bifrost-sasl`
+precedent: it kills the drift without either crate's contract moving. Reopening
+that choice is a repository-owner decision, not an engineering conclusion.

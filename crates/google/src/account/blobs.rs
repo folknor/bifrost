@@ -62,6 +62,15 @@ pub(crate) fn open_blob_range(
     // Gmail attachments never support byte ranges; the convergence
     // contract requires `Unsupported(OpenBlobRange)` rather than a
     // range-not-supported terminal error.
+    //
+    // This answers `Unsupported` for EVERY input, including a forged handle
+    // whose `supports_range` claims otherwise, and that is a decision rather
+    // than a stub: Gmail returns an attachment base64url-encoded inside a
+    // JSON envelope with no HTTP Range surface, so there is no transport a
+    // range could ride. `capabilities.rs` advertises
+    // `BlobRangeSupport::No` for the same reason, and this function is what
+    // enforces it. It would change only if Gmail published a byte-range
+    // attachment endpoint.
     let error = error::into_account_error(
         crate::error::Error::Local(GmailLocalError::BlobRangeUnsupported {
             blob_id: handle.id.0.clone(),

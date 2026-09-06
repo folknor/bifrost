@@ -1,3 +1,12 @@
+//! JSContact (RFC 9553) <-> shared contact types.
+//!
+//! As with the calendar mapper, every shape here was derived STATICALLY from
+//! the RFC and the crate's own types - the project's testing rules keep live
+//! servers out of this workspace, so "a conforming server accepts this" is a
+//! reading of the spec, never an observation. An in-process round trip
+//! through these functions proves the two directions agree with each other,
+//! which is strictly weaker than proving either agrees with a real server.
+
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AddressBook, ContactAddress, ContactCard,
     ContactCorpus, ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch,
@@ -365,6 +374,30 @@ fn address_book_can_delete(rights: Option<&crate::address_book::AddressBookRight
     rights.and_then(|rights| rights.may_delete).unwrap_or(false)
 }
 
+/// Project a JSContact card onto the shared `ContactCard`.
+///
+/// Two different failure policies live here on purpose. Postal addresses
+/// REJECT: `addresses` returns an `Err` that becomes `Unsupported`, because a
+/// recognized RFC 9553 component kind the shared address has no field for
+/// would otherwise be accepted and then dropped, silently moving a house
+/// number out of the address.
+///
+/// Everything else - emails, phones, notes, media, the name - SKIPS: each
+/// projector is a `filter_map` whose `?` discards an entry it cannot read
+/// (a non-object value, a missing `address` / `number` / `name` string) and
+/// keeps the rest of the card. That asymmetry is accepted, not an
+/// inconsistency waiting to be tidied. These are unordered multi-valued
+/// collections in which one junk entry says nothing about the others, and a
+/// server that emits one malformed phone would otherwise make the whole
+/// contact unreadable - including its name and its addresses. An address is
+/// a single structured value whose parts only mean anything together, so a
+/// component it cannot place makes the address itself untrustworthy.
+///
+/// The accepted cost is that a skipped value is invisible: the caller sees a
+/// card with one fewer email and no signal that one was dropped. Changing
+/// that means giving these projectors a per-value failure lane on the shared
+/// `ContactCard` shape, which is a `bifrost-types` surface question, not a
+/// local fix here.
 fn contact_from_jmap(
     card: JmapContactCard,
     operation: AccountOperation,
@@ -912,8 +945,8 @@ fn first_feature(value: Option<&Value>) -> Option<String> {
 /// It is still the weaker mechanism where a better one is known, and the
 /// better one is written down: carry an anchor id on the page cursor, as the
 /// inventory walk does, so a consumer paging a churning list gets a stable
-/// continuation instead of positional drift. Tracked in `notes/todo.md` as
-/// jmap-J13 - an improvement with a known answer, not a bug.
+/// continuation instead of positional drift. An improvement with a known
+/// answer, not a bug; unscheduled.
 fn decode_position(
     page_cursor: Option<Vec<u8>>,
     operation: AccountOperation,

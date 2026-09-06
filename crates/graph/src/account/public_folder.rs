@@ -236,6 +236,18 @@ const PUBLIC_FOLDER_BROWSE_STEP_CAP: usize = 1_000;
 /// bumps the change key without moving the received time sits below the
 /// incremental restriction. The complete scan compares `live_versions` and
 /// emits that edit, bounded by the scan interval rather than losing it.
+///
+/// That leaves an ACCEPTED residual limit of the poll model, not a
+/// regression, and it applies to every public-folder class including
+/// `Message`. An in-place edit is invisible to this incremental lane in two
+/// ways: it is late by up to `FULL_SCAN_INTERVAL_SECS` (the complete scan is
+/// the only lane that sees it), and in the over-cap degraded mode
+/// (`PublicFolderCursor.degraded`, snapshot above `PUBLIC_FOLDER_LIVE_IDS_CAP`)
+/// `live_versions` is empty, so it is not emitted at all until the folder
+/// falls back under the cap. Closing it needs a modification signal EWS can
+/// restrict on - `LastModifiedTime` in place of `DateTimeReceived`, or a
+/// different watermark model entirely - which is a change to the poll's
+/// restriction and its cursor state, not a local fix here.
 pub(crate) fn advance_watermark(prior: Option<String>, items: &[EwsItem]) -> Option<String> {
     let mut best = prior;
     let mut best_instant = best.as_deref().and_then(parse_received);
@@ -410,6 +422,12 @@ pub(crate) fn scan_additions(
 /// folder re-emits its entire inventory on every poll (condition b). Once
 /// a watermark is set the restriction bounds the set to genuinely-new
 /// items, so the baseline filter is a no-op there and is not applied.
+///
+/// This lane emits ARRIVALS only. An item edited in place without its
+/// `DateTimeReceived` moving never reaches here, by construction of the
+/// `>=` timestamp restriction upstream; the complete scan is what catches
+/// it. See `advance_watermark` for the accepted limit that follows and what
+/// would change it.
 pub(crate) fn incremental_added_ids(
     items: &[EwsItem],
     watermark: Option<&str>,

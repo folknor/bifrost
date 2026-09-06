@@ -59,6 +59,10 @@
 //! byte-accounting audit does not re-file it as a metering hole; the general
 //! claim that every request-bearing lane is metered is about the batch-emitting
 //! producers, which this is not.
+//!
+//! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
+//! module; it was skipped as already test-dense. A later auditor should read
+//! it fresh rather than assuming that sweep covered it.
 
 use std::sync::Arc;
 use std::time::Duration;

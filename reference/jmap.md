@@ -141,6 +141,19 @@ kinds and `locality` / `region` / `postcode` / `country`. Any other kind returns
 `separator`) but the shared contact address has no field for, so a recognized
 component is never accepted and then dropped.
 
+The two halves of the card projection fail differently, and a consumer sees
+both. Postal addresses REJECT: an unplaceable component kind fails the whole
+card as `Unsupported`, because a recognized kind with no shared field would
+otherwise be accepted and then dropped out of a value whose parts only mean
+anything together. Everything else - emails, phones, notes, media, the name -
+SKIPS: an entry whose required string is missing or whose value is not an
+object is discarded and the rest of the card is returned. So a `ContactCard`
+may carry fewer emails or phones than the server holds, with no signal that
+one was dropped; these are unordered multi-valued collections where one junk
+entry says nothing about the others, and failing the contact over a single
+malformed phone would cost its name and its addresses too. Surfacing skipped
+values would need a per-value failure lane on the shared `ContactCard`.
+
 RFC 9553 `pref` is a 1-100 RANKING in which the lower number is the more
 preferred entry, not a boolean spelled `1`. The email / phone / address
 projections therefore mark as primary the entry with the LOWEST rank

@@ -128,6 +128,21 @@ pub(crate) fn push_subscribe(
                 let admitted = account.push.supports_notify
                     || covered.contains(&folder.0)
                     || covered.len() < account.push.idle_budget;
+                // Accepted residual, not an open defect: on a NOTIFY server
+                // this `Succeeded` is settled here, before the first dial,
+                // and the whole scope list rides on a `NOTIFY SET` that the
+                // server can still reject at runtime. When it does, coverage
+                // collapses to the one SELECTed mailbox while these outcomes
+                // already said "pushed", and nothing can take them back -
+                // `BatchOutcome` is returned by value from this call and the
+                // `Account` push surface has no per-scope demotion event.
+                // Retracting it would need a new event on that shared
+                // `bifrost-types` surface (a decision no consumer has asked
+                // for), so the collapse is instead degraded rather than
+                // silenced: see `signal_notify_coverage_loss` below, which
+                // emits an account-wide coarse invalidation on every round
+                // whose registration did not take. Re-raise only with a
+                // consumer that needs the demotion typed.
                 if admitted {
                     covered.insert(folder.0.clone());
                     accepted.insert(scope.clone());
@@ -569,6 +584,18 @@ enum ResubscribeAction {
 /// decision is pinned: the loop around it takes its connection from
 /// `pool.dial_idle()`, a real dial, so the re-IDLE wiring above is not
 /// hermetically testable and rests on review.
+///
+/// The same blind spot covers the NOTIFY-collapse degradation. Both
+/// `signal_notify_coverage_loss` and the `register_notify` that feeds it are
+/// individually tested, but that the two are WIRED - `register_notify`'s
+/// answer reaching `signal_notify_coverage_loss` on both call sites, the
+/// outer dial-and-SELECT path and the re-IDLE path in the interrupted-round
+/// arm - is verified by reading the loop, not by a test. Accepted limit:
+/// pinning either would need a dial seam in the pool so the IDLE worker
+/// could be driven against a scripted connection, which was ruled heavier
+/// machinery than the risk it retires (see also the hermetic-STARTTLS
+/// ruling at `ImapStream::into_tcp`). If that seam is ever built for another
+/// reason, both of these become cheap and should be pinned together.
 fn resubscribe_action(
     current: &crate::types::MailboxName,
     chosen: Option<&crate::types::MailboxName>,

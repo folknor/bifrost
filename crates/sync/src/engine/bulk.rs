@@ -757,6 +757,28 @@ pub(super) fn classify_item_outcome(
                     // resolve the item automatically either. Either way
                     // pending-readback is the honest state and surfaces
                     // the id through the counters.
+                    //
+                    // The unconditional read-back here is correct rather
+                    // than an over-reach, and that rests on a PRODUCER
+                    // invariant rather than on anything this crate can
+                    // check: every `ReconcileAdvice` that can actually be
+                    // produced carries `CheckTarget`, because `try_build`
+                    // always routes through `recovery::derive` and both of
+                    // derive's `Reconcile` arms include it - a
+                    // `DedupeByClientId` without `CheckTarget` cannot be
+                    // minted. That invariant is pinned in `bifrost-types`
+                    // by `every_producible_reconcile_requests_check_target`;
+                    // if that test ever goes away or starts to fail, this
+                    // arm has to grow a `CheckTarget` branch.
+                    //
+                    // Known coverage limit, accepted: there is no
+                    // engine-half test driving a real failing
+                    // non-idempotent mutation through here and observing
+                    // both the read-back queue and the warning. It would
+                    // pin behaviour that is correct BECAUSE of the
+                    // producer invariant already pinned, so it earns
+                    // little on its own; worth adding only if the
+                    // mutation-loop harness grows for some other reason.
                     outcomes.insert(id, MutationBucket::PendingReadback);
                     None
                 }

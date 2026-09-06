@@ -1073,6 +1073,18 @@ async fn persist_ack_request(
     //
     // Answered `Ok` with nothing durable, as `Unvouchable` is: the consumer did
     // receive that batch, and the engine has nothing to reproach it with.
+    // Known imprecision, accepted rather than open: `minted_here` is false for
+    // an id minted by ANOTHER ACCOUNT's ledger in the same process just as it
+    // is for a prior attachment of THIS account, so such an id is also
+    // answered `Ok` and withheld rather than `Unknown`/`Rejected`. The
+    // instance segment is per-`PendingCoverage`, not per-account, so the two
+    // cases are indistinguishable here. Withholding is the conservative answer
+    // for both - a foreign row is exactly what must not become this account's
+    // resume position - so the imprecision costs nothing beyond a slightly
+    // generous status. Distinguishing them means putting an account identity
+    // into the publication id, a published-type change out of proportion to
+    // the nit.
+    //
     // Only when the receipt really names THIS batch's lane. A publication from
     // another lane presented with a backfill checkpoint is evidence about the
     // caller, not a replay, and keeps its `Rejected` answer below.

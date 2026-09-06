@@ -26,6 +26,16 @@ pub(crate) const OUTLOOK_BASE: &str = "https://outlook.office365.com";
 /// real Graph endpoint or a harness redirect.
 const GRAPH_HOST: &str = "graph.microsoft.com";
 
+/// In-flight Graph REST requests allowed per client (shared with every
+/// client derived from it, so a shared-mailbox client does not multiply the
+/// budget). This is a LOCAL limiter, and deliberately so only for as long as
+/// there is no shared one: bifrost-net governs rate and retry, not
+/// concurrency, and bifrost-sync's budget is per-scope work, not per-account
+/// requests. If a per-account concurrency limiter ever lands in either of
+/// them, this semaphore and its permit acquisition in `execute_wire` should
+/// be deleted rather than stacked on top of it - two independent limiters on
+/// one request path make the effective ceiling a function of both and neither
+/// one tunable.
 const CONCURRENCY_LIMIT: usize = 3;
 
 // pub: GraphAccountFactory consumers need a constructible Graph client handle.
@@ -444,6 +454,14 @@ impl GraphClient {
         }
     }
 
+    /// Bind this client to the engine's account id so metering, priority,
+    /// caps and tracing use the real key.
+    ///
+    /// Audit boundary: the 2026-07 google+net bug sweep line-audited this
+    /// crate only along the reattach path through here; everything else in
+    /// `bifrost-graph` was covered by its own tests and the later 2026-09-04
+    /// hunt, not by that sweep. Listed so a future auditor knows where that
+    /// sweep's coverage stopped.
     pub(crate) fn attach_account(&self, account_id: AccountId) {
         if let Some(net) = self.inner.net.as_ref() {
             let token_source = Arc::clone(&self.inner.token_source);

@@ -1,3 +1,11 @@
+//! Scope and membership discovery fan-in for the IMAP account.
+//!
+//! Audit boundary: not line-audited by the 2026-09-04 bug hunt, whose depth
+//! was spent on the driver, framing, pool, push, auth, change strategies,
+//! mutations, inventory, hydration and cursor envelope. An absence of
+//! findings in this module is an absence of reading. Noted so a later
+//! auditor knows where coverage stops.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

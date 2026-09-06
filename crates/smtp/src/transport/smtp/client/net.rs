@@ -111,6 +111,16 @@ impl NetworkStream {
         }
     }
 
+    /// Accepted coverage gap: this dial path, and the TLS handshake
+    /// `upgrade_tls` performs on it, have no hermetic test. Reaching either
+    /// needs a peer on a real socket - a listener and a port - which the
+    /// crate's testing rules put out of scope, and the in-process `Transcript`
+    /// harness enters below the dial by construction. Everything above the
+    /// socket is covered instead: address filtering is pinned directly through
+    /// `resolved_address_filter`, and the STARTTLS command exchange is pinned
+    /// up to the handshake boundary. Closing the gap would require a
+    /// production seam that lets a test substitute the connector, not a new
+    /// test.
     pub(crate) fn connect<T: ToSocketAddrs>(
         server: T,
         timeout: Option<Duration>,

@@ -324,6 +324,27 @@ pub(crate) fn derive(
             // than crashing the process. `try_build` rejects the same
             // shape at construction so this branch is only reached when
             // a builder somehow bypasses validation.
+            //
+            // Accepted, with its cost stated so it is not re-filed as a
+            // smell: `Transport + Acknowledged` is rejected TWICE. The
+            // first rejection is `try_build`, which returns
+            // `TransportAcknowledged` before ever calling this function,
+            // and since `derive` runs only from inside `try_build` after
+            // that branch has already returned `Err`, the check here is
+            // dead in normal flow - reachable only by calling the
+            // `pub(crate) derive` directly, which the tests do. It is kept
+            // as belt-and-suspenders on a classification that must never
+            // silently say "acknowledged" about a transport failure.
+            //
+            // Be aware of what the belt actually does, because it is a real
+            // behaviour split rather than a pure assertion: in debug builds
+            // the `debug_assert!` PANICS, while in release the same input
+            // is silently demoted to `InFlight`. A future producer that
+            // manages to mint this shape therefore fails loudly in tests
+            // and quietly in production. That asymmetry is deliberate -
+            // crashing a consumer's process over a producer bug is worse
+            // than conservative misclassification - but anything changing
+            // this branch should change both halves together.
             let effective_tx_state = if tx_state == TransmissionState::Acknowledged {
                 TransmissionState::InFlight
             } else {

@@ -1,3 +1,17 @@
+//! JSCalendar (RFC 8984) <-> shared calendar types.
+//!
+//! Every mapping decision in this file was derived STATICALLY, from the RFCs
+//! and the crate's own types. No conforming server was ever asked, because
+//! the project's testing rules keep live endpoints out of this workspace, so
+//! "a conforming server accepts this shape" is a reading of the spec rather
+//! than an observation. Treat the mappings accordingly: an in-process round
+//! trip through these functions proves self-consistency, not interop. The
+//! all-day `DATE` handling is the standing example of the class a self-round
+//! trip cannot catch - it encoded and decoded symmetrically while being
+//! wrong on the wire. When one of these mappings is disputed, the evidence
+//! that settles it is a real server's response, and that evidence has to be
+//! gathered downstream.
+
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AttendeeRole, Calendar, CalendarEvent,
     CalendarId, CalendarProvenance, DiagnosticText, EventAttendee, EventAvailability, EventCreate,
@@ -971,6 +985,19 @@ fn validate_shared_recurrence(
     Ok(())
 }
 
+/// The supported RRULE part set is exactly the match arms below: `FREQ`,
+/// `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTH`, `BYMONTHDAY`. Every
+/// other part returns `None`, which the callers turn into a loud
+/// `Unsupported` rather than a silently narrowed rule - a dropped `BYHOUR`
+/// would hand the server a recurrence that expands to different occurrences
+/// than the caller asked for, which is worse than a refusal.
+///
+/// This narrowness is an accepted state, not a gap awaiting a bug report.
+/// Widening the set (and the inbound direction in
+/// `rrule_from_jmap_recurrence_rule`, which must stay symmetric with it) is
+/// tracked as deferred work in `reference/jmap/DEFERRED.md`; do not re-file
+/// it as a defect. Anything added here needs its inbound counterpart in the
+/// same change, or a round trip starts losing the new part.
 fn jmap_recurrence_rule_from_rrule(
     rrule: &str,
     start: Option<&EventTime>,

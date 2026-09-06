@@ -1,4 +1,17 @@
 //! Read-only hydration and PIM passthrough onto the live account handle.
+//!
+//! On the ~900 lines of near-identical forwarders below, observed and
+//! deliberately left alone: every one of the roughly 60 methods here is a 1:1
+//! passthrough - `live_account(id)?` then forward - carrying an identical doc
+//! comment shape and inventing no semantics of its own. A macro or a blanket
+//! forwarding trait would collapse them. It was not done because this is a
+//! PUBLISHED-SURFACE question rather than a structural one: these methods are
+//! `SyncEngine`'s public API, and generating them changes how they read in
+//! rustdoc, how their docs are written, and how easily a single method can
+//! deviate later when one of them eventually does need to invent semantics.
+//! The verbosity is the cost of keeping each published signature explicit and
+//! independently documentable. Re-raise it as an API decision with the
+//! repository owner, not as a refactor.
 
 use super::*;
 

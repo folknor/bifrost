@@ -101,6 +101,31 @@ defensible and the API.md "Remaining gaps" entry can be closed.
 **Revisit when:** A consumer hits a real bug from the
 omitted-vs-zero collapse, or the next pre-1.0 ergonomics pass.
 
+## Recurrence coverage: the supported RRULE part set
+
+`sync/calendar_ops.rs::jmap_recurrence_rule_from_rrule` converts exactly
+`FREQ`, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`, `BYMONTH`, `BYMONTHDAY`
+between RFC 5545 RRULE text and JSCalendar `RecurrenceRule` objects.
+Every other part - `BYHOUR`, `BYMINUTE`, `BYSECOND`, `BYYEARDAY`,
+`BYWEEKNO`, `BYSETPOS`, `WKST` - makes the conversion return `None`, and
+the callers (`validate_shared_recurrence` plus the create and patch payload
+builders, which each re-check independently) turn that into a loud
+`Unsupported`. A rule that does not convert is never silently narrowed,
+cleared, or omitted: a dropped `BYHOUR` would expand to a different set of
+occurrences than the caller asked for, which is a worse failure than a
+refusal the caller can see.
+
+That is the accepted state, not an open defect. Widening the set is a
+symmetric change - anything added to the outbound mapper needs its inbound
+counterpart in `rrule_from_jmap_recurrence_rule` in the same change, or a
+read-modify-write round trip starts losing the new part - plus the
+JSCalendar shape question for each part (RFC 8984 §4.3.3 types several of
+these as string arrays rather than integers, the trap `byMonth` already
+hit).
+
+**Revisit when:** a consumer has a real calendar whose rules this set
+refuses, which is the evidence that says which parts to add first.
+
 ## See also
 
 - `API.md` - archived ADR for the pre-1.0 surface redesign.

@@ -475,7 +475,10 @@ requested calendar when supplied; otherwise it walks the calendar list and
 searches each, using an internal cursor that records the calendar id plus
 the provider page token. `calendars_list` walks every `calendarList` page at
 the provider's 250-item maximum, rejects repeated page tokens, and has a
-finite 10,000-page request budget. Each page is one ordinary request
+finite 10,000-page request budget. It returns the whole `Vec<Calendar>`
+rather than a `Page`, deliberately: the walk is bounded, a real account is
+one page, and the trait reserves `Page` for corpora that are large by nature
+(`contacts_list`). Each page is one ordinary request
 against `www.googleapis.com`, so it debits the host `cost_default` of one
 unit through the same governor as before; the paginated walk costs units
 in proportion to the pages the provider actually hands back, and no
@@ -1263,8 +1266,8 @@ fan-out and isolates them by bisection.
 
 ### Accepted residuals
 
-Assessed and deliberately left as they are. Open work sits in `notes/todo.md`;
-these are decisions, not gaps.
+Assessed and deliberately left as they are. These are decisions, not gaps,
+and each is also stated at the code it describes.
 
 - **Cross-calendar event update is non-atomic.** Google exposes the move and the
   field PATCH as separate requests. A second-leg failure returns

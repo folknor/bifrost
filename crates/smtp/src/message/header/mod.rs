@@ -345,6 +345,30 @@ impl<'a> HeaderValueEncoder<'a> {
         }
     }
 
+    /// Splits on spaces: a word made only of allowed characters is written
+    /// verbatim, and a run of words containing unallowed bytes is buffered and
+    /// emitted as RFC 2047 encoded-words.
+    ///
+    /// Accepted limit: an unbreakable ALLOWED token - all-ASCII, no spaces,
+    /// hundreds of characters - is written whole even when it is the only word
+    /// on the line, so the emitted line can exceed 78 octets. This is
+    /// deliberate on both halves of the choice. Folding inside an atom would
+    /// insert whitespace into the value and change it; and RFC 2047 covers
+    /// NON-ASCII text only, so encoding an all-ASCII word to force a fold would
+    /// be using that mechanism outside its remit. The binding rule is RFC 5322
+    /// Section 2.1.1, where 78 octets is a SHOULD and 998 a MUST: this misses
+    /// the SHOULD and stays well inside the MUST, which makes it a preference
+    /// rather than a conformance defect. RFC 6532 UTF-8 headers over RFC 6531
+    /// remove the need to ENCODE non-ASCII but do nothing for folding an
+    /// unbreakable ASCII atom, so no later RFC supersedes the question (RFC
+    /// standing rechecked 2026-07-31).
+    ///
+    /// What would change it: a decision to RFC 2047-encode over-long allowed
+    /// tokens when the header already carries encoded words. That is the
+    /// repository owner's call, and it would require changing
+    /// `format_ascii_with_folding_giant_word` and
+    /// `long_non_ascii_display_names_fold_on_every_address_path`, which pin the
+    /// current behaviour.
     fn format(mut self, words_iter: impl Iterator<Item = &'a str>) -> fmt::Result {
         for next_word in words_iter {
             let allowed = allowed_str(next_word);
@@ -625,6 +649,13 @@ mod tests {
     /// `format_ascii_with_folding_giant_word` pins, and it stays under the
     /// RFC 5322 Section 2.1.1 hard 998-octet limit - only the SHOULD-78 is
     /// missed. Both shapes are asserted here so the split stays visible.
+    ///
+    /// The SHOULD-78 miss is an accepted limit, not an open defect: RFC 2047
+    /// applies to non-ASCII text only, so it has no bearing on an all-ASCII
+    /// token, and no later RFC (6531/6532 included) supersedes the folding
+    /// question. Changing it means deciding to encode over-long allowed tokens
+    /// when the header already carries encoded words, which would rewrite the
+    /// expectation below; see the reasoning on `HeaderValueEncoder::format`.
     #[test]
     fn long_non_ascii_display_names_fold_on_every_address_path() {
         fn longest_line(headers: &Headers) -> usize {

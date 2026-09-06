@@ -85,6 +85,19 @@ pub(crate) enum JmapCursorError {
 }
 
 impl JmapScopeRepr {
+    /// `Type(Thread)` and `Query(_)` encode successfully here even though
+    /// `changes::stream` terminates both as `Unsupported`, so this codec has
+    /// two legal-but-dead paths. That is deliberate and accepted: the codec's
+    /// job is to be a total, symmetric mapping of the wire format, and the
+    /// two scope tags are already spent in cursors written by older builds.
+    /// Refusing them at encode would not stop such a cursor from arriving -
+    /// it must still DECODE, or the round-trip property this type is built on
+    /// stops holding - and it would make encode and decode asymmetric for no
+    /// gain, since discovery never mints either scope. The refusal belongs
+    /// where the scope is actually driven; see the scope list under
+    /// "Per-scope inventory, changes, hydration" in `reference/jmap.md`.
+    /// If thread or query scopes ever become discoverable, this stays as it
+    /// is and the change-stream arm grows a real implementation.
     pub(crate) fn from_cursor_scope(scope: &CursorScope) -> Result<Self, JmapCursorError> {
         match scope {
             CursorScope::Type(ObjectType::Email) => Ok(Self::Email),

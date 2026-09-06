@@ -28,6 +28,14 @@ use crate::parse::CalendarCollection;
 use crate::{CalDavConfig, CalDavCredentials};
 
 // Version 2 changes snapshot ids from base-URL-relative to request-URI-relative.
+//
+// Accepted cost of that bump, recorded so it is not rediscovered as a bug: a
+// v1 cursor is REFUSED by `decode_cursor_snapshot` rather than migrated - a v1
+// payload is byte-identical in shape to a v2 one, so the ids cannot be
+// distinguished and rewritten, only re-derived - so every consumer holding a
+// pre-bump cursor pays one full re-sync per DAV account, once. That is a
+// one-time cost against ids that were silently wrong, which was worth paying.
+// Pinned by `event_cursor_rejects_the_base_relative_id_version`.
 const CURSOR_ENVELOPE_VERSION: u32 = 2;
 const CURSOR_MAGIC: &[u8] = b"CALDAVET1";
 /// How many `sync-collection` REPORTs one poll may spend draining an RFC 6578
@@ -1231,6 +1239,16 @@ fn decode_event_page_cursor(
 /// to when the server refuses to run its filter. The listing is the etag-bearing
 /// PROPFIND the poll path already runs, and its href is exactly the key the page
 /// cursor carries.
+///
+/// Accepted limit, intrinsic to the degrade rather than a regression: this is
+/// the UNFILTERED depth-1 PROPFIND by definition, so VTODO and VJOURNAL
+/// resources in the same collection come back as candidates and nothing can
+/// exclude them server-side. They never reach `Page::items` - a resource with
+/// no VEVENT projects to no events - but they DO count toward
+/// `estimated_total` and they DO consume slots in the sliced page, so a page
+/// served off this lane can come back short of `limit` for a reason the
+/// consumer cannot observe. Closing it would need per-resource component-type
+/// evidence, which only the filtered lane has.
 async fn listing_candidates(
     client: &CalDavClient,
     calendar_url: &str,
@@ -1339,6 +1357,17 @@ fn worse_recovery_option(
 /// The scheduling POST completed before the local PUT began. Preserve that
 /// acknowledged first-leg evidence on any second-leg failure so callers know
 /// the organizer may already have acted on the reply.
+///
+/// Accepted, not a defect: RSVP is non-atomic BY NATURE - iTIP delivers the
+/// reply to the organizer through the scheduling outbox, and the attendee's own
+/// copy of the event is a separate resource that only a second write can
+/// update. There is no transaction spanning the two and no compensating action
+/// (un-sending an iTIP reply is not a thing). So EVERY failure path after the
+/// outbox POST is funnelled through here, including the purely local encoding
+/// steps between the POST and the PUT, and comes out
+/// `Protocol(PartialResponse)` with `TransmissionState::Acknowledged`. A
+/// local-looking failure is classified as a partial success on purpose:
+/// what matters to the consumer is that the organizer already saw the reply.
 fn rsvp_local_write_error(error: AccountError) -> AccountError {
     partial_sequence_error(
         &error,
@@ -1718,6 +1747,18 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, Accoun
     })
 }
 
+/// Poll for changes, preferring the RFC 6578 `sync-collection` REPORT and
+/// falling back to a full listing plus snapshot diff when no token is held.
+///
+/// Two accepted gaps, recorded so neither is re-filed as untouched work. The
+/// token-RETENTION path below - a response that omits the required `sync-token`,
+/// where the previous token is kept so the next poll re-asks from the same
+/// point rather than silently restarting coverage - has no direct test; it is
+/// covered only incidentally through the drain tests. And the omission itself
+/// is reported LOG-ONLY: a server violating the RFC this way is not surfaced to
+/// the consumer as an error, because retaining the token is the correct and
+/// lossless response and there is nothing for a caller to do about it. Raising
+/// it would fail a poll that in fact lost nothing.
 async fn changes_from_cursor(
     client: &CalDavClient,
     previous: &EventSnapshot,

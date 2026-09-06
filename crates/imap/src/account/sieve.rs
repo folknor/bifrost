@@ -1,3 +1,11 @@
+//! Optional ManageSieve client and the Stage 2 script filter surface.
+//!
+//! Audit boundary: not line-audited by the 2026-09-04 bug hunt, which read
+//! the driver, framing, pool, push, auth, change strategies, mutations,
+//! inventory, hydration and cursor envelope instead. An absence of findings
+//! in this module is an absence of reading. Noted so a later auditor knows
+//! where coverage stops.
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};

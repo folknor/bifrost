@@ -1,3 +1,12 @@
+//! Gmail PIM primitives for the shared `Account` trait.
+//!
+//! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
+//! module - specifically the MIME rendering, draft patching, search
+//! translation, and identity and vacation mapping in it. That is a statement
+//! about where a past sweep's coverage stops, not a claim that anything here
+//! is wrong; a later auditor should treat this file as unswept by that pass
+//! and read it fresh rather than assuming it was already walked.
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

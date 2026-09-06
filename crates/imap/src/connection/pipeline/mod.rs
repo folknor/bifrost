@@ -3,6 +3,12 @@
 //! Only commands that are safe to pipeline per RFC 3501 Section5.5 have
 //! methods on [`Pipeline`]. State-changing commands (SELECT, STARTTLS,
 //! IDLE, LOGOUT, etc.) intentionally lack pipeline methods.
+//!
+//! Audit boundary: not line-audited by the 2026-09-04 bug hunt, whose depth
+//! was spent on the driver, framing, pool, push, auth, change strategies,
+//! mutations, inventory, hydration and cursor envelope. An absence of
+//! findings in this module is an absence of reading. Noted so a later
+//! auditor knows where coverage stops.
 
 use crate::types::{
     Flag, MailboxAttribute, MailboxName, NotifySetParams, SequenceSet, StoreOperation,

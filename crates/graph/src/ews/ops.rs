@@ -77,6 +77,17 @@ impl EwsClient {
     /// per-item on the others. The parser tolerates all three classes (see
     /// `parse_get_item_response`); that tolerance is not a claim of
     /// operational non-mail GetItem support.
+    ///
+    /// The fix shape, when this is worth closing: `EwsItem.item_class` is
+    /// already parsed by the inventory pass (`FindItem` requests
+    /// `item:ItemClass`), so thread the class forward from inventory to the
+    /// hydration call and make the requested property set conditional on it -
+    /// message properties for `IPM.Note`, the contact or calendar sets
+    /// otherwise. The blocker is only that the hydration lane addresses a
+    /// bare `ObjectId`, which carries no class marker; nothing about EWS
+    /// prevents the conditional body. Until then the blast radius is bounded:
+    /// only a MIXED-class pinned public folder is affected, and a consumer
+    /// that drops non-mail scopes before hydration never reaches it.
     pub(crate) async fn get_item(
         &self,
         item_id: &str,

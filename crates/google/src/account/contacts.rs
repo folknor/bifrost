@@ -1,3 +1,9 @@
+//! Google People contacts and directory search.
+//!
+//! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
+//! module; it was skipped as already test-dense. A later auditor should read
+//! it fresh rather than assuming that sweep covered it.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

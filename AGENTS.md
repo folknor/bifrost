@@ -211,6 +211,35 @@ The `NetConfig` split deleted three tests along with the fields they described,
 which was locally correct and left three defaults silently unpinned. A falling
 test count after a refactor is the signal; chase it rather than accepting it.
 
+### Fixing a reader is not finished until the OTHER readers of the same identity are checked
+
+The 2026-07-31 workspace sweep hunted one failure mode: a local restatement
+of a rule that lives somewhere else, kept alive by a test that exercises the
+copy rather than the original. The copy and its test agree indefinitely; only
+the original disagrees, and nothing asks it. It found two live defects, both
+the same shape: a producer's shape had moved, one consumer followed, and a
+sibling arm in the very same `match` showed the correct treatment while the
+arm beside it silently dropped to `_ => None` or a default.
+`resolve_throttle_key` read only `ErrorScope::Mailbox` while every production
+folder producer builds `Cursor(Folder(_))`, so `ThrottleKey::Mailbox` was
+unreachable in production and its test passed against a shape only tests
+build; and both engine inventory front ends absorbed `InventoryEvent::Warning`
+one arm below the `Terminated` case that forwards. Three method notes:
+
+- **Delete the copy, do not read it.** Reading the copy tells you what it
+  claims; deleting it (or routing ONE test through the real path) tells you
+  whether the claim was true. Three of four calibration defects were found
+  that way.
+- **Drift needs movement.** Greps for `mirrors` / `same shape as` mostly
+  surface copies of FROZEN specs, which cannot rot. Look where a producer
+  changed shape, a seam was promoted, or a contract crossed a layer boundary.
+- **Arm the compiler instead of reading.** `#![warn(dead_code)]` sits on the
+  error-translation boundaries (`crates/imap/src/account/error.rs`,
+  `crates/jmap/src/sync/error.rs`), where a dead item is a hole in a contract.
+  Removing the crate-wide `allow(dead_code)` from imap and jmap outright is
+  not a cheap win: measured at 105 and 195 warnings, overwhelmingly
+  legitimate unused protocol surface.
+
 ### Verify with a full `brokkr check`, never `-p`
 
 Scoped runs miss cross-crate breakage, and feature unification makes them

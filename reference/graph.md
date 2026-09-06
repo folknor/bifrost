@@ -297,7 +297,12 @@ organizer/status are server-derived. Event search uses the Graph Search API for
 unscoped non-empty default-mailbox searches, else local; composite `EventId`s
 embed the calendar (`{calendar}::{event}`), Search hits use the `$mailbox`
 sentinel routed through `/me/events/{id}`. Contact search uses exact email
-`$filter` for email-shaped queries, else local.
+`$filter` for email-shaped queries, else local. `ContactEmail.kind` maps
+to and from Graph `emailAddress.name`, which is a DISPLAY NAME, not a type
+label - Graph's contact schema has no per-address type. The round trip is
+lossless and consistent, but a consumer must not read a Graph contact's
+`kind` as "work"/"home", and a `kind` it writes appears as the address
+display name in Outlook.
 
 ## `GraphAccount` / `GraphAccountFactory` shape and lifecycle
 
@@ -644,7 +649,13 @@ ids absent from `live_ids`. The EWS item shape carries read state, flag status,
 and categories through the same canonical token hash used by REST inventory.
 `live_ids` is hard-capped at `PUBLIC_FOLDER_LIVE_IDS_CAP` (10_000); above
 it the snapshot empties and the folder degrades to additions-only with one
-scoped `Warning`. Dispatch: routing-map membership for `Folder` scopes
+scoped `Warning`. `DateTimeReceived` is not a modification signal, so an
+in-place edit that does not move an item's received time is invisible to the
+incremental poll: it surfaces only on the next complete scan, up to
+`FULL_SCAN_INTERVAL_SECS` late, and not at all while the folder is in the
+over-cap degraded mode (which empties `live_versions` along with `live_ids`).
+That is a limit of the poll model - closing it needs a different watermark
+field (`LastModifiedTime`) or a different model - not a regression. Dispatch: routing-map membership for `Folder` scopes
 (establish/inventory), cursor kind for changes; a bare non-public `Folder`
 keeps its reject-on-delta behavior. A `Folder` scope is refused
 per scope as `Unsupported(PushSubscribe)` in `push_subscribe`'s failed lane
@@ -1420,6 +1431,18 @@ id. The EWS projection keeps the folder-qualified id, maps `BodyPreview` /
 HTML body onto `body_text` / `body_html`, tags the containing folder as the
 only container, and carries `Importance::Normal` and no `thread_id` (EWS's
 message shape reports neither).
+
+The EWS `GetItem` body is MESSAGE-shaped on both doors: it requests
+`message:ToRecipients` / `CcRecipients`, which a real `Contact` or
+`CalendarItem` answers with `ErrorInvalidPropertyRequest`. A mixed-class
+pinned public folder therefore hydrates its mail items correctly and fails
+PER ITEM on the others; the parser tolerating all three classes is not a claim
+of operational non-mail support. The class is not knowable from a bare
+`ObjectId` at request time, so the fix is threading `EwsItem.item_class`
+forward from the inventory pass and making the property set conditional. A
+consumer that drops non-mail scopes before hydration never reaches it.
+Public-folder hydration also fans out one `GetItem` per item, because ids in
+one chunk can sit in different folders with different routing headers.
 
 `move_thread` calls Graph move directly (the destination is the container id
 the consumer already holds, which is owner-qualified for a shared folder).

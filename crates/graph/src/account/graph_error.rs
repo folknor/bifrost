@@ -845,6 +845,13 @@ fn parse_retry_after_header(headers: &HeaderMap) -> Option<RetryHint> {
 /// class behind it. That is a behaviour change for consumers, not a
 /// diagnostics improvement, and it wants deciding on its own terms rather than
 /// riding along with a tidy-up.
+///
+/// What is actually LOST by leaving it: a Graph 403 on a shared or public
+/// folder derives `NoPermission { resource: None }` and so names no id in the
+/// support export, where the identical failure on IMAP names the mailbox. The
+/// classification and recovery class are unchanged either way, so the cost is
+/// a less specific support export, which is why this stays a deliberate hold
+/// rather than a bug.
 fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
     match scope? {
         ErrorScope::Message { .. } => Some(ResourceKind::Message),

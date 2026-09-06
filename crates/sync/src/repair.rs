@@ -40,6 +40,25 @@
 //! enumeration announced the object, hydration asks whether a projection can be
 //! fetched right now. A later hydration failure is the hydration lane's, with
 //! its own `ItemOutcome`.
+//!
+//! # Known limit: the REGION lane has no live provider
+//!
+//! The OBJECT lane is implemented end to end and Google implements it. The
+//! REGION lane - `InventoryRepairTarget::Region`, `RegionRecovered`, and every
+//! `RegionRepairProof` shape (`ExactReplay`, `Partitioned`, conservation across
+//! children, lineage splitting) - is built and tested, but no account crate
+//! currently produces it: Graph's only region is a `CheckpointBarrier` by
+//! construction. So those paths are exercised by in-crate tests only.
+//!
+//! That is not a defect; the shapes are unreachable rather than wrong. It does
+//! mean the region contract is validated against tests rather than against a
+//! provider, so THE FIRST REAL IMPLEMENTOR MUST BE REVIEWED AGAINST THE
+//! CONTRACT rather than assumed to fit it - the tests encode this crate's
+//! reading of the contract, and nothing has yet forced that reading to survive
+//! contact with a real enumeration. A viable candidate needs a replay token
+//! that survives its own enumeration, which is exactly what Graph lacks.
+//! See `reference/sync.md`, "Inventory coverage" / "Repair", for the contract
+//! itself.
 
 use std::collections::HashMap;
 use std::sync::Arc;

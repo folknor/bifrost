@@ -1,3 +1,12 @@
+//! Account configuration and open: pool construction, DAV attach, ID probe,
+//! QRESYNC negotiation, folder LIST and shared-folder discovery.
+//!
+//! Audit boundary: not line-audited by the 2026-09-04 bug hunt, whose depth
+//! was spent on the driver, framing, pool, push, auth, change strategies,
+//! mutations, inventory, hydration and cursor envelope. An absence of
+//! findings in this module is an absence of reading. Noted so a later
+//! auditor knows where coverage stops.
+
 use std::sync::Arc;
 use std::time::Duration;
 

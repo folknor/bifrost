@@ -1,3 +1,13 @@
+//! Stage 1 PIM actions for the IMAP account.
+//!
+//! Audit boundary: the 2026-09-04 bug hunt read the driver, wire framing,
+//! pool, push/IDLE, auth, change strategies, mutations, inventory,
+//! hydration, blob, cursor envelope and folder registry line by line. It did
+//! NOT line-audit this module's long tail beyond the container-membership,
+//! keyword and search entry points, so an absence of findings here is an
+//! absence of reading, not evidence of correctness. Noted so a later auditor
+//! knows where coverage stops.
+
 use std::collections::HashMap;
 use std::time::SystemTime;
 

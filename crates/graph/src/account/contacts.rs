@@ -501,6 +501,20 @@ fn contact_from_graph(contact: GraphContact) -> ContactCard {
             .filter_map(|email| {
                 Some(ContactEmail {
                     value: email.address?,
+                    // ACCEPTED CONFLATION. `ContactEmail.kind` is a type
+                    // label ("work", "home"); Graph's `emailAddress.name`
+                    // is a display name for the address. Graph's contact
+                    // schema carries no per-address type at all, so there is
+                    // nothing better to map onto, and the alternative -
+                    // dropping `kind` on the Graph backend - would lose the
+                    // only per-address string the provider round-trips.
+                    // The round trip IS consistent (`graph_contact_from_*`
+                    // writes `kind` straight back into `name`, so nothing is
+                    // lost or rewritten), it is only semantically wrong: a
+                    // consumer must not read a Graph contact's `kind` as a
+                    // type label, and a `kind` written here surfaces as the
+                    // display name in Outlook. Revisit only if Graph grows a
+                    // typed address field.
                     kind: email.name,
                     is_primary: false,
                 })
@@ -527,6 +541,8 @@ fn graph_contact_from_create(contact: &ContactCreate) -> GraphContactPatch {
     GraphContactPatch {
         display_name: contact.display_name.clone(),
         email_addresses: non_empty(contact.emails.iter().map(|email| GraphContactEmail {
+            // The outbound half of the accepted `kind` <-> `name` conflation
+            // documented at the inbound projection in `contact_from_graph`.
             name: email.kind.clone(),
             address: Some(email.value.clone()),
         })),
@@ -629,6 +645,8 @@ fn graph_contact_from_patch(patch: &ContactPatch) -> GraphContactPatchBody {
         let addresses = emails
             .iter()
             .map(|email| GraphContactEmail {
+                // Same accepted `kind` <-> `name` conflation as the create
+                // path; see `contact_from_graph`.
                 name: email.kind.clone(),
                 address: Some(email.value.clone()),
             })

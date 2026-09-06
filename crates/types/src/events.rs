@@ -300,7 +300,7 @@ impl std::error::Error for BatchBoundaryError {}
 /// ordinary and advanced past it. The fix that would make the omission a
 /// compile error is a dedicated `PageCheckpoint::{Advance(..), Withheld}`;
 /// that reshapes a published field, so it is the repository owner's call and
-/// is tracked in `notes/todo.md` as types-B2. Until then, both `bifrost-sync`
+/// has not been ruled on. Until then, both `bifrost-sync`
 /// inventory front ends read `coverage` through one shared module so they
 /// cannot diverge - but nothing in the type system stops a third front end
 /// from ignoring it.

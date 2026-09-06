@@ -291,6 +291,17 @@ async fn upload_chunks(
                 }
                 offset = next;
             }
+            // Everything else. This arm is DELIBERATELY not pinned by a test,
+            // and cannot be reached by the failure statuses it reads as though
+            // it handled them: bifrost-net resolves 4xx/5xx into an `Err`
+            // before a response ever surfaces here, so the only status that
+            // arrives is a passed-through 3xx the transport's redirect walk
+            // declined to follow. The arm is kept, and kept classifying with
+            // the real response headers and body rather than a synthesized
+            // error, because "the transport handed us a status we did not
+            // expect" must not be silently treated as success. If bifrost-net
+            // ever stops pre-resolving error statuses, this becomes the live
+            // error path and wants a scripted test.
             _ => {
                 let err =
                     GraphResponseError::from_response(status, response.headers, response.body);

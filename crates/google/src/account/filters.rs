@@ -1,3 +1,9 @@
+//! Gmail settings filters: list, create, delete, and typed-rule mapping.
+//!
+//! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
+//! module; it was skipped as already test-dense. A later auditor should read
+//! it fresh rather than assuming that sweep covered it.
+
 use std::sync::Arc;
 use std::time::SystemTime;
 

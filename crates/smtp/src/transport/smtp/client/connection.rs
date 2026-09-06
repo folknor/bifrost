@@ -2942,6 +2942,17 @@ mod transcript_tests {
 
     /// An unsolicited reply coalesced with a requested reply breaks the
     /// connection before it can be mistaken for the next command's answer.
+    ///
+    /// The coalesced segment is not an incidental choice of harness feature:
+    /// it is the ONLY shape in which an unsolicited reply is observable at
+    /// all. Outside the LMTP final-status drain, SMTP has no surplus-reply
+    /// detection that runs while no reply is owed - a reply that arrives on an
+    /// idle connection is simply not read until the next command asks for one.
+    /// Detection therefore happens exactly when the surplus has already
+    /// crossed into the `BufReader` alongside an answer that was owed, which
+    /// is what `expect_coalesced` reproduces. A test scripting the surplus as
+    /// a separate segment would pin nothing; that is an accepted limit of the
+    /// protocol, not of the harness.
     #[test]
     fn unsolicited_reply_coalesced_with_an_answer_breaks_the_connection() {
         let hello = ClientId::Domain("client.example".to_owned());

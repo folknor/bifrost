@@ -245,6 +245,16 @@ impl AsyncNetworkStream {
         self.state = state;
     }
 
+    /// Accepted coverage gap: this dial path has no hermetic test, for the
+    /// same reason as its blocking twin - reaching it needs a peer on a real
+    /// socket, which the crate's testing rules put out of scope, and the
+    /// in-process `Transcript` harness enters below the dial. The parts that
+    /// can be separated from the socket are pinned without one: the setup
+    /// deadline is driven against `StalledPeer` under paused tokio time,
+    /// including the TLS handshake leg through `upgrade_tls_stream`, and the
+    /// STARTTLS exchange is pinned up to the handshake boundary. A real TLS
+    /// handshake stays out of scope; closing that would need a production seam
+    /// substituting the connector, not another test.
     pub(super) async fn connect_until<T: ToSocketAddrs>(
         server: T,
         deadline: AsyncDeadline,

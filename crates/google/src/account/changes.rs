@@ -131,6 +131,16 @@ pub(crate) fn changes_stream_cancellable(
                 );
                 return Some((SyncEvent::Terminated(account_error), state));
             }
+            // One `users.getProfile` per poll, KEPT DELIBERATELY. The cost
+            // objection is correct and has already been answered: it doubles
+            // the request count and the failure surface on a 30-second poll
+            // path. It is also the only thing that catches a rotated token
+            // now pointing at a DIFFERENT Google account before that
+            // account's history is mixed into this cursor's slot, and there
+            // is no token-source identity binding upstream to lean on. It
+            // comes out when that binding exists, not before; do not re-file
+            // it as free savings. See "Per-scope inventory / changes /
+            // hydration" in `reference/google.md`.
             let profile = tokio::select! {
                 () = state.shutdown.cancelled() => return None,
                 result = state.client.get_profile() => result,

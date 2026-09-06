@@ -31,6 +31,22 @@ use super::{
     mutation, pim, push, state,
 };
 
+/// The engine-facing account is pinned to the production transport, not
+/// generic over one: WebSocket push is reqwest-specific, so `JmapAccount`
+/// cannot be parameterized without either dropping push or growing a second
+/// transport trait for it.
+///
+/// The accepted cost is a testing one, and it is a known, bounded residual
+/// rather than an oversight. Because no scripted transport can be installed
+/// at this level, a WHOLE `Account` call - `capabilities()`,
+/// `describe_cursor`, the mutation doors - is undrivable hermetically; only
+/// the false direction (a refusal that never reaches the wire) can be pinned
+/// here, which is what `capability_contract_tests.rs` documents and does.
+/// Everything pure is instead extracted into free functions and tested
+/// directly, and the sync request helpers below this struct stay generic over
+/// `HttpTransport` so a scripted transport reaches them. Closing the residual
+/// means threading the transport generic through `JmapAccount` (and giving
+/// push its own seam), not adding a test-support type elsewhere.
 type MailAccount = crate::account::Account<ReqwestTransport>;
 
 pub(crate) struct JmapAccount {

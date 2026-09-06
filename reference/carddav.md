@@ -56,16 +56,17 @@ carries the reasoning, and the twin must not drift from it.
   principal and an address book home on different hosts of one service is a
   real deployment shape. Discovery stages the home without changing trust;
   it is admitted only after the complete authenticated discovery succeeds,
-  before the account is shared or a home request starts. Redirects split into
-  two paths. Same-origin hops (exact scheme, host, effective port) are
-  followed inside reqwest, which preserves `Authorization` under exactly that
-  condition. Cross-origin hops are never followed inside reqwest - it strips
-  `Authorization` on any origin change and a redirect policy cannot restore
-  it - so the policy stops them and `send_raw_request` re-dispatches the hop
-  manually with fresh credentials, gated by the same admitted-origin set the
-  credential gate reads. A `Location` naming an unadmitted origin fails
-  locally without a request going out; a 303 is not followed. Both the
-  reqwest chain and the manual hops are bounded by bifrost-net's hop cap.
+  before the account is shared or a home request starts. Redirects are
+  disabled in the transport (`FollowRedirects::Disabled`) and EVERY hop,
+  same-origin or not, is walked by `send_raw_request` in `bifrost-dav-core`:
+  each hop re-mints the credential for the origin it is about to address,
+  gated by the same admitted-origin set the credential gate reads, so a
+  `Location` naming an unadmitted origin fails locally without a request
+  going out. Walking same-origin hops too costs nothing (the credential is
+  the same one) and removed the earlier split where reqwest followed those
+  internally, which stripped `Authorization` on any origin change with no
+  way to restore it. A 303 is not followed, and the walk is bounded by
+  bifrost-net's `DEFAULT_MAX_HOPS`.
 - `parse.rs` - XML response parsers for addressbook discovery,
   contact listing, multiget hydration, depth-0 `getctag`, and nested href
   properties. Addressbook/listing/multiget and href-valued discovery

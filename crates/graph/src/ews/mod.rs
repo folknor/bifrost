@@ -190,6 +190,19 @@ pub(crate) type EwsBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, EwsError
 /// cycle hermetically. The streaming worker takes `impl EwsExecute`
 /// instead of the concrete client for exactly that reason; `EwsClient` is
 /// the production implementation.
+///
+/// This seam answers at the EWS FUNNEL, which puts it ABOVE the transport -
+/// unlike the REST, aux, and download surfaces, which script at the wire
+/// through `bifrost_net::test_support` and therefore exercise retry, backoff,
+/// the rate-limit permit, and the redirect walk below the script. EWS is the
+/// one remaining seam with that gap, and it is left there deliberately rather
+/// than by omission: `EwsClient::execute` does post through `AccountNet`, so
+/// it COULD be moved down to the wire, but this trait double replaced three
+/// review-only rounds that found nothing and immediately caught four defects,
+/// and the marginal gain (observing retry on SOAP posts) does not justify
+/// rebuilding a seam that works. Revisit if an EWS defect is ever traced to
+/// retry, backoff, or a redirect - that is the evidence that would change the
+/// trade.
 pub(crate) trait EwsExecute: Send + Sync {
     fn execute(
         &self,

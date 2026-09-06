@@ -762,7 +762,16 @@ fn ical_offset_suffix(value: &str) -> String {
 
 fn event_end_from_duration(start: &EventTime, duration: &str) -> Option<EventTime> {
     // `caldata` still speaks chrono, so cross the boundary as a plain
-    // second count rather than naming its duration type.
+    // second count rather than naming its duration type. This is the ONLY
+    // place bifrost crosses that boundary: no bifrost source names chrono or
+    // chrono-tz any more, and they remain in the dependency tree solely
+    // because caldata depends on both. Converting through `.num_seconds()`
+    // instead of the type is deliberate - it keeps caldav free of a chrono
+    // dependency - but it is a structural shim rather than a checked
+    // conversion: if caldata ever changed `parse_duration` to return some
+    // other type that also exposes `num_seconds`, this would keep compiling
+    // and silently change meaning. Nothing to fix while caldata speaks
+    // chrono; the shim goes away when caldata drops it or is replaced.
     let raw_duration = duration;
     let duration =
         SignedDuration::from_secs(caldata::types::parse_duration(duration).ok()?.num_seconds());
@@ -1028,7 +1037,15 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) {
         // made servers that trust the supplied VTIMEZONE read an Oslo
         // wall-clock time as UTC and shift the event by the real offset
         // (1-2h). Full STANDARD/DAYLIGHT transition rules are not generated;
-        // most servers re-resolve the TZID by name regardless. An unknown /
+        // most servers re-resolve the TZID by name regardless. That limit was
+        // accepted when the offset had to be resolved by hand-walking chrono's
+        // `LocalResult`; jiff exposes zone transitions directly, so emitting
+        // real transition rules is now substantially cheaper than it was. It
+        // is still not obviously worth it - a server that ignores the supplied
+        // component gains nothing - so this is a standing re-evaluation, not
+        // scheduled work, and the accepted limit is documented in
+        // `reference/caldav.md` under "Account behavior" / `event_create`. An
+        // unknown /
         // unparseable zone omits the offset sub-block rather than emit a
         // misleading `+0000`: the bare VTIMEZONE still names the TZID for
         // servers that resolve it themselves, and we avoid asserting a wrong

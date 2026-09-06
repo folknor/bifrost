@@ -835,8 +835,8 @@ and parks cold start at the bound until it leaves or a lag fires; the
 acknowledger joins at the ring's tail and cannot see those pages. That was
 already the failure shape before the bound existed, when such a walk ran into
 the observer and settled. An explicit observer subscription that counts for
-neither the gate nor the bound is the clean fix, and is filed in
-`notes/todo.md`.
+neither the gate nor the bound is the clean fix; it is ruled and not yet
+built.
 
 The acknowledger may not defer its acknowledgements by more than
 `lane_capacity` publications. The producer parks once that many backfill pages
@@ -848,8 +848,9 @@ predecessors: sibling partitions are separate lanes, so acknowledging a later
 partition's page frees nothing of an earlier one's. Before the bound such a
 consumer risked a lag; under it the consumer waits for a page that will not
 come while the producer waits for an acknowledgement the consumer is holding.
-Whether the engine should also defend against that consumer is filed in
-`notes/todo.md`.
+The ruled replacement is a receipt bound, where reading rather than
+acknowledging frees the producer; it is not yet built, and this paragraph
+shrinks to the receipt rule when it lands.
 
 A bounded `mpsc` for backfill was rejected on the same
 contract: it is single-consumer, so pages would reach one receiver and vanish
@@ -1134,8 +1135,10 @@ failed" degrade for a walk that was starting over regardless.
 **One recorded gap.** A receiver dropped between `detach`'s drain of the
 request set and the slot being dropped records a request nobody can act on,
 because the writer is gone. The cost is the ordinary one for an unrepaired
-loss on an `OpenPages` scope: the next attach resumes past the hole. Filed in
-`notes/todo.md`.
+loss on an `OpenPages` scope: the next attach resumes past the hole. The
+ruling is to close it by contract (a page delivered but unacknowledged at
+detach is the consumer's to have persisted or to forfeit, as at a crash) and
+it is not yet built.
 
 Two consumer-visible answers describe one durable outcome: an acknowledgement
 that lands after the pre-retry discard is refused as an unknown publication,
@@ -2211,7 +2214,8 @@ opaque children is not, and only the multi-dimensional test gets both right.
 **Still not built:** region repair has no provider implementing it (Graph's
 region is a barrier by construction), so `ExactReplay`, `Partitioned` and
 lineage splitting are exercised by tests rather than by a live provider. Ledger
-compaction is also outstanding - see `notes/todo.md`.
+compaction is also outstanding: discharged entries are retained forever for
+audit, so the ledger grows monotonically.
 
 ## Cursor envelope
 

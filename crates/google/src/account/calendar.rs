@@ -1,3 +1,9 @@
+//! Google Calendar list, range, search, and event CRUD.
+//!
+//! Audit boundary: the 2026-07 google bug sweep did NOT line-audit this
+//! module; it was skipped as already test-dense. A later auditor should read
+//! it fresh rather than assuming that sweep covered it.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -21,6 +27,16 @@ const EVENT_ID_SEPARATOR: &str = "::";
 const CALENDAR_LIST_PAGE_SIZE: u16 = 250;
 const MAX_CALENDAR_LIST_PAGES: usize = 10_000;
 
+// Returns a whole `Vec`, not a `Page`, and that is a considered choice
+// rather than an omission. The walk below pages at 250 per request under a
+// repeated-token guard and a finite page budget, so it is bounded; a real
+// account has tens of calendars, which is one page. The shared trait draws
+// this line deliberately - `contacts_list` returns `Page<ContactCard>`
+// because contacts number in the tens of thousands, and calendars do not.
+// It would change if a deployment appeared where a single account carries
+// hundreds of calendars and the caller needs to act before the walk ends;
+// short of that, streaming buys nothing and costs the callers (cross-calendar
+// event search among them) their simple finite vector.
 pub(crate) fn calendars_list(
     client: Arc<GmailClient>,
 ) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
@@ -369,8 +385,8 @@ pub(crate) fn search(
 /// tombstone there is indistinguishable from a page boundary, so the walk can
 /// silently under-report deletions. A search is a query surface, and whether it
 /// should answer with cancelled instances is a PRODUCT decision about what the
-/// consumer asked for. It wants a deliberate ruling (tracked in `notes/todo.md`
-/// as google-B13), not a reflex copy.
+/// consumer asked for. It wants a deliberate ruling from the repository
+/// owner, not a reflex copy.
 async fn search_one_calendar(
     client: &GmailClient,
     calendar_id: String,
@@ -779,6 +795,16 @@ fn event_move_url(
 // original cause chain as secondary evidence. A `Reconcile` directive
 // that does not say what to reconcile is barely better than the silent
 // partial write it replaces.
+//
+// The non-atomicity itself is accepted, not open: Google exposes the move
+// and the field PATCH as two separate requests, so there is no atomic
+// composite to call. No compensating move back to the source calendar is
+// attempted either - that is another blind write (these calendar mutations
+// carry no `If-Match`) with its own partial-failure window, and its own
+// failure would leave the consumer with a less legible story than the
+// `Protocol(PartialResponse)` plus acknowledged first-leg evidence it gets
+// here. It would change only if Google published an atomic move-and-patch.
+// See "Google Calendar" in `reference/google.md`.
 fn event_move_patch_error(error: &AccountError) -> AccountError {
     let consented = error.support_consented();
     let telemetry = &consented.telemetry;

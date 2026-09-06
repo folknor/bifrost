@@ -11,6 +11,15 @@
 //!
 //! These tests pin the attach path healing the row itself: delete the
 //! scope's cursor, re-establish from the live account, keep going.
+//!
+//! On the local `HealAccount` double below: the reusable `StubAccount` seam
+//! now lives in `tests/common/mod.rs` and is the model for NEW tests. This
+//! file predates it and keeps its own purpose-built double. Migrating it is
+//! optional cleanup that is explicitly not owed - the double works, it is
+//! shaped tightly around this file's scripted decode failures, and a
+//! migration would be churn in a test whose whole value is that it already
+//! pins the stranding bug. Write new tests against `common::StubAccount`;
+//! leave this one alone unless it needs to change for its own reasons.
 
 use std::collections::VecDeque;
 use std::pin::Pin;

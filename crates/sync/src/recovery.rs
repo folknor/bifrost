@@ -136,6 +136,18 @@ pub(crate) fn directive_target_scope(directive: &EngineDirective) -> Option<Curs
         // boundary even though every current variant is named above. A new
         // scope-bearing variant still defaults account-wide here until a
         // human adds its arm.
+        //
+        // Ruled sufficient rather than merely tolerated, and the reasons are
+        // why no further machinery is owed here: the account-wide default is
+        // the CONSERVATIVE direction (it is never narrower than the directive
+        // asked for, so a new variant degrades to doing too much rather than
+        // too little); `DirectiveKey::Other` bounds how coarse the dedupe can
+        // get to the pre-existing behaviour; and `handle_engine_directive`
+        // carries a required fallback that LOGS an unhandled variant, so a
+        // new one is visible in operation rather than silent. Making this a
+        // compile error instead would mean dropping `#[non_exhaustive]` from
+        // a public, re-exported `bifrost-types` enum - an API-stability
+        // change far larger than the footgun it would close.
         _ => None,
     }
 }

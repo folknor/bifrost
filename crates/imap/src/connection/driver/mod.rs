@@ -797,6 +797,16 @@ pub(in crate::connection) async fn run_prebuilt_command(
 ///
 /// A oneshot send may schedule the caller on another runtime worker
 /// immediately, so the watch snapshot must be visible first.
+///
+/// The ordering is a convention every completion arm must follow, not a
+/// type-level guarantee: nothing stops a future arm from calling
+/// `result_tx.send` directly and answering a caller that then reads a stale
+/// snapshot. Making it unrepresentable (a result oneshot that cannot be
+/// answered without publishing) was considered and ruled not worth its
+/// machinery while every completion arm lives in the one `match cmd` in
+/// `driver_task` directly above, where the deviation is visible by reading a
+/// single function. Revisit if a new state-changing driver command lane is
+/// added somewhere else.
 fn publish_then_answer<T>(publish: impl FnOnce(), result_tx: oneshot::Sender<T>, result: T) {
     publish();
     let _ = result_tx.send(result);

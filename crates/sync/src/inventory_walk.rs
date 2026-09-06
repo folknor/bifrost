@@ -11,11 +11,14 @@
 //! `Done` handling remain two implementations, because the shapes genuinely
 //! differ - fusion forwards the account's own checkpoint, backfill mints a
 //! positional `page:F:T` from partition coordinates the account never sees.
-//! That is an accepted structural residual, not an oversight, and no loss path
-//! has been found through it across five rounds and two close passes; it is
-//! tracked in `notes/todo.md` as sync-F3. The re-divergence risk is real but
-//! bounded by the fact that a THIRD front end would have to appear for it to
-//! bite, and a third front end is the trigger to revisit.
+//! That is an accepted structural residual, not an oversight: no loss path has
+//! been found through it across five rounds and two close passes. What remains
+//! is a RE-DIVERGENCE RISK, not a defect - the two minting sites can drift the
+//! way the barrier rules once did. Unifying them is worth doing only when one
+//! of two things happens: a THIRD inventory front end appears (at which point
+//! the shapes have to be reconciled anyway), or a defect is actually traced to
+//! the split. Until then the shapes are different enough that a forced common
+//! abstraction would cost more than it buys.
 //!
 //! Both front ends must refuse to announce a barrier the store REFUSED - the
 //! backfill partition fails so the scope stays Pending and re-walks, the

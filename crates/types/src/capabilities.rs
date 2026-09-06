@@ -159,7 +159,7 @@ pub enum QuotaSignal {
 /// hand-maintained facts, each able to be wrong in a way no test catches, and
 /// consumers must consult this AND handle `Unsupported` regardless.
 ///
-/// Two remedies, tracked in `notes/todo.md` as types-B1. The structural one
+/// Two remedies, and the choice between them is open. The structural one
 /// replaces the struct with a runtime `supports(&self, op: AccountOperation)`
 /// query defaulted from a per-impl operation set, so the capability answer and
 /// the error answer become one value read twice and a new trait method defaults

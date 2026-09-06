@@ -470,7 +470,12 @@ pub(crate) fn get_stream_cancellable(
         // not it holds every batch hostage until one more id arrives. A full
         // last batch therefore stays `Page` and the terminator is the
         // following `Done`; the boundary is advisory and losing it on that
-        // one alignment is strictly cheaper than a stall.
+        // one alignment is strictly cheaper than a stall. Accepted rather
+        // than open: no `bifrost-sync` hydration path reads `Final`, so the
+        // boundary is advisory here, and it would only stop being advisory
+        // if the engine started deriving completion from it - at which point
+        // the fix is a declared exhaustion signal on the id stream, not a
+        // lookahead.
         let mut final_batch = false;
         while ids.len() < HYDRATE_BATCH_SIZE {
             let next = tokio::select! {

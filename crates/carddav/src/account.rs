@@ -48,6 +48,14 @@ use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard
 /// only as the default.
 const CONTACT_PAGE_SIZE: usize = 250;
 // Version 2 changes snapshot ids from base-URL-relative to request-URI-relative.
+//
+// Accepted cost of that bump, recorded so it is not rediscovered as a bug: a
+// v1 cursor is REFUSED by `decode_cursor_snapshot` rather than migrated - a v1
+// payload is byte-identical in shape to a v2 one, so the ids cannot be
+// distinguished and rewritten, only re-derived - so every consumer holding a
+// pre-bump cursor pays one full re-sync per DAV account, once. That is a
+// one-time cost against ids that were silently wrong, which was worth paying.
+// Pinned by `contact_cursor_rejects_the_base_relative_id_version`.
 const CURSOR_ENVELOPE_VERSION: u32 = 2;
 const CURSOR_MAGIC: &[u8] = b"CDAVCTAG1";
 
@@ -2448,6 +2456,18 @@ mod tests {
         );
     }
 
+    // The next three tests - `carddav_host_attachment_unsupported`,
+    // `carddav_directory_search_unsupported` and
+    // `carddav_open_raw_rfc822_unsupported` - assert against a HELPER, not
+    // against the account. They call `unsupported_future` / `unsupported_stream`
+    // directly and check that those helpers return what they were told to
+    // return; they never invoke the `Account` method, so they pass regardless of
+    // what the impl does. Their capability-flag assertion is the only line with
+    // bite. `capability_contract_tests.rs` now covers the same ground for real,
+    // driving each gated entry point through the `Account` surface, which makes
+    // these redundant as well as vacuous. They are KEPT rather than removed
+    // because deleting a test is a deliberate act that wants the repository
+    // owner's nod; if that nod comes, all three go.
     #[tokio::test]
     async fn carddav_host_attachment_unsupported() {
         // CardDAV has no cloud-drive hosting; the flag is false (Default) and

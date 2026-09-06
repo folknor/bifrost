@@ -203,6 +203,16 @@ impl DavDispatch {
     /// The bearer token is read from the shared source on every call, so a
     /// token rotated mid-sync is honored on the next DAV request without
     /// reopening the account.
+    ///
+    /// The origin allowlist is a deliberate trade, and it is consumer-visible.
+    /// A server that names hrefs on a THIRD origin - neither the configured
+    /// base nor an origin admitted by `admit_discovered_urls` - now gets a hard
+    /// LOCAL error here, with no request going out at all, where the
+    /// pre-gate behaviour was to send the account credential to whatever origin
+    /// the server named. Failing a legitimate-but-unusual deployment locally is
+    /// accepted as the cheaper failure than leaking a credential to an origin
+    /// the account never authenticated against. The way to widen it is to admit
+    /// the origin through discovery, not to relax this check.
     pub async fn auth_headers(
         &self,
         url: &str,
