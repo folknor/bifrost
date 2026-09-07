@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bifrost_types::{
@@ -1294,9 +1294,7 @@ async fn spawn_scope_poll_inner(
         // shared tenant/provider key) before driving the wire.
         // Re-checked after waking: a longer deadline can land while
         // this scope sleeps off the first one.
-        while let Some(wait) =
-            crate::recovery::account_throttle_wait(&throttles, &account_id, SystemTime::now())
-        {
+        while let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
             tracing::debug!(
                 target: "bifrost.sync.changes",
                 account = ?account_id,

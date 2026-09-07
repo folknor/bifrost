@@ -218,11 +218,9 @@ impl Reconciler {
             // scope's Retry-After, or a shared tenant/provider key)
             // before driving the wire for this hint. Re-checked after
             // waking: a longer deadline can land mid-sleep.
-            while let Some(wait) = crate::recovery::account_throttle_wait(
-                &self.throttles,
-                &self.account_id,
-                std::time::SystemTime::now(),
-            ) {
+            while let Some(wait) =
+                crate::recovery::account_throttle_wait(&self.throttles, &self.account_id)
+            {
                 tracing::debug!(
                     target: "bifrost.sync.reconcile",
                     account = ?self.account_id,

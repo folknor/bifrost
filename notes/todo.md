@@ -268,16 +268,41 @@ any item; some may already be obsolete.
   UIDVALIDITY, UID, part path, transfer encoding), and a consumer-facing
   projection that attaches those handles to hydrated MIME parts so
   `InventoryEntry::blob_id` and attachment metadata are populated.
-  `bifrost-types::mime` now ships the decoded MIME part tree
-  (`ParsedMessage` / `MimePart`) that any such traversal should reuse
-  rather than recreating. What was done instead:
-  the capability now reports `BlobRangeSupport::No` and both openers
-  return `Unsupported`, with the private blob id codec and its openers
-  deleted; `open_raw_rfc822` (whole-message `BODY.PEEK[]`) is unchanged
-  and remains the supported byte path. What remains merely disclosed:
-  consumers that want per-attachment streaming from IMAP still cannot
-  have it - they now get an honest `Unsupported` instead of a handle
-  shape they could not obtain.
+  `bifrost-types::mime` ships the decoded MIME part tree
+  (`ParsedMessage` / `MimePart`), which describes octets already held where
+  BODYSTRUCTURE describes octets not yet fetched - complementary, so the
+  traversal reuses its encoding vocabulary rather than its tree.
+
+  STAGE ONE LANDED 2026-09-07, deliberately UNWIRED. `account/parts.rs` has the
+  BODYSTRUCTURE traversal and the versioned part-handle codec, with 22 tests
+  over real wire bytes through the crate's own parser. `BlobRangeSupport` is
+  still `No` and both openers still return `Unsupported`: a capability that
+  claims a byte path before the projections mint handles is a promise the crate
+  cannot keep. `open_raw_rfc822` remains the supported byte path.
+
+  STAGE TWO, what is left:
+  1. Add `BODYSTRUCTURE` to the hydration attribute selection - the account
+     layer requests it NOWHERE today - and thread the parsed structure into the
+     projection. That selector is shared by the generic and PIM projections.
+  2. Mint a handle per part into `BlobHandle`, and decide there whether
+     `message/rfc822` parts appear as attachments or only as byte-path targets.
+  3. Restore `open_blob` / `open_blob_range` over `blob.rs::run_fetch` with
+     `FetchAttr::BodySection { peek: true, section, partial }` - `run_fetch`
+     already takes both, so the opener is thin. Route its existing UIDVALIDITY
+     recheck through `verify_uidvalidity` rather than keeping two.
+  4. Only then flip `BlobRangeSupport`.
+
+  TWO THINGS STAGE TWO MUST RULE ON, both surfaced by stage one:
+  (a) A range is over ENCODED octets - `MessagePart::size` is what the server
+  reported - so a byte range on a base64 part is NOT a range over decoded
+  content. The capability has to say which it means before it can honestly
+  claim ranges.
+  (b) An unmodelled transfer encoding now survives as a token beside the
+  classified `TransferEncoding`, because `BlobEncoding` has no unknown variant
+  and stage one refused to invent one from inside the imap crate. Stage two has
+  to decide the `bifrost-types` surface: an unknown variant carrying the token,
+  or such parts made ineligible for handles. Losing the token was the P2 that
+  forced this; do not re-lose it by mapping it to something modelled.
 
 ## bifrost-caldav / bifrost-carddav
 
@@ -413,18 +438,17 @@ re-pricing outstanding metering debt) were fixed in that pass.
   so the FIRST provider-wide deadline is invisible to a sibling that
   has never failed. Attach-time enrollment needs the account's
   provider identity at attach - the same identity-channel shape as (a).
-  (d) No hermetic worker-level test proves a recorded deadline defers
-  `changes_stream` or that two attached slots share a provider
-  deadline; the bucket mechanics are unit-pinned in `recovery.rs`.
-  No longer blocked on a stub (the `Account`/`AccountFactory` stub in
-  `tests/attach_schema_recovery.rs` covers it), but blocked on a clock
-  mismatch: `ThrottleBucket` deadlines are `SystemTime`, while the poll
-  loop sleeps them off on tokio time. Under `start_paused` the sleep
-  returns without `SystemTime::now()` having moved, so the re-check
-  loop in `spawn_scope_poll` re-derives the full wait and spins - a
-  virtual-time test of the deferral cannot terminate, and a real-time
-  one would need a wall-clock `Retry-After`. Pinning this wants the
-  bucket to carry a monotonic deadline (or an injectable clock) first.
+  (d) CLOSED 2026-09-07. The blocker really was the clock, not the test:
+  `ThrottleBucket` deadlines were `SystemTime` while the poll loop slept
+  them off on tokio time, so under `start_paused` the sleep returned
+  without wall-clock moving and the re-check re-derived the full wait
+  forever. The bucket is engine-owned in-memory state - no serde, never
+  in a `Checkpoint` or the store - so a monotonic deadline is safe, and
+  `tokio::time::Instant` matches what `AsyncDeadline` and `ByteBucket` in
+  bifrost-smtp had to do for the same reason. `tests/throttle_defers_
+  changes.rs` now pins both halves the item asked for. Note this changed
+  five PUBLIC `ThrottleBucket` signatures from `SystemTime` to
+  `tokio::time::Instant`; nothing was removed or renamed.
 
 ## bifrost-types
 

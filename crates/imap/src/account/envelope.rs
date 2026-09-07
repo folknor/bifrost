@@ -421,7 +421,7 @@ fn parse_nonzero_u32(
 /// primitive), so the op is known at every call site and the resulting
 /// error carries it. The recovery class is `ClientBug` either way; the
 /// operation is what makes the telemetry attributable to a lane.
-fn malformed(detail: &str, op: AccountOperation) -> AccountError {
+pub(super) fn malformed(detail: &str, op: AccountOperation) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
         Cause::Request(RequestCause::Malformed {

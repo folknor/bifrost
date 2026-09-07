@@ -6,7 +6,11 @@
 //! through the bifrost-types builder so the derived RecoveryClass is
 //! exactly what the engine's dispatch must consume.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+
+// Throttle deadlines are monotonic (`tokio::time::Instant`) so they are read
+// on the same clock the engine's `tokio::time::sleep` retires them on.
+use tokio::time::Instant;
 
 use bifrost_sync::ThrottleBucket;
 use bifrost_types::{
@@ -116,7 +120,7 @@ fn schema_incompatible_account_error_derives_engine_directive() {
 #[test]
 fn throttle_bucket_tenant_pauses_multiple_accounts() {
     let mut bucket = ThrottleBucket::new();
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let now = Instant::now();
     // Recording a tenant key is independent of any single account.
     let key = ThrottleKey::Tenant("tenant-1".into());
     bucket.record(key.clone(), now + Duration::from_secs(10));
@@ -130,7 +134,7 @@ fn throttle_bucket_tenant_pauses_multiple_accounts() {
 #[test]
 fn throttle_bucket_provider_pauses_multiple_accounts() {
     let mut bucket = ThrottleBucket::new();
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let now = Instant::now();
     let key = ThrottleKey::Provider(Provider::Microsoft);
     bucket.record(key.clone(), now + Duration::from_secs(5));
     assert_eq!(bucket.wait_for(&key, now), Some(Duration::from_secs(5)));
@@ -139,7 +143,7 @@ fn throttle_bucket_provider_pauses_multiple_accounts() {
 #[test]
 fn throttle_bucket_account_does_not_cross_accounts() {
     let mut bucket = ThrottleBucket::new();
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let now = Instant::now();
     let a = ThrottleKey::Account(AccountId("acc-1".into()));
     let b = ThrottleKey::Account(AccountId("acc-2".into()));
     bucket.record(a.clone(), now + Duration::from_secs(30));
@@ -150,7 +154,7 @@ fn throttle_bucket_account_does_not_cross_accounts() {
 #[test]
 fn throttle_bucket_mailbox_does_not_cross_accounts() {
     let mut bucket = ThrottleBucket::new();
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let now = Instant::now();
     let mb_a = ThrottleKey::Mailbox {
         account: AccountId("a".into()),
         mailbox: MailboxId("INBOX".into()),

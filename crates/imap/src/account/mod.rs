@@ -43,6 +43,9 @@ mod get;
 mod hydration;
 mod inventory;
 mod mutate;
+/// BODYSTRUCTURE part traversal + durable part-handle codec (imap-G1 stage 1).
+/// Not wired into any projection or opener yet; see the module docs.
+mod parts;
 mod pim;
 mod pool;
 mod push;

@@ -23,7 +23,10 @@ const MAX_BODY_NESTING_DEPTH: u32 = 64;
 ///
 /// `depth` tracks the current nesting level; callers at the top level pass 0.
 /// Returns a nom error if `depth` exceeds [`MAX_BODY_NESTING_DEPTH`].
-pub(super) fn body_structure(
+// `pub(crate)`, not `pub(super)`: the account-layer part traversal
+// (`account/parts.rs`) tests itself against real server BODYSTRUCTURE bytes
+// rather than hand-built enum values, so it needs the real parser.
+pub(crate) fn body_structure(
     input: &[u8],
     utf8_mode: bool,
     depth: u32,

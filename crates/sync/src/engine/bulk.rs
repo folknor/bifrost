@@ -185,11 +185,9 @@ impl SyncEngine {
                 if !slot.control.wait_until_running(&slot.shutdown).await {
                     return Err(Error::ShuttingDown);
                 }
-                if let Some(wait) = crate::recovery::account_throttle_wait(
-                    &slot.throttles,
-                    account_id,
-                    std::time::SystemTime::now(),
-                ) {
+                if let Some(wait) =
+                    crate::recovery::account_throttle_wait(&slot.throttles, account_id)
+                {
                     tokio::select! {
                         () = slot.shutdown.cancelled() => return Err(Error::ShuttingDown),
                         () = tokio::time::sleep(wait) => {}

@@ -29,6 +29,29 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
+/// Throttle deadlines live on the SAME clock as the timers that retire them.
+///
+/// Every engine wait site parks a throttle deadline as a
+/// `tokio::time::sleep`, so a bucket holding `SystemTime` deadlines is read on
+/// a different clock from the timer that pays them off. The two agree only
+/// where tokio's clock is the system one. Under `start_paused` they do not:
+/// the sleep returns with wall time unmoved, the wait site re-derives the
+/// full remaining wait, and the re-check loop spins forever without ever
+/// making progress - which is exactly what blocked a hermetic test of the
+/// deferral. `tokio::time::Instant::now()` falls back to the system clock
+/// when no tokio clock is in force, so production behaviour is unchanged.
+/// Same move `bifrost-smtp`'s `AsyncDeadline` and `ByteBucket` made, for the
+/// same reason.
+///
+/// Nothing here is durable: the bucket is one in-memory `Arc<Mutex<_>>` per
+/// `SyncEngine`, never serialized, never checkpointed, and dropped with the
+/// engine. A monotonic instant is therefore safe - it never has to survive a
+/// process. The wall-clock-to-monotonic conversion happens at exactly ONE
+/// boundary, [`record_throttle_parts`], where a provider `RetryHint` (a
+/// duration, or an absolute HTTP date) is resolved to a remaining duration on
+/// the wall clock and immediately anchored to `Instant::now()`.
+use tokio::time::Instant;
+
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, AccountOperation, Cause,
     CursorScope, EngineDirective, ErrorScope, Fatal, ReconcileAdvice, RecoveryClass, RetryAdvice,
@@ -319,8 +342,11 @@ fn checkpoint_protocol(checkpoint: Option<&bifrost_types::Checkpoint>) -> bifros
 /// fact, not a deadline - and is bounded by the identity space (a
 /// handful of providers and tenants per process).
 #[derive(Debug, Default)]
+///
+/// Deadlines are `tokio::time::Instant` - see the clock note at the top of
+/// this module. They are in-memory only; nothing persists a throttle wait.
 pub struct ThrottleBucket {
-    waits: HashMap<ThrottleKey, SystemTime>,
+    waits: HashMap<ThrottleKey, Instant>,
     memberships: HashMap<AccountId, HashSet<ThrottleKey>>,
 }
 
@@ -333,7 +359,7 @@ impl ThrottleBucket {
     /// Record a wait-until deadline for `key`. If a wait already
     /// exists, the later of the two deadlines wins (a stricter throttle
     /// from a parallel response should not shorten an earlier one).
-    pub fn record(&mut self, key: ThrottleKey, wait_until: SystemTime) {
+    pub fn record(&mut self, key: ThrottleKey, wait_until: Instant) {
         self.waits
             .entry(key)
             .and_modify(|existing| {
@@ -349,7 +375,7 @@ impl ThrottleBucket {
     /// membership so `wait_for_account` sees deadlines siblings record
     /// later. Per-account keys (`Account`, `Mailbox`) embed their
     /// account and need no membership entry.
-    pub fn record_for(&mut self, account: &AccountId, key: ThrottleKey, wait_until: SystemTime) {
+    pub fn record_for(&mut self, account: &AccountId, key: ThrottleKey, wait_until: Instant) {
         if matches!(key, ThrottleKey::Tenant(_) | ThrottleKey::Provider(_)) {
             self.memberships
                 .entry(account.clone())
@@ -362,9 +388,9 @@ impl ThrottleBucket {
     /// Return the remaining wait for `key` at `now`. `None` means no
     /// throttle applies (or the recorded deadline has expired).
     #[must_use]
-    pub fn wait_for(&self, key: &ThrottleKey, now: SystemTime) -> Option<Duration> {
+    pub fn wait_for(&self, key: &ThrottleKey, now: Instant) -> Option<Duration> {
         let until = *self.waits.get(key)?;
-        until.duration_since(now).ok().filter(|d| !d.is_zero())
+        until.checked_duration_since(now).filter(|d| !d.is_zero())
     }
 
     /// Longest remaining wait that applies to `account` as a whole at
@@ -374,7 +400,7 @@ impl ThrottleBucket {
     /// engine has no scope-to-mailbox mapping to pause anything
     /// narrower with.
     #[must_use]
-    pub fn wait_for_account(&self, account: &AccountId, now: SystemTime) -> Option<Duration> {
+    pub fn wait_for_account(&self, account: &AccountId, now: Instant) -> Option<Duration> {
         let own = self.wait_for(&ThrottleKey::Account(account.clone()), now);
         let shared = self
             .memberships
@@ -388,7 +414,7 @@ impl ThrottleBucket {
     /// Drop expired entries. Called opportunistically by the engine
     /// (e.g. between work items) to keep the map small. Memberships are
     /// retained: they record identity, not deadlines.
-    pub fn cleanup_expired(&mut self, now: SystemTime) {
+    pub fn cleanup_expired(&mut self, now: Instant) {
         self.waits.retain(|_, until| *until > now);
     }
 
@@ -527,7 +553,16 @@ fn record_throttle_parts(
     let Some(key) = resolve_throttle_key(scope, account, error) else {
         return;
     };
-    let wait_until = hint.not_before(SystemTime::now());
+    // THE clock boundary. A provider hint arrives as wall-clock evidence -
+    // either a bare duration (`After`) or an absolute HTTP date (`At`). It is
+    // resolved to a REMAINING DURATION against the wall clock here, once, and
+    // immediately anchored to the monotonic clock the wait sites sleep on.
+    // `min_delay` is the right resolver for both shapes: it returns the
+    // duration verbatim for `After` and the wall-clock delta for `At`,
+    // saturating at zero for a date already past. Converting anywhere else -
+    // or storing the wall-clock instant and subtracting later - reintroduces
+    // the two-clock mismatch this bucket exists to avoid.
+    let wait_until = Instant::now() + hint.min_delay(SystemTime::now());
     if let Ok(mut guard) = bucket.lock() {
         guard.record_for(account, key, wait_until);
     }
@@ -537,12 +572,18 @@ fn record_throttle_parts(
 /// pruning expired deadlines on the way. `None` when the account may
 /// drive work now (including when the mutex is poisoned - see
 /// [`record_throttle`]).
+///
+/// Deliberately takes no `now`: there is exactly one correct answer for an
+/// engine wait site - the timer clock's notion of now - and letting each
+/// caller supply one is how the wrong clock got read in the first place.
+/// Tests that need an explicit instant use `ThrottleBucket::wait_for_account`
+/// directly.
 #[must_use]
 pub(crate) fn account_throttle_wait(
     bucket: &std::sync::Mutex<ThrottleBucket>,
     account: &AccountId,
-    now: SystemTime,
 ) -> Option<Duration> {
+    let now = Instant::now();
     let mut guard = bucket.lock().ok()?;
     guard.cleanup_expired(now);
     guard.wait_for_account(account, now)
@@ -739,7 +780,9 @@ mod tests {
     #[test]
     fn throttle_bucket_records_and_expires() {
         let mut bucket = ThrottleBucket::new();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        // A bucket instant is monotonic now; anchor the test at a fixed
+        // point on that clock rather than on the wall clock.
+        let now = Instant::now();
         let key = ThrottleKey::Account(AccountId("a".into()));
         bucket.record(key.clone(), now + Duration::from_secs(5));
 
@@ -751,7 +794,9 @@ mod tests {
     #[test]
     fn throttle_bucket_take_max_of_overlapping_records() {
         let mut bucket = ThrottleBucket::new();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        // A bucket instant is monotonic now; anchor the test at a fixed
+        // point on that clock rather than on the wall clock.
+        let now = Instant::now();
         let key = ThrottleKey::Account(AccountId("a".into()));
         bucket.record(key.clone(), now + Duration::from_secs(5));
         bucket.record(key.clone(), now + Duration::from_secs(2));
@@ -761,7 +806,9 @@ mod tests {
     #[test]
     fn throttle_bucket_cleanup_drops_expired() {
         let mut bucket = ThrottleBucket::new();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        // A bucket instant is monotonic now; anchor the test at a fixed
+        // point on that clock rather than on the wall clock.
+        let now = Instant::now();
         let a = ThrottleKey::Account(AccountId("a".into()));
         let b = ThrottleKey::Account(AccountId("b".into()));
         bucket.record(a.clone(), now + Duration::from_secs(1));
@@ -781,7 +828,9 @@ mod tests {
         // has never failed. Attach-time enrollment needs a provider
         // identity channel that does not exist yet.
         let mut bucket = ThrottleBucket::new();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        // A bucket instant is monotonic now; anchor the test at a fixed
+        // point on that clock rather than on the wall clock.
+        let now = Instant::now();
         let a = AccountId("acc-1".into());
         let b = AccountId("acc-2".into());
         let key = ThrottleKey::Provider(Provider::Microsoft);
@@ -808,7 +857,9 @@ mod tests {
     #[test]
     fn wait_for_account_takes_the_longest_applicable_wait() {
         let mut bucket = ThrottleBucket::new();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        // A bucket instant is monotonic now; anchor the test at a fixed
+        // point on that clock rather than on the wall clock.
+        let now = Instant::now();
         let a = AccountId("acc-1".into());
         bucket.record_for(
             &a,
@@ -830,7 +881,9 @@ mod tests {
     fn wait_for_account_excludes_mailbox_keys() {
         // A per-mailbox throttle must not pause the whole account.
         let mut bucket = ThrottleBucket::new();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        // A bucket instant is monotonic now; anchor the test at a fixed
+        // point on that clock rather than on the wall clock.
+        let now = Instant::now();
         let a = AccountId("acc-1".into());
         bucket.record_for(
             &a,
@@ -849,7 +902,9 @@ mod tests {
         // expires and cleanup prunes it, a NEW deadline recorded by a
         // sibling still reaches the enrolled account.
         let mut bucket = ThrottleBucket::new();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        // A bucket instant is monotonic now; anchor the test at a fixed
+        // point on that clock rather than on the wall clock.
+        let now = Instant::now();
         let a = AccountId("acc-1".into());
         let key = ThrottleKey::Provider(Provider::Microsoft);
         bucket.record_for(&a, key.clone(), now + Duration::from_secs(1));
@@ -902,7 +957,7 @@ mod tests {
 
         record_reconcile_throttle(&bucket, &account, advice, &error);
 
-        assert!(account_throttle_wait(&bucket, &account, SystemTime::now()).is_some());
+        assert!(account_throttle_wait(&bucket, &account).is_some());
 
         // The drive loop and the push reconciler sleep this before
         // probing; the provider hint must win over the 1s fallback or

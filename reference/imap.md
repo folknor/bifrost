@@ -488,7 +488,80 @@ Output ordering is therefore input-window order, then lexical folder order withi
 
 ### Blob openers
 
-`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream`), each body section is emitted as its own `Bytes` page as it comes off the socket, and the consumer's back-pressure reaches the socket through the driver's `OwnedPermit` reservation. Like every other body path it carries a client-side byte budget (`RAW_FETCH_BUDGET`, 256 MiB, matching `HYDRATION_FETCH_BUDGET`), crossing which is `Error::FetchLimit`; the response size is the server's to choose, so the unbudgeted buffered read this path used to do could be made arbitrarily large by a corrupt or adversarial peer. The command future stays authoritative for the wire outcome, as in inventory / QRESYNC / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability (BODYSTRUCTURE traversal, a stable part-handle encoding, a consumer-facing projection that attaches handles) is filed as imap-G1.
+`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream`), each body section is emitted as its own `Bytes` page as it comes off the socket, and the consumer's back-pressure reaches the socket through the driver's `OwnedPermit` reservation. Like every other body path it carries a client-side byte budget (`RAW_FETCH_BUDGET`, 256 MiB, matching `HYDRATION_FETCH_BUDGET`), crossing which is `Error::FetchLimit`; the response size is the server's to choose, so the unbudgeted buffered read this path used to do could be made arbitrarily large by a corrupt or adversarial peer. The command future stays authoritative for the wire outcome, as in inventory / QRESYNC / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability is filed as imap-G1 and is being built in stages.
+
+**imap-G1 stage 1 (`account/parts.rs`) - foundation, deliberately unwired.**
+Two pieces exist and are exercised by tests, but nothing calls them: no
+projection mints a handle, `blob_range` stays `BlobRangeSupport::No`, and the
+openers stay `Unsupported`. Flipping the capability before a projection mints
+handles would advertise a byte path the crate cannot serve, which is the
+defect shape this crate has already paid for once.
+
+- `walk_bodystructure` flattens a parsed `BodyStructure` into the
+  individually fetchable parts, each carrying the IMAP part path, lowercased
+  media type/subtype, a `PartEncoding`, the server-reported encoded octet
+  size, and the identity the server gave (content-id verbatim,
+  content-location, filename). Numbering follows RFC 3501 Section 6.4.5 per
+  *message context*, not per node: a single-part message is part `1`; a
+  `multipart/*` container has no number of its own and is not emitted, its
+  path being only a prefix of its children's; and a `message/rfc822` part is
+  emitted at its own path AND opens a fresh context, so its inner multipart
+  numbers `P.1`/`P.2` and its inner *single* part is `P.1`. That last
+  composition is the case wrong implementations miss. Tests parse real wire
+  BODYSTRUCTURE bytes through the crate's own decoder (widened to
+  `pub(crate)` for exactly this) and pin the exact paths for text,
+  alternative, mixed-with-attachment, nested multipart, both embedded-message
+  shapes, and `multipart/signed`.
+- It returns a `PartWalk { parts, truncated }`, not a bare `Vec`, so
+  exhaustion cannot be silent: a caller building a projection that claims to
+  enumerate a message's parts can tell a depth-limited walk from a complete
+  one. `MAX_PART_DEPTH` is 64 and is counted exactly as the BODYSTRUCTURE
+  parser counts its own `MAX_BODY_NESTING_DEPTH` (one level per `multipart/*`
+  container and per `message/rfc822`, bound applied as `depth > MAX`), so for
+  anything that came off the wire the PARSER refuses over-deep input before
+  the traversal ever sees it and `truncated` is unreachable in production;
+  only a hand-built structure can reach the bound. The parity is pinned
+  behaviourally by two tests - a 64-deep `message/rfc822` chain walks complete,
+  a 65-deep one is rejected by the parser - rather than by naming the parser's
+  private constant, so either side drifting fails a test.
+- `PartEncoding` carries this crate's `TransferEncoding` classification AND
+  the server's own token. An encoding the crate does not model (`x-uuencode`
+  and the long `x-` tail) classifies as `Unknown`, and the token is the only
+  remaining description of how those octets are encoded; folding it away
+  would leave a later layer unable to tell a consumer either how to decode
+  the bytes or what the server claimed. The token is the parser's output, so
+  it is ASCII-lowercased (RFC 2045 Section 5.1 makes the token
+  case-insensitive) and otherwise untouched. What a consumer-facing surface
+  does with an unmodelled token - `bifrost-types`' `BlobEncoding` has no
+  unknown variant - is a stage-two decision; stage one owes the information,
+  not the policy.
+- `encode_part_handle` / `decode_part_handle` are the durable handle format,
+  now at version 2:
+  `imappart<version>:<folder-len>:<folder>:<uidvalidity>:<uid>:<path>:<encoding>:<token-len>:<token>`.
+  The version rides in the prefix token so an unknown version is refused as a
+  *version* rather than falling through to "not a handle", and it is never
+  reinterpreted under this version's field rules. v1 (which lacked the token
+  field) is refused outright rather than upgraded with a default: nothing has
+  ever minted a v1 handle, since the module is unwired and `blob_range` still
+  reports `No`, so a migration path would exist only for handles that cannot
+  exist. The folder is length-prefixed rather than escaped (mailbox names may
+  contain `:`), the encoding token is length-prefixed for the same reason (it
+  arrives as a quoted string and can contain `:`), UIDs and path components
+  are `nz-number`-checked, and the classification is a closed token set -
+  `TransferEncoding::from_token`'s tolerant `Unknown` fallback is deliberately
+  NOT used on decode, since it would launder a corrupted field into "hand back
+  undecoded octets". Decode also cross-checks the two encoding fields, but
+  only in the direction that cannot misfire: a modelled classification must
+  agree with `from_token` of the original token (catching `base64` paired with
+  a token of `b64`), while an `unknown` classification accepts any token, so a
+  handle minted by a build that models more encodings than this one is not
+  refused. `verify_uidvalidity` is the redemption check: a handle minted under
+  a prior mailbox epoch names a UID that now means a different message, and is
+  refused rather than fetched.
+
+Stage 2 wires it: a hydration/inventory projection that attaches handles, the
+`open_blob` / `open_blob_range` implementations over `BODY.PEEK[<path>]` with
+`<origin.count>` partials, and only then the capability flip.
 
 ### Bandwidth metering
 
@@ -656,6 +729,7 @@ crates/imap/src/
 |   |-- inventory.rs       - inventory + initial cursor establishment
 |   |-- mod.rs             - ImapAccount trait impl, helpers
 |   |-- mutate.rs          - bulk_set_flags, bulk_move, bulk_destroy
+|   |-- parts.rs           - BODYSTRUCTURE part traversal + part-handle codec (unwired)
 |   |-- pim.rs             - unified PIM primitives + conveniences
 |   |-- pool.rs            - per-folder connection checkout
 |   |-- push.rs            - IDLE-driven WatchEvents

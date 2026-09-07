@@ -40,7 +40,7 @@ use crate::types::response::{
 };
 use crate::types::validated::MailboxName;
 
-mod bodystructure;
+pub(crate) mod bodystructure;
 mod envelope_fetch;
 mod extensions;
 mod flags_caps;

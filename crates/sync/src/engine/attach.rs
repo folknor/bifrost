@@ -842,11 +842,7 @@ pub(super) async fn run_deferred_inventory_establishment(
             // inventory walk, mirroring the backfill partition runner:
             // deferred establishment drives the same heavy inventory
             // lane. Loop back to the boundary check after waking.
-            if let Some(wait) = crate::recovery::account_throttle_wait(
-                &throttles,
-                &account_id,
-                std::time::SystemTime::now(),
-            ) {
+            if let Some(wait) = crate::recovery::account_throttle_wait(&throttles, &account_id) {
                 tracing::debug!(
                     target: "bifrost.sync.backfill",
                     account = ?account_id,

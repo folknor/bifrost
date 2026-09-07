@@ -798,11 +798,7 @@ async fn run_backfill_partition_at_boundary(
         // that paused the polls would defeat the pause. Re-checked after
         // waking, and boundary-checked again, since a pause or a longer
         // deadline can land mid-sleep.
-        if let Some(wait) = crate::recovery::account_throttle_wait(
-            throttles,
-            account_id,
-            std::time::SystemTime::now(),
-        ) {
+        if let Some(wait) = crate::recovery::account_throttle_wait(throttles, account_id) {
             tracing::debug!(
                 target: "bifrost.sync.backfill",
                 account = ?account_id,

@@ -2988,6 +2988,35 @@ stable account identity, not the connection incarnation, and prevents detach
 plus immediate reattach from bypassing a provider wait. Expired waits are
 pruned opportunistically, so retained entries are time-bounded.
 
+Bucket deadlines are `tokio::time::Instant`, not `SystemTime`. Every wait
+site parks the returned duration as a `tokio::time::sleep`, so a deadline
+read on the wall clock is retired by a timer on a different clock; the two
+agree only where tokio's clock IS the system clock. Under paused time they do
+not, and the re-check loop then re-derives the full wait after every sleep and
+spins without progress - which is why the deferral had no hermetic test until
+the bucket moved. `tokio::time::Instant::now()` falls back to the system clock
+when no tokio clock is in force, so production behaviour is unchanged. Nothing
+persists a throttle deadline (the bucket is one in-memory `Arc<Mutex<_>>` per
+engine, never serialized), so a monotonic instant never has to survive a
+process. The wall-clock-to-monotonic conversion happens at exactly one
+boundary, `record_throttle_parts`: a provider `RetryHint` - a duration
+(`After`) or an absolute HTTP date (`At`) - is resolved through `min_delay`
+against `SystemTime::now()` and immediately anchored to `Instant::now()`.
+`account_throttle_wait` takes no `now` for the same reason: there is one
+correct clock for a wait site, and a caller-supplied instant is how the wrong
+one got read. This is the same move `bifrost-smtp` made for `AsyncDeadline`
+and `ByteBucket`.
+
+`tests/throttle_defers_changes.rs` pins the two engine-level facts the unit
+tests cannot reach: that a recorded deadline actually defers `changes_stream`
+(a scope that never failed - so it holds no retry advice and takes no local
+`retry_delay` sleep - stops polling on its fixed cadence and resumes when the
+`Retry-After` elapses), and that two attached slots share a `Provider`
+deadline (the sibling's own record is 1ms and long expired, so only the other
+account's 300s record can explain its pause). Both assert a poll COUNT flat
+across a window many cadences wide and then RESUMING, not a total elapsed
+time another timer could satisfy.
+
 Two documented limits on the cross-account reach. Enrollment is
 lazy - an account joins a shared key only when its own error stream
 names the identity - so the very FIRST provider-wide deadline is
@@ -3084,7 +3113,8 @@ crates/sync/src/
                           // BackfillConfig, MutationConfig, PushConfig,
                           // SchedulerConfig, AccountSlot, WorkerTask
   recovery.rs             // plan_recovery + RecoveryPlan dispatch;
-                          // ThrottleBucket (engine-wide) +
+                          // ThrottleBucket (engine-wide, monotonic
+                          // tokio::time::Instant deadlines) +
                           // resolve_throttle_key / record_throttle /
                           // account_throttle_wait;
                           // retry_delay; restart_scope_error;
