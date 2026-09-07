@@ -434,6 +434,82 @@ fn shared_mailbox_folder_projects_as_shared_namespaced_container() {
     assert_eq!(primary.native_id, "AAMkChild");
 }
 
+/// A shared mailbox's well-known folder roles are resolved on its own client,
+/// so a non-English shared Inbox carries `FolderRole::Inbox` (nc-4). The
+/// primary is armed with an EMPTY script, so a lookup that fell back to `/me`
+/// hits the seam's exhaustion panic; the shared script answers the listing,
+/// then the six well-known lookups, of which only `inbox` resolves. Ablation:
+/// with the primary's empty role map passed instead, "Posteingang" carries no
+/// role and the six lookups never reach the wire.
+#[tokio::test]
+async fn shared_mailbox_roles_are_resolved_on_the_shared_client() {
+    use reqwest::StatusCode;
+
+    let primary = GraphClient::new("token");
+    primary.script_rest([]);
+    let shared = GraphClient::new("token");
+    shared.script_rest([
+        ScriptedRestResponse::json(
+            StatusCode::OK,
+            json!({ "value": [
+                { "id": "AAMkInbox", "displayName": "Posteingang", "childFolderCount": 0 },
+                { "id": "AAMkReports", "displayName": "Berichte", "childFolderCount": 0 },
+            ]}),
+        ),
+        ScriptedRestResponse::json(StatusCode::OK, json!({ "id": "AAMkInbox" })),
+        ScriptedRestResponse::empty(StatusCode::NOT_FOUND),
+        ScriptedRestResponse::empty(StatusCode::NOT_FOUND),
+        ScriptedRestResponse::empty(StatusCode::NOT_FOUND),
+        ScriptedRestResponse::empty(StatusCode::NOT_FOUND),
+        ScriptedRestResponse::empty(StatusCode::NOT_FOUND),
+    ]);
+    let mut shared_clients = HashMap::new();
+    shared_clients.insert(
+        "shared@contoso.com".to_string(),
+        shared.for_shared_mailbox("shared@contoso.com"),
+    );
+    let account = GraphAccount::new_for_tests_with_shared_clients(
+        primary,
+        PushMode::GraphSubscriptions,
+        shared_clients,
+    );
+
+    let (containers, skipped) = shared_containers(&account).await;
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let inbox = containers
+        .iter()
+        .find(|container| container.owner_local_id.as_deref() == Some("AAMkInbox"))
+        .expect("the shared inbox is projected");
+    assert_eq!(
+        inbox.role,
+        Some(FolderRole::Inbox),
+        "a shared Inbox is routable by role, whatever its display name"
+    );
+    let reports = containers
+        .iter()
+        .find(|container| container.owner_local_id.as_deref() == Some("AAMkReports"))
+        .expect("the other folder is projected");
+    assert_eq!(reports.role, None);
+
+    let lookups: Vec<String> = shared
+        .take_rest_requests()
+        .into_iter()
+        .map(|request| request.url)
+        .filter(|url| url.contains("$select=id") && !url.contains("displayName"))
+        .collect();
+    assert_eq!(
+        lookups.len(),
+        6,
+        "one lookup per well-known folder: {lookups:?}"
+    );
+    assert!(
+        lookups
+            .iter()
+            .all(|url| url.contains("/users/shared%40contoso.com/mailFolders/")),
+        "every lookup runs on the shared mailbox's own client: {lookups:?}"
+    );
+}
+
 /// A shared container's `native_id` must be byte-identical to the
 /// `CursorScope::FolderType` string `discover_cursor_scopes` emits for
 /// the same folder - that identity is the join key between a container

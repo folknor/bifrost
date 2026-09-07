@@ -1526,6 +1526,64 @@ async fn detach_drops_push_records_so_a_reattach_cannot_reuse_dead_handles() {
     engine.detach(&account_id).await.expect("final detach");
 }
 
+/// The opt-in the contract needed: `detach_with_teardown` tears the
+/// server-side subscriptions down and then detaches, so a consumer that is
+/// done with the account states that once instead of remembering to call
+/// `unsubscribe_push` inside a window that closes silently. Plain `detach`
+/// is unchanged, which the test above pins. Ablation: with the teardown call
+/// removed, `unsubscribed` stays empty.
+#[tokio::test]
+async fn detach_with_teardown_tears_push_subscriptions_down_before_detaching() {
+    let account_id = AccountId("detach-with-teardown".to_owned());
+    let scope = CursorScope::Account;
+    let subscribed = Arc::new(Mutex::new(Vec::new()));
+    let unsubscribed = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([vec![scope.clone()]])),
+        established: Arc::new(Mutex::new(Vec::new())),
+        closed: Arc::new(AtomicUsize::new(0)),
+        closed_generations: Arc::new(Mutex::new(Vec::new())),
+        subscribed: Arc::clone(&subscribed),
+        unsubscribed: Arc::clone(&unsubscribed),
+        unsubscribe_failures: Arc::new(AtomicUsize::new(0)),
+        lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+        opens: AtomicUsize::new(0),
+    });
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::new(InMemoryCheckpointStore::new()) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = Arc::clone(&factory) as Arc<dyn AccountFactory>;
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("attach");
+    engine
+        .subscribe_push(&account_id, std::slice::from_ref(&scope))
+        .await
+        .expect("push subscription");
+    assert_eq!(subscribed.lock().expect("subscribed lock").len(), 1);
+
+    engine
+        .detach_with_teardown(&account_id)
+        .await
+        .expect("teardown and detach");
+
+    assert_eq!(
+        unsubscribed.lock().expect("unsubscribed lock").len(),
+        1,
+        "the server-side subscription must be torn down by the detach the consumer asked for"
+    );
+    assert!(
+        matches!(
+            engine.unsubscribe_push(&account_id).await,
+            Err(bifrost_sync::Error::AccountNotAttached(_))
+        ),
+        "and the account is detached afterwards"
+    );
+}
+
 #[tokio::test]
 async fn reopen_waits_for_resume_without_opening_during_pause() {
     let account_id = AccountId("paused-reopen".to_owned());

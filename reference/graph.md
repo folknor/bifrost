@@ -818,6 +818,16 @@ scopes; a per-mailbox permission denial skips with a `Warning`.
 `discover_memberships_inner` emits the foreign `MembershipScope::Mailbox(owner)`
 tag with the folder membership, and `inventory_stream` stamps it onto every
 foreign-scope item (the engine covering rule cannot form it).
+`containers_list` resolves each shared mailbox's well-known folder roles on
+that mailbox's own client (`well_known_folder_roles`, six `$select=id` GETs per
+shared mailbox at listing time, not per operation), so a shared Inbox / Sent /
+Drafts / Trash / Spam / Archive carries its `FolderRole` whatever its display
+name. Before nc-4 (ruled 2026-09-07) the shared leg passed an empty role map
+and fell back to matching the well-known NAME against the folder id, which
+never fires for a real id, so shared mailboxes carried no roles and the
+consumer's destructive-action routing (which folder is Trash, where the sent
+copy files) had nothing to go on. Pinned by
+`shared_mailbox_roles_are_resolved_on_the_shared_client`.
 `initial_delta_url` reads the prefix from `client_for_scope` and the native id
 from `parse_folder`, so the mailbox rides in `/users/{id}`, the id in
 `/mailFolders/{id}`.

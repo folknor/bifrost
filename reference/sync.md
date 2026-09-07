@@ -1520,14 +1520,28 @@ rejects with `AccountNotAttached` and reopen only runs on an attached
 slot, so nothing could have reached those records anyway.
 
 Detach is therefore the last point at which server-side teardown is
-possible, and it deliberately does NOT perform it - the contract leaves
-that with the consumer, because push delivers to a consumer-owned
+possible, and plain `detach` deliberately does NOT perform it - the contract
+leaves that with the consumer, because push delivers to a consumer-owned
 endpoint and an application that shuts down wanting events to queue for
 its next start is a legitimate pattern that unconditional teardown would
 break silently. A detach with records still registered means
 `unsubscribe_push` was never called, so the provider holds live
 subscriptions until it expires them itself (24h for Graph); that case is
 logged on `bifrost.sync.push` rather than absorbed.
+
+The other intent has its own door: `SyncEngine::detach_with_teardown` runs
+`unsubscribe_push` and then `detach`, so a consumer that is done with the
+account states it once rather than remembering a call inside a window that
+closes silently (xc-2, ruled 2026-09-07: an explicit opt-in, leaving plain
+`detach` unchanged; unconditional teardown was rejected for breaking the
+queue-for-later pattern silently, and a warning alone still left the consumer
+with nothing to act on). The detach runs whether or not the teardown succeeded
+- a subscription the provider refused to delete is retained
+`teardown_unconfirmed` and then dropped as stranded, with the same log line -
+and the teardown error is returned unless the detach itself failed. Pinned by
+`detach_with_teardown_tears_push_subscriptions_down_before_detaching`, beside
+`detach_drops_push_records_so_a_reattach_cannot_reuse_dead_handles`, which
+pins that plain `detach` still does not tear down.
 
 ## Mutation pipeline
 

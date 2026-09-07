@@ -513,29 +513,6 @@ container projection itself.
   (`parse_get_item_response_contact`). Whether non-mail public-folder items
   should project onto a contact/event type at all is a product decision, not
   a defect - hence filed rather than built.
-- **nc-4 (graph)** `well_known_folder_roles` is only correct for the primary
-  mailbox, so shared-mailbox containers fall back to display-name matching and
-  their Inbox / Sent carry no `FolderRole`. A correct fix costs about six extra
-  round-trips per shared mailbox; decide whether the roles are worth it.
-
-  Re-framed 2026-07-31 after asking what an end user actually loses. Not
-  cosmetic. `FolderRole` (`Inbox | Sent | Drafts | Archive | Trash |
-  Spam`, `crates/types/src/container.rs:87`) is documented as the canonical
-  role a container plays in ratatoskr's UI, so without it on a shared
-  mailbox the app holds names and no routing: Send does not know where to
-  file the copy, Delete does not know which folder is Trash, Save-draft
-  does not know Drafts, Not-spam has no target, and icons plus ordering
-  fall back to alphabetical.
-
-  The decisive part is the FALLBACK. Display-name matching is
-  locale-dependent - a German tenant's shared mailbox is `Gesendete
-  Elemente`, not `Sent` - so shared mailboxes work by accident on English
-  tenants and degrade silently everywhere else. The real question is
-  therefore not "are icons worth six round-trips" but "is correct
-  destructive-action routing on non-English tenants worth six round-trips
-  per shared mailbox AT OPEN" (not per operation). Framed that way it
-  looks like a yes, but it is still unruled.
-
 ## Cross-crate items from the bug-hunt loop (2026-07-29)
 
 Surfaced while working the per-crate bug-hunt ledgers of that wave (since
@@ -557,72 +534,6 @@ blocking; each is a real defect or a real decision, not a cleanup.
   call, so an account that never reopens keeps its orphan until the
   provider expires it (24h for Graph). If that window matters, add a
   bounded engine-side retry timer for unconfirmed records.
-
-- **xc-2 (types + sync + every account crate)** Subscription teardown depends
-  entirely on the caller, and the contract says so deliberately.
-  `Account::close` is idempotent LOCAL teardown and explicitly does not delete
-  durable server-side subscriptions (`reference/types.md`); engine detach
-  cancels workers and calls `close`; the engine tells consumers to tear the
-  subscriptions down themselves. So a consumer that detaches without
-  unsubscribing strands live server subscriptions - for Graph, up to 24h, with
-  provider-side expiry as the only backstop. This is the documented contract
-  rather than a defect, and `bifrost-graph` correctly must NOT add best-effort
-  deletion in `close`. The open question is whether the shared contract should
-  keep placing that burden on the consumer at all.
-
-  UNRULED as of 2026-07-31. Context below was verified against the code
-  during a review pass; the ruling was explicitly deferred, and the
-  reviewer disagreed with the recommendation recorded at the bottom, so
-  treat that recommendation as one input rather than a plan of record.
-
-  First, a naming trap worth knowing before reading any of this. There are
-  TWO entries, one per layer, and their names are near-anagrams:
-  - `Account::push_unsubscribe(handle)` - protocol-crate trait method
-    (`crates/types/src/account.rs`), destroys ONE subscription.
-  - `SyncEngine::unsubscribe_push(account_id)` - engine method
-    (`crates/sync/src/engine/mod.rs`), takes the account's registry records
-    and calls the trait method once per record.
-  `Account::close`'s doc points at the first; `SyncEngine::detach`'s doc
-  points at the second. Both are correct for their layer, and an app calls
-  the engine one because an app holds an engine, not an `Account`. Read
-  within a page of each other they look like a typo for one another.
-
-  Two facts the original entry does not capture, both verified:
-
-  1. The cleanup window closes SILENTLY. `SyncEngine::unsubscribe_push`
-     looks up `self.accounts` first and returns `AccountNotAttached`, so
-     after `detach` there is no API that can reach the handles - even
-     though the engine still holds them. The consumer's only opportunity
-     to do the job the contract assigns them ends at detach, with nothing
-     enforcing or signalling that.
-  2. Records outliving the account is FIXED: `detach` now takes the
-     registry records, so a reattach of the same `AccountId` cannot
-     inherit handles minted by a dead connection. Option D also landed in
-     its low-cost form - a detach with records still registered logs on
-     `bifrost.sync.push`. A structured `Warning` was not used: detach has
-     already torn the change stream down, so no lane is left to carry one.
-     Both are pure hygiene and foreclose none of the options below.
-
-  Options considered, stated neutrally (A and the log-line form of D have
-  landed; B and C remain open, and the contract question is UNRULED):
-  - **A** Hygiene only: `detach` clears the registry, and the window is
-    documented explicitly. Leaves the contract alone. Landed.
-  - **B** `detach` always tears down. Fixes both. Argument against: push
-    delivers to a consumer-owned endpoint (webhook, Pub/Sub topic), so an
-    app that shuts down and wants events to queue for its next start is a
-    legitimate pattern that unconditional teardown breaks silently.
-  - **C** A, plus an explicit opt-in (`detach_with_teardown`, or a flag),
-    leaving plain `detach` unchanged. Consumer states intent; neither
-    pattern is penalised. Costs public API surface.
-  - **D** A, plus a `Warning` emitted on detach when records were still
-    live, so an app that forgot finds out. No API addition.
-
-  The recommendation offered at the time was A + D, on the grounds that
-  (2) is a defect regardless and that surface should wait until ratatoskr
-  asks. That was disputed and is NOT settled - re-derive the choice rather
-  than inheriting it. The two entry points are disambiguated in
-  `reference/sync.md` under "Push reconciler", alongside the detach
-  semantics above.
 
 - **xc-4 (sync, maybe app). Rename `SyncEngine::reopen`.** The cadence
   ruling that produced this item (share-rediscovery cadence is consumer

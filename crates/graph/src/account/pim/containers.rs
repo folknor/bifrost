@@ -77,6 +77,19 @@ pub(crate) async fn containers_list(account: GraphAccount) -> Result<ContainerLi
 /// the shared mailbox, carrying the classified error) plus the remaining
 /// containers: one revoked share must not blank the whole sidebar, and it
 /// must not vanish from it silently either.
+///
+/// Each shared mailbox's well-known folder roles are resolved on ITS OWN
+/// client (nc-4, ruled 2026-09-07). A shared mailbox's `inbox` / `sentItems` /
+/// `deletedItems` ids are its own, so the primary's role map cannot apply,
+/// and without a per-mailbox lookup the role fell back to
+/// `role_from_well_known_name`, which matches the well-known NAME against the
+/// folder id - a match that only ever fires when the id happens to be the
+/// well-known name itself. Shared mailboxes therefore carried no `FolderRole`
+/// at all, and `FolderRole` is what the consumer routes destructive actions
+/// on: with none, Delete does not know which folder is Trash, Send does not
+/// know where to file the copy, Save-draft does not know Drafts. The cost is
+/// six `$select=id` GETs per shared mailbox at `containers_list`, not per
+/// operation, and that was judged worth correct routing.
 pub(super) async fn shared_containers(
     account: &GraphAccount,
 ) -> (Vec<Container>, Vec<SkippedScope>) {
@@ -88,14 +101,14 @@ pub(super) async fn shared_containers(
     for mailbox in mailboxes {
         let client = &account.shared_clients[mailbox];
         match client.list_mail_folders_recursive().await {
-            Ok(folders) => containers.extend(
-                folders
-                    .into_iter()
-                    // A shared mailbox's well-known folder ids are not the
-                    // primary's, so the primary role map must not be applied
-                    // here; role falls back to the well-known-name match.
-                    .map(|folder| container_from_folder(folder, &HashMap::new(), Some(mailbox))),
-            ),
+            Ok(folders) => {
+                let roles = well_known_folder_roles(client).await;
+                containers.extend(
+                    folders
+                        .into_iter()
+                        .map(|folder| container_from_folder(folder, &roles, Some(mailbox))),
+                );
+            }
             Err(error) => skipped.push(SkippedScope {
                 scope: ErrorScope::Mailbox {
                     id: mailbox.clone().into(),

@@ -509,7 +509,8 @@ impl SyncEngine {
     /// aborts workers within `detach_timeout`, closes the live account,
     /// and removes engine registrations. It does not wait for a
     /// consumer-acked safe boundary and does not destroy server-side
-    /// push subscriptions; call [`Self::unsubscribe_push`] first for that.
+    /// push subscriptions; call [`Self::unsubscribe_push`] first for that,
+    /// or [`Self::detach_with_teardown`] to do both in one step.
     ///
     /// Detach is the LAST point at which that call is possible: it drops
     /// this incarnation's push registry records, and afterwards
@@ -540,6 +541,34 @@ impl SyncEngine {
             guard.remove(account_id);
         }
         result
+    }
+
+    /// Tear down the account's server-side push subscriptions, then detach
+    /// it.
+    ///
+    /// The explicit opt-in the push contract needed (xc-2, ruled 2026-09-07,
+    /// option C). Plain [`Self::detach`] deliberately leaves server-side
+    /// subscriptions alive, because push delivers to a consumer-owned endpoint
+    /// and an app that wants events to queue for its next start is a
+    /// legitimate shape; but the window in which a consumer CAN tear them down
+    /// closes silently at detach, after which `unsubscribe_push` answers
+    /// `AccountNotAttached` for handles the engine still holds. This method
+    /// is the other shape stated as intent: a consumer that is done with the
+    /// account says so once, and neither pattern is penalised. Unconditional
+    /// teardown in `detach` was rejected because it breaks the queue-for-later
+    /// pattern silently, and a warning alone still left the consumer with no
+    /// way to act on it.
+    ///
+    /// The detach runs whether or not the teardown succeeded: a subscription
+    /// the provider refused to delete is retained as `teardown_unconfirmed`
+    /// by `unsubscribe_push` and then dropped by the detach as stranded, with
+    /// the same log line a plain detach emits. The teardown error is what this
+    /// returns in that case, so the caller learns the provider still holds a
+    /// subscription; a detach error takes precedence, since it is the later
+    /// failure and the one the caller can least ignore.
+    pub async fn detach_with_teardown(&self, account_id: &AccountId) -> Result<(), Error> {
+        let teardown = self.unsubscribe_push(account_id).await;
+        self.detach(account_id).await.and(teardown)
     }
 
     /// Teardown body. Runs under the lifecycle guard taken by
