@@ -385,7 +385,7 @@ impl SyncEngine {
             .get(account_id)
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let account = slot.current.load_full();
-        let changes_tx = slot.multiplexer.changes_tx.clone();
+        let delivery = Arc::clone(&slot.delivery);
         let coverage = Arc::clone(&slot.coverage);
         let writer_tx = self
             .ack_senders
@@ -399,7 +399,7 @@ impl SyncEngine {
             account.as_ref().as_ref(),
             account_id,
             &ledger,
-            Some(&changes_tx),
+            Some(&delivery),
             &writer_tx,
             &coverage,
             max_requests,
@@ -718,6 +718,7 @@ impl SyncEngine {
             shutdown: &slot.shutdown,
             writer: &writer,
             coverage: &slot.coverage,
+            delivery: &slot.delivery,
         };
         loop {
             if !slot.control.wait_until_running(&slot.shutdown).await {
@@ -767,10 +768,18 @@ impl SyncEngine {
         Ok(skips.clone())
     }
 
-    /// Subscribe to the per-account unified change stream. Each
-    /// subscriber gets its own broadcast receiver; missed events
+    /// Subscribe to the per-account unified change stream as the ACKNOWLEDGING
+    /// consumer. Each subscriber gets its own broadcast receiver; missed events
     /// (slow consumer) are dropped per `tokio::sync::broadcast`'s
     /// lagging semantics.
+    ///
+    /// The receiver this hands out is NUMBERED: it opens the subscriber gate
+    /// that cold-start producers park on, its reads hold and release the
+    /// backfill bound, its departure sweeps what nobody else can acknowledge,
+    /// and its lag abandons the account's outstanding registrations. Every one
+    /// of those follows from "this receiver may acknowledge", so it MUST be
+    /// polled or dropped. A reader that only watches wants
+    /// [`Self::account_changes_observer`] instead.
     pub fn account_changes_stream(
         &self,
         account_id: &AccountId,
@@ -792,6 +801,42 @@ impl SyncEngine {
         // they observe the new subscriber without hot-polling.
         slot.subscriber_notify.notify_waiters();
         Ok(receiver)
+    }
+
+    /// Observe the per-account unified change stream without ever
+    /// acknowledging on it.
+    ///
+    /// The observer sees every event the acknowledging receiver sees, and the
+    /// engine never waits on it: it does not open the subscriber gate, a page
+    /// delivered to it alone counts as delivered to nobody, its reads neither
+    /// hold nor release the backfill bound, its departure sweeps nothing, and
+    /// its lag is reported to the observer alone without abandoning any
+    /// registration. It may be held unpolled indefinitely at no cost to the
+    /// account. An observer that lags still receives the `ChangeStreamLagged`
+    /// warning, describing its own gap.
+    ///
+    /// Acknowledging from an observer is a contract violation: the engine
+    /// judged the page delivered to nobody and may already have retired it. A
+    /// separate method rather than a flag on `account_changes_stream`, because
+    /// the two are different roles and a flag would let a call site flip one
+    /// into the other.
+    ///
+    /// Subscribing an observer BEFORE the acknowledger is safe, which is the
+    /// point: before this existed, an early observer satisfied the subscriber
+    /// gate by receiver count, cold start ran its pages into the observer, and
+    /// the acknowledger, joining at the ring's tail, could never see them.
+    pub fn account_changes_observer(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<crate::multiplexer::ChangesReceiver, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        // No `subscriber_notify` here, deliberately: the gate counts numbered
+        // receivers, and an observer is not one, so there is nothing for a
+        // parked producer to wake up for.
+        Ok(slot.delivery.observe())
     }
 
     /// Subscribe to the per-account control stream. Engine publishes

@@ -512,15 +512,18 @@ change cursor in the registry.
 
 `account_changes_stream` returns `ChangesReceiver`, which preserves the
 ordinary broadcast `recv` / `try_recv` shape but converts ring overflow
-into a synthetic account-scoped `OperatorAttentionNeeded` warning. The
+into a synthetic account-scoped `ChangeStreamLagged` warning. The
 warning carries the overwritten batch count and directs the consumer to
 reconcile from its last acknowledged checkpoint; retained ring entries
 remain readable afterward. The engine cannot replay the overwritten
 batches in-session, but it never presents that loss as success.
+`account_changes_observer` returns the same type in its observer role: same
+events, same lag warning shape, but the engine never waits on it and its lag
+abandons nothing (see the consumer contract under "Bounded backfill lane").
 
-Observing a lag also abandons the account's outstanding checkpoint
-publications through the per-account `Publications` ledger, and the
-warning's `next_action` reports how many. This is load-bearing, not
+Observing a lag on the ACKNOWLEDGING receiver also abandons the account's
+outstanding checkpoint publications through the per-account `Publications`
+ledger, and the warning's `next_action` reports how many. This is load-bearing, not
 tidy-up: registration runs before the send and an entry leaves
 only through a matching consumer ack, so a registration whose batch the
 ring destroyed can never be retired and would gate every later `pause` /
@@ -674,9 +677,11 @@ deferred-inventory fusion path uses): cold-start pages broadcast onto
 the per-account channel during `attach`, but the consumer can only
 `account_changes_stream` after `attach` inserts the slot, and a
 `tokio::broadcast` receiver that joins late starts at the ring tail and
-never sees values sent before it subscribed (the slot's sentinel
-receiver keeps `receiver_count()` at 1, so the send "succeeds" in front
-of no real reader). For a `Ready`-cursor account whose entire cold start
+never sees values sent before it subscribed (the slot keeps a sentinel
+receiver so the channel never closes, and the send "succeeds" in front of
+no real reader). The gate asks `ChangeDelivery::has_numbered_subscriber`,
+never the broadcast's receiver count, so neither the sentinel nor an
+observer opens it. For a `Ready`-cursor account whose entire cold start
 rides backfill (Gmail `CursorScope::Account`, JMAP
 `CursorScope::Type(Email)`) skipping the wait silently drops the initial
 inventory page and the consumer ingests zero objects. That gate and the
@@ -823,38 +828,57 @@ above exactly as it was. Both producers send into the same ring and the bound
 is consulted only before a backfill send, so there is no fairness arbiter: when
 both have a batch ready, both send.
 
-**The consumer contract this rests on.** `account_changes_stream` hands out
-any number of receivers, and exactly ONE of them acknowledges. The others are
-observers. Two independent acknowledgers are not supported by this engine: the
-boundary ledger keeps one entry per lane and releases it on the first
-acknowledgement, so the slower acknowledger's own registration is settled out
-from under it. The RING, though, is followed by the slowest reader, not the
+**The consumer contract this rests on.** There are two subscriptions, and they
+are two roles. `account_changes_stream` hands out the ACKNOWLEDGING receiver,
+NUMBERED by the delivery gate; `account_changes_observer` hands out an
+OBSERVER, unnumbered, that sees the same events and is never waited on. Exactly
+one acknowledger is supported: the boundary ledger keeps one entry per lane and
+releases it on the first acknowledgement, so a second acknowledger's own
+registration is settled out from under it. Several numbered receivers are
+still admitted and the RING is followed by the slowest of them, not the
 fastest: a page charges the lane while any live numbered receiver that could
-hold it has not read it, so an observer that reads instantly cannot run cold
-start ahead of an acknowledger that persists as it goes. Following the fastest
-reader instead reproduced the overrun the bound exists to prevent - the observer
-frees the producer, the acknowledger falls `changes_capacity` events behind and
-lags, `on_lag` abandons the walk's pages and withholds its marker, and the
-cycle repeats for the life of the attachment. The acknowledging receiver must
-still subscribe FIRST: the subscriber gate is a receiver count, so an observer
-that arrives before the acknowledger satisfies it and takes delivery of pages
-the acknowledger - joining at the ring's tail - can never see. That was already
-the failure shape before the bound existed, when such a walk ran into the
-observer and settled. An explicit observer subscription that counts for neither
-the gate nor the bound is the clean fix; it is ruled and not yet built, and it
-is also what makes an observer ineligible for the slowest-reader rule rather
-than merely harmless to it.
+hold it has not read it. Following the fastest reader instead reproduced the
+overrun the bound exists to prevent - the fast reader frees the producer, the
+acknowledger falls `changes_capacity` events behind and lags, `on_lag`
+abandons the walk's pages and withholds its marker, and the cycle repeats for
+the life of the attachment.
+
+An observer counts for nothing, and each of the three places that used to read
+a raw receiver count now asks the gate instead. The subscriber gate
+(`wait_for_real_subscriber`) asks `ChangeDelivery::has_numbered_subscriber`,
+so an observer that arrives first no longer opens it and takes delivery of
+pages the acknowledger - joining at the ring's tail - can never see; that was
+the failure shape before the bound existed, when a walk ran into the observer
+and settled, and it is why the acknowledger once had to subscribe first, which
+it no longer must. A publication that expects an acknowledgement is sent
+through `ChangeDelivery::publish_backfill` or
+`ChangeDelivery::publish_acknowledgeable`, both of which answer "did a NUMBERED
+receiver take delivery" from the live set under the gate's own lock - a page
+that reached only observers reached nobody, and is retired at once rather than
+staying registered for an acknowledgement that can never come. And an observer
+carries no control handle, so its lag is reported to it alone
+(`ChangeStreamLagged`, "observer stream lagged") without abandoning any
+registration; abandoning on an observer's lag voided every in-flight walk on
+the account because a UI reader was slow. Its reads free no capacity
+(`note_receipt` is keyed on the numbering, pinned by
+`an_unnumbered_receivers_read_frees_no_capacity`), and it may be held unpolled
+for ever at no cost. Acknowledging from an observer is a contract violation:
+the engine judged the page delivered to nobody. The two are separate methods
+rather than a flag on one, because the roles differ and a flag would let a call
+site flip one into the other. Pinned by
+`an_observer_counts_for_neither_the_gate_nor_the_delivery` and
+`an_observers_lag_abandons_nothing`.
 
 **Every numbered receiver MUST be polled or dropped.** Every receiver
 `account_changes_stream` hands out is numbered, so a consumer that opens a
-second receiver for a UI and stops polling it holds up to `lane_capacity` pages
-unread for the life of the attachment and parks cold start permanently. That
-stall reports nothing on its own - the departure warning fires on drop and the
-lag warning on poll, and this receiver does neither - so `LaneGate` warns on
+second such receiver for a UI and stops polling it holds up to `lane_capacity`
+pages unread for the life of the attachment and parks cold start permanently.
+That stall reports nothing on its own - the departure warning fires on drop and
+the lag warning on poll, and this receiver does neither - so `LaneGate` warns on
 `bifrost.sync.backfill` when a park BEGINS, at most once per 30s per account,
 naming the account, the charged scopes and the receiver sequences holding the
-charge (`PendingCoverage::backfill_charge_holders`). The ruled observer
-subscription is what lifts the obligation for receivers that only watch.
+charge (`PendingCoverage::backfill_charge_holders`). A receiver that only
+watches should be an observer, which carries no such obligation.
 
 **The precise guarantee, which is narrower than "the slowest reader".** The
 bound follows the slowest live numbered reader among pages NOT YET
@@ -870,10 +894,10 @@ every outstanding registration of the account, including pages the acknowledger
 read but had not answered for, the marker is withheld and the walk restarts.
 The structural close is a residual `(id, delivered_at, readers)` record kept
 when an entry leaves the ledger still unread by an eligible live receiver; it
-is filed as a residual and deliberately not built here. The
-ruled observer subscription removes the case where the slow receiver is an
-observer, and what remains after it is two ACKNOWLEDGING receivers, which the
-contract above already declares unsupported.
+is filed as a residual and deliberately not built here. The observer
+subscription removes the case where the slow receiver is an observer - an
+observer is unnumbered and never in the reader set - and what remains is two
+ACKNOWLEDGING receivers, which the contract above already declares unsupported.
 
 **The permit is the RECEIPT, not the acknowledgement.** A page charges the lane
 from its publication until every eligible NUMBERED receiver has read it off the
@@ -1006,8 +1030,12 @@ transition that removes the entries, and announces the same
 is never swept, since a receiver subscribing in that window really does receive
 it. One mutex orders a send with its stamp, a subscribe with its number, and a
 receiver's destruction with its unregister and sweep; the lock order is
-delivery then coverage, never the reverse. Live changes send on the raw sender
-and are never stamped or swept. The receiver holds a weak handle to the gate,
+delivery then coverage, never the reverse. Live-lane publications are never
+stamped or swept, but one that expects an acknowledgement still goes through
+the gate (`publish_acknowledgeable`), which takes the same lock only to answer
+whether a numbered receiver was live at the send; only events nobody
+acknowledges - warnings, terminations, barrier pages - send on the raw sender.
+The receiver holds a weak handle to the gate,
 so a receiver retained across `detach` sees `Closed` rather than keeping the
 sender alive itself. The acknowledgeability question cannot be answered by the
 ledger alone, because `claim_checkpoint` falls back to the publication receipt
@@ -1062,7 +1090,9 @@ the ledger tests in
 `multiplexer::tests` (multi-threaded: a numbered receiver's read frees capacity
 with no acknowledgement while its registration survives, a superseded page's
 receipt reaches it inside its survivor, an unnumbered reader's read frees
-nothing), and the reset and ack-failure tests in `engine/tests.rs`.
+nothing, an observer counts for neither the gate nor the delivery decision and
+its lag abandons nothing), and the reset and ack-failure tests in
+`engine/tests.rs`.
 Everything in the integration file runs current-thread under `start_paused`
 with no wall-clock sleeps; none of it is a race test. Each ablation named in
 those tests' doc comments was applied, observed to fail the test, and restored,

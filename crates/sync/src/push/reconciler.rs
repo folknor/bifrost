@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use bifrost_types::{Account, AccountId, CursorScope, HintPayload, InvalidationHint, WatchEvent};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use arc_swap::ArcSwap;
@@ -17,13 +17,18 @@ use crate::cancel::BoundaryView;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::{Error, Warning};
-use crate::multiplexer::{ChangesEvent, MultiplexerEvent, ReopenRequest, drive_changes_stream};
+use crate::multiplexer::{
+    ChangeDelivery, ChangesEvent, MultiplexerEvent, ReopenRequest, drive_changes_stream,
+};
 
 pub struct Reconciler {
     pub account_id: AccountId,
     pub account: Arc<ArcSwap<Arc<dyn Account>>>,
     pub cursors: Arc<CursorRegistry>,
-    pub changes_tx: broadcast::Sender<MultiplexerEvent>,
+    /// The account's change delivery gate. The reconciler's drives publish
+    /// checkpoints, and a published checkpoint has to know whether a NUMBERED
+    /// receiver took delivery; warnings and terminations go on its raw sender.
+    pub delivery: Arc<ChangeDelivery>,
     pub boundary: BoundaryView,
     pub shutdown: CancellationToken,
     pub control: SyncControl,
@@ -90,7 +95,7 @@ impl Reconciler {
                 }
             }
             WatchEvent::Disconnected => {
-                let _ = self.changes_tx.send(self.warning_event(
+                let _ = self.delivery.sender().send(self.warning_event(
                     "push transport disconnected",
                     bifrost_types::WarningKind::Other,
                 ));
@@ -150,7 +155,7 @@ impl Reconciler {
                             checkpoint: None,
                             publication: None,
                         };
-                        let _ = self.changes_tx.send(me);
+                        let _ = self.delivery.sender().send(me);
                     }
                     RecoveryPlan::Reconcile(advice) => {
                         crate::recovery::record_reconcile_throttle(
@@ -172,7 +177,7 @@ impl Reconciler {
                             checkpoint: None,
                             publication: None,
                         };
-                        let _ = self.changes_tx.send(me);
+                        let _ = self.delivery.sender().send(me);
                     }
                     RecoveryPlan::Terminal(fatal) => {
                         let me = MultiplexerEvent {
@@ -183,7 +188,7 @@ impl Reconciler {
                             checkpoint: None,
                             publication: None,
                         };
-                        let _ = self.changes_tx.send(me);
+                        let _ = self.delivery.sender().send(me);
                     }
                 }
             }
@@ -256,7 +261,7 @@ impl Reconciler {
                 .with_drive(&scope, |cursor, registry_generation| {
                     let account_swap = self.account.load_full();
                     let cursors = Arc::clone(&self.cursors);
-                    let changes_tx = self.changes_tx.clone();
+                    let delivery = Arc::clone(&self.delivery);
                     let boundary = self.boundary.clone();
                     let control = self.control.clone();
                     let scope = scope.clone();
@@ -267,7 +272,7 @@ impl Reconciler {
                             scope,
                             cursor,
                             cursors,
-                            changes_tx,
+                            delivery,
                             boundary,
                             Some(control),
                             Some(registry_generation),

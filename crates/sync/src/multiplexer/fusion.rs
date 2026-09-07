@@ -22,14 +22,13 @@ use bifrost_types::{
     SyncEvent,
 };
 use futures::stream::StreamExt;
-use tokio::sync::broadcast;
 
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::Error;
 use crate::inventory_walk::{InventoryWalk, WalkDecision};
 
-use super::MultiplexerEvent;
+use super::{ChangeDelivery, MultiplexerEvent};
 
 /// Outcome of an inventory fusion pass.
 #[derive(Debug, Clone)]
@@ -78,20 +77,25 @@ impl InventoryFusion {
     }
 
     /// Same contract as `run`, but each `Batch` of inventory entries
-    /// is fanned out to `changes_tx` as `Change::ObjectChange::Created`
-    /// events BEFORE the terminal cursor is acknowledged. This is the
-    /// only path inventory data flows to consumers for
-    /// `EstablishViaInventory` scopes - dropping it would lose every
+    /// is fanned out on the account's change delivery as
+    /// `Change::ObjectChange::Created` events BEFORE the terminal cursor is
+    /// acknowledged. This is the only path inventory data flows to consumers
+    /// for `EstablishViaInventory` scopes - dropping it would lose every
     /// Graph object and every IMAP-Basic / CONDSTORE-only folder's
     /// cold-start contents.
+    ///
+    /// The delivery gate rather than the raw sender, because every
+    /// checkpoint-bearing page this walk publishes registers a claim that only
+    /// a NUMBERED receiver can answer for, and only the gate knows whether one
+    /// took delivery.
     pub async fn run_with_broadcast(
         &self,
         account: &dyn Account,
         scope: CursorScope,
-        changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
+        delivery: Option<Arc<ChangeDelivery>>,
     ) -> Result<FusionOutcome, Error> {
         let stream = account.inventory_stream(scope.clone());
-        self.run_stream(scope, stream, changes_tx).await
+        self.run_stream(scope, stream, delivery).await
     }
 
     /// Resume a provider-owned inventory page cursor. The account returns
@@ -101,7 +105,7 @@ impl InventoryFusion {
         &self,
         account: &dyn Account,
         cursor: bifrost_types::ChangeCursor,
-        changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
+        delivery: Option<Arc<ChangeDelivery>>,
     ) -> Result<FusionOutcome, Error> {
         let scope = cursor.scope.clone();
         let classified_as_inventory = account.is_inventory_cursor(&cursor);
@@ -112,14 +116,14 @@ impl InventoryFusion {
         let Some(stream) = stream else {
             return Ok(FusionOutcome::NoCursor);
         };
-        self.run_stream(scope, stream, changes_tx).await
+        self.run_stream(scope, stream, delivery).await
     }
 
     async fn run_stream(
         &self,
         scope: CursorScope,
         mut stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent>,
-        changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
+        changes_tx: Option<Arc<ChangeDelivery>>,
     ) -> Result<FusionOutcome, Error> {
         let _activity = match &self.control {
             Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
@@ -187,8 +191,7 @@ impl InventoryFusion {
                         // Register before publishing so a fast consumer
                         // ack cannot land before the entry exists and
                         // leave it outstanding forever.
-                        let delivered = tx.send(me).unwrap_or(0);
-                        if !super::delivered_to_real_subscriber(delivered) {
+                        if !tx.publish_acknowledgeable(me) {
                             // Nothing can ever acknowledge it, so the claim
                             // would sit in the registry for the life of the
                             // attachment.
@@ -205,7 +208,7 @@ impl InventoryFusion {
                             checkpoint: None,
                             publication: None,
                         };
-                        let _ = tx.send(me);
+                        let _ = tx.sender().send(me);
                     }
                     return Ok(FusionOutcome::Terminated(err));
                 }
@@ -222,7 +225,7 @@ impl InventoryFusion {
                             &scope,
                         );
                         if let Some(tx) = &changes_tx {
-                            let _ = tx.send(MultiplexerEvent {
+                            let _ = tx.sender().send(MultiplexerEvent {
                                 scope: scope.clone(),
                                 event: Arc::new(SyncEvent::Terminated(error.clone())),
                                 checkpoint: None,
@@ -286,7 +289,7 @@ impl InventoryFusion {
                             checkpoint: None,
                             publication: None,
                         };
-                        let _ = tx.send(me);
+                        let _ = tx.sender().send(me);
                     }
                 }
                 bifrost_types::InventoryEvent::Progress(_) => {}
@@ -357,7 +360,7 @@ impl InventoryFusion {
     /// and converging, but objects are known-missing and only an operator can
     /// decide whether to repair, wait, or accept the gap.
     fn warn_degraded(
-        changes_tx: &Option<broadcast::Sender<MultiplexerEvent>>,
+        changes_tx: &Option<Arc<ChangeDelivery>>,
         scope: &CursorScope,
         coverage: &bifrost_types::InventoryCoverageReport,
     ) {
@@ -385,7 +388,7 @@ impl InventoryFusion {
                 )
             },
         );
-        let _ = tx.send(MultiplexerEvent {
+        let _ = tx.sender().send(MultiplexerEvent {
             scope: scope.clone(),
             event: Arc::new(SyncEvent::Warning(warning)),
             checkpoint: None,
@@ -395,7 +398,7 @@ impl InventoryFusion {
 
     fn forward_inventory_batch(
         &self,
-        tx: &broadcast::Sender<MultiplexerEvent>,
+        tx: &ChangeDelivery,
         scope: &CursorScope,
         batch: &bifrost_types::InventoryBatch,
     ) {
@@ -436,8 +439,7 @@ impl InventoryFusion {
             checkpoint: batch.checkpoint.clone(),
             publication: publication.clone(),
         };
-        let delivered = tx.send(me).unwrap_or(0);
-        if !super::delivered_to_real_subscriber(delivered) {
+        if !tx.publish_acknowledgeable(me) {
             self.retire_claim(publication);
         }
     }
@@ -486,8 +488,8 @@ fn validate_checkpoint_envelope(checkpoint: Option<&Checkpoint>) -> Result<(), E
         }),
         Some(Checkpoint::Backfill(_)) => Err(Error::Other(
             "inventory fusion batch carried a backfill checkpoint; the fusion path publishes \
-             on the raw sender, so such a publication is charged against the backfill bound \
-             and never swept"
+             without a delivery stamp, so such a publication is charged against the backfill \
+             bound and never swept"
                 .into(),
         )),
         _ => Ok(()),
@@ -524,7 +526,7 @@ mod tests {
     ///
     /// Latent rather than live - no provider in this workspace attaches one - and
     /// refused for a structural reason: fusion registers the publication and then
-    /// sends on the RAW sender, so a `Lane::Backfill` entry created here is never
+    /// publishes it unstamped, so a `Lane::Backfill` entry created here is never
     /// stamped with a delivery. An unsent stamp is deliberately never swept, so
     /// that entry is charged against the account's backfill bound until an
     /// acknowledgement, a lag or a reset frees it - a permanent slot of the bound
@@ -637,7 +639,11 @@ mod tests {
         let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
 
         fusion
-            .run_stream(CursorScope::Account, stream, Some(changes_tx))
+            .run_stream(
+                CursorScope::Account,
+                stream,
+                Some(Arc::new(ChangeDelivery::new(changes_tx))),
+            )
             .await
             .expect("a clean walk carrying a warning still completes");
 
@@ -678,7 +684,11 @@ mod tests {
         let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
 
         let outcome = fusion
-            .run_stream(CursorScope::Account, stream, Some(changes_tx))
+            .run_stream(
+                CursorScope::Account,
+                stream,
+                Some(Arc::new(ChangeDelivery::new(changes_tx))),
+            )
             .await;
         assert!(
             outcome.is_err(),

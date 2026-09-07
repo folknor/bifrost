@@ -324,7 +324,7 @@ impl SyncEngine {
             account_id: account_id.clone(),
             account: Arc::clone(&current),
             cursors: Arc::clone(&cursors),
-            changes_tx: changes_tx.clone(),
+            delivery: Arc::clone(&delivery),
             boundary: boundary_view.clone(),
             shutdown: shutdown.clone(),
             control: control.clone(),
@@ -453,7 +453,7 @@ impl SyncEngine {
             cursors: Arc::clone(&cursors),
             config: self.config.multiplexer,
             boundary: boundary_view.clone(),
-            changes_tx: changes_tx.clone(),
+            delivery: Arc::clone(&delivery),
             control: control.clone(),
             shutdown: multiplexer_cancel.clone(),
             reopen_tx: reopen_tx.clone(),
@@ -819,7 +819,6 @@ pub(super) async fn run_deferred_inventory_establishment(
     // terminated fusion can be dispatched through `ctx.recovery`.
     let account = Arc::clone(&ctx.current);
     let account_id = ctx.account_id.clone();
-    let changes_tx = ctx.changes_tx.clone();
     let control = ctx.control.clone();
     let cursors = Arc::clone(&ctx.cursors);
     let coverage = Arc::clone(&ctx.coverage);
@@ -827,7 +826,7 @@ pub(super) async fn run_deferred_inventory_establishment(
     let shutdown = ctx.shutdown.clone();
     let throttles = Arc::clone(&ctx.throttles);
     let writer_tx = ctx.writer_tx.clone();
-    if !wait_for_real_subscriber(&changes_tx, &ctx.subscriber_notify, &shutdown).await {
+    if !wait_for_real_subscriber(&ctx.delivery, &ctx.subscriber_notify, &shutdown).await {
         return;
     }
     for inventory in scopes {
@@ -902,12 +901,16 @@ pub(super) async fn run_deferred_inventory_establishment(
             let result = match &inventory {
                 DeferredInventory::Start(_) => {
                     fusion
-                        .run_with_broadcast(acc, scope.clone(), Some(changes_tx.clone()))
+                        .run_with_broadcast(acc, scope.clone(), Some(Arc::clone(&ctx.delivery)))
                         .await
                 }
                 DeferredInventory::Resume(cursor) => {
                     fusion
-                        .run_resume_with_broadcast(acc, cursor.clone(), Some(changes_tx.clone()))
+                        .run_resume_with_broadcast(
+                            acc,
+                            cursor.clone(),
+                            Some(Arc::clone(&ctx.delivery)),
+                        )
                         .await
                 }
             };
@@ -958,25 +961,45 @@ pub(super) async fn run_deferred_inventory_establishment(
     }
 }
 
-/// Park until a real subscriber arrives on `changes_tx`.
+/// Park until a NUMBERED subscriber - one that can acknowledge - is present
+/// on the account's change stream.
 ///
-/// The slot keeps a sentinel receiver alive so `receiver_count()`
-/// stays at 1 until a consumer calls `account_changes_stream`. We use
-/// the slot's `subscriber_notify` (fired by
-/// `SyncEngine::account_changes_stream`) so this waits without
+/// Asked of the delivery gate, which holds the live numbered set, and not of
+/// the broadcast's receiver count: the count includes the slot's sentinel and
+/// every observer, and an observer opened the gate once - the walk ran its
+/// pages into a reader that never acknowledges, and the acknowledger, joining
+/// at the ring's tail afterwards, could never see them. We use the slot's
+/// `subscriber_notify` (fired by `SyncEngine::account_changes_stream`, and
+/// deliberately NOT by `account_changes_observer`) so this waits without
 /// hot-polling. (sync-N3)
+///
+/// The `Notified` future is created BEFORE the predicate is checked, on every
+/// turn of the loop. `Notify::notify_waiters` stores no permit: it wakes only
+/// the `Notified` futures that already exist. So a check that found nobody,
+/// followed by a subscribe-and-notify on another thread, followed by creating
+/// the future, slept for ever with the acknowledger already subscribed - cold
+/// start never began until a SECOND subscription happened to arrive. A future
+/// that exists before the check is guaranteed to observe a `notify_waiters`
+/// issued after it was created, even if it has not been polled yet, which
+/// closes the window. Structural rather than tested: the interleaving sits
+/// between two statements of one poll, and no test can preempt a poll there.
 pub(super) async fn wait_for_real_subscriber(
-    changes_tx: &broadcast::Sender<MultiplexerEvent>,
+    delivery: &crate::multiplexer::ChangeDelivery,
     subscriber_notify: &Notify,
     shutdown: &CancellationToken,
 ) -> bool {
     loop {
-        if crate::multiplexer::has_real_subscriber(changes_tx) {
+        let notified = subscriber_notify.notified();
+        tokio::pin!(notified);
+        // Register interest before checking, so a notify that lands between the
+        // check and the wait is still delivered to this future.
+        notified.as_mut().enable();
+        if delivery.has_numbered_subscriber() {
             return true;
         }
         tokio::select! {
             () = shutdown.cancelled() => return false,
-            () = subscriber_notify.notified() => {
+            () = &mut notified => {
                 // Loop and re-check; the notification might have been
                 // spurious or a subscriber may have left between the
                 // notify and our check.

@@ -87,9 +87,11 @@ async fn recovered_ids_are_published_under_their_own_scope() {
 
     let coverage = Arc::new(PendingCoverage::new());
     let (changes_tx, mut sentinel) = broadcast::channel::<MultiplexerEvent>(16);
-    // Two receivers: the engine's own slot keeps one alive purely to hold the
-    // channel open, so a publication only counts as delivered past that.
-    let mut consumer = changes_tx.subscribe();
+    let delivery = Arc::new(bifrost_sync::multiplexer::ChangeDelivery::new(changes_tx));
+    // A publication only counts as delivered once a NUMBERED receiver - one
+    // handed out by the delivery gate, as `account_changes_stream` does - has
+    // taken it; the slot's sentinel and any observer do not count.
+    let mut consumer = delivery.subscribe(None, None);
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<WriterRequest>(16);
     let writer = tokio::spawn(async move {
@@ -112,7 +114,7 @@ async fn recovered_ids_are_published_under_their_own_scope() {
         &account,
         &bifrost_types::AccountId("acct".into()),
         &two_scope_ledger(),
-        Some(&changes_tx),
+        Some(&delivery),
         &writer_tx,
         &coverage,
         8,

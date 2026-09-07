@@ -454,7 +454,7 @@ impl BackfillRunner {
                     // BackfillCheckpoint. Durable persistence awaits the
                     // consumer ack (see module docs); the runner never
                     // writes to CheckpointStore.
-                    if let Some(tx) = &changes_tx {
+                    if changes_tx.is_some() {
                         // FLOW CONTROL, and it belongs exactly here: after the
                         // page has been read off the provider stream and BEFORE
                         // it is registered. Parking here stops the stream being
@@ -575,13 +575,13 @@ impl BackfillRunner {
                         // batch, and that is only true if no subscribe and no
                         // departing receiver's sweep can interleave between the
                         // two - see `ChangeDelivery`.
-                        let delivered = match lane {
+                        let reached = match lane {
                             Some(gate) => {
                                 delivery.publish_backfill(me, gate.coverage(), publication.as_ref())
                             }
-                            None => tx.send(me).unwrap_or(0),
+                            None => delivery.publish_acknowledgeable(me),
                         };
-                        if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
+                        if !reached {
                             // This page reached nobody. Record it against the
                             // account's undelivered watermark so the enclosing
                             // walk cannot later settle the scope on the strength

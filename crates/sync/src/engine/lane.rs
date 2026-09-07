@@ -88,9 +88,10 @@
 //! stall: the departure warning fires on drop and the lag warning on poll, and a
 //! receiver that does neither produces neither. [`LaneGate::wait_for_capacity`]
 //! therefore warns when it parks, naming the account, the scopes and the receiver
-//! sequences holding the charge. The ruled observer subscription - a receiver
-//! counting for neither the subscriber gate nor the bound - is what will lift the
-//! obligation for observers.
+//! sequences holding the charge. A receiver that only watches should be an
+//! observer (`SyncEngine::account_changes_observer`, `ChangeDelivery::observe`),
+//! which is unnumbered, counts for neither the subscriber gate nor the bound,
+//! and carries no such obligation.
 //!
 //! # Fairness, and what a parked producer must not be holding
 //!

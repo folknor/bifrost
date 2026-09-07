@@ -34,14 +34,14 @@ use bifrost_types::{
     Account, AccountError, Change, ChangeCursor, Checkpoint, CursorScope, SyncEvent,
 };
 use futures::stream::StreamExt;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::oneshot;
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::Error;
 
-use super::MultiplexerEvent;
+use super::{ChangeDelivery, MultiplexerEvent};
 
 /// Per-batch driver outcome. Workers consult this between batches to
 /// decide whether to keep pulling.
@@ -87,17 +87,23 @@ pub enum ChangesEvent {
 /// pinned by `a_published_change_checkpoint_always_carries_its_publication_id`
 /// (ablated - it bites), which is what makes it enforced rather than merely
 /// observed. New evidence, not a re-reading, is what would reopen this.
+///
+/// Takes the account's `ChangeDelivery` rather than its raw sender because a
+/// published checkpoint registers a claim that only a NUMBERED receiver can
+/// answer for, and only the delivery gate knows whether one took delivery.
+/// Events that expect no acknowledgement still go on the raw sender.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_changes_stream(
     account: &dyn Account,
     scope: CursorScope,
     cursor: ChangeCursor,
     cursors: Arc<CursorRegistry>,
-    changes_tx: broadcast::Sender<MultiplexerEvent>,
+    delivery: Arc<ChangeDelivery>,
     boundary: BoundaryView,
     control: Option<SyncControl>,
     registry_generation: Option<crate::cursor::DriveGeneration>,
 ) -> Result<ChangesEvent, Error> {
+    let changes_tx = delivery.sender();
     let _activity = match &control {
         Some(control) => match control.begin_activity() {
             Some(activity) => Some(activity),
@@ -143,8 +149,9 @@ pub async fn drive_changes_stream(
         let checkpoint = checkpoint_for(&event).cloned();
         // A BACKFILL checkpoint on the live changes stream is refused, exactly as
         // the fusion path refuses one, and for the same structural reason: this
-        // driver registers the publication and then sends on the RAW sender, so
-        // the entry is never stamped with a delivery. An unsent stamp is
+        // driver registers the publication and then publishes it unstamped
+        // (`publish_acknowledgeable`, not `publish_backfill`), so the entry is
+        // never stamped with a delivery. An unsent stamp is
         // deliberately never swept, so a `Lane::Backfill` entry minted here is
         // charged against the account's backfill bound until an acknowledgement,
         // a lag or a reset frees it - a permanent slot of the bound spent per
@@ -213,7 +220,7 @@ pub async fn drive_changes_stream(
                 }
                 _ => None,
             };
-            (changes_tx.send(me.clone()).unwrap_or(0), expected)
+            (delivery.publish_acknowledgeable(me.clone()), expected)
         };
         let change_cursor = match &checkpoint {
             Some(Checkpoint::Change(cursor)) => Some(cursor.clone()),
@@ -231,14 +238,12 @@ pub async fn drive_changes_stream(
                 Some(result)
             }
         };
-        let Some((delivered, expected)) = published else {
+        let Some((reached, expected)) = published else {
             return Ok(ChangesEvent::Done);
         };
-        if !super::delivered_to_real_subscriber(delivered)
-            && let (Some(control), Some(expected)) = (&control, expected)
-        {
-            // Only the slot's sentinel receiver saw this batch, so no
-            // consumer ack is coming for it.
+        if !reached && let (Some(control), Some(expected)) = (&control, expected) {
+            // No numbered receiver saw this batch - only the slot's sentinel
+            // and any observers - so no consumer ack is coming for it.
             control.retire_publication(expected);
         }
         if let Some(outcome) = post_publish_boundary(boundary.peek(), checkpoint.is_some()) {

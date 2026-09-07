@@ -157,17 +157,18 @@ pub struct BackfillConfig {
     /// reports nothing on its own: the departure warning fires on drop and the lag
     /// warning on poll, and such a receiver does neither, so the engine warns from
     /// the park instead (`bifrost.sync.backfill`, naming the holding sequences).
-    /// The ruled observer subscription - a receiver counting for neither the
-    /// subscriber gate nor the bound - is what will lift this obligation for
-    /// receivers that only watch.
+    /// A receiver that only watches should come from
+    /// `SyncEngine::account_changes_observer` instead: an observer counts for
+    /// neither the subscriber gate nor the bound and carries no such obligation.
     ///
     /// The bound is also narrower than "the producer follows the slowest reader":
     /// it follows the slowest live numbered reader among pages NOT YET
     /// ACKNOWLEDGED, and an acknowledgement frees a page for every receiver. With
     /// two numbered receivers where the ACKNOWLEDGER is the faster one, its
-    /// acknowledgements can therefore run the producer past a slower observer
-    /// until that observer lags. Two acknowledging receivers are not a supported
-    /// shape for this engine in any case.
+    /// acknowledgements can therefore run the producer past the slower numbered
+    /// receiver until it lags. Two acknowledging receivers are not a supported
+    /// shape for this engine in any case, and an observer is unnumbered, so the
+    /// case does not arise for it.
     ///
     /// Keep it well under `changes_capacity`: the point of the bound is that a
     /// cold start cannot overrun the ring by itself, which needs room in the

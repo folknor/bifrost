@@ -109,6 +109,7 @@ impl SlotContext {
             shutdown: &self.shutdown,
             writer,
             coverage: &self.coverage,
+            delivery: &self.delivery,
         }
     }
 }

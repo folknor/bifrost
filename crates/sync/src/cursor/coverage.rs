@@ -344,9 +344,10 @@ struct BoundaryEntry {
     /// outstanding registration of the account, including pages the acknowledger
     /// read but had not yet answered for. Closing that needs a residual record of
     /// a page that left the ledger still unread, which is filed and not built;
-    /// the ruled observer subscription removes the case where the slow receiver
-    /// is an observer, and what remains after it is two ACKNOWLEDGING receivers,
-    /// which this engine already documents as unsupported.
+    /// the observer subscription (`ChangeDelivery::observe`) is unnumbered and
+    /// never enters this set, so the case where the slow receiver is an observer
+    /// does not arise, and what remains is two ACKNOWLEDGING receivers, which
+    /// this engine already documents as unsupported.
     ///
     /// Read and acknowledged free different things: a read returns lane
     /// capacity, an acknowledgement retires the registration (and with it the

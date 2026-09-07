@@ -74,8 +74,8 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
     // real subscriber arrives, exactly as
     // `run_deferred_inventory_establishment` does for the fusion path,
     // so the first page is observed rather than raced away. (sync-N3)
-    if let Some(tx) = &changes_tx
-        && !wait_for_real_subscriber(tx, &subscriber_notify, &shutdown).await
+    if changes_tx.is_some()
+        && !wait_for_real_subscriber(&delivery, &subscriber_notify, &shutdown).await
     {
         return;
     }
@@ -107,8 +107,8 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             // reattaches gets no inventory and no retry, and no amount of waiting
             // helps. Parking here is the same answer the first gate gives, for
             // the same reason.
-            if let Some(tx) = &changes_tx
-                && !wait_for_real_subscriber(tx, &subscriber_notify, &shutdown).await
+            if changes_tx.is_some()
+                && !wait_for_real_subscriber(&delivery, &subscriber_notify, &shutdown).await
             {
                 return;
             }
@@ -1063,8 +1063,7 @@ pub(super) async fn emit_backfill_complete(
         publication: Some(publication.clone()),
     };
     // Send and stamp as one step, exactly as the page path does.
-    let delivered = delivery.publish_backfill(event, lane.coverage(), Some(&publication));
-    if !crate::multiplexer::delivered_to_real_subscriber(delivered) {
+    if !delivery.publish_backfill(event, lane.coverage(), Some(&publication)) {
         lane.coverage().note_undelivered(scope, 1);
         control.retire_publication(publication);
     }

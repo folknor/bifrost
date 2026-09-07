@@ -69,11 +69,11 @@ use bifrost_types::{
     ObjectChangeKind, ObligationKey, RegionRepairProof, RepairAttemptId, SyncEvent,
 };
 use futures::stream::StreamExt;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::cursor::DebtLedger;
 use crate::error::Error;
-use crate::multiplexer::{MultiplexerEvent, WriterRequest};
+use crate::multiplexer::{ChangeDelivery, MultiplexerEvent, WriterRequest};
 
 /// How many completed attempts a lineage gets before it stops being retried
 /// automatically.
@@ -120,7 +120,7 @@ pub async fn run_repair_pass(
     account: &dyn Account,
     account_id: &AccountId,
     ledger: &DebtLedger,
-    changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,
+    delivery: Option<&ChangeDelivery>,
     writer_tx: &mpsc::Sender<WriterRequest>,
     coverage: &Arc<crate::cursor::PendingCoverage>,
     max_requests: usize,
@@ -328,7 +328,7 @@ pub async fn run_repair_pass(
     for scope in order {
         let resolutions = grouped.remove(&scope).unwrap_or_default();
         let ids = ids_by_scope.remove(&scope).unwrap_or_default();
-        let publication = publish_recovered(changes_tx, coverage, &scope, &ids);
+        let publication = publish_recovered(delivery, coverage, &scope, &ids);
         let (done, wait) = oneshot::channel();
         writer_tx
             .send(WriterRequest::ApplyRepair {
@@ -401,12 +401,12 @@ fn validate_object_recovery(
 /// ride their own event and their own publication - an event carries exactly
 /// the ids its `scope` field names.
 fn publish_recovered(
-    changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,
+    delivery: Option<&ChangeDelivery>,
     coverage: &Arc<crate::cursor::PendingCoverage>,
     scope: &CursorScope,
     recovered: &[bifrost_types::ObjectId],
 ) -> Option<crate::cursor::PublicationId> {
-    let tx = changes_tx?;
+    let delivery = delivery?;
     if recovered.is_empty() {
         return None;
     }
@@ -437,11 +437,11 @@ fn publish_recovered(
         checkpoint: None,
         publication: Some(publication.clone()),
     };
-    let delivered = tx.send(event).unwrap_or(0);
-    if crate::multiplexer::delivered_to_real_subscriber(delivered) {
+    if delivery.publish_acknowledgeable(event) {
         Some(publication)
     } else {
-        // Nothing can acknowledge it, so nothing may be discharged on it.
+        // No numbered receiver can acknowledge it, so nothing may be
+        // discharged on it.
         coverage.retire(publication);
         None
     }

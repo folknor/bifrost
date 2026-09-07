@@ -29,41 +29,15 @@ has not made, and ruled work that has not landed. Nothing else.
 
 ## Ruled sync work, sequenced
 
-Two items ruled on 2026-09-06, in this order. The third of that set, the
-receipt bound, has landed; it reshaped the accounting these two touch, and
-they are written against that final shape. Each lands alone, with one
-scoped cold review under the stopping rule in `AGENTS.md`. Two earlier
-structural landings of the same
-week, the dav-core `ResponseParts` collapse and the smtp sans-I/O core,
-never received the cold review their rulings asked for; that review debt
-is listed under their crates below.
+Ruled on 2026-09-06. The receipt bound and the explicit observer
+subscription from that set have landed; the remaining item is written
+against that final shape. Each lands alone, with one scoped cold review
+under the stopping rule in `AGENTS.md`. Two earlier structural landings of
+the same week, the dav-core `ResponseParts` collapse and the smtp sans-I/O
+core, never received the cold review their rulings asked for; that review
+debt is listed under their crates below.
 
-1. **sync: an explicit observer subscription on the change stream. RULED
-    2026-09-06: PROCEED, as a separate method.** `account_changes_stream`
-    supports any number of receivers with exactly one acknowledger, and until
-    this lands the acknowledging receiver must subscribe FIRST, because three
-    places in the engine see only a raw receiver count. The subscriber gate
-    opens on an observer, which then takes pages it never acknowledges while
-    the acknowledger joins at the ring's tail and cannot see them. "Reached a
-    real subscriber" on each send counts an observer too, so once the
-    acknowledger departs mid-walk every later page is judged delivered, stays
-    charged, and can never be answered for. And an observer's lag abandons
-    every registration on the account, which under the completion guarantee
-    voids every in-flight walk. The build: a second public method returning an
-    UNNUMBERED receiver, the shape `ChangesReceiver::new` already has behind
-    `cfg(test)`, and three touch points that follow from it - the gate counts
-    numbered receivers; a send that reached no numbered receiver counts as
-    reaching nobody, decided by the delivery gate under its own lock since it
-    holds the live set; an observer receiver carries no control handle, so its
-    lag warns without abandoning. An observer's read must NOT mark a page
-    received under the receipt bound; the marking is already keyed on a
-    receiver's numbering, so an unnumbered observer inherits that for free -
-    pinned by `an_unnumbered_receivers_read_frees_no_capacity`. Observers are
-    documented as never acknowledging.
-    A separate method rather than a flag on the existing one, because the two
-    are different roles and a flag lets a call site flip one into the other.
-    The "subscribe first" sentence leaves `reference/sync.md` with this.
-2. **sync: the teardown window in the completion guarantee. RULED
+1. **sync: the teardown window in the completion guarantee. RULED
     2026-09-06: close by contract, no durable record.** A receiver dropped
     after `detach`'s drain of the outstanding discard requests records a
     request nobody can act on, because the writer is gone; a receiver dropped
@@ -147,13 +121,12 @@ is listed under their crates below.
       the per-page loss record while dropping the receipts, so it is not the
       forfeit-or-park choice above; it is a representation change with its own
       correctness argument and wants its own ruling.
-    - Costs, not defects, both in the safe direction and both for item 1 to
-      weigh: a lag on ANY receiver, an observer included, records losses for
-      every in-flight backfill scope and requests their discard, a
-      from-scratch re-walk per scope; and an abandonment retires a marker
-      still in the ring, so a live burst that lags the consumer between a
-      walk's last page and its marker acknowledgement re-walks that scope
-      from scratch.
+    - Cost, not defect, in the safe direction: an abandonment retires a
+      marker still in the ring, so a live burst that lags the acknowledging
+      consumer between a walk's last page and its marker acknowledgement
+      re-walks that scope from scratch. (The other half of this bullet, a lag
+      on an observer doing the same, was retired by the observer
+      subscription: an observer's lag abandons nothing.)
     - FILED by the last (2026-09-06) pass, not fixed in it - **the
       slowest-reader bound holds only on the READ path.**
       `backfill_in_flight` sums live entries only, and every acknowledgement
@@ -174,12 +147,14 @@ is listed under their crates below.
       `receiver_departed`, and clear it on lag, on reset and on cap eviction.
       Deliberately NOT built in that pass (the owner ruled the round closed,
       and this is a second mechanism, not a correction to the one that
-      landed). Scope note before anyone works it: ruled item 1 (the explicit
-      observer subscription) removes the case where the slow receiver is an
-      observer, and what remains after item 1 is two ACKNOWLEDGING receivers,
-      which `reference/sync.md`'s consumer contract already declares
-      unsupported - so this may be a residual that item 1 retires rather than
-      work to schedule. What landed instead: `BoundaryEntry::readers`, the
+      landed). Scope note before anyone works it: the explicit observer
+      subscription has since landed and an observer is unnumbered, so the
+      case where the slow receiver is an observer no longer arises; what
+      remains is two ACKNOWLEDGING receivers, which `reference/sync.md`'s
+      consumer contract already declares unsupported. So this is most likely
+      a residual the observer subscription retired rather than work to
+      schedule; delete it once someone confirms no supported shape reaches
+      it. What landed instead: `BoundaryEntry::readers`, the
       `sync.md` contract paragraph and `BackfillConfig::lane_capacity` now
       state the guarantee precisely ("the slowest live numbered reader among
       pages not yet acknowledged; an acknowledgement frees a page for every

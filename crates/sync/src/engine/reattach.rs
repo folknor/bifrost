@@ -37,6 +37,10 @@ pub(crate) struct RecoveryContext<'a> {
     pub writer: &'a WriterHandle,
     /// Where inventory walks record what they proved, read back by the writer.
     pub coverage: &'a Arc<PendingCoverage>,
+    /// The account's change delivery gate. Re-establishment runs inventory
+    /// fusion, whose checkpoint-bearing pages have to know whether a NUMBERED
+    /// receiver took delivery; the raw `changes_tx` cannot say.
+    pub delivery: &'a Arc<ChangeDelivery>,
 }
 
 /// Dispatch an `AccountError` to the engine's recovery machinery.
@@ -399,7 +403,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
             scope.clone(),
             Arc::clone(ctx.cursors),
             ctx.writer,
-            ctx.changes_tx.clone(),
+            Arc::clone(ctx.delivery),
             Some(ctx.control),
             Arc::clone(ctx.coverage),
             true,
@@ -689,7 +693,7 @@ pub(super) async fn reattach_account(
                 scope.clone(),
                 Arc::clone(&staged),
                 ctx.writer,
-                ctx.changes_tx.clone(),
+                Arc::clone(ctx.delivery),
                 None,
                 Arc::clone(ctx.coverage),
                 false,
@@ -1128,7 +1132,7 @@ async fn run_establish(
     scope: CursorScope,
     cursors: Arc<CursorRegistry>,
     writer: &WriterHandle,
-    changes_tx: broadcast::Sender<MultiplexerEvent>,
+    delivery: Arc<crate::multiplexer::ChangeDelivery>,
     control: Option<&SyncControl>,
     coverage: Arc<PendingCoverage>,
     persist_ready: bool,
@@ -1154,7 +1158,7 @@ async fn run_establish(
                     generation: coverage.next_generation(),
                 };
                 return match fusion
-                    .run_resume_with_broadcast(account, existing, Some(changes_tx))
+                    .run_resume_with_broadcast(account, existing, Some(delivery))
                     .await?
                 {
                     crate::multiplexer::FusionOutcome::Established
@@ -1211,7 +1215,7 @@ async fn run_establish(
                 generation: coverage.next_generation(),
             };
             match fusion
-                .run_with_broadcast(account, scope, Some(changes_tx))
+                .run_with_broadcast(account, scope, Some(delivery))
                 .await?
             {
                 crate::multiplexer::FusionOutcome::Established

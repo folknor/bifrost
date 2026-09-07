@@ -87,7 +87,7 @@ async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
         account_id,
         account: Arc::new(ArcSwap::from_pointee(account)),
         cursors,
-        changes_tx,
+        delivery: Arc::new(bifrost_sync::multiplexer::ChangeDelivery::new(changes_tx)),
         boundary: boundary_view,
         shutdown: CancellationToken::new(),
         control,

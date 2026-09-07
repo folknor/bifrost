@@ -102,6 +102,20 @@ impl MultiplexerEvent {
 /// this would convert in-session data loss into a permanent hang. The
 /// receiver therefore abandons the account's outstanding registrations at
 /// the moment it observes the gap, and reports the count in the warning.
+///
+/// # Two roles, two constructors
+///
+/// A NUMBERED receiver ([`ChangeDelivery::subscribe`], handed out by
+/// `SyncEngine::account_changes_stream`) is one that may acknowledge. It counts
+/// for the subscriber gate, its reads hold and release the backfill bound, its
+/// departure is swept, and its lag abandons the account's registrations.
+///
+/// An OBSERVER ([`ChangeDelivery::observe`], handed out by
+/// `SyncEngine::account_changes_observer`) never acknowledges and the engine
+/// never waits on it: it counts for nothing, its reads free nothing, its
+/// departure is unremarkable, and its lag is a warning to itself alone. It
+/// carries no control handle and no coverage handle, which is what makes each
+/// of those true without a per-path check on the receiver's kind.
 pub struct ChangesReceiver {
     /// `Option` only so `Drop` can hand the underlying receiver to
     /// [`ChangeDelivery::depart`], which destroys it under the delivery lock
@@ -213,8 +227,12 @@ impl Drop for ChangesReceiver {
 /// back here.
 ///
 /// Live changes do NOT go through [`ChangeDelivery::publish_backfill`]: they
-/// consume no capacity and are never swept, so they send on [`Self::sender`]
-/// directly and take no lock.
+/// consume no capacity and are never swept, so they are never stamped. A live
+/// publication that expects an ACKNOWLEDGEMENT still goes through
+/// [`Self::publish_acknowledgeable`], which takes the lock only to read the live
+/// numbered set at the send; events nobody acknowledges - warnings,
+/// terminations, barrier pages - send on [`Self::sender`] directly and take no
+/// lock.
 #[derive(Debug)]
 pub struct ChangeDelivery {
     tx: broadcast::Sender<MultiplexerEvent>,
@@ -259,14 +277,15 @@ impl ChangeDelivery {
     /// Broadcast a backfill batch and stamp its publication with the receiver
     /// numbering as of the send, as ONE step.
     ///
-    /// Returns what `broadcast::Sender::send` returns: how many receivers took
-    /// delivery.
+    /// Returns whether a NUMBERED receiver took delivery - see
+    /// [`Self::publish_acknowledgeable`] for why that, and not the broadcast's
+    /// own count, is the answer a publisher needs.
     pub fn publish_backfill(
         &self,
         event: MultiplexerEvent,
         coverage: &crate::cursor::PendingCoverage,
         publication: Option<&crate::cursor::PublicationId>,
-    ) -> usize {
+    ) -> bool {
         let state = self.guard();
         // Every receiver that can possibly hold this batch is numbered below
         // `state.next`, and no `subscribe` and no departing receiver's sweep can
@@ -278,12 +297,74 @@ impl ChangeDelivery {
         // deadlock. `publish_backfill` is the only path that sends a backfill
         // batch, so there is no second ordering to get wrong.
         let issued = state.next;
-        let delivered = self.tx.send(event).unwrap_or(0);
+        let _ = self.tx.send(event);
         if let Some(id) = publication {
             coverage.mark_delivered(id, issued);
         }
+        let reached = !state.live.is_empty();
         drop(state);
-        delivered
+        reached
+    }
+
+    /// Broadcast a publication that consumes no backfill capacity but expects
+    /// an acknowledgement - a live change checkpoint, an inventory fusion page,
+    /// a repair batch - and say whether a NUMBERED receiver took delivery.
+    ///
+    /// The broadcast's own delivery count cannot answer that. It counts the
+    /// slot's sentinel and every observer alongside the receivers that may
+    /// acknowledge, so "more than the sentinel" was satisfied by an observer
+    /// alone: a page it took delivery of was judged delivered, stayed
+    /// registered, and could never be answered for once the acknowledger had
+    /// gone. The live set here holds exactly the numbered receivers, and a
+    /// numbered receiver's underlying `broadcast::Receiver` is destroyed only
+    /// under this lock ([`Self::depart`]), so a send made while the set is
+    /// non-empty reached one of them - and a send made while it is empty
+    /// reached nobody who can acknowledge, whatever else it reached.
+    ///
+    /// Events that expect no acknowledgement - warnings, terminations, barrier
+    /// pages - go on [`Self::sender`] directly and take no lock.
+    pub fn publish_acknowledgeable(&self, event: MultiplexerEvent) -> bool {
+        let state = self.guard();
+        let _ = self.tx.send(event);
+        let reached = !state.live.is_empty();
+        drop(state);
+        reached
+    }
+
+    /// Whether any NUMBERED receiver is live: the subscriber gate's question.
+    ///
+    /// A cold-start producer parks until a consumer that can acknowledge is
+    /// present. The broadcast's receiver count used to stand in for this, and
+    /// an observer satisfied it - the gate opened, the walk ran its pages into
+    /// the observer, and the acknowledger, joining at the ring's tail
+    /// afterwards, could never see them.
+    #[must_use]
+    pub fn has_numbered_subscriber(&self) -> bool {
+        !self.guard().live.is_empty()
+    }
+
+    /// Hand out an OBSERVER on the account's change stream: a receiver that
+    /// sees every event and is never waited on.
+    ///
+    /// Unnumbered, so it is invisible to the subscriber gate, to the delivery
+    /// decision above, and to the backfill bound; it carries no control handle,
+    /// so its lag warns without abandoning anything; and it carries no coverage
+    /// handle, so its read and its departure touch no ledger. Nothing here takes
+    /// the lock, because there is nothing to order: the numbering is exact
+    /// without it, and the only thing an observer's subscribe changes is the
+    /// broadcast's receiver count, which nothing reads any more.
+    ///
+    /// Held WEAK-free on purpose: an observer keeps no reference back here at
+    /// all, so it cannot keep the sender alive past `detach` any more than a
+    /// numbered receiver can.
+    #[must_use]
+    pub fn observe(&self) -> ChangesReceiver {
+        ChangesReceiver {
+            inner: Some(self.tx.subscribe()),
+            control: None,
+            subscription: None,
+            coverage: None,
+        }
     }
 
     /// Hand out a numbered receiver on the account's change stream.
@@ -397,25 +478,12 @@ impl ChangeDelivery {
     }
 }
 
-/// Every account keeps this many internal receivers alive solely to keep the
-/// broadcast channel open. Publication sites use this helper instead of
-/// duplicating knowledge of that channel topology.
-const SENTINEL_RECEIVERS: usize = 1;
-
-pub(crate) fn delivered_to_real_subscriber(delivered: usize) -> bool {
-    delivered > SENTINEL_RECEIVERS
-}
-
-pub(crate) fn has_real_subscriber(tx: &broadcast::Sender<MultiplexerEvent>) -> bool {
-    tx.receiver_count() > SENTINEL_RECEIVERS
-}
-
 impl ChangesReceiver {
-    /// An UNNUMBERED receiver, for tests and for internal readers that never
-    /// acknowledge. Production consumer receivers come from
-    /// [`ChangeDelivery::subscribe`], which numbers them - an unnumbered one
-    /// reports no departure, so it can neither free capacity nor be blamed for
-    /// holding it.
+    /// An UNNUMBERED receiver with whatever handles the test wants on it.
+    /// Production receivers come from [`ChangeDelivery::subscribe`] (numbered)
+    /// or [`ChangeDelivery::observe`] (unnumbered, no handles); this exists so a
+    /// test can exercise one half of the wiring - the lag path's abandonment,
+    /// say - without the other.
     #[cfg(test)]
     pub(crate) fn new(
         inner: broadcast::Receiver<MultiplexerEvent>,
@@ -499,10 +567,15 @@ impl ChangesReceiver {
     }
 
     fn on_lag(&self, skipped: u64) -> MultiplexerEvent {
-        let abandoned = self
-            .control
-            .as_ref()
-            .map_or(0, crate::control::SyncControl::abandon_pending_checkpoints);
+        // An OBSERVER carries no control handle, and that is the whole of its
+        // lag handling: the registrations belong to the acknowledger, and an
+        // observer falling behind says nothing about whether the acknowledger
+        // can still answer for them. Abandoning on an observer's lag voided
+        // every in-flight walk on the account because a UI reader was slow.
+        let Some(control) = &self.control else {
+            return observer_lag_warning(skipped);
+        };
+        let abandoned = control.abandon_pending_checkpoints();
         // Nothing further is needed for the backfill bound: abandonment removes
         // the boundary registrations, and backfill capacity IS those
         // registrations, so a parked producer is already free. That is the whole
@@ -510,6 +583,18 @@ impl ChangesReceiver {
         // remember here.
         lag_warning(skipped, abandoned)
     }
+}
+
+fn observer_lag_warning(skipped: u64) -> MultiplexerEvent {
+    let warning = bifrost_types::Warning::user_safe(
+        bifrost_types::WarningKind::ChangeStreamLagged,
+        format!("observer stream lagged and lost {skipped} batches"),
+    )
+    .with_next_action(bifrost_types::DiagnosticText::user_safe(
+        "an observer never acknowledges, so nothing was abandoned and the acknowledging \
+         receiver is unaffected; what this observer missed is gone from its own view only.",
+    ));
+    MultiplexerEvent::unacked(CursorScope::Account, Arc::new(SyncEvent::Warning(warning)))
 }
 
 fn lag_warning(skipped: u64, abandoned: usize) -> MultiplexerEvent {
@@ -679,7 +764,11 @@ pub struct Multiplexer {
     pub cursors: Arc<CursorRegistry>,
     pub config: MultiplexerConfig,
     pub boundary: BoundaryView,
-    pub changes_tx: broadcast::Sender<MultiplexerEvent>,
+    /// The account's change delivery gate: the broadcast sender plus the
+    /// numbering of the receivers that may acknowledge. Every checkpoint the
+    /// poll loop publishes goes through it, so "did a numbered receiver take
+    /// delivery" is decided under its lock rather than read off a count.
+    pub delivery: Arc<ChangeDelivery>,
     pub control: SyncControl,
     pub shutdown: CancellationToken,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
@@ -745,7 +834,7 @@ impl Multiplexer {
             cursors,
             config,
             boundary,
-            changes_tx,
+            delivery,
             control,
             shutdown,
             reopen_tx,
@@ -762,7 +851,7 @@ impl Multiplexer {
             Arc::clone(&cursors),
             config,
             boundary.clone(),
-            changes_tx.clone(),
+            Arc::clone(&delivery),
             control.clone(),
             shutdown.clone(),
             reopen_tx.clone(),
@@ -780,7 +869,7 @@ impl Multiplexer {
         let lifecycle_cursors = Arc::clone(&cursors);
         let lifecycle_tokens = Arc::clone(&scope_tokens);
         let lifecycle_reopen = reopen_tx.clone();
-        let lifecycle_changes = changes_tx.clone();
+        let lifecycle_changes = delivery.sender().clone();
         let mut lifecycle_generation = account_generation;
         let lifecycle_handle = tokio::spawn(async move {
             let mut reconnect_delay = Duration::from_millis(50);
@@ -910,7 +999,7 @@ impl Multiplexer {
                         Arc::clone(&cursors),
                         config,
                         boundary.clone(),
-                        changes_tx.clone(),
+                        Arc::clone(&delivery),
                         control.clone(),
                         shutdown.clone(),
                         reopen_tx.clone(),
@@ -984,7 +1073,7 @@ fn spawn_and_track_scope_poll(
     cursors: Arc<CursorRegistry>,
     config: MultiplexerConfig,
     boundary: BoundaryView,
-    changes_tx: broadcast::Sender<MultiplexerEvent>,
+    delivery: Arc<ChangeDelivery>,
     control: SyncControl,
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
@@ -1012,7 +1101,7 @@ fn spawn_and_track_scope_poll(
             cursors,
             config,
             boundary,
-            changes_tx,
+            delivery,
             control,
             shutdown,
             scope_cancel,
@@ -1095,7 +1184,7 @@ fn spawn_missing_scope_polls(
     cursors: Arc<CursorRegistry>,
     config: MultiplexerConfig,
     boundary: BoundaryView,
-    changes_tx: broadcast::Sender<MultiplexerEvent>,
+    delivery: Arc<ChangeDelivery>,
     control: SyncControl,
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
@@ -1122,7 +1211,7 @@ fn spawn_missing_scope_polls(
                 Arc::clone(&cursors),
                 config,
                 boundary.clone(),
-                changes_tx.clone(),
+                Arc::clone(&delivery),
                 control.clone(),
                 shutdown.clone(),
                 reopen_tx.clone(),
@@ -1146,7 +1235,7 @@ async fn spawn_scope_poll_inner(
     cursors: Arc<CursorRegistry>,
     config: MultiplexerConfig,
     mut boundary: BoundaryView,
-    changes_tx: broadcast::Sender<MultiplexerEvent>,
+    delivery: Arc<ChangeDelivery>,
     control: SyncControl,
     shutdown: CancellationToken,
     scope_cancel: CancellationToken,
@@ -1240,7 +1329,7 @@ async fn spawn_scope_poll_inner(
                 let advance_cursors = Arc::clone(&cursors);
                 let advance_scope = scope.clone();
                 let scope = scope.clone();
-                let changes_tx = changes_tx.clone();
+                let delivery = Arc::clone(&delivery);
                 let boundary = boundary.clone();
                 let control = control.clone();
                 async move {
@@ -1250,7 +1339,7 @@ async fn spawn_scope_poll_inner(
                         scope,
                         cursor,
                         drive_cursors,
-                        changes_tx,
+                        delivery,
                         boundary,
                         Some(control),
                         Some(registry_generation),
@@ -1993,6 +2082,12 @@ mod tests {
 
         /// Register and broadcast one backfill page, as `run_partition` does.
         fn publish(&self, partition: &str) -> crate::cursor::PublicationId {
+            self.publish_reaching(partition).0
+        }
+
+        /// `publish`, also reporting what the gate reported: whether a
+        /// NUMBERED receiver took delivery.
+        fn publish_reaching(&self, partition: &str) -> (crate::cursor::PublicationId, bool) {
             let checkpoint = Self::backfill_page(partition);
             let id = self.control.expect_checkpoint(checkpoint.clone());
             let event = MultiplexerEvent {
@@ -2007,9 +2102,10 @@ mod tests {
                 checkpoint: Some(checkpoint),
                 publication: Some(id.clone()),
             };
-            self.delivery
+            let reached = self
+                .delivery
                 .publish_backfill(event, &self.coverage, Some(&id));
-            id
+            (id, reached)
         }
 
         fn subscribe(&self) -> ChangesReceiver {
@@ -2040,7 +2136,7 @@ mod tests {
         // B arrives BEFORE A leaves, so the count never touches zero.
         let mut b = h.subscribe();
         assert!(
-            has_real_subscriber(h.delivery.sender()),
+            h.delivery.has_numbered_subscriber(),
             "a consumer is present throughout"
         );
         assert_eq!(
@@ -2230,6 +2326,135 @@ mod tests {
             0,
             "and the NUMBERED receiver's read is what frees it, so the assertion \
              above is about the numbering and not about the page being unreadable"
+        );
+    }
+
+    /// An OBSERVER counts for neither the subscriber gate nor the delivery
+    /// decision, and its reads touch the bound not at all.
+    ///
+    /// The three places that used to see only a raw receiver count, driven
+    /// through the real path. Before the explicit observer subscription, an
+    /// observer arriving first satisfied the gate and took delivery of pages the
+    /// acknowledger - joining at the ring's tail - could never see; and once the
+    /// acknowledger had gone, every later page was judged delivered because the
+    /// observer had it, stayed charged, and could never be answered for.
+    ///
+    /// Ablation: an observer minted through `subscribe` fails the first assertion;
+    /// a delivery decision read off `receiver_count()` fails the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_observer_counts_for_neither_the_gate_nor_the_delivery() {
+        let h = delivery_harness(8);
+        let mut observer = h.delivery.observe();
+        assert!(
+            !h.delivery.has_numbered_subscriber(),
+            "an observer must not open the subscriber gate"
+        );
+
+        let (unreached, reached) = h.publish_reaching("page:0:10");
+        assert!(
+            !reached,
+            "a page that reached only an observer reached nobody who can acknowledge it"
+        );
+        // What the runner does with that answer: retire the publication, since
+        // no acknowledgement can ever come for it.
+        h.control.retire_publication(unreached);
+        assert_eq!(h.coverage.backfill_in_flight(), 0);
+        assert!(
+            !h.delivery
+                .publish_acknowledgeable(MultiplexerEvent::unacked(
+                    CursorScope::Account,
+                    Arc::new(SyncEvent::Warning(bifrost_types::Warning::user_safe(
+                        bifrost_types::WarningKind::Other,
+                        "live".to_owned(),
+                    ))),
+                )),
+            "the same answer on the live-lane path"
+        );
+        observer
+            .try_recv()
+            .expect("the observer still takes delivery");
+        observer.try_recv().expect("of everything");
+
+        // The acknowledger arrives SECOND, which is the order that used to lose
+        // pages, and is now the ordinary one.
+        let mut acker = h.subscribe();
+        assert!(h.delivery.has_numbered_subscriber());
+        let (_, reached) = h.publish_reaching("page:10:20");
+        assert!(reached, "a numbered receiver took delivery");
+        assert_eq!(h.coverage.backfill_in_flight(), 1);
+
+        observer.try_recv().expect("the observer reads the page");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            1,
+            "an observer's read frees nothing"
+        );
+        acker.try_recv().expect("the acknowledger reads the page");
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            0,
+            "the numbered receiver's read is what frees it"
+        );
+
+        // And the observer's departure sweeps nothing: it was never holding
+        // anything on the ledger's account.
+        h.publish("page:20:30");
+        assert_eq!(h.coverage.backfill_in_flight(), 1);
+        drop(observer);
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            1,
+            "the page is still the acknowledger's to read"
+        );
+        drop(acker);
+    }
+
+    /// An observer's lag is its own problem. The registrations belong to the
+    /// acknowledger, and abandoning them because a UI reader fell behind voided
+    /// every in-flight walk on the account - `on_lag` used to abandon for any
+    /// receiver that carried a control handle, and the old unnumbered observer
+    /// carried one.
+    ///
+    /// The acknowledger lagging on the same ring still abandons, which is the
+    /// ablation's other half: the difference is the receiver's role, not the
+    /// ring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_observers_lag_abandons_nothing() {
+        let h = delivery_harness(1);
+        let mut acker = h.subscribe();
+        let mut observer = h.delivery.observe();
+        h.control
+            .expect_checkpoint(account_change_checkpoint(b"registered"));
+        assert_eq!(h.coverage.pending_checkpoints(), 1);
+
+        // Overflow the one-slot ring under both receivers.
+        for text in ["overwritten", "retained"] {
+            let _ = h.delivery.sender().send(warning_event(text));
+        }
+
+        let lag = observer.try_recv().expect("lag becomes an event");
+        assert!(matches!(
+            lag.event.as_ref(),
+            SyncEvent::Warning(warning)
+                if warning.kind == bifrost_types::WarningKind::ChangeStreamLagged
+        ));
+        assert_eq!(
+            h.coverage.pending_checkpoints(),
+            1,
+            "an observer falling behind says nothing about whether the acknowledger \
+             can still answer for the registration"
+        );
+
+        let lag = acker.try_recv().expect("the acknowledger lags too");
+        assert!(matches!(
+            lag.event.as_ref(),
+            SyncEvent::Warning(warning)
+                if warning.kind == bifrost_types::WarningKind::ChangeStreamLagged
+        ));
+        assert_eq!(
+            h.coverage.pending_checkpoints(),
+            0,
+            "the acknowledger's lag is the one that abandons"
         );
     }
 
