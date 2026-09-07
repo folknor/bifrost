@@ -476,6 +476,25 @@ impl ChangeDelivery {
     pub fn min_live(&self) -> Option<u64> {
         self.guard().min_live()
     }
+
+    /// Mark the attachment as tearing down, ordered against the departure
+    /// sweep.
+    ///
+    /// The flag lives on the ledger, but it is set HERE, under this lock,
+    /// because the sweep runs under this lock from start to finish
+    /// ([`Self::depart`]: retire, then `note_undelivered`, which records the
+    /// loss AND inserts the discard request). A bare atomic store raced a
+    /// sweep already admitted: it had recorded the watermark, was preempted
+    /// before inserting the request, and `detach` then drained an empty
+    /// request set and finished the writer - so a loss recorded BEFORE
+    /// teardown, which the guarantee still covers, left rows a later attach
+    /// could resume past. Taking the lock means every sweep that read `false`
+    /// has completed, request included, before this returns.
+    pub fn begin_teardown(&self, coverage: &crate::cursor::PendingCoverage) {
+        let state = self.guard();
+        coverage.begin_teardown();
+        drop(state);
+    }
 }
 
 impl ChangesReceiver {
@@ -2455,6 +2474,55 @@ mod tests {
             h.coverage.pending_checkpoints(),
             0,
             "the acknowledger's lag is the one that abandons"
+        );
+    }
+
+    /// Once teardown has begun, a departing receiver's sweep is inert: no loss
+    /// is recorded and no discard is requested for the pages it was holding.
+    ///
+    /// The ruling this pins (2026-09-06, at `PendingCoverage::release_undelivered`):
+    /// a page delivered but unacknowledged at detach is the consumer's, exactly
+    /// as at a crash, and a drop anywhere in the teardown window behaves like a
+    /// drop after `detach` returns. The registration itself is untouched - the
+    /// sweep is what goes inert, not the ledger.
+    ///
+    /// Ablation: without the teardown check the watermark reads 1 and a discard
+    /// request is left for a writer that has already been drained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_departure_during_teardown_records_no_loss() {
+        let h = delivery_harness(8);
+        let mut a = h.subscribe();
+        h.publish("page:0:10");
+        a.try_recv().expect("delivered, never acknowledged");
+        h.publish("page:10:20");
+        assert_eq!(h.coverage.backfill_in_flight(), 1);
+
+        h.delivery.begin_teardown(&h.coverage);
+        drop(a);
+
+        assert_eq!(
+            h.coverage.undelivered_watermark(&CursorScope::Account),
+            0,
+            "pages in a consumer's hands at detach are the consumer's, not a loss"
+        );
+        assert!(
+            h.coverage.take_backfill_discards().is_empty(),
+            "and nothing asks the departed writer to drop rows"
+        );
+        assert_eq!(
+            h.coverage.pending_checkpoints(),
+            2,
+            "the sweep is inert; the ledger is not touched"
+        );
+        // The unread page stays charged under the no-live-receiver fallback
+        // ("has anybody read it"), as a page published to nobody always does
+        // until something retires it. Harmless here: teardown has already
+        // cancelled the producer this charge would otherwise park.
+        assert_eq!(
+            h.coverage.backfill_in_flight(),
+            1,
+            "the read page is uncharged; the unread one waits for a retirement that \
+             teardown will never need"
         );
     }
 

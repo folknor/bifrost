@@ -559,6 +559,12 @@ impl SyncEngine {
         // ever answer `None`. It is dropped before the writer is awaited, so it
         // cannot hold the writer's channel open past its own drain.
         let teardown_writer = self.ack_senders.remove(account_id).map(|(_, tx)| tx);
+        // From here the departure sweep is inert: a consumer receiver dropped
+        // anywhere in the teardown window behaves as one dropped after `detach`
+        // returns. See `PendingCoverage::release_undelivered` for the ruling.
+        // Through the delivery gate, so a sweep already running finishes -
+        // discard request included - before the flag is observed.
+        slot.delivery.begin_teardown(&slot.coverage);
         // Ask running workers to checkpoint cleanly, then stop.
         slot.boundary_tx.send_replace(BoundaryRequest::Stop);
         // Trip shutdown before awaiting workers. Some account-level
@@ -599,28 +605,65 @@ impl SyncEngine {
         // everything, and a permanent hole for `OpenPages`, which resumes from
         // them. This is the last moment the writer is still alive, so it is where
         // the outstanding requests are settled.
+        //
+        // What this drain settles is every loss recorded BEFORE teardown began.
+        // A consumer receiver dropped after this point - during the drain, after
+        // it, or after `detach` returns - records nothing: the departure sweep
+        // went inert at `begin_teardown` above, because a loss it would record
+        // here is one the writer can no longer act on, and the pages it would
+        // be about are the consumer's by contract (delivered but unacknowledged
+        // at detach is the consumer's to have persisted or to forfeit, exactly
+        // as at a crash). Ruled 2026-09-06; the full reasoning and the cost of
+        // the alternative are at `PendingCoverage::release_undelivered`.
+        //
+        // Both awaits are clamped to the same `detach_timeout` deadline every
+        // other teardown step honours. A store whose `delete_backfill` or
+        // `put_ledger` hangs must not hang `detach` with it; the rows it leaves
+        // behind are the same rows an aborted writer would have left.
         if let Some(writer) = teardown_writer {
             for scope in slot.coverage.take_backfill_discards() {
                 let (done, recv) = oneshot::channel();
-                if writer
-                    .send(WriterRequest::DiscardBackfillProgress {
-                        scope: scope.clone(),
-                        done,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
+                let request = WriterRequest::DiscardBackfillProgress {
+                    scope: scope.clone(),
+                    done,
+                };
+                match tokio::time::timeout_at(deadline, writer.send(request)).await {
+                    Ok(Ok(())) => {}
+                    // The writer is already gone: nothing left to settle to.
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            account = ?account_id,
+                            scope = ?scope,
+                            "detach timeout reached before the writer accepted the discard \
+                             of a walk that lost pages; a later attach may resume past them"
+                        );
+                        break;
+                    }
                 }
-                if let Ok(Err(error)) = recv.await {
-                    tracing::warn!(
-                        target: "bifrost.sync.backfill",
-                        account = ?account_id,
-                        scope = ?scope,
-                        error = %error,
-                        "could not drop the backfill rows of a walk that lost pages before \
-                         detaching; a later attach may resume past them"
-                    );
+                match tokio::time::timeout_at(deadline, recv).await {
+                    Ok(Ok(Err(error))) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            account = ?account_id,
+                            scope = ?scope,
+                            error = %error,
+                            "could not drop the backfill rows of a walk that lost pages before \
+                             detaching; a later attach may resume past them"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            account = ?account_id,
+                            scope = ?scope,
+                            "detach timeout reached while the store dropped the backfill rows \
+                             of a walk that lost pages; a later attach may resume past them"
+                        );
+                        break;
+                    }
                 }
             }
         }

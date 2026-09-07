@@ -453,6 +453,18 @@ impl SyncControl {
     /// Block until the account is quiescent at or after the request
     /// generation. The latest durable checkpoint may be absent when
     /// the account has never produced traffic.
+    ///
+    /// The wait also ends, with an error, when the boundary reads `Stop`.
+    /// `Stop` is written only by `detach`, which removes the public ack
+    /// sender at its top - so from that moment no outstanding registration
+    /// can ever be acknowledged, and a quiescence this waiter is holding out
+    /// for cannot arrive. The checkpoint watch alone cannot deliver that
+    /// verdict: the consumer's own `SyncControl` clone keeps the sender
+    /// alive, so the channel never closes under it. Before this arm existed
+    /// the waiter's only rescue was incidental - a receiver dropped inside
+    /// the teardown window ran the departure sweep, which retired the
+    /// registrations and republished quiescence - and the sweep is now
+    /// inert during teardown by ruling, so the rescue is deliberate instead.
     async fn wait_for_checkpoint_at_or_after(
         &self,
         generation: u64,
@@ -461,6 +473,7 @@ impl SyncControl {
         // last recorded snapshot; if it already matches the
         // generation we return immediately.
         let mut rx = self.inner.checkpoint_tx.subscribe();
+        let mut boundary = self.inner.boundary.subscribe();
         loop {
             {
                 let snap = rx.borrow();
@@ -468,20 +481,45 @@ impl SyncControl {
                     return Ok(snap.checkpoints.clone());
                 }
             }
-            if rx.changed().await.is_err() {
-                return Err(AccountErrorBuilder::new(
-                    AccountErrorKind::Request(RequestErrorKind::Malformed),
-                    Cause::Request(RequestCause::Malformed {
-                        detail: bifrost_types::DiagnosticText::support_only(
+            if boundary.peek() == BoundaryRequest::Stop {
+                return Err(control_wait_ended(
+                    "control: account stopped before reaching a safe boundary; a page \
+                     delivered but unacknowledged at detach is the consumer's to have \
+                     persisted or to forfeit",
+                ));
+            }
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        return Err(control_wait_ended(
                             "control: checkpoint watch channel closed",
-                        ),
-                    }),
-                )
-                .try_build()
-                .expect("valid account error classification"));
+                        ));
+                    }
+                }
+                changed = boundary.changed() => {
+                    if changed.is_none() {
+                        return Err(control_wait_ended(
+                            "control: boundary channel closed",
+                        ));
+                    }
+                    // Loop: re-read the snapshot, then the boundary.
+                }
             }
         }
     }
+}
+
+/// The error a `pause` / `checkpoint_now` waiter returns when the account
+/// can no longer reach the boundary it asked for.
+fn control_wait_ended(detail: &'static str) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: bifrost_types::DiagnosticText::support_only(detail),
+        }),
+    )
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Restores the boundary request `checkpoint_now` displaced, whichever
@@ -645,6 +683,33 @@ mod tests {
         assert!(
             control.begin_activity().is_none(),
             "paused accounts must refuse every new engine activity registration"
+        );
+    }
+
+    /// A `Stop` ends a waiter that can no longer be satisfied.
+    ///
+    /// `Stop` is written only by `detach`, which has already removed the public
+    /// ack sender; the registration this waiter is parked on can never be
+    /// acknowledged, and the consumer's own control clone keeps the checkpoint
+    /// watch open, so nothing else would ever wake it. Ablation: without the
+    /// boundary arm the waiter never finishes.
+    #[tokio::test]
+    async fn a_stop_ends_a_pause_waiting_on_an_unacknowledgeable_registration() {
+        let control = control();
+        control.expect_checkpoint(checkpoint(b"never-acked"));
+        let waiter_control = control.clone();
+        let waiter = tokio::spawn(async move { waiter_control.pause().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "the registration is outstanding");
+
+        control.inner.boundary.set(BoundaryRequest::Stop);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter must end once the account stops")
+            .expect("waiter task");
+        assert!(
+            result.is_err(),
+            "a stopped account cannot reach the boundary, and must not claim to"
         );
     }
 

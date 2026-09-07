@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bifrost_types::{Checkpoint, CursorScope, InventoryCoverageReport};
 
@@ -591,6 +591,11 @@ pub struct PendingCoverage {
     /// boundary entry pulses it, which is one more thing that comes for free
     /// from capacity being a property of the record.
     capacity: tokio::sync::Notify,
+    /// Set by `detach` the moment teardown begins, and never cleared: the
+    /// ledger dies with the attachment. Read by the departure sweep
+    /// ([`PendingCoverage::release_undelivered`]), which is inert once this is
+    /// set - see the ruling recorded there.
+    tearing_down: AtomicBool,
 }
 
 static NEXT_LEDGER_ID: AtomicU64 = AtomicU64::new(0);
@@ -613,6 +618,7 @@ impl Default for PendingCoverage {
             undelivered: Mutex::new(HashMap::new()),
             discard_requests: Mutex::new(HashSet::new()),
             capacity: tokio::sync::Notify::new(),
+            tearing_down: AtomicBool::new(false),
         }
     }
 }
@@ -1084,6 +1090,18 @@ impl PendingCoverage {
         }
     }
 
+    /// Mark the attachment as tearing down. Called by `detach` before it awaits
+    /// anything, and never undone; from here on the departure sweep is inert.
+    ///
+    /// Production reaches this through `ChangeDelivery::begin_teardown`, under
+    /// the delivery lock the sweep itself holds, so a sweep that was admitted
+    /// before the flag finishes recording its loss and its discard request
+    /// before `detach` drains the requests. A bare store here is not ordered
+    /// against that; tests that call it directly have no concurrent sweep.
+    pub fn begin_teardown(&self) {
+        self.tearing_down.store(true, Ordering::Release);
+    }
+
     /// Retire every published backfill boundary that no live receiver can still
     /// acknowledge, carrying its debt forward exactly as a lag does.
     ///
@@ -1096,7 +1114,37 @@ impl PendingCoverage {
     /// exactly this state behind.
     ///
     /// Returns how many were retired, for the caller's log.
+    ///
+    /// # Inert once teardown has begun - a ruling, not a gap
+    ///
+    /// The completion guarantee repairs holes the engine's OWN mechanics create:
+    /// a receiver replaced INSIDE an attachment strands pages its successor
+    /// cannot see, and this sweep records that loss so the walk is not settled
+    /// over it. A receiver that departs while `detach` is running is a different
+    /// case, and it has a window with two halves and one outcome. Dropped after
+    /// `detach`'s drain of the outstanding discard requests, the sweep records a
+    /// request nobody can act on, because the writer is gone; dropped after
+    /// `detach` returns, no sweep runs at all, because the receiver's weak handle
+    /// to the delivery gate no longer upgrades. Either way nothing durable
+    /// changes. The only thing the sweep could do in that window is bite when
+    /// the consumer ends the attachment holding a page it received and never
+    /// acknowledged while the completion marker is already durable - which is
+    /// exactly the case of a consumer that crashes with pages in hand, and that
+    /// case is the consumer's by contract: a page delivered but unacknowledged
+    /// at detach is the consumer's to have persisted or to forfeit.
+    ///
+    /// RULED 2026-09-06: close by contract, no durable record. The full closure
+    /// would be a durable "scope lost pages" row, a new method on the
+    /// `CheckpointStore` trait every downstream store implements, bought for a
+    /// consumer already outside the persist-then-acknowledge contract. So the
+    /// sweep goes inert the moment teardown begins, which makes a drop in the
+    /// window behave exactly like a drop after it, and `reference/sync.md`
+    /// states the contract. Do not re-file the window as a defect; what would
+    /// reopen it is a downstream store willing to pay for the row.
     pub fn release_undelivered(&self, min_live: Option<u64>) -> usize {
+        if self.tearing_down.load(Ordering::Acquire) {
+            return 0;
+        }
         // Which scope each retirement belongs to, so the record lands on the
         // walk it is evidence about and on no other.
         let mut by_scope: HashMap<CursorScope, usize> = HashMap::new();

@@ -1115,6 +1115,30 @@ again. The guarantee holds for one acknowledging receiver under the contract
 above, and it costs re-walks in the direction that is safe: under-reporting
 coverage re-walks, over-reporting it loses objects nobody sees again.
 
+**The guarantee ends where the attachment does.** A page delivered but
+unacknowledged at `detach` is the consumer's to have persisted or to forfeit,
+exactly as at a crash. The departure sweep goes inert the moment `detach`
+begins (`ChangeDelivery::begin_teardown`, which sets the ledger's flag under
+the delivery lock so a sweep already admitted finishes recording its loss and
+its discard request first), so a receiver dropped anywhere in
+the teardown window - during the discard drain, after it, or after `detach`
+returns - records no loss and requests no discard; before the flag, the two
+halves of that window already had one outcome (a request the departed writer
+could not act on, or no sweep at all because the receiver's weak handle no
+longer upgrades), and the flag makes the whole window behave like its end.
+Ruled 2026-09-06, close by contract: the alternative was a durable "scope lost
+pages" row, a new `CheckpointStore` method every downstream store implements,
+bought for a consumer already outside the persist-then-acknowledge contract.
+The drain of discard requests recorded BEFORE teardown still runs, with both
+its writer awaits clamped to the same `detach_timeout` deadline as every other
+teardown step, so a store that hangs in `delete_backfill` or `put_ledger`
+cannot hang `detach`. A `pause` or `checkpoint_now` waiter parked on a
+registration that detach has made unacknowledgeable (the public ack sender
+goes at the top of `detach`) ends with an error when the boundary reads
+`Stop`: the consumer's own control clone keeps the checkpoint watch open, so
+the boundary is the only channel that can carry the verdict, and the
+departure sweep that used to wake such a waiter by accident is inert.
+
 **Every page that reaches nobody is recorded, per scope.** `PendingCoverage`
 keeps a monotonic undelivered counter keyed by scope
 (`undelivered_watermark`, bumped by `note_undelivered`). Three paths feed it:

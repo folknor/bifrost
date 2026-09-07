@@ -27,40 +27,25 @@ has not made, and ruled work that has not landed. Nothing else.
   `net`, `sasl`, `sync`) is verified with the full-workspace `brokkr
   check`, never `-p`.
 
-## Ruled sync work, sequenced
+## Sync residuals
 
-Ruled on 2026-09-06. The receipt bound and the explicit observer
-subscription from that set have landed; the remaining item is written
-against that final shape. Each lands alone, with one scoped cold review
-under the stopping rule in `AGENTS.md`. Two earlier structural landings of
-the same week, the dav-core `ResponseParts` collapse and the smtp sans-I/O
-core, never received the cold review their rulings asked for; that review
-debt is listed under their crates below.
+The three items ruled on 2026-09-06 (the receipt bound, the explicit
+observer subscription, the teardown window) have all landed. Two earlier
+structural landings of the same week, the dav-core `ResponseParts` collapse
+and the smtp sans-I/O core, never received the cold review their rulings
+asked for; that review debt is listed under their crates below.
 
-1. **sync: the teardown window in the completion guarantee. RULED
-    2026-09-06: close by contract, no durable record.** A receiver dropped
-    after `detach`'s drain of the outstanding discard requests records a
-    request nobody can act on, because the writer is gone; a receiver dropped
-    after `detach` returns runs no sweep at all, because its weak handle no
-    longer upgrades. Same outcome either way, and it bites only when the
-    consumer ends the attachment holding a page it received and never
-    acknowledged while the completion marker is already durable - the same
-    case as a consumer that crashes with pages in hand. The engine's guarantee
-    repairs holes its own mechanics create, a receiver replaced INSIDE an
-    attachment; the only full closure would be a durable "scope lost pages"
-    row, a new method on the `CheckpointStore` trait every downstream store
-    implements, bought for a consumer already outside the persist-then-
-    acknowledge contract. The build: one contract line in `reference/sync.md`
-    (a page delivered but unacknowledged at detach is the consumer's to have
-    persisted or to forfeit, exactly as at a crash); a teardown flag that makes
-    the departure sweep inert once `detach` has begun, so a drop in the window
-    behaves like a drop after it; and the drain's writer awaits clamped to
-    `detach_timeout`, which is the cold review's P3 in the same ten lines. THE
-    OWNER'S CONDITION: the ruling must be documented at the code, a doc comment
-    at the sweep's teardown check and at the drain that states the window, why
-    it is the consumer's contract and not a defect, and what the closing
-    alternative would have cost, so a later review reads the ruling there
-    rather than re-filing the window as a bug.
+- **Filed from the teardown-window cold review (2026-09-07), not fixed in
+  it.** (a) Lateral P2: `detach_inner` awaits `Account::close()` with no
+  deadline, so a hanging close hangs `detach` despite every other step being
+  clamped to `detach_timeout`; predates the change. Clamp it like the worker
+  awaits, and decide what a timed-out close means for the handle. (b) P3:
+  `a_departure_during_teardown_records_no_loss` calls `begin_teardown`
+  directly, so deleting the production call from `detach_inner`, or moving it
+  after worker shutdown, changes nothing the test observes. Pinning the
+  lifecycle ordering wants a test through `SyncEngine::detach` with teardown
+  held at a controlled await; the engine harness in
+  `tests/backfill_lane_flow_control.rs` is the closest starting point.
 - **Residuals of the bounded-backfill cold review.** P3 or P4 from that
     review; verify against the code before working any of it. The rest of
     that list was worked on
@@ -77,9 +62,6 @@ debt is listed under their crates below.
     `AlreadyPersisted` on the shared `Lane::Backfill(scope, completion)` key
     and never reaches the refusal at all, so the row-deleting variant of that
     P3 could only ever bite a later attempt's PAGE rows.
-    - P3: `detach`'s discard drain awaits the writer with no deadline, while
-      every other teardown step is clamped to `detach_timeout`. A store whose
-      `delete_backfill` or `put_ledger` hangs now hangs `detach`.
     - FILED by the receipt-bound landing, not fixed in it: a surviving
       backfill entry's `subsumed` history is no longer bounded by
       `lane_capacity`. It was, while the charge was the unacknowledged page -
