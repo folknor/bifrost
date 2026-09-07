@@ -41,7 +41,7 @@ pub(crate) fn carddav_capabilities() -> AccountCapabilities {
         // an ordinary own collection; this crate models no foreign
         // namespace, so there is nothing a rediscovery reopen could
         // surface under that label.
-        reopen_discovers_foreign_namespaces: false,
+        discovers_foreign_namespaces_on_rediscovery: false,
     }
 }
 

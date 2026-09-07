@@ -303,6 +303,59 @@ drives a clock-trickling peer under paused tokio time, and
 blocking driver armed on the transcript and asserts they shrink within a reply
 and reset between replies.
 
+That deadline judges the PEER, so the crate's own bandwidth-throttle waiting is
+excluded from it. This is the read-side statement of the same rule the write
+loop follows (see "Transport types"), and it needed a different mechanism,
+which is why the two paths do not look alike. A write timeout is a fresh
+duration per write, so the write loop simply drains its debt before arming the
+timer. A reply read has no fresh duration to step outside of: the per-operation
+budget has been collapsed into ONE deadline spanning the whole reply, precisely
+so a trickling peer cannot stretch it, and there is no "outside" a deadline -
+only past it. So the async reader drains parked inbound debt and then POSTPONES
+the reply deadline by exactly what the drain cost, and the blocking reader,
+whose `charge` sleeps its own thread between lines, collects that slept time and
+pushes its `expires_at` out by it. Either way the peer gets one configured
+timeout of patience and no more; only our own waiting is refunded.
+
+The async reader assembles each line from a hand-rolled `fill_buf` / `consume`
+loop rather than `read_until` for that reason and no other. A buffer fill is the
+unit that charges the inbound meter, so it is the only place the resulting debt
+can be drained; `read_until` polls the socket an unbounded number of times
+behind one armed timeout, which would leave every charge after a line's first
+paid out of the reply's own budget. That is a real case rather than a
+pathological one - a line split across TCP segments is ordinary. The blocking
+reader keeps `read_until`, because there the sleeps happen between syscalls and
+accumulate into a counter the loop reads before it re-arms `SO_RCVTIMEO`.
+
+The two halves differ in one detail worth not "fixing": the blocking reader
+DISCARDS whatever is on the counter before it takes its deadline. Its debt is
+slept, so a trailing sleep from the previous reply has already elapsed by the
+time this reply's `expires_at` is computed, and crediting it again would hand
+out the same time twice. The async half needs no such discard because its debt
+is a parked timer: nothing has elapsed when the `AsyncDeadline` is minted, and
+the drain that pays it happens inside the loop.
+
+The guarantee is bounded, not weakened. A peer can only buy itself extra time by
+sending bytes, each of which is charged against `MAX_RESPONSE_BYTES`, so the
+most any reply can be postponed is `MAX_RESPONSE_BYTES` (plus one buffer fill of
+surplus) divided by the cap the consumer chose - and a peer that trickles
+without sending bytes earns no postponement at all, which is exactly the case
+the deadline exists for. `a_trickled_multi_line_reply_cannot_outrun_the_operation_timeout`
+runs uncapped and still holds.
+
+Pinned by `a_capped_reply_read_is_not_charged_its_own_throttle_debt` (800 ms of
+inbound debt against a 200 ms timeout, under paused time; before the change
+every reply after the first failed as "SMTP read timed out") and
+`a_setup_deadline_is_not_postponed_by_inbound_throttle_debt`, which holds the
+other half: the shared connect ceiling is ABSOLUTE, so debt is paid inside it
+and debt that does not fit fails as a timeout AT the ceiling. That is the same
+ruling `drain_outbound_throttle_within` makes on the write side, reached from
+the other direction - there the drain has to be bounded to stay inside the
+ceiling, here it simply is not exempted. The blocking half's version of the
+refund is unpinned: a test with bite would have to owe real throttle debt, and
+the blocking funnel sleeps a real thread, which the crate's testing rules put
+out of scope.
+
 ## PIPELINING
 
 When the server advertises PIPELINING, `MAIL FROM` and `RCPT TO` commands are written in bounded recipient windows, with every reply in one window drained before the next is written. `DATA` is issued only after all recipient windows complete; the body is never in the pipelined batch. On RCPT failure mid-pipeline the transaction is reset before the body. The shared window bound respects the peer TCP window while preserving the original recipient indexes in `SendProgress`.
@@ -785,6 +838,13 @@ final DATA-body write gated the read of the server's reply to it, spending
 the caller's per-operation read timeout on outbound debt.
 `outbound_throttle_debt_does_not_gate_the_next_read` pins that a read
 completes on its first poll while a write is still in debt.
+
+Separate slots keep OUTBOUND debt off the read budget; they do nothing about
+INBOUND debt, which a reply's own bytes owe and which `poll_read` waits out
+where it sits. Keeping that off the per-reply deadline is the reader's job, not
+the funnel's - see "Per-reply read deadline". `drain_inbound_throttle` is the
+seam it uses, and unlike its outbound twin it RETURNS how long it waited,
+because the caller does not skip the deadline but repays it.
 
 The blocking funnel cannot deliver that property and is not claimed to.
 `NetworkStream::charge` sleeps the calling thread, and that thread is the

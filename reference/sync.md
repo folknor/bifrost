@@ -161,8 +161,9 @@ for each (logging but not failing on per-account errors), then
 cancels the engine-root token. Strongly preferred over relying
 on `Drop`, which can only fire a best-effort sync cancel.
 
-`reopen` (driven by `EngineDirective::RestartAccount`, and also public
-as `SyncEngine::reopen`) is a staged reattach. It opens a replacement,
+The reattach path (driven internally by `EngineDirective::RestartAccount`
+through the reopen lane, and public as `SyncEngine::reattach`) is a
+staged reattach. It opens a replacement,
 reapplies priority and bandwidth, rediscovers cursor scopes and
 memberships into a temporary registry, establishes newly-appeared
 scopes, removes vanished cursors, recreates registered push
@@ -172,22 +173,22 @@ handle and registry topology. On a successful swap the replacement
 open's `skipped_scopes` replace the slot's stored lane, so a healed
 namespace disappears from `open_skipped_scopes` and a still-degraded
 one reappears with a fresh classification. The public entry is what a consumer pairs
-with `capabilities().reopen_discovers_foreign_namespaces`: when that
+with `capabilities().discovers_foreign_namespaces_on_rediscovery`: when that
 flag is true, a share granted after the last open surfaces only through
 this rediscovery, and the scheduling cadence (how often the reattach's
 wire cost is worth paying) is consumer policy - the engine does not
-schedule speculative reopens on its own.
+schedule speculative reattaches on its own.
 
 That flag is advisory TO THE CONSUMER, not a promise the engine keeps.
 Nothing in `bifrost-sync` reads it: it is not an input to any engine
-decision, and no internal caller of `reopen` exists at all. It reports
-reopen-time discovery POTENTIAL (IMAP derives it from NAMESPACE, JMAP is
+decision, and no internal caller of `SyncEngine::reattach` exists at all.
+It reports rediscovery POTENTIAL (IMAP derives it from NAMESPACE, JMAP is
 constitutively true), and a consumer that wants shares granted after open
-to appear must read it and drive `SyncEngine::reopen` on its own clock.
+to appear must read it and drive `SyncEngine::reattach` on its own clock.
 The engine will not grow a rediscovery timer: the right interval depends
 on things it cannot see - whether the app is foregrounded, whether the
 connection is metered, whether shares are common in the deployment - and
-a reopen is a full staged reattach with real wire cost, so an interval on
+a reattach is a full staged operation with real wire cost, so an interval on
 the consumer's side is both cheaper and better informed. An
 `EngineConfig` interval was rejected (default-off would go unused,
 default-on would be wrong for most deployments); an
@@ -205,7 +206,7 @@ also overlays the final live cursor snapshot onto every retained scope.
 A batch from an old handle that finishes after cutover is therefore fenced
 out before broadcast or durable ack, instead of rolling either cursor copy
 backward. This fencing avoids waiting for an unbounded old stream during
-reopen.
+a reattach.
 
 ## Page loss lanes
 
@@ -367,7 +368,7 @@ built the writer by hand still can, and `BackfillCheckpointWriter::new` gives it
 a constructor. That route performs the read-modify-write it always did and is
 documented as carrying the race; the attached route is the one without it.
 
-A public or engine-initiated reopen queues behind `Pause` and runs after
+A `SyncEngine::reattach` call or an engine-initiated reopen queues behind `Pause` and runs after
 resume: pause is a quiescence boundary, not permission to open a
 replacement connection in the background. The activity registration that
 makes the account non-quiescent is taken BEFORE `factory.open()`, not
@@ -1479,7 +1480,7 @@ shutdown cleanup during an indefinitely paused account.
 `factory.open()`, and answers `ReplacementOpen::Detached` when it is cancelled -
 closing the replacement it just opened before returning. `detach` deliberately
 does not wait for consumer-driven activity, so nothing else excludes a public
-`SyncEngine::reopen` whose `begin_activity()` landed just before detach flipped
+`SyncEngine::reattach` whose `begin_activity()` landed just before detach flipped
 the boundary to `Stop`: the open proceeds while detach removes the slot, awaits
 the workers, and closes the old handle. With unchanged topology the reattach
 establishes no cursor and recreates no subscription - the two paths that would
@@ -1488,7 +1489,7 @@ the replacement into the orphaned slot, and close the already-closed previous
 handle, leaving the replacement connection with no owner and never closed. The
 public entry reports `AccountNotAttached`; `restart_account` simply stops.
 Pinned by
-`a_reopen_racing_detach_closes_its_replacement_instead_of_leaking_it`.
+`a_reattach_racing_detach_closes_its_replacement_instead_of_leaking_it`.
 
 That property is structural rather than remembered. `open_replacement`
 is the single acquisition site for an open/swap, taking the guard after
@@ -2893,7 +2894,7 @@ crates/sync/src/
                           // from bifrost-types
   engine/
     mod.rs                // SyncEngine, SyncEngineBuilder, Drop;
-                          // detach / reopen / shutdown;
+                          // detach / reattach / shutdown;
                           // ack_checkpoint, ack_publication, debt,
                           // repair_debt, waive/block_obligation;
                           // account_changes_stream,

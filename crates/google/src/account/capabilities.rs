@@ -127,7 +127,7 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
         // Gmail delegation rides separate authorization, not open-time
         // discovery: a reopen of this account can never surface another
         // user's mailbox.
-        reopen_discovers_foreign_namespaces: false,
+        discovers_foreign_namespaces_on_rediscovery: false,
     }
 }
 

@@ -638,7 +638,7 @@ fn push_email_alias(emails: &mut Vec<String>, email: &str) {
 /// `accountCapabilities`; A5a auto-discovers them from the session (no
 /// config needed, unlike Graph). Reading the session document alone -
 /// and every `open` fetches a fresh one - is what backs the advertised
-/// `reopen_discovers_foreign_namespaces` capability: a share granted
+/// `discovers_foreign_namespaces_on_rediscovery` capability: a share granted
 /// after the last open appears here on the next open.
 fn foreign_mail_account_ids(
     session: &crate::core::session::Session,
@@ -1570,7 +1570,7 @@ mod tests {
         }
     }
 
-    /// The `reopen_discovers_foreign_namespaces` capability promises
+    /// The `discovers_foreign_namespaces_on_rediscovery` capability promises
     /// that a share granted after the last open surfaces at the next
     /// one. The mechanism is that foreign discovery reads only the
     /// session document and every `open` fetches a fresh one (the

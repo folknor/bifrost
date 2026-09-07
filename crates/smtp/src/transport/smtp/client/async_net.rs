@@ -55,6 +55,19 @@ impl AsyncDeadline {
             .map(Some)
     }
 
+    /// Push the deadline out by `by`, leaving an unbounded deadline unbounded.
+    ///
+    /// The one legitimate use is excluding time this crate spent deliberately
+    /// NOT touching the socket - bandwidth-throttle debt - from a deadline
+    /// whose whole job is to judge the PEER. It must never be applied to the
+    /// shared SETUP deadline, which is an absolute ceiling: postponing that
+    /// one does not spend it, it overruns it.
+    pub(super) fn postponed_by(self, by: Duration) -> Self {
+        Self {
+            expires_at: self.expires_at.map(|expires_at| expires_at + by),
+        }
+    }
+
     async fn timeout<T, F>(self, message: &'static str, future: F) -> Result<T, Error>
     where
         F: Future<Output = T>,
@@ -227,6 +240,34 @@ impl AsyncNetworkStream {
     /// safe to bound with a `tokio::time::timeout`.
     pub(super) async fn drain_outbound_throttle(&mut self) {
         std::future::poll_fn(|cx| self.poll_throttle(cx, false)).await;
+    }
+
+    /// Await any inbound throttle debt parked by an earlier read, and report
+    /// how long that took.
+    ///
+    /// The mirror of `drain_outbound_throttle`, and it exists for the same
+    /// reason: the debt is the cap the CONSUMER asked for, while the read
+    /// deadline is a statement about the PEER. It differs in what the caller
+    /// does with the answer. A per-operation write timeout is a fresh duration
+    /// per write, so the write loop simply drains outside it; a reply read has
+    /// no such thing, because the per-operation budget has been collapsed into
+    /// one deadline spanning the whole reply precisely so a trickling peer
+    /// cannot stretch it. There is no "outside" a deadline - only past it - so
+    /// the reader pushes the reply deadline out by the returned duration
+    /// instead, which leaves the peer exactly the patience it was configured
+    /// with and charges our own waiting to neither side.
+    ///
+    /// Cancel-safe for the same reason: a dropped future leaves the `Sleep`
+    /// parked in its slot, so the debt is neither lost nor double-counted. The
+    /// elapsed measurement is on `tokio::time::Instant`, the clock the `Sleep`
+    /// itself runs on.
+    pub(super) async fn drain_inbound_throttle(&mut self) -> Duration {
+        if self.throttle_in.is_none() {
+            return Duration::ZERO;
+        }
+        let started = Instant::now();
+        std::future::poll_fn(|cx| self.poll_throttle(cx, true)).await;
+        started.elapsed()
     }
 
     /// Record `n` transferred bytes and park the resulting debt, if any.

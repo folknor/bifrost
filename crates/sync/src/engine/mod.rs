@@ -8,7 +8,7 @@
 //! `open_blob`, `open_raw_rfc822`, ...), `invalidation_sink`.
 //!
 //! `SyncEngine` itself lives here, along with the builder, the slot
-//! lifecycle (`detach`, `reopen`, `shutdown`), the consumer-facing ack
+//! lifecycle (`detach`, `reattach`, `shutdown`), the consumer-facing ack
 //! and debt surface, and `Drop`. Its remaining methods are split by
 //! concern across sibling modules, each of which adds its own
 //! `impl SyncEngine` block:
@@ -707,7 +707,7 @@ impl SyncEngine {
         // Drop the push registry records for this incarnation.
         //
         // Nothing can reach them after this point - `unsubscribe_push`
-        // rejects with `AccountNotAttached` and reopen only runs on an
+        // rejects with `AccountNotAttached` and reattach only runs on an
         // attached slot - so leaving them behind does not preserve a
         // teardown opportunity; it only means a later attach of the same
         // `AccountId` inherits handles minted by a dead connection and
@@ -756,11 +756,11 @@ impl SyncEngine {
     ///
     /// This is also the entry a consumer drives to pick up shares granted
     /// after the last open, paired with
-    /// `capabilities().reopen_discovers_foreign_namespaces`. The CADENCE is
+    /// `capabilities().discovers_foreign_namespaces_on_rediscovery`. The CADENCE is
     /// consumer policy and the engine will never schedule speculative
-    /// reopens; see `reference/sync.md`, the `reopen` paragraph, for the
-    /// ruling and the alternatives that were rejected.
-    pub async fn reopen(&self, account_id: &AccountId) -> Result<(), Error> {
+    /// reattaches; see `reference/sync.md`, the `reattach` paragraph, for
+    /// the ruling and the alternatives that were rejected.
+    pub async fn reattach(&self, account_id: &AccountId) -> Result<(), Error> {
         let slot = self
             .accounts
             .get(account_id)
@@ -811,7 +811,7 @@ impl SyncEngine {
                 Err(ReplacementOpen::Detached) => {
                     return Err(Error::AccountNotAttached(account_id.clone()));
                 }
-                // `reopen` is the post-attach swap path. Per the engine error
+                // `reattach` is the post-attach swap path. Per the engine error
                 // policy, failures in this path use `Account` (not
                 // `OpenFailed`) so callers know the account was running and
                 // the engine is reporting an in-flight failure.
@@ -821,12 +821,12 @@ impl SyncEngine {
     }
 
     /// The `OpenedAccount::skipped_scopes` lane from the account's most
-    /// recent successful open (initial attach or reopen swap): parts of
+    /// recent successful open (initial attach or reattach swap): parts of
     /// the account surface - typically foreign / shared namespaces -
     /// the protocol crate discovered but could not bring up, each with
     /// its classified `AccountError`. Empty when the whole discovered
     /// surface is live. A skip whose error is retryable heals on a
-    /// later `reopen`; a terminal one (revoked grant) will keep
+    /// later `reattach`; a terminal one (revoked grant) will keep
     /// reappearing until the grant returns or goes away.
     pub fn open_skipped_scopes(&self, account_id: &AccountId) -> Result<Vec<SkippedScope>, Error> {
         let slot = self

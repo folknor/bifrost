@@ -8,7 +8,7 @@ use std::{
 };
 
 use bifrost_sasl::ScramChannelBinding;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::async_net::AsyncDeadline;
@@ -94,6 +94,59 @@ fn op_reply(result: Result<Response, Error>) -> OpOutcome {
 enum TimeoutBudget {
     PerOperation(Option<Duration>),
     SetupDeadline(AsyncDeadline),
+}
+
+/// The budget one whole REPLY read draws on, and whether the crate's own
+/// inbound throttle debt may be excluded from it.
+///
+/// Both variants are deadlines, because a per-operation timeout has to become
+/// one to bound a multi-line reply as a unit. They differ in who the deadline
+/// is about, which is what decides where throttle debt is paid:
+///
+/// - `Own` was minted here from the per-operation timeout. It exists to judge
+///   the PEER, so a wait this crate imposed at the consumer's own request is
+///   drained first and the deadline pushed out by exactly what the drain cost.
+///   The peer still gets one configured timeout of patience and no more.
+/// - `Setup` is the shared connect ceiling covering DNS, connect, TLS, banner
+///   and EHLO. It is ABSOLUTE, so there is nothing to exclude debt into:
+///   postponing it would overrun the ceiling rather than spend it. Debt is
+///   therefore paid INSIDE it - which needs no code at all, since `poll_read`
+///   consults `throttle_in` itself - and debt that does not fit surfaces as a
+///   read timeout inside the setup budget. Same ruling as the write loop's
+///   `drain_outbound_throttle_within`, reached from the other direction.
+#[derive(Clone, Copy, Debug)]
+enum ReplyBudget {
+    Own(AsyncDeadline),
+    Setup(AsyncDeadline),
+}
+
+impl ReplyBudget {
+    fn new(budget: TimeoutBudget) -> Self {
+        match budget {
+            TimeoutBudget::PerOperation(timeout) => Self::Own(AsyncDeadline::new(timeout)),
+            TimeoutBudget::SetupDeadline(deadline) => Self::Setup(deadline),
+        }
+    }
+
+    /// The budget to arm one socket read with. Always deadline-shaped, so
+    /// every line of a reply draws from the same remaining slack.
+    fn budget(self) -> TimeoutBudget {
+        match self {
+            Self::Own(deadline) | Self::Setup(deadline) => TimeoutBudget::SetupDeadline(deadline),
+        }
+    }
+
+    fn excludes_throttle_debt(self) -> bool {
+        matches!(self, Self::Own(_))
+    }
+
+    /// Give back time spent draining throttle debt. A no-op on `Setup`, which
+    /// is the one budget that may not be moved.
+    fn postpone(&mut self, by: Duration) {
+        if let Self::Own(deadline) = self {
+            *deadline = deadline.postponed_by(by);
+        }
+    }
 }
 
 async fn with_timeout<T, F>(
@@ -1678,32 +1731,64 @@ impl AsyncSmtpConnection {
         // the per-operation budget to a deadline here makes every subsequent
         // line read draw from the same remaining slack. A `SetupDeadline`
         // budget is already deadline-shaped and passes through unchanged.
-        let budget = match budget {
-            TimeoutBudget::PerOperation(timeout) => {
-                TimeoutBudget::SetupDeadline(AsyncDeadline::new(timeout))
-            }
-            deadline @ TimeoutBudget::SetupDeadline(_) => deadline,
-        };
+        let mut budget = ReplyBudget::new(budget);
 
         let mut buffer = String::with_capacity(100);
 
         loop {
             let mut line = Vec::with_capacity(100);
-            let bytes_read = {
-                let mut limited = (&mut self.stream).take((MAX_RESPONSE_LINE_BYTES + 1) as u64);
-                with_timeout(
-                    budget,
-                    "SMTP read timed out",
-                    limited.read_until(b'\n', &mut line),
-                )
-                .await?
-                .map_err(error::network)?
+            // One line, assembled from buffer fills. This is deliberately a
+            // hand-rolled fill loop rather than `read_until`: a fill is the
+            // unit that CHARGES the inbound meter, so it is also the only
+            // place the resulting debt can be drained outside the deadline.
+            // `read_until` polls the socket an unbounded number of times
+            // behind one timeout, which would leave every charge after the
+            // first paid from the reply's own budget - the read-side shape of
+            // the outbound defect this mirrors.
+            let bytes_read = loop {
+                if budget.excludes_throttle_debt() {
+                    // This crate's own wait, at the consumer's request. Pay it
+                    // first, then hand the deadline back the time it cost, so
+                    // the budget is only ever spent on the peer's silence.
+                    let waited = self.stream.get_mut().drain_inbound_throttle().await;
+                    budget.postpone(waited);
+                }
+
+                let (consumed, done) = {
+                    let available = with_timeout(
+                        budget.budget(),
+                        "SMTP read timed out",
+                        self.stream.fill_buf(),
+                    )
+                    .await?
+                    .map_err(error::network)?;
+
+                    if available.is_empty() {
+                        (0, true)
+                    } else {
+                        match available.iter().position(|byte| *byte == b'\n') {
+                            Some(index) => {
+                                line.extend_from_slice(&available[..=index]);
+                                (index + 1, true)
+                            }
+                            None => {
+                                line.extend_from_slice(available);
+                                (available.len(), false)
+                            }
+                        }
+                    }
+                };
+                self.stream.consume(consumed);
+
+                if line.len() > MAX_RESPONSE_LINE_BYTES {
+                    return Err(error::parse("SMTP response line too long"));
+                }
+                if done {
+                    break line.len();
+                }
             };
             if bytes_read == 0 {
                 break;
-            }
-            if line.len() > MAX_RESPONSE_LINE_BYTES {
-                return Err(error::parse("SMTP response line too long"));
             }
             if buffer.len() + line.len() > MAX_RESPONSE_BYTES {
                 return Err(error::parse("SMTP response too large"));
@@ -1983,6 +2068,135 @@ mod transcript_tests {
             started.elapsed() <= Duration::from_secs(30),
             "the whole reply must be bounded by one timeout, took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A connection that has just finished two capped replies and therefore
+    /// owes 800 ms of INBOUND throttle debt.
+    ///
+    /// 1000 B/s, two 900-byte single-line replies: the first spends the
+    /// bucket's initial second of tokens and owes nothing, the second overspends
+    /// by 800 bytes. No virtual time passes while that happens, so nothing
+    /// refills and the debt is exactly 800 ms - four times the 200 ms timeout
+    /// the tests below arm. A third line is left unread for them to reach.
+    async fn connection_owing_inbound_debt(timeout: Option<Duration>) -> AsyncSmtpConnection {
+        use std::sync::{Arc, atomic::AtomicU64};
+
+        use crate::transport::smtp::client::metering::WireMetering;
+        use crate::transport::smtp::test_support::SlowLinePeer;
+
+        fn padded(prefix: &str) -> Vec<u8> {
+            let mut line = prefix.as_bytes().to_vec();
+            line.resize(898, b'x');
+            line.extend_from_slice(b"\r\n");
+            line
+        }
+
+        let hello = ClientId::Domain("client.example".to_owned());
+        let peer = SlowLinePeer::from_owned_lines(
+            [
+                padded("250 first"),
+                padded("250 second"),
+                b"250 third\r\n".to_vec(),
+            ],
+            Duration::ZERO,
+        );
+        let mut connection = AsyncSmtpConnection::from_raw_stream_for_test(
+            Box::new(peer),
+            &hello,
+            Protocol::Smtp,
+            timeout,
+        );
+        connection.stream.get_mut().set_metering(WireMetering::new(
+            None,
+            Some(Arc::new(AtomicU64::new(1000))),
+        ));
+
+        for _ in 0..2 {
+            connection
+                .read_response()
+                .await
+                .expect("the first two replies arrive before any debt is owed");
+        }
+
+        connection
+    }
+
+    /// A bandwidth cap must not consume the per-reply read deadline.
+    ///
+    /// This is the read-side twin of
+    /// `a_capped_upload_outlives_a_write_timeout_shorter_than_its_throttle_debt`,
+    /// and it needed a different mechanism. The write side drains its debt
+    /// outside a per-operation timeout, because that timeout is a fresh
+    /// duration per write. A reply read has no fresh duration to step outside
+    /// of: the per-operation budget is collapsed into ONE deadline spanning the
+    /// whole reply, precisely so a trickling peer cannot stretch it, and
+    /// draining "outside" a deadline is just overrunning it. So the reader
+    /// drains the debt and then pushes the reply deadline out by what the drain
+    /// cost, which leaves the peer exactly the patience it was configured with.
+    ///
+    /// Before that, the debt parked by one reply's own bytes was waited out
+    /// inside the next reply's deadline, so under any cap tight enough to owe
+    /// more than the timeout, every reply after the first failed as "SMTP read
+    /// timed out" - a healthy connection, throttled at the consumer's own
+    /// request, reported as a silent peer.
+    ///
+    /// The elapsed assertion is a floor: it says the read really was held past
+    /// its whole deadline by the cap, which is what makes the successful return
+    /// mean anything.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn a_capped_reply_read_is_not_charged_its_own_throttle_debt() {
+        let mut connection = connection_owing_inbound_debt(Some(Duration::from_millis(200))).await;
+
+        let started = tokio::time::Instant::now();
+        let response = connection
+            .read_response()
+            .await
+            .expect("throttle debt is this crate's own wait, not the peer's silence");
+
+        assert!(response.is_positive());
+        assert!(
+            started.elapsed() > Duration::from_millis(200),
+            "the read must have been throttled past the deadline to mean anything, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// And the setup ceiling is NOT postponed by it.
+    ///
+    /// The shared connect deadline covers DNS, connect, TLS, banner and EHLO
+    /// and is absolute, so the argument that buys the per-operation budget its
+    /// exemption - "this wait is ours, not the peer's" - buys nothing here:
+    /// leaving the ceiling is the whole failure. Debt is paid inside the setup
+    /// budget and debt that does not fit fails as a timeout at the ceiling,
+    /// which is the same ruling `drain_outbound_throttle_within` makes on the
+    /// write side.
+    ///
+    /// The error is not the finding - postponing the deadline also ends in a
+    /// timeout eventually. The elapsed time is: 300 ms of ceiling against
+    /// 800 ms of debt.
+    ///
+    /// A PRESERVATION CHECK, not evidence for the refund this batch added: the
+    /// reader before it also kept inbound debt inside the shared deadline and
+    /// also timed out at 300 ms, so this passes against both. It guards the
+    /// branch that must NOT change while the sibling branch does - which is
+    /// worth having and is not a bite.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn a_setup_deadline_is_not_postponed_by_inbound_throttle_debt() {
+        let mut connection = connection_owing_inbound_debt(None).await;
+
+        let deadline = AsyncDeadline::new(Some(Duration::from_millis(300)));
+        let started = tokio::time::Instant::now();
+        let error = connection
+            .read_response_with_budget(TimeoutBudget::SetupDeadline(deadline))
+            .await
+            .expect_err("debt that outlasts the setup ceiling must fail as a timeout");
+
+        assert!(error.is_timeout(), "expected a timeout, got {error:?}");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(300),
+            "the setup deadline is a ceiling however the time is spent"
         );
     }
 

@@ -622,7 +622,7 @@ pub(super) async fn open_replacement(
         .ok_or(ReplacementOpen::Paused)?;
     let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
     // Detach does not wait for consumer-driven activity, so nothing excludes a
-    // `SyncEngine::reopen` that registered its activity just before detach
+    // `SyncEngine::reattach` that registered its activity just before detach
     // flipped the boundary to `Stop`. The slot's shutdown token is the one
     // thing that observes the teardown from here, so it is consulted on both
     // sides of the open: before, to avoid spending a connection at all, and

@@ -1,4 +1,4 @@
-//! `SyncEngine::reopen` is public and consumer-driven, and `detach`
+//! `SyncEngine::reattach` is public and consumer-driven, and `detach`
 //! deliberately does not wait for consumer-driven activity. Nothing else
 //! excludes the two, so the replacement open has to observe the teardown
 //! itself.
@@ -55,7 +55,7 @@ impl AccountFactory for GatedFactory {
 /// orphaned slot, and close the ALREADY-closed previous handle. The
 /// replacement then had no owner and was never closed.
 #[tokio::test]
-async fn a_reopen_racing_detach_closes_its_replacement_instead_of_leaking_it() {
+async fn a_reattach_racing_detach_closes_its_replacement_instead_of_leaking_it() {
     let scopes = vec![CursorScope::Folder(FolderId("inbox".into()))];
     let first = Arc::new(StubAccount::new(scopes.clone()));
     let replacement = Arc::new(StubAccount::new(scopes));
@@ -80,7 +80,7 @@ async fn a_reopen_racing_detach_closes_its_replacement_instead_of_leaking_it() {
     let reopening = {
         let engine = Arc::clone(&engine);
         let account_id = account_id.clone();
-        tokio::spawn(async move { engine.reopen(&account_id).await })
+        tokio::spawn(async move { engine.reattach(&account_id).await })
     };
 
     // The replacement open is in flight and holds the reopen guard.

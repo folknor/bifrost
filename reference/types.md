@@ -126,15 +126,15 @@ fields include:
 - `filter_rule_shape`;
 - `conveniences`, including starred, replied, forwarded, and MDN
   dispatch shapes;
-- reopen-time foreign namespace discovery
-  (`reopen_discovers_foreign_namespaces`): discovery POTENTIAL, not
+- rediscovery-time foreign namespace discovery
+  (`discovers_foreign_namespaces_on_rediscovery`): discovery POTENTIAL, not
   current membership. True iff re-opening the account can surface
   shared / other-user namespaces granted after the last open (the
   account discovers its foreign surface only at open and no provider
   signal rules such namespaces out). IMAP derives it from NAMESPACE;
   JMAP is constitutively true; configuration-driven foreign surfaces
   (Graph, Gmail delegation, DAV) are false. Consumers act on it by
-  scheduling `SyncEngine::reopen` at a cadence of their choosing.
+  scheduling `SyncEngine::reattach` at a cadence of their choosing.
 
 Consumers should inspect capabilities before presenting an operation.
 An implementation must still return a structured error if an advertised

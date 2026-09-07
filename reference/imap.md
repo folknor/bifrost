@@ -383,7 +383,7 @@ Their outer results intentionally differ: generic hydration can return raw MIME
 and has flags-only/metadata/text-only modes, while PIM hydration always carries
 message metadata and parses selected bytes through `bifrost-types::mime`.
 
-`capabilities.rs` fills `AccountCapabilities::pim_methods` and `conveniences` at open time, and sets `AccountCapabilities::reopen_discovers_foreign_namespaces` from the open-time NAMESPACE response (`namespaces_advertise_foreign`, pure, `factory.rs`): true iff any `other`/`shared` descriptor carries a non-empty prefix, independent of whether any folders are currently shared. IMAP emits no scope-lifecycle events and discovers foreign folders only at open, so consumers read this flag to decide whether a periodic reopen/reattach (the only way a post-open ACL grant becomes visible) can ever surface anything on this server. IMAP advertises real support for:
+`capabilities.rs` fills `AccountCapabilities::pim_methods` and `conveniences` at open time, and sets `AccountCapabilities::discovers_foreign_namespaces_on_rediscovery` from the open-time NAMESPACE response (`namespaces_advertise_foreign`, pure, `factory.rs`): true iff any `other`/`shared` descriptor carries a non-empty prefix, independent of whether any folders are currently shared. IMAP emits no scope-lifecycle events and discovers foreign folders only at open, so consumers read this flag to decide whether a periodic `SyncEngine::reattach` (the only way a post-open ACL grant becomes visible) can ever surface anything on this server. IMAP advertises real support for:
 
 - Container membership: `add_to_container` via UID COPY, `remove_from_container` via `+FLAGS.SILENT \Deleted` plus UID EXPUNGE.
 

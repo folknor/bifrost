@@ -336,7 +336,7 @@ pub(crate) fn build(
         // accounts list is only the current grants, and RFC 9670
         // principals support is sufficient but not necessary evidence),
         // and a false here tells the engine to never look.
-        reopen_discovers_foreign_namespaces: true,
+        discovers_foreign_namespaces_on_rediscovery: true,
     };
 
     let limits = CoreLimits {
@@ -419,7 +419,7 @@ mod tests {
         assert!(caps.conveniences.forwarded_via_keyword);
         assert!(caps.conveniences.mdn_sent_via_keyword);
         assert!(caps.pim_methods.set_importance);
-        assert!(caps.reopen_discovers_foreign_namespaces);
+        assert!(caps.discovers_foreign_namespaces_on_rediscovery);
         assert_eq!(limits.max_objects_in_get, 256);
         assert_eq!(limits.max_objects_in_set, 700);
     }
@@ -969,7 +969,7 @@ mod tests {
         assert!(!caps.blob_digest_pre_download);
         assert_eq!(caps.quota_signal, QuotaSignal::None);
         assert_eq!(caps.rate_limit_class, RateLimitClass::Generous);
-        assert!(caps.reopen_discovers_foreign_namespaces);
+        assert!(caps.discovers_foreign_namespaces_on_rediscovery);
     }
 
     fn scheduled_session() -> Session {

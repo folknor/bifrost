@@ -418,8 +418,20 @@ Surfaced while authoring `reference/error-model.md` (a read of
   optional read-only directory-gateway address book, but gateway discovery
   is a substantial provider-specific unknown with no ratatoskr precedent.
   Scoped out of A9 to keep the blast radius bounded.
-- **a9-2 (graph)** `/users` `otherMails` / `proxyAddresses` into
-  `DirectoryCard.additional_emails` (A9 ships the single `mail`).
+- **a9-2 residual: the alias `$select` may cost directory reach.** The
+  projection itself landed 2026-09-07. What it left open is a consent question
+  nobody can settle hermetically: `otherMails` and `proxyAddresses` sit outside
+  the property set `User.ReadBasic.All` grants, so a tenant holding only basic
+  directory consent may now 403 the WHOLE `/users` query where it previously
+  succeeded. It maps to `NoPermission` correctly, so nothing is misreported -
+  but a tenant with working directory search can lose it, which is a reach
+  regression rather than a graceful degradation. Confirming it needs a live
+  ReadBasic-only tenant, because whether Graph actually refuses a `$select`
+  overreach (as opposed to omitting the fields) is not something the hermetic
+  suite can observe. If it does fire, the fix is a select-narrowing retry after
+  the first 403 - drop the two alias fields and re-issue - NOT dropping them
+  from the query outright, which would give every tenant the degraded
+  projection to spare the minority.
 - **a9-3 (graph)** `$search` (with `ConsistencyLevel: eventual`) as a
   richer substring directory match than the current `startswith` prefix
   `$filter`, if needed.
@@ -481,39 +493,6 @@ blocking; each is a real defect or a real decision, not a cleanup.
   call, so an account that never reopens keeps its orphan until the
   provider expires it (24h for Graph). If that window matters, add a
   bounded engine-side retry timer for unconfirmed records.
-
-- **xc-4 (sync, maybe app). Rename `SyncEngine::reopen`.** The cadence
-  ruling that produced this item (share-rediscovery cadence is consumer
-  policy; the engine grows no rediscovery timer) is settled and recorded in
-  `reference/sync.md` under the `reopen` paragraph, together with its
-  rejected alternatives. What is left is the rename.
-
-  The name undersells the operation and actively hides it from the consumer
-  the ruling puts in charge: someone told "drive share rediscovery yourself"
-  will search for something named `rediscover*` and find nothing. The method
-  does a full staged reattach - re-runs scope and membership discovery,
-  establishes newly-appeared scopes, drops vanished cursors, recreates push
-  subscriptions, refreshes the capability snapshot, then swaps the handle.
-
-  RULED 2026-09-07, not yet landed. Three parts, in this order.
-
-  1. Rename the capability flag `reopen_discovers_foreign_namespaces` to
-     `discovers_foreign_namespaces_on_rediscovery`. This was filed as the
-     rename's blocking COST; it is a separate defect and worth doing on its own
-     merits. A capability flag is an account describing its own property, and
-     the account never calls the engine method - phrasing the flag in terms of
-     that method is backwards. Verified 2026-09-07: the identifier appears in 16
-     files - `bifrost-types`, all seven account crates, and six sync test files.
-     Renaming a published field is the owner's call and was authorised.
-  2. Then rename the method to `reattach`. Cheap and local once the flag no
-     longer names it; nothing outside `sync` depends on the name. Chosen over
-     `rediscover_and_reattach` and `reopen_and_rediscover` because it says what
-     the operation IS, and the discovery belongs in the reference doc rather
-     than crammed into the identifier.
-  3. The reopen LANE keeps its name. `reopen_tx`, `reopen_lock`,
-     `ReopenRequest`, the reopen listener - internal vocabulary for a queue of
-     reattach requests, and renaming it churns most of the ~105 `sync/src/engine/`
-     occurrences to buy nothing.
 
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 
@@ -872,12 +851,13 @@ wave; these are what was left. Verify before working any of them.
   precisely what makes the lineage-root pin necessary. Worth deciding whether
   that is the intended contract or an accident the pin is now compensating for.
 
-- **smtp inbound throttle debt has the CR11 shape and was not fixed.**
-  `poll_read` consults `throttle_in` INSIDE the read budget, so under a small cap
-  a reply's own metering debt is charged against the per-reply deadline - exactly
-  the defect the outbound drain fixed, on the other side. Filed rather than fixed
-  because the read path drains through `BufReader::poll_fill_buf` and the change
-  is materially more invasive than the write side's.
+- **A capped reply read's postponement is bounded but large.** The read-side
+  refund pushes a reply deadline out by the throttle debt the read itself paid,
+  and the bound on that is `MAX_RESPONSE_BYTES / cap` because a peer can only buy
+  time by SENDING bytes and every byte is charged. `MAX_RESPONSE_BYTES` is 100 kB,
+  so at a 100 B/s cap the worst case is on the order of 1000 s. Bounded, and the
+  consumer chose the cap, so this is not a defect - but if that ever needs a
+  ceiling it is a separate ruling and should not be folded into the refund.
 
 - **jmap SSE: let a content-free parser overflow continue.** The stream ends on
   any parser error because `discard(..)` destroys a block that MAY have carried

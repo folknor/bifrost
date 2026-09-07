@@ -32,6 +32,19 @@ pub(crate) struct NetworkStream {
     /// already accepted by choosing the blocking API. The async transport
     /// parks a timer instead.
     metering: WireMetering,
+    /// Thread time slept paying INBOUND throttle debt since the reply reader
+    /// last collected it.
+    ///
+    /// The blocking reader bounds a whole reply with a deadline it re-arms
+    /// `SO_RCVTIMEO` from, so unlike the write side - where `SO_SNDTIMEO` is
+    /// per `write(2)` and a `charge` between two writes costs nothing - a
+    /// `charge` between two reply lines is spent straight out of the reply
+    /// budget. That budget is a statement about the PEER, and this sleep is
+    /// this crate's own doing at the consumer's request, so the reader takes
+    /// the accumulated value and pushes its deadline out by it. The async half
+    /// reaches the same place by postponing its `AsyncDeadline` around
+    /// `drain_inbound_throttle`.
+    inbound_throttle_slept: Duration,
 }
 
 /// Represents the different types of underlying network streams
@@ -57,7 +70,14 @@ impl NetworkStream {
             inner: Some(inner),
             state: ConnectionState::Ok,
             metering: WireMetering::disabled(),
+            inbound_throttle_slept: Duration::ZERO,
         }
+    }
+
+    /// Collect and reset the inbound throttle time slept since the last call.
+    /// See the field.
+    pub(super) fn take_inbound_throttle_slept(&mut self) -> Duration {
+        std::mem::replace(&mut self.inbound_throttle_slept, Duration::ZERO)
     }
 
     /// Install byte accounting / capping for this connection.
@@ -78,6 +98,9 @@ impl NetworkStream {
         };
         if let Some(debt) = debt {
             std::thread::sleep(debt);
+            if inbound {
+                self.inbound_throttle_slept = self.inbound_throttle_slept.saturating_add(debt);
+            }
         }
     }
 

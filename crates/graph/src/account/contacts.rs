@@ -232,7 +232,8 @@ pub(crate) async fn search(
     })
 }
 
-const DIRECTORY_SELECT: &str = "displayName,mail,businessPhones,companyName,jobTitle,department";
+const DIRECTORY_SELECT: &str =
+    "displayName,mail,otherMails,proxyAddresses,businessPhones,companyName,jobTitle,department";
 
 /// Organization-directory (Global Address List) search over `/users`.
 ///
@@ -322,16 +323,188 @@ fn directory_search_path(prefix: &str, query: &str, top: u32) -> String {
     )
 }
 
+/// Which half of the mailbox one SMTP `proxyAddresses` entry names.
+///
+/// The distinction is carried by the CASE of the type prefix and nothing
+/// else, so it has to be read at parse time and preserved: once the prefix
+/// is stripped, `SMTP:ada@x` and `smtp:ada@x` are indistinguishable, and
+/// the `mail`-versus-primary rule below needs to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyKind {
+    /// Upper-case `SMTP:` - the mailbox's primary SMTP address.
+    Primary,
+    /// Lower-case `smtp:` - a secondary alias.
+    Alias,
+}
+
+/// Strip the address-type prefix off one `proxyAddresses` entry, keeping
+/// only the SMTP ones and reporting which kind the prefix named.
+///
+/// A Graph proxy address is `TYPE:value`, and the type prefix is not
+/// decoration: `SMTP:` (upper) marks the mailbox's PRIMARY address, `smtp:`
+/// (lower) a secondary alias, and the remaining types - `X500:`, `x500:`,
+/// `SIP:`, `EUM:`, `SPO:` and friends - are directory/routing identifiers
+/// that are not email addresses at all and must never reach a field a
+/// consumer will put in a To: header.
+///
+/// Only an exactly upper-case `SMTP` is read as primary; every other SMTP
+/// spelling is an alias. Guessing "primary" from a mixed-case prefix would
+/// feed the suppression rule below on evidence the provider never gave.
+///
+/// An entry with no `:` at all carries no type, so its kind is unknowable
+/// and it is DROPPED rather than guessed at - the same silent-drop rule the
+/// mail-less row takes. So is an empty value after the prefix.
+fn smtp_proxy_address(entry: &str) -> Option<(ProxyKind, &str)> {
+    let (kind, value) = entry.split_once(':')?;
+    if !kind.eq_ignore_ascii_case("smtp") {
+        return None;
+    }
+    let kind = if kind == "SMTP" {
+        ProxyKind::Primary
+    } else {
+        ProxyKind::Alias
+    };
+    let value = value.trim();
+    (!value.is_empty()).then_some((kind, value))
+}
+
+/// Comparison key for the UNIVERSAL de-duplication pass: the domain half
+/// ASCII-lowercased, the local part left exactly as spelled.
+///
+/// The split is the whole point. A domain is case-insensitive by DNS, but
+/// RFC 5321 s2.4 requires the local part's case to be PRESERVED and leaves
+/// its interpretation to the destination host - so `User@ext.example` and
+/// `user@ext.example` may be two different mailboxes. `otherMails` is a
+/// free-form list that can name any external system, so folding its local
+/// parts would silently drop one of a pair.
+///
+/// The two error directions are not symmetric, and that is the tie-breaker
+/// wherever case-sensitivity is uncertain. Folding too aggressively DROPS
+/// an address, and this layer cannot reconstruct it: the consumer never
+/// learns it existed. Folding too little emits a near-duplicate, which is
+/// visible and which a consumer can collapse using knowledge this layer
+/// does not have. So when in doubt, keep both.
+///
+/// Only ASCII case is folded (see `directory_additional_emails` for why),
+/// and an address with no `@` has no domain half, so it is compared whole
+/// and unfolded - the same conservative direction.
+fn address_fold_key(address: &str) -> String {
+    match address.rsplit_once('@') {
+        Some((local, domain)) => format!("{local}@{}", domain.to_ascii_lowercase()),
+        None => address.to_string(),
+    }
+}
+
+/// Build `DirectoryCard::additional_emails` from `otherMails` plus the SMTP
+/// half of `proxyAddresses`.
+///
+/// Order is deterministic and provider-driven: every `otherMails` entry in
+/// server order, then every SMTP `proxyAddresses` entry in server order.
+/// `otherMails` leads because it is the tenant-curated "other addresses"
+/// list an admin typed, while `proxyAddresses` is the routing table Exchange
+/// maintains, so the former is the more useful head of a truncated list.
+///
+/// De-duplication runs two comparisons, because the two source lists carry
+/// different guarantees:
+///
+/// - UNIVERSAL, across everything: `address_fold_key`, which folds the
+///   domain only and compares the local part as spelled. This is the safe
+///   rule for `otherMails`, which can name an external system where the
+///   local part really is case-sensitive.
+/// - PROXY-ONLY, between `proxyAddresses` entries: whole-address ASCII
+///   case-insensitive. Exchange refuses two proxy entries that differ only
+///   by case, so a fold here can only ever collapse what the provider
+///   already considers one address. That guarantee is about Exchange's own
+///   proxy table and does not extend to `otherMails`.
+///
+/// A proxy entry that is suppressed still enters the proxy comparison set.
+/// Otherwise "de-duplicate within proxies" would quietly become
+/// "de-duplicate within EMITTED proxies", and a case variant of an entry
+/// already covered by `otherMails` would survive.
+///
+/// `mail` versus the primary proxy entry gets its own explicit ASCII
+/// case-insensitive comparison: the universal rule alone would leave
+/// `mail = Ada@example.test` and `SMTP:ada@example.test` standing as two
+/// entries for one mailbox. Only an entry that actually matches under that
+/// comparison is suppressed - Graph documents guest accounts whose `SMTP:`
+/// entry is NOT `mail`, so dropping every primary on the assumption would
+/// lose a real address. That exception is scoped to the proxy list and does
+/// not reach back into `otherMails`, which keeps a local-part variant of
+/// the primary under the universal rule.
+///
+/// Folding is ASCII-only, and Unicode/IDNA equivalence is explicitly
+/// outside the promise: ASCII folding is right for ASCII spellings
+/// (punycode A-labels included), while general Unicode case folding is not
+/// a correct substitute for IDNA processing, and half-done normalisation
+/// would turn into address loss. Unexpected non-ASCII spellings are
+/// preserved rather than folded.
+///
+/// The FIRST retained spelling wins - after surrounding whitespace is
+/// trimmed; only the comparison is folded. The literal `mail` string can
+/// never recur in `additional_emails`, though a local-part case VARIANT of
+/// it legitimately can when `otherMails` names one.
+fn directory_additional_emails(
+    primary: &str,
+    other_mails: Option<Vec<String>>,
+    proxy_addresses: Option<Vec<String>>,
+) -> Vec<String> {
+    // Universal set, seeded with the primary so no list can restate it.
+    let mut seen = vec![address_fold_key(primary)];
+    // Proxy-only set, whole-address folded, fed by every proxy entry
+    // considered - emitted or suppressed.
+    let mut proxy_seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    let others = other_mails.unwrap_or_default();
+    let proxies = proxy_addresses.unwrap_or_default();
+
+    for candidate in others.iter().map(|mail| mail.trim()) {
+        if candidate.is_empty() {
+            continue;
+        }
+        let key = address_fold_key(candidate);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(candidate.to_string());
+    }
+
+    for (kind, candidate) in proxies.iter().filter_map(|entry| smtp_proxy_address(entry)) {
+        let proxy_key = candidate.to_ascii_lowercase();
+        let key = address_fold_key(candidate);
+        // The primary proxy is the same mailbox as `mail` only when the
+        // values actually match; guest accounts are the documented case
+        // where they do not.
+        let restates_primary =
+            kind == ProxyKind::Primary && candidate.eq_ignore_ascii_case(primary);
+        let duplicate = restates_primary || proxy_seen.contains(&proxy_key) || seen.contains(&key);
+        // Recorded even when suppressed, so the proxy-only fold sees the
+        // whole proxy list rather than only its emitted part.
+        if !proxy_seen.contains(&proxy_key) {
+            proxy_seen.push(proxy_key);
+        }
+        if duplicate {
+            continue;
+        }
+        seen.push(key);
+        out.push(candidate.to_string());
+    }
+    out
+}
+
 /// Project one `/users` directory row into a `DirectoryCard`. Returns
 /// `None` when `mail` is absent or empty (matching ratatoskr's mail-less
-/// drop). `additional_emails` is empty in A9 - `otherMails` /
-/// `proxyAddresses` is a named follow-up.
+/// drop). `additional_emails` carries `otherMails` plus the SMTP
+/// `proxyAddresses`, de-duplicated against `mail` - see
+/// `directory_additional_emails`.
 fn directory_user_to_card(user: GraphDirectoryUser) -> Option<DirectoryCard> {
     let email = user.mail.filter(|mail| !mail.is_empty())?;
+    let additional_emails =
+        directory_additional_emails(&email, user.other_mails, user.proxy_addresses);
     Some(DirectoryCard {
         email,
         display_name: user.display_name,
-        additional_emails: Vec::new(),
+        additional_emails,
         phones: user.business_phones.unwrap_or_default(),
         company: user.company_name,
         title: user.job_title,
@@ -789,6 +962,8 @@ struct GraphContactFolder {
 struct GraphDirectoryUser {
     display_name: Option<String>,
     mail: Option<String>,
+    other_mails: Option<Vec<String>>,
+    proxy_addresses: Option<Vec<String>>,
     business_phones: Option<Vec<String>>,
     company_name: Option<String>,
     job_title: Option<String>,
@@ -1203,6 +1378,8 @@ mod tests {
         let mailless = GraphDirectoryUser {
             display_name: Some("No Mail".to_string()),
             mail: None,
+            other_mails: None,
+            proxy_addresses: None,
             business_phones: None,
             company_name: None,
             job_title: None,
@@ -1213,6 +1390,8 @@ mod tests {
         let user = GraphDirectoryUser {
             display_name: Some("Ada Lovelace".to_string()),
             mail: Some("ada@example.test".to_string()),
+            other_mails: None,
+            proxy_addresses: None,
             business_phones: Some(vec!["+15551234".to_string()]),
             company_name: Some("Analytical Engines".to_string()),
             job_title: Some("Programmer".to_string()),
@@ -1227,5 +1406,273 @@ mod tests {
         assert_eq!(card.title.as_deref(), Some("Programmer"));
         assert_eq!(card.department.as_deref(), Some("Research"));
         assert_eq!(card.provider, ProtocolKind::Graph);
+    }
+
+    #[test]
+    fn directory_select_requests_the_alias_fields() {
+        // Projecting a field nobody selected is a silent no-op: Graph omits
+        // both of these from a /users row unless they are asked for.
+        assert!(DIRECTORY_SELECT.contains("otherMails"));
+        assert!(DIRECTORY_SELECT.contains("proxyAddresses"));
+        assert!(directory_search_path("/me", "", 999).contains("otherMails,proxyAddresses"));
+    }
+
+    #[test]
+    fn directory_card_collects_aliases_from_a_canned_users_page() {
+        // One canned Graph /users response carrying the whole shape:
+        // the primary repeated as SMTP:, secondaries, non-SMTP routing
+        // identifiers, an otherMails/proxyAddresses overlap, a local-part
+        // case variant on each side, and an entry with no type prefix.
+        let body = serde_json::json!({
+            "value": [{
+                "displayName": "Ada Lovelace",
+                "mail": "ada@example.test",
+                "otherMails": ["ada.personal@elsewhere.test", "shared@example.test"],
+                "proxyAddresses": [
+                    "SMTP:ada@example.test",
+                    "smtp:a.lovelace@example.test",
+                    "X500:/o=Contoso/ou=Exchange/cn=ada",
+                    "SIP:ada@example.test",
+                    "smtp:SHARED@example.test",
+                    "smtp:A.Lovelace@example.test",
+                    "smtp:",
+                    "ada.bare@example.test"
+                ],
+                "businessPhones": ["+15551234"],
+                "companyName": "Analytical Engines",
+                "jobTitle": "Programmer",
+                "department": "Research"
+            }]
+        });
+        let page: ODataCollection<GraphDirectoryUser> =
+            serde_json::from_value(body).expect("deserializes");
+        let user = page.value.into_iter().next().expect("one row");
+        let card = directory_user_to_card(user).expect("maps to card");
+
+        assert_eq!(card.email, "ada@example.test");
+        assert_eq!(
+            card.additional_emails,
+            vec![
+                // otherMails in server order first, then SMTP proxies.
+                "ada.personal@elsewhere.test".to_string(),
+                "shared@example.test".to_string(),
+                "a.lovelace@example.test".to_string(),
+                // A local-part case variant is a possibly-distinct mailbox
+                // and survives; the whole-address variant that follows it
+                // inside proxyAddresses does not, because Exchange refuses
+                // two proxy entries differing only by case.
+                "SHARED@example.test".to_string(),
+            ]
+        );
+        // The literal primary string never repeats, whichever list it came
+        // from.
+        assert!(!card.additional_emails.contains(&card.email));
+        // X500/SIP are directory identifiers, not addresses.
+        assert!(
+            !card
+                .additional_emails
+                .iter()
+                .any(|mail| mail.contains("X500") || mail.contains("/o="))
+        );
+    }
+
+    #[test]
+    fn smtp_proxy_address_reads_only_the_smtp_types_and_keeps_the_kind() {
+        // Both SMTP casings are addresses; the prefix distinguishes primary
+        // from alias, not address from non-address, and that distinction
+        // has to survive parsing - nothing downstream can recover it.
+        assert_eq!(
+            smtp_proxy_address("SMTP:primary@example.test"),
+            Some((ProxyKind::Primary, "primary@example.test"))
+        );
+        assert_eq!(
+            smtp_proxy_address("smtp:alias@example.test"),
+            Some((ProxyKind::Alias, "alias@example.test"))
+        );
+        // Only an exactly upper-case prefix asserts "primary".
+        assert_eq!(
+            smtp_proxy_address("Smtp:mixed@example.test"),
+            Some((ProxyKind::Alias, "mixed@example.test"))
+        );
+        for entry in [
+            "X500:/o=Contoso/ou=Exchange/cn=Recipients/cn=ada",
+            "x500:/o=Contoso",
+            "SIP:ada@example.test",
+            "EUM:12345;phone-context=x",
+            "SPO:SPO_abc@SPO_def",
+        ] {
+            assert_eq!(smtp_proxy_address(entry), None, "kept non-SMTP {entry}");
+        }
+        // No type prefix at all, and an empty value, both drop silently.
+        assert_eq!(smtp_proxy_address("bare@example.test"), None);
+        assert_eq!(smtp_proxy_address("smtp:"), None);
+        assert_eq!(smtp_proxy_address("smtp:   "), None);
+    }
+
+    #[test]
+    fn universal_dedup_folds_the_domain_and_keeps_local_part_case() {
+        // RFC 5321 s2.4: the local part's case is preserved and its meaning
+        // belongs to the destination host, so two otherMails entries that
+        // differ only there may be two mailboxes on an external system.
+        // Dropping one is unrecoverable here; emitting both is visible and
+        // collapsible upstream, so both are kept.
+        let emails = directory_additional_emails(
+            "Ada@Example.TEST",
+            Some(vec![
+                "User@external.example".to_string(),
+                "user@external.example".to_string(),
+                // Domain-only case difference: one address, folded away.
+                "user@EXTERNAL.example".to_string(),
+                // A local-part variant of the primary is likewise kept.
+                "ada@example.test".to_string(),
+            ]),
+            None,
+        );
+        assert_eq!(
+            emails,
+            vec![
+                "User@external.example".to_string(),
+                "user@external.example".to_string(),
+                "ada@example.test".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_entries_fold_on_the_whole_address() {
+        // Exchange refuses two proxy entries differing only by case, so a
+        // whole-address fold BETWEEN proxies can only collapse what the
+        // provider already calls one address.
+        //
+        // Scope note, because the name used to claim more than this pins: with
+        // no `otherMails` input, nothing here shows the licence STOPPING at the
+        // proxy table. That boundary is pinned by
+        // `universal_dedup_folds_the_domain_and_keeps_local_part_case`, where
+        // the same case-variant pair inside `otherMails` survives, and by
+        // `the_primary_proxy_exception_does_not_reach_into_other_mails`.
+        let emails = directory_additional_emails(
+            "ada@example.test",
+            None,
+            Some(vec![
+                "smtp:One@example.test".to_string(),
+                "smtp:ONE@example.test".to_string(),
+                "smtp:one@Example.TEST".to_string(),
+            ]),
+        );
+        assert_eq!(emails, vec!["One@example.test".to_string()]);
+    }
+
+    #[test]
+    fn primary_proxy_is_suppressed_only_when_it_matches_mail() {
+        // The universal rule alone leaves `mail` and a case-variant SMTP:
+        // entry standing as two entries for one mailbox, so the pair gets
+        // its own whole-address comparison.
+        let matching = directory_additional_emails(
+            "Ada@example.test",
+            None,
+            Some(vec!["SMTP:ada@EXAMPLE.test".to_string()]),
+        );
+        assert!(
+            matching.is_empty(),
+            "kept a restatement of mail: {matching:?}"
+        );
+
+        // ... but Graph documents guest accounts whose primary proxy is NOT
+        // `mail`, so "it is SMTP:, therefore it is mail" would lose a real
+        // address.
+        let guest = directory_additional_emails(
+            "ada@external.example",
+            None,
+            Some(vec![
+                "SMTP:ada_external.example#EXT#@contoso.test".to_string(),
+            ]),
+        );
+        assert_eq!(
+            guest,
+            vec!["ada_external.example#EXT#@contoso.test".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_primary_proxy_exception_does_not_reach_into_other_mails() {
+        // otherMails names a local-part variant of the primary, which the
+        // universal rule keeps; the proxy entry that really does restate
+        // the primary is the one suppressed. Suppressing the otherMails
+        // entry instead would drop the only spelling a consumer had.
+        let emails = directory_additional_emails(
+            "Ada@example.test",
+            Some(vec!["ada@example.test".to_string()]),
+            Some(vec!["SMTP:ada@example.test".to_string()]),
+        );
+        assert_eq!(emails, vec!["ada@example.test".to_string()]);
+    }
+
+    #[test]
+    fn a_suppressed_proxy_still_feeds_the_proxy_comparison_set() {
+        // The first proxy is already represented by otherMails and is not
+        // emitted - but it must still enter the proxy-only fold, or the
+        // second one survives and "de-duplicate within proxies" has
+        // quietly become "de-duplicate within EMITTED proxies".
+        let emails = directory_additional_emails(
+            "ada@example.test",
+            Some(vec!["Alias@example.test".to_string()]),
+            Some(vec![
+                "smtp:Alias@example.test".to_string(),
+                "smtp:ALIAS@example.test".to_string(),
+            ]),
+        );
+        assert_eq!(emails, vec!["Alias@example.test".to_string()]);
+    }
+
+    #[test]
+    fn folding_is_ascii_only_and_leaves_non_ascii_spellings_alone() {
+        // IDNA equivalence is outside the promise: ASCII folding is right
+        // for ASCII spellings including punycode A-labels, and general
+        // Unicode case folding is not a substitute for IDNA processing.
+        // Half-done normalisation would turn into address loss, so
+        // unexpected non-ASCII spellings are preserved.
+        let emails = directory_additional_emails(
+            "ada@example.test",
+            Some(vec![
+                // Escaped rather than literal so the source stays ASCII:
+                // U+00DC / U+00FC, the U-label pair for the A-label below.
+                "user@B\u{00dc}CHER.test".to_string(),
+                "user@b\u{00fc}cher.test".to_string(),
+                // The punycode A-label is ASCII, so it folds normally.
+                "user@XN--BCHER-KVA.test".to_string(),
+                "user@xn--bcher-kva.test".to_string(),
+            ]),
+            None,
+        );
+        assert_eq!(
+            emails,
+            vec![
+                "user@B\u{00dc}CHER.test".to_string(),
+                "user@b\u{00fc}cher.test".to_string(),
+                "user@XN--BCHER-KVA.test".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_retained_spelling_wins_after_trimming() {
+        // The promise is the first RETAINED spelling after surrounding
+        // whitespace is trimmed - not the byte-for-byte server spelling.
+        let emails = directory_additional_emails(
+            "ada@example.test",
+            Some(vec![
+                "  Alias@Example.test  ".to_string(),
+                "  ".to_string(),
+                "Alias@example.TEST".to_string(),
+            ]),
+            Some(vec!["smtp:  third@example.test  ".to_string()]),
+        );
+        assert_eq!(
+            emails,
+            vec![
+                "Alias@Example.test".to_string(),
+                "third@example.test".to_string(),
+            ]
+        );
     }
 }

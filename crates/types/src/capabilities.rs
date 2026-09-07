@@ -390,8 +390,8 @@ pub struct AccountCapabilities {
     /// convenience layer pick the right primitive without matching
     /// on `ProtocolKind`.
     pub conveniences: ConvenienceShape,
-    /// True iff re-opening the account can discover foreign
-    /// (other-user / shared) namespaces that were not visible at the
+    /// True iff rediscovering the account (a full staged reattach) can
+    /// surface foreign (other-user / shared) namespaces not visible at the
     /// last open. This is discovery POTENTIAL, not current membership:
     /// an account with zero shares today still reports `true` when a
     /// grant made after open would surface at the next open. Three
@@ -401,7 +401,7 @@ pub struct AccountCapabilities {
     ///   open (IMAP NAMESPACE walk, the JMAP session's non-personal
     ///   accounts), and
     /// - it emits no foreign scope-lifecycle events mid-session, so a
-    ///   reopen is the only door a new grant can walk through, and
+    ///   rediscovery is the only door a new grant can walk through, and
     /// - no provider signal rules foreign namespaces out.
     ///
     /// IMAP has such a signal and refines with it: a personal-only
@@ -415,11 +415,11 @@ pub struct AccountCapabilities {
     /// opening the account (Graph delegates / public-folder pins,
     /// Gmail delegation behind separate authorization, DAV home sets).
     ///
-    /// Consumers act on `true` by scheduling a full reopen/reattach
-    /// (`bifrost-sync` exposes `SyncEngine::reopen`, whose staged
+    /// Consumers act on `true` by scheduling a full reattach
+    /// (`bifrost-sync` exposes `SyncEngine::reattach`, whose staged
     /// rediscovery establishes newly-appeared scopes); the cadence is
     /// consumer policy, weighed against the reattach's wire cost.
-    pub reopen_discovers_foreign_namespaces: bool,
+    pub discovers_foreign_namespaces_on_rediscovery: bool,
 }
 
 impl AccountCapabilities {

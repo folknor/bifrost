@@ -86,7 +86,7 @@ fn caps() -> AccountCapabilities {
         pim_methods: PimMethodSupport::default(),
         filter_rule_shape: FilterRuleShape::None,
         conveniences: ConvenienceShape::default(),
-        reopen_discovers_foreign_namespaces: false,
+        discovers_foreign_namespaces_on_rediscovery: false,
     }
 }
 
@@ -1348,7 +1348,7 @@ async fn failed_attach_closes_the_opened_account() {
 }
 
 #[tokio::test]
-async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
+async fn reattach_refreshes_topology_subscriptions_and_lifecycle_handle() {
     let account_id = AccountId("full-reattach".to_owned());
     let old_scope = CursorScope::Account;
     let new_scope = CursorScope::Type(bifrost_types::ObjectType::Email);
@@ -1387,7 +1387,7 @@ async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
         .subscribe_push(&account_id, std::slice::from_ref(&old_scope))
         .await
         .expect("initial push subscription");
-    engine.reopen(&account_id).await.expect("full reattach");
+    engine.reattach(&account_id).await.expect("full reattach");
 
     assert_eq!(factory.opens.load(Ordering::SeqCst), 2);
     assert_eq!(
@@ -1585,7 +1585,7 @@ async fn detach_with_teardown_tears_push_subscriptions_down_before_detaching() {
 }
 
 #[tokio::test]
-async fn reopen_waits_for_resume_without_opening_during_pause() {
+async fn reattach_waits_for_resume_without_opening_during_pause() {
     let account_id = AccountId("paused-reopen".to_owned());
     let established = Arc::new(Mutex::new(Vec::new()));
     let closed = Arc::new(AtomicUsize::new(0));
@@ -1606,7 +1606,7 @@ async fn reopen_waits_for_resume_without_opening_during_pause() {
         .await
         .expect("idle account pauses immediately");
 
-    let mut reopen = Box::pin(engine.reopen(&account_id));
+    let mut reopen = Box::pin(engine.reattach(&account_id));
     tokio::select! {
         result = &mut reopen => panic!("paused reopen completed early: {result:?}"),
         () = tokio::task::yield_now() => {}
@@ -1774,7 +1774,7 @@ async fn pause_cannot_report_quiescence_while_a_replacement_is_mid_open() {
 
     let reopen_engine = Arc::clone(&engine);
     let reopen_id = account_id.clone();
-    let reopen = tokio::spawn(async move { reopen_engine.reopen(&reopen_id).await });
+    let reopen = tokio::spawn(async move { reopen_engine.reattach(&reopen_id).await });
     entered.notified().await;
 
     let mut pause = Box::pin(control.pause());
@@ -1848,7 +1848,7 @@ async fn correlated_teardown_failure_retains_both_sides_for_retry() {
         .expect("subscribe");
 
     assert!(
-        matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
+        matches!(engine.reattach(&account_id).await, Err(Error::Account(_))),
         "an unconfirmed old-handle teardown must abort the swap"
     );
     assert!(
@@ -1903,7 +1903,7 @@ async fn correlated_teardown_failure_retains_both_sides_for_retry() {
 /// "absent from the live registry" as "newly created" would make the abort
 /// path delete a legitimately persisted cursor.
 #[tokio::test]
-async fn aborted_reopen_preserves_preexisting_cursor_for_rediscovered_scope() {
+async fn aborted_reattach_preserves_preexisting_cursor_for_rediscovered_scope() {
     let account_id = AccountId("rediscovered-preexisting".to_owned());
     let live_scope = CursorScope::Account;
     let rediscovered = CursorScope::Type(bifrost_types::ObjectType::Email);
@@ -1946,7 +1946,7 @@ async fn aborted_reopen_preserves_preexisting_cursor_for_rediscovered_scope() {
         .expect("seed prior-session cursor");
 
     assert!(
-        matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
+        matches!(engine.reattach(&account_id).await, Err(Error::Account(_))),
         "the old-handle teardown failure must abort the swap"
     );
     let survived = store
@@ -2104,7 +2104,7 @@ async fn transient_get_failure_cannot_demote_preexisting_cursor_to_created() {
     *store.fail_get_for.lock().expect("flaky get lock") = Some(rediscovered.clone());
 
     assert!(
-        engine.reopen(&account_id).await.is_err(),
+        engine.reattach(&account_id).await.is_err(),
         "a failed classification read must abort the swap"
     );
     let survived = inner
@@ -2225,7 +2225,7 @@ impl CheckpointStore for AckRacingStore {
 /// preexisting row (vanished or live) must remain untouched until the
 /// cutover is committed.
 #[tokio::test]
-async fn aborted_reopen_cannot_clobber_concurrently_acked_vanished_cursor() {
+async fn aborted_reattach_cannot_clobber_concurrently_acked_vanished_cursor() {
     let account_id = AccountId("ack-race-vanished".to_owned());
     let live_scope = CursorScope::Account;
     let vanished = CursorScope::Type(bifrost_types::ObjectType::Mailbox);
@@ -2271,7 +2271,7 @@ async fn aborted_reopen_cannot_clobber_concurrently_acked_vanished_cursor() {
     store.mutated_scopes.lock().expect("mutations lock").clear();
 
     assert!(
-        matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
+        matches!(engine.reattach(&account_id).await, Err(Error::Account(_))),
         "the old-handle teardown failure must abort the swap"
     );
     let survived = inner
@@ -2350,7 +2350,7 @@ impl AccountFactory for SkippingFactory {
 }
 
 #[tokio::test]
-async fn open_skips_surface_on_attach_and_reopen_replaces_them() {
+async fn open_skips_surface_on_attach_and_reattach_replaces_them() {
     let account_id = AccountId("open-skips".to_owned());
     let skip = bifrost_types::SkippedScope {
         scope: bifrost_types::ErrorScope::Mailbox {
@@ -2396,7 +2396,7 @@ async fn open_skips_surface_on_attach_and_reopen_replaces_them() {
         "the lane preserves the classified error"
     );
 
-    engine.reopen(&account_id).await.expect("reopen succeeds");
+    engine.reattach(&account_id).await.expect("reopen succeeds");
     assert!(
         engine
             .open_skipped_scopes(&account_id)
@@ -2896,7 +2896,7 @@ async fn a_committed_reattach_is_not_rolled_back_by_the_next_aborted_one() {
         .expect("initial push subscription");
 
     // First reopen succeeds: `second` becomes ordinary durable state.
-    engine.reopen(&account_id).await.expect("first reattach");
+    engine.reattach(&account_id).await.expect("first reattach");
     assert!(
         store
             .get_change_cursor(&account_id, &second)
@@ -2910,7 +2910,7 @@ async fn a_committed_reattach_is_not_rolled_back_by_the_next_aborted_one() {
     // only what IT inserted.
     unsubscribe_failures.store(1, Ordering::SeqCst);
     assert!(
-        matches!(engine.reopen(&account_id).await, Err(Error::Account(_))),
+        matches!(engine.reattach(&account_id).await, Err(Error::Account(_))),
         "the old-handle teardown failure must abort the second swap"
     );
 

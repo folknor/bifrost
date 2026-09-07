@@ -301,6 +301,20 @@ impl SlowLinePeer {
             next: None,
         }
     }
+
+    /// Same peer, for lines a test builds rather than writes out - notably
+    /// lines long enough to move a bandwidth meter, which no `&'static str`
+    /// literal wants to be.
+    pub(super) fn from_owned_lines<I: IntoIterator<Item = Vec<u8>>>(
+        lines: I,
+        gap: Duration,
+    ) -> Self {
+        Self {
+            lines: lines.into_iter().collect(),
+            gap,
+            next: None,
+        }
+    }
 }
 
 #[cfg(feature = "tokio")]

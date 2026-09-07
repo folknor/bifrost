@@ -77,7 +77,7 @@ pub fn caps() -> AccountCapabilities {
         pim_methods: bifrost_types::PimMethodSupport::default(),
         filter_rule_shape: FilterRuleShape::None,
         conveniences: ConvenienceShape::default(),
-        reopen_discovers_foreign_namespaces: false,
+        discovers_foreign_namespaces_on_rediscovery: false,
     }
 }
 

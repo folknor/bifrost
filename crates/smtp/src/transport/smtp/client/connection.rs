@@ -1352,7 +1352,14 @@ impl SmtpConnection {
         manage_state: bool,
         configured: Option<Duration>,
     ) -> Result<Response, Error> {
-        let expires_at = configured.map(|timeout| Instant::now() + timeout);
+        // Any inbound throttle sleep still on the counter was slept during the
+        // PREVIOUS reply, so it has already elapsed before this deadline is
+        // taken and must not be credited to it. Discard it, then collect only
+        // what this reply's own reads sleep. (The async half needs no
+        // equivalent: its debt is a parked timer rather than an elapsed sleep,
+        // so nothing has been spent before its deadline is minted.)
+        let _ = self.stream.get_mut().take_inbound_throttle_slept();
+        let mut expires_at = configured.map(|timeout| Instant::now() + timeout);
 
         if manage_state {
             self.stream.get_ref().state().verify()?;
@@ -1362,6 +1369,15 @@ impl SmtpConnection {
         let mut buffer = String::with_capacity(100);
 
         loop {
+            // Hand the deadline back whatever the last line's `charge` slept.
+            // The bandwidth cap is the consumer's own instruction; the reply
+            // deadline judges the peer, and spending one on the other turns a
+            // healthy capped connection into "SMTP read timed out".
+            let slept = self.stream.get_mut().take_inbound_throttle_slept();
+            if let Some(expires_at) = &mut expires_at {
+                *expires_at += slept;
+            }
+
             if let Some(expires_at) = expires_at {
                 // A zero `SO_RCVTIMEO` means "block forever" on a real socket,
                 // so an exactly-spent deadline must be an error here, not a

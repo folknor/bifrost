@@ -1371,12 +1371,85 @@ searches keep the `$filter` path.
 
 `directory_search` (organization directory / GAL, distinct from the personal
 `/contacts` corpus `contact_search` scans) queries `/users` with a
-`displayName,mail,businessPhones,companyName,jobTitle,department` `$select`,
+`displayName,mail,otherMails,proxyAddresses,businessPhones,companyName,jobTitle,department`
+`$select`,
 `$top`, and (non-empty query) a provider-side `$filter`
 `startswith(displayName,'q') or startswith(mail,'q')` (escaped + URL-encoded as
 a whole) - unlike `contact_search`, which scans client-side and only
 server-filters exact-email queries. Rows without `mail` are dropped;
-`additional_emails` is empty; `@odata.nextLink` pages. Search cursors retain
+`@odata.nextLink` pages.
+
+`additional_emails` carries `otherMails` in server order, then the SMTP half
+of `proxyAddresses` in server order. A Graph proxy address is `TYPE:value`
+and the type prefix is load-bearing: `SMTP:` marks the mailbox's PRIMARY
+address, `smtp:` a secondary alias, and every other type (`X500:`, `SIP:`,
+`EUM:`, `SPO:`) is a directory or routing identifier that is NOT an email
+address and never enters the field. Both SMTP casings are kept as addresses,
+and the parse PRESERVES which one it saw (only an exactly upper-case `SMTP`
+counts as primary), because the de-duplication below needs that distinction
+and nothing downstream can recover it. An entry with no `:` carries no type,
+so its kind is unknowable and it is dropped silently, as is an empty value
+after the prefix.
+
+De-duplication runs two comparisons, because the two source lists carry
+different guarantees.
+
+- UNIVERSAL, across `mail`, `otherMails` and `proxyAddresses` alike: the
+  DOMAIN half is ASCII-lowercased and the local part is compared as spelled.
+  RFC 5321 s2.4 requires local-part case to be preserved and leaves its
+  interpretation to the destination host, and `otherMails` is a free-form
+  list that can name an external system where the local part really is
+  case-sensitive.
+- PROXY-ONLY, between `proxyAddresses` entries: whole-address ASCII
+  case-insensitive. Exchange refuses two proxy entries differing only by
+  case, so a fold there can only collapse what the provider already calls
+  one address. That guarantee is about Exchange's own proxy table and does
+  not extend to `otherMails`. A proxy entry that is SUPPRESSED still enters
+  this set, or "de-duplicate within proxies" silently becomes "de-duplicate
+  within emitted proxies" and a case variant of an entry already covered by
+  `otherMails` survives.
+
+The tie-breaker behind the split: the two error directions are not
+symmetric. Folding too aggressively DROPS an address this layer cannot
+reconstruct, and the consumer never learns it existed; folding too little
+emits a near-duplicate, which is visible and which a consumer can collapse
+using knowledge this layer does not have. Where case-sensitivity is
+genuinely uncertain, both are kept.
+
+`mail` versus the PRIMARY (`SMTP:`) proxy entry gets its own explicit ASCII
+case-insensitive comparison, since the universal rule alone would leave
+`mail = Ada@example.test` and `SMTP:ada@example.test` standing as two
+entries for one mailbox. Only an entry that actually matches under that
+comparison is suppressed: Graph documents guest accounts whose `SMTP:` entry
+is not `mail`, so dropping every primary on the assumption would lose a real
+address. The exception is scoped to the proxy list and does not reach back
+into `otherMails` - given `mail = Ada@example.test`,
+`otherMails = [ada@example.test]` and `proxyAddresses = [SMTP:ada@example.test]`,
+the `otherMails` entry is kept and the proxy entry suppressed.
+
+Folding is ASCII-only, and Unicode/IDNA equivalence is explicitly outside
+the promise: ASCII folding is correct for ASCII spellings (punycode A-labels
+included), general Unicode case folding is not a substitute for IDNA
+processing, and half-done normalisation would turn into address loss.
+Unexpected non-ASCII spellings are preserved rather than folded.
+
+The FIRST RETAINED spelling wins, after surrounding whitespace is trimmed -
+the stored value is the trimmed one, not the byte-for-byte server spelling,
+and only the comparison folds. **The literal `mail` string can never appear
+in `additional_emails`**; a local-part case VARIANT of it, coming from
+`otherMails`, legitimately can, because under the universal rule it may be a
+different mailbox.
+
+Consent caveat, unresolved: `otherMails` and `proxyAddresses` sit outside the
+fixed property set `User.ReadBasic.All` grants, so a tenant consented only to
+ReadBasic may answer the whole `/users` query with a 403
+(`Authorization_RequestDenied`) now that they are selected, where before it
+succeeded. That maps to `NoPermission` on the existing path, which is honest
+but is a REGRESSION in reach for those tenants: the fix, if it bites, is a
+select-narrowing retry after the first 403 rather than dropping the fields.
+Not built, because it needs a live tenant to confirm the 403 actually fires
+for a `$select` overreach as opposed to being tolerated with the fields
+omitted. Search cursors retain
 the current page URL and consumed server-row count, so an over-delivered page
 resumes within that page rather than dropping matches. A tenant lacking
 `User.ReadBasic.All` / `User.Read.All` 403s -> `NoPermission` (an unauthorized

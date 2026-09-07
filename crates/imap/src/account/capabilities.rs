@@ -156,7 +156,7 @@ pub(crate) fn build_capabilities(
         // a reopen is the only door a post-open ACL grant can walk
         // through - and NAMESPACE is a truthful "never" signal, so a
         // personal-only server honestly reports false.
-        reopen_discovers_foreign_namespaces: foreign_namespaces_advertised,
+        discovers_foreign_namespaces_on_rediscovery: foreign_namespaces_advertised,
     }
 }
 
@@ -287,9 +287,9 @@ mod tests {
     fn foreign_namespace_flag_flows_through_verbatim() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
         let without = build_capabilities(&profile, &[], false, None, None, false, false);
-        assert!(!without.reopen_discovers_foreign_namespaces);
+        assert!(!without.discovers_foreign_namespaces_on_rediscovery);
         let with = build_capabilities(&profile, &[], false, None, None, false, true);
-        assert!(with.reopen_discovers_foreign_namespaces);
+        assert!(with.discovers_foreign_namespaces_on_rediscovery);
     }
 
     fn mailbox(name: &str, attributes: Vec<MailboxAttribute>) -> MailboxInfo {
