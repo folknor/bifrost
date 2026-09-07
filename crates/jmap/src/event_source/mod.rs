@@ -36,6 +36,19 @@ pub(crate) enum PushNotification {
     StateChange(Changes),
     #[cfg(feature = "calendars")]
     CalendarAlert(CalendarAlert),
+    /// An `EmailPush` payload, forwarded as what it is rather than dropped.
+    ///
+    /// It carries no state string of its own, so it cannot be folded into the
+    /// block's merged `StateChange`: a synthesised state string would be a lie
+    /// about a position the consumer compares against a stored cursor. It is
+    /// surfaced verbatim instead - `account_id` plus the raw `email` JSON the
+    /// server sent - so that a block whose state change commits the resume
+    /// token cannot silently bury a push object that will never be replayed.
+    #[cfg(feature = "mail")]
+    EmailPush {
+        account_id: String,
+        email: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

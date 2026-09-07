@@ -925,6 +925,111 @@ fn a_failure_closing_the_lmtp_drain_preserves_the_recipient_outcomes() {
     assert_eq!(harness.ops.last().map(String::as_str), Some("ABORT"));
 }
 
+/// The LMTP batch drain opens its reply group AFTER the body has been written
+/// and terminated, so a failure there can never be a batch-level `Err`: that
+/// shape means "nothing was transmitted", and the engine reading it would
+/// resend a message the peer may already have delivered. The accepted
+/// recipients are `uncertain`, the same answer a failed final-status read
+/// gives. Reachable only through an aimed failure - in production
+/// `open_reply_group` fails on `verify()` alone, and a completed body write
+/// leaves the stream `Ok` - so this pins the SHAPE of an arm that is latent
+/// today. Ablation: restoring `Step::Finish(Err((error, progress)))` fails the
+/// `expect` below.
+#[test]
+fn a_failed_lmtp_group_open_leaves_the_recipients_uncertain_not_the_batch_unsent() {
+    let progress = SendProgress::new(Protocol::Lmtp, batch_recipients(2));
+    let mut machine = BatchLmtp::new(mail(), rcpts(2), progress);
+    let mut harness = Harness::new(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(intermediate()),
+    ])
+    .aiming(Aim::Kind("OPEN", 0));
+    let progress = harness
+        .run(&mut machine)
+        .expect("the body already left: this is not a whole-request failure");
+    let outcome = progress.resolve();
+
+    assert_eq!(
+        outcome.uncertain().len(),
+        2,
+        "both accepted recipients are in doubt: {:?}",
+        harness.ops
+    );
+    assert!(outcome.succeeded().is_empty());
+    assert!(outcome.failed().is_empty());
+    assert_eq!(harness.ops.last().map(String::as_str), Some("OPEN"));
+}
+
+/// A direct LMTP body upload carries the phase of its own framing, exactly as
+/// `DirectSmtp` does. The phase was hardcoded to `DataBody`, so a failed BDAT
+/// chunk on the LMTP path reported the wrong boundary. Ablation: hardcode
+/// `SmtpCommandPhase::DataBody` again and this fails.
+#[test]
+fn a_failed_direct_lmtp_bdat_chunk_carries_the_bdat_phase() {
+    for (body, phase) in [
+        (BodyKind::Bdat, SmtpCommandPhase::BdatBody),
+        (BodyKind::Data, SmtpCommandPhase::DataBody),
+    ] {
+        let mut machine = DirectLmtp::new(mail(), rcpts(1), body);
+        let mut harness = Harness::positive(6).aiming(Aim::Kind(
+            match body {
+                BodyKind::Bdat => "BDAT",
+                BodyKind::Data => "BODY",
+            },
+            0,
+        ));
+        let error = harness
+            .run(&mut machine)
+            .expect_err("the body upload failed");
+        assert_eq!(error.phase(), Some(phase), "{body:?}: {:?}", harness.ops);
+    }
+}
+
+/// A failure while draining the window a rejected pipelined `MAIL FROM` left
+/// behind does not erase the rejection. The drain is bookkeeping for the
+/// STREAM; the transaction's outcome was settled by the peer's answer, and
+/// reporting the drain's transport failure instead handed the caller a
+/// retryable network error for an envelope the server had permanently refused,
+/// with the reply text gone. Both boundaries of the drain behave the same way.
+/// Ablation: report `phased(SmtpCommandPhase::RcptTo, error)` at either arm and
+/// that case fails on the phase.
+#[test]
+fn a_failed_window_drain_still_reports_the_mail_from_rejection() {
+    // READG #1 is the first read of the leftover window; CLOSE #0 is the
+    // group close after the whole window drained.
+    for aim in [Aim::Kind("READG", 1), Aim::Kind("CLOSE", 0)] {
+        let mut machine = DirectSmtp::new(mail(), rcpts(2), true, BodyKind::Data);
+        let mut harness = Harness::new(vec![
+            OpOutcome::Reply(rejection()),
+            OpOutcome::Reply(ok_reply()),
+            OpOutcome::Reply(ok_reply()),
+        ])
+        .aiming(aim);
+        let error = harness
+            .run(&mut machine)
+            .expect_err("MAIL FROM was rejected");
+
+        assert_eq!(
+            error.phase(),
+            Some(SmtpCommandPhase::MailFrom),
+            "{aim:?}: {:?}",
+            harness.ops
+        );
+        assert!(
+            matches!(error.kind(), ErrorKind::Permanent(_)),
+            "{aim:?}: the server's refusal, not a retryable transport error"
+        );
+        assert_eq!(
+            harness.ops.last().map(String::as_str),
+            Some("ABORT"),
+            "{aim:?}: the stream is still lost: {:?}",
+            harness.ops
+        );
+    }
+}
+
 /// The aim itself, pinned: a failure aimed by position lands on that op and
 /// on no earlier one, which is what lets the tests above target a boundary a
 /// scripted failure would have been consumed long before.

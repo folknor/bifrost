@@ -4,10 +4,30 @@ const MAX_EVENT_SIZE: usize = 1024 * 1024;
 #[non_exhaustive]
 pub(crate) enum EventType {
     Ping,
+    /// The default type, which covers a block with no `event` field at
+    /// all. WHATWG names that case `message`; RFC 8620 s7.3 names the
+    /// state-change event `state`. Both reach this variant, so a server
+    /// that omits the field and one that spells it out are treated alike.
     #[default]
     State,
     #[cfg(feature = "calendars")]
     CalendarAlert,
+    /// An `event` name this crate has no handler for.
+    ///
+    /// WHATWG dispatches an event stream's blocks under their declared
+    /// type name, so a client that registered no listener for a name it
+    /// does not know simply never sees the block: unknown types are inert,
+    /// not errors. Mapping them onto [`EventType::State`] instead would
+    /// hand the payload we understand least to the strictest treatment in
+    /// `stream.rs`, where an undecodable state payload tears the
+    /// connection down. Nothing is learned by doing that - a type this
+    /// build cannot name carries no state this build tracks - so the
+    /// block is dropped without decoding it.
+    ///
+    /// `calendarAlert` lands here when the `calendars` feature is off, for
+    /// the same reason: with no [`crate::CalendarAlert`] type compiled in,
+    /// the payload is exactly as opaque as any other unknown name.
+    Unknown,
 }
 
 #[derive(Default, Debug)]
@@ -120,8 +140,14 @@ impl EventParser {
                 b"ping" => {
                     self.result.event = EventType::Ping;
                 }
-                _ => {
+                // An `event` line with an empty value clears the type
+                // buffer (WHATWG), which dispatches under the default type
+                // - the same thing as omitting the field.
+                b"state" | b"message" | b"" => {
                     self.result.event = EventType::State;
+                }
+                _ => {
+                    self.result.event = EventType::Unknown;
                 }
             },
             _ => {
@@ -559,6 +585,62 @@ mod tests {
             parser.next().is_none(),
             "the ignored field dispatched nothing"
         );
+    }
+
+    // An `event` name this crate has no handler for must not be laundered
+    // into `State`, which is the one type `stream.rs` tears the connection
+    // down over. `state`, `message` (the WHATWG default name), an empty
+    // value, and an absent field all mean the same thing.
+    #[test]
+    fn unrecognised_event_names_map_to_unknown() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from(
+            "event: somethingNew\ndata: a\n\n\
+             event: state\ndata: b\n\n\
+             event: message\ndata: c\n\n\
+             event\ndata: d\n\n\
+             data: e\n\n\
+             event: ping\ndata: f\n\n",
+        ));
+
+        let types: Vec<EventType> = parser
+            .by_ref()
+            .map(|event| event.expect("no parse error").event)
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                EventType::Unknown,
+                EventType::State,
+                EventType::State,
+                EventType::State,
+                EventType::State,
+                EventType::Ping,
+            ]
+        );
+    }
+
+    // With the `calendars` feature off there is no type to decode an alert
+    // into, so `calendarAlert` is as opaque as any other unknown name - and
+    // must get the same inert treatment, not the state teardown.
+    #[cfg(not(feature = "calendars"))]
+    #[test]
+    fn calendar_alert_is_unknown_when_the_feature_is_off() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("event: calendarAlert\ndata: {}\n\n"));
+
+        let event = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(event.event, EventType::Unknown);
+    }
+
+    #[cfg(feature = "calendars")]
+    #[test]
+    fn calendar_alert_is_recognised_when_the_feature_is_on() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("event: calendarAlert\ndata: {}\n\n"));
+
+        let event = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(event.event, EventType::CalendarAlert);
     }
 
     #[test]

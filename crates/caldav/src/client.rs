@@ -9,10 +9,10 @@ pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ErrorScope, FolderId, Protocol, RequestErrorKind, ResourceKind,
-    ServerErrorKind, StateCause, SyncStateErrorKind,
+    DiagnosticText, ErrorScope, FolderId, Protocol, ProtocolErrorKind, RequestErrorKind,
+    ResourceKind, ServerErrorKind, StateCause, SyncStateErrorKind,
 };
-use reqwest::header::{CONTENT_TYPE, HeaderValue};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
 
 use crate::CalDavConfig;
@@ -632,7 +632,17 @@ impl CalDavClient {
         // RFC 6638 outbox POSTs route iTIP via the `Originator` (the
         // replying calendar user) and `Recipient` (the organizer) headers;
         // servers reject the POST without them.
-        let mut request = self
+        //
+        // Both go through `DavRequest::header` with the raw address rather than
+        // a pre-validated `HeaderValue`, so an address the HTTP grammar cannot
+        // carry - a non-ASCII calendar-user address, most plausibly - is
+        // RECORDED on the request and refused by `dispatch_once` as
+        // `Request(Malformed)` before any I/O. Filtering with `if let Ok(..)`
+        // instead put the POST on the wire with NO routing headers, and the
+        // server's inevitable 400 reached the consumer as `ProviderRefused`:
+        // a local caller error dressed up as a remote refusal, and the exact
+        // silently-dropped-header defect the record exists to prevent.
+        let request = self
             .dav
             .request(Method::POST, outbox_url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
@@ -640,14 +650,10 @@ impl CalDavClient {
                 self.dav
                     .auth_headers(outbox_url, AccountOperation::EventRsvp)
                     .await?,
-            );
-        if let Ok(value) = HeaderValue::from_str(&schedule_address(originator)) {
-            request = request.header("Originator", value);
-        }
-        if let Ok(value) = HeaderValue::from_str(&schedule_address(recipient)) {
-            request = request.header("Recipient", value);
-        }
-        let request = request.body(body);
+            )
+            .header("Originator", schedule_address(originator).as_str())
+            .header("Recipient", schedule_address(recipient).as_str())
+            .body(body);
         self.dav
             .send_status_request(request, AccountOperation::EventRsvp)
             .await
@@ -792,11 +798,39 @@ fn cursor_invalid_error(calendar_url: &str, status: StatusCode, body: String) ->
 ///   and that host cannot be admitted to the credential-origin set before
 ///   discovery has authenticated anything - so the walk refuses it locally, and
 ///   that refusal is evidence about the probe, not about the account.
+/// - A body that will not parse as DAV XML (`Protocol(ParseFailed)`). A front
+///   end sitting on the origin root answers a PROPFIND with `200 text/html` and
+///   its index page as often as it answers 404 or 405 - the same deployment
+///   shape, one status apart - and an HTML document fails the XML parse rather
+///   than decoding as an empty multistatus. Without this arm that deployment
+///   fails the open while the identical one answering an empty 207 falls back
+///   and works.
+///
+/// Do NOT narrow that last arm. ANY `Protocol(ParseFailed)` from the well-known
+/// principal lookup triggers the fallback, INCLUDING malformed or truncated DAV
+/// XML from a genuine discovery endpoint. The predicate cannot distinguish that
+/// from a non-DAV body: both arrive here as an XML parse failure with no headers
+/// available, so the distinction is unobtainable at this seam rather than merely
+/// unimplemented. It is safe because the fallback cannot accept bad data - it
+/// performs a FRESH principal lookup against the configured base URL
+/// (`discover_principal_from_base`), requires its result, and runs the
+/// subsequent principal discovery normally; nothing partially parsed from the
+/// failed probe is reused, no origin from it is admitted, and both the base leg
+/// and everything after the principal still propagate their failures. The most
+/// a fallback can do is prefer the user-configured endpoint over a probe that
+/// would not parse. The cost is a lost DIAGNOSTIC: an operator does not learn
+/// that the well-known endpoint is serving truncated XML. That cost is
+/// deliberately accepted here; it is not an open defect.
+///
+/// The arm stays safe precisely because it is probe-scoped: a garbage document
+/// from the CONFIGURED base URL is a real contract violation and still fails,
+/// because `discover_principal_from_base` never consults this predicate.
 fn should_fallback_discovery(error: &AccountError) -> bool {
     matches!(
         error.kind(),
         AccountErrorKind::NotFound(ResourceKind::Calendar)
             | AccountErrorKind::Request(RequestErrorKind::Malformed)
+            | AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
             | AccountErrorKind::Server(ServerErrorKind::Error { status: Some(405) })
     )
 }
@@ -1020,7 +1054,7 @@ mod tests {
     };
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bifrost_types::{ProtocolErrorKind, ReconcileAction, RecoveryClass, ServerErrorKind};
-    use reqwest::header::{AUTHORIZATION, HeaderMap};
+    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
     /// Every error this crate mints is stamped CalDAV, and names calendars.
     ///
@@ -1474,6 +1508,42 @@ mod tests {
         assert!(transcripts(&script).is_empty());
     }
 
+    /// A calendar-user address the HTTP grammar cannot carry refuses LOCALLY.
+    ///
+    /// The RFC 6638 `Originator` / `Recipient` headers used to be filtered
+    /// through `if let Ok(HeaderValue::from_str(..))`, so a non-ASCII address
+    /// put the outbox POST on the wire carrying NEITHER routing header, and the
+    /// server's 400 reached the consumer as `ProviderRefused` - a caller error
+    /// reported as a remote refusal. The script is EMPTY, so a regression that
+    /// sends the POST anyway starves it rather than failing quietly.
+    #[tokio::test]
+    async fn a_non_ascii_schedule_address_fails_before_the_wire() {
+        let script = dav_script_empty();
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let error = client
+            .post_schedule_reply(
+                "https://dav.example.test/cal/ada/outbox/",
+                "adá@example.test",
+                "organizer@example.test",
+                "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
+            )
+            .await
+            .expect_err("an address no header can carry must refuse locally");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::Malformed),
+            "a header the request could not carry is a local caller error"
+        );
+        assert_eq!(*error.recovery(), RecoveryClass::ClientBug);
+        assert!(
+            transcripts(&script).is_empty(),
+            "no POST may go out missing the headers RFC 6638 routes on"
+        );
+    }
+
     /// An empty calendar home lists NOTHING - no fabricated placeholder.
     ///
     /// This crate removed its phantom home-calendar long ago but never pinned
@@ -1792,6 +1862,58 @@ mod tests {
             CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
 
         let discovery = client.discover_account().await.expect("fallback succeeds");
+
+        assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
+        let urls = transcripts(&script)
+            .into_iter()
+            .map(|request| request.url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://dav.example.test/.well-known/caldav".to_string(),
+                "https://dav.example.test/".to_string(),
+                "https://dav.example.test/principals/ada/".to_string(),
+            ]
+        );
+    }
+
+    /// A front end sitting on the origin root answers a PROPFIND with `200` and
+    /// its index page. That is the SAME deployment the empty-207 test above
+    /// covers - a base URL that works, behind an origin root that knows nothing
+    /// about DAV - and it must reach the same place. It did not: the HTML fails
+    /// the XML decode, which mints `Protocol(ParseFailed)`, and the probe
+    /// predicate admitted only 404, 405 and a refused redirect, so the open
+    /// FAILED on a deployment one status code away from one that works.
+    #[tokio::test]
+    async fn discovery_falls_back_to_base_after_a_well_known_index_page() {
+        let script = dav_script([
+            DavResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: "<html><body><p>It works!</body></html>".to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>".to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<C:calendar-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:href>/cal/ada/</D:href></C:calendar-home-set>".to_string(),
+                url: String::new(),
+            },
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let discovery = client
+            .discover_account()
+            .await
+            .expect("an index page at the origin root is not a discovery answer");
 
         assert_eq!(discovery.calendar_home, "https://dav.example.test/cal/ada/");
         let urls = transcripts(&script)
@@ -2314,6 +2436,13 @@ mod tests {
         assert!(should_fallback_discovery(&local_error(
             AccountOperation::Discover,
             "redirect to an unadmitted origin",
+        )));
+        // The origin root answered 200 with a body that will not parse as DAV
+        // XML. An index page is the readable case; a truncated DAV document
+        // reaches the predicate identically, which is why it admits both.
+        assert!(should_fallback_discovery(&parse_error(
+            AccountOperation::Discover,
+            "XML parse error",
         )));
     }
 

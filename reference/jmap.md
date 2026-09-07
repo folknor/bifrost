@@ -87,11 +87,12 @@ returns `Error::Method` for JMAP method-level errors. RFC 8620 s3.2 lets one cal
 
 - `HttpTransport` - api_request, upload, download, get_session (returns `Bytes`).
 - `SseTransport` - open_sse (EventSource, with `last_event_id` support).
-  `Client::event_source()` and `event_source/` (WHATWG-conformant SSE parser
-  plus stream driver, hermetically pinned) are supported public API even
-  though the `sync/` Account impl does not call them: eventSourceUrl is a
-  mandatory RFC 8620 session property, unlike the RFC 8887 WebSocket
-  extension `sync/` push relies on. Wiring EventSource in as the sync-layer
+  `Client::event_source()` and everything in `event_source/` (WHATWG-conformant
+  SSE parser plus stream driver, hermetically pinned) are `pub(crate)`: they are
+  internal surface, not published API, and are kept built and tested even though
+  the `sync/` Account impl does not call them. The reason they are built at all
+  is that eventSourceUrl is a mandatory RFC 8620 session property, unlike the
+  RFC 8887 WebSocket extension `sync/` push relies on. Wiring EventSource in as the sync-layer
   push fallback for servers without WebSocket push is tracked in
   `reference/jmap/DEFERRED.md`. The long-lived SSE response explicitly suppresses
   the ordinary JMAP request deadline while retaining response-header and body

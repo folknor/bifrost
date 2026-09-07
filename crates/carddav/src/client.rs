@@ -7,8 +7,8 @@ use bifrost_dav_core::{
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
-    AccountError, AccountErrorKind, AccountOperation, ErrorScope, RequestErrorKind, ResourceKind,
-    ServerErrorKind,
+    AccountError, AccountErrorKind, AccountOperation, ErrorScope, ProtocolErrorKind,
+    RequestErrorKind, ResourceKind, ServerErrorKind,
 };
 use reqwest::header::{CONTENT_TYPE, ETAG};
 use reqwest::{Method, StatusCode};
@@ -93,48 +93,45 @@ impl CardDavClient {
         let well_known_url = bifrost_net::url::well_known_url(self.dav.base_url(), "carddav");
         let dav_root = match well_known_url {
             None => self.dav.base_url().to_string(),
-            Some(well_known_url) => match self
-                .dav
-                .propfind_raw(
-                    &well_known_url,
-                    "0",
-                    PROPFIND_PRINCIPAL,
-                    AccountOperation::Discover,
-                )
-                .await
-            {
-                Ok(response) => {
-                    match extract_href_property(&response.text, "current-user-principal")
-                        .map_err(|error| parse_error(AccountOperation::Discover, error))?
-                        .map(|href| resolve_href(&response.url, &href))
-                    {
-                        Some(principal) => {
-                            return self.addressbook_home_for_principal(principal).await;
-                        }
-                        None => self.dav.base_url().to_string(),
-                    }
+            // The probe's DECODE failure is a probe answer like any other, so it
+            // has to be raised as an `Err` that `should_fallback_discovery` can
+            // read. Parsing inside the `Ok` arm and lifting the failure with `?`
+            // put it outside the predicate entirely: an origin root answering
+            // `200 text/html` failed the open, while the same deployment
+            // answering an empty 207 fell back and worked.
+            Some(well_known_url) => match self.discover_principal(&well_known_url).await {
+                Ok(Some(principal)) => {
+                    return self.addressbook_home_for_principal(principal).await;
                 }
+                Ok(None) => self.dav.base_url().to_string(),
                 Err(error) if should_fallback_discovery(&error) => self.dav.base_url().to_string(),
                 Err(error) => return Err(error),
             },
         };
 
+        let principal = self.discover_principal(&dav_root).await?.ok_or_else(|| {
+            parse_error(AccountOperation::Discover, "missing current-user-principal")
+        })?;
+        self.addressbook_home_for_principal(principal).await
+    }
+
+    /// One principal PROPFIND, decode included.
+    ///
+    /// The decode lives here rather than at the call sites so both the
+    /// well-known probe and the configured-base leg produce the same
+    /// `Result<Option<String>, _>` shape, and the probe's fallback predicate
+    /// sees a malformed body as the probe answer it is. `bifrost-caldav`'s
+    /// `discover_principal` is the twin.
+    async fn discover_principal(&self, root: &str) -> Result<Option<String>, AccountError> {
         let response = self
             .dav
-            .propfind_raw(
-                &dav_root,
-                "0",
-                PROPFIND_PRINCIPAL,
-                AccountOperation::Discover,
-            )
+            .propfind_raw(root, "0", PROPFIND_PRINCIPAL, AccountOperation::Discover)
             .await?;
-        let principal = extract_href_property(&response.text, "current-user-principal")
-            .map_err(|error| parse_error(AccountOperation::Discover, error))?
-            .map(|href| resolve_href(&response.url, &href))
-            .ok_or_else(|| {
-                parse_error(AccountOperation::Discover, "missing current-user-principal")
-            })?;
-        self.addressbook_home_for_principal(principal).await
+        Ok(
+            extract_href_property(&response.text, "current-user-principal")
+                .map_err(|error| parse_error(AccountOperation::Discover, error))?
+                .map(|href| resolve_href(&response.url, &href)),
+        )
     }
 
     async fn addressbook_home_for_principal(
@@ -613,12 +610,34 @@ fn addressbook_text_query_body(property: &str, query: &str) -> String {
 /// origin root, and a locally-refused cross-origin redirect (RFC 6764's
 /// canonical shape, which the credential-origin gate cannot admit before
 /// discovery has authenticated anything) all mean the probe found no discovery
-/// endpoint and the configured base URL should be tried.
+/// endpoint and the configured base URL should be tried. A body that will not
+/// parse as DAV XML (`Protocol(ParseFailed)`) joins them: a front end
+/// answering a PROPFIND on the origin root with `200 text/html` and its index
+/// page is the same deployment shape one status apart, and an HTML document
+/// fails the XML parse rather than decoding as an empty multistatus.
+///
+/// Do NOT narrow that last arm. ANY `Protocol(ParseFailed)` from the well-known
+/// principal lookup triggers the fallback, INCLUDING malformed or truncated DAV
+/// XML from a genuine discovery endpoint. The predicate cannot distinguish that
+/// from a non-DAV body - both arrive as an XML parse failure with no headers
+/// available - so the distinction is unobtainable at this seam rather than
+/// merely unimplemented. It is safe because the fallback cannot accept bad data:
+/// `discover_addressbook_home` falls back to a FRESH principal lookup against
+/// the configured base URL, requires its result, and runs the rest of discovery
+/// normally, reusing nothing partially parsed from the probe and admitting no
+/// origin from it, while the base leg and every step after the principal still
+/// propagate their failures. So a fallback can only prefer the user-configured
+/// endpoint over a probe that would not parse. The cost is a lost DIAGNOSTIC -
+/// an operator does not learn that the well-known endpoint is serving truncated
+/// XML - and that cost is deliberately accepted here, not an open defect. The
+/// configured-base leg never consults this predicate, so a parse failure there
+/// remains a real contract violation.
 fn should_fallback_discovery(error: &AccountError) -> bool {
     matches!(
         error.kind(),
         AccountErrorKind::NotFound(ResourceKind::Contact)
             | AccountErrorKind::Request(RequestErrorKind::Malformed)
+            | AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
             | AccountErrorKind::Server(ServerErrorKind::Error { status: Some(405) })
     )
 }
@@ -1494,6 +1513,59 @@ mod tests {
         );
     }
 
+    /// Twin of `bifrost-caldav`'s
+    /// `discovery_falls_back_to_base_after_a_well_known_index_page`. A front end
+    /// answering the origin-root PROPFIND with `200` and its index page is the
+    /// same deployment the empty-207 test above covers, and must reach the same
+    /// place. Two things stood in the way here and BOTH are load-bearing: the
+    /// probe predicate did not admit `Protocol(ParseFailed)`, and the decode ran
+    /// inside the `Ok` arm and lifted its failure with `?`, so it never reached
+    /// the predicate at all.
+    #[tokio::test]
+    async fn discovery_falls_back_to_base_after_a_well_known_index_page() {
+        let script = dav_script([
+            DavResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: "<html><body><p>It works!</body></html>".to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>".to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::MULTI_STATUS,
+                headers: HeaderMap::new(),
+                body: "<C:addressbook-home-set xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\"><D:href>/books/ada/</D:href></C:addressbook-home-set>".to_string(),
+                url: String::new(),
+            },
+        ]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let home = client
+            .discover_addressbook_home()
+            .await
+            .expect("an index page at the origin root is not a discovery answer");
+
+        assert_eq!(home, "https://dav.example.test/books/ada/");
+        let urls = transcripts(&script)
+            .into_iter()
+            .map(|request| request.url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://dav.example.test/.well-known/carddav".to_string(),
+                "https://dav.example.test/".to_string(),
+                "https://dav.example.test/principals/ada/".to_string(),
+            ]
+        );
+    }
+
     /// RFC 6764 puts well-known discovery at the origin root. A base URL
     /// carrying a path is the only input that distinguishes an
     /// origin-rooted construction from suffix concatenation, and getting
@@ -2226,6 +2298,13 @@ mod tests {
         assert!(should_fallback_discovery(&local_error(
             AccountOperation::Discover,
             "redirect to an unadmitted origin",
+        )));
+        // The origin root answered 200 with a body that will not parse as DAV
+        // XML. An index page is the readable case; a truncated DAV document
+        // reaches the predicate identically, which is why it admits both.
+        assert!(should_fallback_discovery(&parse_error(
+            AccountOperation::Discover,
+            "XML parse error",
         )));
     }
 

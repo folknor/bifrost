@@ -455,8 +455,17 @@ impl ProtocolMachine for DirectSmtp {
                 remaining,
                 mut response,
             } => match outcome {
-                OpOutcome::Failed(error) => {
-                    let value = phased(SmtpCommandPhase::RcptTo, error);
+                OpOutcome::Failed(_) => {
+                    // The send's outcome is already decided: the peer rejected
+                    // `MAIL FROM`, so nothing was transmitted and the rest of
+                    // the window's replies were bookkeeping for the STREAM, not
+                    // for the transaction. Reporting the drain's transport
+                    // failure instead threw that rejection away - the caller
+                    // got a retryable network error where the server had
+                    // permanently refused the envelope, and never saw the reply
+                    // text saying why. The stream is still aborted.
+                    let response = response.take().expect("the rejection is carried through");
+                    let value = phased(SmtpCommandPhase::MailFrom, error::status(response));
                     self.begin_epilogue(Epilogue::abort(value))
                 }
                 _ => {
@@ -473,8 +482,12 @@ impl ProtocolMachine for DirectSmtp {
                 }
             },
             DirectSmtpStage::MailRejectedClosing(response) => match outcome {
-                OpOutcome::Failed(error) => {
-                    let value = phased(SmtpCommandPhase::RcptTo, error);
+                // Same rule as the drain above, and the same value this
+                // stage's success arm produces: a surplus-bytes or verify
+                // failure at the group close costs the connection, not the
+                // answer the peer already gave to `MAIL FROM`.
+                OpOutcome::Failed(_) => {
+                    let value = phased(SmtpCommandPhase::MailFrom, error::status(response));
                     self.begin_epilogue(Epilogue::abort(value))
                 }
                 _ => Step::Finish(
@@ -801,7 +814,12 @@ impl ProtocolMachine for DirectLmtp {
             },
             DirectLmtpStage::BodyWritten => match outcome {
                 OpOutcome::Failed(error) => {
-                    let phase = SmtpCommandPhase::DataBody;
+                    // The framing decides the phase, exactly as `DirectSmtp`
+                    // does: a failed `BDAT` chunk is `BdatBody`, not
+                    // `DataBody`. Hardcoding one of the two made the direct
+                    // LMTP path the only send path that mislabels its own body
+                    // upload.
+                    let phase = self.body.body_phase();
                     self.abort_with(phase, error)
                 }
                 _ => {
@@ -1102,6 +1120,18 @@ impl ProtocolMachine for BatchSmtp {
                     // A broken stream at the window boundary is reported
                     // without an abort: the caller sees the batch-level error
                     // and the stream is already unusable.
+                    //
+                    // The batch-level `Err` is deliberate and correct here.
+                    // Every window is on the clean side of `DATA`, so nothing
+                    // was transmitted and the whole request is retryable, which
+                    // is exactly what `Err` promises. It is lossy, though, and
+                    // knowingly so: both transports discard the `progress`, so
+                    // RCPT answers already collected in earlier windows -
+                    // including 550s the server gave - fold into one `Unsent`
+                    // retry and the caller relearns them on the resend. Turning
+                    // those into lanes would mean returning `Ok(progress)` for
+                    // a request that never reached the peer, which is a worse
+                    // lie than the lost diagnostics. Same at `WindowClosing`.
                     let error = error
                         .with_attempt(SmtpTransmissionState::Unsent)
                         .with_phase(SmtpCommandPhase::RcptTo);
@@ -1168,6 +1198,10 @@ impl ProtocolMachine for BatchSmtp {
             },
             BatchSmtpStage::WindowClosing { end } => match outcome {
                 OpOutcome::Failed(error) => {
+                    // Batch-level `Err`, for the reason spelled out at
+                    // `WindowOpened`: still before `DATA`, so nothing was
+                    // transmitted, and the collected RCPT answers are dropped
+                    // with the progress rather than claimed as lanes.
                     let error = error
                         .with_attempt(SmtpTransmissionState::Unsent)
                         .with_phase(SmtpCommandPhase::RcptTo);
@@ -1499,11 +1533,24 @@ impl ProtocolMachine for BatchLmtp {
             },
             BatchLmtpStage::GroupOpened => match outcome {
                 OpOutcome::Failed(error) => {
-                    let error = error
-                        .with_attempt(SmtpTransmissionState::InFlight)
-                        .with_phase(SmtpCommandPhase::LmtpFinalStatus);
+                    // The body has already been written and terminated
+                    // (`set_body_finished` ran one stage ago), so a batch-level
+                    // `Err` is the wrong shape here whatever the cause: it
+                    // means "nothing was transmitted", and the engine reading
+                    // it would resend a non-idempotent message that may well
+                    // have been delivered. The accepted recipients are
+                    // `uncertain` instead, which is the same answer the final
+                    // status arm below gives. No abort: this failure comes from
+                    // the stream's own verify, so it is already unusable.
+                    let account_error = Self::account_error(
+                        error
+                            .with_attempt(SmtpTransmissionState::InFlight)
+                            .with_phase(SmtpCommandPhase::LmtpFinalStatus),
+                    );
+                    self.progress()
+                        .mark_uncertain_unresolved(|| account_error.clone());
                     let progress = self.take_progress();
-                    Step::Finish(Err((error, progress)))
+                    Step::Finish(Ok(progress))
                 }
                 _ => match self.next_accepted(0) {
                     Some(index) => {

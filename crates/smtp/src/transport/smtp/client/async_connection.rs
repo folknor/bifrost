@@ -117,6 +117,20 @@ where
     }
 }
 
+/// Hard ceiling on how long an async teardown may await `poll_shutdown`,
+/// independent of the connection's configured operation timeout.
+///
+/// `timeout(None)` means "do not limit my protocol operations" - a caller
+/// saying a large message may take as long as it takes. Reading "hang forever
+/// tearing down a connection I have finished with" out of that is the bug: past
+/// `abort()` there is nothing left to accomplish but a courtesy `close_notify`,
+/// and a peer that will not answer it has already said what it needed to say.
+/// A TLS `poll_shutdown` waits for the peer's `close_notify`, so an
+/// unresponsive peer would otherwise park the caller forever - and
+/// `Pool::shutdown` WAITS on the closes it runs concurrently, so one wedged
+/// peer would hang pool shutdown, where a hang is least recoverable.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Structure that implements the SMTP client
 pub(crate) struct AsyncSmtpConnection {
     /// TCP stream between client and server
@@ -145,6 +159,15 @@ impl AsyncSmtpConnection {
 
     fn per_operation_budget(&self) -> TimeoutBudget {
         TimeoutBudget::PerOperation(self.timeout)
+    }
+
+    /// Budget for teardown: the smaller of the configured operation timeout and
+    /// `TEARDOWN_TIMEOUT`, so the bound binds whether or not a timeout is set.
+    fn teardown_budget(&self) -> TimeoutBudget {
+        TimeoutBudget::PerOperation(Some(
+            self.timeout
+                .map_or(TEARDOWN_TIMEOUT, |timeout| timeout.min(TEARDOWN_TIMEOUT)),
+        ))
     }
 
     /// Connects to the configured server
@@ -1082,16 +1105,20 @@ impl AsyncSmtpConnection {
 
     /// Close the connection.
     ///
-    /// Bounded by the per-operation timeout, unlike the blocking half's
-    /// `abort()`: `poll_shutdown` on a TLS stream sends `close_notify` and
-    /// waits for the peer's, so an unresponsive peer would otherwise hang the
-    /// caller after the timeout that already fired. That is the one deliberate
+    /// Bounded by `min(configured timeout, TEARDOWN_TIMEOUT)`, unlike the
+    /// blocking half's `abort()`: `poll_shutdown` on a TLS stream sends
+    /// `close_notify` and waits for the peer's, so an unresponsive peer would
+    /// otherwise hang the caller after the timeout that already fired - and
+    /// with `timeout(None)` would hang it forever. See `TEARDOWN_TIMEOUT` for
+    /// why teardown has a cap of its own. That is the one deliberate
     /// behavioural difference between the two adapters, and it lives here
-    /// because it is I/O rather than protocol.
+    /// because it is I/O rather than protocol: `Shutdown::Both` on a blocking
+    /// socket is a syscall that returns immediately, so the blocking half
+    /// already satisfies the same rule with no timeout at all.
     pub(crate) async fn abort(&mut self) {
         self.stream.get_mut().set_state(ConnectionState::Broken);
         let _ = with_timeout(
-            self.per_operation_budget(),
+            self.teardown_budget(),
             "SMTP shutdown timed out",
             self.stream.shutdown(),
         )
@@ -1684,7 +1711,7 @@ mod transcript_tests {
     };
     use bifrost_types::error::BatchItemId;
 
-    use super::{AsyncSmtpConnection, SendOptions};
+    use super::{AsyncSmtpConnection, SendOptions, TEARDOWN_TIMEOUT};
 
     const HELLO: &str = "EHLO client.example\r\n";
 
@@ -2390,6 +2417,42 @@ mod transcript_tests {
         tokio::time::timeout(Duration::ZERO, abort)
             .await
             .expect("abort must finish when its operation timeout expires");
+    }
+
+    /// The companion to the test above, for the case it cannot reach: a
+    /// transport built with `timeout(None)` has no operation timeout to bound
+    /// teardown, so only the independent `TEARDOWN_TIMEOUT` cap can end the
+    /// await. Without that cap this parks forever, and `Pool::shutdown` - which
+    /// waits on the closes it runs - parks with it.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn abort_is_bounded_by_the_teardown_cap_when_no_operation_timeout_is_set() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250 smtp.example\r\n")
+            .stall_shutdown();
+        // `from_transcript` builds the connection with `timeout: None`.
+        let mut connection =
+            AsyncSmtpConnection::from_transcript(transcript, &hello, Protocol::Smtp)
+                .await
+                .unwrap();
+
+        let mut abort = Box::pin(connection.abort());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(abort.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Still pending just short of the cap: the bound is the cap, not zero.
+        tokio::time::advance(TEARDOWN_TIMEOUT - Duration::from_millis(1)).await;
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(abort.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::timeout(Duration::ZERO, abort)
+            .await
+            .expect("abort must finish on the teardown cap with no operation timeout set");
     }
 
     #[tokio::test(crate = "tokio")]

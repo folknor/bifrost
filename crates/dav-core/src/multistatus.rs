@@ -239,9 +239,16 @@ impl<P: PropSet> ResponseParts<P> {
     /// server answers `404 Not Found` for any requested property it lacks,
     /// beside a `200` propstat that carries the etag. So any successful
     /// propstat makes the member successful (`None`), and only a response
-    /// whose every propstat failed reports its first failed code; reading the
+    /// whose every propstat failed reports a failed code; reading the
     /// first propstat's code regardless turned a per-property miss into a
     /// `Destroyed` for a resource that exists.
+    ///
+    /// Which failed code is [`worst_failed_status`](Self::worst_failed_status):
+    /// document order alone let a `<propstat 404: getcontenttype>` written
+    /// ahead of a `<propstat 403: getetag>` report the member as a benign
+    /// missing resource, and an all-refused 207 then classified `Usable` with
+    /// no entries - an empty snapshot for a collection the server refused,
+    /// whose diff destroys every resource in it.
     pub fn member_status_code(&self) -> Option<u16> {
         if let Some(code) = self.response_status.as_deref().and_then(status_line_code) {
             return Some(code);
@@ -249,7 +256,25 @@ impl<P: PropSet> ResponseParts<P> {
         if self.has_success_propstat {
             return None;
         }
-        self.failed_statuses.first().copied()
+        self.worst_failed_status()
+    }
+
+    /// The failed propstat code that describes the RESOURCE rather than one
+    /// property lookup: the first refusal that is not a 404/410, falling back
+    /// to document order when every refusal was a missing-property answer.
+    ///
+    /// Not a numeric maximum. `404`/`410` are the only codes
+    /// [`FailedResource::is_missing_resource`] reads as benign, and among real
+    /// refusals a larger number is not a worse one - ranking `507` over `401`
+    /// would bury a reauthorization signal under a storage complaint. So the
+    /// ladder has exactly two rungs, and inside the upper rung the server's own
+    /// order stands.
+    fn worst_failed_status(&self) -> Option<u16> {
+        self.failed_statuses
+            .iter()
+            .find(|code| !matches!(**code, 404 | 410))
+            .or_else(|| self.failed_statuses.first())
+            .copied()
     }
 
     /// The href of a response that commits as a member entry.
@@ -286,7 +311,7 @@ impl<P: PropSet> ResponseParts<P> {
     /// The status is [`member_status_code`](Self::member_status_code), which is
     /// exactly the rule the sync lane already applies: a response-level code
     /// wins, and below it only a response whose every propstat failed reports
-    /// its first failed code. Without the status the listing lanes could report
+    /// a failed code. Without the status the listing lanes could report
     /// WHICH resources a 207 refused but never WHY, so an all-refused 207 came
     /// back as an empty page carrying a list of hrefs instead of a classified
     /// error, and a consumer recorded a completed walk over a collection it had
@@ -306,8 +331,10 @@ impl<P: PropSet> ResponseParts<P> {
         Some((self.href.as_deref()?, self.committed.resource_data()?))
     }
 
-    /// A multiget response with an actual non-2xx status: the first refused
-    /// propstat code, or a non-2xx response-level code.
+    /// A multiget response with an actual non-2xx status: the refused propstat
+    /// code that describes the resource (see
+    /// [`worst_failed_status`](Self::worst_failed_status)), or a non-2xx
+    /// response-level code.
     // Accepted edge: a failed propstat whose status line is absent or
     // unparseable yields no numeric code here, so the resource degrades to the
     // benign missing-data lane and cannot contribute to a complete failure. A
@@ -320,7 +347,7 @@ impl<P: PropSet> ResponseParts<P> {
             return None;
         }
         let href = self.href.as_deref()?;
-        let status = self.failed_statuses.first().copied().or_else(|| {
+        let status = self.worst_failed_status().or_else(|| {
             self.response_status
                 .as_deref()
                 .and_then(status_line_code)
@@ -407,8 +434,34 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
             Ok(Event::Empty(element)) => {
                 let name = local_name(element.name().as_ref());
                 if parts.in_response() {
-                    sink.element(&name, &stack, &mut parts);
+                    // `<status/>` is the driver's element in either position,
+                    // and an empty one never reaches the `End` arm that reads
+                    // it. Left to the sink it set nothing, so `commit_propstat`
+                    // saw an ABSENT status and committed the propstat as a
+                    // success - the exact inverse of the rule: a status that is
+                    // present and unparseable is a refusal, because it is not
+                    // evidence that the property was returned.
+                    if name == "status"
+                        && matches!(stack.last().map(String::as_str), Some("propstat"))
+                    {
+                        parts.staged_status = None;
+                        parts.staged_success = Some(false);
+                    } else {
+                        sink.element(&name, &stack, &mut parts);
+                    }
                 }
+                // Then the same text reset `Start` and `End` do, unconditionally
+                // and after the status branch above, which reads no text. An
+                // empty child is a child: `<getetag>abc<foo/>def</getetag>` must
+                // yield the same `def` a non-empty `<foo></foo>` yields, or the
+                // accumulated value depends on whether the server chose the
+                // self-closing spelling. Safe for every property read through
+                // this driver - all of them are PCDATA-only by their schema
+                // (etag, ctag, sync-token, displayname, colour, content type,
+                // calendar-data, address-data); the structured ones
+                // (`resourcetype`, `privilege`, home sets) are read through
+                // `element` and hrefs, never through accumulated text.
+                text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
             Ok(Event::CData(value)) => {
@@ -468,6 +521,23 @@ pub fn extract_href_properties(xml: &str, property_name: &str) -> Result<Vec<Str
         match reader.read_event() {
             Ok(Event::Start(element)) => {
                 stack.push(local_name(element.name().as_ref()));
+                text.clear();
+            }
+            // An empty `<status/>` is present and unparseable, so it refuses
+            // the propstat. It never reaches the `End` arm below, and without
+            // this the propstat committed under the absent-status-is-success
+            // rule and published hrefs the server had refused.
+            Ok(Event::Empty(element)) => {
+                let name = local_name(element.name().as_ref());
+                if name == "status" && matches!(stack.last().map(String::as_str), Some("propstat"))
+                {
+                    propstat_success = Some(false);
+                }
+                // Same reset the `Start` arm does. An empty child element opens
+                // and closes a nested element, so text accumulated before it
+                // belongs to that child's parent and not to the property being
+                // read - without this, `<href>abc<x/>def</href>` reads `abcdef`
+                // where the paired spelling of the same child reads `def`.
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
@@ -549,6 +619,20 @@ pub fn parse_collection_property(xml: &str, property_name: &str) -> Result<Optio
                 stack.push(name);
                 text.clear();
             }
+            // Same rule as the driver: an empty `<status/>` is a present,
+            // unparseable status, so the propstat is refused rather than
+            // committing a stale token under the absent-status allowance.
+            Ok(Event::Empty(element)) => {
+                let name = local_name(element.name().as_ref());
+                if name == "status" && matches!(stack.last().map(String::as_str), Some("propstat"))
+                {
+                    staged_success = Some(false);
+                }
+                // Same reset the `Start` arm does; see `extract_href_properties`
+                // for why an empty child element must not leave its parent's
+                // text glued to the text that follows it.
+                text.clear();
+            }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
             Ok(Event::CData(value)) => {
                 let value = value.decode().map_err(|error| error.to_string())?;
@@ -628,6 +712,7 @@ mod tests {
         member_statuses: Vec<(String, Option<u16>)>,
         fetched: Vec<(String, String)>,
         missing_data: Vec<String>,
+        failed_resources: Vec<(String, u16)>,
     }
 
     impl MultiStatusSink for MemberSink {
@@ -685,6 +770,9 @@ mod tests {
             }
             if let Some(failure) = parts.failed_member() {
                 self.failed_members.push(failure);
+            }
+            if let Some((href, status)) = parts.failed_resource() {
+                self.failed_resources.push((href.to_string(), status));
             }
             if let Some(href) = parts.missing_data_href() {
                 self.missing_data.push(href.to_string());
@@ -915,6 +1003,180 @@ mod tests {
         );
         // An empty body is a legitimate empty result, not a failure.
         assert_eq!(classify_207(false, &[]), MultiStatusOutcome::Usable);
+    }
+
+    /// Document order must not decide the member status. A server that writes
+    /// its per-property `404` propstat ahead of the `403` that describes the
+    /// resource made the member read as a benign missing resource, so an
+    /// all-refused 207 classified `Usable` with no entries - an empty snapshot
+    /// whose diff destroys every resource in the collection.
+    #[test]
+    fn a_missing_property_propstat_does_not_mask_the_refusal_beside_it() {
+        let sink = run(r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/c/refused</D:href>
+          <D:propstat><D:prop><D:getcontenttype/></D:prop>
+          <D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>
+          <D:propstat><D:prop><D:getetag/></D:prop>
+          <D:status>HTTP/1.1 403 Forbidden</D:status></D:propstat>
+          </D:response></D:multistatus>"#);
+
+        assert_eq!(
+            sink.member_statuses,
+            vec![("/c/refused".to_string(), Some(403))]
+        );
+        assert_eq!(
+            sink.failed_members,
+            vec![FailedResource {
+                href: "/c/refused".to_string(),
+                status: Some(403),
+            }]
+        );
+        // The consequence the ordering bug produced: read as 404 this lane
+        // classified Usable and the caller minted an empty snapshot.
+        assert_eq!(
+            classify_207(false, &sink.failed_members),
+            MultiStatusOutcome::CompleteFailure { status: Some(403) }
+        );
+        // The multiget lane reads the same ladder from the same codes.
+        assert_eq!(sink.failed_resources, vec![("/c/refused".to_string(), 403)]);
+    }
+
+    /// An all-404 response has no refusal to prefer, so document order stands
+    /// and the benign missing-resource reading survives.
+    #[test]
+    fn an_all_missing_response_still_reports_its_missing_status() {
+        let sink = run(r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/c/gone</D:href>
+          <D:propstat><D:prop><D:getcontenttype/></D:prop>
+          <D:status>HTTP/1.1 410 Gone</D:status></D:propstat>
+          <D:propstat><D:prop><D:getetag/></D:prop>
+          <D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>
+          </D:response></D:multistatus>"#);
+
+        assert_eq!(
+            sink.member_statuses,
+            vec![("/c/gone".to_string(), Some(410))]
+        );
+        assert_eq!(
+            classify_207(false, &sink.failed_members),
+            MultiStatusOutcome::Usable
+        );
+    }
+
+    /// An empty-element `<status/>` is PRESENT and unparseable, so it refuses
+    /// its propstat. Routed to the sink as a bare element it set nothing, and
+    /// `commit_propstat` then committed the block under the
+    /// absent-status-is-success allowance.
+    #[test]
+    fn an_empty_status_element_refuses_its_propstat() {
+        let sink = run(r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/c/one</D:href>
+          <D:propstat><D:prop><D:data>body</D:data></D:prop>
+          <D:status/></D:propstat>
+          </D:response></D:multistatus>"#);
+
+        assert!(sink.entries.is_empty());
+        assert!(sink.fetched.is_empty());
+        assert_eq!(sink.failed_hrefs, vec!["/c/one".to_string()]);
+    }
+
+    /// The same hole in the href extractor: hrefs inside a propstat whose
+    /// status is an empty element were published as though the block had
+    /// succeeded, which is how a refused home-set or address-set reads as a
+    /// discovered one.
+    #[test]
+    fn an_empty_status_element_discards_the_propstat_hrefs() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/p/</D:href>
+          <D:propstat><D:prop><D:calendar-home-set><D:href>/home/</D:href></D:calendar-home-set></D:prop>
+          <D:status/></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        assert!(
+            extract_href_properties(xml, "calendar-home-set")
+                .expect("valid XML")
+                .is_empty()
+        );
+    }
+
+    /// And in the depth-0 token read, where committing under a refused
+    /// propstat is a stale `sync-token` / `getctag` that suppresses a real
+    /// change.
+    #[test]
+    fn an_empty_status_element_discards_the_collection_property() {
+        let xml = r#"<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+          <D:response><D:href>/c/</D:href>
+          <D:propstat><D:prop><CS:getctag>stale</CS:getctag></D:prop>
+          <D:status/></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        assert_eq!(
+            parse_collection_property(xml, "getctag").expect("valid XML"),
+            None
+        );
+    }
+
+    /// An empty child element resets the text accumulator exactly as a
+    /// `Start` does. Without it the spelling of a child decides the value:
+    /// `<data>abc<x/>def</data>` accumulated `abcdef` while the identical
+    /// `<data>abc<x></x>def</data>` yielded `def`.
+    ///
+    /// Ablation: drop the `text.clear()` from the `Empty` arm and the first
+    /// assertion reads `abcdef`.
+    #[test]
+    fn an_empty_child_element_resets_the_text_accumulator() {
+        let sink = run(r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/c/one</D:href>
+          <D:propstat><D:prop><D:data>abc<D:x/>def</D:data></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          </D:response></D:multistatus>"#);
+
+        assert_eq!(
+            sink.fetched,
+            vec![("/c/one".to_string(), "def".to_string())],
+            "the empty child resets the accumulator, as a non-empty one does"
+        );
+
+        let paired = run(r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:href>/c/one</D:href>
+          <D:propstat><D:prop><D:data>abc<D:x></D:x>def</D:data></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          </D:response></D:multistatus>"#);
+
+        assert_eq!(
+            sink.fetched, paired.fetched,
+            "the self-closing spelling of a child cannot change the value"
+        );
+    }
+
+    /// The same reset, in the two functions that keep their own accumulator.
+    ///
+    /// `parse_multistatus` is pinned above; these two were the sibling arms
+    /// that had the identical hole, which is the drift shape a fix to one
+    /// reader and not its neighbours leaves behind.
+    #[test]
+    fn an_empty_child_element_resets_the_text_of_the_standalone_readers() {
+        let href = r#"<D:multistatus xmlns:D="DAV:"><D:response>
+          <D:propstat><D:prop><D:owner><D:href>/p/<D:x/>real</D:href></D:owner></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        assert_eq!(
+            extract_href_properties(href, "owner").expect("valid XML"),
+            vec!["real".to_string()],
+            "the empty child resets the accumulator, as a non-empty one does"
+        );
+
+        let ctag = r#"<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+          <D:response><D:href>/c/</D:href>
+          <D:propstat><D:prop><CS:getctag>stale<D:x/>fresh</CS:getctag></D:prop>
+          <D:status>HTTP/1.1 200 OK</D:status></D:propstat>
+          </D:response></D:multistatus>"#;
+
+        assert_eq!(
+            parse_collection_property(ctag, "getctag").expect("valid XML"),
+            Some("fresh".to_string()),
+            "and the collection reader agrees with both of its siblings"
+        );
     }
 
     #[test]

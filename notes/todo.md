@@ -27,6 +27,26 @@ has not made, and ruled work that has not landed. Nothing else.
   `net`, `sasl`, `sync`) is verified with the full-workspace `brokkr
   check`, never `-p`.
 
+## Blocked on an unvalidated consumer contract
+
+Recorded 2026-09-07, while working the open rulings serially. Several items in
+this file are not engineering questions at all: they ask what a CONSUMER should
+get from a surface no consumer uses. `ratatoskr` is the intended consumer of
+every one of them, it has not wired them, and what it needs is open. Deciding
+them now means guessing on the consumer's behalf and then defending the guess.
+
+Known members of the class: the backfill `subsumed` history (see below),
+**google-B13**, **types-B1** (the rewrite half), **types-B2**, **sync-B6**. The
+tell is that the remedy is a default, a shape, or a policy that only the caller
+can evaluate.
+
+Two ways out, both better than ruling blind. Where the surface can simply STOP
+deciding - google-B13 is the clean case, an additive `include_cancelled` request
+field defaulting to today's behaviour - take that, subject to every backend on
+the shared trait being able to honour it, since a field two of three
+implementations ignore is worse than no field. Otherwise leave the item parked
+and say so, as the `subsumed` entry now does.
+
 ## Sync residuals
 
 The three items ruled on 2026-09-06 (the receipt bound, the explicit
@@ -62,6 +82,38 @@ asked for; that review debt is listed under their crates below.
     `AlreadyPersisted` on the shared `Lane::Backfill(scope, completion)` key
     and never reaches the refusal at all, so the row-deleting variant of that
     P3 could only ever bite a later attempt's PAGE rows.
+    - DEFERRED 2026-09-07, and the deferral is the ruling: this was put to the
+      repository owner as a representation choice (tally, park, forfeit, or
+      leave) and the choice was declined as premature. The reason is upstream of
+      every option on the list. The whole publication ledger - receipts,
+      per-publication acknowledgement, supersession, the boundary registration -
+      is the price of ONE bargain offered to a consumer: persist-then-
+      acknowledge, in exchange for a mirror that is provably complete or
+      precisely annotated where it is not. No consumer has ever paid that price.
+      `ratatoskr` is the intended one and has not wired it, and what it actually
+      needs from sync is open. Optimizing the internals of a contract whose
+      TERMS are unvalidated is the wrong activity: if the answer turns out to be
+      "tell me when you are degraded and I will re-walk", most of this ledger
+      evaporates and the memory question with it. Do not work this item, or
+      re-file it as a defect, until ratatoskr's requirement is known.
+      One observation banked from the read, because it survives whatever
+      ratatoskr wants and sharpens the item if it comes back: `reference/sync.md`
+      states that only ONE acknowledger is supported. With one acknowledger and
+      one sequential producer per lane, acknowledgements are already effectively
+      ordered - so the out-of-order acknowledgement that `subsumed` exists to
+      serve is a shape the contract does not admit in the first place. If that
+      holds under scrutiny (it was NOT verified against the code), the memory
+      growth is a symptom and the disease is that the ledger carries a mechanism
+      for a caller that is not allowed to exist. The candidate answer then is
+      per-lane monotonic acknowledgement, which deletes `subsumed`,
+      `SubsumedPage`, the `folded` map and the hot-path `absorb`, makes the
+      per-page stamp invariant true by construction, and removes the
+      `debt_only` demotion in `release_undelivered` - which is a live cost, not
+      tidiness: an undelivered subsumed page currently destroys its survivor's
+      clean proof and pays for it in re-walks. Its own tension, unresolved: a
+      watermark acknowledgement needs a CUMULATIVE receipt per lane to replay
+      across a writer restart, which wants `CoverageClaim` to merge reports by
+      domain instead of appending them.
     - FILED by the receipt-bound landing, not fixed in it: a surviving
       backfill entry's `subsumed` history is no longer bounded by
       `lane_capacity`. It was, while the charge was the unacknowledged page -
@@ -208,62 +260,12 @@ any item; some may already be obsolete.
 
 ## bifrost-caldav / bifrost-carddav
 
-- **dav-F3 (P3, filed 2026-09-06, cold review).** `multistatus.rs`
-  `member_status_code` reports `failed_statuses.first()`, so a member
-  answering `<propstat 404: getcontenttype>` then `<propstat 403: getetag>`
-  reads as 404. 404 is `is_missing_resource`, so `classify_207` calls the
-  lane `Usable` with no entries, and `establish_initial_cursor` /
-  `inventory_stream` mint an EMPTY snapshot for a collection the server
-  actually refused - a snapshot diff that destroys every resource in it.
-  `failed_member` inherits the same code. Fix shape: with no success
-  propstat, report the WORST failed code, preferring any non-404/410 over a
-  404/410, rather than whichever came first in document order.
-- **dav-F4 (P3, filed 2026-09-06, cold review).** A well-known probe that
-  answers `200 text/html` - a front end that returns the index page for any
-  method - fails `extract_href_property` with an XML parse error, which
-  mints `Protocol(ParseFailed)`. `should_fallback_discovery` admits only
-  `NotFound(Calendar)`, `Request(Malformed)` and `Server(Error{405})`, so
-  the open FAILS instead of falling back to the configured base URL, which
-  is what the same deployment answering an empty 207 gets. Either admit
-  `Protocol(ParseFailed)` for the well-known leg specifically (not for the
-  base leg, where a garbage document is a real contract violation), or
-  gate the probe on a `text/xml`-ish content type.
-- **dav-F5 (P3, filed 2026-09-06, cold review).** `post_schedule_reply`
-  (caldav `client.rs`) drops the RFC 6638 `Originator` and `Recipient`
-  headers silently via `if let Ok(value) = HeaderValue::from_str(..)`. A
-  non-ASCII calendar-user address therefore goes out with no routing
-  headers at all and the server's 400 surfaces as `ProviderRefused`. The
-  seam to refuse locally already exists: routing the value through
-  `DavRequest::header` records the rejection and `dispatch_once` refuses
-  with `Request(Malformed)` before any I/O, which is what every other
-  header on that request already does. Two lines.
-- **dav-F6 (P3, filed 2026-09-06, cold review).** An empty-element
-  `<D:status/>` inside a propstat arrives as `Event::Empty`, which routes to
-  `sink.element` and never sets `staged_status` / `staged_success`, so
-  `commit_propstat` sees `None` and commits under the absent-status-is-
-  success rule. The stated rule in the `multistatus.rs` module doc is the
-  opposite: a status that is PRESENT and unparseable is a failure. Same
-  hole in `extract_href_properties` and `parse_collection_property`, which
-  keep their own `staged_success` and only write it from `Event::End`.
 - **dav-F7 (P4, filed 2026-09-06, cold review).** Page-size default drift:
   CalDAV `event_search` and `events_in_range` use `usize::MAX` when `limit`
   is `None` (`account.rs`, two sites), CardDAV `contact_search` defaults to
   `CONTACT_PAGE_SIZE` (250). Neither reference states the CalDAV default, so
   a consumer omitting `limit` gets an unbounded page from one crate and a
   250-entry page from its twin with nothing documenting either.
-- **dav-F11 (P4, filed 2026-09-06, cold review).** `DavDispatch::resolve_url`
-  joins a relative id two different ways: `Url::join` on the parsed base
-  (which REPLACES the base's last path segment) and, when the base does not
-  parse, a plain `format!` concatenation (which APPENDS). Only reachable for
-  a consumer-supplied relative native id against an unparseable base, so it
-  is latent - but the two branches should agree.
-- **dav-F12 (P4, filed 2026-09-06, cold review).** `move_resource` keeps the
-  original `Destination` header across a redirect OF THE SOURCE: the walk
-  clones `request.headers` and rewrites only the url, so a server that
-  moves `/cal/one.ics` to `/dav/cal/one.ics` gets a MOVE whose destination
-  still names the pre-redirect collection namespace. Rebasing the
-  destination on the same hop the source took is the fix, and it must stay
-  inside the admitted-origin gate.
 ## bifrost-sasl
 
 - **sasl-F1.** Typed public auth-outcome surface. The SASL/channel-binding
@@ -306,51 +308,6 @@ DATA-final-negative `uncertain` lane, and the async body upload bounded by one
 per-operation timeout) were fixed in the same pass; everything below is
 verified against the code and awaiting its own ruling.
 
-- **smtp-CR2 (P3).** `BatchLmtpStage::GroupOpened` has the wrong exit shape on
-  `OpOutcome::Failed`: it returns `Step::Finish(Err((error, progress)))`, and
-  it is reached only AFTER `BatchLmtpStage::BodyWritten` ran
-  `set_body_finished()`. A batch-level `Err` means "nothing was transmitted"
-  (`reference/error-model.md`), so this arm would claim that for a body that
-  already left. Unreachable today - `open_reply_group` fails only on
-  `verify()`, and a completed body write leaves the stream `Ok` - so it is a
-  latent shape defect, not a live one. `BatchLmtpStage::FinalStatus`'s `Failed`
-  arm has the right shape (`mark_uncertain_unresolved` + `Ok(progress)`).
-  `BatchSmtp::WindowOpened` returns the same `Err` shape but sits on the clean
-  side of DATA, where it is correct.
-
-- **smtp-CR3 (P3).** The async `abort()` is bounded by
-  `per_operation_budget()`, which is `TimeoutBudget::PerOperation(self.timeout)`
-  - so a transport built with `timeout(None)` awaits `poll_shutdown`
-  unbounded, and on a TLS peer that never answers `close_notify` the await
-  never returns. `Pool::shutdown` runs closes concurrently but waits for them,
-  so a single wedged TLS peer can hang shutdown. `reference/smtp.md` states
-  "each close is bounded by the connection's operation timeout" flatly; it
-  holds only when one is configured. Either bound the shutdown with a floor
-  independent of the configured timeout, or say so in the reference.
-
-- **smtp-CR4 (P4).** `DirectLmtpStage::BodyWritten` hardcodes
-  `SmtpCommandPhase::DataBody` where `DirectSmtp::BodyWritten` uses
-  `self.body.body_phase()`, so an LMTP BDAT chunk-write failure reports
-  `DataBody` instead of `BdatBody`. One-line fix; the phase feeds
-  `classify_response`, which does not currently split on it, so nothing
-  observable changes today.
-
-- **smtp-CR5 (P4).** `DirectSmtpStage::MailRejectedDrain` on a `Failed` drain
-  read reports `phased(SmtpCommandPhase::RcptTo, error)`, dropping the
-  `MAIL FROM` rejection it is carrying in `response` along with its reply text.
-  The caller gets the transport failure of the drain and never learns why the
-  transaction was doomed.
-
-- **smtp-CR6 (P4).** `BatchSmtpStage::WindowOpened` and
-  `BatchSmtpStage::WindowClosing` exit `Failed` as
-  `Step::Finish(Err((error, progress)))`, and both transports discard the
-  progress (`Err((e, _progress)) => Err(batch_level_error(e, ctx))`). So the
-  RCPT answers already collected in earlier windows - including `550`s the
-  server gave - fold into one `Unsent` batch-level retry. Contract-correct (no
-  content was transmitted, the whole request is retryable) but lossy for
-  diagnostics: a caller retrying learns nothing about the recipients the server
-  had already refused.
-
 - **smtp-CR7 (P4, doc).** Two reference corrections, plus one unreachable
   shape. (a) The "Transport types" list of deliberate half-differences is now
   three, not two: the async setup deadline is ONE shared `AsyncDeadline` across
@@ -363,16 +320,6 @@ verified against the code and awaiting its own ruling.
   `after_envelope()` and writes `DATA` with no `MAIL FROM` ahead of it.
   Unreachable through `Envelope::new`, which requires at least one recipient,
   but the machine itself does not enforce it.
-
-- **smtp-CR9 (P4).** `SlowSinkPeer::new` arms its first `Sleep` at
-  CONSTRUCTION rather than at the first `poll_write`, so the gap between
-  building the peer and the first write is silently credited against the
-  first chunk's delay. Harmless in the tests that use it (they build and
-  write immediately, under paused time, where no virtual time elapses in
-  between), but it makes the peer's contract "chunk bytes every gap, counted
-  from whenever you happened to construct me", which is a trap for a future
-  test that builds the peer during setup. Arm lazily on the first poll
-  instead.
 
 Filed 2026-09-06 from the third cold review of the same diff. Its two other
 findings (the batch machine parking a 421'd connection, and a cap retune
@@ -547,21 +494,26 @@ blocking; each is a real defect or a real decision, not a cleanup.
   does a full staged reattach - re-runs scope and membership discovery,
   establishes newly-appeared scopes, drops vanished cursors, recreates push
   subscriptions, refreshes the capability snapshot, then swaps the handle.
-  Candidate names: `rediscover_and_reattach` (most literal), `reattach`,
-  `reopen_and_rediscover`. Not settled.
 
-  Sizing, because it is bigger than it looks: `reopen` appears 105 times in
-  `sync/src/engine/` and 35 times in `reference/sync.md`, and most of those
-  are the reopen LANE (`reopen_tx`, `reopen_lock`, `ReopenRequest`, the
-  reopen listener), not the public method - a blind rename would churn the
-  internal vocabulary too. Decide whether the lane keeps its name.
+  RULED 2026-09-07, not yet landed. Three parts, in this order.
 
-  The sharper consequence: the capability flag
-  `reopen_discovers_foreign_namespaces` NAMES the method. Renaming the
-  method either drags the flag with it - a `bifrost-types` public API change
-  touching all seven account crates plus every test stub - or leaves the flag
-  naming a method that no longer exists. That coupling is the real cost of
-  the rename and should be decided before starting, not discovered midway.
+  1. Rename the capability flag `reopen_discovers_foreign_namespaces` to
+     `discovers_foreign_namespaces_on_rediscovery`. This was filed as the
+     rename's blocking COST; it is a separate defect and worth doing on its own
+     merits. A capability flag is an account describing its own property, and
+     the account never calls the engine method - phrasing the flag in terms of
+     that method is backwards. Verified 2026-09-07: the identifier appears in 16
+     files - `bifrost-types`, all seven account crates, and six sync test files.
+     Renaming a published field is the owner's call and was authorised.
+  2. Then rename the method to `reattach`. Cheap and local once the flag no
+     longer names it; nothing outside `sync` depends on the name. Chosen over
+     `rediscover_and_reattach` and `reopen_and_rediscover` because it says what
+     the operation IS, and the discovery belongs in the reference doc rather
+     than crammed into the identifier.
+  3. The reopen LANE keeps its name. `reopen_tx`, `reopen_lock`,
+     `ReopenRequest`, the reopen listener - internal vocabulary for a queue of
+     reattach requests, and renaming it churns most of the ~105 `sync/src/engine/`
+     occurrences to buy nothing.
 
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 
@@ -588,12 +540,25 @@ confirm against the code before working any of them.
   last `std::env::var` read in the workspace and the last place a bifrost crate
   names a downstream consumer. Coordinate with those two repos; there is nothing
   to do here until they are ready.
-- **sync-B5. Ledger compaction and audit retention.** [C4] Discharged entries
-  are retained forever for audit, so the ledger grows monotonically. Compaction
-  needs to preserve the proved/waived distinction rather than flattening it -
-  separate counters or audit roots for proved discharges, waived unresolved
-  loss, and currently-open obligations. Not urgent at present volumes; it
-  becomes real now that repair churns entries.
+- **sync-B5. Ledger compaction and audit retention.** RULED 2026-09-07, not yet
+  landed. Discharged entries are retained forever for audit, so the ledger grows
+  monotonically, and repair churns entries faster than when the retention rule
+  was written. Note that two neighbours are already bounded and must not be
+  confused with this: `proved` prunes (a proof older than newly-raised debt
+  cannot discharge it, and proofs whose load-bearing debt closed are discarded)
+  and so do `barriers`. It is `entries` that never shrinks.
+
+  Compact `Discharged` entries ONLY, into a per-scope count plus an audit root.
+  Every `Unresolved` entry stays a live entry, WAIVED ONES INCLUDED. The line
+  falls out of `ProofStatus`: `Discharged` is terminal, since something proved
+  the coverage and nothing will transition it again, while a waiver leaves the
+  entry `Unresolved` forever by design, and a later walk with a covering domain
+  can still discharge it. Compacting a waived entry would destroy an
+  `ObligationKey` an operator may still need and a proof may still land on.
+  This satisfies the constraint the item names - preserve the proved/waived
+  distinction rather than flattening it - by construction rather than by
+  bookkeeping: only the proved side compacts, so the waived entries are exactly
+  the ones left sitting there in full.
 
 - **sync-B6. Repair is caller-driven, with no scheduler.** [C4]
   `SyncEngine::repair_debt(account, max_requests)` runs exactly one pass when a
@@ -738,8 +703,22 @@ PUBLISHED SURFACE fence apply.
   and a reflex copy of the G8 fix is the wrong move: a range reread is a
   COVERAGE question, where a missing tombstone is indistinguishable from a
   page boundary, whereas a SEARCH returning cancelled instances is a PRODUCT
-  decision about what a query surface should answer. Wants a deliberate
-  answer.
+  decision about what a query surface should answer.
+
+  Considered 2026-09-07 and NOT ruled, deliberately: the choice belongs to the
+  consumer, not to us, so picking a default either way is the error. See
+  "Blocked on an unvalidated consumer contract" at the top of this file. The
+  direction, when someone works it, is to stop deciding - an additive
+  `include_cancelled: bool` on `EventSearchRequest`
+  (`crates/types/src/calendar.rs`), defaulting to `false`, which is exactly
+  today's behaviour, so nothing changes until a consumer asks. That is purely
+  additive to a plain struct with a `new()` constructor, so it does not hit the
+  published-surface fence. The prerequisite, and the reason it was not just
+  done: `event_search` is on the shared `Account` trait, so a request field is
+  a promise JMAP and CalDAV must honour too. Google is a one-parameter change;
+  whether CalDAV's `calendar-query` filter and JMAP's `CalendarEvent/query` can
+  express it is UNVERIFIED. A field that two of three backends silently ignore
+  is a worse API than no field, so verify that before adding it.
 
 ## Open items folded in from the third bug-hunt wave (2026-09-04)
 
@@ -772,20 +751,87 @@ PUBLISHED SURFACE fence apply.
   filed rather than fixed. Same shape applies to `pim`'s upload paths, but
   those are outbound and the tally is inbound-only.
 
-- **jmap-C2. The SSE stream tears down on one malformed event payload.** [C4]
-  `crates/jmap/src/event_source/stream.rs` (`break 'events`). SSE's design
-  intent is skip-and-continue; the crate reconnects and replays from
-  `lastEventId` instead, on the argument that an undecodable state-change
-  payload means the push contract is broken and dropping it would lose the
-  change it carried. Defensible either way. The comment at the loop records
-  the choice; this item is the decision to revisit it.
-
 - **jmap-C3. Generic requests fall back to the lowest-capability primary
   account.** [C4] `Session::default_account_id` picks the lowest capability
   URI in `primaryAccounts`, so a session advertising only calendars serves a
   mail-shaped generic request off the calendar account. The empty-id half
   (no `primaryAccounts` at all) is refused before the wire; narrowing the
   fallback itself is a product decision, recorded at the function.
+
+## Surfaced by the 2026-09-07 fix wave
+
+Found while resolving the dav-F, smtp-CR and jmap-C2 items and the two cold
+reviews over them. Everything the reviews found at P1 or P2 was fixed in that
+wave; these are what was left. Verify before working any of them.
+
+- **Four owner rulings, none blocking.**
+  (a) Move `should_fallback_discovery` into `bifrost-dav-core`, parameterised by
+  the existing `DavProtocol` (the only difference between the copies is
+  `ResourceKind::Calendar` versus `Contact`, which `DavProtocol` already
+  carries). Internal only, but it touches three crates. The case: this wave was
+  the second time the twins needed the SAME edit, and the first time they needed
+  DIFFERENT edits to reach the same behaviour - the CardDAV copy parsed the probe
+  body inside its `Ok(response)` arm and lifted the failure with `?`, so the
+  parse error never reached the predicate at all. Eleventh measured divergence.
+  (b) Bound the STARTTLS handshake under `timeout(None)`. `AsyncSmtpConnection::
+  starttls` passes `self.timeout` to `upgrade_tls`, so a transport built with no
+  timeout has an unbounded TLS handshake on the explicit-STARTTLS path. Same root
+  cause as the teardown cap that landed, but a handshake is a PROTOCOL operation,
+  so the teardown reasoning ("nothing left to accomplish past this point") does
+  not carry over and a default bound is a new policy. The mechanism underneath is
+  `TimeoutBudget::SetupDeadline` yielding `None` slack when built from
+  `AsyncDeadline::new(None)`; any future "everything is bounded" claim starts
+  there.
+  (c) Add `[check] consumer_features` to `brokkr.toml`. Two tests landed this
+  wave under `#[cfg(not(feature = "calendars"))]` - the feature-off SSE path,
+  which is exactly where the alert ruling was silently failing - and
+  `brokkr check` runs `--all-features` with no second sweep, so their bodies are
+  not even typechecked, let alone run. A cold reviewer's verdict: they earn their
+  place as executable assertions and provide ZERO automated protection until a
+  feature-off sweep exists. Deleting them would keep the gap and lose the
+  assertions.
+  (d) `PushNotification::CalendarAlert` carries no resume token, so a block
+  containing ONLY alerts advances no checkpoint and is replayed in full after
+  every reconnect. Inherent to the type and consistent with the ordering rule
+  that puts the token-bearing notification last; closing it is a change to that
+  type's shape.
+
+- **jmap SSE: let a content-free parser overflow continue.** The stream ends on
+  any parser error because `discard(..)` destroys a block that MAY have carried
+  state data, and the parser reports only "too long". It could report the
+  difference cheaply - at every `discard(..)` site the state is in hand and the
+  predicate is `data_seen || (field == b"data" && !value.is_empty())`, the second
+  disjunct because the `Value`-state overflow fires mid-`data` line before
+  `commit_field` runs. The cost is the error channel, not the parser:
+  `Iterator::Item` is `crate::Result<Event>` and `too_long_error()` mints a
+  generic `Error::Transport`, so carrying the bit needs a parser-owned error enum
+  threaded through `Item`, or a dedicated variant with a `carried_data` flag.
+  `stream.rs` would then continue on a genuinely content-free overflow and keep
+  tearing down otherwise. Note `discard(..)` deliberately does NOT clear
+  `last_event_id`, so a discarded block's id is not itself a loss - only its
+  `data` is.
+
+- **Two documentation gaps left by this wave.** (a) `DavDispatch::resolve_url`
+  now resolves a relative id UNDER the configured base path (`join_base` restores
+  the trailing slash before joining, where `Url::join` on a slashless base
+  replaced the base's last segment). Neither DAV reference describes relative-id
+  resolution at all, so nothing was false - but the behaviour belongs in the
+  dav-core write-up. (b) `reference/net.md` may need the redirect-versus-
+  `Destination` interaction now that `move_resource` rebases the destination on
+  the hop the source took; nobody checked it.
+
+- **smtp `DirectSmtpStage::RcptWindowReply` keeps only the FIRST negative reply**
+  in a window (`failure: Option<Response>`) and drops any later ones. It looks
+  deliberate on the direct path, whose output is a single `Response`, and it is
+  the direct-path analogue of the accepted batch loss recorded at
+  `BatchSmtpStage::WindowOpened` - but unlike that one it is written down
+  nowhere. Either document it at the arm or decide it is a defect.
+
+- **`flatten_push_object`'s `#[allow(unreachable_patterns)] _ => {}` arm now
+  covers nothing** when both `mail` and `calendars` are on, since every
+  `PushObject` variant has a real arm. It is still needed for feature-off builds,
+  so it stays, but a reader can misread it as "something is still being dropped".
+  Worth a clarifying comment or a cfg-shaped alternative.
 
 ## Notes
 

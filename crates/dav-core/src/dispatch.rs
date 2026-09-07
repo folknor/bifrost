@@ -30,8 +30,12 @@ use bifrost_net::{
 };
 use bifrost_types::{AccountError, AccountId, AccountOperation};
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
+
+/// The WebDAV `Destination` header, lowercased so it is both a valid
+/// `HeaderName::from_static` argument and the key `HeaderMap` stores it under.
+const DESTINATION: &str = "destination";
 
 use crate::error::{DavProtocol, local_error, response_read_error, status_error, transport_error};
 use crate::transport::{
@@ -146,12 +150,27 @@ impl DavDispatch {
         DavRequest::new(method, url)
     }
 
+    /// Turn a native id into an absolute request URL.
+    ///
+    /// An absolute href is returned verbatim. A root-relative href (`/cal/x`)
+    /// replaces the base's path, which is what RFC 3986 says and what a server
+    /// naming such an href in a Multi-Status means. A RELATIVE href lands under
+    /// the configured base path.
+    ///
+    /// That last case is why the base is given its trailing slash back before
+    /// joining. `around()` trims it, and `Url::join` reads a base whose path has
+    /// no trailing slash as naming a RESOURCE, so a relative href replaces the
+    /// base's last segment instead of landing beneath it: an account configured
+    /// at `https://host/dav` resolved `cal/one.ics` to `https://host/cal/one.ics`,
+    /// silently relocating the id out of the collection the account lives in.
+    /// Appending is also what the unparseable-base fallback below has always
+    /// done, so the two branches now agree on the shape they share.
     #[must_use]
     pub fn resolve_url(&self, href: &str) -> String {
         if href.starts_with("http://") || href.starts_with("https://") {
             return href.to_string();
         }
-        if let Ok(base) = Url::parse(&self.base_url)
+        if let Some(base) = self.join_base()
             && let Ok(resolved) = base.join(href)
         {
             return resolved.to_string();
@@ -163,6 +182,16 @@ impl DavDispatch {
         } else {
             format!("{}/{href}", self.base_url)
         }
+    }
+
+    /// The base URL as a directory, so relative hrefs resolve beneath it.
+    fn join_base(&self) -> Option<Url> {
+        let mut base = Url::parse(&self.base_url).ok()?;
+        if !base.cannot_be_a_base() && !base.path().ends_with('/') {
+            let path = format!("{}/", base.path());
+            base.set_path(&path);
+        }
+        Some(base)
     }
 
     /// Admit successfully discovered DAV origins to the credential gate.
@@ -515,6 +544,43 @@ impl DavDispatch {
             for (name, value) in &auth {
                 headers.insert(name, value.clone());
             }
+            // A redirect of the SOURCE relocates the collection namespace, and a
+            // `Destination` still naming the pre-redirect one asks the server to
+            // write where it has just said the source no longer lives: a MOVE of
+            // `/cal/one.ics` redirected to `/dav/cal/one.ics` kept a destination
+            // under `/cal/`. Rebase it on the same hop the source took - express
+            // it relative to the pre-hop request URL, resolve that against the
+            // post-hop one - so a cross-collection move stays cross-collection
+            // inside the new namespace.
+            //
+            // This is inside the credential gate rather than beside it. The
+            // destination is a URL this client asks the server to write to, so
+            // it carries the same admitted-origin requirement `move_resource`
+            // enforced on the caller's value. The rebase happens only after
+            // `auth_headers` has admitted `next`, and the rebased URL is
+            // `next`-relative, so the requirement holds by construction; the
+            // check below is the guard that keeps it holding if either half
+            // moves. A destination on a different origin than the source is left
+            // verbatim - the source's hop says nothing about it, and it passed
+            // the gate on the way in.
+            let rebased = headers
+                .get(DESTINATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|destination| rebase_destination(&request.url, &next, destination));
+            if let Some(rebased) = rebased {
+                if !self.is_trusted_url(&rebased) {
+                    return Err(local_error(
+                        operation,
+                        format!(
+                            "refusing to name an untrusted DAV move destination after a redirect: {rebased}"
+                        ),
+                        self.protocol,
+                    ));
+                }
+                let value = HeaderValue::from_str(&rebased)
+                    .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
+                headers.insert(HeaderName::from_static(DESTINATION), value);
+            }
             request = DavRequest {
                 method: request.method,
                 url: next.to_string(),
@@ -679,7 +745,7 @@ impl DavDispatch {
         let destination = HeaderValue::from_str(to)
             .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
         let request = DavRequest::new(method, from)
-            .header("Destination", destination)
+            .header(DESTINATION, destination)
             .header("Overwrite", "F")
             .headers(self.auth_headers(from, operation).await?)
             // `MOVE` is an extension method, so `bifrost-net` never replays it
@@ -710,6 +776,25 @@ impl DavDispatch {
             self.protocol,
         ))
     }
+}
+
+/// Re-express `destination` against the URL the source was redirected to.
+///
+/// The hop is applied as a relative resolution rather than as a string rewrite:
+/// the destination is made relative to the pre-hop request URL, then joined onto
+/// the post-hop one. That is what keeps a cross-collection move
+/// cross-collection, where prefix arithmetic on the two paths would not:
+/// `/cal/a/one.ics` to `/cal/b/one.ics`, redirected to `/dav/cal/a/one.ics`,
+/// yields `/dav/cal/b/one.ics` rather than losing the `b`.
+///
+/// `None` when the hop does not apply: an unparseable URL on either side, or a
+/// destination on a different origin than the source, which the source's own
+/// relocation says nothing about. The caller then keeps the destination it had.
+fn rebase_destination(previous: &str, next: &Url, destination: &str) -> Option<String> {
+    let previous = Url::parse(previous).ok()?;
+    let destination = Url::parse(destination).ok()?;
+    let relative = previous.make_relative(&destination)?;
+    Some(next.join(&relative).ok()?.to_string())
 }
 
 /// Decode a DAV response body.
@@ -749,22 +834,26 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        dav_dropped_after_send, dav_script, dav_script_empty, scripted_dav_net,
-        scripted_dav_net_capped, transcripts,
+        DavTranscript, dav_dropped_after_send, dav_redirect, dav_script, dav_script_empty,
+        scripted_dav_net, scripted_dav_net_capped, transcripts,
     };
 
     const BASE: &str = "https://dav.example.test";
 
-    fn scripted_dispatch(net: AccountNet) -> DavDispatch {
+    fn dispatch_at(net: AccountNet, base_url: &str) -> DavDispatch {
         DavDispatch::with_account_net(
             net,
-            BASE,
+            base_url,
             DavCredentials::Basic {
                 username: "user".to_string(),
                 password: "pass".to_string(),
             },
             DavProtocol::CalDav,
         )
+    }
+
+    fn scripted_dispatch(net: AccountNet) -> DavDispatch {
+        dispatch_at(net, BASE)
     }
 
     fn reconciles(error: &AccountError) -> bool {
@@ -811,6 +900,102 @@ mod tests {
             reconciles(&error),
             "a dropped MOVE must reconcile against the destination: {:?}",
             error.recovery()
+        );
+    }
+
+    /// A relative native id lands UNDER the configured base path, and the two
+    /// resolution branches agree on that.
+    ///
+    /// `around()` trims the base's trailing slash, and `Url::join` reads a
+    /// slashless path as naming a resource, so the parsed branch used to replace
+    /// the base's last segment: an account configured at `/dav` resolved
+    /// `cal/one.ics` to `/cal/one.ics`, outside the collection it lives in. The
+    /// string fallback for an unparseable base appended instead, so the same id
+    /// resolved two different ways depending on whether the base parsed.
+    ///
+    /// The root-relative and absolute cases are pinned alongside because they
+    /// are deliberately NOT append: an href the server names with a leading `/`
+    /// is root-relative per RFC 3986, and replacing the base's whole path is the
+    /// right answer for it.
+    #[test]
+    fn a_relative_id_resolves_under_the_base_path_on_both_branches() {
+        let dispatch = dispatch_at(
+            scripted_dav_net(&dav_script_empty()),
+            "https://dav.example.test/dav/",
+        );
+        assert_eq!(
+            dispatch.resolve_url("cal/one.ics"),
+            "https://dav.example.test/dav/cal/one.ics",
+            "a relative id belongs under the configured base path"
+        );
+        assert_eq!(
+            dispatch.resolve_url("/cal/one.ics"),
+            "https://dav.example.test/cal/one.ics",
+            "a root-relative href replaces the base path"
+        );
+        assert_eq!(
+            dispatch.resolve_url("https://other.example.test/cal/one.ics"),
+            "https://other.example.test/cal/one.ics",
+            "an absolute href is returned verbatim"
+        );
+
+        // The fallback branch, reached only when the base does not parse, must
+        // give a relative id the same shape.
+        let unparseable = dispatch_at(scripted_dav_net(&dav_script_empty()), "not a url/dav");
+        assert_eq!(
+            unparseable.resolve_url("cal/one.ics"),
+            "not a url/dav/cal/one.ics"
+        );
+    }
+
+    /// A redirect of the SOURCE rebases the `Destination` on the same hop.
+    ///
+    /// The walk rebuilds each hop from the previous request's headers, so a MOVE
+    /// redirected into a new collection namespace kept a `Destination` naming
+    /// the pre-redirect one - the server was asked to write where it had just
+    /// said the source no longer lives. The move here is cross-collection, which
+    /// is the shape prefix arithmetic gets wrong: `b` must survive the rebase.
+    #[tokio::test]
+    async fn a_redirected_move_rebases_its_destination_on_the_same_hop() {
+        let script = dav_script([
+            dav_redirect(StatusCode::MOVED_PERMANENTLY, "/dav/cal/a/one.ics"),
+            Canned::Response {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        ]);
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+
+        let moved = dispatch
+            .move_resource(
+                &format!("{BASE}/cal/a/one.ics"),
+                &format!("{BASE}/cal/b/one.ics"),
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .expect("the followed MOVE succeeds");
+        assert!(moved);
+
+        let sent = transcripts(&script);
+        assert_eq!(sent.len(), 2, "one hop, then the redirected MOVE");
+        let destination = |hop: &DavTranscript| {
+            hop.headers
+                .get(DESTINATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            destination(&sent[0]),
+            format!("{BASE}/cal/b/one.ics"),
+            "the first attempt names the destination the caller gave"
+        );
+        assert_eq!(sent[1].url, format!("{BASE}/dav/cal/a/one.ics"));
+        assert_eq!(
+            destination(&sent[1]),
+            format!("{BASE}/dav/cal/b/one.ics"),
+            "the destination must follow the source into the new namespace"
         );
     }
 

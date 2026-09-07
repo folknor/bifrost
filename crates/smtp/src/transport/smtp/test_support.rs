@@ -280,7 +280,13 @@ impl std::io::Write for TranscriptStream {
 pub(super) struct SlowLinePeer {
     lines: VecDeque<Vec<u8>>,
     gap: Duration,
-    next: std::pin::Pin<Box<tokio::time::Sleep>>,
+    /// Armed on the FIRST `poll_read`, not at construction. Arming it in `new`
+    /// credits the setup time between building the peer and the first read
+    /// against the first line's delay, so a test that constructs the peer early
+    /// gets a first line for free - a contract of "a line every gap, counted
+    /// from whenever you happened to construct me". Same shape as
+    /// `SlowSinkPeer` below.
+    next: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
 #[cfg(feature = "tokio")]
@@ -292,7 +298,7 @@ impl SlowLinePeer {
                 .map(|line| line.as_bytes().to_vec())
                 .collect(),
             gap,
-            next: Box::pin(tokio::time::sleep(gap)),
+            next: None,
         }
     }
 }
@@ -304,14 +310,17 @@ impl tokio::io::AsyncRead for SlowLinePeer {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::ready!(std::future::Future::poll(self.next.as_mut(), cx));
+        let gap = self.gap;
+        let sleep = self
+            .next
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(gap)));
+        std::task::ready!(std::future::Future::poll(sleep.as_mut(), cx));
         let Some(line) = self.lines.pop_front() else {
             // Out of lines: park forever, the way a peer that simply stops
             // talking does. Only the caller's own deadline resumes this.
             return std::task::Poll::Pending;
         };
-        let gap = self.gap;
-        self.next = Box::pin(tokio::time::sleep(gap));
+        self.next = Some(Box::pin(tokio::time::sleep(gap)));
         buf.put_slice(&line);
         std::task::Poll::Ready(Ok(()))
     }
@@ -342,6 +351,48 @@ impl tokio::io::AsyncWrite for SlowLinePeer {
     }
 }
 
+/// The lazily armed gap, pinned for the line peer the same way `slow_sink_tests`
+/// pins it for the sink: a harness whose delay starts at construction silently
+/// discounts a test's setup time from the first line, which is a trap for any
+/// test that builds its peer before the exchange it is timing.
+///
+/// Ablation: arm the `Sleep` in `SlowLinePeer::new` again and the first read
+/// completes at once, because the idle gaps below already elapsed it.
+#[cfg(all(test, feature = "tokio"))]
+mod slow_line_tests {
+    use super::SlowLinePeer;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_line_peer_counts_its_first_gap_from_the_first_read() {
+        let gap = Duration::from_secs(5);
+        let mut peer = SlowLinePeer::new(["250-one\r\n", "250 two\r\n"], gap);
+        // Stand-in for whatever setup a test does between building the peer
+        // and reading from it.
+        tokio::time::sleep(gap * 2).await;
+
+        let mut line = [0_u8; 32];
+        let started = tokio::time::Instant::now();
+        let read = peer.read(&mut line).await.expect("the peer sends a line");
+        assert_eq!(&line[..read], b"250-one\r\n");
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            gap,
+            "the first line costs one whole gap, measured from the read"
+        );
+
+        let started = tokio::time::Instant::now();
+        let read = peer.read(&mut line).await.expect("the peer sends a line");
+        assert_eq!(&line[..read], b"250 two\r\n");
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            gap,
+            "and every later line costs the same gap"
+        );
+    }
+}
+
 /// A peer that drains an upload slowly but steadily, or not at all.
 ///
 /// `new(chunk, gap)` accepts `chunk` bytes every `gap`, which is a slow link:
@@ -357,7 +408,12 @@ pub(super) struct SlowSinkPeer {
     /// Bytes accepted per `gap`. `None` means the peer never accepts anything.
     chunk: Option<usize>,
     gap: Duration,
-    next: std::pin::Pin<Box<tokio::time::Sleep>>,
+    /// Armed on the FIRST `poll_write`, not at construction. Arming it in
+    /// `new` credits the setup time between building the peer and the first
+    /// write against the first chunk's delay, so a test that constructs the
+    /// peer early gets a first write that costs nothing - a contract of "every
+    /// gap, counted from whenever you happened to construct me".
+    next: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
 }
 
 #[cfg(feature = "tokio")]
@@ -366,7 +422,7 @@ impl SlowSinkPeer {
         Self {
             chunk: Some(chunk),
             gap,
-            next: Box::pin(tokio::time::sleep(gap)),
+            next: None,
         }
     }
 
@@ -375,7 +431,7 @@ impl SlowSinkPeer {
         Self {
             chunk: None,
             gap: Duration::ZERO,
-            next: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            next: None,
         }
     }
 }
@@ -402,9 +458,12 @@ impl tokio::io::AsyncWrite for SlowSinkPeer {
             // No waker: only the caller's own timeout may resume this.
             return std::task::Poll::Pending;
         };
-        std::task::ready!(std::future::Future::poll(self.next.as_mut(), cx));
         let gap = self.gap;
-        self.next = Box::pin(tokio::time::sleep(gap));
+        let sleep = self
+            .next
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(gap)));
+        std::task::ready!(std::future::Future::poll(sleep.as_mut(), cx));
+        self.next = Some(Box::pin(tokio::time::sleep(gap)));
         std::task::Poll::Ready(Ok(chunk.min(buf.len())))
     }
 
@@ -420,6 +479,46 @@ impl tokio::io::AsyncWrite for SlowSinkPeer {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// The lazily armed gap, pinned: a harness whose delay starts at construction
+/// silently discounts a test's setup time from the first chunk, which is a trap
+/// for any test that builds its peer before the exchange it is timing.
+///
+/// Ablation: arm the `Sleep` in `SlowSinkPeer::new` again and the first write
+/// completes at once, because the idle gaps below already elapsed it.
+#[cfg(all(test, feature = "tokio"))]
+mod slow_sink_tests {
+    use super::SlowSinkPeer;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_sink_counts_its_first_gap_from_the_first_write() {
+        let gap = Duration::from_secs(5);
+        let mut peer = SlowSinkPeer::new(4, gap);
+        // Stand-in for whatever setup a test does between building the peer
+        // and writing to it.
+        tokio::time::sleep(gap * 2).await;
+
+        let started = tokio::time::Instant::now();
+        let written = peer.write(b"abcd").await.expect("the peer accepts a chunk");
+        assert_eq!(written, 4);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            gap,
+            "the first chunk costs one whole gap, measured from the write"
+        );
+
+        let started = tokio::time::Instant::now();
+        let written = peer.write(b"efgh").await.expect("the peer accepts a chunk");
+        assert_eq!(written, 4);
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            gap,
+            "and every later chunk costs the same gap"
+        );
     }
 }
 

@@ -125,12 +125,27 @@ post-TLS reply.
   aborted connection can never pass `state().verify()` again. There is no live
   QUIT path; the Quit command builder is gone. If a graceful shutdown is wanted
   later it will need to be re-added with a real call site.
-- The async `abort()` is bounded by the per-operation timeout. `poll_shutdown`
-  on a TLS stream sends `close_notify` and waits for the peer's, so an
-  unresponsive peer would otherwise hang the caller *after* the timeout that
-  already fired. The blocking `abort()` needs no such bound: `Shutdown::Both`
-  on a blocking socket is a syscall that returns immediately. This is the one
-  place the two halves differ by design rather than by omission.
+- The async `abort()` is bounded by the operation timeout or the teardown cap,
+  whichever is SMALLER. `poll_shutdown` on a TLS stream sends `close_notify`
+  and waits for the peer's, so an unresponsive peer would otherwise hang the
+  caller *after* the timeout that already fired. The cap
+  (`TEARDOWN_TIMEOUT`, 5 s, in `async_connection.rs`) is independent of the
+  configured timeout because the per-operation budget does not bind at all when
+  a transport is built with `timeout(None)`: that setting means "do not limit
+  my protocol operations", not "hang forever tearing down a connection I have
+  finished with", and past `abort()` there is nothing left to accomplish but a
+  courtesy `close_notify`. This mattered most at `Pool::shutdown`, which runs
+  its closes concurrently but WAITS for them, so one wedged TLS peer hung pool
+  shutdown. The blocking `abort()` needs no such bound and deliberately has
+  none: `Shutdown::Both` on a blocking socket is a syscall that returns
+  immediately, so that half already satisfies "teardown returns in bounded
+  time". The rule holds on every teardown path; the two halves reach it by
+  different means, which is the one place they differ by design rather than by
+  omission. Pinned by
+  `abort_is_bounded_when_tls_style_shutdown_never_completes` (configured
+  timeout) and
+  `abort_is_bounded_by_the_teardown_cap_when_no_operation_timeout_is_set`
+  (`timeout(None)`, which the first cannot reach).
 
 ## Connection state and cancel-safety
 
@@ -255,6 +270,19 @@ rejection would make the PIPELINING path classify a plain relay rejection
 differently from the non-pipelined path for the same wire exchange. Both halves
 are pinned by transcript tests over all four boundaries.
 
+The phase names the boundary the CALLER's outcome came from, not the last op
+the machine happened to run. After a pipelined `MAIL FROM` is rejected,
+`DirectSmtp` still has to drain the window's RCPT replies and close the group
+(`MailRejectedDrain`, then `MailRejectedClosing`), and a transport failure in
+either of those is bookkeeping for the STREAM, not for the transaction: the
+send's outcome was already decided by the rejection. Both stages therefore
+finish with the carried `MAIL FROM` rejection under `SmtpCommandPhase::MailFrom`
+and abort the stream. Reporting the drain's own error instead handed the caller
+a retryable `RcptTo` network error for an envelope the server had permanently
+refused, with the reply text that said why thrown away (2026-09-07).
+`MailRejectedClosing` is the identical defect one stage later and was fixed with
+it. Pinned by `a_failed_window_drain_still_reports_the_mail_from_rejection`.
+
 A negative reply to the DATA end-of-data terminator follows the same rule from
 the other end. The peer read the whole message and refused it, so the
 transaction is complete (RFC 5321 4.1.1.4), there is nothing to reset, and the
@@ -313,6 +341,14 @@ what `BatchSmtp` already produced; a transport FAILURE at the same boundary
 keeps `body_phase()` (`DataBody` / `BdatBody`), because that is an upload
 failure rather than an answer. BDAT has no distinct final phase, so a rejected
 `BDAT ... LAST` stays `BdatBody`.
+
+`DirectLmtp` reads the same `body_phase()` at its own `BodyWritten` boundary,
+so an LMTP `BDAT` chunk-write failure reports `BdatBody`. It hardcoded
+`DataBody`, which made the direct LMTP path the only send path that mislabelled
+its own body framing (2026-09-07). Nothing in `classify_response` splits on the
+two today, so this changes the reported phase and the diagnostics that carry it,
+not the recovery classification. Pinned by
+`a_failed_direct_lmtp_bdat_chunk_carries_the_bdat_phase`.
 
 A rejected `MAIL FROM` deliberately sends no `RSET`: it opened no transaction,
 so there is nothing to reset and the connection stays reusable as it is. The
@@ -502,7 +538,10 @@ Recycling therefore has no await point and no blocking call at all, which is why
 it is safe to run from `Drop`: there is no recycling future to be dropped before
 its first poll, and no close to block on an unresponsive peer. Explicit
 `shutdown()` owns graceful close work, runs closes concurrently, and each close
-is bounded by the connection's operation timeout.
+is bounded by the connection's operation timeout or the teardown cap, whichever
+is smaller (see "Connection lifecycle"). The cap is what makes this a bound at
+all for a transport built with `timeout(None)`: `shutdown()` waits for the
+closes it starts, so one unresponsive TLS peer would otherwise hang it.
 
 The admission gate participates in shutdown. Because `max_size` is enforced by a
 semaphore (async) and a live counter plus condvar (blocking), a checkout blocked
@@ -618,6 +657,33 @@ Internal pipeline errors carry two value-side decorations the classifier reads:
 
 Evidence must match what actually crossed the wire. A transport failure in the envelope phase (`MAIL FROM` / `RCPT TO`), including a failed write of a later PIPELINING recipient window, is `Unsent` and resolves through `SendProgress::mark_unresolved_unsent`: `DATA` has not been issued, so no message content can have reached the peer and an `Uncertain` lane would falsely claim a possible delivery. RCPT rejections the server already gave are preserved; accepted and unanswered recipients are both rewritten (an accepted RCPT with no `DATA` would otherwise resolve as a delivery that never happened), into `failed` lanes that `RecoveryClass` derives as `Retry(SameRequest)`. `InFlight` is reserved for failures from the `DATA` command onward.
 
+The dividing line for batch sends is whether the body has left. A batch-level
+`Err((error, progress))` means "nothing was transmitted, resend the whole
+request"; once `set_body_started` / `set_body_finished` has run, that claim is
+false and the machine must finish `Ok(progress)` with per-recipient lanes even
+when the failure is a transport one. `BatchLmtp`'s `GroupOpened` used to finish
+`Err` on a failed reply-group open, one stage after `BodyWritten` terminated the
+body, so an engine reading it would have resent a non-idempotent message that
+may well have been delivered. It now marks the accepted recipients `uncertain`
+(`InFlight` / `LmtpFinalStatus`) and finishes `Ok(progress)`, which is the same
+answer its `FinalStatus` arm gives (2026-09-07). It still performs no abort: the
+failure comes from the stream's own `verify()`, so the stream is already
+unusable. Pinned by
+`a_failed_lmtp_group_open_leaves_the_recipients_uncertain_not_the_batch_unsent`.
+
+`BatchSmtp`'s `WindowOpened` and `WindowClosing` sit on the other side of that
+line and deliberately keep the batch-level `Err`: every recipient window is
+before `DATA`, so nothing was transmitted and the whole request genuinely is
+retryable. The cost is accepted and worth knowing before writing retry logic
+against these lanes: both transports discard the `progress` half of the tuple
+(`Err((e, _progress)) => Err(batch_level_error(e, ctx))`), so RCPT answers
+already collected in earlier windows - including 550s the server gave - fold
+into one `Unsent` batch-level retry and the caller learns nothing about the
+recipients already refused, relearning them on the resend. Turning those answers
+into lanes would mean returning `Ok(progress)` for a request that never reached
+the peer, which is a worse lie than the lost diagnostics. Both arms carry a
+comment saying so.
+
 `batch.rs` `SendProgress::resolve` is the per-recipient lane resolver. LMTP `DATA`-command negative replies route through `mark_accepted_rejected_with_response` so accepted recipients become per-recipient `Failed` lanes - never a batch-level `Err` (the previous shape let the engine resend the entire non-idempotent `Send` after the server rejected it). DATA-final-negative replies tag `SmtpCommandPhase::DataFinal`,
 and that arm is live rather than latent: `BatchSmtp` records a negative
 end-of-data reply through `set_data_response` exactly as it records a positive
@@ -656,7 +722,8 @@ names the reset write and nothing else. The replies before the aimed op are
 untouched, so the machine reaches the boundary in the state production would.
 That is what pins the failed-RSET-write abort, the two pipelined group
 boundaries returning their error without a second abort and with the recipient
-lanes they had collected, and an LMTP drain close that fails after every final
+lanes they had collected (which the transports then discard - see "Error
+model"), and an LMTP drain close that fails after every final
 status was recorded (the batch result stands; only the stream is lost).
 
 The transcript suites carry the other half of that pair: a requested op is not

@@ -28,18 +28,42 @@ Discovery tries `/.well-known/caldav` first - built from the ORIGIN of the
 configured base URL via `bifrost_net::url::well_known_url`, never by appending
 the suffix to a configured path - and falls back to the configured
 base URL only when that initial principal lookup answers that it is not a
-discovery endpoint, or its successful body names no principal. Three probe
+discovery endpoint, or its successful body names no principal. Four probe
 answers mean that: 404, a 405 (a static site or a proxy sitting on the origin
 root in front of the DAV path, common enough that a 404-only rule failed the
-open on deployments whose configured base URL works), and a locally-refused
+open on deployments whose configured base URL works), a locally-refused
 redirect - RFC 6764's canonical shape is a well-known redirecting to another
 host, which the credential-origin gate cannot admit before discovery has
-authenticated anything, so the walk refuses it as `Request(Malformed)`. A 401 or
+authenticated anything, so the walk refuses it as `Request(Malformed)` - and a
+body that will not parse as DAV XML (`Protocol(ParseFailed)`), the motivating
+case being the front end answering the PROPFIND with `200 text/html` and its
+index page: the same deployment shape one status apart from the 405, and an HTML
+document fails the XML parse rather than decoding as an empty multistatus. That
+arm is deliberately not narrowed: ANY `Protocol(ParseFailed)` from the
+well-known principal lookup triggers the fallback, INCLUDING malformed or
+truncated DAV XML from a genuine discovery endpoint. The predicate cannot
+distinguish the two - both arrive as an XML parse failure with no headers in
+hand - so the distinction is unobtainable at this seam, not merely
+unimplemented. It is safe because the fallback cannot accept bad data: it
+performs a FRESH principal lookup against the configured base URL and requires
+its result, then runs principal discovery normally. Nothing partially parsed
+from the failed probe is reused, no origin from it is admitted, and the
+base-leg and post-principal failures still propagate. The most a fallback can do
+is prefer the user-configured endpoint over a probe that would not parse. The
+real cost is a lost DIAGNOSTIC - an operator is not told that the well-known
+endpoint is serving truncated XML - and this crate accepts that cost here rather
+than fail the open on a deployment whose configured base URL works. A 401 or
 403 still FAILS the open: those come from a discovery endpoint that exists and
 refused the credential, and retrying the base URL would bury a reauthorization
 signal. The widening applies to the well-known probe only, never to a request
-against the configured base URL. A failure after the principal is identified is
-not a root-discovery fallback trigger.
+against the configured base URL, where a parse failure is a real
+contract violation rather than evidence that this was never a discovery
+endpoint. A failure after the principal is identified is
+not a root-discovery fallback trigger. Both legs run through one
+`discover_principal(root)` helper that performs the PROPFIND and the decode
+together, so the probe's parse failure surfaces as an `Err` the fallback
+predicate can read rather than being lifted past it; `bifrost-carddav`'s walk is
+the same shape, method for method.
 
 ## Module layout
 
@@ -122,7 +146,9 @@ not a root-discovery fallback trigger.
   event whose own properties came back 200.
   Propstat-scoped values live in one `PropStat` staging struct cleared with
   `mem::take` at commit. An absent status remains success, while a present but
-  unparseable status remains an explicit non-success.
+  unparseable status remains an explicit non-success - including an
+  empty-element `<status/>` inside a propstat, which is present rather than
+  absent and therefore refuses it.
   Event listing and multiget parsers use element-stack parent checks so
   nested same-name properties do not overwrite response-level hrefs or
   propstat status. Every text-bearing parser accepts both XML text and
@@ -384,7 +410,13 @@ Supported calendar primitives:
   `Err` with that status's recovery class, not an empty candidate set. The
   member status comes from `ResponseParts::failed_member`, which reads
   `member_status_code` - a response-level code wins, and below it only a
-  response whose every propstat failed reports its first failed code. The
+  response whose every propstat failed reports a failed code, chosen by the
+  two-rung ladder described under "The 207 parser, collapsed": the first
+  refusal that is not a 404/410, and document order only among the
+  missing-property answers. Document order alone let a `404` propstat written
+  ahead of a `403` one report a wholly refused collection as a benign missing
+  resource, so the 207 classified `Usable` with no entries and the diff
+  destroyed everything in it. The
   depth-1 listing and the snapshot poll go through the same `listing_failure`
   funnel and inherit the classification. A listing with any committed entry
   never reaches it, so a member refused beside members that answered stays a
@@ -450,7 +482,12 @@ Supported calendar primitives:
   file name at the destination and `Overwrite: F`, so a collision refuses rather
   than destroying a stranger's resource. `Destination` is credential-gated
   against the same admitted-origin set as the source, so a consumer-supplied
-  `CalendarId` cannot steer a write anywhere the gate would refuse. Only 405 and
+  `CalendarId` cannot steer a write anywhere the gate would refuse. A redirect of
+the SOURCE rebases `Destination` onto the same hop, inside the credential gate
+and re-checked against `is_trusted_url` after the rebase: the destination is
+made relative to the pre-hop URL and joined onto the post-hop one, so a
+cross-collection move stays cross-collection in the new namespace, and a
+destination on a different origin than the source is left verbatim. Only 405 and
   501 mean "no MOVE support"; 412 (destination occupied) and 502 (destination
   refused) stay real errors.
 
@@ -565,7 +602,9 @@ well. The member status itself comes from
 `ResponseParts::member_status_code`: a response-level status wins (RFC 6578
 reports a removed member as a response carrying its own `404`/`410` and no
 propstat); below that, any successful propstat makes the member successful,
-and only a response whose every propstat failed reports its first failed code.
+and only a response whose every propstat failed reports a failed code - the
+first refusal that is not a 404/410, falling back to document order when every
+refusal was a missing-property answer.
 A propstat `404` is a per-PROPERTY miss that servers answer for any requested
 property they lack, beside the `200` propstat carrying the etag; reading it as
 the member status destroyed a live resource.
@@ -875,12 +914,29 @@ rules are where every one of the drift defects lived:
 - `staged_mut` / `marker_mut` plus `commit_propstat` - a property is read into
   the STAGED bag and promoted only when its own propstat answered 2xx. An absent
   status is success; a status that is PRESENT and unparseable is a refusal.
+  An empty-element `<status/>` inside a propstat counts as PRESENT. It never
+  reaches the `End` arm that reads status text, so left to the sink it looked
+  ABSENT and committed the propstat as a success - the exact inverse of the
+  rule, and enough to publish properties the server had refused.
+  `parse_multistatus`, `extract_href_properties` and
+  `parse_collection_property` each refuse the propstat on it. An empty
+  `<status/>` directly under `<response>` is unchanged: it leaves the
+  response-level status unset and the propstat ladder decides the member.
 - `entry_href` / `failed_href` - a response whose ONLY propstat failed is a
   failed href, not an entry; a response with NO propstat at all commits as an
   entry, because dropping a resource the server named out of both lanes makes
   the snapshot diff destroy something that exists.
 - `fetched` / `failed_resource` / `missing_data_href` - the multiget lanes,
-  including the collection exclusion and the first-refused-code rule.
+  including the collection exclusion and the worst-failed-status rule.
+  `failed_resource` and `member_status_code` share one private
+  `worst_failed_status` with exactly two rungs: the first refusal that is not
+  404/410, else document order among the missing-property answers. It is
+  deliberately NOT a numeric maximum - `404`/`410` are the only codes
+  `FailedResource::is_missing_resource` reads as benign, and among real
+  refusals a larger number is not a worse one, so ranking `507` over `401`
+  would bury a reauthorization signal under a storage complaint. Inside the
+  upper rung the server's own order stands. The rationale in full is at the
+  function.
 - `failed_member` - the listing lanes' failure entry, an href paired with
   `member_status_code`. Both lanes therefore produce the shared
   `FailedResource`, and both feed the one `classify_207` ladder
@@ -959,7 +1015,10 @@ includes the `ResponseParts` propstat state machine, href resolution, multiget
 classification, the cursor codec and the snapshot diff, all of which this
 section used to list as hand-mirrored. What remains duplicated is a much smaller
 remainder: the query bodies and property constants, the per-domain projections
-(`ical.rs` / `vcard.rs`), the discovery walk's shape, the account-level
+(`ical.rs` / `vcard.rs`), the discovery walk (duplicated but no longer
+divergent - both crates now probe well-known, decode inside one
+`discover_principal(root)` helper, and apply the same four-answer fallback
+predicate), the account-level
 orchestration around the shared pieces, and the `Unsupported` stubs each crate
 carries for the other's domain.
 

@@ -24,9 +24,34 @@ configured base URL via `bifrost_net::url::well_known_url`, never by appending
 the suffix to a configured path - and falls
 back to the configured base URL both when that probe answers that it is not a
 discovery endpoint and when its successful body does not identify a current-user
-principal. The probe-only fallback triggers are 404, 405, and a locally-refused
-cross-origin redirect; 401 and 403 still fail the open. `reference/caldav.md`
-carries the reasoning, and the twin must not drift from it.
+principal. The probe-only fallback triggers are 404, 405, a locally-refused
+cross-origin redirect, and a body that will not parse as DAV XML
+(`Protocol(ParseFailed)`, motivated by the front end answering the origin-root
+PROPFIND with `200 text/html` and its index page); 401 and 403 still fail the
+open, and `ParseFailed` is deliberately NOT a trigger on the configured-base
+leg, where a parse failure is a real contract violation.
+
+The `ParseFailed` arm is deliberately not narrowed: ANY `Protocol(ParseFailed)`
+from the well-known principal lookup triggers the fallback, INCLUDING malformed
+or truncated DAV XML from a genuine discovery endpoint, because the predicate
+cannot tell that apart from a non-DAV body - both arrive as an XML parse failure
+with no headers in hand, so the distinction is unobtainable here rather than
+merely unimplemented. The fallback cannot accept bad data: it performs a FRESH
+principal lookup against the configured base URL, requires its result, and runs
+the rest of discovery normally, reusing nothing partially parsed from the probe
+and admitting no origin from it, while base-leg and post-principal failures
+still propagate. The accepted cost is a lost DIAGNOSTIC - an operator is not
+told that the well-known endpoint is serving truncated XML. `reference/caldav.md`
+carries the same reasoning at length, and the twin must not drift from it.
+
+The walk is one shape across both crates: a `discover_principal(root)` helper
+runs the PROPFIND and the `current-user-principal` decode together, returning
+`Result<Option<String>, _>`, and both the well-known probe and the
+configured-base leg call it. Keeping the decode at the call site is what let
+this crate diverge - it parsed the probe body inside the `Ok(response)` arm and
+lifted the failure with `?`, so a probe answer that would not parse never
+reached `should_fallback_discovery` at all and failed the open, while the same
+deployment answering an empty 207 fell back and worked.
 
 ## Module layout
 
@@ -75,7 +100,11 @@ carries the reasoning, and the twin must not drift from it.
   properties. Addressbook/listing/multiget and href-valued discovery
   properties are staged per `propstat` and committed only for successful 2xx
   statuses or a missing status, which RFC 4918 requires but the parser
-  tolerates as success.
+  tolerates as success. A status that is present but unparseable is NOT a
+  missing one and refuses the propstat - including an empty-element
+  `<status/>`, which reaches no text-reading arm and so used to look absent and
+  commit properties the server had refused. An empty `<status/>` directly under
+  `<response>` is unchanged.
   `parse_propfind_contacts` returns a `CardDavContactListing`: committed
   non-collection `entries` plus `failed` (non-collection resources whose only
   propstat failed within the 207, each carrying its member status), so the
@@ -288,7 +317,10 @@ Supported contact primitives:
   **An all-refused candidate 207 is classified, not served as an empty page.**
   The listing failure lane carries each member's status, so the candidate leg
   runs `bifrost_dav_core::classify_207` exactly as the multiget report does and
-  a wholly refused query reaches the consumer with its recovery class. A member
+  a wholly refused query reaches the consumer with its recovery class. That
+  member status is `member_status_code`, so a response whose every propstat
+  failed reports the first refusal that is not a 404/410, and document order
+  only among the missing-property answers. A member
   refused BESIDE members that answered stays a per-id failure on `failed_ids`
   and the page is served. `reference/caldav.md` carries the reasoning; both
   sides are pinned by
@@ -518,7 +550,9 @@ polling cursor have all been collapsed into `bifrost-dav-core` and can no longer
 drift.
 
 What remains duplicated is smaller but still real: the query bodies and property
-constants, the discovery walk's shape, the `Unsupported` stubs each crate
+constants, the discovery walk (duplicated but no longer divergent: both crates
+decode inside one `discover_principal(root)` helper and apply the same
+four-answer fallback predicate), the `Unsupported` stubs each crate
 carries for the other's domain, and the account-level orchestration around the
 shared pieces. **Any fix to shared-shape code here must still be checked against
 `bifrost-caldav`, and vice versa** - and where the fix is to something both
