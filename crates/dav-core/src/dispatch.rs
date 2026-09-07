@@ -612,21 +612,38 @@ impl DavDispatch {
         settle_body(response, operation, self.protocol)
     }
 
+    /// `DELETE` one resource. A target that is already gone is a success.
+    ///
+    /// RULED 2026-09-07 (dav-D1). A DELETE is REPLAYABLE, as HTTP says, and
+    /// a 404 or 410 answer is absorbed here rather than classified: a delete
+    /// whose target does not exist has reached its intended end state. That is
+    /// what makes the replay safe. A DELETE dropped mid-flight before the
+    /// server saw it replays and succeeds; one dropped after it landed replays,
+    /// answers 404, and succeeds too - with no consumer probe either way. The
+    /// alternative, declaring the DELETE unreplayable and sending every drop to
+    /// `Reconcile(CheckTarget)`, cost a probe on every drop to keep one signal:
+    /// a "resource never existed" for a consumer deleting by a stale id. That
+    /// signal is now absorbed, deliberately; a consumer that needs it reads the
+    /// resource first. CalDAV's `delete_event` and CardDAV's `delete_vcard`
+    /// carry the same rule and must move with this one.
     pub async fn delete_resource(
         &self,
         url: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let request = DavRequest::new(Method::DELETE, url)
-            .headers(self.auth_headers(url, operation).await?)
-            // HTTP calls DELETE idempotent, so `bifrost-net` would replay one
-            // whose connection dropped after the bytes went out. A replay of a
-            // DELETE that landed answers 404, which the status ladder reads as
-            // `NotFound` -> `ProviderRefused` - a successful delete reported as
-            // a permanent refusal. Declaring it unreplayable makes the drop
-            // surface as `InFlight` on a non-idempotent op, which reconciles.
-            .idempotent(false);
-        self.send_status_request(request, operation).await
+        let request =
+            DavRequest::new(Method::DELETE, url).headers(self.auth_headers(url, operation).await?);
+        let response = self.send_raw_request(request, operation).await?;
+        if response.status.is_success() || delete_target_already_gone(response.status) {
+            Ok(())
+        } else {
+            Err(status_error(
+                operation,
+                response.status,
+                response.body,
+                self.protocol,
+            ))
+        }
     }
 
     /// WebDAV `MOVE` of one resource into another collection.
@@ -713,6 +730,13 @@ impl std::fmt::Debug for DavDispatch {
     }
 }
 
+/// Whether a DELETE's answer says the target is already gone, which is the end
+/// state the DELETE was asking for. 404 and 410 both say so; nothing else does.
+#[must_use]
+pub fn delete_target_already_gone(status: StatusCode) -> bool {
+    status == StatusCode::NOT_FOUND || status == StatusCode::GONE
+}
+
 #[cfg(test)]
 mod tests {
     use bifrost_net::AccessToken;
@@ -788,6 +812,48 @@ mod tests {
             "a dropped MOVE must reconcile against the destination: {:?}",
             error.recovery()
         );
+    }
+
+    /// A DELETE replays after a mid-flight drop, and a target already gone is
+    /// a success - the two halves of the dav-D1 ruling, which only hold
+    /// together: the replay is safe BECAUSE the 404 a replayed landed DELETE
+    /// answers is absorbed. Ablation: with the 404 arm removed the second case
+    /// reports a successful delete as `NotFound`; with the request declared
+    /// unreplayable the first case starves on the script.
+    #[tokio::test]
+    async fn a_delete_replays_and_reads_a_gone_target_as_success() {
+        let gone = |status: StatusCode| Canned::Response {
+            status,
+            headers: HeaderMap::new(),
+            body: bytes::Bytes::new(),
+        };
+        for (script, requests, label) in [
+            (
+                dav_script([dav_dropped_after_send(), gone(StatusCode::NO_CONTENT)]),
+                2,
+                "a drop before the server saw the DELETE replays and lands",
+            ),
+            (
+                dav_script([dav_dropped_after_send(), gone(StatusCode::NOT_FOUND)]),
+                2,
+                "a drop after the DELETE landed replays, answers 404, and succeeds",
+            ),
+            (
+                dav_script([gone(StatusCode::GONE)]),
+                1,
+                "a target already gone is the delete's end state",
+            ),
+        ] {
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+            dispatch
+                .delete_resource(
+                    &format!("{BASE}/cal/one.ics"),
+                    AccountOperation::EventDelete,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!(transcripts(&script).len(), requests, "{label}");
+        }
     }
 
     /// An oversized response on an unreplayable request reconciles too.

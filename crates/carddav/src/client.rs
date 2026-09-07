@@ -508,6 +508,12 @@ impl CardDavClient {
         self.dav.move_resource(from, to, operation).await
     }
 
+    /// `DELETE` one vCard resource. Replayable, and a target already gone is a
+    /// success - the dav-D1 ruling, stated in full at
+    /// `DavDispatch::delete_resource`; twin of `bifrost-caldav`'s
+    /// `delete_event`, and the two must move together. Not a call into
+    /// `delete_resource` itself only because this side hands the response ETag
+    /// back, which a gone target has none of.
     pub(crate) async fn delete_vcard(
         &self,
         url: &str,
@@ -516,12 +522,21 @@ impl CardDavClient {
         let request = self
             .dav
             .request(Method::DELETE, url)
-            .headers(self.dav.auth_headers(url, operation).await?)
-            // Twin of `bifrost-caldav`'s `delete_event`: a replayed DELETE that
-            // already landed answers 404, reporting a successful delete as a
-            // permanent refusal.
-            .idempotent(false);
-        self.send_status_request(request, operation).await
+            .headers(self.dav.auth_headers(url, operation).await?);
+        let response = self.dav.send_raw_request(request, operation).await?;
+        if bifrost_dav_core::delete_target_already_gone(response.status) {
+            return Ok(None);
+        }
+        let etag = response
+            .headers
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(normalize_http_etag);
+        if response.status.is_success() {
+            Ok(etag)
+        } else {
+            Err(status_error(operation, response.status, response.body))
+        }
     }
 
     /// A status-only request that also hands back the response ETag.
@@ -863,61 +878,99 @@ mod tests {
 
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
-    /// A create-PUT and a DELETE must not be replayed after a mid-flight drop.
+    /// A create-PUT must not be replayed after a mid-flight drop.
     ///
     /// `bifrost-net` derives replay safety from the METHOD, and HTTP calls PUT
-    /// and DELETE idempotent. That is true of an absolute-state write to a known
-    /// URL and false of these two. A replayed create whose first attempt
-    /// committed answers 412 -> `ConcurrencyConflict` ->
-    /// `Retry(AfterStateRefresh)`, and the consumer re-creates the contact under
-    /// a fresh UUID, leaving two copies. A replayed DELETE that landed answers
-    /// 404 -> `NotFound` -> `ProviderRefused`, reporting a successful delete as
-    /// a permanent refusal.
+    /// idempotent. That is true of an absolute-state write to a known URL and
+    /// false of a create. A replayed create whose first attempt committed
+    /// answers 412 -> `ConcurrencyConflict` -> `Retry(AfterStateRefresh)`, and
+    /// the consumer re-creates the contact under a fresh UUID, leaving two
+    /// copies.
     ///
-    /// One drop is scripted per case, so a request that IS replayed exhausts the
-    /// script and panics rather than passing quietly.
+    /// One drop is scripted, so a request that IS replayed exhausts the script
+    /// and panics rather than passing quietly.
     #[tokio::test]
-    async fn a_create_put_and_a_delete_are_not_replayed_after_a_mid_flight_drop() {
-        for create in [true, false] {
-            let script = dav_script([dav_dropped_after_send()]);
+    async fn a_create_put_is_not_replayed_after_a_mid_flight_drop() {
+        let script = dav_script([dav_dropped_after_send()]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let error = client
+            .put_vcard(
+                "https://dav.example.test/book/new.vcf",
+                "BEGIN:VCARD\r\nEND:VCARD\r\n".to_string(),
+                PutCondition::IfNoneMatch,
+                AccountOperation::ContactCreate,
+            )
+            .await
+            .expect_err("a dropped create must fail");
+
+        assert_eq!(
+            transcripts(&script).len(),
+            1,
+            "the dropped create must not be replayed"
+        );
+        assert!(
+            matches!(
+                error.recovery(),
+                RecoveryClass::Reconcile(advice)
+                    if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+            ),
+            "a drop after send must reconcile against the target: {:?}",
+            error.recovery()
+        );
+    }
+
+    /// A DELETE is replayed after a mid-flight drop, and the 404 a replayed
+    /// landed DELETE answers is a success, reported with no validator - the
+    /// dav-D1 ruling, at `DavDispatch::delete_resource`. Twin of
+    /// `bifrost-caldav`'s test of the same name; keep them in step.
+    #[tokio::test]
+    async fn a_dropped_delete_replays_and_a_gone_target_is_a_success() {
+        let answer = |status: StatusCode, etag: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(etag) = etag {
+                headers.insert(ETAG, HeaderValue::from_str(etag).expect("etag"));
+            }
+            DavResponse {
+                status,
+                headers,
+                body: String::new(),
+                url: String::new(),
+            }
+        };
+        for (script, requests, expected, label) in [
+            (
+                dav_script([
+                    dav_dropped_after_send(),
+                    answer(StatusCode::NO_CONTENT, Some("\"v9\"")).into(),
+                ]),
+                2,
+                Some("v9".to_string()),
+                "a drop before the server saw the DELETE replays and lands",
+            ),
+            (
+                dav_script([
+                    dav_dropped_after_send(),
+                    answer(StatusCode::NOT_FOUND, None).into(),
+                ]),
+                2,
+                None,
+                "a drop after the DELETE landed replays to a 404 that reads as done",
+            ),
+        ] {
             let client = CardDavClient::with_account_net(
                 "https://dav.example.test",
                 scripted_dav_net(&script),
             );
-            let error = if create {
-                client
-                    .put_vcard(
-                        "https://dav.example.test/book/new.vcf",
-                        "BEGIN:VCARD\r\nEND:VCARD\r\n".to_string(),
-                        PutCondition::IfNoneMatch,
-                        AccountOperation::ContactCreate,
-                    )
-                    .await
-                    .expect_err("a dropped create must fail")
-            } else {
-                client
-                    .delete_vcard(
-                        "https://dav.example.test/book/one.vcf",
-                        AccountOperation::ContactDelete,
-                    )
-                    .await
-                    .expect_err("a dropped delete must fail")
-            };
-
-            assert_eq!(
-                transcripts(&script).len(),
-                1,
-                "create={create}: the dropped request must not be replayed"
-            );
-            assert!(
-                matches!(
-                    error.recovery(),
-                    RecoveryClass::Reconcile(advice)
-                        if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
-                ),
-                "create={create}: a drop after send must reconcile against the target: {:?}",
-                error.recovery()
-            );
+            let etag = client
+                .delete_vcard(
+                    "https://dav.example.test/book/one.vcf",
+                    AccountOperation::ContactDelete,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!(etag, expected, "{label}");
+            assert_eq!(transcripts(&script).len(), requests, "{label}");
         }
     }
 

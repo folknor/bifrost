@@ -480,7 +480,9 @@ Supported calendar primitives:
   override components are preserved for scalar patches, but recurrence
   replacement is rejected for resources with override VEVENTs because the
   shared recurrence model cannot rewrite those instances losslessly.
-- `event_delete` - deletes the DAV resource.
+- `event_delete` - deletes the DAV resource. A target already gone (404 /
+  410) is a success, and the DELETE replays after a mid-flight drop; see
+  "DELETE is replayable" below.
 - `event_rsvp` - uses an email-like Basic username, or a mailto address
   discovered from the principal's `calendar-user-address-set`, to rewrite
   the matching attendee's participation status. When the principal
@@ -728,23 +730,39 @@ the dispatcher's `DavCredentials`, cloning the `Arc` so a bearer token is still
 read live from the shared source at every request.
 
 **Which requests are declared unreplayable, and why it is a request-level
-declaration.** `DavRequest::idempotent(false)` is set at three call sites: the
+declaration.** `DavRequest::idempotent(false)` is set at two call sites: the
 create-PUT (`If-None-Match: *`) in both crates' `put_event` / `put_vcard` - which
 is also the copy leg of the MOVE fallback, one caller up, so the two lanes share
-one declaration - the DELETE in `delete_event` / `delete_vcard` (and in
-`DavDispatch::delete_resource`, which is published but has no in-workspace
-caller), and the `MOVE` in `DavDispatch::move_resource`. Each is a request whose
-blind replay
-after a mid-flight drop misreports a mutation that SUCCEEDED: a replayed create
-answers 412 and the consumer re-creates under a fresh UUID, leaving two copies;
-a replayed DELETE or a re-issued update after a committed MOVE answers 404 at a
-source the first attempt already emptied, which the status ladder reads as
-`NotFound` -> `ProviderRefused`. `If-Match` and unconditional PUTs are
-deliberately NOT declared: they address a known URL with absolute state, so a
-replay lands on the same end state, and a replay arriving after the first
-attempt committed answers 412 -> `ConcurrencyConflict` ->
+one declaration - and the `MOVE` in `DavDispatch::move_resource`. Each is a
+request whose blind replay after a mid-flight drop misreports a mutation that
+SUCCEEDED: a replayed create answers 412 and the consumer re-creates under a
+fresh UUID, leaving two copies; a re-issued update after a committed MOVE
+answers 404 at a source the first attempt already emptied, which the status
+ladder reads as `NotFound` -> `ProviderRefused`. `If-Match` and unconditional
+PUTs are deliberately NOT declared: they address a known URL with absolute
+state, so a replay lands on the same end state, and a replay arriving after the
+first attempt committed answers 412 -> `ConcurrencyConflict` ->
 `Retry(AfterStateRefresh)`, which is already the right handling. Losing that
 resilience on the update lane is a cost the fix must not impose.
+
+**DELETE is replayable, and a gone target is a success (dav-D1, ruled
+2026-09-07).** The DELETE was briefly declared unreplayable too, because a
+replayed DELETE that had landed answered 404 and the ladder reported a
+successful delete as `ProviderRefused`. That traded away delete resilience: every
+drop, whether the request landed or not, reached the consumer as
+`Reconcile(CheckTarget)` and cost a probe. The ruling takes the other answer.
+`DavDispatch::delete_resource`, `delete_event` and `delete_vcard` absorb a 404
+or 410 (`delete_target_already_gone`) as success under `reference/error-model.md`'s
+"a benign NotFound lives at the call site" rule - a delete whose target is gone
+has reached its intended end state - and the DELETE is left replayable as HTTP
+says. A drop before the server saw it replays and lands; a drop after it landed
+replays to a 404 that reads as done; neither costs a probe. What is given up,
+deliberately, is the "resource never existed" signal for a consumer deleting by
+a stale id; a consumer that needs it reads first. The copy-then-delete leg of
+the MOVE fallback inherits the same rule, so a replayed delete of a source the
+first attempt already removed is the move's end state rather than a failed leg.
+Pinned by `a_dropped_delete_replays_and_a_gone_target_is_a_success` in both
+crates and `a_delete_replays_and_reads_a_gone_target_as_success` in dav-core.
 
 The declaration does two things, and the second is the one that is easy to miss.
 On the wire it stops `bifrost-net` replaying the request. At CLASSIFICATION it
@@ -771,8 +789,8 @@ called `EventUpdate` / `ContactUpdate` idempotent, and answered
 `Retry(SameRequest)` for a half-applied sequence: on a MOVE-less server the
 engine re-issues the update, finds no MOVE, create-PUTs the destination the first
 attempt already occupied, takes a 412 -> `Retry(AfterStateRefresh)`, and loops
-forever - or, if the source DELETE had landed, GETs a 404 and reports a move that
-SUCCEEDED as `ProviderRefused`. Both wrappers therefore set
+forever - or, before DELETE absorbed a gone target, GETs a 404 and reports a
+move that SUCCEEDED as `ProviderRefused`. Both wrappers therefore set
 `.idempotency_override(false)` unconditionally: a sequence whose earlier leg
 landed cannot be replayed from the top whatever the table says about the logical
 operation. RSVP was right only by accident, because `EventRsvp` is

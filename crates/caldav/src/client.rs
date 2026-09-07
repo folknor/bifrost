@@ -608,20 +608,18 @@ impl CalDavClient {
         }
     }
 
+    /// `DELETE` one event resource. Replayable, and a target already gone is a
+    /// success - the dav-D1 ruling, stated in full at
+    /// `DavDispatch::delete_resource`; the two must move together. The
+    /// copy-then-delete leg of the MOVE fallback relies on it as well: a
+    /// replayed delete of a source the first attempt already removed is the
+    /// move's end state, not a failed leg.
     pub(crate) async fn delete_event(
         &self,
         url: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        let request = self
-            .dav
-            .request(Method::DELETE, url)
-            .headers(self.dav.auth_headers(url, operation).await?)
-            // Unreplayable for the same reason `DavDispatch::delete_resource`
-            // is: a replayed DELETE that already landed answers 404, which the
-            // ladder reports as a permanent refusal of a delete that succeeded.
-            .idempotent(false);
-        self.dav.send_status_request(request, operation).await
+        self.dav.delete_resource(url, operation).await
     }
 
     pub(crate) async fn post_schedule_reply(
@@ -1047,63 +1045,94 @@ mod tests {
         );
     }
 
-    /// A create-PUT and a DELETE must not be replayed after a mid-flight drop.
+    /// A create-PUT must not be replayed after a mid-flight drop.
     ///
     /// Twin of `bifrost-carddav`'s
-    /// `a_create_put_and_a_delete_are_not_replayed_after_a_mid_flight_drop`;
-    /// keep them in step. `bifrost-net` derives replay safety from the METHOD,
-    /// and HTTP calls PUT and DELETE idempotent - true of an absolute-state
-    /// write to a known URL, false of these two. A replayed create whose first
-    /// attempt committed answers 412 -> `ConcurrencyConflict` ->
-    /// `Retry(AfterStateRefresh)`, and `event_create` mints a fresh UUID on the
-    /// retry, so the calendar ends up holding two copies of one event. A
-    /// replayed DELETE that landed answers 404 -> `NotFound` ->
-    /// `ProviderRefused`, reporting a successful delete as a permanent refusal.
+    /// `a_create_put_is_not_replayed_after_a_mid_flight_drop`; keep them in
+    /// step. `bifrost-net` derives replay safety from the METHOD, and HTTP calls
+    /// PUT idempotent - true of an absolute-state write to a known URL, false of
+    /// a create. A replayed create whose first attempt committed answers 412 ->
+    /// `ConcurrencyConflict` -> `Retry(AfterStateRefresh)`, and `event_create`
+    /// mints a fresh UUID on the retry, so the calendar ends up holding two
+    /// copies of one event.
     ///
-    /// One drop is scripted per case, so a request that IS replayed exhausts the
-    /// script and panics rather than passing quietly.
+    /// One drop is scripted, so a request that IS replayed exhausts the script
+    /// and panics rather than passing quietly.
     #[tokio::test]
-    async fn a_create_put_and_a_delete_are_not_replayed_after_a_mid_flight_drop() {
-        for create in [true, false] {
-            let script = dav_script([dav_dropped_after_send()]);
+    async fn a_create_put_is_not_replayed_after_a_mid_flight_drop() {
+        let script = dav_script([dav_dropped_after_send()]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let error = client
+            .put_event(
+                "https://dav.example.test/cal/new.ics",
+                "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
+                PutCondition::IfNoneMatch,
+                AccountOperation::EventCreate,
+            )
+            .await
+            .expect_err("a dropped create must fail");
+
+        assert_eq!(
+            transcripts(&script).len(),
+            1,
+            "the dropped create must not be replayed"
+        );
+        assert!(
+            matches!(
+                error.recovery(),
+                RecoveryClass::Reconcile(advice)
+                    if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
+            ),
+            "a drop after send must reconcile against the target: {:?}",
+            error.recovery()
+        );
+    }
+
+    /// A DELETE is replayed after a mid-flight drop, and the 404 a replayed
+    /// landed DELETE answers is a success - the dav-D1 ruling, at
+    /// `DavDispatch::delete_resource`. Twin of `bifrost-carddav`'s test of the
+    /// same name; keep them in step. Ablation: declaring the DELETE
+    /// unreplayable starves the first case on its script; dropping the
+    /// gone-target arm fails the second with `NotFound`.
+    #[tokio::test]
+    async fn a_dropped_delete_replays_and_a_gone_target_is_a_success() {
+        let answer = |status: StatusCode| DavResponse {
+            status,
+            headers: HeaderMap::new(),
+            body: String::new(),
+            url: String::new(),
+        };
+        for (script, requests, label) in [
+            (
+                dav_script([
+                    dav_dropped_after_send(),
+                    answer(StatusCode::NO_CONTENT).into(),
+                ]),
+                2,
+                "a drop before the server saw the DELETE replays and lands",
+            ),
+            (
+                dav_script([
+                    dav_dropped_after_send(),
+                    answer(StatusCode::NOT_FOUND).into(),
+                ]),
+                2,
+                "a drop after the DELETE landed replays to a 404 that reads as done",
+            ),
+        ] {
             let client = CalDavClient::with_account_net(
                 "https://dav.example.test",
                 scripted_dav_net(&script),
             );
-            let error = if create {
-                client
-                    .put_event(
-                        "https://dav.example.test/cal/new.ics",
-                        "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
-                        PutCondition::IfNoneMatch,
-                        AccountOperation::EventCreate,
-                    )
-                    .await
-                    .expect_err("a dropped create must fail")
-            } else {
-                client
-                    .delete_event(
-                        "https://dav.example.test/cal/one.ics",
-                        AccountOperation::EventDelete,
-                    )
-                    .await
-                    .expect_err("a dropped delete must fail")
-            };
-
-            assert_eq!(
-                transcripts(&script).len(),
-                1,
-                "create={create}: the dropped request must not be replayed"
-            );
-            assert!(
-                matches!(
-                    error.recovery(),
-                    RecoveryClass::Reconcile(advice)
-                        if advice.guidance.actions.contains(&ReconcileAction::CheckTarget)
-                ),
-                "create={create}: a drop after send must reconcile against the target: {:?}",
-                error.recovery()
-            );
+            client
+                .delete_event(
+                    "https://dav.example.test/cal/one.ics",
+                    AccountOperation::EventDelete,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!(transcripts(&script).len(), requests, "{label}");
         }
     }
 

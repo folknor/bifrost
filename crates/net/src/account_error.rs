@@ -82,6 +82,18 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 &response.body,
                 retry_after_history.last().copied(),
             ),
+            // DEFENSIVE ARM, unreachable from the retry loop. `request.rs`
+            // mints `RetryBudgetExhausted` only from the status branch, always
+            // with `Some(final_response)`; a budget spent on transport failures
+            // returns the LAST transport error itself (`Network` / `Timeout` /
+            // `Tls`), which carries its own transmission state and so derives
+            // `Retry(SameRequest)` for an `Unsent` attempt as it should. The
+            // variant carries no per-attempt evidence, so `InFlight` is the
+            // conservative stamp for a caller that builds one by hand. A filed
+            // finding that this arm sends an all-`Unsent` DELETE or create-PUT
+            // to `Reconcile(CheckTarget)` was checked 2026-09-07 and is not a
+            // defect: no production path reaches it. Re-raise only if a
+            // producer starts minting the variant without a response.
             None => {
                 let detail = retry_history_text(&retry_after_history);
                 let mut builder = base_builder(

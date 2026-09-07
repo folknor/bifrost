@@ -317,42 +317,6 @@ any item; some may already be obsolete.
   still names the pre-redirect collection namespace. Rebasing the
   destination on the same hop the source took is the fix, and it must stay
   inside the admitted-origin gate.
-- **dav-D1 (product decision for the owner, filed 2026-09-06, third cold
-  review).** Declaring the DELETE unreplayable TRADES AWAY delete resilience,
-  and the trade was made without a ruling. Before, a drop that happened BEFORE
-  the server ever saw the DELETE was transparently replayed and the delete
-  simply succeeded; now every drop, whether the request landed or not, reaches
-  the consumer as `Reconcile(CheckTarget)` and costs a probe. The alternative
-  keeps the replay and absorbs the resulting 404 at `event_delete` /
-  `contact_delete` as SUCCESS, under `reference/error-model.md`'s "a benign
-  NotFound lives at the call site" rule - a delete whose target is already gone
-  has reached its intended end state. That was not taken here, and it is a
-  real choice, not an oversight: absorbing the 404 also hides a genuine
-  "resource never existed" from a consumer that deleted by a stale id, where
-  the current shape reports it. Two coherent answers; the owner picks. Whichever
-  wins, CalDAV and CardDAV must move together, and the reference's
-  "Which requests are declared unreplayable" section is where it is written
-  down.
-
-## bifrost-net
-
-- **net-F1 (P3, filed 2026-09-06, lateral from the DAV cold review).**
-  `into_account_error` stamps `TransmissionState::InFlight` on
-  `Error::RetryBudgetExhausted { final_response: None }` unconditionally
-  (`crates/net/src/account_error.rs`, the `None` arm), even when every attempt
-  in the budget failed `Unsent` - the variant carries only
-  `retry_after_history` and no per-attempt transmission evidence, so the worst
-  observed state is not available to the mapping and the most conservative one
-  is assumed. Safe but over-conservative, and the DAV unreplayable declaration
-  makes it visible: a create-PUT or DELETE whose every attempt never left the
-  process now derives `Reconcile(CheckTarget)`, sending the consumer to probe a
-  target nothing was ever written to, where `Retry(SameRequest)` is the
-  accurate answer. The fix is in net, not DAV: carry the worst transmission
-  state observed across the attempts through the `RetryBudgetExhausted`
-  variant, and stamp that instead of the constant. Not a live defect - the
-  wrong direction is the safe one - but it costs a retry the request had
-  earned. Outside the DAV lane; needs a ruling from whoever owns net.
-
 ## bifrost-sasl
 
 - **sasl-F1.** Typed public auth-outcome surface. The SASL/channel-binding

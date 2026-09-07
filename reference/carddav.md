@@ -266,7 +266,10 @@ Supported contact primitives:
   (`contact_update_moves_across_address_books_and_updates_in_place_otherwise`
   and `a_contact_move_without_server_move_support_copies_then_deletes`). That
   gap is the eighth measured divergence between these two crates.
-- `contact_delete` - deletes the DAV resource.
+- `contact_delete` - deletes the DAV resource. A target already gone (404 /
+  410) is a success with no validator, and the DELETE replays after a
+  mid-flight drop; the ruling is in `reference/caldav.md`, "DELETE is
+  replayable".
 - `contact_search` / `contact_autocomplete` - non-empty searches issue
   CardDAV `addressbook-query` text-match `REPORT`s over eight common vCard
   fields, including ADR postal addresses, asking for `getetag` ONLY.
@@ -454,8 +457,9 @@ the dispatcher's `DavCredentials`.
 Replay policy is shared and lives with the dispatcher: `reference/caldav.md`,
 "Which requests are declared unreplayable", is the description. It names the same
 call sites on this side - the create-PUT in `put_vcard` (which is also the copy
-leg of the MOVE fallback), `delete_vcard`, and `DavDispatch::move_resource` -
-states that `If-Match` and unconditional PUTs stay replayable, and explains that
+leg of the MOVE fallback) and `DavDispatch::move_resource` - states that
+`If-Match` and unconditional PUTs stay replayable and that DELETE is replayable
+with a gone target absorbed as success (`delete_vcard`, dav-D1), and explains that
 the declaration overrides the `AccountOperation` idempotency table at
 classification as well as suppressing the wire replay, which is what a
 `ContactUpdate`-scoped copy leg or MOVE needs. The third leg of that rule lands
@@ -464,7 +468,8 @@ a fresh `AccountErrorBuilder`, which carries no override forward, so it re-state
 `.idempotency_override(false)` itself - without it a half-applied move derived
 `Retry(SameRequest)` and the replay create-PUT the destination it had already
 occupied. Pinned here by
-`a_create_put_and_a_delete_are_not_replayed_after_a_mid_flight_drop`,
+`a_create_put_is_not_replayed_after_a_mid_flight_drop`,
+`a_dropped_delete_replays_and_a_gone_target_is_a_success`,
 `a_dropped_relocate_move_reconciles_rather_than_replaying`,
 `an_if_match_update_put_still_replays_after_a_mid_flight_drop` and the
 `recovery()` assertion in
