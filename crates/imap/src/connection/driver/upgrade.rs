@@ -269,10 +269,7 @@ pub(super) async fn logout_best_effort(
             crate::types::Response::Tagged(t) if t.tag == tag => break,
             crate::types::Response::Tagged(_) => break,
             crate::types::Response::Untagged(u) => {
-                let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
-                if !code_emitted {
-                    let _ = event_sink.emit((*u).into());
-                }
+                super::process_untagged_as_event(digest, u, event_sink)?;
             }
             crate::types::Response::Continuation(_) | crate::types::Response::Greeting(_) => {}
         }

@@ -707,4 +707,26 @@ mod tests {
             .expect("no parse error");
         assert_eq!(String::from_utf8(recovered.data).unwrap(), "recovered");
     }
+
+    // `discard` documents that it drops every partial buffer EXCEPT the
+    // persistent last event ID. Nothing else in the suite pins that
+    // exception, and the difference is a resume token: if a discard cleared
+    // `last_event_id`, a reconnect after an oversized block would replay
+    // from the wrong point.
+    #[test]
+    fn a_discard_preserves_the_last_event_id() {
+        let mut parser = super::EventParser::default();
+        let mut frame = Vec::from("id: keep-me\n:");
+        frame.extend_from_slice(&vec![b'z'; super::MAX_EVENT_SIZE + 4]);
+        frame.extend_from_slice(b"\n\ndata: after\n\n");
+        parser.push_bytes(frame);
+
+        assert!(parser.next().expect("an item").is_err());
+        let after = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(
+            String::from_utf8(after.id).unwrap(),
+            "keep-me",
+            "the id survived the discarded block"
+        );
+    }
 }

@@ -853,6 +853,30 @@ pub(super) fn process_untagged_prefix(
     Ok(code_emitted)
 }
 
+/// The whole untagged arm of a read loop that has no consumer to route to:
+/// run the shared prologue, then forward the response as a typed event unless
+/// the prologue already published its critical code as one.
+///
+/// Four read loops answer an untagged response this way and only this way -
+/// the IDLE loop, the post-DONE IDLE drain, the synchronizing-literal
+/// continuation wait, and the best-effort LOGOUT drain. They differ in how
+/// they terminate and in what they do with a tagged response, but not here,
+/// so the "prologue, then forward iff no code event" pairing lives once.
+/// Loops that DO have a consumer (command dispatch and the pipeline batch)
+/// cannot use this: for them the forward is conditional on classification,
+/// and they call `process_untagged_prefix` directly.
+pub(super) fn process_untagged_as_event(
+    digest: super::state::SideEffectDigest,
+    response: Box<UntaggedResponse>,
+    event_sink: &mut event_sink::DriverEventSink,
+) -> Result<(), Error> {
+    let code_emitted = process_untagged_prefix(digest, &response, event_sink)?;
+    if !code_emitted {
+        let _ = event_sink.emit((*response).into());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers  -  derive protocol context from ProtocolState
 // ---------------------------------------------------------------------------

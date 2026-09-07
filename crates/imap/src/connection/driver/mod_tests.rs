@@ -316,3 +316,75 @@ fn untagged_prologue_reports_whether_a_code_event_was_emitted() {
         "the prologue does not forward plain responses; its caller does"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Shared consumer-less untagged arm
+// ---------------------------------------------------------------------------
+//
+// The four read loops with nowhere to route a response (IDLE, the post-DONE
+// IDLE drain, the literal continuation wait, and the LOGOUT drain) answer an
+// untagged response through `process_untagged_as_event`. These pin the tail
+// the helper owns: forward exactly once, never on top of a code event, and
+// never at all once the BYE guard has fired.
+
+/// Run the consumer-less arm exactly as those loops do.
+fn run_as_event(response: UntaggedResponse) -> (Result<(), crate::error::Error>, Vec<TypedEvent>) {
+    let (mut sink, mut rx) = prefix_sink();
+    let mut state = super::super::state::ProtocolState::new();
+    let boxed = Box::new(response);
+    let wrapped = crate::types::Response::Untagged(boxed.clone());
+    let digest = state.apply_side_effects(&wrapped);
+    let result = process_untagged_as_event(digest, boxed, &mut sink);
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    (result, events)
+}
+
+#[test]
+fn consumerless_arm_forwards_a_plain_response_as_its_own_event() {
+    let (result, events) = run_as_event(UntaggedResponse::Exists(42));
+    assert!(result.is_ok());
+    assert!(
+        matches!(events.as_slice(), [TypedEvent::Exists(42)]),
+        "a loop with no consumer publishes the response itself, got {events:?}"
+    );
+}
+
+#[test]
+fn consumerless_arm_does_not_double_publish_a_code_event() {
+    let (result, events) = run_as_event(UntaggedResponse::Status {
+        status: UntaggedStatus::Ok,
+        text: "mailbox is over quota".to_owned(),
+        code: Some(ResponseCode::Alert),
+    });
+    assert!(result.is_ok());
+    assert!(
+        matches!(
+            events.as_slice(),
+            [TypedEvent::Alert(text)] if text == "mailbox is over quota"
+        ),
+        "the ALERT is published once, not also as a raw status event, got {events:?}"
+    );
+}
+
+#[test]
+fn consumerless_arm_fails_on_bye_after_publishing_its_alert() {
+    let (result, events) = run_as_event(UntaggedResponse::Status {
+        status: UntaggedStatus::Bye,
+        text: "server shutting down".to_owned(),
+        code: Some(ResponseCode::Alert),
+    });
+    assert!(
+        matches!(result, Err(crate::error::Error::Bye { .. })),
+        "a BYE is fatal in every read loop, got {result:?}"
+    );
+    assert!(
+        matches!(
+            events.as_slice(),
+            [TypedEvent::Alert(text)] if text == "server shutting down"
+        ),
+        "the ALERT reaches the queue and the BYE is not also forwarded, got {events:?}"
+    );
+}

@@ -76,10 +76,7 @@ pub(super) async fn run_idle(
                         super::emit_tagged_response_code_events(&t, event_sink);
                     }
                     crate::types::Response::Untagged(u) => {
-                        let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
-                        if !code_emitted {
-                            let _ = event_sink.emit((*u).into());
-                        }
+                        super::process_untagged_as_event(digest, u, event_sink)?;
                     }
                     crate::types::Response::Continuation(_) => {
                         // A second continuation during IDLE is invalid;
@@ -131,10 +128,7 @@ async fn drain_idle_responses(
                 super::emit_tagged_response_code_events(&t, event_sink);
             }
             crate::types::Response::Untagged(u) => {
-                let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
-                if !code_emitted {
-                    let _ = event_sink.emit((*u).into());
-                }
+                super::process_untagged_as_event(digest, u, event_sink)?;
             }
             crate::types::Response::Continuation(_) => {
                 // Ignore unexpected continuation while draining DONE.

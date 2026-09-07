@@ -182,13 +182,10 @@ pub(super) async fn wait_for_continuation(
                 };
             }
             crate::types::Response::Untagged(u) => {
-                // (I13): emit alert/notification overflow before
-                // BYE handling to ensure ALERT codes on BYE responses
-                // are not lost.
-                let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
-                if !code_emitted {
-                    let _ = event_sink.emit((*u).into());
-                }
+                // (I13): the shared arm emits alert/notification overflow
+                // before BYE handling, so ALERT codes on BYE responses are
+                // not lost.
+                super::process_untagged_as_event(digest, u, event_sink)?;
             }
             crate::types::Response::Greeting(_) => {
                 return Err(Error::Protocol("unexpected greeting".into()));

@@ -97,6 +97,35 @@ returns `Error::Method` for JMAP method-level errors. RFC 8620 s3.2 lets one cal
   `reference/jmap/DEFERRED.md`. The long-lived SSE response explicitly suppresses
   the ordinary JMAP request deadline while retaining response-header and body
   inactivity bounds.
+
+  The stream driver's failure policy is per-case, not uniform. An undecodable
+  `EventType::State` payload ends the stream, because the payload was
+  authoritative and only a reconnect from `lastEventId` replays it; an
+  undecodable `calendarAlert` and an unrecognised event name do not, because
+  nothing downstream regenerates an alert and terminating would let one
+  non-authoritative payload livelock the whole push lane. A parser error (the
+  1 MiB `MAX_EVENT_SIZE` cap) ends the stream unconditionally, and not because
+  the framing broke: the parser always resynchronises - every error site
+  discards to the next blank line and returns to `Init`, and `discard(..)`
+  deliberately preserves `last_event_id`. It ends because of what the discard
+  destroys. The block may already have accumulated `data`, and delivering the
+  next block's checkpoint would let a consumer resume past a state change it
+  never saw. Every failure is yielded either way.
+
+  Exempting a "content-free" overflow so a megabyte keepalive comment could not
+  kill a working stream was tried and rejected; it is unsound in the unsafe
+  direction and should not be rebuilt. The verdict is not computable where the
+  cap trips, because the block is not over: an oversized comment (or `event:` /
+  `id:` / unknown field name) ahead of a valid `data:` line looks content-free
+  at the trip point, and then `discard(..)` consumes that `data:` line too - a
+  state change destroyed while the code reports nothing lost. Deferring the
+  verdict to the terminating blank line needs data scanning, `id` preservation
+  (`discard(..)` also swallows a later `id:`, so the next event would carry a
+  stale resume token), a discard budget plus EOF policy for a blank line that
+  may never arrive, and a stream EOF branch that currently exits without asking
+  whether an overflow is pending. That is far more machinery than surviving an
+  over-1 MiB comment line is worth, and nothing suggests such comments are a
+  normal interoperability requirement.
 - `ReqwestTransport` - default implementation with a pooled reqwest::Client.
 - `Client::with_transport(transport, session, session_url)` - crate-internal custom transport injection. The session URL is required and rejected when empty: a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
 - WebSocket remains reqwest-specific (documented).
@@ -314,7 +343,7 @@ Per-RFC features: `mail`, `calendars`, `contacts`, `blob`, `quota`. Each gates:
 
 The Account layer under `crates/jmap/src/sync/` wires optional PIM capabilities at open. `contacts.rs` maps AddressBook/ContactCard methods onto the shared contact primitives (incl. JSContact postal addresses); `calendar_ops.rs` maps Calendar/CalendarEvent onto list/range/get/create/update/delete/RSVP/search. Create payloads stamp the mandatory top-level `@type` (`Card` / `Event`) and the `@type` on the nested RFC-defined objects (Name, EmailAddress, Phone, Organization, Title, Address, AddressComponent, Note; Participant, Location, RecurrenceRule, NDay). JSContact photo media is written with `kind: "photo"` (resource role, not a URI marker) so self-written photos read back; the read path filters on that kind.
 Range queries send a server-side `AND(inCalendar, after, before)` filter and reapply the local overlap predicate after hydration. Recurrence maps common RRULE fields to JSCalendar `recurrenceRules` and back; simple RDATE/EXDATE map through `recurrenceOverrides`. Unsupported outbound RRULE parts are rejected before Set construction, and the payload builders reject a failed conversion again on their own - a rule that does not convert is an error, never a cleared or omitted recurrence - so the refusal does not depend on `validate_shared_recurrence` having run first. Modified overrides, multiple rules, excluded rules, and unrecognized inbound recurrence components return `Unsupported` rather than being silently discarded. A `recurrenceOverrides` entry projects only when it is a bare addition or a bare `excluded`; anything that patches the occurrence itself fails hydration instead of handing back the master event with the modified occurrence missing.
-Calendar page walks (`events_in_range`, `search`) reconcile their submitted ids the way `contacts.rs::reconcile_cards` does. Every id the `CalendarEvent/get` answer covered in neither `list` nor `notFound`, and every returned event `event_from_jmap` refuses (a modified recurrence override, multiple or excluded recurrence rules, an unknown participant role or status), rides `Page::failed_ids`; the rest of the page still returns. One unrepresentable event therefore costs its own row, not the walk - before this it failed the whole call, permanently, since the event does not go away. The single-event `get` door is unchanged: with no neighbours to protect it still returns the conversion error itself. `search`'s calendar filter is client-side, so when `EventSearchRequest.calendar_id` is set the server's `total` (which counts the unfiltered result set) is suppressed rather than reported as this walk's total; the cursor stays live, and a page whose every hit belonged to another calendar is legitimately empty with more pages behind it.
+Calendar page walks (`events_in_range`, `search`) reconcile their submitted ids the way `contacts.rs::reconcile_cards` does. Every id the `CalendarEvent/get` answer covered in neither `list` nor `notFound`, and every returned event `event_from_jmap` refuses (a modified recurrence override, multiple or excluded recurrence rules, an unknown participant role or status), rides `Page::failed_ids`; the rest of the page still returns. One unrepresentable event therefore costs its own row, not the walk - before this it failed the whole call, permanently, since the event does not go away. The single-event `get` door is unchanged: with no neighbours to protect it still returns the conversion error itself. `search`'s calendar filter is client-side, so when `EventSearchRequest.calendar_id` is set the server's `total` (which counts the unfiltered result set) is suppressed rather than reported as this walk's total; the cursor stays live, and a page whose every hit belonged to another calendar is legitimately empty with more pages behind it. Both calendar page walks (and both contact ones) page by anchor with a pinned `queryState`, not by integer position - see "PIM page cursors".
 
 `UNTIL` conversion and the start/duration write both need the event start timezone and all-day flag, which an `EventPatch` need not carry. `update` reads the current event (`CalendarEvent/get`, before hydration, so an event whose own recurrence is unrepresentable does not block the patch) for exactly the fields the patch leaves unset: a recurrence-only patch carrying `UNTIL`, or any time patch that does not restate `is_all_day`. Omitting `is_all_day` therefore means "unchanged", not "timed". RFC 5545 `UNTIL` is converted, not copied: basic DATE and DATE-TIME syntax becomes an extended JSCalendar `LocalDateTime`, a zoned event's UTC UNTIL is resolved into the event timezone, and the inbound direction restores DATE for all-day events, floating DATE-TIME for floating events, or UTC DATE-TIME for zoned events. The inclusive bound is unchanged in both directions.
 Event time updates: JSCalendar derives end from `start` + `duration`, so a patch must carry both `start` and `end` (recomputing `duration`); a one-bound patch is rejected Unsupported rather than dropping the change or keeping a stale duration. All-day ends follow the exclusive `EventTime` contract: inbound end is `start + duration` days and outbound `duration` is `end - start` days (a single all-day event is start D / end D+1 / `P1D`), uniform with caldav/google/graph. JSCalendar has no DATE type, so an all-day start is written as midnight on its date (`2026-06-02T00:00:00`) with `showWithoutTime` carrying the all-day sense, and an inbound all-day time is truncated back to the shared bare date.
@@ -430,7 +459,7 @@ Validation rules in `state::decode`:
 
 Supported scopes for `inventory_stream` and `changes_stream`:
 
-- `CursorScope::Type(ObjectType::Email)` - inventory walks `Email/query` (`receivedAt` desc) then `Email/get` with the fixed inventory property set. The first query starts at position zero; every later page uses the previous page's last id as `anchor` with `anchorOffset: 1`. The walk also pins `queryState` across its pages: if it moves, the walk ends via `terminated_walk_superseded` (`SyncState(CursorInvalid)` -> `RestartScope`), never with `Done`, so a changing result set is neither reported as complete coverage nor treated as permanently fatal. Every other error path likewise ends the stream with a `Terminated` and no `Done`; `Done(None)` is reachable only from an anchored query that came back empty under an unchanged `queryState`. `inventory_partitioning` reports `Full`: a positional `PageCount` plan would lose the anchor between engine partition calls and reopen the deletion-shift skip at every boundary. Explicit page partitions are refused rather than claiming coverage. Primary and foreign-account inventory share ONE loop, `inventory::email_inventory_loop`, exactly as the change walks share `changes::changes_walk`: the only parameter that varies is the `owner` tag - `Some(accountId)` for a foreign scope, which qualifies the emitted ids and memberships into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walk always used, since `shared_scope_error` with no owner is `into_account_error`.
+- `CursorScope::Type(ObjectType::Email)` - inventory walks `Email/query` (`receivedAt` desc) then `Email/get` with the fixed inventory property set. The first query starts at position zero; every later page uses the previous page's last id as `anchor` with `anchorOffset: 1`. The walk also pins `queryState` across its pages: if it moves, the walk ends via `terminated_walk_superseded` (`SyncState(CursorInvalid)` -> `RestartScope`), never with `Done`, so a changing result set is neither reported as complete coverage nor treated as permanently fatal. The contact and calendar page walks share these mechanics but answer a moved state differently, because they claim no coverage - see "PIM page cursors". Every other error path likewise ends the stream with a `Terminated` and no `Done`; `Done(None)` is reachable only from an anchored query that came back empty under an unchanged `queryState`. `inventory_partitioning` reports `Full`: a positional `PageCount` plan would lose the anchor between engine partition calls and reopen the deletion-shift skip at every boundary. Explicit page partitions are refused rather than claiming coverage. Primary and foreign-account inventory share ONE loop, `inventory::email_inventory_loop`, exactly as the change walks share `changes::changes_walk`: the only parameter that varies is the `owner` tag - `Some(accountId)` for a foreign scope, which qualifies the emitted ids and memberships into the owning account's namespace AND routes a permission denial into a per-scope quarantine, and with `None` reduces to the plain error mapping the primary walk always used, since `shared_scope_error` with no owner is `into_account_error`.
 - `CursorScope::Type(ObjectType::Mailbox)` - inventory is a single `Mailbox/get` (Id, Name, ParentId, Role, SortOrder, totals, unread counts, IsSubscribed). Changes use `Mailbox/changes`.
 - `CursorScope::Type(ObjectType::Thread)` and `CursorScope::Query(_)` are not discovered. A legacy cursor for either terminates unsupported: thread inventory derives from email inventory, and the v1 trait has no registered query definition to supply an `Email/queryChanges` filter/sort.
 - `CursorScope::Folder(FolderId(encode_foreign_account(account_id)))` - a foreign (shared/delegate) account, one account-level scope per share. Inventory paginates an UNFILTERED `Email/query` against the foreign account handle (one walk per share); changes use that account's `Email/changes`, which is account-wide and cannot be filtered by mailbox - which is exactly why the topology is one scope per account, never one per mailbox (a per-mailbox topology streamed the identical change set once per mailbox and fanned every foreign push out M ways). Per-mailbox membership is learned at hydration from the qualified `mailboxIds`, the same model the primary `Type(Email)` scope uses. A legacy per-mailbox `Folder` cursor still decodes and takes an `inMailbox`-filtered inventory walk, but is never seeded. See "Foreign (shared/delegate) accounts".
@@ -565,6 +594,170 @@ Container CRUD is `Mailbox/get`/`set`. Mailboxes surface as `ContainerKind::Fold
 Settings use `Identity/get`/`set`, `VacationResponse/get`/`set` (`singleton` id), and `Quota/get`. `identity_update` supports name/signatures/reply-to; default-identity selection is unsupported.
 
 `thread_hydrate` does `Thread/get` then `Email/get` in order. `message_hydrate` selects headers / preview / full projections and returns blob handles without pre-downloading. `move_thread`/`delete_thread` add-to-target then remove-from-source; deleting from Trash destroys the emails. The thread is expanded ONCE, before either leg, and both legs run over that fixed id set (`patch_mailbox_membership_of`); the cross-account container check runs for both containers before the resolve. Each leg used to run its own `Thread/get`, so a message delivered to the thread between the two resolves was removed from the source having never been added to the target - it lost its source membership and gained nothing. The two-leg non-atomicity itself is the documented cross-provider shape and remains; the window is now one `Email/set` pair over a fixed set.
+
+### PIM page cursors
+
+The crate has TWO page-cursor encodings serving three families of walk. Both
+are versioned with a `2:` tag; they are not interchangeable, and each is
+decoded only by the module that mints it.
+
+**Mail search (`pim.rs`)** is positional: `2:<position>:<queryState>`,
+owner-qualified for a share. It is described under "Known limitations" below.
+
+**The contact and calendar page walks** - `ContactCard/query` behind
+`contacts_list` / `contact_search`, `CalendarEvent/query` behind
+`events_in_range` / `event_search` - use an ANCHORED, state-pinned cursor
+instead. The payload is `2:` followed by a JSON two-element array,
+`[anchor, queryState]`. JSON rather than a delimited pair on purpose: a JMAP
+id and a `queryState` are both opaque and either may contain any character a
+delimiter could be, so a delimited pair has no unambiguous split, while JSON
+escapes its own contents and both halves round-trip verbatim.
+
+- A first page sends `position: 0` and captures the response's own
+  `queryState` into the cursor it mints. A continuation sends `anchor` with
+  `anchorOffset: 1` (RFC 8620 s5.5) and no position, so churn BEHIND the
+  cursor cannot shift the window the way an integer offset would.
+- The anchor alone is not enough, which is why the state is pinned too. An
+  anchor survives reordering AROUND it: an item that moves from ahead of the
+  anchor to behind it is returned twice, one that moves the other way is never
+  returned, and neither is visible from the anchor, because the anchor is
+  still exactly where the server says it is.
+- `verify_query_state` compares the served state against the pin BEFORE the
+  total, before minting a successor, and before hydration - unconditionally,
+  including on an empty or apparently final page. A mismatch is
+  `ConcurrencyConflict` -> `Retry(AfterStateRefresh)`, and the call returns
+  `Err`: no items, no successor cursor, no hydration `/get` issued. Checking
+  afterwards would have already handed the caller items from a list it just
+  decided was the wrong one.
+- The successor anchors on the LAST QUERY-RESULT id, never on a
+  post-hydration survivor. So a page whose every hit was dropped by calendar
+  search's client-side calendar filter, or by `events_in_range`'s local
+  overlap predicate, or by hydration, still names where the server continues
+  from and the walk goes on correctly.
+- A non-v2 payload is refused `SyncState(SchemaIncompatible)` ("restart from
+  the first page"), not reinterpreted: that covers the v1 bare integer (which
+  under anchored paging would read as either a stale offset or an id named
+  "100") and, just as deliberately, an anchor with no pinned state, since
+  honouring one is exactly the unchecked paging the pin exists to end. An
+  empty anchor id is refused the same way.
+- `anchorNotFound` on an ANCHORED page is remapped to `ConcurrencyConflict`:
+  an item deleted while a consumer pages is ordinary concurrent activity. On a
+  first page, which never sent an anchor, it keeps the central
+  `Protocol(ContractViolation)` reading.
+
+Be precise about what the refusal buys. It prevents SILENT acceptance of an
+inconsistent continuation - the caller learns the walk broke instead of
+receiving a page it cannot tell is short. It does NOT recover the lost
+results, and it does not guarantee the walk ever terminates: a sufficiently
+busy query can move the state on every attempt and fail repeatedly, the same
+limitation mail search already carries. A restart re-reads the earlier pages,
+so the consumer must replace its prior result set or deduplicate ids. And a
+stable `queryState` pins the ordered ID LIST only - the hydrated properties of
+those objects can have changed underneath it. Nor does every edit invalidate a
+walk: `queryState` describes the ordered matching ids, so an unrelated
+property edit need not move it, though RFC 8620 s5.5 permits a server to
+invalidate conservatively when it cannot tell.
+
+**Why the email inventory walk differs.** `inventory::email_inventory_loop`
+uses the same anchor-plus-pinned-state mechanics, but a moved state ends it
+through `terminated_walk_superseded` (`SyncState(CursorInvalid)` ->
+`RestartScope`) rather than a per-call `ConcurrencyConflict`. That is not a
+disagreement between the two: the inventory walk claims COVERAGE to the sync
+engine - a `Done` means "this scope has been fully enumerated" - so a broken
+walk must be reported to the engine as a scope to restart, never allowed to
+end in `Done`-shaped silence. The PIM page walks claim nothing beyond the page
+in hand; their caller holds the cursor and re-lists on its own, so the
+per-call retryable error is the whole contract. `CursorInvalid` is also
+unavailable to them for the reason the mail-search cursor documents: it
+requires an `ErrorScope::Cursor`, and a page cursor is not an engine cursor
+scope.
+
+**Termination on an absent `total`: continue-until-empty, in all three walks.**
+Every one of these queries sets `calculateTotal: true`, and when the server
+answers with a `total` that total is the authority: `position + served ==
+total` ends the walk, exactly. When the server omits it - permitted, since
+`calculateTotal` is a request, not a guarantee - each of the three walks
+continues until an EMPTY page: every NONEMPTY page mints a successor whatever
+its length, and only an empty response terminates.
+
+Both alternatives are unsound, and both were live in this crate:
+
+- **End the walk on an absent `total`** (what `contacts.rs` and
+  `calendar_ops.rs` did, via a `?` on the `Option`) truncates at page ONE
+  against such a server, and reports the truncation as completion.
+- **Fall back to page fullness** (what `pim.rs::search_email_ids` did) is not
+  a completion test. Note the reason, because this document and three code
+  comments used to give the wrong one: RFC 8620 s5.5 does NOT permit an
+  arbitrary short non-final page - `ids` runs to the end of the result list
+  or to the effective limit, and a server that clamps the requested limit
+  must RETURN the limit it used. The honest argument is that an absent
+  `total` is not evidence of completion while a conforming EMPTY page is
+  conclusive; fullness would additionally have to trust a `limit` echo a
+  server may omit, for no gain over asking once more.
+  `a_short_non_final_page_still_yields_a_next_cursor` pins the rule on the
+  total-bearing branch.
+
+Continue-until-empty is sound for the anchored contact and calendar walks
+because the cursor names the last id of a nonempty page, so the next request
+either returns more or returns nothing, and nothing is the honest end signal.
+It transfers to `pim.rs`'s POSITIONAL cursor because the successor position is
+the server's own `position` echo plus what it served. The cost is one extra
+round trip against a `total`-less server whose last page landed exactly on
+the end.
+
+**An implausible envelope is refused, never read as completion.** A present
+`total` used to end a walk on `position + served >= total`, which for a
+NONEMPTY page inverts the relationship RFC 8620 s5.5 defines: `position` is
+the index of the response's first id and `total` is the length of the whole
+result list, so the last id sits at `position + served - 1` and
+`position + served <= total` must hold. `>` is a CONTRADICTION, not evidence
+that the walk finished, and reading it as completion is the same silent-loss
+shape as every other termination defect here. All three walks now validate the
+envelope before any termination test, and refuse
+`Protocol(ContractViolation)` -> `RecoveryClass::ProviderContractViolation`
+on: a negative echoed `position` (the response field is an UnsignedInt); a
+nonempty page with `position + served > total`; and, in the anchored walks, an
+empty id where a continuation anchor would go. `ProviderContractViolation` is
+deliberate over the two neighbouring classes - `ConcurrencyConflict` and
+`SyncState(SchemaIncompatible)` both direct the caller to restart, and a
+restart re-issues the identical request to the identical broken server, so
+the caller would spin. An EMPTY page is exempt from the content rules: with no
+first id there is nothing for `position` to index, so a position past the end
+of an empty page terminates the walk normally. The comparisons happen in `u64`
+rather than `i32`, so an out-of-range `total` is compared instead of being
+absorbed into the absent-total branch, and an overflowing position is caught
+instead of saturating into a false completion.
+
+**The non-termination residual is detectable, and this document used to say
+otherwise.** The claim was that a server which omits `total` and ignores
+`position` (or ignores `anchor`) is indistinguishable from an unbounded result
+set. That is FALSE: the query state is PINNED and verified equal before any of
+this runs, so the server has asserted the result list is one stable finite
+ordered list, and a walk that does not advance under an unmoved state is a
+contract violation rather than a long list. All three walks now detect it, and
+refuse with the same `Protocol(ContractViolation)`:
+
+- `pim.rs` compares the response's `position` against the position it SENT
+  rather than trusting the echo. On a positive positional continuation - which
+  only a decoded cursor produces, and which therefore always carries a
+  verified pin - a nonempty response must BEGIN where it was asked to; there
+  is nothing for a conforming server to clamp against under a state that did
+  not move. It also refuses a successor position that fails to advance past
+  the incoming cursor. That second rule is a real backstop (it independently
+  catches a server echoing `0` for a page requested at 2) but the echo rule is
+  strictly stronger and runs first, so nothing reaches it through
+  `search_email_ids` today.
+- The anchored walks refuse a continuation page that CONTAINS the anchor it
+  was told to resume strictly after. `anchorOffset: 1` means strictly after,
+  and the pinned state says the anchor has not moved, so re-serving it is the
+  server re-serving the window it was asked to leave. This subsumes the
+  narrower "the newly minted anchor equals the incoming anchor" rule, which is
+  the same condition restricted to the last id.
+
+What remains genuinely undetectable is narrower: a server that advances its
+positions and anchors correctly while inventing an unbounded stream of new
+ids. That is not a paging defect the cursor can see, and it is the same
+exposure any consumer of an unbounded query has.
 
 ### Server-side filter scripts
 
@@ -807,7 +1000,9 @@ a whole new share still waits for reopen.
   under a filter that routes elsewhere is refused rather than paging one
   account by another's offsets.
 - The search page cursor payload is versioned: `2:<position>:<queryState>`,
-  owner-qualified for a share. Two things ride in it because a bare position
+  owner-qualified for a share. It is the POSITIONAL encoding; the contact and
+  calendar page walks use a different `2:` payload (anchored, see "PIM page
+  cursors"), and the two are never decoded by the same reader. Two things ride in it because a bare position
   means nothing without either. The account, because the order is
   account-scoped (above); and the `queryState`, because the order is not
   stable across calls - `Email/query` recomputes it per call, so page 2 taken
@@ -821,9 +1016,14 @@ a whole new share still waits for reopen.
   carried no pin) is refused `SyncState(SchemaIncompatible)` rather than
   resumed, since resuming it is exactly the unpinned paging the bump exists
   to stop; the two shapes are unambiguous (a v1 payload is all digits).
-- Whether a next page exists is decided by the response's echoed `position`
-  plus `total`, not by the page having come back full. RFC 8620 permits a
-  short non-final page, and reading fullness as "more remains" ended such a
-  walk in `Done`-shaped silence with most of the hits unreported. The query
-  always sets `calculateTotal`; page fullness survives only as the fallback
-  for a server that omits `total` anyway.
+- Whether a next page exists is decided by `position` plus `total`, not by the
+  page having come back full: reading fullness as "more remains" ended such a
+  walk in `Done`-shaped silence with most of the hits unreported. (The old
+  justification here - "RFC 8620 permits a short non-final page" - was wrong;
+  the correct one is under "PIM page cursors".) The query always sets
+  `calculateTotal`; a server that omits `total` anyway gets
+  continue-until-empty. `validate_search_page` checks the envelope before any
+  of that: the echoed `position` is compared against the position the request
+  SENT rather than trusted, and a nonempty page that claims to have served
+  past its own `total` is refused rather than read as a finished walk. See
+  "PIM page cursors".

@@ -53,6 +53,20 @@ pub fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
     .expect("valid account error classification")
 }
 
+/// A classified transport failure for a provider that refuses to close. There
+/// is no `AccountOperation::Close`, so this is tagged by its cause alone.
+pub fn close_refused() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
+        Cause::Transport(bifrost_types::TransportCause::new(
+            bifrost_types::TransportKind::Network,
+            None,
+        )),
+    )
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Neutral capability set: no push, no blob ranges, generous rate class.
 pub fn caps() -> AccountCapabilities {
     AccountCapabilities {
@@ -152,8 +166,39 @@ pub struct StubAccount {
     pub walked: Arc<Mutex<Vec<(CursorScope, InventoryPartition)>>>,
     /// Every scope the engine asked to establish, in call order.
     pub established: Arc<Mutex<Vec<CursorScope>>>,
-    /// `close()` call count.
+    /// `close()` call count. Incremented on ENTRY, before `close_gate` is
+    /// awaited, so a test can tell "close was reached" from "close returned".
     pub closed: Arc<std::sync::atomic::AtomicUsize>,
+    /// `close()` completion count: bumped only once the future has passed
+    /// `close_gate` and is about to answer. A caller that abandoned the close
+    /// (drop at a timeout) leaves this behind `closed`.
+    pub close_returned: Arc<std::sync::atomic::AtomicUsize>,
+    /// When set, `close()` parks on this `Notify` before answering - a
+    /// provider whose connection teardown hangs. Never notifying it is the
+    /// hang-forever case; `notify_waiters` releases it.
+    pub close_gate: Option<Arc<tokio::sync::Notify>>,
+    /// When true, `close()` answers a classified transport error instead of
+    /// `Ok`. Distinct from `close_gate`: a refusal, not a hang.
+    pub close_fails: bool,
+    /// When set, `inventory_stream` yields whatever `inventory_hook` produced
+    /// and then PARKS on this `Notify` before ending; `notify_waiters` lets the
+    /// stream finish.
+    ///
+    /// This parks a worker `detach` actually AWAITS: the deferred-inventory
+    /// establishment worker is a stored `WorkerRole::Stream`, and
+    /// `InventoryFusion::run_stream` polls the provider stream with no shutdown
+    /// arm, so a parked inventory stream holds `detach` inside its worker await
+    /// until the gate is notified - and a gate never notified makes it a
+    /// straggler aborted at `detach_timeout`. Parking a CHANGES stream instead
+    /// does NOT do this, which was established by measurement: the multiplexer
+    /// owns its per-scope poll tasks and aborts them itself, so they are not
+    /// among the workers `detach` waits on.
+    ///
+    /// The worker waits for a real subscriber before walking anything, so a
+    /// test that wants the straggler must subscribe first.
+    pub inventory_stall: Option<Arc<tokio::sync::Notify>>,
+    /// `inventory_stream()` call count.
+    pub inventory_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StubAccount {
@@ -173,6 +218,11 @@ impl StubAccount {
             walked: Arc::new(Mutex::new(Vec::new())),
             established: Arc::new(Mutex::new(Vec::new())),
             closed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            close_returned: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            close_gate: None,
+            close_fails: false,
+            inventory_stall: None,
+            inventory_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -291,10 +341,19 @@ impl Account for StubAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
-        match &self.inventory_hook {
-            Some(hook) => Box::pin(stream::iter(hook(&scope))),
-            None => Box::pin(stream::empty()),
+        self.inventory_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let items = match &self.inventory_hook {
+            Some(hook) => hook(&scope),
+            None => Vec::new(),
+        };
+        if let Some(gate) = &self.inventory_stall {
+            let gate = Arc::clone(gate);
+            let tail = stream::once(async move { gate.notified().await })
+                .filter_map(|()| async move { None::<InventoryEvent> });
+            return Box::pin(stream::iter(items).chain(tail));
         }
+        Box::pin(stream::iter(items))
     }
 
     fn inventory_partition_stream(
@@ -409,7 +468,16 @@ impl Account for StubAccount {
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         self.closed
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async { Ok(()) })
+        let gate = self.close_gate.clone();
+        let fails = self.close_fails;
+        let returned = Arc::clone(&self.close_returned);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            returned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if fails { Err(close_refused()) } else { Ok(()) }
+        })
     }
 
     fn add_to_container(

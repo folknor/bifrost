@@ -55,17 +55,29 @@ structural landings of the same week, the dav-core `ResponseParts` collapse
 and the smtp sans-I/O core, never received the cold review their rulings
 asked for; that review debt is listed under their crates below.
 
-- **Filed from the teardown-window cold review (2026-09-07), not fixed in
-  it.** (a) Lateral P2: `detach_inner` awaits `Account::close()` with no
-  deadline, so a hanging close hangs `detach` despite every other step being
-  clamped to `detach_timeout`; predates the change. Clamp it like the worker
-  awaits, and decide what a timed-out close means for the handle. (b) P3:
-  `a_departure_during_teardown_records_no_loss` calls `begin_teardown`
-  directly, so deleting the production call from `detach_inner`, or moving it
-  after worker shutdown, changes nothing the test observes. Pinning the
-  lifecycle ordering wants a test through `SyncEngine::detach` with teardown
-  held at a controlled await; the engine harness in
-  `tests/backfill_lane_flow_control.rs` is the closest starting point.
+- **The ack writer shares the worker deadline, so a straggler starves its
+  drain.** Found 2026-09-07 while clamping `Account::close()`, and it is the
+  SAME SHAPE as that fix one step over: `detach` gives the stream workers and
+  the ack writer one `deadline`, so a provider stream that stops yielding burns
+  the whole `detach_timeout` and the writer is then aborted with
+  `remaining == 0` - immediately, without draining. That is precisely the
+  "writer aborted with unpersisted work" outcome the two-phase ordering and
+  `take_ack_writer` exist to prevent, reached by a different route. The remedy
+  is the one the close clamp already took: a fresh budget for the writer phase,
+  on the same reasoning (detach is documented as worker awaits PLUS the trailing
+  phases, and sharing one deadline silently zeroes whichever runs last). I
+  believe this is settled by consistency rather than being a fresh decision, but
+  it changes how long a detach can take in the worst case, so it is recorded
+  here rather than assumed.
+
+- **Three stream-poll loops have no shutdown arm**, which is what makes the
+  above reachable: `drive_changes_stream`, `InventoryFusion::run_stream` and
+  `BackfillRunner::run_partition` poll a provider stream with no select on the
+  cancellation token, so a stream that neither yields nor ends parks its worker
+  until detach aborts it. `reference/sync.md` documents that the DELAYS around
+  the drive select on the token; the drive itself does not. Two tests now
+  deliberately exploit this to hold a teardown window open, so closing it would
+  break them - by design, and they say so.
 - **Residuals of the bounded-backfill cold review.** P3 or P4 from that
     review; verify against the code before working any of it. The rest of
     that list was worked on
@@ -591,30 +603,26 @@ Nothing in this section misbehaves. None of it is a bug, and none of it blocks a
 defect fix - in particular, do not let a unification proposal become a
 prerequisite for the small local fixes above.
 
-- **jmap-B1.** `imap` has four copies of the untagged-response dispatch loop.
-  Recorded for completeness with the other duplication findings; same standing
-  as the above. (The jmap half is landed: `sync/changes.rs`'s `email_changes`
-  and `mailbox_changes` are now one generic `changes_walk` over the new
-  `core::changes::ChangesMethod`. The inventory walk stayed separate - it is
-  anchored query-then-get with its own no-`Done` exits, not a state walk - and
-  the reason is written at `changes_walk`.)
+- **jmap page-cursor machinery is duplicated between `contacts.rs` and
+  `calendar_ops.rs`.** Landed 2026-09-07 and immediately flagged by the agent
+  that wrote the second copy. `PageCursor`, the `2:` prefix, `anchor_query`,
+  `verify_query_state`, `next_cursor`, `decode_page_cursor`, the
+  `anchorNotFound` mapping and the error constructors are near-identical,
+  differing only in the id type, the query builder type and diagnostic wording -
+  and both modules carry their own parallel unit tests. This is the exact shape
+  the standing lessons name: a local restatement of a rule that lives elsewhere,
+  kept alive by a test that exercises the copy rather than the original, so the
+  copy and its test agree indefinitely while only the original disagrees. It is
+  not hypothetical here - the absent-`total` truncation had to be fixed in three
+  places in one day, and the same reviewer found the three walks answering one
+  termination question three ways. A shared generic helper would make the next
+  such fix one edit. Wants a ruling because it is a new module in `sync/`, not a
+  local edit.
 
 ## Open items folded in from the second bug-hunt wave (2026-08-29)
 
 The deferred tail of the August 2026 arcs. The same category labels and the
 PUBLISHED SURFACE fence apply.
-
-- **jmap-J13. Positional paging in the consumer-facing list and search
-  paths.** [C3] `crates/jmap/src/contacts.rs`, `calendar_ops.rs` and `pim.rs`
-  page by integer position over orders that are not total - the same
-  unstable-order shape J1 fixed for the inventory walk. Deliberately NOT J1
-  reopened: those are consumer-driven page-cursor APIs, not coverage-claiming
-  walks, so churn-induced skip or duplication is ordinary list-API behaviour
-  and nothing reports complete coverage off them. High confidence the paging
-  is positional, LOW confidence it is a defect. The better mechanism exists
-  and is known: carry an anchor id on the page cursor, as the inventory walk
-  does, so a consumer paging a churning list gets stable continuation instead
-  of positional drift.
 
 - **types-B1. `PimMethodSupport` is a hand-maintained mirror of the trait
   surface.** [C3, PUBLISHED SURFACE] `crates/types/src/capabilities.rs`. Sixty
@@ -859,20 +867,35 @@ wave; these are what was left. Verify before working any of them.
   consumer chose the cap, so this is not a defect - but if that ever needs a
   ceiling it is a separate ruling and should not be folded into the refund.
 
-- **jmap SSE: let a content-free parser overflow continue.** The stream ends on
-  any parser error because `discard(..)` destroys a block that MAY have carried
-  state data, and the parser reports only "too long". It could report the
-  difference cheaply - at every `discard(..)` site the state is in hand and the
-  predicate is `data_seen || (field == b"data" && !value.is_empty())`, the second
-  disjunct because the `Value`-state overflow fires mid-`data` line before
-  `commit_field` runs. The cost is the error channel, not the parser:
-  `Iterator::Item` is `crate::Result<Event>` and `too_long_error()` mints a
-  generic `Error::Transport`, so carrying the bit needs a parser-owned error enum
-  threaded through `Item`, or a dedicated variant with a `carried_data` flag.
-  `stream.rs` would then continue on a genuinely content-free overflow and keep
-  tearing down otherwise. Note `discard(..)` deliberately does NOT clear
-  `last_event_id`, so a discarded block's id is not itself a loss - only its
-  `data` is.
+- **imap: `wait_for_continuation` reads a FOREIGN tagged response as its own
+  command's rejection.** Live defect, found 2026-09-07 while unifying the
+  untagged-response arms, and left unfixed because the remedy changes an
+  observed error class and a termination. Any tagged response ends the wait -
+  `NO`/`BAD` become that command's error, `OK` becomes a protocol violation -
+  which is right when one command is outstanding. But `run_pipeline` calls it
+  per command, sequentially, with earlier commands already sent and their tags
+  pending. On a server without LITERAL+/LITERAL-/rev2 (`literal_mode` is
+  `Synchronizing`) a pipelined command carrying a literal can therefore consume
+  command #1's tagged response: the batch aborts, #1's real result is destroyed,
+  and a `NO` for #1 is reported as a failure of #2. Every other loop in the crate
+  distinguishes its own tag from a foreign one. The narrow fix passes the
+  expected tag in and ignores a foreign one; the design question, and the reason
+  this wants a ruling, is whether the pipeline should instead PARK the foreign
+  response and route it into the right command's result slot - ignoring it
+  discards a result that was legitimately delivered, which is the actual loss.
+
+- **imap: two smaller divergences between the response loops**, both found in
+  the same pass and both left alone because each changes something observable.
+  (a) `logout_best_effort` is the only loop whose tagged arm does not call
+  `emit_tagged_response_code_events`, so an `ALERT` on the LOGOUT completion is
+  dropped; low impact, since the sink is about to be torn down, but it is an
+  undocumented deviation rather than a stated one. (b)
+  `has_critical_response_code` excludes `UntaggedStatus::Bye` while
+  `emit_untagged_response_code_events` publishes for it, though the two are
+  meant to be exact complements. Latent only because the prologue makes a BYE
+  fatal before any consumer sees it, so a BYE never reaches the one caller - but
+  the exclusion is dead as written and becomes a double-emit the moment the BYE
+  short-circuit moves after classification.
 
 - **Two documentation gaps left by this wave.** (a) `DavDispatch::resolve_url`
   now resolves a relative id UNDER the configured base path (`join_base` restores

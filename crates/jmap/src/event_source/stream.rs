@@ -192,6 +192,33 @@ impl<T: HttpTransport + SseTransport> Client<T> {
         // What cannot be established is the block's content, not the
         // framing.
         //
+        // Exempting a "content-free" overflow - letting a pathological
+        // comment line be reported without ending the stream - was tried
+        // and rejected, so do not rebuild it. The verdict is not computable
+        // where the error is raised: the cap trips mid-block, and the block
+        // is not over. In
+        //
+        //     :<more than 1 MiB>
+        //     data: {"@type":"StateChange", ...}
+        //
+        // no data has been seen when the comment trips the cap, so the
+        // overflow looks content-free - and then `discard(..)` eats the
+        // rest of the block, `data:` line included. The same holds for an
+        // oversized `event:`/`id:`/unknown field name ahead of a valid
+        // `data:` line, and for a block whose remainder arrives in a later
+        // frame. Deferring the verdict to the terminating blank line is
+        // strictly more machinery than the case is worth: `discard(..)`
+        // also swallows a later `id:`, so "no data lost" is narrower than
+        // "continuation preserves parser semantics" and the next event
+        // would carry a stale resume token; the blank line may never
+        // arrive, turning an immediately reportable error into an
+        // indefinitely pending read that needs its own budget and EOF
+        // policy; and the EOF branch below exits without asking the parser
+        // whether an overflow is pending, so frame exhaustion would be read
+        // as proof of a safely completed block. All of that buys exactly
+        // one thing: surviving a comment line over 1 MiB, which no
+        // interoperability requirement asks for.
+        //
         // An undecodable `EventType::State` payload ends it because the
         // payload was authoritative. Skipping it silently loses the state
         // change it carried and leaves the client believing it is caught up;

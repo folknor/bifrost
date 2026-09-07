@@ -60,7 +60,16 @@ emits critical response-code events and only then applies the BYE guard - that
 order is what keeps an `ALERT` carried on a `* BYE` from being lost when the
 error unwinds the command. `short_circuit_on_bye` is private to the driver
 module and reachable only through that prologue, so no read loop can re-derive
-the ordering and get it wrong. The guard is fed by
+the ordering and get it wrong. The four loops that have no consumer to route to
+(IDLE, the post-DONE IDLE drain, the synchronizing-literal continuation wait,
+and the best-effort LOGOUT drain) share their entire untagged arm as
+`process_untagged_as_event`: prologue, then forward the response as a typed
+event exactly when the prologue did not already publish its critical code as
+one. They remain separate machines below that arm - they disagree on
+termination, on the foreign-tag rule, and on whether a continuation or greeting
+is fatal - so only the arm is shared. The two loops that do have a consumer
+(command dispatch and the pipeline batch) call the prologue directly, because
+for them the forward is conditional on classification. The guard is fed by
 `ProtocolState::apply_side_effects`'s
 `SideEffectDigest`. The digest is `#[must_use]` and its `had_bye` field is
 private, so a new loop cannot silently ignore it. BYE is recognized from

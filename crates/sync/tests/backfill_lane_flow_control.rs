@@ -2116,6 +2116,255 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
     engine.detach(&account_id).await.expect("detach succeeds");
 }
 
+/// The MIRROR of the test above, and the one that pins the ORDERING rather than
+/// the flag: the same departure, moved from just before `detach` to inside it,
+/// records nothing.
+///
+/// `a_departure_during_teardown_records_no_loss` (in `multiplexer::tests`) calls
+/// `ChangeDelivery::begin_teardown` directly, so it pins what the sweep does
+/// once the flag is set and says nothing about where the flag gets set. Deleting
+/// the `begin_teardown` call from `detach_inner`, or moving it below the worker
+/// awaits, leaves that test green. This one drives the real `SyncEngine::detach`
+/// and drops the receiver while the call is in flight.
+///
+/// How the window is held open, since detach otherwise runs to completion in one
+/// scheduling pass: a second scope establishes via inventory and its inventory
+/// stream PARKS instead of ending (`inventory_stall`). The deferred-inventory
+/// worker is one of the workers `detach` joins and its fusion stream poll has no
+/// shutdown arm, so `detach` cannot leave its worker await until the test
+/// releases the gate. The departure is therefore inside the window by
+/// construction rather than by timing luck, and the release keeps the teardown
+/// drain's own budget intact - which matters, because the drain is what settles
+/// the discard under the ablation. The `is_finished` assertion below is the
+/// guard on that staging, and it is not decorative: a first version of this test
+/// parked the CHANGES stream instead, which the multiplexer's own per-scope task
+/// owns rather than `detach`, and the detach had already RETURNED by the time
+/// the receiver was dropped. It passed both ablations.
+///
+/// How the window is ENTERED deterministically: `detach_inner` removes the slot,
+/// calls `begin_teardown`, publishes `Stop` and cancels the token with NO await
+/// between them, so the slot's absence from `engine.accounts` is proof that the
+/// flag is already set - under the current ordering. Under either
+/// ablation it is proof of the opposite, which is exactly the discrimination
+/// this test needs.
+///
+/// Ablation (both directions): delete the `begin_teardown` call, or move it
+/// below the worker awaits, and the departure records the loss and its discard
+/// request, the teardown drain settles it against a writer that is still alive,
+/// and the durable completion marker is gone - the assertion below fails. The
+/// positive control that the staging really can destroy the marker is
+/// `a_loss_with_no_walk_running_is_settled_by_detach` above: identical setup,
+/// with the drop one step EARLIER.
+/// `open_pages_stub`'s walk, cut to `windows` pages.
+///
+/// The full-length stub needs a lever to hold the walk still while the first
+/// consumer finishes draining, and every such lever in this file is the
+/// scheduler permit - which is unavailable to a test that parks the scope's poll
+/// worker, since the parked worker holds an admission of its own for as long as
+/// it is parked. A SHORT walk removes the need for one: the pages the first
+/// consumer leaves unread never reach `lane_capacity`, so the producer runs to
+/// its marker with no gating at all.
+fn short_open_pages_stub(scope: &CursorScope, windows: u32) -> common::StubAccount {
+    let mut stub = common::StubAccount::new(vec![scope.clone()]);
+    stub.partitioning = InventoryPartitioning::PageCount {
+        total: None,
+        page_size: Some(PAGE),
+    };
+    let end = windows * PAGE;
+    stub.partition_hook = Some(Arc::new(move |scope, partition| {
+        let from = match partition {
+            InventoryPartition::Page { from, .. } => *from,
+            other => panic!("the PageCount plan yields page partitions only: {other:?}"),
+        };
+        let items: Vec<InventoryEntry> = if from >= end {
+            Vec::new()
+        } else {
+            (0..PAGE).map(|n| entry(&format!("s{from}-{n}"))).collect()
+        };
+        vec![
+            InventoryEvent::Batch(
+                InventoryBatch::try_new(
+                    items,
+                    PageBoundary::Final,
+                    Duration::ZERO,
+                    0,
+                    None,
+                    InventoryCoverageReport::complete(CoverageDomain::full(scope.clone())),
+                )
+                .expect("a Final page with no checkpoint is boundary-valid"),
+            ),
+            InventoryEvent::Done(InventoryCompletion::complete(
+                CoverageDomain::full(scope.clone()),
+                None,
+            )),
+        ]
+    }));
+    stub
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_departure_inside_a_live_detach_records_no_loss() {
+    let account_id = AccountId("lane-departure-in-detach".to_owned());
+    let scope = CursorScope::Account;
+    let mut stub = short_open_pages_stub(&scope, 4);
+    // A SECOND scope, established via inventory, whose inventory stream parks.
+    // That is what holds `detach` inside its worker await: the deferred
+    // inventory worker is one of the workers detach joins, and the fusion
+    // stream poll has no shutdown arm. Releasing it right after the departure
+    // keeps the teardown drain's own budget intact - which matters, because the
+    // drain is what settles the discard under the ablation.
+    //
+    // A parked CHANGES stream will NOT do, and this was established by
+    // measurement, not by reading: the multiplexer owns its per-scope poll
+    // tasks and aborts them itself, so they are not among the workers detach
+    // waits on, and a first version of this test staged that way found the
+    // detach already FINISHED by the time it dropped the receiver - it passed
+    // with `begin_teardown` deleted.
+    let parked_scope = CursorScope::Type(bifrost_types::ObjectType::Contact);
+    stub.scopes.push(parked_scope.clone());
+    stub.establishment = |scope| match scope {
+        CursorScope::Type(_) => bifrost_types::CursorEstablishment::EstablishViaInventory,
+        other => {
+            bifrost_types::CursorEstablishment::Ready(common::cursor_for(other, b"stub-ready"))
+        }
+    };
+    let stall = Arc::new(tokio::sync::Notify::new());
+    stub.inventory_stall = Some(Arc::clone(&stall));
+    let stub = Arc::new(stub);
+    let store = Arc::new(InMemoryCheckpointStore::default());
+    let engine = Arc::new(
+        attach(
+            &account_id,
+            Arc::clone(&stub),
+            Arc::clone(&store),
+            // The file's ordinary `LANE`-bounded config. The bound is what holds
+            // the walk still while B subscribes: A reads one page and stops, and
+            // the producer parks `LANE` publications later with nobody eligible
+            // to free it but A.
+            config(None),
+            // The engine default, deliberately. The neighbouring tests run
+            // `global: 1` and hold a permit of their own to keep the walk still;
+            // neither is available here, because the parked poll worker holds an
+            // admission for as long as it is parked and would starve the walk
+            // outright under a budget of one. The short stub replaces that lever.
+            None,
+        )
+        .await,
+    );
+
+    // A takes one page and ACKNOWLEDGES NOTHING, here or later - every page it
+    // reads is a strandable hole, which is all this test needs of it. Stopping
+    // here parks the producer at the bound, which is what keeps the walk from
+    // running past B's subscription: B joins at the ring's tail, so a walk that
+    // finished first would leave it nothing to receive at all.
+    let mut first = engine
+        .account_changes_stream(&account_id)
+        .expect("attached account has a change stream");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let event = first.recv().await.expect("the broadcast stays open");
+            if partition_key(&event).is_some() {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the first page reaches the first consumer");
+
+    // B joins at the ring's tail - so the page A is holding is unreachable to it
+    // for ever - and carries the walk to a legitimately durable completion
+    // marker. A is drained (never acknowledged) on each pass, because A is the
+    // only receiver eligible to free the pages the producer is parked on; B's
+    // reads cannot, having joined behind them.
+    let mut second = engine
+        .account_changes_stream(&account_id)
+        .expect("attached account has a change stream");
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            while first.try_recv().is_ok() {}
+            let event = second.recv().await.expect("the broadcast stays open");
+            let Some(checkpoint) = backfill_checkpoint(&event) else {
+                continue;
+            };
+            let completion = checkpoint.partition.0 == b"complete";
+            engine
+                .ack_checkpoint(
+                    &account_id,
+                    event.scope.clone(),
+                    Checkpoint::Backfill(checkpoint.clone()),
+                    event.publication.clone(),
+                )
+                .await
+                .expect("the ack persists");
+            if completion {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the walk reaches its marker");
+    assert!(
+        completion_recorded(&store, &account_id, &scope).await,
+        "the marker is legitimately durable at this point"
+    );
+
+    // The parked worker has to BE parked, or detach has nothing to wait on.
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while stub
+            .inventory_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the deferred inventory worker enters its walk");
+
+    // Detach, and drop A once the call is demonstrably past the slot removal.
+    let detaching = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        let account_id = account_id.clone();
+        async move { engine.detach(&account_id).await }
+    });
+    // Probed through `open_skipped_scopes` rather than `account_changes_stream`:
+    // both answer off `engine.accounts`, but subscribing would add and then drop
+    // a numbered receiver on every poll, which is itself a departure and would
+    // perturb the ledger this test is reading.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.open_skipped_scopes(&account_id).is_ok() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the detach reaches its teardown window");
+    assert!(
+        !detaching.is_finished(),
+        "the whole test rests on detach still being IN its teardown window here; a \
+         staging that lets it finish first observes nothing at all"
+    );
+    // No await between the observation and the drop: the sweep runs inline on
+    // this task, so it cannot slip past the drain.
+    drop(first);
+    // Now let the parked worker go, so the rest of the teardown - the drain in
+    // particular - runs with its budget intact.
+    stall.notify_waiters();
+
+    tokio::time::timeout(Duration::from_secs(60), detaching)
+        .await
+        .expect("the detach is clamped, not hung")
+        .expect("the detach task does not panic")
+        .expect("detach succeeds");
+    drop(second);
+
+    assert!(
+        completion_recorded(&store, &account_id, &scope).await,
+        "a page in a consumer's hands when detach began is the consumer's, exactly as \
+         at a crash: the departure sweep is inert from the top of detach, so nothing \
+         records a loss and the marker stands"
+    );
+}
+
 /// A DETACH between the loss and the end of the walk still leaves the rows gone.
 ///
 /// NOTE on what this does and does not pin: it does NOT exercise the teardown

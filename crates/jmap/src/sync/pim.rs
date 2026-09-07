@@ -2441,39 +2441,152 @@ async fn search_email_ids<T: HttpTransport>(
         return Err(super::error::search_result_set_superseded(op));
     }
 
-    let total = response.total();
-    // The server echoes the position it actually served from; a server that
-    // clamped or adjusted the requested one makes its own echo the only
-    // truthful base for the next offset.
+    // A `total` that does not fit `u64` is reported, not dropped: silently
+    // converting it to `None` would switch the walk's termination mode
+    // without saying so.
+    let total = response
+        .total()
+        .map(|total| {
+            u64::try_from(total).map_err(|error| {
+                super::error::unsupported_error(
+                    op,
+                    None,
+                    format!("JMAP search total does not fit u64: {error}"),
+                )
+            })
+        })
+        .transpose()?;
     let served_from = response.position();
     let query_state = response.query_state().to_string();
     let ids = response.into_ids();
-    let served = i32::try_from(ids.len()).map_err(|_| schema_incompatible_search_cursor(op))?;
-    let next_position = served_from
-        .checked_add(served)
-        .ok_or_else(|| schema_incompatible_search_cursor(op))?;
+    let next_position = validate_search_page(cursor.position, served_from, ids.len(), total, op)?;
 
     // "The page came back full" is not evidence that more remains, and a
-    // short page is not evidence that nothing does: RFC 8620 lets a server
-    // return fewer ids than `limit` on a non-final page. `total` (which this
-    // query always requests via `calculateTotal`) is the authoritative
-    // answer; page fullness is only the fallback for a server that omits it.
+    // short page is not evidence that nothing does. `total` (which this query
+    // always requests via `calculateTotal`) is the authoritative answer; with
+    // no total the walk continues until an EMPTY page, the same rule the
+    // anchored contact and calendar walks use. See `validate_search_page` for
+    // why the envelope is checked before this test rather than after, and for
+    // why the "server ignores position" non-termination residual this comment
+    // used to accept is in fact detectable.
     let more = if ids.is_empty() {
         false
     } else if let Some(total) = total {
-        i64::from(next_position) < i64::try_from(total).unwrap_or(i64::MAX)
+        // `next_position` is non-negative (`validate_search_page` refused a
+        // negative echo), so `unsigned_abs` is an exact widening and the
+        // comparison happens in a domain that holds both sides. The previous
+        // `i64::try_from(total).unwrap_or(i64::MAX)` substituted a sentinel
+        // for an unrepresentable total instead of comparing it.
+        u64::from(next_position.unsigned_abs()) < total
     } else {
-        ids.len() == usize::try_from(limit).unwrap_or(usize::MAX)
+        true
     };
     let next_cursor = more.then(|| encode_position(next_position, &query_state, owner));
 
     Ok(Page {
         items: ids,
         next_cursor,
-        estimated_total: total.and_then(|v| u64::try_from(v).ok()),
+        estimated_total: total,
         failed_ids: Vec::new(),
         skipped_scopes: Vec::new(),
     })
+}
+
+/// Check a search page's envelope against the invariants RFC 8620 s5.5 gives
+/// it, and return the position a successor cursor would carry.
+///
+/// Four rules, each of which a conforming server satisfies for free. All are
+/// checked BEFORE the termination test, so a broken envelope can never
+/// present as a completed search - which is what the old
+/// `next_position >= total` arm did on its own.
+///
+/// - The echoed `position` is an UnsignedInt in the response schema; a
+///   negative one indexes nothing.
+/// - On a NONEMPTY page `position` is the index of the first returned id and
+///   `total` is the length of the whole result list, so
+///   `position + served <= total`. A response claiming to have served past
+///   the end of the list it just measured is CONTRADICTORY - it is not
+///   evidence that the walk finished, which is exactly how `>= total` alone
+///   read it.
+/// - On a NONEMPTY continuation (a positive requested position, which only a
+///   decoded cursor produces) the page must BEGIN where it was asked to. The
+///   pinned `queryState` was verified equal just above, so the result list is
+///   the same finite ordered list the previous page came from and there is
+///   nothing for a conforming server to clamp against; an echo that
+///   disagrees with the request means the window moved while the state did
+///   not. Trusting the echo instead is what let a server silently re-serve
+///   its own idea of the page.
+/// - The successor must advance past the position this page resumed from.
+///   Given the echo rule this is implied on a continuation and trivial on a
+///   first page (`served >= 1` from position 0), so it does not bite at this
+///   seam today; it is stated because it is the property TERMINATION rests
+///   on, and it is the rule a relaxation of the echo check would otherwise
+///   take away silently.
+///
+/// The last two are why the non-termination residual is detectable. It was
+/// documented as undetectable - "a server that omits `total` and ignores
+/// `position` is indistinguishable from an unbounded result set" - and that
+/// is false. The query state is PINNED, so the result list is stable and
+/// finite for the length of the walk; a walk that does not advance under an
+/// unmoved state is a server contract violation, not a long list.
+///
+/// A count or sum that does not fit the cursor's `i32` position is
+/// `SyncState(SchemaIncompatible)`: it is the CURSOR representation that
+/// cannot carry the value, and the caller's answer is to restart the search
+/// rather than to conclude anything about the server.
+fn validate_search_page(
+    requested: i32,
+    served_from: i32,
+    served: usize,
+    total: Option<u64>,
+    op: AccountOperation,
+) -> Result<i32, AccountError> {
+    if served_from < 0 {
+        return Err(super::error::contract_violation(
+            op,
+            None,
+            format!("Email/query answered with a negative position ({served_from})"),
+        ));
+    }
+    if served > 0 && requested > 0 && served_from != requested {
+        return Err(super::error::contract_violation(
+            op,
+            None,
+            format!(
+                "Email/query served page from position {served_from} for a continuation \
+                 requested at {requested}, under an unmoved queryState"
+            ),
+        ));
+    }
+    let served_i32 = i32::try_from(served).map_err(|_| schema_incompatible_search_cursor(op))?;
+    let next_position = served_from
+        .checked_add(served_i32)
+        .ok_or_else(|| schema_incompatible_search_cursor(op))?;
+    if served > 0 {
+        if let Some(total) = total
+            && u64::from(next_position.unsigned_abs()) > total
+        {
+            return Err(super::error::contract_violation(
+                op,
+                None,
+                format!(
+                    "Email/query served {served} ids from position {served_from} of a result \
+                     list it reports as {total} long"
+                ),
+            ));
+        }
+        if next_position <= requested {
+            return Err(super::error::contract_violation(
+                op,
+                None,
+                format!(
+                    "Email/query did not advance past position {requested}: the successor \
+                     would resume at {next_position}, under an unmoved queryState"
+                ),
+            ));
+        }
+    }
+    Ok(next_position)
 }
 
 /// A decoded search page cursor: where in the result order the next page
@@ -4164,6 +4277,9 @@ mod tests {
     struct PagingTransport {
         pages: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>>,
         positions: std::sync::Arc<std::sync::Mutex<Vec<i64>>>,
+        /// When set, every response echoes this `position` instead of the
+        /// one the request asked for - the "server ignores `position`" shape.
+        forced_position: Option<i64>,
     }
 
     impl PagingTransport {
@@ -4181,7 +4297,13 @@ mod tests {
             Self {
                 pages: std::sync::Arc::new(std::sync::Mutex::new(pages)),
                 positions: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                forced_position: None,
             }
+        }
+
+        fn echoing(mut self, position: i64) -> Self {
+            self.forced_position = Some(position);
+            self
         }
 
         fn positions(&self) -> Vec<i64> {
@@ -4212,7 +4334,7 @@ mod tests {
                 "accountId": call[1]["accountId"].clone(),
                 "queryState": page["queryState"].clone(),
                 "canCalculateChanges": false,
-                "position": position,
+                "position": self.forced_position.unwrap_or(position),
                 "ids": page["ids"].clone(),
             });
             if !page["total"].is_null() {
@@ -4260,7 +4382,10 @@ mod tests {
     fn paging_handles(
         pages: Vec<(Vec<&'static str>, Option<usize>, &'static str)>,
     ) -> PagingHandles {
-        let transport = PagingTransport::new(pages);
+        handles_for(PagingTransport::new(pages))
+    }
+
+    fn handles_for(transport: PagingTransport) -> PagingHandles {
         let client = crate::client::Client::with_transport(
             transport.clone(),
             search_session(),
@@ -4277,11 +4402,18 @@ mod tests {
         request
     }
 
-    /// The defect: `next_cursor` was derived from "the page came back
-    /// full". RFC 8620 lets a server answer a non-final page with fewer
-    /// ids than `limit`, and that walk then ended in Done-shaped silence -
-    /// the consumer sees a complete search that is missing most of its
-    /// hits. `total` is the authority on whether more remains.
+    /// The defect: `next_cursor` was derived from "the page came back full",
+    /// so a page short of its `limit` ended the walk in Done-shaped silence -
+    /// the consumer sees a complete search missing most of its hits. `total`
+    /// is the authority on whether more remains.
+    ///
+    /// Note the fixture is a NON-CONFORMING server, deliberately. RFC 8620
+    /// s5.5 does not permit an arbitrary short non-final page (`ids` runs to
+    /// the end of the results or to the effective limit), which is what a
+    /// wrong justification in three comments and the reference used to
+    /// claim. The rule survives the correction: fullness is still not a
+    /// completion test, because it would rest on a `limit` echo a server may
+    /// omit, and `total` costs nothing to prefer.
     #[tokio::test]
     async fn a_short_non_final_page_still_yields_a_next_cursor() {
         let (primary, foreign, _transport) =
@@ -4316,30 +4448,50 @@ mod tests {
         assert!(page.next_cursor.is_none(), "position + served == total");
     }
 
-    /// With no `total` at all there is nothing better than page fullness,
-    /// and that fallback must stay: refusing to page a server that omits
-    /// `total` would truncate every search against it.
+    /// With no `total` the walk continues until an EMPTY page. Page fullness
+    /// used to be the fallback here and it truncated: the FIRST short page
+    /// ended the search in Done-shaped silence - the same defect
+    /// `a_short_non_final_page_still_yields_a_next_cursor` pins for the
+    /// total-bearing case, surviving on the other branch. The honest argument
+    /// for continue-until-empty is that an absent `total` is not evidence of
+    /// completion while a conforming empty page is conclusive; it is NOT
+    /// "the RFC permits an arbitrary short non-final page", which is false.
+    ///
+    /// The rule transfers from the anchored PIM walks to this positional
+    /// cursor because the successor position is the server's own echo plus
+    /// what it served, and `validate_search_page` refuses an echo that
+    /// disagrees with the request, so it advances by at least one per
+    /// nonempty page.
+    ///
+    /// Bite check: with the fullness fallback restored, the second assertion
+    /// fails - page two is short, so the walk would stop with M4 unread.
     #[tokio::test]
-    async fn a_server_that_omits_total_still_pages_on_fullness() {
+    async fn a_server_that_omits_total_pages_until_an_empty_page() {
         let (primary, foreign, transport) = paging_handles(vec![
             (vec!["M1", "M2"], None, "q-1"),
             (vec!["M3"], None, "q-1"),
+            (vec!["M4"], None, "q-1"),
+            (vec![], None, "q-1"),
         ]);
 
-        let page = search_messages(primary.clone(), Arc::clone(&foreign), search_with_limit(2))
-            .await
-            .expect("search succeeds");
-        let mut resume = search_with_limit(2);
-        resume.page_cursor = Some(
-            page.next_cursor
-                .expect("a full page with no total pages on"),
-        );
-        let second = search_messages(primary, foreign, resume)
-            .await
-            .expect("resume succeeds");
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = None;
+        for _ in 0..4 {
+            let mut request = search_with_limit(2);
+            request.page_cursor = cursor;
+            let page = search_messages(primary.clone(), Arc::clone(&foreign), request)
+                .await
+                .expect("search succeeds");
+            seen.extend(page.items.iter().map(|id| id.0.clone()));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
 
-        assert_eq!(transport.positions(), vec![0, 2]);
-        assert!(second.next_cursor.is_none(), "a short page ends it");
+        assert_eq!(seen, vec!["M1", "M2", "M3", "M4"]);
+        assert!(cursor.is_none(), "the empty page is what ends it");
+        assert_eq!(transport.positions(), vec![0, 2, 3, 4]);
     }
 
     /// The defect: page 2 was taken from whatever order the server had at
@@ -4399,6 +4551,132 @@ mod tests {
             vec![ObjectId("M3".to_string()), ObjectId("M4".to_string())]
         );
         assert!(second.next_cursor.is_none(), "total is exhausted");
+    }
+
+    /// BITES, at the envelope level. All four refusals in
+    /// `validate_search_page`, each stated as the smallest input that
+    /// separates it from the old behaviour.
+    ///
+    /// Bite check per row, against the code this replaced (`served_from`
+    /// trusted verbatim, `next_position >= total` the only test):
+    ///
+    /// - negative echo: `-4 + 2 = -2`, which compares below every total, so
+    ///   the walk minted `2:-2:q-1` and paged on from a nonsense base.
+    /// - `2 + 2 > 3`: `4 >= 3` ended the walk and reported it complete.
+    /// - echo 0 for a page requested at 2: accepted silently, and since the
+    ///   successor is `0 + 2 = 2` the walk re-requests position 2 forever.
+    ///
+    /// The advance rule is a real backstop rather than a restatement: on the
+    /// "echo that ignores the request" row it catches the same envelope on
+    /// its own (`0 + 2 <= 2`), so removing EITHER rule leaves that row
+    /// refused. The echo rule is the strictly stronger of the two - the
+    /// "moved the window" row advances to 7 and only the echo rule sees it -
+    /// and it runs first, which is why the advance rule has no row of its own
+    /// that reaches it through `search_email_ids`. It is exercised here at
+    /// the function, and this doc says that rather than implying a coverage
+    /// it does not have.
+    #[test]
+    fn a_search_page_envelope_is_validated_before_it_can_end_the_walk() {
+        let op = AccountOperation::Search;
+        for (case, requested, served_from, served, total) in [
+            ("a negative position echo", 0, -4, 2, Some(50_u64)),
+            ("a negative position echo, no total", 0, -4, 2, None),
+            ("served past the reported total", 0, 2, 2, Some(3)),
+            ("served past a zero total", 0, 0, 1, Some(0)),
+            ("an echo that ignores the request", 2, 0, 2, None),
+            ("an echo that moved the window", 2, 5, 2, Some(50)),
+        ] {
+            let error =
+                validate_search_page(requested, served_from, served, total, op).expect_err(case);
+            assert!(
+                matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::Protocol(
+                        bifrost_types::ProtocolErrorKind::ContractViolation
+                    )
+                ),
+                "{case} must be a ProviderContractViolation, got {:?}",
+                error.kind()
+            );
+        }
+
+        // An EMPTY page is exempt from all three content rules: it carries no
+        // first id for `position` to index and it terminates the walk anyway.
+        // Refusing it here would turn every ordinary end-of-list into an
+        // error.
+        assert_eq!(
+            validate_search_page(4, 4, 0, None, op).expect("an empty page is a legitimate ending"),
+            4
+        );
+        assert_eq!(
+            validate_search_page(4, 99, 0, Some(4), op).expect("so is an empty page past the end"),
+            99
+        );
+
+        // The controls: conforming envelopes still produce a successor.
+        assert_eq!(
+            validate_search_page(0, 0, 2, Some(9), op).expect("valid first page"),
+            2
+        );
+        assert_eq!(
+            validate_search_page(2, 2, 2, Some(4), op).expect("valid continuation"),
+            4
+        );
+        assert_eq!(
+            validate_search_page(2, 2, 1, None, op).expect("valid, total-less continuation"),
+            3
+        );
+    }
+
+    /// BITES end to end, and this is the residual `reference/jmap.md` used to
+    /// record as undetectable: a server that omits `total` and IGNORES
+    /// `position` re-serves its first page forever, and the walk never
+    /// terminates.
+    ///
+    /// It is detectable because the `queryState` is pinned. This server
+    /// answers `q-1` on both pages, so by its own account the result list is
+    /// one stable finite list - and a stable finite list cannot answer a
+    /// request for position 2 with the rows that live at position 0.
+    ///
+    /// Bite check: with the echo rule removed the advance rule still refuses
+    /// this page (`0 + 2` does not pass 2); with BOTH removed, page two
+    /// mints `2:2:q-1` again and the caller loops on the same two ids
+    /// forever, which is precisely the behaviour the reference used to
+    /// document as unavoidable.
+    #[tokio::test]
+    async fn a_server_that_ignores_position_cannot_page_forever() {
+        let (primary, foreign, transport) = handles_for(
+            PagingTransport::new(vec![
+                (vec!["M1", "M2"], None, "q-1"),
+                (vec!["M1", "M2"], None, "q-1"),
+            ])
+            .echoing(0),
+        );
+
+        let page = search_messages(primary.clone(), Arc::clone(&foreign), search_with_limit(2))
+            .await
+            .expect("first page succeeds");
+        let mut resume = search_with_limit(2);
+        resume.page_cursor = Some(page.next_cursor.expect("more may remain"));
+
+        let error = search_messages(primary, foreign, resume)
+            .await
+            .expect_err("a re-served page must not extend the walk");
+        assert!(
+            matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation
+                )
+            ),
+            "got {:?}",
+            error.kind()
+        );
+        assert_eq!(
+            transport.positions(),
+            vec![0, 2],
+            "the walk did ask for the second page"
+        );
     }
 
     /// The cursor codec: version, position and an opaque `queryState`

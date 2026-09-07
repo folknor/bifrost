@@ -701,8 +701,49 @@ impl SyncEngine {
         }
 
         let current = slot.current.load_full();
-        if let Err(e) = current.close().await {
-            tracing::warn!(target: "bifrost.sync.changes", error=?e, "account close failed");
+        // Clamped, like every other await in this teardown: a provider whose
+        // `close()` never returns must not hang `detach` itself, which is the
+        // one call a consumer has for getting rid of an account.
+        //
+        // The budget is a FRESH `detach_timeout` rather than the `deadline` the
+        // worker awaits and the discard drain share, and that is deliberate.
+        // Detach has always been "up to `detach_timeout` of worker awaits PLUS
+        // `close()`", so sharing the deadline would silently take the close
+        // budget away whenever a straggler worker had already spent it: a
+        // perfectly healthy close needing one wire round trip would be reported
+        // as hung and its connection abandoned, on a path where nothing was
+        // wrong. The clamp exists to bound a hang, not to starve a slow close.
+        //
+        // What a timed-out close MEANS here is exactly what a FAILED close
+        // already means, and that is the reason it is treated identically:
+        // warn, and carry on to the registry cleanup with the handle dropped
+        // alongside the slot. There is no third option available to it. The
+        // slot left `self.accounts` at the top of this function, so no caller
+        // can reach the handle for a retry; `detach`'s contract does not report
+        // close failure to its caller, since the account is gone either way;
+        // and retaining the handle for a later attempt would mean keeping a
+        // dead incarnation's connection reachable under an id a fresh `attach`
+        // may already have claimed. Provider-side resources that a hung close
+        // did not release are in the same position as those a failed close did
+        // not release: the drop of the last `Arc<dyn Account>` is what is left,
+        // and the log line is what tells an operator it happened. The two get
+        // DISTINCT messages, because "the provider refused" and "the provider
+        // never answered" want different follow-up.
+        match tokio::time::timeout(self.config.detach_timeout, current.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(target: "bifrost.sync.changes", error=?e, "account close failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    timeout = ?self.config.detach_timeout,
+                    "account close exceeded the detach timeout; abandoning the handle. \
+                     Provider-side resources it holds are released only when the \
+                     connection itself drops"
+                );
+            }
         }
         // Drop the push registry records for this incarnation.
         //

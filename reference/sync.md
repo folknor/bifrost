@@ -140,6 +140,22 @@ by its spawn position. It IS spawned first, and the predecessor read
 teardown order that any reordering of the spawn block would have broken
 silently.
 
+`Account::close()` is clamped too, and every await in the teardown now is. Its
+budget is a FRESH `detach_timeout` rather than the remainder of the deadline the
+worker awaits and the discard drain share: detach has always been "worker awaits
+PLUS the close", and sharing the deadline would take the close budget away
+whenever a straggler had already spent it, reporting a healthy close that needs
+one round trip as hung. A TIMED-OUT close is treated exactly as a FAILED one -
+warn, drop the handle, carry on to the registry cleanup, report success to the
+caller - because no other outcome is available to it: the slot left
+`engine.accounts` at the top, so nothing can reach the handle for a retry, and
+retaining it would keep a dead incarnation's connection reachable under an id a
+fresh `attach` may already have claimed. The two get distinct log lines, since
+"the provider refused" and "the provider never answered" want different
+follow-up. Pinned by `tests/detach_close_clamp.rs`, whose three tests separate a
+clamped hang from a refusal by elapsed budget and by whether the close future
+ever completed.
+
 The whole teardown runs under the same `lifecycle_inflight` guard
 `attach` takes, claimed together with the slot removal under one lock
 acquisition. The slot leaves `engine.accounts` at the top while the
@@ -1127,6 +1143,26 @@ returns - records no loss and requests no discard; before the flag, the two
 halves of that window already had one outcome (a request the departed writer
 could not act on, or no sweep at all because the receiver's weak handle no
 longer upgrades), and the flag makes the whole window behave like its end.
+The ORDERING that puts the flag there - `begin_teardown` above the boundary
+`Stop`, the shutdown cancel and the worker awaits, with no await between the
+slot removal and it - is pinned separately from the flag's effect, by
+`tests/backfill_lane_flow_control.rs::a_departure_inside_a_live_detach_records_no_loss`.
+The unit test beside the sweep calls `begin_teardown` directly, so deleting the
+production call or moving it below the worker shutdown leaves it green; the
+integration test drives the real `detach`, holds it inside its worker await with
+a parked deferred-inventory walk, and drops a receiver holding an
+unacknowledged page into that window. Both ablations were run and both fail it.
+
+One mechanical note that cost a round: parking a CHANGES stream does not hold
+`detach` at all. The multiplexer spawns its per-scope poll tasks itself and
+aborts them; the workers `detach` joins are the ones `attach` stored, so the
+straggler has to be one of those - the deferred-inventory worker, the backfill
+orchestrator, the multiplexer task itself. A test that stages a window must
+assert it is really in one (`JoinHandle::is_finished`), because a detach that
+has already returned passes every such test. Its positive control is
+`a_loss_with_no_walk_running_is_settled_by_detach`, the identical setup with the
+drop one step earlier, which does destroy the completion marker.
+
 Ruled 2026-09-06, close by contract: the alternative was a durable "scope lost
 pages" row, a new `CheckpointStore` method every downstream store implements,
 bought for a consumer already outside the persist-then-acknowledge contract.
