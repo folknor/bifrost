@@ -1873,7 +1873,14 @@ fn apply_sync_report(
         {
             continue;
         }
-        if matches!(entry.status, Some(404 | 410)) {
+        // A member the server positively declared a non-event (RFC 4791
+        // `component=` on its content type) is treated as absent: it never
+        // enters the snapshot, and one that slipped in earlier - reported as a
+        // created event that hydrated to nothing, on a poll before the
+        // evidence was read - leaves it now with the Destroyed the consumer
+        // needs to drop the phantom. A member with NO such declaration is
+        // admitted exactly as before; see `parse::declared_non_vevent`.
+        if matches!(entry.status, Some(404 | 410)) || entry.non_vevent {
             // Only emit a Destroyed event for an href the prior snapshot
             // actually held. A 404/410 sync-report entry for an unknown
             // href (a resource created and deleted between polls, or one
@@ -1940,7 +1947,19 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
     };
     let rrule = event.recurrence.rrule.as_deref().unwrap_or_default();
     if rrule.is_empty() {
-        // Non-recurring: plain interval overlap.
+        // Non-recurring: RFC 4791 s9.9's overlap rule, which has TWO shapes.
+        // An event with duration overlaps a `[start, end)` window when
+        // `start < event_end && end > event_start`. A zero-length instant (no
+        // DTEND, no DURATION, not all-day - `time_interval` collapses it to
+        // `event_end == event_start`) overlaps when `start <= DTSTART && end >
+        // DTSTART`: the instant sitting EXACTLY on the window's start is
+        // inside it. The strict rule alone dropped that event, which the
+        // server's time-range REPORT had correctly returned. Ruled dav-F9,
+        // 2026-09-07; pinned by `range_filter_includes_a_zero_length_event_on_
+        // the_window_start` and its two boundary siblings.
+        if event_start == event_end {
+            return range_start <= event_start && event_start < range_end;
+        }
         return event_start < range_end && event_end > range_start;
     }
     // Recurring master: its own interval can sit entirely before the
@@ -2989,6 +3008,46 @@ mod tests {
         ));
     }
 
+    /// RFC 4791 s9.9: a zero-length instant on the window's start is inside
+    /// the window (`start <= DTSTART && end > DTSTART`). Ablation: the
+    /// duration rule alone (`event_end > range_start`) drops it.
+    #[test]
+    fn range_filter_includes_a_zero_length_event_on_the_window_start() {
+        let event = event("2026-06-02T00:00:00Z", "2026-06-02T00:00:00Z", false);
+
+        assert!(event_in_range(
+            &event,
+            &time("2026-06-02T00:00:00Z"),
+            &time("2026-06-03T00:00:00Z")
+        ));
+    }
+
+    /// The same instant on the window's END is outside it: the window is
+    /// half-open, and an event with duration ending there is excluded too.
+    #[test]
+    fn range_filter_excludes_a_zero_length_event_on_the_window_end() {
+        let event = event("2026-06-03T00:00:00Z", "2026-06-03T00:00:00Z", false);
+
+        assert!(!event_in_range(
+            &event,
+            &time("2026-06-02T00:00:00Z"),
+            &time("2026-06-03T00:00:00Z")
+        ));
+    }
+
+    /// And one instant before the window starts is outside it, so the
+    /// inclusive rule is a boundary rule and not a widening.
+    #[test]
+    fn range_filter_excludes_a_zero_length_event_just_before_the_window() {
+        let event = event("2026-06-01T23:59:59Z", "2026-06-01T23:59:59Z", false);
+
+        assert!(!event_in_range(
+            &event,
+            &time("2026-06-02T00:00:00Z"),
+            &time("2026-06-03T00:00:00Z")
+        ));
+    }
+
     #[test]
     fn range_filter_excludes_event_ending_at_window_start() {
         let event = event("2026-06-01", "2026-06-02", true);
@@ -3458,16 +3517,19 @@ mod tests {
                     uri: "https://dav.example.test/cal/one.ics".to_string(),
                     etag: Some("new".to_string()),
                     status: Some(200),
+                    non_vevent: false,
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/two.ics".to_string(),
                     etag: None,
                     status: Some(404),
+                    non_vevent: false,
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/three.ics".to_string(),
                     etag: Some("created".to_string()),
                     status: Some(200),
+                    non_vevent: false,
                 },
             ],
         );
@@ -3521,11 +3583,13 @@ mod tests {
                     uri: "https://dav.example.test/cal/one.ics".to_string(),
                     etag: None,
                     status: Some(403),
+                    non_vevent: false,
                 },
                 crate::parse::CalDavSyncEntry {
                     uri: "https://dav.example.test/cal/two.ics".to_string(),
                     etag: None,
                     status: Some(507),
+                    non_vevent: false,
                 },
             ],
         );
@@ -3641,10 +3705,82 @@ mod tests {
                 uri: "https://dav.example.test/cal/ghost.ics".to_string(),
                 etag: None,
                 status: Some(404),
+                non_vevent: false,
             }],
         );
 
         assert!(changes.is_empty());
         assert_eq!(snapshot.entries.len(), 1);
+    }
+
+    /// A sync member the server declares a non-event never enters the
+    /// snapshot, and one that slipped in on an earlier poll leaves it with a
+    /// Destroyed. The evidence is positive only: an unlabelled member is
+    /// admitted exactly as before. Ablation: without the `non_vevent` arm the
+    /// task is Created and the phantom stays.
+    #[test]
+    fn a_declared_task_is_dropped_from_the_sync_snapshot() {
+        let mut snapshot = EventSnapshot {
+            calendar_url: "https://dav.example.test/cal/".to_string(),
+            sync_token: Some("token-1".to_string()),
+            entries: vec![EventSnapshotEntry {
+                uri: "https://dav.example.test/cal/phantom.ics".to_string(),
+                etag: Some("leaked".to_string()),
+            }],
+            failed_hrefs: Vec::new(),
+        };
+
+        let changes = apply_sync_report(
+            &mut snapshot,
+            vec![
+                crate::parse::CalDavSyncEntry {
+                    uri: "https://dav.example.test/cal/task.ics".to_string(),
+                    etag: Some("t1".to_string()),
+                    status: Some(200),
+                    non_vevent: true,
+                },
+                crate::parse::CalDavSyncEntry {
+                    uri: "https://dav.example.test/cal/phantom.ics".to_string(),
+                    etag: Some("leaked-2".to_string()),
+                    status: Some(200),
+                    non_vevent: true,
+                },
+                crate::parse::CalDavSyncEntry {
+                    uri: "https://dav.example.test/cal/unlabelled.ics".to_string(),
+                    etag: Some("u1".to_string()),
+                    status: Some(200),
+                    non_vevent: false,
+                },
+            ],
+        );
+
+        let kinds: Vec<(String, ObjectChangeKind)> = changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::ObjectChange(object) => Some((object.id.0.clone(), object.kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    "https://dav.example.test/cal/phantom.ics".to_string(),
+                    ObjectChangeKind::Destroyed,
+                ),
+                (
+                    "https://dav.example.test/cal/unlabelled.ics".to_string(),
+                    ObjectChangeKind::Created,
+                ),
+            ]
+        );
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://dav.example.test/cal/unlabelled.ics"]
+        );
     }
 }

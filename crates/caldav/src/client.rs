@@ -727,6 +727,10 @@ fn calendar_text_query_body(property: &str, query: &str) -> String {
     )
 }
 
+/// The `sync-collection` REPORT body. Asks for `getcontenttype` beside the
+/// etag: RFC 6578 has no filter grammar, so a `component=` parameter on the
+/// content type (RFC 4791 s5.2.6) is the only way this lane can learn that a
+/// changed member is a task and not an event. See `parse::declared_non_vevent`.
 fn sync_collection_body(sync_token: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
@@ -735,6 +739,7 @@ fn sync_collection_body(sync_token: &str) -> String {
   <D:sync-level>1</D:sync-level>\n\
   <D:prop>\n\
     <D:getetag/>\n\
+    <D:getcontenttype/>\n\
   </D:prop>\n\
 </D:sync-collection>",
         escape_xml(sync_token)
@@ -941,6 +946,19 @@ pub(crate) fn status_error(
     bifrost_dav_core::status_error(operation, status, body, DAV)
 }
 
+/// The scope for a failure on ONE event resource.
+///
+/// `ErrorScope::Calendar` carries a COLLECTION href everywhere else in this
+/// crate (`reference/caldav.md`, "A CalDAV `CalendarId` IS the resolved
+/// collection href"), and here it carries the event's URL. That is a deliberate
+/// overload, ruled dav-F8 on 2026-09-07: `bifrost-types` has no
+/// `ErrorScope::Event`, adding a public variant to a `#[non_exhaustive]` enum
+/// every consumer matches on was judged not worth it for a diagnostic, and the
+/// single-resource paths (`fetch_event_from_url`, the dropped create in
+/// `event_create`) need SOME scope so a `Reconcile(CheckTarget)` names a
+/// checkable target. A consumer routing on this scope must not assume the id
+/// is a collection; the URL's final segment is the resource. What would reopen
+/// it: an engine-side use of the scope that has to tell the two apart.
 pub(crate) fn event_scope(id: impl Into<String>) -> ErrorScope {
     ErrorScope::Calendar {
         id: (id.into()).into(),
@@ -2538,6 +2556,10 @@ mod tests {
         assert!(body.contains("<D:sync-token>token&amp;1</D:sync-token>"));
         assert!(body.contains("<D:sync-level>1</D:sync-level>"));
         assert!(body.contains("<D:getetag/>"));
+        assert!(
+            body.contains("<D:getcontenttype/>"),
+            "the content type is the sync lane's only component evidence"
+        );
     }
 
     #[test]

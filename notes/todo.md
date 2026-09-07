@@ -208,36 +208,6 @@ any item; some may already be obsolete.
 
 ## bifrost-caldav / bifrost-carddav
 
-- **caldav-F1 (residual).** The snapshot lanes are now VEVENT-filtered on
-  the server (`list_event_hrefs_filtered`, 2026-09-06), so a VTODO no
-  longer enters the cursor at establish, inventory, or the polling
-  changes fallback. What remains is the `sync-collection` lane: RFC 6578
-  has no filter grammar, so a task resource created or modified between
-  two token polls is still reported once as a created/updated event
-  change that hydrates to nothing, and then sits in the snapshot.
-  Closing it needs positive evidence that a newly-reported href is not a
-  VEVENT, and the cheap shapes each open a hole: a comp-filter query run
-  after the sync report cannot tell "not a VEVENT" from "created after
-  the query ran", and dropping the href on that evidence loses a real
-  event permanently, since the token has already advanced past it. The
-  correct shapes are an unfiltered listing plus a filtered query (two
-  round trips on any poll that creates, ordered listing-then-filter so a
-  mid-flight creation lands in neither drop set), or a durable per-href
-  classification mark in the cursor payload - which is a version-3
-  envelope. Neither is obviously worth its cost against a leak this
-  narrow; needs a ruling before it is built.
-- **caldav-F2 (filed 2026-09-06, lateral).** `getcontenttype` is requested
-  on every depth-1 event PROPFIND (`PROPFIND_EVENTS` in `client.rs`) and
-  staged and committed by `EventProps` in `parse.rs`
-  (`EventProps::content_type`), and then read by nothing at all - grep for
-  `content_type` across `crates/caldav` and `crates/dav-core` returns only
-  the declaration, the commit and the parse arm. So it is a property on
-  the wire and a field in the parser that no lane consumes. Two ways out
-  and they point opposite directions: drop it from the request and the
-  `PropSet`, or USE it - RFC 4791 s5.2 lets a server answer
-  `text/calendar; component=vevent`, which would be free component-type
-  evidence for the caldav-F1 residual above on the servers that emit it
-  (SabreDAV / Baikal do). Decide against F1 rather than in isolation.
 - **dav-F3 (P3, filed 2026-09-06, cold review).** `multistatus.rs`
   `member_status_code` reports `failed_statuses.first()`, so a member
   answering `<propstat 404: getcontenttype>` then `<propstat 403: getetag>`
@@ -281,29 +251,6 @@ any item; some may already be obsolete.
   `CONTACT_PAGE_SIZE` (250). Neither reference states the CalDAV default, so
   a consumer omitting `limit` gets an unbounded page from one crate and a
   250-entry page from its twin with nothing documenting either.
-- **dav-F8 (P4, filed 2026-09-06, cold review).** `ErrorScope::Calendar {
-  id }` carries an EVENT url on the single-resource get paths -
-  `fetch_event_from_url` decorates with `event_scope(event.0)` - while
-  `reference/caldav.md` promises that scope carries the collection href.
-  There is no `ErrorScope::Event`, so this is a modelling gap in
-  `bifrost-types`, not a local mistake: either the scope gains an event
-  variant or the doc admits the overload. Adding a public variant needs an
-  owner ruling.
-- **dav-F9 (P4, filed 2026-09-06, cold review).** `event_in_range` collapses
-  a missing DTEND to zero length (`time_interval` defaults `end` to `start`)
-  and then tests strict overlap (`event_end > range_start`), so a timed
-  event with no DTEND starting EXACTLY at the window start is dropped.
-  RFC 4791 s9.9 includes it - a zero-length instant at `start` overlaps a
-  `[start, end)` window. One-character fix (`>=`) but it changes the
-  boundary for genuinely zero-length events generally, so it wants a
-  ruling and a pinned pair of tests.
-- **dav-F10 (P4, filed 2026-09-06, cold review).** A transiently degraded
-  cursor listing - `filter_unsupported` reads a 405 hiccup as "the server
-  will not run the filter" and degrades to the unfiltered PROPFIND walk -
-  puts VTODO hrefs into the snapshot as Created, and the next successful
-  filtered REPORT reports them Destroyed. The degradation is deliberate and
-  right; the flap is the cost, and neither reference mentions it. Related
-  to caldav-F1 above and should be decided with it.
 - **dav-F11 (P4, filed 2026-09-06, cold review).** `DavDispatch::resolve_url`
   joins a relative id two different ways: `Url::join` on the parsed base
   (which REPLACES the base's last path segment) and, when the base does not

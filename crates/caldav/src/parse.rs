@@ -130,6 +130,43 @@ pub(crate) struct CalDavSyncEntry {
     pub(crate) uri: String,
     pub(crate) etag: Option<String>,
     pub(crate) status: Option<u16>,
+    /// The server POSITIVELY declared this member something other than a
+    /// VEVENT, through a `component=` parameter on its `getcontenttype`
+    /// (RFC 4791 s5.2.6; SabreDAV and Baikal emit it). The sync-collection
+    /// lane cannot be component-filtered - RFC 6578 has no filter grammar - so
+    /// this is the only evidence it gets, and it is honoured only in the
+    /// positive: a bare `text/calendar`, or no content type at all, says
+    /// nothing and the member is admitted as before. See
+    /// [`declared_non_vevent`].
+    pub(crate) non_vevent: bool,
+}
+
+/// Whether a `getcontenttype` value names a component other than VEVENT.
+///
+/// `text/calendar; component=vtodo` is positive evidence that the resource is
+/// not an event, and it is the only evidence the unfilterable lanes have: the
+/// `sync-collection` REPORT (RFC 6578 has no filter grammar) and the depth-1
+/// PROPFIND the cursor listing degrades to when a server refuses the VEVENT
+/// `comp-filter`. Dropping a member on this evidence loses nothing: a server
+/// that labels a resource `component=vtodo` will never return it from the
+/// filtered query either, so the two lanes agree instead of flapping. Absent
+/// or unparameterised content types are NOT evidence, and answer `false`; the
+/// residual leak on servers that emit no parameter is documented in
+/// `reference/caldav.md`.
+pub(crate) fn declared_non_vevent(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    content_type.split(';').skip(1).any(|parameter| {
+        let Some((name, value)) = parameter.split_once('=') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("component")
+            && !value
+                .trim()
+                .trim_matches('"')
+                .eq_ignore_ascii_case("vevent")
+    })
 }
 
 impl CalendarCollection {
@@ -373,6 +410,12 @@ impl MultiStatusSink for EventListingSink {
 
     fn finish_response(&mut self, parts: &ResponseParts<Self::Props>) {
         if let Some(href) = parts.entry_href() {
+            // The degrade lane: this listing runs only when the server refused
+            // the VEVENT `comp-filter`, so the content type is the one piece of
+            // component evidence left. Honoured in the positive only.
+            if declared_non_vevent(parts.props().content_type.as_deref()) {
+                return;
+            }
             self.listing.entries.push(CalDavEventEntry {
                 uri: href.to_string(),
                 etag: parts.props().etag.clone(),
@@ -473,8 +516,10 @@ impl MultiStatusSink for SyncReportSink {
         text: &str,
         parts: &mut ResponseParts<Self::Props>,
     ) {
-        if let (Some("prop"), "getetag") = (parent, name) {
-            parts.staged_mut().etag = normalize_etag(text);
+        match (parent, name) {
+            (Some("prop"), "getetag") => parts.staged_mut().etag = normalize_etag(text),
+            (Some("prop"), "getcontenttype") => parts.staged_mut().content_type = trimmed(text),
+            _ => {}
         }
     }
 
@@ -496,6 +541,7 @@ impl MultiStatusSink for SyncReportSink {
             uri: href.to_string(),
             etag: parts.props().etag.clone(),
             status: parts.member_status_code(),
+            non_vevent: declared_non_vevent(parts.props().content_type.as_deref()),
         });
     }
 }
@@ -1289,14 +1335,61 @@ END:VCALENDAR</C:calendar-data>
                     uri: "/cal/one.ics".to_string(),
                     etag: Some("new".to_string()),
                     status: None,
+                    non_vevent: false,
                 },
                 CalDavSyncEntry {
                     uri: "/cal/two.ics".to_string(),
                     etag: None,
                     status: Some(404),
+                    non_vevent: false,
                 },
             ]
         );
+    }
+
+    /// A `component=` parameter on `getcontenttype` is the only component
+    /// evidence the unfilterable lanes get, and it is read in the positive
+    /// only: `vtodo` marks the member, `vevent`, a bare `text/calendar` and no
+    /// content type at all do not.
+    #[test]
+    fn a_declared_component_marks_non_vevent_members_on_both_unfiltered_lanes() {
+        assert!(declared_non_vevent(Some("text/calendar; component=vtodo")));
+        assert!(declared_non_vevent(Some(
+            "text/calendar; charset=utf-8; Component=\"VJOURNAL\""
+        )));
+        assert!(!declared_non_vevent(Some(
+            "text/calendar; component=VEVENT"
+        )));
+        assert!(!declared_non_vevent(Some("text/calendar")));
+        assert!(!declared_non_vevent(None));
+
+        let sync = parse_sync_collection_report(
+            r#"<D:multistatus xmlns:D="DAV:"><D:sync-token>t</D:sync-token><D:response><D:href>/cal/task.ics</D:href><D:propstat><D:prop><D:getetag>"a"</D:getetag><D:getcontenttype>text/calendar; component=vtodo</D:getcontenttype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response><D:response><D:href>/cal/one.ics</D:href><D:propstat><D:prop><D:getetag>"b"</D:getetag><D:getcontenttype>text/calendar</D:getcontenttype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid sync report");
+        assert_eq!(
+            sync.entries
+                .iter()
+                .map(|entry| (entry.uri.as_str(), entry.non_vevent))
+                .collect::<Vec<_>>(),
+            vec![("/cal/task.ics", true), ("/cal/one.ics", false)],
+            "the sync lane carries the evidence to the snapshot, which decides"
+        );
+
+        let listing = parse_propfind_events(
+            r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/cal/task.ics</D:href><D:propstat><D:prop><D:getetag>"a"</D:getetag><D:getcontenttype>text/calendar; component=vtodo</D:getcontenttype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response><D:response><D:href>/cal/one.ics</D:href><D:propstat><D:prop><D:getetag>"b"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid listing");
+        assert_eq!(
+            listing
+                .entries
+                .iter()
+                .map(|entry| entry.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/cal/one.ics"],
+            "the degrade listing drops a declared task and keeps an unlabelled member"
+        );
+        assert!(listing.failed.is_empty(), "a dropped task is not a failure");
     }
 
     #[test]

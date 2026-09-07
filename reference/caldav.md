@@ -254,10 +254,22 @@ Supported calendar primitives:
   spec-correct server 404s.
   A CalDAV `CalendarId` IS the resolved collection href used by the account;
   `Calendar.id`, `Calendar.native_id`, event `calendar_id`, request routing,
-  and `ErrorScope::Calendar` all carry that same URL identity.
+  and `ErrorScope::Calendar` all carry that same URL identity - with one
+  documented overload: on the single-resource paths (`fetch_event_from_url`
+  behind `event_get` / `event_update` / `event_rsvp`, and the dropped-create
+  scope in `event_create`) `ErrorScope::Calendar` carries the EVENT's URL,
+  because `bifrost-types` has no event scope and a `Reconcile(CheckTarget)`
+  needs a checkable target. Ruled dav-F8 (2026-09-07): the overload is
+  admitted rather than a public variant added; the reasoning is at
+  `client::event_scope`.
 - `events_in_range` - `calendar-query` `REPORT` with a CalDAV
   `time-range` filter, followed by local overlap filtering as a defensive
-  guard. Invalid time bounds fail locally
+  guard. The guard applies RFC 4791 s9.9's two overlap shapes: an event with
+  duration overlaps a half-open `[start, end)` window when it starts before
+  `end` and ends after `start`; a zero-length instant (no DTEND, not all-day)
+  overlaps when `start <= DTSTART < end`, so an instant sitting exactly on the
+  window's start is IN the window (dav-F9, ruled 2026-09-07; the strict
+  duration rule alone dropped it). Invalid time bounds fail locally
   before a REPORT is sent, and the encoder preserves legal one-sided ranges.
   Query REPORTs use `Depth: 1`; `calendar-multiget` REPORTs enumerate their
   hrefs in the body and use `Depth: 0`.
@@ -631,12 +643,36 @@ the odd task resource. Both halves are pinned by
 assertions read the REQUEST, so a lane that reverts to the PROPFIND fails rather
 than passing on an unchanged snapshot.
 
-Residual: the `sync-collection` lane is not filtered - RFC 6578 has no filter
-grammar. A VTODO created or modified between two token polls is still reported
-once as a created/updated event change that hydrates to nothing, and then sits in
-the snapshot. Nothing establishes or re-walks with it any more, so the leak is
-now bounded to resources touched during a token-backed poll rather than to every
-resource in the collection.
+**The unfilterable lanes read the content type as component evidence (caldav-F1
+/ F2 / dav-F10, ruled 2026-09-07).** Two lanes cannot carry the VEVENT
+`comp-filter`: the `sync-collection` REPORT, because RFC 6578 has no filter
+grammar, and the depth-1 PROPFIND the cursor listing degrades to. Both ask for
+`getcontenttype`, and RFC 4791 s5.2.6 lets a server answer
+`text/calendar; component=vtodo` (SabreDAV and Baikal do). `parse::declared_non_vevent`
+reads that parameter, in the POSITIVE only: a `component=` naming anything but
+VEVENT drops the member from the degrade listing before it reaches the snapshot,
+and marks the sync entry (`CalDavSyncEntry::non_vevent`) so `apply_sync_report`
+treats it as absent - never inserted, and removed with a `Destroyed` if an
+earlier poll let it in as a phantom. A bare `text/calendar` or a missing content
+type is not evidence and admits the member exactly as before. The other shapes
+were considered and not taken: a comp-filter query run after the sync report
+cannot tell "not a VEVENT" from "created after the query ran", a
+listing-plus-filter pair costs two round trips on every creating poll, and a
+per-href classification mark in the cursor is a version-3 envelope. Pinned by
+`a_declared_component_marks_non_vevent_members_on_both_unfiltered_lanes` and
+`a_declared_task_is_dropped_from_the_sync_snapshot`.
+
+Residual, now narrowed to servers that emit NO `component=` parameter: on those,
+a VTODO created or modified between two token polls is still reported once as a
+created/updated event change that hydrates to nothing, and then sits in the
+snapshot; nothing establishes or re-walks with it, so the leak is bounded to
+resources touched during a token-backed poll. The degrade lane has the matching
+cost on the same servers: a transient `405` on the filtered REPORT (read by
+`filter_unsupported` as "the server will not run the filter") walks the
+unfiltered PROPFIND, puts the collection's tasks into the snapshot as `Created`,
+and the next successful filtered REPORT reports them `Destroyed`. That flap is
+the accepted price of a degrade that must not drop real events; it does not
+occur where the content type labels the task.
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.
