@@ -140,10 +140,45 @@ by its spawn position. It IS spawned first, and the predecessor read
 teardown order that any reordering of the spawn block would have broken
 silently.
 
+Each teardown PHASE carries its own fresh `detach_timeout`; they do not share one
+deadline. There are three: the worker awaits, then the writer phase (the teardown
+discard drain and the ack writer's final drain, which run while the writer is the
+last worker alive), then `Account::close()`. So the worst-case `detach` is
+`3 * detach_timeout` - 15s at the default - and only when a wedged worker, a
+checkpoint store that stops answering, and a provider close that never returns all
+coincide. A consumer calling `detach` on the way out of a process is bounding its
+own shutdown by that number.
+
+The per-phase budget is not a nicety. A shared deadline silently zeroes whichever
+phase runs last, so a provider stream that neither yields nor ends - and three
+stream-poll loops in this crate have no shutdown arm (`drive_changes_stream`,
+`InventoryFusion::run_stream`, `BackfillRunner::run_partition`), so a wedged
+provider parks a worker until the deadline - burnt the whole budget in the worker
+phase and left the writer to be aborted IMMEDIATELY, with `remaining == 0` and no
+drain at all. That is exactly the "writer aborted with unpersisted work" outcome
+the two-phase ordering and `take_ack_writer` exist to prevent, arrived at by a
+different route. Pinned by
+`tests/detach_close_clamp.rs::a_straggler_worker_does_not_cost_the_ack_writer_its_drain`.
+
+A writer that exhausts its OWN budget is answered explicitly rather than falling
+through the generic straggler path (`await_ack_writer_until`, not
+`await_worker_until`). It is either blocked in the `CheckpointStore` or still
+waiting on its request channel: every ENGINE-side sender is gone by that point,
+but `BackfillCheckpointWriter` is published and owns a `WriterRequest` sender,
+so a consumer that retains one across the detach keeps the channel open and the
+writer can exhaust the budget with a perfectly responsive store. The diagnostic
+must not name the store as the culprit. Abort is still the only
+available outcome (the account is gone; no caller can reach the writer for a
+retry; waiting longer only lengthens the bound above), but it gets its own log
+line, because the acknowledged work it was carrying is precisely what the drain
+exists to persist. The consequence is redelivery, not loss: an acknowledgement is
+durable only once the writer says so, so the account resumes from an older
+checkpoint on the next attach.
+
 `Account::close()` is clamped too, and every await in the teardown now is. Its
-budget is a FRESH `detach_timeout` rather than the remainder of the deadline the
-worker awaits and the discard drain share: detach has always been "worker awaits
-PLUS the close", and sharing the deadline would take the close budget away
+budget is a FRESH `detach_timeout` rather than the remainder of the worker
+deadline: detach has always been "worker awaits
+PLUS the trailing phases", and sharing the deadline would take the close budget away
 whenever a straggler had already spent it, reporting a healthy close that needs
 one round trip as hung. A TIMED-OUT close is treated exactly as a FAILED one -
 warn, drop the handle, carry on to the registry cleanup, report success to the
@@ -152,16 +187,17 @@ caller - because no other outcome is available to it: the slot left
 retaining it would keep a dead incarnation's connection reachable under an id a
 fresh `attach` may already have claimed. The two get distinct log lines, since
 "the provider refused" and "the provider never answered" want different
-follow-up. Pinned by `tests/detach_close_clamp.rs`, whose three tests separate a
+follow-up. Pinned by `tests/detach_close_clamp.rs`, whose four tests separate a
 clamped hang from a refusal by elapsed budget and by whether the close future
-ever completed.
+ever completed, and pin both trailing phases against a straggler worker.
 
 The whole teardown runs under the same `lifecycle_inflight` guard
 `attach` takes, claimed together with the slot removal under one lock
 acquisition. The slot leaves `engine.accounts` at the top while the
 registry cleanup (invalidation sink, budget gate, backfill registry,
 throttle memberships, bandwidth meter) happens at the very bottom,
-after up to `detach_timeout` of worker awaits plus `Account::close()`.
+after up to three `detach_timeout` budgets of worker awaits, writer drain and
+`Account::close()`.
 Without the guard an attach landing in that window saw no slot, no
 in-flight entry, succeeded, and then had its brand-new registrations
 unregistered by the detach's tail - leaving an account that reported
@@ -172,10 +208,62 @@ true: the incarnation is attached and draining. A racing detach, and an
 attach still in flight, both yield `AccountNotAttached`. Pinned by
 `tests/attach_schema_recovery.rs::attach_cannot_land_inside_an_in_flight_detach`.
 
-`shutdown(self)` enumerates attached accounts, calls `detach`
-for each (logging but not failing on per-account errors), then
-cancels the engine-root token. Strongly preferred over relying
-on `Drop`, which can only fire a best-effort sync cancel.
+`shutdown(self)` cancels the engine-root token FIRST, then enumerates attached
+accounts and calls `detach` for each (logging but not failing on per-account
+errors). Strongly preferred over relying on `Drop`, which can only fire a
+best-effort sync cancel.
+
+Cancel-first is load-bearing. Every slot's shutdown token is a child of the root
+(`engine/attach.rs`), so the cancel trips the same token `detach_inner` cancels
+per account, only earlier and for all accounts at once. Cancelling AFTER the
+sequential loop - which is what it did - left the last of `N` accounts fully
+operational (polling, publishing, writing) for up to
+`3 * (N - 1) * detach_timeout` after the consumer called `shutdown`: a caller
+that believed it had stopped the engine had only started a queue whose tail was
+still working.
+
+What cancel-first claims is narrow: **cancellation is REQUESTED for every
+account before cleanup begins.** It does not establish quiescence and does not
+mean publication has stopped.
+
+**Respond promptly**: the control applier, the bandwidth feed, the push
+forwarder, the multiplexer main loop, the push reconciler, and backfill and
+deferred inventory while in their subscriber / pause / throttle / capacity /
+admission waits.
+
+**Do not**: `InventoryFusion::run_stream` and `BackfillRunner::run_partition`
+do not select on cancellation while reading a provider stream, and
+`drive_changes_stream` checks `BoundaryRequest::Stop` only after a stream item
+arrives and never reads the root token. So a later account's in-flight changes
+drive can still publish after root cancellation while its boundary is `Run`.
+
+**The reopen listener is both**, and which one depends on what it is doing when
+the token fires. Idle, its select covers the wait for the next request and it
+exits at once. Inside `handle_account_error` it does not: the recovery backoffs
+and the replacement-open boundaries consult the token, but the provider calls,
+writer requests, scope re-establishment and membership discovery it awaits do
+not, so a wedged provider operation keeps that worker alive until its own
+account reaches its worker deadline.
+
+One asymmetry a CONSUMER can observe, and the reason this enumeration is a
+contract rather than a note: a bulk mutation campaign selects on the same token
+and fails with `Error::ShuttingDown` the moment it fires - even for an account
+whose detach is several budgets away - while in that same window the account is
+still discoverable, still hands out change receivers, and still accepts
+acknowledgements through its writer. Shutdown therefore closes the MUTATION
+surface first and the read surfaces last, per account, for as long as that
+account waits its turn.
+
+A strict publication cutoff is a separate, deliberate change, and would have to
+be named as one.
+
+Detach stays SEQUENTIAL. Cancel-first already lets the cooperative workers
+across all accounts wind down concurrently; sequential cleanup then limits the
+overlap of discard processing and provider closes without changing failure
+attribution, and a dying process is the wrong place to introduce fan-out. The
+conservative total is therefore still `3 * N * detach_timeout` plus overhead -
+typical joins get faster, but an unresponsive provider operation or a slow store
+still justifies the bound.
 
 The reattach path (driven internally by `EngineDirective::RestartAccount`
 through the reopen lane, and public as `SyncEngine::reattach`) is a
@@ -1167,8 +1255,8 @@ Ruled 2026-09-06, close by contract: the alternative was a durable "scope lost
 pages" row, a new `CheckpointStore` method every downstream store implements,
 bought for a consumer already outside the persist-then-acknowledge contract.
 The drain of discard requests recorded BEFORE teardown still runs, with both
-its writer awaits clamped to the same `detach_timeout` deadline as every other
-teardown step, so a store that hangs in `delete_backfill` or `put_ledger`
+its writer awaits clamped to the writer phase's own fresh `detach_timeout`
+deadline, so a store that hangs in `delete_backfill` or `put_ledger`
 cannot hang `detach`. A `pause` or `checkpoint_now` waiter parked on a
 registration that detach has made unacknowledgeable (the public ack sender
 goes at the top of `detach`) ends with an error when the boundary reads

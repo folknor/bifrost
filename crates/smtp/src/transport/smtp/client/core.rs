@@ -511,6 +511,36 @@ impl ProtocolMachine for DirectSmtp {
                     self.begin_epilogue(Epilogue::abort(value))
                 }
                 OpOutcome::Reply(response) => {
+                    // Only the FIRST negative reply in the window is kept; a
+                    // later one is read, counted, and dropped. Deliberate and
+                    // lossy, on the same reasoning as `BatchSmtpStage::
+                    // WindowOpened`: this machine's output is a single
+                    // `Response`, and the direct path is all-or-nothing - any
+                    // refused recipient ends the envelope for every recipient,
+                    // so there is no lane a second refusal could land in. The
+                    // caller learns that a recipient was refused and the text of
+                    // the first refusal; it never learns WHICH recipient, in
+                    // this arm or any other, because the output carries no
+                    // per-recipient identity at all. A caller that needs the
+                    // full per-recipient answer uses the batch machine, which
+                    // records every reply into `SendProgress`.
+                    //
+                    // Note what the retention rule costs beyond diagnostics: the
+                    // `closing_channel` check runs at `WindowClosing` on the
+                    // RETAINED failure only, so a 550 followed by a 421 in one
+                    // window takes the RSET-and-keep path rather than the abort
+                    // a 421 asks for. `Epilogue::reset` aborts anyway when the
+                    // peer does not positively acknowledge the RSET, so the
+                    // connection still goes; the cost is one wasted command on a
+                    // channel already closing. `BatchSmtpStage::RcptWindowReply`
+                    // tests every reply for it instead, because it has somewhere
+                    // to put the ones it keeps.
+                    //
+                    // What would change the answer: giving this path a
+                    // per-recipient output (the batch machine's `SendProgress`,
+                    // or a multi-response error). Until the output shape can
+                    // carry a second refusal, retaining one is the whole of what
+                    // is reportable.
                     let failure = match failure {
                         Some(failure) => Some(failure),
                         None if !response.is_positive() => Some(response),

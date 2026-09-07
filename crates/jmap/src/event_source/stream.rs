@@ -649,10 +649,11 @@ mod tests {
     // resume past it.
     #[tokio::test]
     async fn a_recoverable_parser_error_still_ends_the_stream() {
-        // One byte over the parser's own 1 MiB cap (`parser::MAX_EVENT_SIZE`,
-        // which is module-private), spelled out here rather than imported.
+        // Derived from the parser's own bound, never restated: a hardcoded
+        // literal would still compile and still pass if the cap moved, while
+        // no longer describing an overflow at all.
         let mut frame = Vec::from(":");
-        frame.extend_from_slice(&vec![b'z'; 1024 * 1024 + 4]);
+        frame.extend_from_slice(&vec![b'z'; crate::event_source::parser::MAX_EVENT_SIZE + 1]);
         frame.extend_from_slice(
             b"\n\nid: after\ndata: {\"@type\": \"StateChange\", \"changed\": {}}\n\n",
         );

@@ -191,14 +191,79 @@ pub struct StubAccount {
     /// until the gate is notified - and a gate never notified makes it a
     /// straggler aborted at `detach_timeout`. Parking a CHANGES stream instead
     /// does NOT do this, which was established by measurement: the multiplexer
-    /// owns its per-scope poll tasks and aborts them itself, so they are not
-    /// among the workers `detach` waits on.
+    /// owns its per-scope poll tasks and retires them itself in its shutdown
+    /// tail (it CANCELS their tokens; the explicit abort there is for the
+    /// lifecycle task), so they are not among the workers `detach` waits on.
     ///
     /// The worker waits for a real subscriber before walking anything, so a
     /// test that wants the straggler must subscribe first.
     pub inventory_stall: Option<Arc<tokio::sync::Notify>>,
+    /// Instrumentation for the stalled stream above, taken by the first stalling
+    /// `inventory_stream` call. See [`InventoryStallProbe`].
+    pub inventory_stall_probe: Option<InventoryStallProbe>,
     /// `inventory_stream()` call count.
     pub inventory_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Observes the LIFETIME of the stalled inventory stream, not just its effects.
+///
+/// Two signals, both one-shot so a test can await either whenever it likes
+/// rather than having to be waiting at the moment it fires:
+///
+/// - `parked`: sent from inside the stalled tail the first time it is polled,
+///   immediately before it parks. This is what tells a test the straggler is
+///   really staged, rather than merely that `inventory_stream` was called.
+/// - `destroyed`: sent from inside `Drop` with the instant of destruction. The
+///   timestamp is taken INSIDE the drop, not when the test receives it, because
+///   the receive is subject to scheduling delay and the whole point of the
+///   signal is to measure WHEN the provider stream went away.
+///
+/// The drop stamp is captured by the tail future at construction, so it is
+/// dropped with the stream whether or not the tail was ever polled.
+pub struct InventoryStallProbe {
+    parked: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    destroyed: Mutex<Option<tokio::sync::oneshot::Sender<tokio::time::Instant>>>,
+}
+
+/// Fires its instant from `Drop`. Held by the stalled stream's tail future.
+struct DropStamp(Option<tokio::sync::oneshot::Sender<tokio::time::Instant>>);
+
+impl Drop for DropStamp {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(tokio::time::Instant::now());
+        }
+    }
+}
+
+impl InventoryStallProbe {
+    /// Build a probe plus its two receivers: the parked signal and the
+    /// destruction instant.
+    #[must_use]
+    pub fn install() -> (
+        Self,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (destroyed_tx, destroyed_rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                parked: Mutex::new(Some(parked_tx)),
+                destroyed: Mutex::new(Some(destroyed_tx)),
+            },
+            parked_rx,
+            destroyed_rx,
+        )
+    }
+
+    fn take_parked(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        self.parked.lock().expect("parked lock").take()
+    }
+
+    fn take_stamp(&self) -> DropStamp {
+        DropStamp(self.destroyed.lock().expect("destroyed lock").take())
+    }
 }
 
 impl StubAccount {
@@ -222,6 +287,7 @@ impl StubAccount {
             close_gate: None,
             close_fails: false,
             inventory_stall: None,
+            inventory_stall_probe: None,
             inventory_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -349,8 +415,28 @@ impl Account for StubAccount {
         };
         if let Some(gate) = &self.inventory_stall {
             let gate = Arc::clone(gate);
-            let tail = stream::once(async move { gate.notified().await })
-                .filter_map(|()| async move { None::<InventoryEvent> });
+            // Captured at CONSTRUCTION so the stamp lives in the tail future
+            // from the moment the stream exists, and therefore fires when the
+            // stream is destroyed whether or not the tail was ever polled.
+            let stamp = self
+                .inventory_stall_probe
+                .as_ref()
+                .map(InventoryStallProbe::take_stamp);
+            let parked_tx = self
+                .inventory_stall_probe
+                .as_ref()
+                .and_then(InventoryStallProbe::take_parked);
+            let tail = stream::once(async move {
+                let _stamp = stamp;
+                // The park future is created before the signal is sent, so a
+                // releaser reacting to it cannot notify into the gap.
+                let waiter = gate.notified();
+                if let Some(tx) = parked_tx {
+                    let _ = tx.send(());
+                }
+                waiter.await;
+            })
+            .filter_map(|()| async move { None::<InventoryEvent> });
             return Box::pin(stream::iter(items).chain(tail));
         }
         Box::pin(stream::iter(items))

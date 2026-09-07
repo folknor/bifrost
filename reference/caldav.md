@@ -507,12 +507,12 @@ Supported calendar primitives:
   file name at the destination and `Overwrite: F`, so a collision refuses rather
   than destroying a stranger's resource. `Destination` is credential-gated
   against the same admitted-origin set as the source, so a consumer-supplied
-  `CalendarId` cannot steer a write anywhere the gate would refuse. A redirect of
-the SOURCE rebases `Destination` onto the same hop, inside the credential gate
-and re-checked against `is_trusted_url` after the rebase: the destination is
-made relative to the pre-hop URL and joined onto the post-hop one, so a
-cross-collection move stays cross-collection in the new namespace, and a
-destination on a different origin than the source is left verbatim. Only 405 and
+    `CalendarId` cannot steer a write anywhere the gate would refuse. A redirect of
+  the SOURCE rebases `Destination` onto the same hop, inside the credential gate
+  and re-checked against `is_trusted_url` after the rebase: the destination is
+  made relative to the pre-hop URL and joined onto the post-hop one, so a
+  cross-collection move stays cross-collection in the new namespace, and a
+  destination on a different origin than the source is left verbatim. Only 405 and
   501 mean "no MOVE support"; 412 (destination occupied) and 502 (destination
   refused) stay real errors.
 
@@ -810,6 +810,25 @@ plus the CalDAV-specific bodies and parsers. This was the security-sensitive
 half: the credential gate, the HTTPS-downgrade refusal and the redirect walk
 were all duplicated, and a divergence there is a credential leak. Ablating
 `is_trusted_url` in the shared crate fails three tests in each crate.
+
+**How `resolve_url` turns a native id into a request URL.** Three shapes, and
+only the third is interesting. An href already carrying an `http://` or
+`https://` scheme is returned verbatim - that is what makes a recurrence-qualified
+`EventId` resolve to its master resource, and what a Multi-Status naming an
+absolute href means. A ROOT-RELATIVE href (`/cal/x`) replaces the base URL's
+path, per RFC 3986, which is deliberately unchanged and is what a server naming
+such an href intends. A RELATIVE href (`cal/x`) lands UNDER the configured base
+path.
+
+That last case is why `join_base` restores the trailing slash `around()` trimmed
+before joining: `Url::join` reads a base whose path does not end in one as
+naming a RESOURCE, so `https://host/dav` + `cal/one.ics` resolved to
+`https://host/cal/one.ics`, silently relocating the id out of the collection the
+account lives in. Appending is also what the unparseable-base string fallback in
+the same function has always done, so the two branches agree on the shape they
+share. The reason lives at `DavDispatch::resolve_url` and `join_base` in
+`crates/dav-core/src/dispatch.rs`; this is the contract, not a second copy of
+the argument.
 
 `DavRequest::header` is a fluent builder, so it cannot return a `Result`. A name
 or value the HTTP grammar rejects is therefore RECORDED on the request

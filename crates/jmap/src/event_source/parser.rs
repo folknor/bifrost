@@ -1,4 +1,30 @@
-const MAX_EVENT_SIZE: usize = 1024 * 1024;
+/// Resource bound on a stream whose length the SERVER chooses. The WHATWG
+/// event-stream rules impose no size limit at all - a comment line, a field
+/// name, or an accumulated `data` buffer may be arbitrarily long and still be
+/// well-formed - so this is not a protocol limit and nothing on the wire is
+/// invalid for reaching it. It exists only to stop an unterminated line from
+/// growing a buffer without end. A payload of EXACTLY this many bytes is
+/// therefore accepted at every guard; only the byte that would take it past
+/// the bound is refused. Anything else would make the cap a limit of one less
+/// than its own name.
+///
+/// The four guards spell that same rule with two different operators, and
+/// neither is a typo. Read what each one is measuring:
+///
+/// - the three mid-line guards run BEFORE the byte is appended, so the
+///   accumulated length they see is one short of the length that byte would
+///   produce. `len >= MAX` therefore refuses exactly the byte that would make
+///   the buffer `MAX + 1`.
+/// - `commit_field`'s `data` arm runs on a whole line at once and computes the
+///   length the append WOULD produce, so it compares that hypothetical total
+///   with `> MAX`.
+///
+/// Both admit `MAX` and refuse `MAX + 1`. Aligning the operators literally
+/// would move the bound on one path by one byte, so do not "fix" either.
+///
+/// Made visible to the sibling `stream.rs` so its oversized-block fixtures are
+/// derived from the bound rather than restating its current value.
+pub(super) const MAX_EVENT_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -659,12 +685,13 @@ mod tests {
         assert_eq!(String::from_utf8(recovered.data).unwrap(), "recovered");
     }
 
-    // A bounded comment does not trip the cap, and the counter resets for
-    // the next comment line.
+    // A comment of EXACTLY the cap does not trip it - the bound is a limit
+    // on growth, not a length that is itself illegal - and the counter
+    // resets for the next comment line.
     #[test]
     fn bounded_comments_pass_and_reset_the_counter() {
         let mut parser = super::EventParser::default();
-        let long_comment = format!(":{}\n", "c".repeat(super::MAX_EVENT_SIZE - 1));
+        let long_comment = format!(":{}\n", "c".repeat(super::MAX_EVENT_SIZE));
         let mut frame = long_comment.clone().into_bytes();
         frame.extend_from_slice(long_comment.as_bytes());
         frame.extend_from_slice(b"data: alive\n\n");
@@ -701,6 +728,56 @@ mod tests {
         parser.push_bytes(frame.into_bytes());
 
         assert!(parser.next().expect("an item").is_err());
+        let recovered = parser
+            .next()
+            .expect("a recovered event")
+            .expect("no parse error");
+        assert_eq!(String::from_utf8(recovered.data).unwrap(), "recovered");
+    }
+
+    // The boundary itself, in both directions. `MAX_EVENT_SIZE` bounds
+    // buffer growth on a stream the server controls; it is not a protocol
+    // limit, so a block carrying exactly that many data bytes is well-formed
+    // and must be delivered, and only the byte past it is refused. The two
+    // halves are built from the constant so they move with it.
+    //
+    // A single `data` line cannot reach the cap on its own - the mid-line
+    // guard counts the field name too - so the payload is accumulated across
+    // two lines, which is also the path `commit_field`'s separator arithmetic
+    // runs on.
+    fn two_data_lines_totalling(total: usize) -> Vec<u8> {
+        let first = total / 2;
+        // The joining '\n' that `commit_field` inserts is one of the bytes.
+        let second = total - first - 1;
+        format!(
+            "data:{}\ndata:{}\n\ndata: recovered\n\n",
+            "y".repeat(first),
+            "z".repeat(second)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn data_of_exactly_the_cap_is_delivered() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(two_data_lines_totalling(super::MAX_EVENT_SIZE));
+
+        let event = parser
+            .next()
+            .expect("the block at the cap dispatches")
+            .expect("a payload of exactly the cap is not an error");
+        assert_eq!(event.data.len(), super::MAX_EVENT_SIZE);
+    }
+
+    #[test]
+    fn data_one_byte_past_the_cap_is_refused() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(two_data_lines_totalling(super::MAX_EVENT_SIZE + 1));
+
+        assert!(
+            parser.next().expect("an item").is_err(),
+            "one byte past the bound trips it"
+        );
         let recovered = parser
             .next()
             .expect("a recovered event")

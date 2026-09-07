@@ -50,6 +50,63 @@ pub(super) async fn await_worker_until(deadline: tokio::time::Instant, worker: W
     }
 }
 
+/// Await the ack writer's final drain on the writer phase's own deadline.
+///
+/// Split from [`await_worker_until`] for the log line, not the mechanics. A
+/// stream worker that misses its deadline was asked to stop and would not; a
+/// writer that misses its own full budget is carrying acknowledged work the
+/// drain exists to persist, which is a different operator story.
+///
+/// Do NOT read this as "the store is at fault". The engine's own senders are
+/// gone by this point, but `BackfillCheckpointWriter` is published and owns a
+/// `WriterRequest` sender of its own, so a consumer that retains one keeps the
+/// channel open past the engine: the writer can then exhaust this budget
+/// waiting for closure with a perfectly responsive `CheckpointStore`. Either
+/// way the outcome is the same and bounded - abort is the only thing available,
+/// since the account is gone and nothing can reach the writer for a retry - and
+/// the consequence is redelivery, not loss.
+pub(super) async fn await_ack_writer_until(
+    deadline: tokio::time::Instant,
+    worker: WorkerTask,
+    account_id: &AccountId,
+) {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let timed_out = if remaining.is_zero() {
+        true
+    } else {
+        match tokio::time::timeout(remaining, worker.join).await {
+            Ok(Ok(())) => false,
+            Ok(Err(join)) => {
+                if !join.is_cancelled() {
+                    tracing::warn!(
+                        target: "bifrost.sync.changes",
+                        account = ?account_id,
+                        error = ?join,
+                        "the ack writer panicked during detach; checkpoints it had \
+                         accepted but not yet persisted are forfeited and the account \
+                         resumes from an older checkpoint on the next attach"
+                    );
+                }
+                false
+            }
+            Err(_) => true,
+        }
+    };
+    if timed_out {
+        worker.abort.abort();
+        tracing::warn!(
+            target: "bifrost.sync.changes",
+            account = ?account_id,
+            "the ack writer did not finish its final drain within its own detach \
+             budget: it is either blocked in the checkpoint store or still waiting \
+             on a request channel a retained BackfillCheckpointWriter is holding \
+             open. Aborting it forfeits the checkpoints it had accepted but not \
+             persisted: the account resumes from an older checkpoint on the next \
+             attach and redelivers, it does not lose changes"
+        );
+    }
+}
+
 /// Ack writer task. One per attached account. Receives `AckRequest`
 /// messages on `rx` and durably persists the carried checkpoint via
 /// the `CheckpointStore`. Notifies the control's checkpoint watch so

@@ -82,7 +82,7 @@ mod tests;
 // Re-imported at the parent so every sibling module reaches them through
 // its own `use super::*`, exactly as they reached each other while this
 // was one file.
-use ack::{WriterHandle, ack_writer, await_worker_until, take_ack_writer};
+use ack::{WriterHandle, ack_writer, await_ack_writer_until, await_worker_until, take_ack_writer};
 use attach::{discover_scopes_from, link_discovered_memberships, wait_for_real_subscriber};
 use backfill::{BackfillWiring, run_backfill_orchestrator};
 use context::SlotContext;
@@ -116,8 +116,9 @@ pub struct SyncEngine {
     /// the final slot insert span several awaits, so two concurrent
     /// attaches would otherwise both spawn workers. Detach needs it for
     /// the mirror-image reason: it removes the slot first but does its
-    /// registry cleanup last, after awaiting workers (up to
-    /// `detach_timeout`) and `Account::close()`. An attach landing in
+    /// registry cleanup last, after three separately-clamped
+    /// `detach_timeout` phases (worker awaits, ack-writer drain,
+    /// `Account::close()`). An attach landing in
     /// that window sees no slot and no in-flight entry, installs fresh
     /// registrations, and then the still-running detach unregisters the
     /// NEW incarnation from the invalidation sink, the budget gate, the
@@ -483,11 +484,67 @@ impl SyncEngine {
             .map_err(|e| Error::Other(format!("writer dropped before deciding: {e}")))?
     }
 
-    /// Explicitly shutdown the engine. Awaits all attached accounts'
-    /// workers up to `EngineConfig::detach_timeout`. Strongly preferred
-    /// over relying on `Drop`, which can only fire a best-effort
-    /// cancel.
+    /// Explicitly shutdown the engine. Cancels the engine root token FIRST,
+    /// then detaches every attached account in turn, each on its own three
+    /// `EngineConfig::detach_timeout` budgets. Strongly preferred over relying
+    /// on `Drop`, which can only fire a best-effort cancel.
+    ///
+    /// Cancel-first REQUESTS cancellation for every account before any cleanup
+    /// begins. It does not establish quiescence, and must not be read as one:
+    /// see the comment on the cancel below for what does and does not respond
+    /// promptly. The bound is unchanged at `3 * N * detach_timeout` plus
+    /// overhead for `N` accounts.
     pub async fn shutdown(self) -> Result<(), Error> {
+        // Cancel the engine root BEFORE the sequential cleanup, not after it.
+        //
+        // Every slot's shutdown token is a child of this one (`engine/attach.rs`),
+        // so this trips the same token `detach_inner` cancels per account - only
+        // earlier, and for all accounts at once. Cancelling afterwards meant the
+        // LAST account of N was still fully operational (polling, publishing,
+        // writing) for up to `3 * (N - 1) * detach_timeout` after the consumer
+        // called `shutdown`: a caller that believes it has stopped the engine
+        // has in fact only started a queue whose tail is still working.
+        //
+        // What this DOES claim: cancellation is requested for every account
+        // before cleanup begins. It does NOT claim publication has stopped.
+        //
+        // Respond promptly: the control applier, the bandwidth feed, the push
+        // forwarder, the multiplexer main loop, the push reconciler, and
+        // backfill and deferred inventory while in their subscriber / pause /
+        // throttle / capacity / admission waits.
+        //
+        // Do NOT: `InventoryFusion::run_stream` and
+        // `BackfillRunner::run_partition` do not select on cancellation while
+        // reading a provider stream, and `drive_changes_stream` checks
+        // `BoundaryRequest::Stop` only after a stream item arrives and never
+        // reads the root token. So a later account's in-flight changes drive can
+        // still publish after this cancel while its boundary is `Run`.
+        //
+        // The reopen listener is BOTH, depending on what it is doing. Idle, its
+        // select covers the wait for the next request and it exits at once. Once
+        // it has entered `handle_account_error` it does not: the recovery
+        // backoffs and the replacement-open boundaries check the token, but the
+        // provider calls, writer requests, scope re-establishment and membership
+        // discovery it awaits do not, so a wedged provider operation keeps that
+        // worker alive until its own account reaches its worker deadline.
+        //
+        // One consumer-visible asymmetry worth stating, because it is the one a
+        // caller can actually observe: a bulk mutation campaign selects on this
+        // token and fails with `Error::ShuttingDown` the moment it fires, even
+        // for an account whose detach is several budgets away - while during that
+        // same window the account is still discoverable, still hands out change
+        // receivers, and still accepts acknowledgements through its writer. So
+        // shutdown closes the mutation surface first and the read surfaces last.
+        //
+        // A strict publication cutoff is a separate, deliberate change and is
+        // not what this is.
+        //
+        // Detach stays SEQUENTIAL. Cancel-first already lets the cooperative
+        // workers across all accounts wind down concurrently; sequential cleanup
+        // then limits the overlap of discard processing and provider closes
+        // without changing failure attribution, and a dying process is the wrong
+        // place to introduce fan-out.
+        self.root_cancel.cancel();
         let ids: Vec<AccountId> = self.accounts.iter().map(|r| r.key().clone()).collect();
         for id in ids {
             // Best-effort: any detach error is logged but does not
@@ -501,13 +558,17 @@ impl SyncEngine {
                 );
             }
         }
-        self.root_cancel.cancel();
         Ok(())
     }
 
     /// Detach an account. Publishes `Stop`, cancels the slot, drains or
-    /// aborts workers within `detach_timeout`, closes the live account,
-    /// and removes engine registrations. It does not wait for a
+    /// aborts workers within `detach_timeout`, drains the ack writer within a
+    /// further `detach_timeout`, closes the live account within a third, and
+    /// removes engine registrations. Each phase is separately clamped rather
+    /// than sharing one deadline, so a wedged worker cannot zero the budget of
+    /// the phase behind it; the worst case is therefore
+    /// `3 * detach_timeout` (15s at the default), and only when a worker, the
+    /// checkpoint store and the provider's close all hang. It does not wait for a
     /// consumer-acked safe boundary and does not destroy server-side
     /// push subscriptions; call [`Self::unsubscribe_push`] first for that,
     /// or [`Self::detach_with_teardown`] to do both in one step.
@@ -645,10 +706,32 @@ impl SyncEngine {
         // as at a crash). Ruled 2026-09-06; the full reasoning and the cost of
         // the alternative are at `PendingCoverage::release_undelivered`.
         //
-        // Both awaits are clamped to the same `detach_timeout` deadline every
-        // other teardown step honours. A store whose `delete_backfill` or
-        // `put_ledger` hangs must not hang `detach` with it; the rows it leaves
-        // behind are the same rows an aborted writer would have left.
+        // The writer phase - this drain and the writer await below - gets a FRESH
+        // `detach_timeout` rather than the remainder of the worker deadline, for
+        // the same reason `Account::close()` does. Detach is documented as "up to
+        // `detach_timeout` of worker awaits PLUS the trailing phases", and a
+        // single shared deadline silently zeroes whichever phase runs last: a
+        // provider stream that neither yields nor ends parks a worker until the
+        // deadline (three stream-poll loops in this crate have no shutdown arm),
+        // and the writer then reached `await_worker_until` with `remaining == 0`
+        // and was aborted IMMEDIATELY, without draining. That is precisely the
+        // "writer aborted with unpersisted work" outcome the two-phase ordering
+        // and `take_ack_writer` exist to prevent, reached by a different route.
+        // A straggler worker must not be able to spend the drain's budget.
+        //
+        // WORST CASE. `detach` is now bounded by three sequential budgets, each
+        // one `detach_timeout`: the worker awaits, this writer phase, and
+        // `Account::close()`. So at most 3 * `detach_timeout` (15s by default),
+        // and only when all three of a wedged worker, a wedged store and a wedged
+        // provider close coincide. Recorded in `reference/sync.md`, because a
+        // consumer calling `detach` on the way out of a process is bounding its
+        // own shutdown by that number.
+        //
+        // Both awaits are clamped, like every other teardown step. A store whose
+        // `delete_backfill` or `put_ledger` hangs must not hang `detach` with it;
+        // the rows it leaves behind are the same rows an aborted writer would
+        // have left.
+        let writer_deadline = tokio::time::Instant::now() + timeout;
         if let Some(writer) = teardown_writer {
             for scope in slot.coverage.take_backfill_discards() {
                 let (done, recv) = oneshot::channel();
@@ -656,7 +739,7 @@ impl SyncEngine {
                     scope: scope.clone(),
                     done,
                 };
-                match tokio::time::timeout_at(deadline, writer.send(request)).await {
+                match tokio::time::timeout_at(writer_deadline, writer.send(request)).await {
                     Ok(Ok(())) => {}
                     // The writer is already gone: nothing left to settle to.
                     Ok(Err(_)) => break,
@@ -671,7 +754,7 @@ impl SyncEngine {
                         break;
                     }
                 }
-                match tokio::time::timeout_at(deadline, recv).await {
+                match tokio::time::timeout_at(writer_deadline, recv).await {
                     Ok(Ok(Err(error))) => {
                         tracing::warn!(
                             target: "bifrost.sync.backfill",
@@ -696,8 +779,27 @@ impl SyncEngine {
                 }
             }
         }
+        // The writer drains on its OWN budget, and a writer that exhausts it is
+        // answered explicitly rather than by falling through the generic
+        // straggler path. The two situations differ: a worker aborted at the
+        // worker deadline was asked to stop and would not, while a writer that
+        // cannot finish draining inside a full fresh `detach_timeout` is either
+        // blocked in the durable store or still waiting on its request channel.
+        // The ENGINE's senders are all gone by then - every stream worker has
+        // exited and the teardown sender was dropped above - but
+        // `BackfillCheckpointWriter` is published and owns a sender of its own, so
+        // a consumer that retains one keeps the channel open past the engine and
+        // the writer can exhaust this budget with a healthy store. Either way the
+        // treatment is to abort (nothing else is available: the account is
+        // gone, no caller can reach the writer for a retry, and holding the
+        // teardown open longer only lengthens the bound above), but the LOG says
+        // which requests are being forfeited, because the acknowledged work it
+        // was carrying is exactly what the drain exists to persist, and an
+        // operator seeing this line needs to know the account resumes from an
+        // older checkpoint on the next attach. Redelivery, not loss - a
+        // consumer's acknowledgement is durable only once the writer says so.
         if let Some(worker) = ack_worker {
-            await_worker_until(deadline, worker).await;
+            await_ack_writer_until(writer_deadline, worker, account_id).await;
         }
 
         let current = slot.current.load_full();

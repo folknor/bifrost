@@ -494,7 +494,12 @@ inventory of what was extracted and why the two dialects reduce to a single
 
 `CardDavClient` is a newtype over the shared `DavDispatch`, which owns the HTTP
 client, credentials, the admitted-origin credential gate, the manual
-cross-origin redirect walk and the generic WebDAV verbs.
+cross-origin redirect walk and the generic WebDAV verbs. Native-id resolution is
+shared too: `DavDispatch::resolve_url` returns an absolute href verbatim, lets a
+root-relative href replace the base path per RFC 3986, and resolves a relative
+href UNDER the configured base path rather than beside it. `reference/caldav.md`,
+"How `resolve_url` turns a native id into a request URL", carries the rule and
+the trailing-slash reason it depends on.
 `CardDavCredentials` stays published and unchanged; `to_shared` projects it onto
 the dispatcher's `DavCredentials`.
 

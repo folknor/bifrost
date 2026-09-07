@@ -854,8 +854,11 @@ effective port - and this crate strips `Authorization` on any origin change
 with no way to restore it, so a followed cross-origin hop would arrive
 unauthenticated. They therefore attach with `FollowRedirects::Disabled` and walk
 every hop themselves in `DavDispatch::send_raw_request`, re-minting credentials
-for each target origin against the set authenticated discovery admitted, with
-the hop cap still sourced from `RedirectPolicy::default`.
+for each target origin against the set authenticated discovery admitted. The hop
+cap they apply is the exported `DEFAULT_MAX_HOPS` constant, read by name rather
+than through `RedirectPolicy::default().max_hops`: DAV carries no per-account
+redirect config, and laundering the cap through a type `Default` hid the
+coupling, so changing that default silently changed DAV behavior.
 
 ### A 401 on a hop the transport disarmed itself
 

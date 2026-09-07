@@ -55,29 +55,38 @@ structural landings of the same week, the dav-core `ResponseParts` collapse
 and the smtp sans-I/O core, never received the cold review their rulings
 asked for; that review debt is listed under their crates below.
 
-- **The ack writer shares the worker deadline, so a straggler starves its
-  drain.** Found 2026-09-07 while clamping `Account::close()`, and it is the
-  SAME SHAPE as that fix one step over: `detach` gives the stream workers and
-  the ack writer one `deadline`, so a provider stream that stops yielding burns
-  the whole `detach_timeout` and the writer is then aborted with
-  `remaining == 0` - immediately, without draining. That is precisely the
-  "writer aborted with unpersisted work" outcome the two-phase ordering and
-  `take_ack_writer` exist to prevent, reached by a different route. The remedy
-  is the one the close clamp already took: a fresh budget for the writer phase,
-  on the same reasoning (detach is documented as worker awaits PLUS the trailing
-  phases, and sharing one deadline silently zeroes whichever runs last). I
-  believe this is settled by consistency rather than being a fresh decision, but
-  it changes how long a detach can take in the worst case, so it is recorded
-  here rather than assumed.
+- **Three stream-poll loops have no shutdown arm.** `drive_changes_stream`,
+  `InventoryFusion::run_stream` and `BackfillRunner::run_partition` poll a
+  provider stream with no select on the cancellation token, so a stream that
+  neither yields nor ends parks its worker until detach aborts it at the
+  deadline. `reference/sync.md` documents that the DELAYS around the drive
+  select on the token; the drive itself does not. This is the actual GENERATOR
+  of straggler workers, and the per-phase detach budgets that landed 2026-09-07
+  bound the damage without removing it: every detach of a wedged provider still
+  costs a full `detach_timeout` in the worker phase. Adding a shutdown arm to
+  the three would turn that into a prompt teardown. Two tests deliberately
+  exploit the current behaviour to hold a teardown window open and say so, so
+  closing it means restaging them. Wants a ruling; it is a behaviour change to
+  every detach, not a local fix.
 
-- **Three stream-poll loops have no shutdown arm**, which is what makes the
-  above reachable: `drive_changes_stream`, `InventoryFusion::run_stream` and
-  `BackfillRunner::run_partition` poll a provider stream with no select on the
-  cancellation token, so a stream that neither yields nor ends parks its worker
-  until detach aborts it. `reference/sync.md` documents that the DELAYS around
-  the drive select on the token; the drive itself does not. Two tests now
-  deliberately exploit this to hold a teardown window open, so closing it would
-  break them - by design, and they say so.
+- **`detach` now costs up to `3 * detach_timeout`, and `shutdown()` is
+  sequential.** Recorded 2026-09-07 with the per-phase budgets rather than
+  buried in them. Three sequential phases - worker awaits, writer phase, close -
+  each with a fresh budget, so a detach that hits a wedged worker AND a
+  non-answering store AND a hung provider close costs 15s at the default. That
+  is stated in the `detach` rustdoc and in `reference/sync.md`. Two consequences
+  somebody should look at: `EngineConfig::detach_timeout` is still documented in
+  `crates/sync/src/types.rs` as "timeout for awaiting spawned workers", which is
+  now one phase of three and is the natural place for a consumer to learn the
+  total; and `SyncEngine::shutdown()` detaches accounts SEQUENTIALLY, so engine
+  shutdown is worst-case `3 * detach_timeout * n_accounts`. Whether that should
+  be concurrent is a product decision, not a defect - but the number just got
+  larger.
+
+- **`await_worker_until`'s timeout warning carries no account.** Every other
+  teardown log line in `detach_inner` names the account; this one logs "worker
+  exceeded detach timeout; aborted" with nothing to attribute it to, which is
+  unusable in a multi-account process. One line in `engine/ack.rs`.
 - **Residuals of the bounded-backfill cold review.** P3 or P4 from that
     review; verify against the code before working any of it. The rest of
     that list was worked on
@@ -897,21 +906,19 @@ wave; these are what was left. Verify before working any of them.
   the exclusion is dead as written and becomes a double-emit the moment the BYE
   short-circuit moves after classification.
 
-- **Two documentation gaps left by this wave.** (a) `DavDispatch::resolve_url`
-  now resolves a relative id UNDER the configured base path (`join_base` restores
-  the trailing slash before joining, where `Url::join` on a slashless base
-  replaced the base's last segment). Neither DAV reference describes relative-id
-  resolution at all, so nothing was false - but the behaviour belongs in the
-  dav-core write-up. (b) `reference/net.md` may need the redirect-versus-
-  `Destination` interaction now that `move_resource` rebases the destination on
-  the hop the source took; nobody checked it.
-
-- **smtp `DirectSmtpStage::RcptWindowReply` keeps only the FIRST negative reply**
-  in a window (`failure: Option<Response>`) and drops any later ones. It looks
-  deliberate on the direct path, whose output is a single `Response`, and it is
-  the direct-path analogue of the accepted batch loss recorded at
-  `BatchSmtpStage::WindowOpened` - but unlike that one it is written down
-  nowhere. Either document it at the arm or decide it is a defect.
+- **smtp: a 421 masked by an earlier 550 in the same RCPT window.** Found
+  2026-09-07 while documenting `DirectSmtpStage::RcptWindowReply`, which keeps
+  only the first negative reply. `closing_channel` at `WindowClosing` therefore
+  tests the RETAINED failure only, so a window whose first negative is a 550 and
+  whose second is a 421 takes `Epilogue::reset` instead of the abort that
+  commit e5a15b7a established for a 421 at every envelope boundary. NOT a
+  correctness hole - `Epilogue::reset` aborts anyway when the peer does not
+  positively acknowledge the RSET, so the connection still goes and the cost is
+  one wasted command on a channel the server is closing. But it is a real
+  divergence from the direct/batch symmetry, since `BatchSmtpStage::
+  RcptWindowReply` tests every reply for it. Filed rather than fixed because
+  making the direct path scan every reply for a 421 changes an observed
+  termination nobody ruled on.
 
 - **`flatten_push_object`'s `#[allow(unreachable_patterns)] _ => {}` arm now
   covers nothing** when both `mail` and `calendars` are on, since every
