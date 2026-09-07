@@ -16,7 +16,26 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+/// The bucket refills on the SAME clock the async funnel sleeps on.
+///
+/// `AsyncNetworkStream` parks the debt this bucket returns as a
+/// `tokio::time::Sleep`, so a bucket measuring refill on `std::time::Instant`
+/// reads a different clock from the timer that pays the debt off. The two
+/// disagree wherever tokio's clock is not the system one - which under
+/// `start_paused` test time means virtual waiting never refills the bucket at
+/// all, so a paused-time test accumulates debt that no amount of waiting can
+/// retire and any assertion about elapsed transfer time measures the artifact.
+/// `tokio::time::Instant::now()` falls back to the system clock when no tokio
+/// clock is in force, so the blocking funnel (which sleeps its own thread) is
+/// unaffected. Same reasoning as `AsyncDeadline`, which had to move for the
+/// same reason.
+#[cfg(feature = "tokio")]
+use tokio::time::Instant;
+
+#[cfg(not(feature = "tokio"))]
+use std::time::Instant;
 
 use bifrost_net::MeterSinkHandle;
 
@@ -92,15 +111,23 @@ impl WireMetering {
     /// How many bytes a single socket write may offer, given the cap in
     /// force right now: one second of budget, or `None` when uncapped.
     ///
-    /// The bucket lets tokens go negative, so a write charged for several
-    /// megabytes parks a sleep of several *seconds* - and the async funnel
-    /// makes the next write wait that sleep out before it touches the
-    /// socket, inside the caller's per-operation write timeout. A healthy
-    /// throttled upload then looks exactly like a stalled peer. Clamping
-    /// what is offered bounds any parked debt at about a second, so the
-    /// write timeout is only ever spent on the peer. It does not clamp the
-    /// debt itself: a write at or below this limit still owes proportional
-    /// time, which is what keeps a 1 B/s cap at 1 B/s.
+    /// The bucket lets tokens go negative, so an unclamped write charged
+    /// for several megabytes parks a sleep of several *seconds*, and the
+    /// next write waits that sleep out before it touches the socket.
+    /// Clamping what is offered bounds any single charge - and therefore
+    /// any single uninterruptible throttle wait - at about a second. It
+    /// does not clamp the debt itself: a write at or below this limit still
+    /// owes proportional time, which is what keeps a 1 B/s cap at 1 B/s.
+    ///
+    /// This clamp is NOT what keeps the per-operation write timeout a
+    /// statement about the peer, and must not be read as if it were:
+    /// bounding debt at one second only helps while the timeout is
+    /// comfortably larger than a second. The write loop in
+    /// `async_connection` drains parked outbound debt before it arms the
+    /// timeout, which is what makes that guarantee hold at any timeout. (Under
+    /// the shared SETUP deadline the drain is bounded by the slack instead:
+    /// that ceiling is absolute, so waiting outside it would overrun it rather
+    /// than protect it.)
     ///
     /// Re-read per call for the same reason `cap_now` is.
     pub(crate) fn write_chunk_limit(&self) -> Option<usize> {

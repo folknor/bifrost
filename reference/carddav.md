@@ -345,6 +345,18 @@ Supported contact primitives:
   clamped up to one (which served a contact the caller asked not to receive)
   or emitted as an empty page naming its own watermark again (which loops a
   cursor-following consumer forever). The CalDAV twin pins the same rule.
+
+  **An OMITTED `limit` defaults to `CONTACT_PAGE_SIZE` (250), and that is where
+  the twins diverge (dav-F7).** `contact_search` with `limit: None` serves at
+  most 250 candidates and carries a `next_cursor` for the remainder, so a
+  consumer that omits the field still walks the collection a page at a time.
+  `bifrost-caldav`'s `events_in_range` and `event_search` instead map
+  `limit: None` to `usize::MAX`, which truncates nothing and hydrates the whole
+  matching set into one continuation-less page; the two crates handle an
+  EXPLICIT limit identically, so the default is the only difference. Both
+  behaviours are now stated on both sides; choosing one is a product decision
+  about a published surface and is left to the repository owner.
+  `reference/caldav.md` carries the same note with the unbounded lane's cost.
   Every page
   reruns the remote search, so `failed_ids` reports what that page's fetch
   observed - a resource that only starts failing on page three is news on

@@ -408,6 +408,13 @@ pub(super) struct SlowSinkPeer {
     /// Bytes accepted per `gap`. `None` means the peer never accepts anything.
     chunk: Option<usize>,
     gap: Duration,
+    /// How many more writes may be accepted before the peer wedges for good.
+    ///
+    /// A test that needs throttle debt AND a peer that then accepts nothing
+    /// cannot use two peers - the stream owns one - so the transition has to
+    /// live here: `accepting(n, ...)` builds the debt with n writes and is a
+    /// `stalled()` peer from then on.
+    accepts: usize,
     /// Armed on the FIRST `poll_write`, not at construction. Arming it in
     /// `new` credits the setup time between building the peer and the first
     /// write against the first chunk's delay, so a test that constructs the
@@ -423,6 +430,18 @@ impl SlowSinkPeer {
             chunk: Some(chunk),
             gap,
             next: None,
+            accepts: usize::MAX,
+        }
+    }
+
+    /// Accepts `accepts` writes of up to `chunk` bytes each, instantly, and
+    /// wedges after that.
+    pub(super) fn accepting(accepts: usize, chunk: usize) -> Self {
+        Self {
+            chunk: Some(chunk),
+            gap: Duration::ZERO,
+            next: None,
+            accepts,
         }
     }
 
@@ -432,6 +451,7 @@ impl SlowSinkPeer {
             chunk: None,
             gap: Duration::ZERO,
             next: None,
+            accepts: 0,
         }
     }
 }
@@ -454,7 +474,7 @@ impl tokio::io::AsyncWrite for SlowSinkPeer {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let Some(chunk) = self.chunk else {
+        let Some(chunk) = self.chunk.filter(|_| self.accepts > 0) else {
             // No waker: only the caller's own timeout may resume this.
             return std::task::Poll::Pending;
         };
@@ -464,6 +484,7 @@ impl tokio::io::AsyncWrite for SlowSinkPeer {
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(gap)));
         std::task::ready!(std::future::Future::poll(sleep.as_mut(), cx));
         self.next = Some(Box::pin(tokio::time::sleep(gap)));
+        self.accepts = self.accepts.saturating_sub(1);
         std::task::Poll::Ready(Ok(chunk.min(buf.len())))
     }
 

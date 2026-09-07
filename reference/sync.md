@@ -2368,9 +2368,123 @@ opaque children is not, and only the multi-dimensional test gets both right.
 
 **Still not built:** region repair has no provider implementing it (Graph's
 region is a barrier by construction), so `ExactReplay`, `Partitioned` and
-lineage splitting are exercised by tests rather than by a live provider. Ledger
-compaction is also outstanding: discharged entries are retained forever for
-audit, so the ledger grows monotonically.
+lineage splitting are exercised by tests rather than by a live provider.
+
+### Ledger compaction
+
+`entries` used to grow monotonically - discharged entries were retained forever
+for audit - while its two neighbours were already bounded: `proved` drops any
+proof that can no longer contribute to an open obligation or barrier, and
+`record_proof` retains barriers on the same test. Repair churns entries faster
+than that retention rule was written for, so the entry map is now bounded too.
+
+**Only `Discharged` entries compact, into a per-scope count plus an audit root.
+Every `Unresolved` entry stays a live entry, waived ones included.** The line
+falls out of `ProofStatus`. `Discharged` is TERMINAL: something proved the
+coverage and nothing transitions it again, so a count plus a root loses nothing
+anyone could act on. `Unresolved` is not terminal even when waived - a waiver is
+a policy decision that stops the entry blocking completion and leaves the proof
+`Unresolved` forever by design, and a later walk with a covering domain can
+still discharge it. Compacting a waived entry would destroy an `ObligationKey`
+an operator may still need and a proof may still land on. That is also what
+preserves the proved-versus-waived distinction BY CONSTRUCTION rather than by
+bookkeeping: only the proved side folds, so the waived entries are exactly the
+ones left in the table in full.
+
+`DischargeAudit` is `{ count, root: [u8; 32], latest_generation }` per
+`CursorScope`. The root is a DETECTION root: the 256-bit wrapping SUM of
+per-entry SHA-256 fingerprints over (key, generation, evidence discriminant).
+Folding a candidate history and comparing detects a divergence - a discharge
+that quietly vanished, a corrupted durable row - and that is the whole claim.
+It is NOT proof of exact history: a sum of digests is weaker than its summands,
+two histories can in principle fold alike, and nothing here defends against an
+adversary who picks obligation keys. Addition rather than XOR because a key
+discharged, folded, rediscovered and folded again must count twice, and XOR
+would cancel it. `DischargeAudit::fold` and `discharge_fingerprint` are public
+so an audit can rebuild a root without reimplementing the framing.
+
+The fingerprint is SHA-256 (`sha2`, already a pinned workspace dependency for
+bifrost-sasl) and not the 128-bit FNV-1a it started as. The additive fold made
+the summands' collision resistance load-bearing, and FNV was not up to it: the
+histories `{"00", "05"}` and `{"01", "04"}` at generation 3, all
+`ProvedIrrelevant`, folded to identical count, generation and root out of
+ordinary two-byte keys. `the_short_key_collision_that_sank_the_additive_fnv_root_is_gone`
+keeps that pair as a regression.
+
+**The audited history is narrower than the word suggests.** Only
+`(key, generation, evidence KIND)` enters the fold. Repair attempt ids, covering
+domains, `ReplacedByChildren` child lists and `ProvedIrrelevant` reason text are
+INVISIBLE to the root at any hash strength - they are diagnostic payloads that
+legitimately change between revisions, and hashing them would make the root
+disagree with itself across a refactor. An audit comparing roots is comparing
+which obligations closed at which generation by which kind of proof, and nothing
+else.
+
+It deliberately cannot answer "was key K discharged" on its own. Open debt is
+the actionable state and is retained in full; an exact index means retaining the
+keys, which is the growth this removes; and a probabilistic index errs by
+reporting DISCHARGED for something that never was, which is the silent-loss
+shape the whole coverage model exists to prevent.
+
+Compaction runs at the END of `ingest` / `ingest_debt_only`, in the single
+writer, once the entry map crosses `COMPACTION_THRESHOLD` (512);
+`compact_discharged` is public for a consumer that knows a repair burst just
+closed. Running only at a fold boundary is what makes it safe against a
+concurrent transition rather than merely unlucky to race one, and the removal
+itself is inert by construction: `discharge_repaired` and `replace_obligation`
+already bail on `!is_open()`, and the foreign-lineage check only fires on an
+open entry, so a removed terminal entry and a present one give the same answer.
+
+**The one exception is the lineage, and it is why this needed care.**
+`replace_obligation` discharges the parent while leaving its policy `Retrying`,
+and children charge attempts against that discharged root. Folding a root out
+from under a live child would make `record_attempt` find nothing and silently
+un-cap the retry budget. So a discharged entry on a surviving entry's parent
+chain is retained: terminal as proof, still load-bearing as structure. It folds
+once its lineage closes too.
+
+The pin set is the ancestor CLOSURE, and the guarantee is stated deliberately:
+**every entry the ledger retains has its whole parent chain retained too.** Each
+survivor's ancestors are pinned, each newly pinned ancestor is walked in turn,
+and a visited set terminates it (and any cycle). The weaker alternative - one
+bounded walk from each unresolved entry - preserves that entry's own
+`lineage_root` lookup and leaves a retained endpoint pointing at a removed
+ancestor. Two details carry the whole thing: `lineage_root` follows at most
+`LINEAGE_DEPTH_CAP` (64) EDGES and returns the key reached after the last one
+even when it has a further parent, so the pin walk retains distances 1 through
+the cap INCLUSIVE; and both go through the single `lineage_ancestors` primitive
+so the resolver and the pin walk cannot disagree about where a chain ends.
+`DischargeEvidence::ReplacedByChildren` also names entries and those are
+deliberately not pinned - no reader dereferences that list for a decision, so it
+is evidence, not a link. If one ever does, they become operational dependencies
+and belong in the pin set.
+
+**Pending repair results are the dependency that lives outside the ledger.** A
+pass plans against a snapshot and only speaks to the writer again with results
+in hand, so between dispatch and result a covering proof can discharge the
+obligation and compaction can fold it - and nothing in the ledger names it, so
+no amount of pinning from its siblings preserves it. The deferred result then
+resolves its own root to itself, finds no entry, and charges nothing: the
+attempt vanishes against the budget. The ledger therefore keeps a small
+`folded_lineage` table of folded entries' parent links, consulted by
+`lineage_root` only when no entry exists, so a budget identity stays resolvable
+across compaction. It is bounded (a link is dropped once its chain no longer
+reaches a retained entry) and IN-MEMORY only - the attempt it protects is in
+flight in this process, and a restart loses the executor that would deliver the
+result, so nothing in `ledger_envelope` carries it. Chosen over retaining the
+entry path of every pending attempt, which would need a dispatch-time pin
+protocol between `run_repair_pass` and the writer plus a release on every
+abnormal exit, and a missed release leaks exactly what compaction reclaims. A
+folded entry with no parent gets no link: its budget identity is itself, it is
+discharged, and `repairable` already refuses it.
+
+Accepted cost: a compacted key rediscovered later is raised as a NEW entry, with
+`first_seen_unix_seconds` at now and the budget at zero, where an uncompacted
+discharged entry would have kept both. The entry was proved covered before it
+was folded, so a re-raise after proof is a fresh gap rather than a continuing
+one. `DebtLedger::is_empty` counts the audit table for the same reason: a caller
+that skips writing an "empty" ledger must not erase the only surviving record
+that those obligations existed.
 
 ## Cursor envelope
 
@@ -2473,12 +2587,30 @@ primitives, same `Error::SchemaIncompatible` for a version outside
 rule that a panic belongs to encode and never to decode. `decode_ledger` is
 likewise the single migration boundary: a version inside the window is migrated
 through `migrate_ledger`, not merely accepted, so what comes out is
-current-shaped ledger state. Both constants are `1` today, so that chain is
-empty; the first bump adds its fixup there together with a byte fixture, for the
-same reason the cursor envelope needs one.
+current-shaped ledger state. `LEDGER_ENVELOPE_VERSION` is `2` and
+`MIN_MIGRATABLE_LEDGER` is `1`.
+
+Version 2 added the compacted discharge audit table, and appended it to the
+PAYLOAD rather than widening the header: a fourth header count would move
+`HEADER_LEN` and force this decoder to know two header shapes. A version-1 row
+simply has no trailing section, so one reader handles both by asking the
+version. Such a row still loads, and loads as "never compacted" - version 1
+never compacted, so its entry map already holds every discharged entry verbatim
+and an empty audit table describes it exactly. `migrate_ledger` is therefore
+still a no-op for 1 -> 2, which is a conclusion rather than an omission: there
+is no field to reinterpret, and a fixup would be inventing a discharged history
+the row never claimed. The reverse direction is not readable and is not meant to
+be - a version-2 row handed to an older engine decodes to
+`Error::SchemaIncompatible`, the classification that authorizes clearing the row
+and re-establishing rather than reading as a store failure.
 
 The encoded form covers everything a restart must not forget: the entry map, the
-barrier map, and the retained proof set. Proof retention is easy to mistake for
+barrier map, the retained proof set, and the per-scope discharge audit (scope,
+`count`, a fixed 32-byte `root`, `latest_generation`) - dropping the last would
+silently reset an account's discharged count to zero and make its root
+uncheckable forever after. The folded parent links compaction keeps are
+deliberately NOT encoded: they exist for a repair attempt in flight in this
+process, which no restart survives. Proof retention is easy to mistake for
 a cache - it is not. Coverage discharges by UNION, so a proof dropped on restart
 turns debt that two later windows jointly cover into debt neither covers alone.
 A `BarrierIncident::resume_from` nests a whole cursor envelope through
@@ -2875,7 +3007,8 @@ crates/sync/src/
                           // `await_backfill_capacity`,
                           // `release_undelivered`)
     envelope.rs           // MIN_MIGRATABLE / ENGINE_VERSION + migrations
-    ledger.rs             // DebtLedger: entries, barriers, retained proofs
+    ledger.rs             // DebtLedger: entries, barriers, retained proofs,
+                          // compacted discharge audit, folded parent links
     ledger_envelope.rs    // encode_ledger / decode_ledger + error digest
     store.rs              // CheckpointStore trait (6 methods) +
                           // InMemoryCheckpointStore

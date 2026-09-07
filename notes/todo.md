@@ -758,6 +758,60 @@ PUBLISHED SURFACE fence apply.
   (no `primaryAccounts` at all) is refused before the wire; narrowing the
   fallback itself is a product decision, recorded at the function.
 
+## The outbound cap is evadable by reconnecting
+
+Found by the cold review of the 2026-09-07 throttle work; PRE-EXISTING, and
+explicitly not introduced by it. `throttle_out` is per-stream while `ByteBucket`
+is shared, and `poll_write` consults the bucket only AFTER the socket has
+accepted bytes. So a fresh connection's first write is ungated whatever the
+bucket owes: write one cap-sized chunk, drop the connection, dial again, and the
+cap never binds. N concurrent connections can likewise each pass a chunk against
+the same zero balance, because none of them reserved anything - ordinary async
+interleaving is enough, no threads needed.
+
+What that wave DID get wrong was the claim, since corrected in
+`reference/smtp.md` and at `poll_flush`, that the next connection pays the
+dropped connection's debt. It does not.
+
+The fix is a mechanism this crate does not have: shared ADMISSION, meaning
+permission held against the balance that a second connection cannot
+simultaneously obtain. Querying the shared deficit is NOT sufficient - other
+connections consume capacity between the query and the write - and the naive
+placement is actively wrong: a shared gate consulted inside `poll_write` sits
+inside `with_timeout` and re-creates smtp-CR11 one layer down, so admission
+waiting has to stay outside the per-operation timer (and inside the absolute
+deadline under a setup budget, with the write taking the recomputed slack).
+
+Two shapes, each with a cost that wants a ruling rather than a pick:
+
+- An exclusive lease held from the balance check through one socket write and
+  its charge. Closes the race, but one connection stalled on a write - forever,
+  under `timeout(None)` - then blocks every other connection. That is a new
+  dependency between connections and must be judged deliberately.
+- A byte reservation. Avoids exclusive ownership of the socket wait, but permits
+  acquired over time can accumulate on stalled sockets and all be exercised at
+  once, so a design promising bounded bursts has to bound outstanding admission
+  or revalidate it when writes actually progress.
+
+Either way: accepted-byte debt stays in the shared bucket and a dropped future
+must neither erase it nor pay it twice; settlement of a short write has to
+happen in the same poll that observes `Ready(Ok(n))`, before any await, since
+refunding an accepted write on drop re-opens the reconnect escape; and the
+connection-local `Sleep` can survive only as a cached wakeup, never as the
+authoritative gate, because a stale one waits inside `with_timeout` and is
+CR11 again.
+
+Scope notes for whoever builds it. The async application-write funnel is
+currently complete - every production async SMTP and LMTP write reaches
+`write_stream_with_budget`, which drains before each write - but three things
+sit outside it: the BLOCKING `NetworkStream::write` uses the same bucket
+implementation and writes before charging, so a universal contract needs both
+adapters; direct `AsyncNetworkStream` writes in tests bypass the connection
+drain, and would need the admission mechanism wherever they claim to exercise
+throttling; and TLS handshake, record overhead and shutdown traffic bypass
+plaintext accounting entirely. The honest guarantee is therefore about
+admission of METERED PLAINTEXT writes, not about every byte on the wire.
+
 ## Surfaced by the 2026-09-07 fix wave
 
 Found while resolving the dav-F, smtp-CR and jmap-C2 items and the two cold
@@ -795,6 +849,35 @@ wave; these are what was left. Verify before working any of them.
   every reconnect. Inherent to the type and consistent with the ordering rule
   that puts the token-bearing notification last; closing it is a change to that
   type's shape.
+
+- **Three rulings from the ledger-compaction landing (2026-09-07).**
+  (a) After compaction a re-raised key becomes a NEW entry:
+  `first_seen_unix_seconds` resets to now and the retry budget to zero, where an
+  uncompacted discharged entry preserved both, since `upsert` deliberately keeps
+  history on re-raise. Accepted and documented on the argument that the entry was
+  proved covered before folding, so a re-raise after proof is a fresh gap and
+  charging it the old budget charges it for failures that provably stopped. It is
+  still a behaviour change to the "re-raising must not reset history" rule and it
+  is reachable in production; preserving it means retaining keys, which reopens
+  the growth compaction removes.
+  (b) Multi-level lineages cannot arise in process - `replace_obligation`
+  re-points every child at `lineage_root(parent)`, so live shapes are always
+  flat. A chain is reachable only through `decode_ledger` / `from_parts`
+  restoring a durable row written by another revision or by hand. The depth cap
+  and the ancestor closure are therefore either cheap insurance or load-bearing
+  depending on whether such rows are possible; the tests build chains that way
+  deliberately and say so. Somebody should rule on it.
+  (c) `record_attempt` charges an entry regardless of `is_open()`, so a
+  discharged-but-`Retrying` entry can still take charges. Pre-existing, and it is
+  precisely what makes the lineage-root pin necessary. Worth deciding whether
+  that is the intended contract or an accident the pin is now compensating for.
+
+- **smtp inbound throttle debt has the CR11 shape and was not fixed.**
+  `poll_read` consults `throttle_in` INSIDE the read budget, so under a small cap
+  a reply's own metering debt is charged against the per-reply deadline - exactly
+  the defect the outbound drain fixed, on the other side. Filed rather than fixed
+  because the read path drains through `BufReader::poll_fill_buf` and the change
+  is materially more invasive than the write side's.
 
 - **jmap SSE: let a content-free parser overflow continue.** The stream ends on
   any parser error because `discard(..)` destroys a block that MAY have carried

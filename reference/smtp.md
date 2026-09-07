@@ -29,10 +29,28 @@ share one sans-I/O core and differ only in how they move bytes. See "Protocol
 core and I/O adapters". What still exists twice - connect, greeting, EHLO/LHLO,
 the AUTH ladder, STARTTLS, reply reading, deadlines - is I/O-shaped, and the
 paired tests over it remain intentional while the published sync and async
-transports remain separate. The deliberate behavioural differences are the
-`abort()` timeout (see "Connection lifecycle") and the outbound-throttle
-invariant (see "Bandwidth metering"). Any proposal to remove or reshape this
-surface is the owner's call - see the standing lessons in `AGENTS.md`.
+transports remain separate. There are three deliberate behavioural differences:
+the `abort()` timeout (see "Connection lifecycle"), the outbound-throttle
+invariant (see "Bandwidth metering"), and what the configured timeout covers
+during SETUP, immediately below. Any proposal to remove or reshape this surface
+is the owner's call - see the standing lessons in `AGENTS.md`.
+
+The third one is easy to miss because each half is documented by its MECHANISM
+rather than by its BOUND. The async half runs DNS, connect, TLS handshake,
+banner and EHLO under ONE shared `AsyncDeadline`, so async setup as a whole
+cannot exceed the configured timeout. The blocking half has no such thing, and
+is not merely looser - it is not bounded by that value at all:
+`to_socket_addrs()` resolves synchronously with no timeout, `connect_timeout`
+applies the full value to EACH candidate address in turn, the TLS handshake runs
+before `set_timeout` has armed the socket and so is unbounded, and only the
+banner and EHLO reads are bounded, per reply, by `SO_RCVTIMEO`. A caller reading
+"timeout" as a ceiling on how long a transport may take to produce a usable
+connection is therefore right on the async half and wrong on the blocking one.
+The difference is structural rather than an oversight: a blocking connect has no
+cancellation point to hang a shared deadline on, and giving the blocking half
+one would mean a non-blocking socket and a poll loop, which is not what that
+half is for. A blocking caller who needs a ceiling on setup must impose it
+outside the call.
 
 The write timeout is deliberately NOT a third difference, and the async half
 had to be built to keep it that way. The configured timeout bounds one write
@@ -51,12 +69,67 @@ slow-but-progressing upload does not. Pinned on the async side by
 time. A `SetupDeadline` budget still shrinks across the loop, so the shared
 connect deadline is unaffected.
 
+The contract that property implies is worth stating in full, because it is a
+guarantee about a WRITE and callers read it as a guarantee about a TRANSFER:
+**there is no total bound on a body upload, by design.** A peer that accepts one
+byte per (timeout minus epsilon) keeps a send alive indefinitely, and that is
+the same rule the two pinned tests describe, not a hole in it. Bounding the
+whole transfer would need a second, size-aware budget nothing configures, and
+any value picked for it would fail exactly the healthy slow uploads the
+re-arming loop was built to keep - a 12 MB message on a domestic uplink. The
+read side differs for a reason that does not carry over: a REPLY has a size cap
+(`MAX_RESPONSE_BYTES`), so "one reply" is a bounded unit and a per-reply
+deadline is expressible; a message body has no such ceiling. A caller who needs
+a wall-clock ceiling on a whole send imposes it above the transport, by wrapping
+the send in its own timeout - which is also the only place that knows what the
+message size makes reasonable.
+
 Re-arming covers the slow LINK. It does not by itself cover a bandwidth CAP,
 and the two failures look identical from inside the loop: a write that hands
-the socket several megabytes has every accepted byte charged, parks a
-multi-second `Sleep` in `throttle_out`, and the next iteration's fresh timeout
-is spent on this crate's own throttle rather than on the peer. The cap half is
-held one layer down instead - see "Bandwidth metering".
+the socket several megabytes has every accepted byte charged and parks a
+multi-second `Sleep` in `throttle_out`. Two things hold that half. The offer
+clamp one layer down bounds what a single write can charge (see "Bandwidth
+metering"), and the write loop DRAINS its own outbound debt before arming the
+next timeout, so a wait this crate imposed at the consumer's request is never
+charged to the budget that exists to judge the peer. The clamp alone was not
+enough and could not be: it bounds parked debt at about one second of cap, which
+keeps the timeout meaningful only while the timeout is comfortably larger than a
+second, so any configured timeout at or below a second failed every capped write
+after the first with `Timeout` / `DataBody` and every recipient `uncertain`.
+Draining removes the dependency on that ratio entirely and makes the async half
+match the blocking one, where `NetworkStream::charge` already sleeps outside
+`SO_SNDTIMEO`. The cap itself is untouched - a throttled upload still takes
+exactly as long as the cap says, it just does not fail. Pinned by
+`a_capped_upload_outlives_a_write_timeout_shorter_than_its_throttle_debt`, under
+paused time with a 200 ms timeout and a 1000 B/s cap.
+
+Draining before arming is right for ONE of the two budgets, and the write loop
+matches on which. `PerOperation` is a bound on one write's dealings with the
+peer, so the drain runs entirely outside it, as above. `SetupDeadline` is an
+ABSOLUTE ceiling shared by DNS, connect, TLS, banner and EHLO, and there
+"outside the budget" is not a saving but the failure: draining outside it does
+not SPEND the deadline, it WAITS PAST it. Under a cap small enough to throttle a
+greeting, an EHLO write goes a byte at a time with a second of debt between
+bytes while the remaining setup budget is milliseconds, and the operation does
+report a timeout - but only after overrunning a ceiling the contract says it
+cannot exceed. So the drain is bounded by the slack left on the deadline, and
+debt that cannot be paid inside the setup budget fails as a setup timeout. The
+write and flush that follow re-read the slack for themselves, because
+`with_timeout` resolves a `SetupDeadline` when it arms the timer; computing a
+remaining duration once and reusing it across the drain and the write would hand
+back the same overrun in smaller pieces. Pinned by
+`a_setup_deadline_bounds_the_throttle_drain_rather_than_waiting_past_it` (the
+elapsed time is the finding; an unbounded drain also ends in a timeout, just
+1000 ms into a 300 ms ceiling) and
+`the_write_after_a_bounded_drain_gets_the_recomputed_slack`. There is no third
+budget shape to consider: `teardown_budget()` builds a `PerOperation` value and
+applies it directly to `stream.shutdown()`, never to a write.
+
+Bounding the drain closes the overrun the drain itself introduced. It does not
+on its own prove that the public connect future returns by the setup deadline:
+setup error handling goes on to call `abort()`, which carries its own teardown
+timeout (see "Connection lifecycle"), so the wall-clock bound a caller
+experiences is the setup deadline plus at most that teardown cap.
 
 ## Protocol core and I/O adapters
 
@@ -181,6 +254,18 @@ wire-level failure runs, so the connection would stay `Ok`, return to the pool,
 and hand the next send a half-open transaction. Building first keeps every
 address rejection on the clean side of `MAIL FROM`, where no abort is needed
 and the connection stays reusable.
+
+`DirectSmtp` also enforces "no `DATA` before `MAIL FROM`" itself rather than
+inheriting it from its callers. `Envelope::new` rejects an empty recipient list,
+so an empty envelope is unreachable from the public API, but the pipelined
+branch used to call `start_window(0)`, find nothing to write, fall through to
+`after_envelope` and open the transaction with a bare `DATA`. The machine is the
+authority on its own command sequence and cannot see the type that forbids the
+input, so the empty case is routed through the sequential branch, which writes
+`MAIL FROM` before it looks at the list. Pinned by
+`a_pipelined_send_with_no_recipients_still_opens_with_mail_from`. `BatchSmtp`
+has the same shape one degree milder - a pipelined empty batch writes `RSET`
+with no transaction open, which is legal SMTP - and is deliberately left alone.
 
 ## Async setup deadline
 
@@ -613,6 +698,71 @@ the resulting debt together (async only - the clamp lives in
 equivalent: `NetworkStream::charge` sleeps the thread outside
 `SO_SNDTIMEO`, so throttle debt never counts against a write deadline
 there.
+
+What outbound debt guarantees is that it gates the NEXT write, and nothing
+more. The cap is a RATE and the rate is enforced by the `ByteBucket`: bytes are
+debited the moment the socket accepts them, and the bucket is shared by every
+connection a transport dials. The parked `Sleep` is not the accounting, only
+the mechanism that holds the next transfer until the bucket has refilled. So a
+send that ends in debt RETURNS with that debt still parked - the DATA
+terminator is a write like any other - and `poll_flush` deliberately does not
+drain it. Flushing pays nothing back, since the bytes are already charged, so
+draining there would only add latency to a send that has finished, without
+changing the rate the cap enforces. A pooled connection recycled with debt
+parked is covered: the next checkout writes through the same `throttle_out`,
+which is exactly when the wait is owed.
+`outbound_throttle_debt_gates_the_next_write` pins it.
+
+**The gate is PER CONNECTION, and the cap is therefore evadable by
+reconnecting.** `throttle_out` lives on the stream while the `ByteBucket` is
+shared, and `poll_write` consults the bucket only AFTER the socket has accepted
+bytes, so a fresh connection's first write is ungated whatever the bucket owes.
+A caller that writes one cap-sized chunk, drops the connection and dials again
+never waits, and N concurrent connections can each pass a chunk against the
+same zero balance because none of them reserved anything. This predates the
+throttle-drain split and is not closed by it. An earlier revision of this
+section claimed the next connection pays the debt; that was wrong and is
+recorded here so it is not restated. Closing it needs shared ADMISSION -
+permission held against the balance that another connection cannot
+simultaneously obtain - and the two shapes that would provide it both carry a
+cost worth ruling on rather than picking: an exclusive lease held across a
+write makes one stalled peer block every other connection, while byte
+reservations let permits accumulate on stalled sockets and be exercised
+together later. Filed in `notes/todo.md`.
+
+`ByteBucket` refills on `tokio::time::Instant`, not `std`'s, for the same
+reason `AsyncDeadline` does: the debt it returns is paid off by a
+`tokio::time::Sleep`, and a bucket reading a different clock from the timer
+that retires its debt is only accidentally right. Under `start_paused` test
+time it was not right at all - virtual waiting never refilled the bucket, so a
+paused-time test accumulated debt nothing could retire and any assertion about
+elapsed transfer time measured the artifact rather than the cap.
+`tokio::time::Instant::now()` falls back to the system clock when no tokio
+clock is in force, so the blocking funnel, which sleeps its own thread, is
+unaffected.
+
+The clamp is no longer the only thing standing between a cap and a
+spurious write timeout, and must not be relied on as if it were: the
+async write loop now drains parked outbound debt BEFORE arming the
+per-operation timeout, which is what makes the guarantee independent of
+the ratio between the timeout and one second (see "Transport types"). The
+clamp still earns its place - it keeps a single charge, and therefore a
+single uninterruptible throttle wait, bounded at about a second, which
+matters for cancellation granularity and for how much traffic one retune
+can be late to govern.
+
+Bytes are counted as PLAINTEXT, not as ciphertext, and the gap is not
+negligible under a small cap. The meter sits in `AsyncNetworkStream` /
+`NetworkStream`, above native-tls, so `charge` never sees the record
+header, MAC or padding the TLS layer adds. The offer clamp makes each
+capped write about one second of cap, and each such write typically
+becomes its own TLS record, so the bytes actually on the wire exceed the
+cap by roughly one record's overhead (tens of bytes) per second of cap -
+negligible at a megabyte, around a third at a 100 B/s cap. Charging real
+wire bytes would mean putting the meter below the TLS layer, which
+native-tls does not expose, so this is recorded rather than fixed. A
+consumer sizing a cap against a hard link budget should leave headroom
+accordingly.
 
 That bound survives a RETUNE, which it did not always. Tokens are BYTES
 and debt is read back as `-tokens / cap_now`, so lowering the cap between

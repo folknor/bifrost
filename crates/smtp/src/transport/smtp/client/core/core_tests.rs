@@ -474,6 +474,29 @@ fn a_pipelined_window_drains_exactly_one_reply_per_command() {
     assert_eq!(second_window.matches("RCPT TO").count(), 3);
 }
 
+/// No send path may write `DATA` before `MAIL FROM`, whatever the recipient
+/// count.
+///
+/// `Envelope::new` refuses an empty recipient list, so this is unreachable from
+/// the public API - but the machine is the authority on its own command
+/// sequence, and it did not enforce it: with no recipients the pipelined branch
+/// called `start_window(0)`, found nothing to send, fell straight through to
+/// `after_envelope`, and opened with a bare `DATA`. The sequential branch never
+/// had the hole, because it writes `MAIL FROM` before it looks at the list.
+#[test]
+fn a_pipelined_send_with_no_recipients_still_opens_with_mail_from() {
+    let mut machine = DirectSmtp::new(mail(), rcpts(0), true, BodyKind::Data);
+    let mut harness = Harness::positive(8);
+    let _ = harness.run(&mut machine);
+
+    let first = harness.ops.first().expect("something is written");
+    assert!(
+        first.starts_with("W:MAIL FROM"),
+        "the transaction must be opened before the body: {:?}",
+        harness.ops
+    );
+}
+
 /// The surplus check is deferred to the end of a window, not applied per
 /// reply. A peer whose replies arrive coalesced is normal; only bytes left
 /// after the whole group has drained prove it spoke out of turn.

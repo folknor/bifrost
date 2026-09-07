@@ -32,8 +32,8 @@ pub use envelope::{
     CursorEnvelope, ENGINE_VERSION, EnvelopeKind, MIN_MIGRATABLE, decode_envelope, encode_envelope,
 };
 pub use ledger::{
-    BarrierIncident, DebtLedger, DischargeEvidence, LedgerEntry, PolicyStatus, ProofStatus,
-    ReplacementProgress, ReplacementRefusal,
+    BarrierIncident, DebtLedger, DischargeAudit, DischargeEvidence, LedgerEntry, PolicyStatus,
+    ProofStatus, ReplacementProgress, ReplacementRefusal, discharge_fingerprint,
 };
 pub use ledger_envelope::{
     LEDGER_ENVELOPE_VERSION, MIN_MIGRATABLE_LEDGER, decode_ledger, encode_ledger,

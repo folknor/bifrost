@@ -344,6 +344,31 @@ Supported calendar primitives:
   rather than an empty page that names its own watermark again and loops a
   cursor-following consumer forever.
 
+  **An OMITTED `limit` means unbounded, on both paging lanes, and it means it
+  literally (dav-F7).** `events_in_range` and `event_search` both map
+  `limit: None` to `usize::MAX`, which reaches
+  `bifrost_dav_core::slice_after_watermark` and truncates nothing: the page
+  carries every candidate href the query (or the degrade listing) named, the
+  multiget hydrates all of them, and `next_cursor` is `None` because there is no
+  remainder. Nothing downstream clamps it. `MULTIGET_BATCH_SIZE` chunks the
+  REPORTs but every chunk is dispatched and merged into the one page,
+  `MULTIGET_LEG_CONCURRENCY` bounds only how many are in flight at once, and
+  `Page` imposes no boundary of its own. So a `limit`-less call against a large
+  collection issues O(collection / batch) REPORTs and materializes the whole
+  collection's projected events in memory - and because a recurring resource
+  expands into an event per override, the item count is not even bounded by the
+  resource count. A consumer that wants a bounded page must ask for one.
+
+  **This does not match the CardDAV twin, and the divergence is recorded rather
+  than resolved.** `bifrost-carddav::contact_search` defaults `limit: None` to
+  `CONTACT_PAGE_SIZE` (250); the two crates handle an explicit limit
+  identically, so the default is the only difference. Aligning them is a product
+  decision about a published surface - one direction silently truncates results
+  a consumer currently receives whole, the other removes a bound a consumer
+  currently relies on - and it belongs to the repository owner, not to whoever
+  next reads this paragraph. What is settled is that neither behaviour is
+  undocumented any more.
+
   **The key is the href, never the event id, and that is load-bearing.** The
   recurrence-qualified `EventId` (`{uri}#{RECURRENCE-ID}`) survives on the
   ITEMS - a time-range filter matches a recurring master whose instances fall

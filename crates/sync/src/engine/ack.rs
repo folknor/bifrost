@@ -819,6 +819,15 @@ async fn apply_repair_resolutions(
                 apply_replacement(ledger, &key, &proof, generation, now);
             }
             crate::repair::RepairResolution::Deferred { key } => {
+                // Charged even when `key` no longer HAS an entry, which is
+                // ordinary rather than exotic: a repair pass plans against a
+                // ledger snapshot, and a covering proof acknowledged while the
+                // pass is out can discharge the obligation and let compaction
+                // fold it before this result gets back. The ledger keeps the
+                // folded entry's parent link precisely so the charge still
+                // lands on the lineage root its surviving siblings share -
+                // otherwise the attempt evaporates and the retry budget stops
+                // being a cap. See `DebtLedger::record_attempt`.
                 ledger.record_attempt(&key, crate::repair::DEFAULT_REPAIR_BUDGET);
             }
         }

@@ -27,6 +27,14 @@
 //!   4 bytes   proof count       -> N (generation, CoverageDomain) pairs
 //! ```
 //!
+//! Version 2 appends one further section AFTER the proofs, in the payload
+//! rather than in the header: a `u32` count followed by that many
+//! `(CursorScope, DischargeAudit)` pairs, the compacted terminal history.
+//! Appending in the payload rather than widening the header is deliberate - a
+//! fourth header count would move `HEADER_LEN`, and then this decoder would
+//! need two header shapes to read a version-1 row. A version-1 row simply has
+//! no trailing section, so the same reader handles both by asking the version.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -79,13 +87,14 @@ use super::envelope::{
     write_bytes, write_string,
 };
 use super::ledger::{
-    BarrierIncident, DebtLedger, DischargeEvidence, LedgerEntry, PolicyStatus, ProofStatus,
+    BarrierIncident, DebtLedger, DischargeAudit, DischargeEvidence, LedgerEntry, PolicyStatus,
+    ProofStatus,
 };
 use crate::error::Error;
 
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 1;
+pub const LEDGER_ENVELOPE_VERSION: u32 = 2;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -99,6 +108,9 @@ pub const MIN_MIGRATABLE_LEDGER: u32 = 1;
 
 const MAGIC: u8 = 0xB6;
 const HEADER_LEN: usize = 20;
+
+/// First version that carries the compacted discharge audit table.
+const LEDGER_VERSION_WITH_AUDIT: u32 = 2;
 
 /// Serialize a whole `DebtLedger`.
 ///
@@ -137,6 +149,19 @@ pub fn encode_ledger(ledger: &DebtLedger) -> Vec<u8> {
         out.extend_from_slice(&generation.to_le_bytes());
         encode_domain(&mut out, domain);
     }
+
+    let compacted = ledger.compacted();
+    write_count(&mut out, compacted.len(), "discharge audits");
+    for (scope, audit) in compacted {
+        write_bytes(&mut out, &encode_scope(scope));
+        out.extend_from_slice(&audit.count.to_le_bytes());
+        // Fixed 32 bytes, written as the digest sum's own little-endian byte
+        // order rather than through an integer type: the root is a 256-bit
+        // value, and routing it through anything narrower is how a durable
+        // record silently loses half of one.
+        out.extend_from_slice(&audit.root);
+        out.extend_from_slice(&audit.latest_generation.to_le_bytes());
+    }
     out
 }
 
@@ -150,12 +175,18 @@ pub fn encode_ledger(ledger: &DebtLedger) -> Vec<u8> {
 ///
 /// A version inside the window is MIGRATED, not merely accepted: whatever this
 /// returns is current-shaped ledger state, exactly as `decode_envelope` returns
-/// a `ChangeCursor` its own consumers will accept. `MIN_MIGRATABLE_LEDGER ==
-/// LEDGER_ENVELOPE_VERSION` today so the chain is empty, but decode is the
-/// declared migration boundary and the per-version fixup goes in
-/// `migrate_ledger` when the first bump lands - together with a byte fixture
-/// for the outgoing layout, because only a fixture proves a fixup reads old
-/// bytes correctly.
+/// a `ChangeCursor` its own consumers will accept.
+///
+/// Version 1 is still readable, and reads as a ledger that has never compacted:
+/// its entry map already holds every discharged entry verbatim, so an empty
+/// audit table describes it exactly and nothing is lost or invented. The first
+/// ingest that carries it over `COMPACTION_THRESHOLD` folds that history the
+/// same way it would fold history this revision produced. The reverse
+/// direction is not readable and is not meant to be: a version-2 row handed to
+/// an older engine is outside its window and decodes to
+/// `Error::SchemaIncompatible`, the classification that authorizes a consumer
+/// to clear the row and re-establish rather than to treat it as a store
+/// failure.
 pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
     if bytes.len() < HEADER_LEN {
         return Err(Error::Other("ledger envelope: truncated header".into()));
@@ -169,7 +200,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
         ));
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    if version < MIN_MIGRATABLE_LEDGER || version > LEDGER_ENVELOPE_VERSION {
+    if !(MIN_MIGRATABLE_LEDGER..=LEDGER_ENVELOPE_VERSION).contains(&version) {
         return Err(Error::SchemaIncompatible);
     }
 
@@ -194,17 +225,43 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
         proved.push((generation, decode_domain(&mut reader)?));
     }
 
+    // A version-1 row stops after the proofs. Reading nothing is exactly right
+    // for it: version 1 never compacted, so every entry it ever discharged is
+    // still an entry in the map above, and an empty audit table is a true
+    // statement about it rather than a lossy default.
+    let mut compacted = Vec::new();
+    if version >= LEDGER_VERSION_WITH_AUDIT {
+        let audit_count = reader.u32()? as usize;
+        compacted.reserve(audit_count.min(1024));
+        for _ in 0..audit_count {
+            let scope = decode_scope(&reader.bytes()?)?;
+            compacted.push((
+                scope,
+                DischargeAudit {
+                    count: reader.u64()?,
+                    root: reader.digest32()?,
+                    latest_generation: reader.u64()?,
+                },
+            ));
+        }
+    }
+
     Ok(migrate_ledger(
         version,
-        DebtLedger::from_parts(entries, barriers, proved),
+        DebtLedger::from_parts(entries, barriers, proved, compacted),
     ))
 }
 
 /// Bring a ledger decoded from an accepted historical layout up to the current
 /// one.
 ///
-/// Empty today because `MIN_MIGRATABLE_LEDGER == LEDGER_ENVELOPE_VERSION`. It
-/// exists as the named boundary anyway, for the same reason
+/// Still a no-op for the 1 -> 2 step, and that is a conclusion rather than an
+/// omission: version 2 only ADDS the audit table, and a version-1 ledger has a
+/// truthfully empty one. There is no field to reinterpret and no state to
+/// synthesize, so a fixup here would be inventing a discharged history the row
+/// never claimed.
+///
+/// It exists as the named boundary anyway, for the same reason
 /// `migrate_change_cursor` does: the codec is the only place in the workspace
 /// that may hold ledger state in an older shape, so a fixup written anywhere
 /// else spreads knowledge of a dead layout into consumers that have no code to
@@ -1335,6 +1392,13 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(buf))
     }
 
+    fn digest32(&mut self) -> Result<[u8; 32], Error> {
+        let bytes = self.take(32)?;
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(bytes);
+        Ok(buf)
+    }
+
     fn i64(&mut self) -> Result<i64, Error> {
         let bytes = self.take(8)?;
         let mut buf = [0u8; 8];
@@ -1357,8 +1421,12 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use bifrost_types::CursorScope;
+
     use super::{LEDGER_ENVELOPE_VERSION, decode_ledger, encode_ledger};
-    use crate::cursor::ledger::DebtLedger;
+    use crate::cursor::ledger::{DebtLedger, DischargeAudit, DischargeEvidence};
     use crate::error::Error;
 
     /// The empty ledger is the state every account starts in, so a consumer
@@ -1420,6 +1488,70 @@ mod tests {
         let mut bytes = encode_ledger(&DebtLedger::new());
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert!(decode_ledger(&bytes).is_err());
+    }
+
+    /// A version-1 row has no audit section at all. It must still load, and
+    /// load as "never compacted" rather than as a decode failure - an older
+    /// writer's ledger is the single most likely thing this decoder will ever
+    /// be handed after a version bump.
+    #[test]
+    fn a_version_one_row_without_an_audit_section_still_loads() {
+        let mut bytes = encode_ledger(&DebtLedger::new());
+        // The version-1 layout is exactly this one minus the trailing audit
+        // count, which is the last four bytes of an otherwise empty ledger.
+        let audit_count = bytes.split_off(bytes.len() - 4);
+        assert_eq!(audit_count, 0u32.to_le_bytes(), "empty ledger, empty table");
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+
+        let restored = decode_ledger(&bytes).expect("a version-1 ledger still decodes");
+        assert!(restored.is_empty());
+        assert_eq!(
+            restored.discharge_audit(&CursorScope::Account),
+            None,
+            "version 1 never compacted, so it has no folded history to claim"
+        );
+    }
+
+    /// The same bytes at the CURRENT version are truncated, and must be
+    /// refused. This is what proves the audit section is genuinely read rather
+    /// than optional at every version - without it, the test above would pass
+    /// against a decoder that ignored the section entirely.
+    #[test]
+    fn a_current_version_row_missing_its_audit_section_is_refused() {
+        let mut bytes = encode_ledger(&DebtLedger::new());
+        bytes.truncate(bytes.len() - 4);
+        assert!(matches!(decode_ledger(&bytes), Err(Error::Other(_))));
+    }
+
+    /// The audit is the whole point of compaction, so it must cross the durable
+    /// boundary intact. A root that changed value on the way through would make
+    /// every later verification fail against a ledger that lost nothing.
+    #[test]
+    fn a_compacted_audit_round_trips_with_its_root() {
+        let mut audit = DischargeAudit::default();
+        audit.fold(
+            &bifrost_types::ObligationKey(b"gone".to_vec()),
+            9,
+            &DischargeEvidence::ProvedIrrelevant {
+                detail: "out of scope".into(),
+            },
+        );
+        let ledger = DebtLedger::from_parts(
+            BTreeMap::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            vec![(CursorScope::Account, audit)],
+        );
+
+        let restored = decode_ledger(&encode_ledger(&ledger)).expect("decodes");
+        let restored = restored
+            .discharge_audit(&CursorScope::Account)
+            .expect("audit survives");
+        assert_eq!(*restored, audit);
+        assert_ne!(
+            restored.root, [0u8; 32],
+            "a folded entry must move the root"
+        );
     }
 
     /// Every operation tag must survive the table round trip. A transposed pair

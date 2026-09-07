@@ -27,6 +27,10 @@ dashmap = { workspace = true }
 uuid = { workspace = true }
 jiff = { workspace = true }
 arc-swap = { workspace = true }
+# The debt ledger's discharge audit root. A pinned workspace dependency already
+# used by bifrost-sasl, chosen over hand-rolling a hash because the additive
+# fold makes the summands' collision resistance load-bearing.
+sha2 = { workspace = true }
 
 # Protocol-crate dev-dependencies so `cross_crate_conformance.rs` can
 # construct each public factory and witness the new

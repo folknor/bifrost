@@ -330,7 +330,17 @@ impl ProtocolMachine for DirectSmtp {
                 }
             }
             DirectSmtpStage::Start => {
-                if self.pipelined {
+                // The empty recipient list is excluded from the pipelined
+                // branch rather than left to the caller: `start_window(0)`
+                // would find nothing to send, fall straight through to
+                // `after_envelope`, and write `DATA` with no `MAIL FROM` ahead
+                // of it. `Envelope::new` rejects an empty list, so no
+                // production caller reaches this - but the machine is the
+                // authority on its own command sequence, and "a type upstream
+                // happens to forbid it" is not an invariant this file can see.
+                // The sequential branch opens the transaction correctly for
+                // any recipient count.
+                if self.pipelined && !self.recipients.is_empty() {
                     return self.start_window(0);
                 }
                 let bytes = self.mail.to_string();

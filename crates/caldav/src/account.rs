@@ -936,6 +936,17 @@ impl Account for CalDavAccount {
             )?;
             let calendar_url = client.resolve_url(&range.calendar_id.0);
             let (range_start, range_end) = caldav_query_range(&range.start, &range.end)?;
+            // An omitted `limit` means UNBOUNDED, and it means it literally:
+            // `usize::MAX` reaches `slice_after_watermark`, which then truncates
+            // nothing, so the page carries every candidate the range query named
+            // and the multiget hydrates all of them (chunked at
+            // `MULTIGET_BATCH_SIZE`, but every chunk is dispatched and merged
+            // into one page, with no continuation cursor). Nothing downstream
+            // clamps this - not the batch size, not the `Page` boundary - so the
+            // caller decides the page size or gets the whole matching set. The
+            // CardDAV twin defaults `contact_search` to `CONTACT_PAGE_SIZE`
+            // instead; the divergence is deliberate for now and recorded in
+            // `reference/caldav.md`, not an oversight to be quietly aligned.
             let page_size = range.limit.map_or(usize::MAX, |value| {
                 usize::try_from(value).unwrap_or(usize::MAX)
             });
@@ -1172,6 +1183,11 @@ impl Account for CalDavAccount {
                 AccountOperation::EventSearch,
             )?;
             let needle = request.query.to_lowercase();
+            // Same unbounded default as `events_in_range`, deliberately kept
+            // identical to it: an omitted `limit` hydrates every candidate the
+            // text legs (or the degrade listing) named, in one page with no
+            // continuation. See the comment there for what does and does not
+            // clamp it, and for the CardDAV divergence.
             let page_size = request.limit.map_or(usize::MAX, |value| {
                 usize::try_from(value).unwrap_or(usize::MAX)
             });
