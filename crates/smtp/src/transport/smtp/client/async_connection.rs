@@ -3699,6 +3699,12 @@ mod transcript_tests {
             outcome.failed()[0].error.kind(),
             AccountErrorKind::Server(ServerErrorKind::Error { status: Some(554) })
         ));
+        // An SMTP 5xx is permanent (RFC 5321 4.2.1); see the blocking twin.
+        assert_eq!(
+            outcome.failed()[0].error.recovery(),
+            &bifrost_types::RecoveryClass::ProviderRefused,
+            "a permanent SMTP refusal must not be advice to resend"
+        );
         assert!(
             !connection.has_broken(),
             "the transaction completed; the connection is still clean"

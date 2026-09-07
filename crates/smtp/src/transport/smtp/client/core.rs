@@ -135,6 +135,24 @@ fn phased(phase: SmtpCommandPhase, error: Error) -> Result<Response, PhasedError
     Err(PhasedError::new(phase, error))
 }
 
+/// Whether a negative reply is the peer announcing that it is hanging up.
+///
+/// `421` is "service not available, closing transmission channel" (RFC 5321
+/// 4.2.3), and it overrides every reset-or-keep rule below: those rules reason
+/// about the TRANSACTION - a rejected `MAIL FROM` opened none, so nothing to
+/// reset; a rejected `RCPT TO` or `DATA` is cleared with RSET - while a 421 is
+/// about the CONNECTION. Parking a socket the peer just said it is closing
+/// hands the next checkout a dead connection, which under
+/// `test_on_checkout(false)` surfaces as an `Unsent` failure on a send that had
+/// nothing to do with this one. So every arm that decides what to do with a
+/// negative reply asks this FIRST and aborts on `true`, carrying the same status
+/// error (or the same per-recipient record) it would otherwise have produced.
+/// One check in one place: the end-of-data arms had it and the envelope arms
+/// did not, and a 421 to `MAIL FROM` parked the dying connection.
+fn closing_channel(response: &Response) -> bool {
+    response.has_code(421)
+}
+
 /// Which body framing a send uses. `Bdat` skips the `DATA` command entirely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BodyKind {
@@ -331,12 +349,14 @@ impl ProtocolMachine for DirectSmtp {
                     self.write_then(DirectSmtpStage::RcptReply(0), bytes)
                 }
                 OpOutcome::Reply(response) => {
+                    let closing = closing_channel(&response);
+                    let value = phased(SmtpCommandPhase::MailFrom, error::status(response));
+                    if closing {
+                        return self.begin_epilogue(Epilogue::abort(value));
+                    }
                     // No RSET and no abort: a rejected MAIL FROM opened no
                     // transaction, so the connection stays reusable as it is.
-                    Step::Finish(
-                        phased(SmtpCommandPhase::MailFrom, error::status(response))
-                            .map_err(PhasedError::into_error),
-                    )
+                    Step::Finish(value.map_err(PhasedError::into_error))
                 }
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
             },
@@ -354,7 +374,11 @@ impl ProtocolMachine for DirectSmtp {
                     self.write_then(DirectSmtpStage::RcptReply(next), bytes)
                 }
                 OpOutcome::Reply(response) => {
+                    let closing = closing_channel(&response);
                     let value = phased(SmtpCommandPhase::RcptTo, error::status(response));
+                    if closing {
+                        return self.begin_epilogue(Epilogue::abort(value));
+                    }
                     self.begin_epilogue(Epilogue::reset(value))
                 }
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
@@ -412,6 +436,13 @@ impl ProtocolMachine for DirectSmtp {
                     Step::Run(Op::ReadGrouped)
                 }
                 OpOutcome::Reply(response) => {
+                    if closing_channel(&response) {
+                        // The peer is hanging up; the window's RCPT replies
+                        // may never arrive, and draining them would only turn
+                        // the status error into a transport failure.
+                        let value = phased(SmtpCommandPhase::MailFrom, error::status(response));
+                        return self.begin_epilogue(Epilogue::abort(value));
+                    }
                     self.stage = DirectSmtpStage::MailRejectedDrain {
                         remaining: end,
                         response: Some(response),
@@ -479,7 +510,11 @@ impl ProtocolMachine for DirectSmtp {
                 }
                 _ => match failure {
                     Some(response) => {
+                        let closing = closing_channel(&response);
                         let value = phased(SmtpCommandPhase::RcptTo, error::status(response));
+                        if closing {
+                            return self.begin_epilogue(Epilogue::abort(value));
+                        }
                         self.begin_epilogue(Epilogue::reset(value))
                     }
                     None => self.start_window(end),
@@ -495,7 +530,11 @@ impl ProtocolMachine for DirectSmtp {
                     Step::Run(self.body.write_op())
                 }
                 OpOutcome::Reply(response) => {
+                    let closing = closing_channel(&response);
                     let value = phased(SmtpCommandPhase::DataCommand, error::status(response));
+                    if closing {
+                        return self.begin_epilogue(Epilogue::abort(value));
+                    }
                     self.begin_epilogue(Epilogue::reset(value))
                 }
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
@@ -522,14 +561,13 @@ impl ProtocolMachine for DirectSmtp {
                         BodyKind::Data => SmtpCommandPhase::DataFinal,
                         BodyKind::Bdat => SmtpCommandPhase::BdatBody,
                     };
-                    let closing = u16::from(response.code()) == 421;
+                    let closing = closing_channel(&response);
                     let value = phased(phase, error::status(response));
                     if closing {
-                        // 421 is "closing transmission channel". Whatever the
-                        // body framing, the peer is hanging up, so parking
-                        // this connection would hand the next checkout a dead
-                        // socket. The status error is still what the caller
-                        // sees.
+                        // Whatever the body framing, the peer is hanging up
+                        // (`closing_channel`), so parking this connection
+                        // would hand the next checkout a dead socket. The
+                        // status error is still what the caller sees.
                         self.begin_epilogue(Epilogue::abort(value))
                     } else {
                         match self.body {
@@ -703,13 +741,28 @@ impl ProtocolMachine for DirectLmtp {
                     self.write_then(DirectLmtpStage::RcptReply(0), bytes)
                 }
                 OpOutcome::Reply(response) => {
-                    self.abort_with(SmtpCommandPhase::MailFrom, error::status(response))
+                    if closing_channel(&response) {
+                        return self
+                            .abort_with(SmtpCommandPhase::MailFrom, error::status(response));
+                    }
+                    // The SMTP rule, which LMTP (RFC 2033) inherits unchanged:
+                    // a rejected MAIL FROM opened no transaction, so there is
+                    // nothing to reset and nothing to abort. Aborting here
+                    // cost one reconnect per rejected envelope on a
+                    // local-delivery socket, and made the direct LMTP path
+                    // differ from both `DirectSmtp` and `BatchLmtp`.
+                    Step::Finish(Err(
+                        error::status(response).or_phase(SmtpCommandPhase::MailFrom)
+                    ))
                 }
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
             },
             DirectLmtpStage::RcptReply(index) => match outcome {
                 OpOutcome::Failed(error) => self.abort_with(SmtpCommandPhase::RcptTo, error),
                 OpOutcome::Reply(response) => {
+                    if closing_channel(&response) {
+                        return self.abort_with(SmtpCommandPhase::RcptTo, error::status(response));
+                    }
                     if response.is_positive() {
                         self.accepted += 1;
                         self.statuses.push(None);
@@ -732,7 +785,17 @@ impl ProtocolMachine for DirectLmtp {
                     Step::Run(self.body.write_op())
                 }
                 OpOutcome::Reply(response) => {
-                    self.abort_with(SmtpCommandPhase::DataCommand, error::status(response))
+                    if closing_channel(&response) {
+                        return self
+                            .abort_with(SmtpCommandPhase::DataCommand, error::status(response));
+                    }
+                    // RSET-and-keep, as `DirectSmtp` and `BatchLmtp` do at this
+                    // boundary: the transaction is open, the peer refused to
+                    // take a body, and a positively acknowledged reset leaves
+                    // the connection reusable.
+                    let value =
+                        Err(error::status(response).or_phase(SmtpCommandPhase::DataCommand));
+                    self.begin_epilogue(Epilogue::reset(value))
                 }
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
             },
@@ -880,6 +943,22 @@ impl BatchSmtp {
         Step::Run(op)
     }
 
+    /// A `421` answered a `RCPT TO`: the peer is closing the channel with the
+    /// envelope half-built. The recipient it answered is rejected with that
+    /// reply; every other unanswered or accepted recipient is `Unsent`, since
+    /// `DATA` was never issued and nothing can have been delivered; and the
+    /// connection is aborted rather than parked. See `closing_channel`.
+    fn closing_during_envelope(&mut self, index: usize, response: Response) -> Step<BatchResult> {
+        let unsent = Self::account_error(
+            error::status(response.clone())
+                .with_attempt(SmtpTransmissionState::Unsent)
+                .with_phase(SmtpCommandPhase::RcptTo),
+        );
+        self.progress().record_rcpt_rejected(index, response);
+        self.progress().mark_unresolved_unsent(|| unsent.clone());
+        self.begin_epilogue(Epilogue::abort(BatchExit::Progress))
+    }
+
     fn after_envelope(&mut self) -> Step<BatchResult> {
         if !self.any_accepted() {
             return self.begin_epilogue(Epilogue::reset(BatchExit::Progress));
@@ -969,6 +1048,8 @@ impl ProtocolMachine for BatchSmtp {
                 OpOutcome::Reply(response) => {
                     if response.is_positive() {
                         self.progress().record_rcpt_accepted(index);
+                    } else if closing_channel(&response) {
+                        return self.closing_during_envelope(index, response);
                     } else {
                         self.progress().record_rcpt_rejected(index, response);
                     }
@@ -1060,6 +1141,8 @@ impl ProtocolMachine for BatchSmtp {
                 OpOutcome::Reply(response) => {
                     if response.is_positive() {
                         self.progress().record_rcpt_accepted(next);
+                    } else if closing_channel(&response) {
+                        return self.closing_during_envelope(next, response);
                     } else {
                         self.progress().record_rcpt_rejected(next, response);
                     }
@@ -1103,8 +1186,12 @@ impl ProtocolMachine for BatchSmtp {
                     // DATA rejected before the body: every accepted recipient
                     // failed with this response, per-recipient rather than as a
                     // batch-level error the engine would resend.
+                    let closing = closing_channel(&response);
                     self.progress()
                         .mark_accepted_rejected_with_response(response);
+                    if closing {
+                        return self.begin_epilogue(Epilogue::abort(BatchExit::Progress));
+                    }
                     self.begin_epilogue(Epilogue::reset(BatchExit::Progress))
                 }
                 OpOutcome::Failed(error) => {
@@ -1154,20 +1241,18 @@ impl ProtocolMachine for BatchSmtp {
                         // `uncertain`. The response is recorded either way and
                         // `resolve` fans it out - succeeded on a positive
                         // reply, `DataFinal` `failed` lanes on a rejection.
-                        let closing = u16::from(response.code()) == 421;
+                        let closing = closing_channel(&response);
                         self.progress().set_body_finished();
                         self.progress().set_data_response(response);
                         if !closing {
                             let progress = self.take_progress();
                             return Step::Finish(Ok(progress));
                         }
-                        // 421 is "closing transmission channel". The lanes
-                        // still resolve from the answer, but parking a
-                        // connection the peer just said it is hanging up on
-                        // hands the next checkout a dead socket - and with
-                        // `test_on_checkout(false)` that shows up as an
-                        // `Unsent` failure on the NEXT send. Same rule the
-                        // direct machine applies at this boundary.
+                        // The lanes still resolve from the answer, but a peer
+                        // that is hanging up (`closing_channel`) must not be
+                        // parked - with `test_on_checkout(false)` that shows
+                        // up as an `Unsent` failure on the NEXT send. Same
+                        // rule the direct machine applies at this boundary.
                         return self.begin_epilogue(Epilogue::abort(BatchExit::Progress));
                     }
                     OpOutcome::Failed(error) => error,
@@ -1243,6 +1328,18 @@ impl BatchLmtp {
         let (epilogue, op) = epilogue;
         self.epilogue = Some(epilogue);
         Step::Run(op)
+    }
+
+    /// Twin of `BatchSmtp::closing_during_envelope`; see `closing_channel`.
+    fn closing_during_envelope(&mut self, index: usize, response: Response) -> Step<BatchResult> {
+        let unsent = Self::account_error(
+            error::status(response.clone())
+                .with_attempt(SmtpTransmissionState::Unsent)
+                .with_phase(SmtpCommandPhase::RcptTo),
+        );
+        self.progress().record_rcpt_rejected(index, response);
+        self.progress().mark_unresolved_unsent(|| unsent.clone());
+        self.begin_epilogue(Epilogue::abort(BatchExit::Progress))
     }
 
     /// The next accepted recipient index at or after `from`, which is the
@@ -1328,6 +1425,8 @@ impl ProtocolMachine for BatchLmtp {
                     if response.is_positive() {
                         self.progress().record_rcpt_accepted(index);
                         self.accepted += 1;
+                    } else if closing_channel(&response) {
+                        return self.closing_during_envelope(index, response);
                     } else {
                         self.progress().record_rcpt_rejected(index, response);
                     }
@@ -1361,8 +1460,12 @@ impl ProtocolMachine for BatchLmtp {
                     // would collapse the RCPT acceptances and let the engine
                     // resend a non-idempotent `Send` the server already
                     // rejected.
+                    let closing = closing_channel(&response);
                     self.progress()
                         .mark_accepted_rejected_with_response(response);
+                    if closing {
+                        return self.begin_epilogue(Epilogue::abort(BatchExit::Progress));
+                    }
                     self.begin_epilogue(Epilogue::reset(BatchExit::Progress))
                 }
                 OpOutcome::Failed(error) => {

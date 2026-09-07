@@ -221,7 +221,15 @@ operation is treated idempotent). The rules at altitude (read
   while retaining both fields, so engine buckets and the reconciliation
   delay still honor the provider signal. `Error { status }`: 5xx (or no
   numeric status while `InFlight`) is transient; everything else (4xx,
-  IMAP `NO`/`BAD` not in-flight) -> `ProviderRefused`.
+  IMAP `NO`/`BAD` not in-flight) -> `ProviderRefused`. The 5xx rule is
+  HTTP's, and it does not apply to an SMTP reply: RFC 5321 4.2.1 defines
+  the 5yz class as PERMANENT negative completion, so `derive_server` reads
+  the protocol from the cause chain (`Cause::Wire(WireCause::Smtp(_))`,
+  which only the SMTP translator mints) and derives an SMTP 5xx as
+  `ProviderRefused`. Before that row a 554 at the end-of-data terminator
+  was `Retry(SameRequest)`: advice to resend a whole message body to a
+  server that had just permanently refused it. Pinned by
+  `an_smtp_5xx_is_a_permanent_refusal_not_a_retry`.
 - **SyncState** -> all `Engine(_)`: `CursorInvalid` -> `RestartScope`
   (scope guaranteed by build-time check); `StrategyFailure` ->
   `DowngradeStrategy`; `ScopeCapabilityLost` ->

@@ -8,7 +8,7 @@ use crate::ids::{AccountId, MailboxId};
 use super::account_error::AccountError;
 use super::cause::{
     AccessCause, AuthCause, Cause, CauseChain, RequestCause, ServerCause, StateCause,
-    TransmissionState,
+    TransmissionState, WireCause,
 };
 use super::kind::{
     AccessErrorKind, AccountErrorKind, AuthErrorKind, MailboxUnavailableKind, ProtocolErrorKind,
@@ -651,7 +651,19 @@ fn derive_server(
         ServerErrorKind::Error { status } => {
             let status = status.or_else(|| server_status(chain));
             match status {
-                Some(500..=599) => transient_retry_or_reconcile(
+                // The 5xx rule is HTTP's: a server-side failure the client did
+                // nothing to cause, worth a retry. An SMTP 5xx is the opposite
+                // - RFC 5321 4.2.1 defines the 5yz class as PERMANENT negative
+                // completion, "the command was not accepted and the requested
+                // action did not occur" - so a 554 spam rejection or a 5.3.5
+                // misconfiguration is refused, not retried. Before this row a
+                // permanent refusal at `DataFinal` derived `Retry(SameRequest)`
+                // and told the consumer to resend a whole message body to a
+                // server that had just permanently refused it. The protocol is
+                // read from the cause chain: every SMTP reply the translator
+                // classifies carries `Cause::Wire(WireCause::Smtp(_))`, and no
+                // other protocol mints that cause. Ruled smtp-CR10, 2026-09-07.
+                Some(500..=599) if !smtp_reply(chain) => transient_retry_or_reconcile(
                     tx_state,
                     idempotent,
                     RetryReason::ServerUnavailable,
@@ -842,6 +854,14 @@ fn server_status(chain: &CauseChain) -> Option<u16> {
         Cause::Server(ServerCause::Error { status }) => *status,
         _ => None,
     })
+}
+
+/// Whether the failure is an SMTP (or LMTP) reply, whose numeric status
+/// classes carry RFC 5321 semantics rather than HTTP's. See `derive_server`.
+fn smtp_reply(chain: &CauseChain) -> bool {
+    chain
+        .iter()
+        .any(|cause| matches!(cause, Cause::Wire(WireCause::Smtp(_))))
 }
 
 pub(crate) fn cursor_scope(scope: Option<&ErrorScope>) -> Option<CursorScope> {
@@ -1234,6 +1254,44 @@ mod tests {
 
         assert!(retry.is_retryable());
         assert_eq!(refused, RecoveryClass::ProviderRefused);
+    }
+
+    /// An SMTP 5xx is permanent (RFC 5321 4.2.1), whatever the HTTP rule says
+    /// about the same digits. The protocol is read from the wire cause, so the
+    /// same kind and status with no SMTP cause keeps the HTTP derivation.
+    /// Ablation: without the `smtp_reply` guard the 554 derives a retry that
+    /// resends a whole message to a server that permanently refused it.
+    #[test]
+    fn an_smtp_5xx_is_a_permanent_refusal_not_a_retry() {
+        let smtp = CauseChain::new(vec![
+            Cause::Server(ServerCause::Error { status: Some(554) }),
+            Cause::Wire(WireCause::Smtp(crate::error::EnhancedStatusCode::new(
+                554, None, None,
+            ))),
+            Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)),
+        ]);
+        let refused = derive(
+            &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(554) }),
+            None,
+            Some(AccountOperation::Send),
+            &smtp,
+            None,
+            None,
+        );
+        assert_eq!(refused, RecoveryClass::ProviderRefused);
+
+        let http = derive(
+            &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(554) }),
+            None,
+            Some(AccountOperation::Send),
+            &chain(Cause::Server(ServerCause::Error { status: Some(554) })),
+            None,
+            None,
+        );
+        assert!(
+            http.is_retryable(),
+            "the same digits without an SMTP cause keep the HTTP rule: {http:?}"
+        );
     }
 
     #[test]

@@ -282,19 +282,31 @@ open, and the next checkout's `MAIL FROM` drew `503 bad sequence`.
 `a_rejected_bdat_last_resets_the_transaction_before_the_connection_is_reused`
 pins it in both halves.
 
-One reply overrides all of that, in BOTH machines: `421` means "closing
-transmission channel", so whatever the body framing, a 421 at that boundary
-goes through `Epilogue::abort`. `DirectSmtp` carries the status error as the
-epilogue's value; `BatchSmtp` still records the reply through
-`set_body_finished` + `set_data_response` first, so its lanes resolve as
-`DataFinal` `failed` / `Acknowledged` exactly as any other rejection does, and
-only the connection is retired. Parking a connection the peer just said it is
-closing hands the next checkout a dead socket - and on the batch path, which is
-the account-level `send_smtp_batch`, that dead connection is pooled, so under
+One reply overrides all of that, at EVERY boundary in ALL FOUR machines: `421`
+means "closing transmission channel" (RFC 5321 4.2.3), and `core::closing_channel`
+is asked ahead of every reset-or-keep decision a negative reply reaches. The
+reset-or-keep rules reason about the transaction; a 421 is about the
+connection, so whatever the boundary - `MAIL FROM`, `RCPT TO`, `DATA`, the
+end-of-data terminator, `BDAT ... LAST` - it goes through `Epilogue::abort`
+carrying the same value the arm would otherwise have produced. `DirectSmtp` and
+`DirectLmtp` carry the status error; a pipelined `MAIL FROM` answered 421 aborts
+without draining the window, since the RCPT replies may never come. `BatchSmtp`
+and `BatchLmtp` still record the answer first, so their lanes resolve from it:
+at `RCPT TO` the answered recipient is rejected with the 421 and every other
+unanswered or accepted recipient is `Unsent`, because `DATA` was never issued
+(`closing_during_envelope`); at `DATA` the accepted recipients fail with it; at
+the end-of-data terminator the lanes resolve `DataFinal` `failed` /
+`Acknowledged` exactly as any other rejection does. Only the connection is
+retired. Parking a connection the peer just said it is closing hands the next
+checkout a dead socket - and on the batch path, which is the account-level
+`send_smtp_batch`, that dead connection is pooled, so under
 `test_on_checkout(false)` the NEXT send writes `MAIL FROM` into it and fails
-`Unsent`. Pinned by `a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection`
-and `a_421_data_final_reply_aborts_the_batch_connection_too`, both in both
-halves.
+`Unsent`. The check used to live only on the end-of-data arms, and a 421 to
+`MAIL FROM` parked the dying connection (smtp-CR8, 2026-09-07). Pinned by
+`a_421_at_any_envelope_boundary_aborts_instead_of_parking` in the core tests
+and, at the end-of-data boundary,
+`a_421_data_final_reply_aborts_instead_of_parking_a_dying_connection` and
+`a_421_data_final_reply_aborts_the_batch_connection_too`, both in both halves.
 
 The direct path tags a rejected DATA end-of-data reply `DataFinal`, matching
 what `BatchSmtp` already produced; a transport FAILURE at the same boundary
@@ -306,7 +318,14 @@ A rejected `MAIL FROM` deliberately sends no `RSET`: it opened no transaction,
 so there is nothing to reset and the connection stays reusable as it is. The
 rejection paths that follow an accepted `MAIL FROM` go through
 `reset_transaction`, which keeps the connection when the peer positively
-acknowledges the reset and aborts it otherwise.
+acknowledges the reset and aborts it otherwise. LMTP (RFC 2033) inherits both
+rules unchanged, and the direct LMTP machine now applies them: a rejected
+`MAIL FROM` finishes with no RSET and no abort, and a rejected `DATA` is
+RSET-and-keep, exactly as `DirectSmtp` and `BatchLmtp` do. It used to abort at
+both boundaries, costing one reconnect per rejected envelope on a
+local-delivery socket and leaving the direct LMTP path differing from its
+batch twin in more than the `restore_ok` drain (smtp-CR1, 2026-09-07). Pinned
+by `a_rejected_lmtp_envelope_follows_the_smtp_reset_or_keep_rules`.
 
 This is not a PIPELINING-only rule. The direct sends (`send_with_options` and
 `send_bdat_with_options`) take the same shape when the server advertises no
@@ -602,7 +621,13 @@ Evidence must match what actually crossed the wire. A transport failure in the e
 `batch.rs` `SendProgress::resolve` is the per-recipient lane resolver. LMTP `DATA`-command negative replies route through `mark_accepted_rejected_with_response` so accepted recipients become per-recipient `Failed` lanes - never a batch-level `Err` (the previous shape let the engine resend the entire non-idempotent `Send` after the server rejected it). DATA-final-negative replies tag `SmtpCommandPhase::DataFinal`,
 and that arm is live rather than latent: `BatchSmtp` records a negative
 end-of-data reply through `set_data_response` exactly as it records a positive
-one (see "PIPELINING"), so `DataFinal` is a phase a driver actually produces. LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
+one (see "PIPELINING"), so `DataFinal` is a phase a driver actually produces.
+Those lanes derive as a PERMANENT refusal: an SMTP 5xx is RFC 5321's permanent
+negative completion, and `bifrost-types`' `derive_server` reads the protocol
+from the `Cause::Wire(WireCause::Smtp(_))` every classified reply carries, so a
+554 at the terminator is `ProviderRefused` rather than the HTTP 5xx
+`Retry(SameRequest)` it derived before (smtp-CR10, 2026-09-07; see
+`reference/error-model.md`, the Server row). LMTP `Accepted` at resolve time without a per-recipient `Final` is a programming bug caught by `debug_assert!` in debug builds and falls back to an `Uncertain` lane in release. Every failed and uncertain lane carries the envelope recipient as `DiagnosticText::support_only` so support exports preserve per-recipient correlation when N lanes share the same wire response text.
 
 ## Connection test harness
 

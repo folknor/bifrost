@@ -306,19 +306,6 @@ DATA-final-negative `uncertain` lane, and the async body upload bounded by one
 per-operation timeout) were fixed in the same pass; everything below is
 verified against the code and awaiting its own ruling.
 
-- **smtp-CR1 (P3).** `DirectLmtp` ABORTS where `DirectSmtp` does not, on two
-  boundaries. `DirectLmtpStage::MailReply` on a negative reply calls
-  `abort_with(SmtpCommandPhase::MailFrom, ..)`, and `DirectLmtpStage::DataReply`
-  on a negative reply calls `abort_with(SmtpCommandPhase::DataCommand, ..)`. On
-  the SMTP side the same two boundaries finish without an RSET (MAIL FROM
-  opened no transaction) and RSET-and-keep (DATA), and `BatchLmtp::DataReply`
-  also RSET-and-keeps. So the two LMTP paths differ from each other as well as
-  from SMTP. `reference/smtp.md` says the direct and batch LMTP paths differ in
-  exactly ONE respect (`restore_ok`), and states the no-RSET MAIL FROM rule
-  with no LMTP carve-out - so either the code is wrong on both counts or the
-  reference owes two carve-outs. Cost of the current shape: one reconnect per
-  rejected LMTP envelope, on a local-delivery socket.
-
 - **smtp-CR2 (P3).** `BatchLmtpStage::GroupOpened` has the wrong exit shape on
   `OpOutcome::Failed`: it returns `Step::Finish(Err((error, progress)))`, and
   it is reached only AFTER `BatchLmtpStage::BodyWritten` ran
@@ -377,21 +364,6 @@ verified against the code and awaiting its own ruling.
   Unreachable through `Envelope::new`, which requires at least one recipient,
   but the machine itself does not enforce it.
 
-- **smtp-CR8 (P3).** A `421` reply to `MAIL FROM` still parks the connection.
-  `421` is "closing transmission channel", and the `FinalReply` stage now
-  routes it through `Epilogue::abort` for exactly that reason - but
-  `DirectSmtpStage::MailReply` (and its pipelined `MailWindowReply` /
-  `MailRejectedDrain` siblings) deliberately does NOT reset or abort a
-  negative `MAIL FROM`, on the correct reasoning that no transaction was
-  opened. That reasoning is about the TRANSACTION; a 421 is about the
-  CONNECTION, so a peer shutting down mid-envelope leaves a dead socket
-  parked for the next checkout. Same shape for a 421 to `RCPT TO`, `DATA` and
-  `RSET` itself. Likely fix: one `is_closing_channel(response)` check shared
-  by every negative-reply arm, ahead of the reset/keep decision, rather than
-  the single-arm check that exists now. Surfaced by the cold review of the
-  end-of-data-completion change; the `FinalReply` half was fixed in place
-  because it sat inside the arm being changed.
-
 - **smtp-CR9 (P4).** `SlowSinkPeer::new` arms its first `Sleep` at
   CONSTRUCTION rather than at the first `poll_write`, so the gap between
   building the peer and the first write is silently credited against the
@@ -405,24 +377,6 @@ verified against the code and awaiting its own ruling.
 Filed 2026-09-06 from the third cold review of the same diff. Its two other
 findings (the batch machine parking a 421'd connection, and a cap retune
 re-pricing outstanding metering debt) were fixed in that pass.
-
-- **smtp-CR10 (P2, product decision, spans `bifrost-types`).** A permanent
-  SMTP 5xx at `DataFinal` now derives `Retry(SameRequest)` for a
-  non-idempotent send. `account_error.rs::classify_response` maps an untabled
-  5xx (554 spam rejection, say) to `Server(Error { status: Some(554) })`, and
-  `derive_server` in `crates/types/src/error/recovery.rs` routes
-  `Some(500..=599)` through `transient_retry_or_reconcile` with
-  `RetryReason::ServerUnavailable` - which with `Acknowledged` is
-  `Retry(SameRequest)`. So the exact fixture in
-  `a_rejected_data_final_reply_fails_the_recipients_and_keeps_the_connection`
-  produces failed lanes whose advice is "resend the same message" against a
-  server that permanently refused it. Before this round those recipients were
-  `uncertain` - wrong, but not an instruction to resend. The `500..=599` rule
-  is HTTP semantics; an SMTP 5xx is permanent by definition. `RcptTo` 5xx lanes
-  already suffer this, but `DataFinal` carries a whole message body per retry.
-  The fix belongs either in `classify_response` (a terminal-deriving kind for
-  SMTP 5xx) or as a protocol-aware row in `derive_server`; both touch published
-  surface outside this crate, so it needs the owner's ruling.
 
 - **smtp-CR11 (P3).** With a per-operation timeout of about one second or
   less, every capped write after the first waits its parked ~1 s of debt

@@ -54,6 +54,201 @@ fn intermediate() -> Response {
     reply(Severity::PositiveIntermediate, "send body")
 }
 
+/// `421`: the peer is closing the transmission channel.
+fn closing() -> Response {
+    "421 closing transmission channel\r\n"
+        .parse()
+        .expect("a valid 421 reply")
+}
+
+/// A 421 answering an envelope command aborts the connection at every
+/// boundary, in every machine, instead of parking it (a rejected `MAIL FROM`)
+/// or resetting it (a rejected `RCPT TO` or `DATA`). The reset-or-keep rules
+/// are about the transaction; a 421 is about the connection, and the
+/// end-of-data arms already knew it while the envelope arms did not. Ablation:
+/// with `closing_channel` answering `false` the direct MAIL FROM case ends
+/// with no ABORT and the RCPT and DATA cases write `RSET` first.
+#[test]
+fn a_421_at_any_envelope_boundary_aborts_instead_of_parking() {
+    // Direct SMTP, unpipelined and pipelined, at MAIL FROM, RCPT TO and DATA.
+    for pipelined in [false, true] {
+        for (script, phase) in [
+            (
+                vec![OpOutcome::Reply(closing())],
+                SmtpCommandPhase::MailFrom,
+            ),
+            (
+                vec![OpOutcome::Reply(ok_reply()), OpOutcome::Reply(closing())],
+                SmtpCommandPhase::RcptTo,
+            ),
+            (
+                vec![
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(ok_reply()),
+                    OpOutcome::Reply(closing()),
+                ],
+                SmtpCommandPhase::DataCommand,
+            ),
+        ] {
+            let mut machine = DirectSmtp::new(mail(), rcpts(1), pipelined, BodyKind::Data);
+            let mut harness = Harness::new(script);
+            let error = harness.run(&mut machine).expect_err("the peer is closing");
+            assert_eq!(error.phase(), Some(phase), "pipelined={pipelined}");
+            assert_eq!(error.status().map(u16::from), Some(421));
+            assert!(
+                !harness.ops.iter().any(|op| op.starts_with("W:RSET")),
+                "pipelined={pipelined} {phase:?}: no RSET into a closing channel: {:?}",
+                harness.ops
+            );
+            assert_eq!(
+                harness.ops.last().map(String::as_str),
+                Some("ABORT"),
+                "pipelined={pipelined} {phase:?}: {:?}",
+                harness.ops
+            );
+        }
+    }
+
+    // Direct LMTP, at the same three boundaries.
+    for (script, phase) in [
+        (
+            vec![OpOutcome::Reply(closing())],
+            SmtpCommandPhase::MailFrom,
+        ),
+        (
+            vec![OpOutcome::Reply(ok_reply()), OpOutcome::Reply(closing())],
+            SmtpCommandPhase::RcptTo,
+        ),
+        (
+            vec![
+                OpOutcome::Reply(ok_reply()),
+                OpOutcome::Reply(ok_reply()),
+                OpOutcome::Reply(closing()),
+            ],
+            SmtpCommandPhase::DataCommand,
+        ),
+    ] {
+        let mut machine = DirectLmtp::new(mail(), rcpts(1), BodyKind::Data);
+        let mut harness = Harness::new(script);
+        let error = harness.run(&mut machine).expect_err("the peer is closing");
+        assert_eq!(error.phase(), Some(phase));
+        assert!(!harness.ops.iter().any(|op| op.starts_with("W:RSET")));
+        assert_eq!(
+            harness.ops.last().map(String::as_str),
+            Some("ABORT"),
+            "lmtp {phase:?}: {:?}",
+            harness.ops
+        );
+    }
+
+    // Batch SMTP and LMTP: a 421 to RCPT TO rejects that recipient with the
+    // reply, leaves the rest Unsent (no DATA was issued), and aborts; a 421 to
+    // DATA fails the accepted recipients and aborts without a reset.
+    for protocol in [Protocol::Smtp, Protocol::Lmtp] {
+        let run = |script: Vec<OpOutcome>| {
+            let progress = SendProgress::new(protocol, batch_recipients(2));
+            let mut harness = Harness::new(script);
+            let progress = if protocol == Protocol::Smtp {
+                let mut machine = BatchSmtp::new(mail(), rcpts(2), false, progress);
+                harness.run(&mut machine)
+            } else {
+                let mut machine = BatchLmtp::new(mail(), rcpts(2), progress);
+                harness.run(&mut machine)
+            }
+            .expect("a closing peer is not a batch-level error");
+            (progress.resolve(), harness.ops)
+        };
+
+        let (outcome, ops) = run(vec![
+            OpOutcome::Reply(ok_reply()),
+            OpOutcome::Reply(closing()),
+        ]);
+        assert_eq!(
+            outcome.failed().len(),
+            2,
+            "{protocol:?}: one rejected, one unsent"
+        );
+        assert!(
+            outcome.uncertain().is_empty(),
+            "{protocol:?}: nothing was sent"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("W:RSET")),
+            "{protocol:?}: {ops:?}"
+        );
+        assert_eq!(
+            ops.last().map(String::as_str),
+            Some("ABORT"),
+            "{protocol:?}: {ops:?}"
+        );
+
+        let (outcome, ops) = run(vec![
+            OpOutcome::Reply(ok_reply()),
+            OpOutcome::Reply(ok_reply()),
+            OpOutcome::Reply(ok_reply()),
+            OpOutcome::Reply(closing()),
+        ]);
+        assert_eq!(
+            outcome.failed().len(),
+            2,
+            "{protocol:?}: DATA refused for both"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("W:RSET")),
+            "{protocol:?}: {ops:?}"
+        );
+        assert_eq!(
+            ops.last().map(String::as_str),
+            Some("ABORT"),
+            "{protocol:?}: {ops:?}"
+        );
+    }
+}
+
+/// The direct LMTP path follows the SMTP rules at the envelope boundaries: a
+/// rejected `MAIL FROM` opened no transaction, so it is finished with no RSET
+/// and no abort, and a rejected `DATA` is RSET-and-keep. Both used to abort,
+/// which cost a reconnect per rejected envelope on a local-delivery socket
+/// and made the direct path differ from both `DirectSmtp` and `BatchLmtp`.
+/// Ablation: restoring either abort fails the matching case on its last op.
+#[test]
+fn a_rejected_lmtp_envelope_follows_the_smtp_reset_or_keep_rules() {
+    let mut machine = DirectLmtp::new(mail(), rcpts(1), BodyKind::Data);
+    let mut harness = Harness::new(vec![OpOutcome::Reply(rejection())]);
+    let error = harness
+        .run(&mut machine)
+        .expect_err("MAIL FROM was rejected");
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::MailFrom));
+    assert!(
+        !harness
+            .ops
+            .iter()
+            .any(|op| op.starts_with("W:RSET") || op == "ABORT"),
+        "a rejected MAIL FROM opened no transaction: {:?}",
+        harness.ops
+    );
+
+    let mut machine = DirectLmtp::new(mail(), rcpts(1), BodyKind::Data);
+    let mut harness = Harness::new(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(rejection()),
+        OpOutcome::Reply(ok_reply()),
+    ]);
+    let error = harness.run(&mut machine).expect_err("DATA was rejected");
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::DataCommand));
+    assert!(
+        harness.ops.iter().any(|op| op == "W:RSET|"),
+        "a rejected DATA clears the open transaction: {:?}",
+        harness.ops
+    );
+    assert!(
+        !harness.ops.iter().any(|op| op == "ABORT"),
+        "an acknowledged RSET keeps the connection: {:?}",
+        harness.ops
+    );
+}
+
 /// Where a scripted failure lands.
 ///
 /// A plain script cannot express "fail at the third grouped read" or "fail the
