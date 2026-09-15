@@ -778,7 +778,9 @@ pub(in crate::connection) async fn run_prebuilt_command(
     // Errors before a tagged response are Unsent or InFlight depending
     // on where in the send they occur; send_with_literal_sync propagates
     // them without decoration. After send, responses are InFlight.
-    send_with_literal_sync(wire_reader, state, event_sink, &wire_bytes).await?;
+    // No routing: a prebuilt command is dispatched alone, so its own tagged
+    // response is the only one that can arrive during the send.
+    send_with_literal_sync(wire_reader, state, event_sink, &wire_bytes, None).await?;
 
     dispatch_response_loop(
         wire_reader,
@@ -858,13 +860,18 @@ pub(super) fn process_untagged_prefix(
 /// the prologue already published its critical code as one.
 ///
 /// Four read loops answer an untagged response this way and only this way -
-/// the IDLE loop, the post-DONE IDLE drain, the synchronizing-literal
-/// continuation wait, and the best-effort LOGOUT drain. They differ in how
-/// they terminate and in what they do with a tagged response, but not here,
-/// so the "prologue, then forward iff no code event" pairing lives once.
-/// Loops that DO have a consumer (command dispatch and the pipeline batch)
-/// cannot use this: for them the forward is conditional on classification,
-/// and they call `process_untagged_prefix` directly.
+/// the IDLE loop, the post-DONE IDLE drain, the best-effort LOGOUT drain, and
+/// the synchronizing-literal continuation wait WHEN IT HAS NO ROUTING
+/// CONTEXT, i.e. for single-command dispatch and IDLE. Under a pipelined batch
+/// that same wait does have consumers to route to - earlier commands in the
+/// batch are still outstanding - and takes the router instead; answering those
+/// responses here is what silently truncated a batch's results. The four
+/// differ in how they terminate and in what they do with a tagged response,
+/// but not here, so the "prologue, then forward iff no code event" pairing
+/// lives once. Loops that DO have a consumer (command dispatch, the pipeline
+/// batch, and the pipelined continuation wait) cannot use this: for them the
+/// forward is conditional on classification, and they call
+/// `process_untagged_prefix` directly.
 pub(super) fn process_untagged_as_event(
     digest: super::state::SideEffectDigest,
     response: Box<UntaggedResponse>,

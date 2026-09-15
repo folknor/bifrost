@@ -8,6 +8,28 @@ use crate::types::Command;
 use crate::types::response::{Capability, StatusKind};
 
 use super::event_sink;
+use super::pipeline::{PipelineRouting, Routed, route_pipeline_response};
+
+/// Whether a command's bytes all reached the wire, or the server refused a
+/// synchronizing literal first.
+///
+/// Only reachable as `Rejected` in pipeline context: a refusal there is the
+/// rejected command's ordinary per-command result, already routed into its
+/// result slot, and the batch goes on to the next command. Outside the
+/// pipeline the refusal is still returned as an error, so single-command
+/// dispatch and IDLE only ever see `Sent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SendOutcome {
+    Sent,
+    Rejected,
+}
+
+/// Whether the server granted the literal or refused the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContinuationOutcome {
+    Granted,
+    Rejected,
+}
 
 /// Encode and send a command over the wire, handling literal
 /// synchronization (RFC 3501 Section4.3).
@@ -36,7 +58,7 @@ pub(super) async fn send_command_on_wire(
             // markers to non-synchronizing and send in one shot.
             let flat = encoded.into_buf();
             let patched = super::super::patch_literals_to_plus_with_binary(&flat, allow_literal8);
-            send_with_literal_sync(wire_reader, state, event_sink, &patched).await?;
+            send_with_literal_sync(wire_reader, state, event_sink, &patched, None).await?;
         }
         LiteralMode::LiteralMinus => {
             // LITERAL- path (RFC 7888 Section5): patch small (<=4096 byte)
@@ -44,12 +66,12 @@ pub(super) async fn send_command_on_wire(
             let flat = encoded.into_buf();
             let patched =
                 super::super::patch_small_literals_to_plus_with_binary(&flat, allow_literal8);
-            send_with_literal_sync(wire_reader, state, event_sink, &patched).await?;
+            send_with_literal_sync(wire_reader, state, event_sink, &patched, None).await?;
         }
         LiteralMode::Synchronizing => {
             // No literal extension: all literals are synchronizing
             // (RFC 3501 Section4.3). Use pre-split segments from the encoder.
-            send_encoded_segments(wire_reader, state, event_sink, encoded.segments()).await?;
+            send_encoded_segments(wire_reader, state, event_sink, encoded.segments(), None).await?;
         }
     }
     Ok(tag)
@@ -65,7 +87,8 @@ pub(super) async fn send_with_literal_sync(
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
     buf: &[u8],
-) -> Result<(), Error> {
+    mut routing: Option<&mut PipelineRouting<'_>>,
+) -> Result<SendOutcome, Error> {
     let mut pos = 0;
     while pos < buf.len() {
         if let Some((marker_end, literal_size)) = super::super::find_literal_boundary(&buf[pos..]) {
@@ -87,7 +110,16 @@ pub(super) async fn send_with_literal_sync(
                 .write_all(&buf[pos..send_end])
                 .await
                 .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
-            wait_for_continuation(wire_reader, state, event_sink).await?;
+            if wait_for_continuation(wire_reader, state, event_sink, routing.as_deref_mut()).await?
+                == ContinuationOutcome::Rejected
+            {
+                // The server refused this literal. Its remaining bytes - the
+                // body and every trailing byte of command syntax after it -
+                // must not be written: the server has ended this command's
+                // parsing state and would read them as a new command line
+                // (RFC 3501 Section4.3).
+                return Ok(SendOutcome::Rejected);
+            }
             // Send the literal body data (RFC 3501 Section4.3).
             // After the continuation is received the server is expecting
             // our literal bytes, so a send failure here is InFlight: the
@@ -106,7 +138,7 @@ pub(super) async fn send_with_literal_sync(
             break;
         }
     }
-    Ok(())
+    Ok(SendOutcome::Sent)
 }
 
 /// Send pre-split [`EncodedCommand`](crate::codec::encode::EncodedCommand)
@@ -120,7 +152,8 @@ pub(super) async fn send_encoded_segments(
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
     segments: &[BytesMut],
-) -> Result<(), Error> {
+    mut routing: Option<&mut PipelineRouting<'_>>,
+) -> Result<SendOutcome, Error> {
     for (i, segment) in segments.iter().enumerate() {
         // Whether this segment is Unsent or InFlight depends on whether a
         // prior continuation was received. The first segment is always
@@ -137,11 +170,16 @@ pub(super) async fn send_encoded_segments(
             .map_err(|e| e.with_attempt(state_for_segment))?;
         // After every segment except the last, wait for `+`
         // (RFC 3501 Section4.3).
-        if i + 1 < segments.len() {
-            wait_for_continuation(wire_reader, state, event_sink).await?;
+        if i + 1 < segments.len()
+            && wait_for_continuation(wire_reader, state, event_sink, routing.as_deref_mut()).await?
+                == ContinuationOutcome::Rejected
+        {
+            // Refused: abandon every remaining segment of this command. See
+            // `send_with_literal_sync` for why the remainder must not go out.
+            return Ok(SendOutcome::Rejected);
         }
     }
-    Ok(())
+    Ok(SendOutcome::Sent)
 }
 
 /// Wait for a server continuation response (`+ ...`) during
@@ -153,37 +191,42 @@ pub(super) async fn send_encoded_segments(
 /// The driver owns this wait outright. It was lifted out of the pre-driver
 /// connection layer, which retains no copy of it.
 ///
-/// KNOWN DEFECT, ruling pending - do not "fix" this in passing.
+/// This wait has two modes, and which one applies is decided entirely by
+/// whether the caller has other commands outstanding.
 ///
-/// This function does not know its own tag, so ANY tagged response ends the
-/// wait and is attributed to the command currently being written: `NO`/`BAD`
-/// become that command's error, `OK` becomes a protocol violation. That is
-/// correct only while exactly one command is outstanding, which holds for
-/// single-command dispatch and for IDLE. It does not hold for the pipeline:
-/// when `literal_mode` is `Synchronizing` (no LITERAL+, no LITERAL-, not
-/// IMAP4rev2), and likewise for a `LiteralMinus` literal too large to patch,
-/// `run_pipeline_batch` sends the batch command by command, so commands
-/// already on the wire have tags still pending. A later command's
-/// synchronizing literal can then consume an EARLIER command's tagged
-/// response: the earlier command's real result is destroyed, the whole batch
-/// aborts on the `?` at the send site before the response loop ever runs, and
-/// a `NO` belonging to command #1 is reported as a failure of command #2.
-/// Every other read loop in the crate distinguishes its own tag from a
-/// foreign one.
+/// With `routing: None` - single-command dispatch and IDLE - exactly one
+/// command is on the wire, so ANY tagged response is that command's, and any
+/// untagged response has no consumer to route to and becomes an event.
 ///
-/// Two remedies exist and the choice is a product decision, not a local one.
-/// The narrow one passes the expected tag in and ignores a foreign tagged
-/// response, which is cheap but silently discards a result the server DID
-/// legitimately deliver. The broader one parks the foreign response and routes
-/// it into the owning command's result slot, which is the behaviour a caller
-/// would expect but needs the pipeline's tag-to-index map to be reachable from
-/// the send phase. Both change an observed error class and a batch
-/// termination, so neither is applied until the repository owner rules.
+/// With `routing: Some(..)` the caller is `run_pipeline_batch`, which sends
+/// command by command whenever a literal is synchronizing (`literal_mode` is
+/// `Synchronizing`, or `LiteralMinus` with a literal too large for
+/// `patch_small_literals_to_plus_with_binary` to patch). Commands already on
+/// the wire then have tags still pending, and their responses arrive HERE. So
+/// this wait routes them through the pipeline's own router rather than
+/// answering them itself:
+///
+/// * a tagged response for an earlier command is that command's completion,
+///   routed into its result slot;
+/// * an untagged response solicited by an earlier command reaches the
+///   consumer that asked for it;
+/// * the tagged `NO`/`BAD` of the command being written is its own ordinary
+///   per-command result, and the wait answers `Rejected` so the sender
+///   abandons the rest of that command rather than failing the batch;
+/// * a tagged `OK` for the command being written stays a protocol error: it
+///   claims successful execution of a command the server has not received.
+///
+/// Both halves matter. Answering a foreign tagged response here destroyed an
+/// earlier command's real result and reported its `NO` as a failure of the
+/// command being written; answering a foreign untagged response as an
+/// anonymous event was worse, because the batch then COMPLETED and the caller
+/// got a silently short result with no error at all.
 pub(super) async fn wait_for_continuation(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
-) -> Result<(), Error> {
+    mut routing: Option<&mut PipelineRouting<'_>>,
+) -> Result<ContinuationOutcome, Error> {
     loop {
         let utf8 = super::utf8_mode(state);
         // We have already sent the pre-literal bytes; a transport failure
@@ -192,9 +235,19 @@ pub(super) async fn wait_for_continuation(
             .read_one(utf8)
             .await
             .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
+
+        if let Some(routing) = routing.as_deref_mut() {
+            // The router applies side effects itself, exactly once.
+            match route_pipeline_response(state, event_sink, routing, resp)? {
+                Routed::Continuation => return Ok(ContinuationOutcome::Granted),
+                Routed::OwnTagRejected => return Ok(ContinuationOutcome::Rejected),
+                Routed::Continue => continue,
+            }
+        }
+
         let digest = state.apply_side_effects(&resp);
         match resp {
-            crate::types::Response::Continuation(_) => return Ok(()),
+            crate::types::Response::Continuation(_) => return Ok(ContinuationOutcome::Granted),
             crate::types::Response::Tagged(t) => {
                 // Server rejected the command before the literal was
                 // sent. The server processed the prefix, so this is

@@ -60,16 +60,17 @@ emits critical response-code events and only then applies the BYE guard - that
 order is what keeps an `ALERT` carried on a `* BYE` from being lost when the
 error unwinds the command. `short_circuit_on_bye` is private to the driver
 module and reachable only through that prologue, so no read loop can re-derive
-the ordering and get it wrong. The four loops that have no consumer to route to
-(IDLE, the post-DONE IDLE drain, the synchronizing-literal continuation wait,
-and the best-effort LOGOUT drain) share their entire untagged arm as
-`process_untagged_as_event`: prologue, then forward the response as a typed
-event exactly when the prologue did not already publish its critical code as
-one. They remain separate machines below that arm - they disagree on
-termination, on the foreign-tag rule, and on whether a continuation or greeting
-is fatal - so only the arm is shared. The two loops that do have a consumer
-(command dispatch and the pipeline batch) call the prologue directly, because
-for them the forward is conditional on classification. The guard is fed by
+the ordering and get it wrong. The loops that have no consumer to route to
+(IDLE, the post-DONE IDLE drain, the best-effort LOGOUT drain, and the
+synchronizing-literal continuation wait *when no pipeline is in flight*) share
+their entire untagged arm as `process_untagged_as_event`: prologue, then
+forward the response as a typed event exactly when the prologue did not already
+publish its critical code as one. They remain separate machines below that arm -
+they disagree on termination, on the foreign-tag rule, and on whether a
+continuation or greeting is fatal - so only the arm is shared. The loops that do
+have a consumer (command dispatch, the pipeline batch, and the continuation wait
+under a pipeline) call the prologue directly, because for them the forward is
+conditional on classification. The guard is fed by
 `ProtocolState::apply_side_effects`'s
 `SideEffectDigest`. The digest is `#[must_use]` and its `had_bye` field is
 private, so a new loop cannot silently ignore it. BYE is recognized from
@@ -81,6 +82,29 @@ specific `RecoveryClass`; response-code events (e.g. ALERT) are emitted
 before the short-circuit fires. Command results are published to the state
 watch channel *before* the caller's oneshot is answered, so a caller that
 observes the result always sees the matching snapshot.
+
+A pipelined batch reads from the socket in two places, not one, and both use
+the same router. Whenever a literal is synchronizing (`LiteralMode::
+Synchronizing`, or `LiteralMinus` with a literal past the 4096-byte patch
+ceiling) `run_pipeline_batch` sends command by command, so commands already on
+the wire have tags still pending and their responses arrive during a later
+command's continuation wait. The routing tables are therefore built before the
+send phase, and `wait_for_continuation` takes an optional `PipelineRouting`:
+an earlier command's tagged response is its own completion, an untagged
+response solicited by an earlier command reaches that command's consumer, and
+side effects are applied exactly once at read time. Two rules govern the
+command currently negotiating its literal. It is the EXCLUSIVE upper bound on
+untagged ownership - the server has not received it, so it cannot have executed
+it, so no solicited response for it can exist and neither it nor any later
+command is an eligible owner. And its own tagged `NO`/`BAD` is its ordinary
+per-command result rather than a batch error: the sender abandons the rest of
+that command's bytes (the server has ended its parsing state, so the remainder
+would read as a new command) and the batch continues. A tagged `OK` there stays
+a hard protocol error, because it claims success for a command the server never
+finished receiving. This is what keeps a `NO` for command #1 from being
+reported as a failure of command #2, and what stops a `* MYRIGHTS` solicited by
+command #1 from being downgraded to an anonymous event while the batch
+completes with a silently short result.
 
 The codec draws the line that decides which of those two buckets a bad
 response lands in. A response opening with a keyword the codec claims to

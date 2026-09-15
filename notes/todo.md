@@ -1004,95 +1004,24 @@ wave; these are what was left. Verify before working any of them.
   consumer chose the cap, so this is not a defect - but if that ever needs a
   ceiling it is a separate ruling and should not be folded into the refund.
 
-- **imap: `wait_for_continuation` reads a FOREIGN tagged response as its own
-  command's rejection.** Live defect, found 2026-09-07 while unifying the
-  untagged-response arms, and left unfixed because the remedy changes an
-  observed error class and a termination. Any tagged response ends the wait -
-  `NO`/`BAD` become that command's error, `OK` becomes a protocol violation -
-  which is right when one command is outstanding. But `run_pipeline` calls it
-  per command, sequentially, with earlier commands already sent and their tags
-  pending. On a server without LITERAL+/LITERAL-/rev2 (`literal_mode` is
-  `Synchronizing`) a pipelined command carrying a literal can therefore consume
-  command #1's tagged response: the batch aborts, #1's real result is destroyed,
-  and a `NO` for #1 is reported as a failure of #2. Every other loop in the crate
-  distinguishes its own tag from a foreign one. The narrow fix passes the
-  expected tag in and ignores a foreign one; the design question, and the reason
-  this wants a ruling, is whether the pipeline should instead PARK the foreign
-  response and route it into the right command's result slot - ignoring it
-  discards a result that was legitimately delivered, which is the actual loss.
-
-  RE-VERIFIED 2026-09-15, holds, and the ruling is now easier because one
-  option turns out not to exist. **The narrow fix is not safe standalone.**
-  Ignoring a foreign tag leaves `run_pipeline_batch`'s step-4 tag-matching
-  loop waiting forever for a tag the server has already answered, so the
-  narrow fix converts a wrong error into a HANG unless it is combined with
-  parking. Parking is therefore the only complete remedy. Its shape: build
-  `tag_to_idx`, `consumers`, `targets`, `tags` and `results` BEFORE the send
-  phase rather than after it, and give the send phase a sink (or a shared
-  parked-response buffer that step 4 drains first). That restructures steps 2
-  to 4 and leaves single-command dispatch and IDLE untouched.
-  Also: the trigger condition above is too narrow. `LiteralMinus` is exposed
-  too, because `patch_small_literals_to_plus_with_binary` only patches
-  literals up to 4096 bytes and larger ones stay synchronizing, so a LITERAL-
-  server still hits this on any pipelined APPEND-sized literal. Only the
-  `LiteralPlus` arm is immune, since it is a single batched write with no
-  waits. Independently, an untagged BYE during a pipelined literal send
-  aborts the batch with the same total result loss, whatever the tag question
-  is decided.
-
-  DESIGNED 2026-09-15, ready to rule on. Two findings make the item bigger and
-  more urgent than the text above.
-  - **There is a second, INVISIBLE half of this defect.** The untagged arm of
-    `wait_for_continuation` calls `process_untagged_as_event`, the shared
-    consumerless arm, whose own doc says it is for loops with no consumer to
-    route to. But the pipeline send phase HAS consumers, so a `* MYRIGHTS`,
-    `* LIST` or `* ESEARCH` legitimately solicited by an earlier pipelined
-    command is downgraded to an anonymous typed event and its owner never sees
-    it. The batch then still COMPLETES, so the caller gets a silently short or
-    empty result rather than an error. That is worse than the tagged case,
-    which at least fails loudly, and the current inline comment does not name
-    it. Parking must cover the untagged arm or the fix is half a fix.
-  - **A naive parking implementation is a state-corruption regression.**
-    `wait_for_continuation` calls `state.apply_side_effects` before it matches,
-    and so does step 4. Park a bare `Response` and let step 4 treat it as
-    freshly read, and side effects apply TWICE: a parked `* 3 EXPUNGE`
-    decrements twice. So the parked record must be four fields -
-    `{ resp, digest, notify_before, code_emitted }` - and the drain path must
-    re-apply nothing. `notify_before` is load-bearing because step 4 reads
-    `state.notify()` BEFORE applying effects and feeds it to classification;
-    `code_emitted` is load-bearing because a parked untagged response has
-    already had its code events emitted in the send phase. There is no smaller
-    correct record. THE RULING SHOULD APPROVE THE FOUR-FIELD RECORD EXPLICITLY,
-    not "the parking fix" in the abstract, since an implementer following the
-    one-line sketch lands the regression.
-  Shape: `wait_for_continuation` gains one `park: Option<&mut Vec<Parked>>`
-  parameter; the three single-command call sites pass `None` and are unchanged.
-  Do NOT route inside the send phase - that contagions five arguments into a
-  function IDLE also calls. Step 4 drains the buffer before reading the socket.
-  Buffer stays frame-local in `run_pipeline_batch`; hoisting it into
-  `ProtocolState` would outlive the tag namespace that gives it meaning.
-  Blast radius: IDLE verified genuinely unaffected (it sends one command and
-  its own loop already discriminates `t.tag == tag`). Nothing published moves;
-  everything involved is `pub(super)` or private. Size 60-80 lines net plus
-  roughly 250 of tests.
-  The reproducer is the fiddly part and is worked out: it needs `Synchronizing`
-  mode, two commands of DISTINCT `CommandKind` (same kind gets split into
-  sub-batches by `group_into_sub_batches` and the bug does not fire), and the
-  SECOND command must carry a synchronizing literal. Most pipelinable commands
-  cannot produce one, because mailbox names go through mUTF-7 and come out
-  ASCII-quotable. The one that can is `LISTRIGHTS` with a non-ASCII identifier,
-  which is passed raw. Greet with `* PREAUTH [CAPABILITY IMAP4rev1 ACL]` to
-  force `Synchronizing`. Assert the POSITIVE post-fix shape including that the
-  literal body bytes reached the wire - a narrow-fix implementation hangs there
-  rather than passing, which is worth pinning too. The untagged test must
-  assert on the payload, not `is_ok()`, because today it passes `is_ok()`.
-  BYE stays unfixed deliberately: `short_circuit_on_bye` must stay ahead of the
-  park, since a BYE means the connection is closing and delivering partial
-  results while tearing down is a more confusing contract than failing. Record
-  it as considered-and-declined rather than letting it look handled; partial-on
-  -BYE needs `run_pipeline_batch` to return `(PipelineResults, Option<Error>)`,
-  which ripples into `run_pipeline`'s sub-batch loop and the driver's fatal
-  check.
+- **imap: a pipelined consumer's buffered untagged responses are destroyed by
+  its own command's failure.** Found 2026-09-15 by the cold review of the
+  continuation-wait routing fix, and FILED rather than fixed there because it is
+  a pre-existing defect of the consumer contract, not a consequence of that
+  change. `TaggedOkConsumer::finalize` calls `require_ok()?` BEFORE returning its
+  buffered events, so every untagged response it accumulated is dropped when the
+  command fails. `NotifySetConsumer` is the existing counter-example that avoids
+  it, by carrying its command error INSIDE `Finalized.output` so it can still
+  return its events. Reachable from the step 4 response loop today; the reviewer's
+  transcript is a pipelined `DELETE` plus a `RENAME` carrying a synchronizing
+  literal, where a `* 12 EXISTS` classified `Either` reaches the DELETE consumer
+  and is then destroyed by the DELETE's `NO`. Note the read-time router did make
+  it reachable at additional wire positions - responses read during a literal
+  negotiation now route to consumers where they previously became events - so
+  this is more reachable than before, not merely more visible. The fix is a
+  ruling about the consumer contract: whether a failing consumer must still
+  surrender its buffered events, and if so whether that is `Finalized.output`
+  everywhere or a change to `finalize_erased`'s signature.
 
 - **imap: `emit_untagged_response_code_events` and `has_critical_response_code`
   are complements maintained by hand.** Both handle exactly `Alert` and

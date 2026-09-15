@@ -32,7 +32,9 @@ pub(super) async fn run_idle(
     let tag = send_command_on_wire(wire_reader, state, tag_gen, event_sink, &Command::Idle).await?;
 
     // 2. Wait for `+` continuation (RFC 2177 Section 3).
-    wait_for_continuation(wire_reader, state, event_sink).await?;
+    // No routing: IDLE has exactly one command outstanding, so every tagged
+    // response is its own and no untagged response has a consumer to reach.
+    wait_for_continuation(wire_reader, state, event_sink, None).await?;
 
     trace!(tag, "driver: entered IDLE mode");
 

@@ -69,6 +69,295 @@ pub(super) fn group_into_sub_batches(
         .collect()
 }
 
+/// Everything the pipeline response router needs that is not the protocol
+/// state or the event sink: the per-command tables built in step 2, the
+/// consumer/result slots, and where in the batch we currently are.
+///
+/// This exists so the router can run from BOTH read loops - the step 4
+/// response loop and the synchronizing-literal continuation wait inside the
+/// send phase - rather than the send phase falling back to the consumerless
+/// arm. A response read during a literal negotiation belongs to whichever
+/// earlier pipelined command solicited it, and only a routing context makes
+/// that reachable from there.
+pub(super) struct PipelineRouting<'a> {
+    /// Index of the command whose synchronizing literal is currently being
+    /// negotiated, or `None` in the step 4 response loop.
+    ///
+    /// Load-bearing twice. It names the command whose OWN tagged response
+    /// ends the negotiation, and it is the EXCLUSIVE upper bound on untagged
+    /// ownership: a solicited untagged response is one the server produced by
+    /// EXECUTING a command, and the server has not received this command (it
+    /// is waiting on a literal it has not been given), so it cannot have
+    /// executed it and no solicited response for it can exist. The only
+    /// things it can legitimately produce for a half-received command are the
+    /// continuation and a tagged rejection of the prefix, and both are
+    /// matched before classification ever runs. Commands after it have not
+    /// been sent at all.
+    sending: Option<usize>,
+    tag_to_idx: &'a std::collections::HashMap<String, usize>,
+    commands: &'a [Command],
+    kinds: &'a [crate::types::CommandKind],
+    targets: &'a [Option<MailboxName>],
+    tags: &'a [String],
+    consumers: &'a mut [Option<Box<dyn ConsumerErased>>],
+    results: &'a mut [Option<Result<Box<dyn std::any::Any + Send>, Error>>],
+    completed: &'a mut usize,
+}
+
+impl PipelineRouting<'_> {
+    /// The exclusive bound on consumers eligible to own an untagged response.
+    fn untagged_bound(&self) -> usize {
+        self.sending.unwrap_or(self.consumers.len())
+    }
+}
+
+/// What a routed response means to the loop that read it.
+pub(super) enum Routed {
+    /// A `+` continuation. Grants the literal in the send phase; a protocol
+    /// error in the step 4 loop.
+    Continuation,
+    /// The tagged `NO`/`BAD` of the command currently negotiating its
+    /// literal. Already finalized into its own result slot; the sender must
+    /// abandon the remainder of that command's bytes.
+    OwnTagRejected,
+    /// Routed; keep reading.
+    Continue,
+}
+
+/// Apply the pre-`apply_side_effects` state mutation a tagged completion
+/// implies for its own command.
+///
+/// Among pipelinable commands only NOTIFY SET/NONE need this (RFC 5465
+/// Section3). The ordering is load-bearing: `apply_side_effects` consumes the
+/// registration this installs, so installing it afterwards loses the
+/// transition permanently. It lives here, called once from the router, because
+/// the router is reached from two read loops and a second copy of this rule is
+/// the drift shape this crate has paid for before.
+///
+/// Design note: the other state-changing commands (ENABLE, SELECT, CLOSE,
+/// UNSELECT) are excluded from pipeline execution by API design - no pipeline
+/// methods exist for them - which is why there is no `set_in_close` here.
+fn apply_pipeline_pre_effects(
+    state: &mut super::super::state::ProtocolState,
+    routing: &PipelineRouting<'_>,
+    t: &crate::types::response::TaggedResponse,
+) {
+    let Some(&idx) = routing.tag_to_idx.get(&t.tag) else {
+        return;
+    };
+    match routing.commands[idx] {
+        Command::NotifySet(ref params) => {
+            let (list, status, metadata) = super::super::extensions::compute_notify_flags(params);
+            state.set_in_notify_set(Some(super::super::NotifyFlags {
+                list,
+                status,
+                metadata,
+            }));
+        }
+        Command::NotifyNone => {
+            state.set_in_notify_set(Some(super::super::NotifyFlags::default()));
+        }
+        _ => {}
+    }
+}
+
+/// Route one response read in pipeline context: apply its side effects
+/// exactly once, then deliver it to the command that owns it.
+///
+/// The single router for both pipeline read loops. Side effects are applied
+/// here and nowhere else on this path, so a response cannot be processed
+/// twice - which is what makes routing a response at READ time correct where
+/// buffering it for later replay was not: a replayed `* 3 EXPUNGE` would
+/// either decrement twice or need its whole read-time context reconstructed.
+#[allow(clippy::too_many_lines)]
+pub(super) fn route_pipeline_response(
+    state: &mut super::super::state::ProtocolState,
+    event_sink: &mut event_sink::DriverEventSink,
+    routing: &mut PipelineRouting<'_>,
+    resp: crate::types::Response,
+) -> Result<Routed, Error> {
+    // Read before any mutation: classification is against the notification
+    // registration as it stood when this response was produced.
+    let notify_before = state.notify();
+
+    if let crate::types::Response::Tagged(ref t) = resp {
+        apply_pipeline_pre_effects(state, routing, t);
+    }
+
+    let digest = state.apply_side_effects(&resp);
+
+    match resp {
+        crate::types::Response::Continuation(_) => Ok(Routed::Continuation),
+        crate::types::Response::Greeting(_) => {
+            Err(Error::Protocol("unexpected greeting mid-pipeline".into()))
+        }
+        crate::types::Response::Tagged(t) => {
+            // Before every exit below, including the protocol errors: an
+            // [ALERT] on a tagged response reaches the event queue whatever
+            // happens to the response itself (RFC 3501 Section7.1).
+            super::emit_tagged_response_code_events(&t, event_sink);
+
+            let Some(&idx) = routing.tag_to_idx.get(&t.tag) else {
+                return Err(Error::Protocol(format!(
+                    "unknown tag in pipeline response: {:?}",
+                    t.tag,
+                )));
+            };
+
+            if let Some(sending) = routing.sending {
+                if idx == sending {
+                    // The server answered the command whose literal it has
+                    // not been given (RFC 3501 Section4.3).
+                    if matches!(t.status, crate::types::response::StatusKind::Ok) {
+                        // An OK claims successful execution of a command the
+                        // server has not received completely. NO/BAD are an
+                        // honest refusal of the prefix and can be finalized as
+                        // that command's ordinary result; a success cannot,
+                        // because there is nothing that could have succeeded.
+                        return Err(Error::Protocol(
+                            "unexpected OK before literal continuation \
+                             (RFC 3501 Section4.3)"
+                                .into(),
+                        ));
+                    }
+                } else if idx > sending {
+                    // A completion for a command still unsent: the server
+                    // cannot complete what it has not received.
+                    return Err(Error::Protocol(format!(
+                        "tagged response for unsent pipelined command: {:?}",
+                        t.tag,
+                    )));
+                }
+            }
+
+            let own_tag_rejected = routing.sending == Some(idx);
+
+            if let Some(consumer) = routing.consumers[idx].take() {
+                let ctx = super::build_consumer_context(
+                    state,
+                    routing.targets[idx].as_ref(),
+                    &routing.tags[idx],
+                );
+                match consumer.finalize_erased(t, &ctx) {
+                    Ok(finalized) => {
+                        for ev in finalized.reclassified_as_events {
+                            if !super::has_critical_response_code(&ev) {
+                                let _ = event_sink.emit(ev.into());
+                            }
+                        }
+                        routing.results[idx] = Some(Ok(finalized.output));
+                    }
+                    Err(e) => {
+                        routing.results[idx] = Some(Err(e));
+                    }
+                }
+                *routing.completed += 1;
+            }
+            // Duplicate tagged response for an already-finalized command:
+            // ignore silently (Postel's law).
+
+            if own_tag_rejected {
+                Ok(Routed::OwnTagRejected)
+            } else {
+                Ok(Routed::Continue)
+            }
+        }
+        crate::types::Response::Untagged(u) => {
+            // The prologue's BYE short-circuit stays AHEAD of any routing, so
+            // an untagged BYE during a pipelined literal send still aborts the
+            // batch and loses every result. That was considered and declined,
+            // not overlooked: a BYE means the connection is closing, and
+            // handing back partial results while tearing down is a more
+            // confusing contract than failing. Changing it means
+            // `run_pipeline_batch` returning `(PipelineResults, Option<Error>)`,
+            // which ripples into the sub-batch loop and the driver's fatal
+            // check; re-raise it only with that whole shape in hand.
+            let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
+            let bound = routing.untagged_bound();
+
+            // Head consumer: the first still-active command eligible to own
+            // an untagged response. Per the tag-completion barrier a
+            // finalized command can no longer receive one, and per `sending`
+            // neither can a command the server has not finished receiving.
+            let head_idx = routing.consumers[..bound].iter().position(Option::is_some);
+            let Some(idx) = head_idx else {
+                // Nothing eligible: late-flushed server data.
+                if !code_emitted {
+                    let _ = event_sink.emit((*u).into());
+                }
+                return Ok(Routed::Continue);
+            };
+
+            let class_ctx = ClassificationContext {
+                notify: notify_before,
+                command_target: routing.targets[idx].as_ref(),
+            };
+            match classification::classify(routing.kinds[idx], &u, &class_ctx) {
+                SolicitationRule::OnlySolicited | SolicitationRule::Either => {
+                    let ctx = super::build_consumer_context(
+                        state,
+                        routing.targets[idx].as_ref(),
+                        &routing.tags[idx],
+                    );
+                    if let Some(ref mut consumer) = routing.consumers[idx] {
+                        consumer.on_response(*u, notify_before, &ctx);
+                    }
+                }
+                SolicitationRule::OnlyUnsolicited | SolicitationRule::Impossible => {
+                    // Forward-classify: the head consumer does not want this
+                    // response. Scan later eligible consumers to see if it is
+                    // OnlySolicited for one of them. Non-conformant servers
+                    // may interleave responses across pipelined commands
+                    // (Postel's law).
+                    let mut u = Some(u);
+                    for later in (idx + 1)..bound {
+                        if routing.consumers[later].is_none() {
+                            continue;
+                        }
+                        let claimed = match u {
+                            Some(ref inner) => {
+                                let later_ctx = ClassificationContext {
+                                    notify: notify_before,
+                                    command_target: routing.targets[later].as_ref(),
+                                };
+                                matches!(
+                                    classification::classify(
+                                        routing.kinds[later],
+                                        inner,
+                                        &later_ctx,
+                                    ),
+                                    SolicitationRule::OnlySolicited
+                                )
+                            }
+                            None => false,
+                        };
+                        if claimed {
+                            if let Some(taken) = u.take() {
+                                let ctx = super::build_consumer_context(
+                                    state,
+                                    routing.targets[later].as_ref(),
+                                    &routing.tags[later],
+                                );
+                                if let Some(ref mut consumer) = routing.consumers[later] {
+                                    consumer.on_response(*taken, notify_before, &ctx);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    // No eligible consumer claimed it: emit as event.
+                    if let Some(unclaimed) = u
+                        && !code_emitted
+                    {
+                        let _ = event_sink.emit((*unclaimed).into());
+                    }
+                }
+            }
+            Ok(Routed::Continue)
+        }
+    }
+}
+
 /// Execute a batch of pipelined commands, splitting into sub-batches
 /// when duplicate [`CommandKind`]s are present.
 ///
@@ -165,8 +454,8 @@ pub(super) async fn run_pipeline(
 /// interleave. This function:
 ///
 /// 1. Snapshots encode options (C7 fix: capability state at batch start).
-/// 2. Encodes all commands before sending any bytes. Any encode failure
-///    aborts the entire batch.
+/// 2. Encodes all commands before sending any bytes, and builds the routing
+///    tables. Any encode failure aborts the entire batch.
 /// 3. Sends all commands on the wire (batch write for LITERAL+ mode).
 /// 4. Reads responses, routing each to the correct consumer by tag.
 ///    Untagged responses are classified against the head (first
@@ -174,9 +463,18 @@ pub(super) async fn run_pipeline(
 ///    finalized (its tagged response arrived), it can no longer receive
 ///    untagged responses: the tag-completion barrier.
 ///
-/// Continuations (`+`) are errors in pipeline context. Pipelinable
-/// commands do not produce continuations (the `Pipelinable` sealed trait
-/// enforces this at the type level).
+/// The routing tables are built BEFORE step 3 rather than after it because
+/// the send phase reads from the socket too. Whenever a synchronizing literal
+/// forces a continuation wait (no LITERAL+, or a LITERAL- literal too large to
+/// patch), commands already on the wire have tags still pending, and their
+/// responses arrive during that wait. Routing them needs the same tables step
+/// 4 uses, so both loops share one router and the send phase is not a
+/// consumerless loop.
+///
+/// Continuations (`+`) are errors in the step 4 loop. Pipelinable commands do
+/// not produce continuations of their own (the `Pipelinable` sealed trait
+/// enforces this at the type level); a `+` during the send phase is the
+/// literal grant and belongs to the sender.
 #[allow(clippy::too_many_lines)]
 async fn run_pipeline_batch(
     wire_reader: &mut super::super::wire::WireReader,
@@ -216,6 +514,18 @@ async fn run_pipeline_batch(
         encoded_commands.push(encoded);
     }
 
+    // Routing tables, built before the send: see the doc comment.
+    let mut tag_to_idx: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(count);
+    for (i, tag) in tags.iter().enumerate() {
+        tag_to_idx.insert(tag.clone(), i);
+    }
+    let mut consumers: Vec<Option<Box<dyn ConsumerErased>>> =
+        consumers.into_iter().map(Some).collect();
+    let mut results: Vec<Option<Result<Box<dyn std::any::Any + Send>, Error>>> =
+        (0..count).map(|_| None).collect();
+    let mut completed = 0usize;
+
     trace!(count, "driver: sending pipelined batch");
 
     // 3. Send all commands on the wire. For LITERAL+ mode, batch all
@@ -243,188 +553,80 @@ async fn run_pipeline_batch(
         LiteralMode::LiteralMinus => {
             // RFC 7888 Section5: small literals (<=4096) are non-synchronizing;
             // larger ones need sync. Send each command with patching.
-            for encoded in encoded_commands {
+            for (i, encoded) in encoded_commands.into_iter().enumerate() {
                 let flat = encoded.into_buf();
                 let patched =
                     super::super::patch_small_literals_to_plus_with_binary(&flat, allow_literal8);
-                send_with_literal_sync(wire_reader, state, event_sink, &patched).await?;
+                let mut routing = PipelineRouting {
+                    sending: Some(i),
+                    tag_to_idx: &tag_to_idx,
+                    commands: &commands,
+                    kinds: &kinds,
+                    targets: &targets,
+                    tags: &tags,
+                    consumers: &mut consumers,
+                    results: &mut results,
+                    completed: &mut completed,
+                };
+                send_with_literal_sync(
+                    wire_reader,
+                    state,
+                    event_sink,
+                    &patched,
+                    Some(&mut routing),
+                )
+                .await?;
             }
         }
         LiteralMode::Synchronizing => {
             // RFC 3501 Section4.3: all literals are synchronizing. Send each
             // command's segments with literal sync.
-            for encoded in encoded_commands {
-                send_encoded_segments(wire_reader, state, event_sink, encoded.segments()).await?;
+            for (i, encoded) in encoded_commands.into_iter().enumerate() {
+                let mut routing = PipelineRouting {
+                    sending: Some(i),
+                    tag_to_idx: &tag_to_idx,
+                    commands: &commands,
+                    kinds: &kinds,
+                    targets: &targets,
+                    tags: &tags,
+                    consumers: &mut consumers,
+                    results: &mut results,
+                    completed: &mut completed,
+                };
+                send_encoded_segments(
+                    wire_reader,
+                    state,
+                    event_sink,
+                    encoded.segments(),
+                    Some(&mut routing),
+                )
+                .await?;
             }
         }
     }
 
     // 4. Response loop with tag-completion barrier.
     //
-    // Build a tag->index lookup for O(1) matching. Consumers are stored
-    // in an Option vec: None means finalized.
-    let mut tag_to_idx: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::with_capacity(count);
-    for (i, tag) in tags.iter().enumerate() {
-        tag_to_idx.insert(tag.clone(), i);
-    }
-
-    let mut consumers: Vec<Option<Box<dyn ConsumerErased>>> =
-        consumers.into_iter().map(Some).collect();
-    let mut results: Vec<Option<Result<Box<dyn std::any::Any + Send>, Error>>> =
-        (0..count).map(|_| None).collect();
-    let mut completed = 0usize;
-
+    // The send phase may already have routed responses - and, when the last
+    // command's literal was rejected, may already have finalized every
+    // command - so the guard is checked before the first read rather than
+    // after it.
     while completed < count {
-        let notify_before = state.notify();
         let utf8 = super::utf8_mode(state);
         let resp = wire_reader.read_one(utf8).await?;
-
-        // Set pre-flight state mutations before apply_side_effects
-        // processes the tagged response. Among pipelinable commands,
-        // only NOTIFY SET/NONE need this (RFC 5465 Section3).
-        //
-        // Design note: State-changing commands (ENABLE, SELECT, CLOSE, UNSELECT)
-        // are excluded from pipeline execution by API design: no pipeline methods
-        // exist for them. This is enforced structurally via the Pipeline type, not
-        // by runtime validation. There is no `set_in_close` call here for the
-        // same reason.
-        if let crate::types::Response::Tagged(ref t) = resp
-            && let Some(&idx) = tag_to_idx.get(&t.tag)
-        {
-            match commands[idx] {
-                Command::NotifySet(ref params) => {
-                    let (list, status, metadata) =
-                        super::super::extensions::compute_notify_flags(params);
-                    state.set_in_notify_set(Some(super::super::NotifyFlags {
-                        list,
-                        status,
-                        metadata,
-                    }));
-                }
-                Command::NotifyNone => {
-                    state.set_in_notify_set(Some(super::super::NotifyFlags::default()));
-                }
-                _ => {}
-            }
-        }
-
-        let digest = state.apply_side_effects(&resp);
-
-        match resp {
-            crate::types::Response::Tagged(t) => {
-                super::emit_tagged_response_code_events(&t, event_sink);
-                if let Some(&idx) = tag_to_idx.get(&t.tag) {
-                    if let Some(consumer) = consumers[idx].take() {
-                        let ctx =
-                            super::build_consumer_context(state, targets[idx].as_ref(), &tags[idx]);
-                        match consumer.finalize_erased(t, &ctx) {
-                            Ok(finalized) => {
-                                for ev in finalized.reclassified_as_events {
-                                    if !super::has_critical_response_code(&ev) {
-                                        let _ = event_sink.emit(ev.into());
-                                    }
-                                }
-                                results[idx] = Some(Ok(finalized.output));
-                            }
-                            Err(e) => {
-                                results[idx] = Some(Err(e));
-                            }
-                        }
-                        completed += 1;
-                    }
-                    // Duplicate tagged response for already-finalized
-                    // command: ignore silently (Postel's law).
-                } else {
-                    return Err(Error::Protocol(format!(
-                        "unknown tag in pipeline response: {:?}",
-                        t.tag,
-                    )));
-                }
-            }
-            crate::types::Response::Untagged(u) => {
-                let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
-
-                // Find the head consumer: first still-active
-                // (non-finalized) consumer. Per the tag-completion
-                // barrier, only consumers whose tagged response hasn't
-                // arrived yet can receive untagged responses.
-                let head_idx = consumers.iter().position(Option::is_some);
-                if let Some(idx) = head_idx {
-                    let class_ctx = ClassificationContext {
-                        notify: notify_before,
-                        command_target: targets[idx].as_ref(),
-                    };
-                    let rule = classification::classify(kinds[idx], &u, &class_ctx);
-                    match rule {
-                        SolicitationRule::OnlySolicited | SolicitationRule::Either => {
-                            let ctx = super::build_consumer_context(
-                                state,
-                                targets[idx].as_ref(),
-                                &tags[idx],
-                            );
-                            if let Some(ref mut consumer) = consumers[idx] {
-                                consumer.on_response(*u, notify_before, &ctx);
-                            }
-                        }
-                        SolicitationRule::OnlyUnsolicited | SolicitationRule::Impossible => {
-                            // Forward-classify: the head consumer does not
-                            // want this response. Scan later consumers to
-                            // see if it is OnlySolicited for one of them.
-                            // Non-conformant servers may interleave responses
-                            // across pipelined commands (Postel's law).
-                            let mut u = Some(u);
-                            for later in (idx + 1)..consumers.len() {
-                                if consumers[later].is_none() {
-                                    continue;
-                                }
-                                let claimed = match u {
-                                    Some(ref inner) => {
-                                        let later_ctx = ClassificationContext {
-                                            notify: notify_before,
-                                            command_target: targets[later].as_ref(),
-                                        };
-                                        matches!(
-                                            classification::classify(
-                                                kinds[later],
-                                                inner,
-                                                &later_ctx,
-                                            ),
-                                            SolicitationRule::OnlySolicited
-                                        )
-                                    }
-                                    None => false,
-                                };
-                                if claimed {
-                                    if let Some(taken) = u.take() {
-                                        let ctx = super::build_consumer_context(
-                                            state,
-                                            targets[later].as_ref(),
-                                            &tags[later],
-                                        );
-                                        if let Some(ref mut consumer) = consumers[later] {
-                                            consumer.on_response(*taken, notify_before, &ctx);
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                            // No later consumer claimed it: emit as event.
-                            if let Some(unclaimed) = u
-                                && !code_emitted
-                            {
-                                let _ = event_sink.emit((*unclaimed).into());
-                            }
-                        }
-                    }
-                } else {
-                    // All consumers finalized: late-flushed server data.
-                    if !code_emitted {
-                        let _ = event_sink.emit((*u).into());
-                    }
-                }
-            }
-            crate::types::Response::Continuation(_) => {
+        let mut routing = PipelineRouting {
+            sending: None,
+            tag_to_idx: &tag_to_idx,
+            commands: &commands,
+            kinds: &kinds,
+            targets: &targets,
+            tags: &tags,
+            consumers: &mut consumers,
+            results: &mut results,
+            completed: &mut completed,
+        };
+        match route_pipeline_response(state, event_sink, &mut routing, resp)? {
+            Routed::Continuation => {
                 // Pipelinable commands do not produce continuations
                 // (enforced by the Pipelinable sealed trait).
                 // An unexpected + is a protocol error (RFC 3501 Section7.5).
@@ -432,9 +634,8 @@ async fn run_pipeline_batch(
                     "unexpected continuation in pipeline response loop".into(),
                 ));
             }
-            crate::types::Response::Greeting(_) => {
-                return Err(Error::Protocol("unexpected greeting mid-pipeline".into()));
-            }
+            // Unreachable with `sending: None`: no tag is the own tag.
+            Routed::OwnTagRejected | Routed::Continue => {}
         }
     }
 
@@ -445,3 +646,7 @@ async fn run_pipeline_batch(
         .map(|r| r.unwrap_or_else(|| Err(Error::Internal("missing pipeline result".into()))))
         .collect())
 }
+
+#[cfg(test)]
+#[path = "pipeline_tests.rs"]
+mod tests;
