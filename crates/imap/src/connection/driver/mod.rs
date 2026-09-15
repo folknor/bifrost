@@ -859,10 +859,10 @@ pub(super) fn process_untagged_prefix(
 /// run the shared prologue, then forward the response as a typed event unless
 /// the prologue already published its critical code as one.
 ///
-/// Four read loops answer an untagged response this way and only this way -
-/// the IDLE loop, the post-DONE IDLE drain, the best-effort LOGOUT drain, and
-/// the synchronizing-literal continuation wait WHEN IT HAS NO ROUTING
-/// CONTEXT, i.e. for single-command dispatch and IDLE. Under a pipelined batch
+/// Three read loops always answer an untagged response this way - the IDLE
+/// loop, the post-DONE IDLE drain, and the best-effort LOGOUT drain - and a
+/// fourth, the synchronizing-literal continuation wait, does so only WHEN IT
+/// HAS NO ROUTING CONTEXT, i.e. for single-command dispatch and IDLE. Under a pipelined batch
 /// that same wait does have consumers to route to - earlier commands in the
 /// batch are still outstanding - and takes the router instead; answering those
 /// responses here is what silently truncated a batch's results. The four
@@ -890,19 +890,13 @@ pub(super) fn process_untagged_as_event(
 
 /// Derive whether the connection is in `IMAP4rev2` mode.
 ///
-/// RFC 9051 Section6.3.1: on dual-mode servers (both rev1 and rev2), rev2
-/// behavior requires explicit ENABLE.
+/// RFC 9051 Section6.3.1, via the single authority in `crate::types::profile`.
+/// The rule is NOT restated here. This is the driver's view of it, and it is
+/// the one that decides wire bytes - `utf8_mode`, `literal_mode` and the
+/// `allow_literal8` choice all read it - so a copy that drifted here would send
+/// bytes the server's active revision does not accept.
 fn is_rev2(state: &super::state::ProtocolState) -> bool {
-    let has_rev2 = state.capabilities().contains(&Capability::Imap4Rev2);
-    let has_rev1 = state.capabilities().contains(&Capability::Imap4Rev1);
-    if has_rev2 && has_rev1 {
-        state
-            .enabled()
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("IMAP4rev2"))
-    } else {
-        has_rev2
-    }
+    crate::types::profile::imap4rev2_active(state.capabilities(), state.enabled())
 }
 
 /// Derive the UTF-8 wire mode from protocol state.

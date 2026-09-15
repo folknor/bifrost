@@ -1,5 +1,77 @@
 use super::*;
 
+/// The complete truth table for the RFC 9051 Section 6.3.1 dual-mode rule,
+/// against the single authority every view now delegates to.
+///
+/// Worth stating why this table and not a test that calls all four wrappers and
+/// asserts they agree: once they delegate, such a test is tautological. It
+/// cannot fail when someone re-inlines a CORRECT copy, and it fails only if a
+/// wrapper is miswired - so it would pin the wiring on the day it was written
+/// and nothing after. No behavioural test can detect a semantically identical
+/// re-inlining; preventing future copies is a review property, not a runtime
+/// one. What a test CAN do is pin the rule itself, so that a centralized
+/// implementation which is wrong is caught however many wrappers delegate to
+/// it. That is this table.
+///
+/// The rule used to be written out five times, over four different views, and
+/// only two of the copies had any test. The three without were the ones that
+/// decide wire bytes and SELECT validation.
+#[test]
+fn the_dual_mode_rule_truth_table() {
+    let rev1 = || vec![Capability::Imap4Rev1];
+    let rev2 = || vec![Capability::Imap4Rev2];
+    let both = || vec![Capability::Imap4Rev1, Capability::Imap4Rev2];
+    let enabled = |s: &str| vec![s.to_owned()];
+
+    for (caps, en, expected, why) in [
+        (Vec::new(), Vec::new(), false, "neither revision advertised"),
+        (rev1(), Vec::new(), false, "rev1 only"),
+        (rev2(), Vec::new(), true, "rev2 only is rev2 from the start"),
+        (
+            both(),
+            Vec::new(),
+            false,
+            "dual-mode without ENABLE stays rev1",
+        ),
+        (
+            both(),
+            enabled("IMAP4rev2"),
+            true,
+            "dual-mode with ENABLE is rev2",
+        ),
+        (
+            both(),
+            enabled("imap4rev2"),
+            true,
+            "the ENABLE match is case-insensitive (RFC 9051 capability atoms)",
+        ),
+        (
+            both(),
+            enabled("CONDSTORE"),
+            false,
+            "an unrelated ENABLE does not activate rev2",
+        ),
+        (
+            rev2(),
+            enabled("IMAP4rev2"),
+            true,
+            "rev2-only stays rev2 when redundantly enabled",
+        ),
+        (
+            rev1(),
+            enabled("IMAP4rev2"),
+            false,
+            "ENABLE cannot conjure a revision the server never advertised",
+        ),
+    ] {
+        assert_eq!(
+            imap4rev2_active(&caps, &en),
+            expected,
+            "{why} (capabilities={caps:?}, enabled={en:?})"
+        );
+    }
+}
+
 #[test]
 fn dual_rev_server_requires_enable_for_rev2_profile() {
     let profile = ServerProfile::new(vec![Capability::Imap4Rev1, Capability::Imap4Rev2], vec![]);

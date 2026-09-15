@@ -71,20 +71,30 @@ async fn an_earlier_commands_untagged_response_reaches_its_consumer_mid_literal(
         "LISTRIGHTS did not produce a synchronizing literal: {listrights:?}"
     );
 
-    // Both responses for command #1 land while command #2 is blocked waiting
-    // for its `+`.
-    respond(
-        &mut server,
-        &format!("* MYRIGHTS INBOX lrswipkxte\r\n{tag1} OK myrights done\r\n+ ready\r\n"),
-    )
-    .await;
+    // ORDERING IS THE WHOLE TEST. Command #1's untagged data lands inside the
+    // continuation wait, but its TAGGED completion must NOT - it comes after
+    // the `+`, once the wait is over.
+    //
+    // Sending the tagged response inside the wait as well would make the old
+    // code fail loudly on the tagged path (it answered any tagged response with
+    // a protocol error), which is the OTHER half of this defect and already has
+    // its own test. Then this transcript would pass for the wrong reason and
+    // the silent half - batch completes, caller gets a short result, no error
+    // at all - would stay unpinned. A previous version of this test made
+    // exactly that mistake.
+    respond(&mut server, "* MYRIGHTS INBOX lrswipkxte\r\n+ ready\r\n").await;
 
     // The grant must actually release the literal body.
     let body = read_exact(&mut server, 5).await;
     assert_eq!(body, LITERAL_IDENTIFIER.as_bytes());
     let _trailer = read_line(&mut server).await;
 
-    respond(&mut server, &format!("{tag2} OK listrights done\r\n")).await;
+    // Both completions now, in the step 4 response loop.
+    respond(
+        &mut server,
+        &format!("{tag1} OK myrights done\r\n{tag2} OK listrights done\r\n"),
+    )
+    .await;
 
     let results = task.await.unwrap().unwrap();
     let rights = results[0]
@@ -206,9 +216,30 @@ async fn the_sending_commands_own_rejection_is_its_result_not_a_batch_error() {
         "wrong error routed to the rejected command: {err}"
     );
 
-    // Nothing further reached the wire: the abandoned literal body would
-    // otherwise be parsed as a command.
-    drop(server);
+    // The abandoned remainder must NOT have reached the wire - the server has
+    // ended this command's parsing state, so those bytes would be read as a new
+    // command line (RFC 3501 Section 4.3). This is the rule the whole
+    // `Rejected` path exists to honour and it needs a real assertion: simply
+    // dropping the server end verifies nothing, because a client that DID
+    // write the body would pass that just as happily.
+    let mut tail = Vec::new();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        tokio::io::AsyncReadExt::read_to_end(&mut server, &mut tail),
+    )
+    .await;
+    // Anything at all is not the assertion: dropping the connection at the end
+    // of the test sends a graceful LOGOUT, which is ordinary teardown traffic
+    // and would make a bare "no more bytes" check fail for the wrong reason.
+    // The assertion is that the ABANDONED BYTES specifically never went out.
+    assert!(
+        !tail
+            .windows(LITERAL_IDENTIFIER.len())
+            .any(|w| w == LITERAL_IDENTIFIER.as_bytes()),
+        "the refused literal's body reached the wire and would be parsed as a \
+         command: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
 }
 
 /// A tagged `OK` for the command whose literal has not been granted stays a

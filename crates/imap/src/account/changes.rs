@@ -199,11 +199,6 @@ async fn run_changes(
     ) {
         return Err(super::error::incomplete_uid_baseline(&folder).into());
     }
-    let qresync_negotiation_warning = if matches!(cursor, FolderCursor::QResync { .. }) {
-        account.take_qresync_negotiation_warning()
-    } else {
-        None
-    };
     match cursor {
         FolderCursor::QResync { .. } if account.qresync_enabled() => {
             run_qresync(account, folder, cursor, tx).await
@@ -214,16 +209,20 @@ async fn run_changes(
             known_uids,
             known_uids_complete,
         } => {
-            // Prefer the one-shot warning (fires the account-level
-            // negotiation warning once), then the non-consuming session
-            // reason so a later folder's downgrade still names the
-            // specific cause rather than the generic fallback.
-            let reason = qresync_negotiation_warning
-                .or_else(|| account.qresync_negotiation_reason())
-                .unwrap_or_else(|| {
-                    "QRESYNC is disabled for this account session; continuing with CONDSTORE"
-                        .to_string()
-                });
+            // The NON-consuming read, deliberately. This used to take the
+            // account-level one-shot first and fall back to this, which could
+            // not change a single byte of what this arm emits - both return the
+            // same `Option<String>` - while spending the one-shot so
+            // `run_inventory`, the only place it does real work, found it
+            // already gone. Since the stream is channel-backed by a spawned
+            // task that outlives a dropped receiver, and the engine now drops a
+            // pending changes stream on every PAUSE rather than only at
+            // teardown, that take could burn the account-level warning without
+            // anyone ever receiving it.
+            let reason = account.qresync_negotiation_reason().unwrap_or_else(|| {
+                "QRESYNC is disabled for this account session; continuing with CONDSTORE"
+                    .to_string()
+            });
             send_strategy_downgrade(&tx, SyncStrategy::QResync, SyncStrategy::Condstore, &reason)
                 .await?;
             run_condstore_with_baseline(

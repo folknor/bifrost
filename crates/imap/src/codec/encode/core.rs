@@ -62,16 +62,11 @@ impl EncodeOptions {
         self.has_capability(&Capability::Condstore) || self.has_capability(&Capability::QResync)
     }
 
+    /// RFC 9051 Section6.3.1, via the single authority in
+    /// `crate::types::profile`. The rule is NOT restated here: this view owns a
+    /// coherent `(capabilities, enabled)` pair and hands it over.
     fn imap4rev2_active(&self) -> bool {
-        let has_rev2 = self.capabilities.contains(&Capability::Imap4Rev2);
-        let has_rev1 = self.capabilities.contains(&Capability::Imap4Rev1);
-        if has_rev2 && has_rev1 {
-            self.enabled
-                .iter()
-                .any(|extension| extension.eq_ignore_ascii_case("IMAP4rev2"))
-        } else {
-            has_rev2
-        }
+        crate::types::profile::imap4rev2_active(&self.capabilities, &self.enabled)
     }
 
     fn rev2_implies(&self, capability: &Capability) -> bool {

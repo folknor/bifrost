@@ -244,13 +244,15 @@ the whole drive, and the poll task selects its per-scope token too, which is
 what releases the drive LEASE when a scope is deleted or restarted while the
 account boundary is still `Run`.
 
-In every case cancellation declines to read ANOTHER event. It never interrupts
-the processing or publication of an event the stream has already returned: the
-registration and the broadcast are synchronous and a `select!` cannot split
-them. The cost is that a provider item which was ready concurrently with the
-cancellation may be deferred to a later drive rather than published now - no
-publication is partial, and no cursor advanced past it, so the next drive
-re-reads it.
+In every case cancellation stops the loop at a poll boundary. It never
+interrupts the processing or publication of an event the stream has already
+RETURNED TO THE LOOP: the registration and the broadcast are synchronous and a
+`select!` cannot split them. It can, however, discard an item that became ready
+in the same poll as the cancellation - the changes drive's select is unbiased,
+so either branch may win, and the runner's is `biased` toward cancellation on
+purpose. So the honest guarantee is not "declines to read another event" but
+this: no publication is ever partial, and no cursor advances past an item the
+consumer did not receive, so a discarded item is re-read by the next drive.
 
 **Do not**: `InventoryFusion::run_stream` still does not select on cancellation
 while reading its provider stream, so a wedged fusion stream keeps its worker

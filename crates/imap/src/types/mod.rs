@@ -20,7 +20,7 @@ pub(crate) mod flag;
 mod ids;
 pub(crate) mod mailbox;
 pub(crate) mod notify;
-mod profile;
+pub(crate) mod profile;
 pub(crate) mod response;
 pub(crate) mod search;
 mod secret;

@@ -78,30 +78,93 @@ asked for; that review debt is listed under their crates below.
   close phases by the per-phase budgets. If it is wanted, the restaged test must
   keep the `Drop`-instant probe.
 
-- **imap: a dropped `changes_stream` can spend the QRESYNC one-shot warning
-  without delivering it.** Found 2026-09-15 while auditing the six
-  `changes_stream` implementations against the drop-tolerance requirement the
-  poll arms added to `Account::changes_stream`. `run_changes` calls
-  `take_qresync_negotiation_warning()` near the top, which `swap`s a
-  `qresync_negotiation_warning_sent` flag and so is spent for the life of the
-  account. IMAP's stream is channel-backed by a SPAWNED task, so dropping the
-  stream does not cancel that task - it runs on until a send fails - and a
-  warning already taken is then dropped on the floor with the channel. The
-  engine now drops pending streams on every pause, not only at teardown, so this
-  is more reachable than it was, though it was already reachable via detach
-  aborts.
-  Bounded, and worth stating precisely rather than as "the warning is lost": the
-  NON-consuming `qresync_negotiation_reason()` survives, so every later
-  per-folder QRESYNC->CONDSTORE downgrade still carries the specific reason
-  string. What can be lost is the standalone ACCOUNT-level warning, exactly once.
-  The fix is a ruling about where a one-shot lives: taking it only at the moment
-  it is successfully sent, or making the flag a compare-and-set that a failed
-  send rolls back, or dropping the one-shot in favour of the non-consuming read
-  everywhere. Note the same audit found the other five implementations have no
-  such state - graph and jmap are `async_stream` generators, caldav and carddav
-  are `stream::once` over an `Arc` client, and google already has a
-  `changes_stream_cancellable` - so imap is the only one of the six with a
-  drop-sensitive one-shot.
+- **imap: a paused `changes_stream` leaves an ORPHANED driver task on the
+  account.** Widened 2026-09-15 from a note that scoped this to a lost QRESYNC
+  warning; the warning was the symptom and this is the shape. IMAP's
+  `changes_stream` is channel-backed by a detached `tokio::spawn`, so dropping
+  the stream drops only the RECEIVER - the task runs on against the account's
+  connection until its next `tx.send` fails. The engine now cuts a pending poll
+  on every PAUSE, not only at teardown, and the poll loop then calls
+  `changes_stream` again on the same account, so pause/resume churn can leave
+  two spawned drivers issuing IMAP commands concurrently over one
+  `ImapAccount`, the older one holding a pool checkout it will not release until
+  it next tries to send.
+  Checked and NOT found: silent data loss. `record_modseq` feeds a per-UID cache
+  used for opportunistic `STORE UNCHANGEDSINCE`, not a sync cursor, and the
+  engine's cursor advances only on published checkpoints. So this is duplicated
+  work and a held connection, not lost mail.
+  Related and also true before this change: `SyncControl::pause` reports
+  quiescence while such a task is still talking to the server, because the
+  activity guard lives in the drive rather than in the provider's task. Reached
+  far more often now.
+  The QRESYNC half is FIXED: `run_changes` no longer takes the account-level
+  one-shot, because that take could not change a byte of what it emitted and
+  only spent the warning out from under `run_inventory`. What remains is that
+  `run_inventory` can still spend it and lose it in the same drop window, and
+  the structural fix is the orphan above rather than the one-shot.
+
+- **imap: `take_dav_degraded_warnings` drains with no fallback and no delivery
+  guarantee.** Found 2026-09-15 by the same audit, and strictly worse than the
+  QRESYNC case it was found beside. `discover_cursor_scopes` drains a
+  `Mutex<Vec<Warning>>` SYNCHRONOUSLY, before the stream is constructed, and the
+  drained warnings then ride inside a `stream::once` future. Drop that stream
+  un-polled and they are gone permanently - unlike the QRESYNC warning there is
+  no non-consuming sibling to re-read, because the `Vec` was emptied. These are
+  the warnings that tell a consumer its CardDAV or CalDAV half degraded to
+  IMAP-only for the cycle, so losing them means an account silently presents as
+  mail-only. Same class as the one-shot; the fix is the same question of where a
+  consume-on-read lives relative to a delivery that can fail.
+
+- **graph: a push connectivity edge can be raised without being delivered.**
+  `mark_push_disconnected` / `mark_push_reconnected` flip `push_disconnected`
+  and then `let _ = push_tx.send(..)` on a `broadcast::Sender`. A send with no
+  receivers returns `Err` and is discarded while the latch has already moved, so
+  a consumer subscribing between a lost `Disconnected` and a later `Reconnected`
+  sees one half of an edge it never saw the other half of. Same shape as the two
+  above: state mutated independently of successful delivery.
+  The distinction worth keeping when this class is written up: a one-shot flag
+  is SAFE when the flag itself is the observable (`closed.swap(true)` and its
+  google/jmap equivalents are idempotent by design), and unsafe the moment the
+  flag guards a payload travelling over a channel someone else can drop.
+
+- **imap: a prebuilt APPEND or MULTIAPPEND can be encoded from a stale
+  snapshot.** Found 2026-09-15 by the cold review of the `is_rev2` unification,
+  and it is a protocol-correctness defect rather than the conservative skew the
+  rest of that neighbourhood has. Ordinary commands are re-encoded driver-side
+  from live `ProtocolState` immediately before they go out, so a stale
+  handle-side gate can only refuse something the driver would now accept, or
+  pick a legacy path that stays valid under either revision. APPEND and
+  MULTIAPPEND are built entirely handle-side from the published snapshot -
+  mailbox encoding from `utf8_enabled()`, literal mode from `literal_mode()`,
+  literal8 eligibility from `is_rev2_from_snapshot` - and the driver sends those
+  bytes without re-encoding. The driver republishes the snapshot only when a
+  command completes, so a concurrent handle can build bytes for one revision and
+  have them executed under another: queue `UNAUTHENTICATE` on handle A, build an
+  APPEND on handle B against the pre-clear snapshot, and the raw UTF-8 mailbox
+  or rev2 literal treatment goes out after `enabled` was cleared. The reverse
+  transition is worse than a refusal - modified UTF-7 bytes stay syntactically
+  ASCII under rev2 and can address the WRONG mailbox rather than failing.
+  MULTIAPPEND has the widest window, since it may await an APPENDLIMIT lookup
+  between snapshotting policy and building bytes. No disagreement between the
+  five former copies of the dual-mode rule is needed to reach this; unifying
+  them did not touch it.
+
+- **The reconciler/multiplexer `ScopeTokens` sharing has no test.** The wiring
+  defect itself was FIXED 2026-09-15 (attach built the map, cloned it into the
+  reconciler, and then handed the multiplexer a fresh empty one, so
+  `scope_is_parked` answered `false` unconditionally and the terminal tombstone
+  had never fired in a real engine). What did not land is a test that bites it.
+  `tests/push_reconcile_throttle.rs` cannot: it constructs the map itself and
+  inserts the tombstone, so it pins the reconciler's READING logic - the copy -
+  rather than whether the map it reads is the one the poll scan writes. Neither
+  the slot nor the engine retains a handle, so there is no cheap structural
+  assertion either.
+  The test that would bite is end-to-end: attach an account, drive one scope's
+  poll loop to a TERMINAL verdict so it parks a tombstone, then deliver a push
+  hint naming that scope and assert no drive occurs. That needs a stub emitting
+  a terminal `AccountError` on `changes_stream` plus a way to inject a hint into
+  the reconciler spawned inside `attach`, neither of which exists in the harness
+  today. Until it does, the fix is verified by reading rather than by the suite.
 
 - **The push reconciler cannot release a stalled drive on SCOPE cancellation.**
   Found 2026-09-15 by the cold review of the poll-arm work, and filed rather than
@@ -387,14 +450,28 @@ any item; some may already be obsolete.
   Note that F4's mechanism threading landed through that same choke point on
   2026-09-15, so the plumbing a phase would ride is already there.
 
-- **imap: `is_rev2` is restated in two places.** Found 2026-09-15.
-  `driver/mod.rs::is_rev2(&ProtocolState)` and
-  `connection/auth.rs::is_rev2_from_snapshot(&ConnectionStateSnapshot)` both
-  implement the RFC 9051 dual-mode rule, over different inputs, with no
-  cross-reference between them. The snapshot is DERIVED from the state, so this
-  is a genuine live restatement rather than two views of one rule, and it is the
-  real drift risk in the neighbourhood the now-deleted stale "Mirrors" comments
-  were vaguely gesturing at. Unifying is a small refactor, not a comment fix.
+- **imap: the rev2-IMPLIED-capability list is the next instance of the same
+  drift.** The dual-mode ACTIVE rule was unified on 2026-09-15 (it had five
+  copies, not the two filed; `types/profile.rs::imap4rev2_active` is now the
+  single authority and the four views delegate). This is the adjacent question -
+  "given active rev2, which extension capabilities are part of the rev2
+  baseline?" - and it is a strictly larger surface: the list is enumerated
+  centrally TWICE, in `ServerProfile::rev2_implies` and
+  `EncodeOptions::rev2_implies`, which are byte-identical today, and then
+  re-derived ad hoc at roughly 15 connection-handle sites as
+  `snap.capabilities.contains(&X) || is_rev2_from_snapshot(&snap)`. An audit
+  found NO live mismatch - every gate that should carry the `|| is_rev2` clause
+  does, and every capability correctly absent from the rev2 base set lacks it -
+  but the invariant is maintained by hand at 15 sites with nothing checking it,
+  so adding a capability to the two central lists silently fails to reach any
+  handle gate.
+  Deliberately NOT folded into the active-rule unification, because it has a
+  different correctness argument: it moves a policy boundary spanning encoder
+  command admission, handle-side validation, account-facing
+  `ServerProfile::supports`, special cases like QRESYNC implying CONDSTORE, and
+  extensions that are advertised but not rev2-implied. It wants its own
+  authority (a shared `supports(capabilities, enabled, capability)`) and a
+  capability-by-capability test matrix, not a fold.
 
 - **imap: `UnavailableOnLiveSnapshot` is unreachable by construction.** The
   rung-fall-through that records it landed 2026-09-15 and is correct and
@@ -1008,24 +1085,88 @@ wave; these are what was left. Verify before working any of them.
   consumer chose the cap, so this is not a defect - but if that ever needs a
   ceiling it is a separate ruling and should not be folded into the refund.
 
-- **imap: a pipelined consumer's buffered untagged responses are destroyed by
-  its own command's failure.** Found 2026-09-15 by the cold review of the
-  continuation-wait routing fix, and FILED rather than fixed there because it is
-  a pre-existing defect of the consumer contract, not a consequence of that
-  change. `TaggedOkConsumer::finalize` calls `require_ok()?` BEFORE returning its
-  buffered events, so every untagged response it accumulated is dropped when the
-  command fails. `NotifySetConsumer` is the existing counter-example that avoids
-  it, by carrying its command error INSIDE `Finalized.output` so it can still
-  return its events. Reachable from the step 4 response loop today; the reviewer's
-  transcript is a pipelined `DELETE` plus a `RENAME` carrying a synchronizing
-  literal, where a `* 12 EXISTS` classified `Either` reaches the DELETE consumer
-  and is then destroyed by the DELETE's `NO`. Note the read-time router did make
-  it reachable at additional wire positions - responses read during a literal
-  negotiation now route to consumers where they previously became events - so
-  this is more reachable than before, not merely more visible. The fix is a
-  ruling about the consumer contract: whether a failing consumer must still
-  surrender its buffered events, and if so whether that is `Finalized.output`
-  everywhere or a change to `finalize_erased`'s signature.
+- **imap: a failing command destroys the untagged responses its consumer
+  buffered.** [C1 live defect, and far bigger than first filed] Audited across
+  the whole dispatch layer 2026-09-15. `Consumer::finalize` implementations call
+  `tagged.require_ok()?` BEFORE constructing their `Finalized`, so the `?` drops
+  the consumer and the `Vec<UntaggedResponse>` it holds. **24 of 32 consumers do
+  this**; the 8 that do not carry the command error INSIDE `Finalized.output`
+  instead (NotifySetConsumer, SelectConsumer, the three List consumers, the
+  three Search consumers).
+
+  NOT cosmetic. Everything in those buffers was classified `Either`, and
+  `ProtocolState` has NO handling for Exists, Expunge or Vanished - the typed
+  event stream is their only carrier. Downstream they drive `clear_modseqs` and
+  cursor-scope invalidation in the account push path, so a dropped EXPUNGE or
+  VANISHED leaves a per-folder modseq cache entry that is never cleared.
+  ExpungeConsumer and MoveConsumer are sharpest: a tagged NO after the server
+  already emitted `* 3 EXPUNGE` destroys evidence of a mutation the server
+  actually performed. The read-time routing that landed 2026-09-15 made this
+  reachable at MORE wire positions, since responses read during a literal
+  negotiation now reach consumers where they previously became events.
+
+  THE OBVIOUS FIX IS INSUFFICIENT, AND SO IS THE CLEVER ONE. Converting all 24
+  to `Output = Result<T, Error>` fixes today's instances and leaves the trap
+  armed: `require_ok()?` is the obvious thing to write and nothing would complain
+  for consumer #33. Moving the `Either` buffer out of the consumers and into the
+  dispatcher that classified it was sparred and BROKEN by a counterexample.
+  `MoveConsumer` CLAIMS its `Either` EXPUNGE/VANISHED into its typed
+  `MoveResult`, so under a "the consumer hands back what it did not claim"
+  contract the dispatcher forgets it and the tagged NO loses it exactly as
+  today. Ownership cannot be "claimed means forgotten".
+
+  THE DESIGN THAT SURVIVED, for whoever builds it. The dispatcher ESCROWS an
+  `Either` response until its disposition is final, the consumer choosing among
+  `Event`, `ConsumeRegardless`, and - the load-bearing one - `ConsumeOnSuccess`:
+  discarded as solicited on tagged OK, emitted as an event on tagged NO/BAD or
+  on a finalization error. Escrow is per command index, beside the existing
+  `tags` / `kinds` / `targets` / `consumers` / `results` tables in
+  `run_pipeline_batch`, and in the command frame for single dispatch. It must be
+  flushed on BOTH result branches of `route_pipeline_response` - today the
+  `Err(e)` arm only writes into `results[idx]`, which is exactly where the new
+  invariant goes. A response no consumer claims keeps being emitted immediately;
+  it has no command completion to defer against.
+  `Finalized.reclassified_as_events` survives for genuinely delayed consumer
+  judgements: SELECT's `[CLOSED]` temporal partition and the NOTIFY-marked LIST
+  lane, both of which are about `OnlySolicited` data rather than the `Either`
+  buffer and are therefore orthogonal to the escrow.
+
+  THREE SUB-RULINGS IT DEPENDS ON, each separable:
+  (a) `SearchConsumer::drain_all_into_buffered()` on tagged failure is WRONG and
+  should drop its solicited SEARCH/ESEARCH results instead. LIST's
+  drop-on-failure is right and Search's re-emit is not, and the crate's own
+  classifier settles it: SEARCH/ESEARCH are `OnlySolicited` inside a search
+  command and `Impossible` outside one, so a tagged NO cannot retroactively turn
+  partial SEARCH output into an unsolicited notification. The two consumers
+  answer one question opposite ways today.
+  (b) `ExpungeConsumer` needs an explicit failure rule. Its EXPUNGE responses
+  are classified `OnlySolicited`, not `Either`, so an escrow limited to `Either`
+  cannot preserve them - and a failed EXPUNGE may still have expunged something.
+  (c) `StatusConsumer` deliberately drops its generic `Either` buffer on
+  failure, reasoning that potentially-solicited STATUS must not leak. Its
+  MATCHING status responses live in a separate `matching` field, so the generic
+  buffer does not contain them and the reasoning does not apply to it. Escrow
+  changes that behaviour, correctly.
+
+  THE EXISTING TESTS PIN THE BUG. `fetch_consumer_propagates_terminal_no_after_
+  data`, `streaming_fetch_consumer_propagates_terminal_no_and_closes_channel`
+  and `expunge_consumer_propagates_terminal_bad_after_data` all assert the outer
+  `Err` that has to go away, and none supplies a buffered `Either` response
+  first, so none observes the buffer at all. What they are reaching for is real
+  - a tagged NO must fail the command even after partial data, and the streaming
+  channel must still close - but that `Consumer::finalize` returns an outer
+  `Err` is internal plumbing, not the contract. Replacements belong at the
+  driver boundary and must assert BOTH halves together: the command result is
+  `Err`, AND an `Either` response received before the failure is emitted exactly
+  once.
+
+  Two smaller things from the same audit. `LogoutConsumer` has a SECOND discard
+  site, a missing-BYE `Err` ahead of `require_ok`, easy to miss in a mechanical
+  conversion. And `StoreConsumer` is inconsistent with itself: it treats
+  `NO [MODIFIED]` as partial success and keeps its buffer, but a `BAD` on the
+  same conditional command destroys both `fetches` and `buffered` - if the
+  per-UID evidence is worth special-casing for `NO`, the implicit FETCHes on the
+  way to a `BAD` are the same evidence.
 
 - **imap: `emit_untagged_response_code_events` and `has_critical_response_code`
   are complements maintained by hand.** Both handle exactly `Alert` and

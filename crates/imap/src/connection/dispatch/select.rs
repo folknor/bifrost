@@ -2,9 +2,7 @@ use crate::connection::NotifyFlags;
 use crate::connection::helpers::inbox_eq;
 use crate::error::Error;
 use crate::types::SelectedMailbox;
-use crate::types::response::{
-    Capability, ResponseCode, StatusKind, TaggedResponse, UntaggedResponse,
-};
+use crate::types::response::{ResponseCode, StatusKind, TaggedResponse, UntaggedResponse};
 
 use super::super::{
     build_selected_mailbox, is_notify_list_event, selected_mailbox_effective_responses,
@@ -229,18 +227,11 @@ fn validate_select_responses(
     is_examine: bool,
     ctx: &ConsumerContext,
 ) -> Result<(), Error> {
-    let is_rev2 = {
-        let has_rev2 = ctx.capabilities().contains(&Capability::Imap4Rev2);
-        let has_rev1 = ctx.capabilities().contains(&Capability::Imap4Rev1);
-        if has_rev2 && has_rev1 {
-            // RFC 9051 Section6.3.1: dual-mode requires ENABLE IMAP4REV2.
-            ctx.enabled()
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case("IMAP4REV2"))
-        } else {
-            has_rev2
-        }
-    };
+    // RFC 9051 Section6.3.1, via the single authority in
+    // `crate::types::profile`. This decides whether a SELECT must carry a
+    // RECENT (rev1) or a matching LIST (rev2), so an inlined copy that drifted
+    // would reject every SELECT against a conforming server.
+    let is_rev2 = crate::types::profile::imap4rev2_active(ctx.capabilities(), ctx.enabled());
 
     let command_name = if is_examine { "EXAMINE" } else { "SELECT" };
     let section = match (is_rev2, is_examine) {

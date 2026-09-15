@@ -457,7 +457,13 @@ impl SyncEngine {
             control: control.clone(),
             shutdown: multiplexer_cancel.clone(),
             reopen_tx: reopen_tx.clone(),
-            scope_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            // The SAME map the reconciler got above, not a fresh one. A private
+            // map here silently un-wires the terminal tombstone: the poll scan
+            // would write parks nobody reads and the reconciler would read a
+            // map nothing writes, so `scope_is_parked` answered `false`
+            // unconditionally and a push hint re-drove a scope whose poll loop
+            // had permanently retired.
+            scope_tokens: Arc::clone(&scope_tokens),
             throttles: Arc::clone(&throttles),
             scheduler: self.scheduler.clone(),
         };

@@ -1146,22 +1146,20 @@ fn offered_authentication(
 /// Check if `IMAP4rev2` behavior is active from a
 /// [`ConnectionStateSnapshot`](driver::ConnectionStateSnapshot).
 ///
-/// This is the rule, not a copy of it: `ImapConnection::is_rev2` borrows the
-/// snapshot and delegates here. Taking the snapshot as an argument is what lets
-/// a caller that already holds the borrow ask the question (RFC 9051
-/// Section6.3.1).
+/// The snapshot-side view of the rule, delegating to the single authority in
+/// `crate::types::profile` (RFC 9051 Section6.3.1). Taking the snapshot as an
+/// argument is what lets a caller that already holds the borrow ask the
+/// question; `ImapConnection::is_rev2` borrows and delegates here.
+///
+/// Answers about a SNAPSHOT, which the driver republishes only when a command
+/// completes, so under concurrent handles it can be older than the live
+/// protocol state. Safe for the gates on this side, which only ever refuse an
+/// operation the driver would now accept or pick a legacy path that stays valid
+/// under either revision. It is NOT safe for a caller that encodes bytes from
+/// the snapshot and hands them over prebuilt, because the driver sends those
+/// without re-encoding against live state.
 pub(super) fn is_rev2_from_snapshot(snap: &driver::ConnectionStateSnapshot) -> bool {
-    let has_rev2 = snap.capabilities.contains(&Capability::Imap4Rev2);
-    let has_rev1 = snap.capabilities.contains(&Capability::Imap4Rev1);
-    if has_rev2 && has_rev1 {
-        // Dual-mode server: rev2 requires explicit ENABLE
-        // (RFC 9051 Section 6.3.1).
-        snap.enabled
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("IMAP4rev2"))
-    } else {
-        has_rev2
-    }
+    crate::types::profile::imap4rev2_active(&snap.capabilities, &snap.enabled)
 }
 
 /// Channel-binding policy for a peer certificate, split out from the live

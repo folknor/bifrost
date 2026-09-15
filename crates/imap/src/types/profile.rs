@@ -194,7 +194,27 @@ impl ServerProfile {
     }
 }
 
-fn imap4rev2_active(capabilities: &[Capability], enabled: &[String]) -> bool {
+/// Whether IMAP4rev2 behaviour is active: the single authority for the RFC 9051
+/// Section6.3.1 dual-mode rule.
+///
+/// A server advertising BOTH revisions has not committed to either until the
+/// client says which it wants, so rev2 behaviour there requires an explicit
+/// `ENABLE IMAP4rev2`. A server advertising only rev2 is in rev2 from the start.
+///
+/// This lives here, over a slice pair, rather than on any one of the state
+/// types that hold those slices, because the rule's real input is exactly
+/// `(capabilities, enabled)` and four different views own that pair -
+/// `ProtocolState`, `ConnectionStateSnapshot`, `EncodeOptions` and
+/// `ServerProfile`. It used to be written out five times over those four views,
+/// and the two copies that had tests were not the three that decide wire bytes
+/// (modified UTF-7 versus raw UTF-8, synchronizing versus non-synchronizing
+/// literals) and SELECT validation.
+///
+/// CALL IT THROUGH A TYPED WRAPPER unless you are adapting one coherent owner.
+/// The slice pair is deliberately low-level and nothing stops a caller pairing
+/// one view's capabilities with another view's enabled list; the wrappers exist
+/// so that ordinary call sites cannot.
+pub(crate) fn imap4rev2_active(capabilities: &[Capability], enabled: &[String]) -> bool {
     let has_rev2 = capabilities.contains(&Capability::Imap4Rev2);
     let has_rev1 = capabilities.contains(&Capability::Imap4Rev1);
     if has_rev2 && has_rev1 {
