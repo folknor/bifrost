@@ -369,19 +369,20 @@ fn problem_details_from_every_body_bearing_transport_error() {
 /// transmission evidence belong to bifrost-net, so its body is not
 /// lifted into a status-derived problem guess.
 ///
-/// Gated on `sync` only because that is what pulls in the optional
-/// `bifrost-types` dependency this test needs to NAME `TransmissionState`;
-/// bifrost-net depends on it unconditionally, so the behaviour under test is
-/// present in every configuration and it is the spelling that is unavailable.
-/// bifrost-net does not re-export the type, which is what would let this run
-/// everywhere.
-#[cfg(feature = "sync")]
+/// Runs in EVERY configuration, which took a one-line change in bifrost-net to
+/// become true. This used to be gated on `sync`, not because the behaviour
+/// varied - bifrost-net depends on bifrost-types unconditionally, so it is
+/// identical in every build - but because `sync` was what pulled in the
+/// optional dependency needed to SPELL `TransmissionState`. A test whose
+/// coverage depends on which features a sibling happens to enable is a
+/// feature-graph accident; bifrost-net now re-exports the type that its own
+/// `Error::AuthLost` carries, so the spelling is always available.
 #[test]
 fn auth_lost_stays_a_transport_error() {
     use crate::core::transport::TransportError;
 
     let error: Error = TransportError::from_net(bifrost_net::Error::AuthLost {
-        transmission_state: Some(bifrost_types::TransmissionState::Acknowledged),
+        transmission_state: Some(bifrost_net::TransmissionState::Acknowledged),
         final_response: Some(bifrost_net::FinalResponse {
             status: reqwest::StatusCode::UNAUTHORIZED,
             headers: reqwest::header::HeaderMap::new(),

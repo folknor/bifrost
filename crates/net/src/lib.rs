@@ -48,7 +48,15 @@ pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 // in bifrost-types so the engine, the protocol crates, and this
 // crate all speak the same language. Re-exported here for ergonomic
 // imports from downstream code.
-pub use bifrost_types::{AccountFuture, AccountId, ByteRange, Priority};
+//
+// `TransmissionState` is here for a sharper reason than ergonomics: it is
+// part of THIS crate's published error surface - `Error::AuthLost` carries
+// one - so a consumer that can name the error must be able to name its field
+// without taking a bifrost-types dependency of its own. A crate for which
+// bifrost-types is optional could otherwise construct the error only in the
+// configurations where some other feature happened to pull the spelling in,
+// which is a feature-graph accident rather than a contract.
+pub use bifrost_types::{AccountFuture, AccountId, ByteRange, Priority, TransmissionState};
 pub use config::{DEFAULT_MAX_BUFFERED_RESPONSE, NetConfig};
 pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, STATUS_BODY_CAP};
 pub use http::Method;

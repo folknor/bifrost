@@ -78,6 +78,31 @@ asked for; that review debt is listed under their crates below.
   close phases by the per-phase budgets. If it is wanted, the restaged test must
   keep the `Drop`-instant probe.
 
+- **imap: a dropped `changes_stream` can spend the QRESYNC one-shot warning
+  without delivering it.** Found 2026-09-15 while auditing the six
+  `changes_stream` implementations against the drop-tolerance requirement the
+  poll arms added to `Account::changes_stream`. `run_changes` calls
+  `take_qresync_negotiation_warning()` near the top, which `swap`s a
+  `qresync_negotiation_warning_sent` flag and so is spent for the life of the
+  account. IMAP's stream is channel-backed by a SPAWNED task, so dropping the
+  stream does not cancel that task - it runs on until a send fails - and a
+  warning already taken is then dropped on the floor with the channel. The
+  engine now drops pending streams on every pause, not only at teardown, so this
+  is more reachable than it was, though it was already reachable via detach
+  aborts.
+  Bounded, and worth stating precisely rather than as "the warning is lost": the
+  NON-consuming `qresync_negotiation_reason()` survives, so every later
+  per-folder QRESYNC->CONDSTORE downgrade still carries the specific reason
+  string. What can be lost is the standalone ACCOUNT-level warning, exactly once.
+  The fix is a ruling about where a one-shot lives: taking it only at the moment
+  it is successfully sent, or making the flag a compare-and-set that a failed
+  send rolls back, or dropping the one-shot in favour of the non-consuming read
+  everywhere. Note the same audit found the other five implementations have no
+  such state - graph and jmap are `async_stream` generators, caldav and carddav
+  are `stream::once` over an `Arc` client, and google already has a
+  `changes_stream_cancellable` - so imap is the only one of the six with a
+  drop-sensitive one-shot.
+
 - **The push reconciler cannot release a stalled drive on SCOPE cancellation.**
   Found 2026-09-15 by the cold review of the poll-arm work, and filed rather than
   fixed because closing it needs a token the reconciler does not have. The poll
