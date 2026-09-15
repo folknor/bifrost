@@ -63,6 +63,90 @@ async fn account() -> Arc<GoogleAccount> {
         .expect("the scripted profile opens the account")
 }
 
+/// A send naming a shared mailbox this account cannot hold.
+///
+/// Unknownness comes from the value being absent from the fixture's routing
+/// table, not from the string being degenerate: `MailboxId` has no syntax
+/// validator, so an empty or malformed id would invite a future validation
+/// layer to reject it for an unrelated reason and quietly stop testing the
+/// routing lookup. Everything else stays default - `scheduled: None`
+/// especially, since a scheduled send is refused before the routing question.
+fn send_as_request() -> SendRequest {
+    let mut request = SendRequest::default();
+    request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+        "contract-unknown-mailbox".to_string(),
+    )));
+    request
+}
+
+/// Assert the `send_as` REQUEST-FIELD contract, whichever branch of the
+/// capability flag this account is on.
+///
+/// Every other macro in this file drives a gated METHOD and can only assert the
+/// false direction, because a true flag means the method reaches the network.
+/// `send_as` gates a request FIELD, so this file used to miss it entirely - it
+/// always passes `send_as: None`. It is also the contract with two answers
+/// rather than one, stated on `SendRequest::send_as`: `send_as == false` means
+/// the feature is absent, so `Unsupported(Send)`; `send_as == true` means it is
+/// present, so an unheld mailbox id is a bad ARGUMENT and gets
+/// `Request(Malformed)` with a `send_as.mailbox` field pointer for a UI.
+///
+/// The true direction needs no network seam, because the behaviour under test
+/// IS a local refusal - the guard or the routing lookup answers before anything
+/// touches a transport. That is what makes this different from asserting that a
+/// supported method SUCCEEDS, which this file cannot do.
+///
+/// The expected kind is DERIVED from the crate's own flag rather than written
+/// down, which is the whole point: a backend whose flag and behaviour drift
+/// apart fails here instead of agreeing with a local copy of the rule forever.
+/// It caught two live violations the day it was written - graph and jmap both
+/// answered `Request(Malformed)` while advertising `send_as == false`.
+///
+/// The `send_message` precondition is load-bearing, not defensive. Where the
+/// entry-point gate refuses first, this would pass against a `send_as`
+/// implementation that had been deleted outright - a test agreeing with a gate
+/// it is not testing. caldav and carddav are in exactly that position and
+/// deliberately do not call it.
+macro_rules! refuses_field {
+    ($caps:expr, $call:expr) => {
+        assert!(
+            $caps.pim_methods.send_message,
+            "refuses_field! asserts nothing where the send_message gate answers \
+             first; omit it in that crate rather than letting it pass for the \
+             wrong reason"
+        );
+        let error = $call
+            .await
+            .expect_err("a send_as naming a mailbox this account cannot hold must be refused");
+        if $caps.pim_methods.send_as {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+                "pim_methods.send_as is true, so the feature is present and an \
+                 unheld mailbox is a bad argument, not a missing capability",
+            );
+            assert!(
+                matches!(
+                    error.chain().outermost(),
+                    bifrost_types::Cause::Request(
+                        bifrost_types::RequestCause::InvalidArgument { field, .. },
+                    ) if field.as_deref() == Some("send_as.mailbox"),
+                ),
+                "the rejection must carry the send_as.mailbox field pointer a \
+                 consumer highlights; got {:?}",
+                error.chain().outermost(),
+            );
+        } else {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Unsupported(AccountOperation::Send),
+                "pim_methods.send_as is false, so the feature is absent and the \
+                 only honest answer is Unsupported(Send)",
+            );
+        }
+    };
+}
+
 fn target() -> MutationTarget {
     MutationTarget::Message(ObjectId("m1".to_string()))
 }
@@ -270,6 +354,7 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
         AccountOperation::Send,
         account.send_message(SendRequest::default())
     );
+    refuses_field!(caps, account.send_message(send_as_request()));
     refuses!(
         caps,
         attachment_upload,

@@ -74,6 +74,28 @@ const SESSION: &str = r#"{
 }"#;
 
 fn account() -> JmapAccount {
+    account_with(false, None)
+}
+
+/// The same account with primary submission, and optionally one seeded foreign
+/// account that advertises submission.
+///
+/// Both knobs exist for the `send_as` request-field contract and nothing else.
+/// `submission` decides `pim_methods.send_message`, which has to be true or the
+/// entry-point gate answers before any `send_as` logic runs and the assertion
+/// would agree with a gate it is not testing. The foreign account decides
+/// `pim_methods.send_as`, which is the flag that selects between the two
+/// rejection classes, so a fixture without one can only ever exercise half the
+/// contract.
+///
+/// No transport is scripted for either: an id absent from `foreign_mail` is
+/// refused by `route_send_as` before a `MailAccount` is selected, so reaching
+/// the wire at all would be the failure.
+fn account_with_submission(foreign_submission_id: Option<&str>) -> JmapAccount {
+    account_with(true, foreign_submission_id)
+}
+
+fn account_with(submission_available: bool, foreign_submission_id: Option<&str>) -> JmapAccount {
     let session: Session = serde_json::from_str(SESSION).expect("session fixture parses");
     let transport = ReqwestTransport::new(
         reqwest::header::HeaderMap::new(),
@@ -89,9 +111,9 @@ fn account() -> JmapAccount {
     let mail = crate::account::Account::new(client.clone(), "acct-1");
 
     let support = PimSupport {
-        submission: false,
+        submission: submission_available,
         max_delayed_send: 0,
-        foreign_submission: false,
+        foreign_submission: foreign_submission_id.is_some(),
         vacation: false,
         quota: false,
         sieve: false,
@@ -114,12 +136,29 @@ fn account() -> JmapAccount {
         )),
     );
 
+    let foreign_mail: HashMap<String, crate::account::Account<ReqwestTransport>> =
+        foreign_submission_id
+            .map(|id| {
+                (
+                    id.to_string(),
+                    crate::account::Account::new(client.clone(), id),
+                )
+            })
+            .into_iter()
+            .collect();
+    let foreign_submission: HashSet<String> = foreign_submission_id
+        .map(ToString::to_string)
+        .into_iter()
+        .collect();
+    let submission =
+        submission_available.then(|| crate::account::Account::new(client.clone(), "acct-1"));
+
     JmapAccount::new(
         client,
         mail,
-        HashMap::new(),
-        HashSet::new(),
-        None,
+        foreign_mail,
+        foreign_submission,
+        submission,
         0,
         None,
         None,
@@ -137,6 +176,87 @@ fn account() -> JmapAccount {
         HashMap::new(),
         HashMap::new(),
     )
+}
+
+/// A send naming a foreign account this fixture cannot hold.
+///
+/// Unknownness comes from the value being absent from the fixture's routing
+/// table, not from the string being degenerate: `MailboxId` has no syntax
+/// validator, so an empty or malformed id would invite a future validation
+/// layer to reject it for an unrelated reason and quietly stop testing the
+/// routing lookup. `scheduled` stays `None` especially, since a scheduled
+/// foreign send is refused before the routing question is reached.
+fn send_as_request() -> SendRequest {
+    let mut request = SendRequest::default();
+    request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+        "contract-unknown-mailbox".to_string(),
+    )));
+    request
+}
+
+/// Assert the `send_as` REQUEST-FIELD contract, whichever branch of the
+/// capability flag this account is on.
+///
+/// Every other macro in this file drives a gated METHOD and can only assert the
+/// false direction, because a true flag means the method reaches the network.
+/// `send_as` gates a request FIELD, so this file used to miss it entirely - it
+/// always passes `send_as: None`. It is also the contract with two answers
+/// rather than one, stated on `SendRequest::send_as`: `send_as == false` means
+/// the feature is absent, so `Unsupported(Send)`; `send_as == true` means it is
+/// present, so an unheld mailbox id is a bad ARGUMENT and gets
+/// `Request(Malformed)` with a `send_as.mailbox` field pointer for a UI.
+///
+/// The true direction needs no network seam, because the behaviour under test
+/// IS a local refusal: `route_send_as` runs before a foreign `MailAccount` is
+/// selected. That matters more here than elsewhere, because this crate's
+/// `MailAccount = Account<ReqwestTransport>` alias means no scripted seam
+/// exists at the `Account` level at all.
+///
+/// The expected kind is DERIVED from the crate's own flag rather than written
+/// down, which is the whole point: a backend whose flag and behaviour drift
+/// apart fails here instead of agreeing with a local copy of the rule forever.
+/// It caught a live violation the day it was written - `route_send_as` did not
+/// consult the capability at all, so an account advertising `send_as == false`
+/// still answered `Request(Malformed)`, telling a consumer to correct an
+/// argument when no argument could have worked.
+macro_rules! refuses_field {
+    ($caps:expr, $call:expr) => {
+        assert!(
+            $caps.pim_methods.send_message,
+            "refuses_field! asserts nothing where the send_message gate answers \
+             first; omit it in that crate rather than letting it pass for the \
+             wrong reason"
+        );
+        let error = $call
+            .await
+            .expect_err("a send_as naming a mailbox this account cannot hold must be refused");
+        if $caps.pim_methods.send_as {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+                "pim_methods.send_as is true, so the feature is present and an \
+                 unheld mailbox is a bad argument, not a missing capability",
+            );
+            assert!(
+                matches!(
+                    error.chain().outermost(),
+                    bifrost_types::Cause::Request(
+                        bifrost_types::RequestCause::InvalidArgument { field, .. },
+                    ) if field.as_deref() == Some("send_as.mailbox"),
+                ),
+                "the rejection must carry the send_as.mailbox field pointer a \
+                 consumer highlights; got {:?}",
+                error.chain().outermost(),
+            );
+        } else {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Unsupported(AccountOperation::Send),
+                "pim_methods.send_as is false, so the feature is absent and the \
+                 only honest answer is Unsupported(Send)",
+            );
+        }
+    };
 }
 
 fn target() -> MutationTarget {
@@ -346,6 +466,28 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
         AccountOperation::Send,
         account.send_message(SendRequest::default())
     );
+    // Both branches of the send_as field contract. The bare fixture cannot
+    // reach either - its `send_message` is false, so the entry gate answers
+    // first - hence two purpose-built accounts rather than a conditional on
+    // whatever shape this one happens to be in.
+    {
+        let no_foreign = account_with_submission(None);
+        let no_foreign_caps = no_foreign.capabilities();
+        assert!(
+            !no_foreign_caps.pim_methods.send_as,
+            "no seeded foreign submission account means the feature is absent"
+        );
+        refuses_field!(no_foreign_caps, no_foreign.send_message(send_as_request()));
+
+        let foreign = account_with_submission(Some("contract-known-mailbox"));
+        let foreign_caps = foreign.capabilities();
+        assert!(
+            foreign_caps.pim_methods.send_as,
+            "one seeded submission-capable foreign account makes the feature \
+             present; without that this asserts the same branch twice"
+        );
+        refuses_field!(foreign_caps, foreign.send_message(send_as_request()));
+    }
     refuses!(
         caps,
         attachment_upload,

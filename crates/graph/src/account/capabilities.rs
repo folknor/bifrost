@@ -14,9 +14,18 @@ use super::PushMode;
 /// `shared_clients` map, not a static property of the provider. Graph CAN
 /// route a send-as, but only through a mailbox it holds a `/users/{id}`
 /// client for, and that map is seeded from configuration (plus, optionally,
-/// delegate Autodiscover). An account with no shared mailboxes can satisfy
-/// no `send_as` request at all, so advertising the flag there would promise
-/// a path on which every request is a guaranteed `Request(Malformed)`.
+/// delegate Autodiscover). An account with no shared mailboxes can satisfy no
+/// `send_as` request at all, so the feature is absent and the flag is false.
+///
+/// The send path reads the SAME emptiness to pick its rejection, which is what
+/// keeps the flag and the behaviour from drifting apart: empty map answers
+/// `Unsupported(Send)` (the feature is absent), non-empty map answers
+/// `Request(Malformed)` for an id it does not hold (the feature is present and
+/// the argument is wrong). That split is stated once, on
+/// `SendRequest::send_as`, and this is a reader of it rather than a second
+/// copy. An earlier version of this comment justified the false flag by saying
+/// every request on that path would be `Request(Malformed)` - which described
+/// the bug rather than the contract.
 pub(crate) fn build_capabilities(
     push_mode: PushMode,
     has_shared_mailboxes: bool,

@@ -738,20 +738,28 @@ PUBLISHED SURFACE fence apply.
   brought up to the documented contract rather than the doc hedged down to
   Graph. What remains open here is only types-B1d below.
 
-- **types-B1d. The published `send_as` contract contradicts two of six crates.**
-  [found 2026-09-15] `crates/types/src/compose.rs` states the rejection is
-  `Unsupported(Send)` on both `SendAs` and the field itself, and never mentions
-  `Request(Malformed)` - which is what graph and jmap actually answer. Meanwhile
-  `send_as_guard` is duplicated in structure between imap and google, each with
-  its own local `send_as_rejected_unsupported` test exercising the copy. Textbook
-  standing-lesson shape: the copies agree indefinitely while only the original
-  disagrees, and nothing asks the original. `capability_contract_tests.rs` cannot
-  reach it - its own comment concedes it drives methods, not request fields, and
-  it always passes `send_as: None`. The structural close, additive: a
-  `refuses_field!` arm beside `refuses!` that drives a `Some(send_as)` request
-  and asserts the kind IMPLIED BY THAT CRATE'S OWN `pim_methods.send_as` flag.
-  That tests the rule instead of the copies, is expressible in all six crates
-  today, and would have caught types-B1c automatically.
+- **send_message and send_as cannot both be honest about a JMAP account with
+  foreign submission only.** [found 2026-09-15 by the cold review of the
+  types-B1d work; PUBLISHED SURFACE] `send_message: support.submission` and
+  `send_as: support.foreign_submission` are independent, and
+  `JmapAccount::send_message` takes its send_as branch BEFORE the
+  `self.submission` check. So a session whose primary account lacks Submission
+  while a seeded foreign account has it yields `send_message == false` with
+  `send_as == true`, and a send_as request through it genuinely works - while a
+  consumer respecting `send_message` never offers the operation.
+  The obvious remedy is WRONG and was rejected in the spar: widening to
+  `send_message: support.submission || support.foreign_submission` makes the
+  flag advertise a method that still refuses the ORDINARY request, since the
+  personal path has no fallback to `foreign_mail`. That is the exact
+  false-advertisement `capability_contract_tests.rs` exists to catch, so it
+  trades a gap for a lie. Pinning `assert!(!send_as || send_message)` is also
+  wrong: it asserts an invariant nobody has ruled on, and the state it forbids
+  is one JMAP can legitimately be in.
+  The real question is what `send_message` MEANS - does it gate the whole
+  method, or describe ordinary personal sending? - and that is a published
+  contract question for the owner, not something to settle inside a
+  test-hardening pass. Note it may be answerable with documentation alone; the
+  evidence does not force a struct change.
 
 - **types-B2. `InventoryBatch::checkpoint` cannot express a withheld
   checkpoint.** [C2, PUBLISHED SURFACE] It is `Option<Checkpoint>`, with no way
@@ -961,7 +969,12 @@ wave; these are what was left. Verify before working any of them.
   the man page and the parser both disagree. So a stale upstream help string
   propagated into a binding project document, then into a filed ruling, then
   into a recommendation to the repository owner, with nothing in the loop
-  checking it against the tool. Report the stale help text upstream to brokkr.
+  checking it against the tool.
+  VERIFIED 2026-09-15: the phantom key is GONE from the tool's help - neither
+  the check subcommand's long help nor the `feature-unification` man section
+  mentions `consumer_features` any more, so there is nothing left to report
+  upstream and nobody should re-file it. The story is kept anyway, because it
+  explains a class of error rather than one mistake.
   The reusable lesson: a config-load failure is raised before any phase runs, so
   brokkr validates a config far more cheaply than a build does. Validate a key
   that way before writing it into any document.

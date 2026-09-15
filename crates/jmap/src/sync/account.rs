@@ -789,6 +789,7 @@ impl Account for JmapAccount {
             let id = send_as.mailbox().0.clone();
             if let Err(err) = route_send_as(
                 send_as,
+                !self.foreign_submission.is_empty(),
                 request.scheduled.is_some(),
                 self.foreign_mail.contains_key(&id),
                 self.foreign_submission.contains(&id),
@@ -1425,18 +1426,38 @@ where
 
 /// Pure send-as routing decision. Returns `Ok(())` when the request may be
 /// dispatched to the foreign account named by `send_as`, or the boundary
-/// rejection otherwise. Precedence: scheduled foreign sends are refused
-/// first (their bare submission handles cannot be safely cancelled or
-/// rescheduled through the primary account); an id absent from the seeded
-/// routing table is a malformed request (the consumer got it from foreign
-/// membership ownership); a known-but-not-submission-capable id is
-/// unsupported.
+/// rejection otherwise. Precedence: the feature being absent outright is
+/// answered first; then scheduled foreign sends (their bare submission handles
+/// cannot be safely cancelled or rescheduled through the primary account); then
+/// an id absent from the seeded routing table, which is a malformed request
+/// (the consumer got it from foreign membership ownership); then a
+/// known-but-not-submission-capable id, which is unsupported.
+///
+/// `feature_available` is `pim_methods.send_as`, i.e. whether ANY seeded
+/// foreign account advertises submission. It has to be consulted here because
+/// `SendRequest::send_as` makes the capability flag decide between the two
+/// rejection classes, and without it an account that advertises `send_as ==
+/// false` still answered `Request(Malformed)` - telling a consumer to correct
+/// an argument when no argument would have worked.
+///
+/// This cannot refuse a request that previously routed: anything that reached
+/// `Ok(())` had its id in `foreign_submission`, which makes that set non-empty,
+/// which is exactly the condition that makes `feature_available` true.
 fn route_send_as(
     send_as: &SendAs,
+    feature_available: bool,
     scheduled: bool,
     known: bool,
     submission_capable: bool,
 ) -> Result<(), AccountError> {
+    if !feature_available {
+        return Err(super::error::unsupported_error(
+            AccountOperation::Send,
+            None,
+            "no seeded foreign account advertises submission, \
+             so send-as is unavailable on this account",
+        ));
+    }
     if scheduled {
         return Err(super::error::unsupported_error(
             AccountOperation::Send,
@@ -1657,12 +1678,13 @@ mod tests {
 
     #[test]
     fn route_send_as_known_submission_capable_ok() {
-        assert!(route_send_as(&as_shared(), false, true, true).is_ok());
+        assert!(route_send_as(&as_shared(), true, false, true, true).is_ok());
     }
 
     #[test]
     fn route_send_as_scheduled_is_unsupported() {
-        let err = route_send_as(&as_shared(), true, true, true).expect_err("scheduled rejected");
+        let err =
+            route_send_as(&as_shared(), true, true, true, true).expect_err("scheduled rejected");
         assert!(matches!(
             err.kind(),
             AccountErrorKind::Unsupported(AccountOperation::Send)
@@ -1671,8 +1693,8 @@ mod tests {
 
     #[test]
     fn route_send_as_unknown_account_is_malformed() {
-        let err =
-            route_send_as(&as_shared(), false, false, false).expect_err("unknown id rejected");
+        let err = route_send_as(&as_shared(), true, false, false, false)
+            .expect_err("unknown id rejected");
         assert!(matches!(
             err.kind(),
             AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
@@ -1681,12 +1703,36 @@ mod tests {
 
     #[test]
     fn route_send_as_known_not_submission_capable_is_unsupported() {
-        let err =
-            route_send_as(&as_shared(), false, true, false).expect_err("no submission rejected");
+        let err = route_send_as(&as_shared(), true, false, true, false)
+            .expect_err("no submission rejected");
         assert!(matches!(
             err.kind(),
             AccountErrorKind::Unsupported(AccountOperation::Send)
         ));
+    }
+
+    /// With the feature absent, an unknown id is `Unsupported`, NOT the
+    /// `Malformed` the same inputs produce when it is present.
+    ///
+    /// This is the capability flag selecting the rejection class, which is the
+    /// rule `SendRequest::send_as` states and which this function did not read
+    /// until 2026-09-15: an account advertising `send_as == false` answered
+    /// `Request(Malformed)`, telling a consumer to correct an argument when no
+    /// argument could have worked. The contrast with
+    /// `route_send_as_unknown_account_is_malformed` - identical but for this
+    /// one bool - is the whole assertion.
+    #[test]
+    fn route_send_as_unknown_account_is_unsupported_when_the_feature_is_absent() {
+        let err = route_send_as(&as_shared(), false, false, false, false)
+            .expect_err("send-as is unavailable");
+        assert!(
+            matches!(
+                err.kind(),
+                AccountErrorKind::Unsupported(AccountOperation::Send)
+            ),
+            "got {:?}",
+            err.kind()
+        );
     }
 
     fn cursor(scope: CursorScope) -> ChangeCursor {

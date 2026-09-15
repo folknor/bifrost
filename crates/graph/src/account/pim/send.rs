@@ -34,6 +34,18 @@ pub(crate) async fn send_message(
     // `/users/{id}` client so the draft is owned by the shared mailbox.
     let client = match &request.send_as {
         None => &account.client,
+        // The two answers mean different things and the capability flag picks
+        // between them (`SendRequest::send_as` is the governing statement).
+        // An EMPTY map is `pim_methods.send_as == false`: the feature is
+        // absent on this account, so the honest answer is `Unsupported`, and
+        // telling the caller to correct an argument would send them to fix a
+        // request that no argument could have satisfied. A non-empty map is
+        // the flag being true, so an id that is not in it is a bad argument.
+        Some(_) if account.shared_clients.is_empty() => {
+            return Err(crate::account::graph_error::unsupported_account_error(
+                AccountOperation::Send,
+            ));
+        }
         Some(send_as) => account
             .shared_clients
             .get(&send_as.mailbox().0)

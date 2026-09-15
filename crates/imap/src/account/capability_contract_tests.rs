@@ -91,6 +91,69 @@ async fn account() -> ImapAccount {
     })
 }
 
+/// The same account with an SMTP submission transport configured, which is
+/// what makes `pim_methods.send_message` true.
+///
+/// Needed for one assertion only, and the reason is worth stating because it is
+/// the difference between a test that bites and one that does not. `send_as` is
+/// always false on IMAP, so its documented answer is `Unsupported(Send)` - and
+/// so is the answer the SUBMISSION gate gives when no transport is configured.
+/// Against the bare fixture the assertion therefore holds whether or not
+/// `send_as_guard` exists at all. With a transport present, deleting the guard
+/// lets the send proceed toward SMTP instead, which is not `Unsupported`, so
+/// the assertion is about the guard rather than about the gate behind it.
+///
+/// Hermetic: `SubmissionTransport::build` opens no socket, and the assertion
+/// never gets past the guard.
+async fn account_with_submission() -> ImapAccount {
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    drop(server);
+
+    let config = Arc::new(ImapAccountConfig::new(
+        crate::ImapConfig::plaintext("test.invalid"),
+        Credentials::password("user", "pass"),
+        AuthPolicy::default(),
+    ));
+    let bandwidth_cap = Arc::new(AtomicU64::new(0));
+    let pool = Arc::new(Pool::new(
+        Arc::clone(&config),
+        conn,
+        1,
+        None,
+        Arc::clone(&bandwidth_cap),
+    ));
+    let submission_config = super::SmtpSubmissionConfig::new(
+        "smtp.test.invalid",
+        super::SubmissionTls::Plaintext,
+        bifrost_types::Address::bare("user@test.invalid"),
+    );
+    let submission = Arc::new(
+        super::SubmissionTransport::build(
+            &submission_config,
+            &Credentials::password("user", "pass"),
+            None,
+            Arc::clone(&bandwidth_cap),
+        )
+        .expect("a plaintext relay transport builds without I/O"),
+    );
+    let profile = ServerProfile::new(Vec::new(), Vec::new());
+    ImapAccount::new(ImapAccountParts {
+        config,
+        capabilities: build_capabilities(&profile, &[], false, None, None, true, false),
+        pool,
+        folders: Arc::new(FolderRegistry::default()),
+        qresync_enabled: false,
+        qresync_negotiation_warning: None,
+        supports_notify: false,
+        bandwidth_cap,
+        contacts: None,
+        calendars: None,
+        dav_scopes: Default::default(),
+        submission: Some(submission),
+        dav_degraded: Vec::new(),
+    })
+}
+
 fn target() -> MutationTarget {
     MutationTarget::Message(ObjectId("m1".to_string()))
 }
@@ -150,12 +213,92 @@ fn vacation() -> VacationConfig {
     }
 }
 
+/// A send naming a shared mailbox no account in this workspace holds.
+///
+/// Unknownness comes from the value being absent from every fixture's routing
+/// table, not from the string being degenerate: `MailboxId` has no syntax
+/// validator, so an empty or malformed id would invite a future validation
+/// layer to reject it for an unrelated reason and quietly stop testing the
+/// routing lookup. Everything else stays default - `scheduled: None`
+/// especially, since a scheduled foreign send is refused before the routing
+/// question is even reached.
+fn send_as_request() -> SendRequest {
+    let mut request = SendRequest::default();
+    request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+        "contract-unknown-mailbox".to_string(),
+    )));
+    request
+}
+
 fn assert_unsupported(flag: &str, expected: AccountOperation, error: &AccountError) {
     assert_eq!(
         error.kind(),
         &AccountErrorKind::Unsupported(expected),
         "pim_methods.{flag} is false, so the method must refuse with Unsupported({expected:?})",
     );
+}
+
+/// Assert the `send_as` REQUEST-FIELD contract, whichever branch of the
+/// capability flag this account is on.
+///
+/// Every other macro in this file drives a gated METHOD and can only assert the
+/// false direction, because a true flag means the method reaches the network.
+/// `send_as` gates a request FIELD, so this file used to miss it entirely - it
+/// always passes `send_as: None`. It is also the contract with two answers
+/// rather than one, stated on `SendRequest::send_as`: `send_as == false` means
+/// the feature is absent, so `Unsupported(Send)`; `send_as == true` means it is
+/// present, so an unheld mailbox id is a bad ARGUMENT and gets
+/// `Request(Malformed)` with a `send_as.mailbox` field pointer for a UI to
+/// highlight.
+///
+/// Both directions are assertable here, and the true direction needs no network
+/// seam, because the behaviour under test IS a local refusal: graph resolves
+/// `shared_clients` and jmap runs `route_send_as` before either one touches a
+/// transport. That is what makes this different from asserting that a supported
+/// method SUCCEEDS, which this file cannot do.
+///
+/// The expected kind is derived from the crate's own flag rather than written
+/// down, which is the point: a backend whose flag and behaviour drift apart
+/// fails here instead of agreeing with a local copy of the rule forever. It
+/// caught two live violations the day it was written - graph and jmap both
+/// answered `Request(Malformed)` while advertising `send_as == false`.
+///
+/// Only meaningful where `send_message` itself is available. In a crate that
+/// refuses `send_message` outright, the entry-point gate answers first and this
+/// would pass against a `send_as` implementation that had been deleted.
+macro_rules! refuses_field {
+    ($caps:expr, $call:expr) => {
+        assert!(
+            $caps.pim_methods.send_message,
+            "refuses_field! asserts nothing where the send_message gate answers \
+             first; omit it in that crate rather than letting it pass for the \
+             wrong reason"
+        );
+        let error = $call
+            .await
+            .expect_err("a send_as naming a mailbox this account cannot hold must be refused");
+        if $caps.pim_methods.send_as {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+                "pim_methods.send_as is true, so the feature is present and an \
+                 unheld mailbox is a bad argument, not a missing capability",
+            );
+            assert!(
+                matches!(
+                    error.chain().outermost(),
+                    bifrost_types::Cause::Request(
+                        bifrost_types::RequestCause::InvalidArgument { field, .. },
+                    ) if field.as_deref() == Some("send_as.mailbox"),
+                ),
+                "the rejection must carry the send_as.mailbox field pointer a \
+                 consumer highlights; got {:?}",
+                error.chain().outermost(),
+            );
+        } else {
+            assert_unsupported("send_as", AccountOperation::Send, &error);
+        }
+    };
 }
 
 /// Await a gated future and assert the documented refusal.
@@ -298,6 +441,15 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
         AccountOperation::Send,
         account.send_message(SendRequest::default())
     );
+    // The send_as field contract. IMAP has no mailbox routing table, so only
+    // the false branch exists here - but it needs its own fixture, because
+    // against the bare account the submission gate would answer with the same
+    // kind and the assertion would hold with `send_as_guard` deleted.
+    {
+        let sending = account_with_submission().await;
+        let sending_caps = sending.capabilities();
+        refuses_field!(sending_caps, sending.send_message(send_as_request()));
+    }
     refuses!(
         caps,
         attachment_upload,

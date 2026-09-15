@@ -189,11 +189,15 @@ pub struct SendRequest {
     /// decides which of two answers the consumer gets, and the two mean
     /// different things:
     ///
-    /// - `send_as == false` (imap, google, caldav, carddav): the feature is
-    ///   absent. The backend holds no mailbox routing table, so it has no id
-    ///   to judge the request against and `Unsupported(Send)` is the only
-    ///   honest answer. Remediation is to reconfigure the account, or the
-    ///   provider, so the feature exists.
+    /// - `send_as == false`: the feature is absent, so `Unsupported(Send)` is
+    ///   the only honest answer, and remediation is to reconfigure the account
+    ///   or the provider so the feature exists. Why it is absent differs, and
+    ///   the flag is what unifies them: imap and google hold no mailbox routing
+    ///   table at all; graph holds an EMPTY shared-client map; jmap may hold a
+    ///   populated foreign routing table while no entry in it advertises
+    ///   submission, so it has ids and still has no route. In every case
+    ///   answering `Request(Malformed)` would tell the consumer to correct an
+    ///   argument when no argument could have worked.
     /// - `send_as == true` (graph with at least one shared mailbox
     ///   configured; jmap with a seeded, submission-capable foreign
     ///   account): the feature is present, so naming a mailbox the account
@@ -209,6 +213,12 @@ pub struct SendRequest {
     /// so nothing retries either; the distinction exists to tell the
     /// consumer whether to fix the request or reconfigure the feature.
     /// A `Some(..)` request is never silently downgraded to a personal send.
+    ///
+    /// Every backend that can reach this contract asserts it against its OWN
+    /// flag, in `capability_contract_tests.rs`, so an implementation that
+    /// drifts from this paragraph fails rather than agreeing with a local copy
+    /// of the rule. That test found graph and jmap both answering
+    /// `Request(Malformed)` while advertising `send_as == false`.
     pub send_as: Option<SendAs>,
     /// Request a read receipt (message disposition notification) for this
     /// send. `true` makes each provider ask the recipient's MUA to confirm

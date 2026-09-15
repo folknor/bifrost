@@ -44,6 +44,106 @@ fn account() -> GraphAccount {
     GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions)
 }
 
+/// The same account with ONE shared mailbox configured, which is what makes
+/// `pim_methods.send_as` true.
+///
+/// `send_as` is the only flag in the whole snapshot derived from live account
+/// state rather than from a provider constant, so it is the only one this file
+/// can exercise on BOTH branches - and exercising only the empty-map branch
+/// would leave the richer answer, the one a consumer actually has to handle,
+/// unpinned. The script stays empty: a request naming a mailbox that is not
+/// this one is refused by the routing lookup before any REST call, so reaching
+/// the seam at all would be the failure.
+fn account_with_shared_mailbox() -> GraphAccount {
+    let client = GraphClient::new("token");
+    client.script_rest(std::iter::empty());
+    GraphAccount::new_for_tests_with_shared(
+        client,
+        PushMode::GraphSubscriptions,
+        &["contract-known-mailbox".to_string()],
+    )
+}
+
+/// A send naming a shared mailbox this account cannot hold.
+///
+/// Unknownness comes from the value being absent from the fixture's routing
+/// table, not from the string being degenerate: `MailboxId` has no syntax
+/// validator, so an empty or malformed id would invite a future validation
+/// layer to reject it for an unrelated reason and quietly stop testing the
+/// routing lookup. Everything else stays default - `scheduled: None`
+/// especially, since a scheduled send is refused before the routing question.
+fn send_as_request() -> SendRequest {
+    let mut request = SendRequest::default();
+    request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+        "contract-unknown-mailbox".to_string(),
+    )));
+    request
+}
+
+/// Assert the `send_as` REQUEST-FIELD contract, whichever branch of the
+/// capability flag this account is on.
+///
+/// Every other macro in this file drives a gated METHOD and can only assert the
+/// false direction, because a true flag means the method reaches the network.
+/// `send_as` gates a request FIELD, so this file used to miss it entirely - it
+/// always passes `send_as: None`. It is also the contract with two answers
+/// rather than one, stated on `SendRequest::send_as`: `send_as == false` means
+/// the feature is absent, so `Unsupported(Send)`; `send_as == true` means it is
+/// present, so an unheld mailbox id is a bad ARGUMENT and gets
+/// `Request(Malformed)` with a `send_as.mailbox` field pointer for a UI.
+///
+/// The true direction needs no network seam, because the behaviour under test
+/// IS a local refusal: the `shared_clients` lookup happens before
+/// `create_draft_message`. That is what makes this different from asserting
+/// that a supported method SUCCEEDS, which this file cannot do.
+///
+/// The expected kind is DERIVED from the crate's own flag rather than written
+/// down, which is the whole point: a backend whose flag and behaviour drift
+/// apart fails here instead of agreeing with a local copy of the rule forever.
+/// It caught a live violation the day it was written - this crate answered
+/// `Request(Malformed)` on an empty shared-client map while advertising
+/// `send_as == false`, and `capabilities.rs` justified the flag by describing
+/// that behaviour rather than the contract.
+macro_rules! refuses_field {
+    ($caps:expr, $call:expr) => {
+        assert!(
+            $caps.pim_methods.send_message,
+            "refuses_field! asserts nothing where the send_message gate answers \
+             first; omit it in that crate rather than letting it pass for the \
+             wrong reason"
+        );
+        let error = $call
+            .await
+            .expect_err("a send_as naming a mailbox this account cannot hold must be refused");
+        if $caps.pim_methods.send_as {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+                "pim_methods.send_as is true, so the feature is present and an \
+                 unheld mailbox is a bad argument, not a missing capability",
+            );
+            assert!(
+                matches!(
+                    error.chain().outermost(),
+                    bifrost_types::Cause::Request(
+                        bifrost_types::RequestCause::InvalidArgument { field, .. },
+                    ) if field.as_deref() == Some("send_as.mailbox"),
+                ),
+                "the rejection must carry the send_as.mailbox field pointer a \
+                 consumer highlights; got {:?}",
+                error.chain().outermost(),
+            );
+        } else {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Unsupported(AccountOperation::Send),
+                "pim_methods.send_as is false, so the feature is absent and the \
+                 only honest answer is Unsupported(Send)",
+            );
+        }
+    };
+}
+
 fn target() -> MutationTarget {
     MutationTarget::Message(ObjectId("m1".to_string()))
 }
@@ -251,6 +351,20 @@ async fn every_false_pim_flag_refuses_without_touching_the_wire() {
         AccountOperation::Send,
         account.send_message(SendRequest::default())
     );
+    // Both branches of the send_as field contract. This crate is one of two
+    // that can reach the `true` branch at all, so it drives its own second
+    // fixture rather than only asserting the shape it happens to be in.
+    refuses_field!(caps, account.send_message(send_as_request()));
+    {
+        let shared = account_with_shared_mailbox();
+        let shared_caps = shared.capabilities();
+        assert!(
+            shared_caps.pim_methods.send_as,
+            "one configured shared mailbox must make the feature present; \
+             without that this fixture asserts the same branch twice"
+        );
+        refuses_field!(shared_caps, shared.send_message(send_as_request()));
+    }
     refuses!(
         caps,
         attachment_upload,
