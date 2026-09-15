@@ -1274,30 +1274,36 @@ impl AsyncSmtpConnection {
         credentials: &Credentials,
     ) -> Result<Response, Error> {
         let hash = scram_hash(mechanism).expect("auth_scram only called for SCRAM mechanisms");
+        // Every auth-phase stamp in this exchange names the rung that is
+        // running, derived from the same `Mechanism` that frames the AUTH
+        // command, so the reported name and the wire token cannot disagree.
+        let phase = SmtpCommandPhase::Auth {
+            mechanism: Some(mechanism.name()),
+        };
         let (username, password) = credentials.password_parts()?;
         let mut exchange = ScramExchange::new(hash, binding, username, password.into())?;
 
         let auth = Auth::new(mechanism, credentials.clone(), None)?;
-        let response = try_smtp!(self.command(auth).await, self, SmtpCommandPhase::Auth);
+        let response = try_smtp!(self.command(auth).await, self, phase);
         if !response.has_code(334) {
             self.abort().await;
-            return Err(error::status(response).with_phase(SmtpCommandPhase::Auth));
+            return Err(error::status(response).with_phase(phase));
         }
         let response = try_smtp!(
             self.write_auth_continuation(&exchange.client_first()).await,
             self,
-            SmtpCommandPhase::Auth
+            phase
         );
 
         // A malformed continuation is a protocol-class parse error (not an
         // auth failure), so it is not Auth-phase tagged, but it must still
         // abort the connection like every other error path in this exchange.
         let server_first = try_smtp!(decode_auth_challenge(&response), self);
-        let response = match try_smtp!(exchange.step(&server_first), self, SmtpCommandPhase::Auth) {
+        let response = match try_smtp!(exchange.step(&server_first), self, phase) {
             ScramStep::Reply(client_final) => try_smtp!(
                 self.write_auth_continuation(&client_final).await,
                 self,
-                SmtpCommandPhase::Auth
+                phase
             ),
             ScramStep::Complete => {
                 self.abort().await;
@@ -1316,16 +1322,12 @@ impl AsyncSmtpConnection {
             try_smtp!(
                 Self::verify_scram_server_final(&mut exchange, &server_final),
                 self,
-                SmtpCommandPhase::Auth
+                phase
             );
-            let final_reply = try_smtp!(
-                self.write_auth_continuation("").await,
-                self,
-                SmtpCommandPhase::Auth
-            );
+            let final_reply = try_smtp!(self.write_auth_continuation("").await, self, phase);
             if !final_reply.is_positive() {
                 self.abort().await;
-                return Err(error::status(final_reply).with_phase(SmtpCommandPhase::Auth));
+                return Err(error::status(final_reply).with_phase(phase));
             }
             final_reply
         } else if response.is_positive() {
@@ -1333,12 +1335,12 @@ impl AsyncSmtpConnection {
             try_smtp!(
                 Self::verify_scram_server_final(&mut exchange, &server_final),
                 self,
-                SmtpCommandPhase::Auth
+                phase
             );
             response
         } else {
             self.abort().await;
-            return Err(error::status(response).with_phase(SmtpCommandPhase::Auth));
+            return Err(error::status(response).with_phase(phase));
         };
 
         let hello_name = self.hello_name.clone();
@@ -1374,17 +1376,19 @@ impl AsyncSmtpConnection {
         mechanism: Mechanism,
         credentials: &Credentials,
     ) -> Result<Response, Error> {
+        // Every auth-phase stamp in this exchange names the rung that is
+        // running, derived from the same `Mechanism` that frames the AUTH
+        // command, so the reported name and the wire token cannot disagree.
+        let phase = SmtpCommandPhase::Auth {
+            mechanism: Some(mechanism.name()),
+        };
         // Resolve the OAuth access token from the shared source once, up
         // front, so the same token frames the initial response and any
         // OAUTHBEARER error-continuation round. Awaiting `current()` here
         // is the single rotation read point; a token refreshed on the
         // source is presented on this (re)connect.
         let oauth_token = if matches!(mechanism, Mechanism::Xoauth2 | Mechanism::OAuthBearer) {
-            Some(try_smtp!(
-                credentials.oauth2_token().await,
-                self,
-                SmtpCommandPhase::Auth
-            ))
+            Some(try_smtp!(credentials.oauth2_token().await, self, phase))
         } else {
             None
         };
@@ -1398,7 +1402,7 @@ impl AsyncSmtpConnection {
         // out; it must not be derived from the remaining-challenge budget.
         let mut challenge_index: usize = 0;
         let auth = Auth::new(mechanism, credentials.clone(), oauth_token)?;
-        let mut response = try_smtp!(self.command(auth).await, self, SmtpCommandPhase::Auth);
+        let mut response = try_smtp!(self.command(auth).await, self, phase);
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
@@ -1418,14 +1422,10 @@ impl AsyncSmtpConnection {
                     oauth_token,
                 ),
                 self,
-                SmtpCommandPhase::Auth
+                phase
             );
             challenge_index += 1;
-            response = try_smtp!(
-                self.command(continuation).await,
-                self,
-                SmtpCommandPhase::Auth
-            );
+            response = try_smtp!(self.command(continuation).await, self, phase);
         }
 
         if challenges == 0 {
@@ -1434,8 +1434,7 @@ impl AsyncSmtpConnection {
             // lane (InvalidInput + Auth -> Authorization), not an untagged
             // Protocol(ParseFailed).
             self.abort().await;
-            Err(error::invalid_input("Unexpected number of challenges")
-                .with_phase(SmtpCommandPhase::Auth))
+            Err(error::invalid_input("Unexpected number of challenges").with_phase(phase))
         } else {
             let hello_name = self.hello_name.clone();
             try_smtp!(self.hello(&hello_name).await, self);
@@ -1669,6 +1668,24 @@ impl AsyncSmtpConnection {
         // as good as the ratio between the timeout and one second, so any
         // configured timeout at or below a second failed every capped write
         // after the first.
+        //
+        // The consequence is worth stating where the re-arming happens, because
+        // it is the exact shape the READ side went out of its way to close:
+        // there is NO total bound on a transfer here. A peer that accepts one
+        // byte per (timeout minus epsilon) re-arms this loop forever and keeps
+        // an upload alive indefinitely. The reply reader refuses the same trick
+        // - it collapses the per-operation budget into ONE deadline spanning
+        // the whole reply, so a peer trickling one line per period cannot
+        // stretch it - and the asymmetry is deliberate, not an oversight in
+        // this loop. A reply is a bounded unit (`MAX_RESPONSE_BYTES`), so "one
+        // reply" is expressible as a single deadline; a message body has no
+        // such ceiling, and any total bound picked for it would be a function
+        // of message size and link speed, which is precisely the bound that
+        // failed healthy multi-megabyte uploads on a domestic uplink and made
+        // the re-arming loop necessary. A caller who needs a wall-clock ceiling
+        // on a whole send imposes it above the transport, where the message
+        // size is known. Adding one here is a behaviour change and the
+        // repository owner's call, not this loop's.
         let mut rest = string;
         while !rest.is_empty() {
             Self::drain_outbound_throttle_within(stream, budget).await?;
@@ -1844,6 +1861,7 @@ mod transcript_tests {
         address::Envelope,
         transport::smtp::{
             Protocol,
+            account_error::{SmtpErrorContext, into_account_error},
             authentication::{Credentials, Mechanism},
             batch::SmtpBatchRecipient,
             commands::Noop,
@@ -3085,6 +3103,69 @@ mod transcript_tests {
             "expected the scripted 535, got {error:?}"
         );
         assert!(connection.has_broken());
+        transcript.assert_exhausted();
+    }
+
+    #[tokio::test(crate = "tokio")]
+    async fn a_refused_scram_plus_rung_is_named_in_support_diagnostics() {
+        // The async half of the server-rejection naming, on the rung whose
+        // name an operator most needs: the `-PLUS` suffix distinguishes the
+        // channel-bound rung from the unbound one, and the name is derived
+        // from the same `Mechanism` that framed the AUTH command, so the
+        // reported rung cannot drift from the one on the wire.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(
+                HELLO,
+                "250-smtp.example\r\n250 AUTH SCRAM-SHA-256-PLUS PLAIN\r\n",
+            )
+            .expect(
+                "AUTH SCRAM-SHA-256-PLUS\r\n",
+                "535 5.7.8 credentials rejected\r\n",
+            );
+        let mut connection = AsyncSmtpConnection::from_transcript_with_peer_certificate(
+            transcript.clone(),
+            &hello,
+            Protocol::Smtp,
+            usable_peer_certificate(),
+        )
+        .await
+        .unwrap();
+
+        let error = connection
+            .auth(
+                &[Mechanism::ScramSha256Plus, Mechanism::Plain],
+                &Credentials::password("user".to_owned(), "pass".to_owned()),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.phase(),
+            Some(super::SmtpCommandPhase::Auth {
+                mechanism: Some("SCRAM-SHA-256-PLUS")
+            })
+        );
+        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Smtp));
+        assert!(
+            matches!(
+                account.kind(),
+                bifrost_types::error::AccountErrorKind::Authentication(
+                    bifrost_types::error::AuthErrorKind::ReauthorizationRequired
+                )
+            ),
+            "naming the mechanism must not move the classification: {:?}",
+            account.kind()
+        );
+        let consented = account.support_consented();
+        assert!(
+            consented
+                .support_text
+                .iter()
+                .any(|text| text.contains("mechanism SCRAM-SHA-256-PLUS")),
+            "support text did not name the refused rung: {:?}",
+            consented.support_text
+        );
         transcript.assert_exhausted();
     }
 

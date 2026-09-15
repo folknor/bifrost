@@ -90,17 +90,21 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             diagnostic.as_deref(),
             None,
         ),
-        ErrorKind::InvalidInput if matches!(phase, Some(SmtpCommandPhase::Auth)) => {
+        ErrorKind::InvalidInput if matches!(phase, Some(SmtpCommandPhase::Auth { .. })) => {
             // "No compatible authentication mechanism" and other local AUTH
             // refusals must surface as Authorization(PolicyBlocked) so
             // consumers route to a policy/reauth UX instead of "malformed
             // request" -> ClientBug (internal telemetry).
+            //
+            // A SCRAM `e=` server error arrives here too, and that one does
+            // know its rung, so the support text names it.
+            let detail = name_mechanism(diagnostic.clone(), auth_mechanism(phase));
             build_basic(
                 &ctx,
                 AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
                 Cause::Access(AccessCause::PolicyBlocked),
                 attempt_state,
-                diagnostic.as_deref(),
+                detail.as_deref(),
                 None,
             )
         }
@@ -196,6 +200,43 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
         ErrorKind::Transient(response) | ErrorKind::Permanent(response) => {
             response_to_account_error(response, &ctx, phase, attempt_state)
         }
+    }
+}
+
+/// The SASL rung an auth-phase error was running, if the stamp names one.
+fn auth_mechanism(phase: Option<SmtpCommandPhase>) -> Option<&'static str> {
+    match phase {
+        Some(SmtpCommandPhase::Auth { mechanism }) => mechanism,
+        _ => None,
+    }
+}
+
+/// Fold a mechanism name into the support-only diagnostic text.
+///
+/// The name rides the SUPPORT-ONLY tier (`DiagnosticText::support_only`,
+/// read back through `AccountError::support_consented`), never the telemetry
+/// tier. Not because the token is sensitive - it crosses the wire in clear on
+/// the AUTH line and in the EHLO advertisement - but because the telemetry
+/// tier carries no free-form text at all, and a mechanism name is not one of
+/// the structured discriminants the shared error model declares. It is
+/// deliberately not a new typed field on `AccountError` either.
+///
+/// This closes the asymmetry with the local-policy path, where
+/// `password_mechanism` already spells out what it would not attempt: before
+/// this, a server rejecting a rung (535, or 504 5.5.4) was the one auth
+/// failure that could not say which rung.
+///
+/// Only the mechanism NAME crosses this boundary. The credential and the SASL
+/// client responses stay inside the exchange.
+fn name_mechanism(text: Option<String>, mechanism: Option<&'static str>) -> Option<String> {
+    match (text, mechanism) {
+        (Some(text), Some(mechanism)) if !text.is_empty() => {
+            Some(format!("{text} (mechanism {mechanism})"))
+        }
+        (_, Some(mechanism)) => Some(format!("server refused mechanism {mechanism}")),
+        // Unnamed lane: byte-identical to what it emitted before the name
+        // existed, empty text included.
+        (text, None) => text,
     }
 }
 
@@ -299,9 +340,18 @@ pub(crate) fn response_to_account_error(
         .as_ref()
         .map(|d| d.value.clone())
         .unwrap_or_else(|| status.to_string());
-    let text_first = response.message().next().map(str::to_owned);
+    // On the AUTH lane the support text names the rung the server refused.
+    // The classification itself is untouched by the name: it is read from
+    // the reply code and the enhanced code, exactly as before.
+    let text_first = name_mechanism(
+        response.message().next().map(str::to_owned),
+        auth_mechanism(phase),
+    );
 
     let (kind, primary_cause) = classify_response(response, phase, ctx.protocol);
+    // Decided from the same classification the builder is given, so the
+    // throttle hint below cannot drift away from the kind it describes.
+    let rate_or_quota = kind_is_rate_or_quota(&kind);
 
     let mut builder = AccountErrorBuilder::new(kind, primary_cause)
         .protocol(ctx.protocol)
@@ -318,18 +368,13 @@ pub(crate) fn response_to_account_error(
     }
     // Wire 4xx rate-limit text gets a throttle-scope hint so recovery can
     // surface throttle scope. Default to ThrottleScope::Account.
-    if builder_kind_is_rate_or_quota(response, phase, ctx.protocol) {
+    if rate_or_quota {
         builder = builder.throttle_scope(ThrottleScope::Account);
     }
     finish(builder)
 }
 
-fn builder_kind_is_rate_or_quota(
-    response: &Response,
-    phase: Option<SmtpCommandPhase>,
-    protocol: Protocol,
-) -> bool {
-    let (kind, _) = classify_response(response, phase, protocol);
+fn kind_is_rate_or_quota(kind: &AccountErrorKind) -> bool {
     matches!(
         kind,
         AccountErrorKind::Server(ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted)
@@ -368,6 +413,8 @@ fn classify_enhanced(
 ) -> Option<(AccountErrorKind, Cause)> {
     let class = code.class;
     let is_recipient_lane = matches!(phase, Some(SmtpCommandPhase::RcptTo));
+    let is_auth_lane = matches!(phase, Some(SmtpCommandPhase::Auth { .. }));
+    let status = u16::from(response.code());
     // Class 2 inside an error path is a contract violation: a positive code
     // appeared on a path that already classified as an error. Handle first so
     // it does not fall through to the X.* arms.
@@ -467,6 +514,12 @@ fn classify_enhanced(
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
             Cause::Server(ServerCause::RateLimited { retry_hint: None }),
         )),
+        // RFC 4954 Section 6: `504 5.5.4` on the AUTH lane is "unrecognized
+        // authentication type" - the server refused the MECHANISM, and
+        // nothing about the request was malformed. The same X.5.4 subcode
+        // reached by `501` really is an invalid-argument syntax fault, so the
+        // reply code, not the phase alone, picks the arm.
+        (_, 5, 4) if is_auth_lane && status == 504 => Some(auth_mechanism_refused()),
         (_, 5, 4) => Some(malformed(response)),
         (_, 5, 5) => Some(unsupported_send()),
         // X.6 content
@@ -479,6 +532,14 @@ fn classify_enhanced(
             }),
         )),
         // X.7 security/policy
+        //
+        // RFC 4954 Section 6: `454 4.7.0` is "temporary authentication
+        // failure" - the server could not complete the exchange right now and
+        // invites a retry. `Server(Unavailable)` loses that it was AUTH that
+        // failed, and `PolicyBlocked` is terminal, which is the opposite
+        // answer. Only the transient class carries this meaning; `5.7.0`
+        // ("authentication required") stays a policy block.
+        (4, 7, 0) if is_auth_lane => Some(auth_refresh_transient()),
         (_, 7, 0) => Some(policy_blocked()),
         (_, 7, 1 | 2) => Some(permission_denied()),
         (_, 7, 3..=6) => Some(policy_blocked()),
@@ -537,7 +598,13 @@ fn classify_status(
     protocol: Protocol,
 ) -> (AccountErrorKind, Cause) {
     let is_recipient_lane = matches!(phase, Some(SmtpCommandPhase::RcptTo));
+    let is_auth_lane = matches!(phase, Some(SmtpCommandPhase::Auth { .. }));
     match status {
+        // RFC 4954 Section 6, before the generic 4xx and 5xx rows below.
+        // Outside the AUTH lane these codes keep their RFC 5321 meanings:
+        // 454 is "TLS not available", 502/504 are command-not-implemented.
+        454 if is_auth_lane => auth_refresh_transient(),
+        502 | 504 if is_auth_lane => auth_mechanism_refused(),
         421 | 450 | 451 | 455 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_hint: None }),
@@ -621,6 +688,30 @@ fn unsupported_send() -> (AccountErrorKind, Cause) {
         Cause::Request(RequestCause::Unsupported {
             operation: AccountOperation::Send,
         }),
+    )
+}
+
+/// The server refused the AUTH mechanism itself (RFC 4954 `504 5.5.4`
+/// "unrecognized authentication type", or a bare `502`/`504` on the AUTH
+/// lane).
+///
+/// `Authorization(PolicyBlocked)` -> `NeedsPolicyChange`, matching the LOCAL
+/// refusal already built a few hundred lines up for "no compatible
+/// authentication mechanism was found". Client and server failing to agree on
+/// a mechanism is one condition and gets one answer regardless of which side
+/// noticed it first.
+///
+/// The two neighbours are both wrong answers, not merely less precise ones.
+/// `Unsupported(Send)` tells the consumer that SENDING MAIL is unsupported on
+/// a server that only declined one SASL mechanism, and it is terminal, so the
+/// account is written off over a mechanism-list mismatch. `Authentication(_)`
+/// derives `AuthLost`, sending the user to re-enter credentials that were
+/// never presented and were never the problem - the server rejected the
+/// mechanism before any credential crossed the wire.
+fn auth_mechanism_refused() -> (AccountErrorKind, Cause) {
+    (
+        AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
+        Cause::Access(AccessCause::PolicyBlocked),
     )
 }
 
@@ -1095,7 +1186,7 @@ mod tests {
         let err = crate::transport::smtp::error::invalid_input(
             "No compatible authentication mechanism was found",
         )
-        .with_phase(SmtpCommandPhase::Auth);
+        .with_phase(SmtpCommandPhase::Auth { mechanism: None });
         let account = into_account_error(err, ctx_smtp_send());
         assert!(matches!(
             account.kind(),
@@ -1147,9 +1238,283 @@ mod tests {
     fn error_phase_drives_auth_classification() {
         // Phase has one carrier: `SmtpErrorContext` cannot hold one, so batch
         // conversion cannot construct disagreeing evidence.
-        let err =
-            crate::transport::smtp::error::invalid_input("x").with_phase(SmtpCommandPhase::Auth);
+        let err = crate::transport::smtp::error::invalid_input("x")
+            .with_phase(SmtpCommandPhase::Auth { mechanism: None });
         let account = into_account_error(err, ctx_smtp_send());
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        ));
+    }
+
+    fn auth_error(resp: Response) -> AccountError {
+        into_account_error(
+            smtp_error::status(resp).with_phase(SmtpCommandPhase::Auth { mechanism: None }),
+            ctx_smtp_send(),
+        )
+    }
+
+    fn auth_error_named(resp: Response, mechanism: &'static str) -> AccountError {
+        into_account_error(
+            smtp_error::status(resp).with_phase(SmtpCommandPhase::Auth {
+                mechanism: Some(mechanism),
+            }),
+            ctx_smtp_send(),
+        )
+    }
+
+    fn support_text(account: &AccountError) -> Vec<String> {
+        account
+            .support_consented()
+            .support_text
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_named_rung_reaches_the_support_tier_without_moving_the_classification() {
+        // 535 and `504 5.5.4` are the two server rejections that say "auth
+        // failed" without saying which rung. The name belongs in the
+        // support-only tier: it is not sensitive (it travels in clear on the
+        // AUTH line and in EHLO), but the telemetry tier carries no free-form
+        // text and a mechanism name is not a declared discriminant. The
+        // classification is read from the reply code and must be identical to
+        // the unnamed case.
+        let rejected = response(
+            Severity::PermanentNegativeCompletion,
+            Category::Unspecified3,
+            Detail::Five,
+            &["5.7.8 credentials rejected"],
+        );
+        let named = auth_error_named(rejected.clone(), "SCRAM-SHA-256-PLUS");
+        let unnamed = auth_error(rejected);
+        assert_eq!(named.kind(), unnamed.kind());
+        assert!(matches!(
+            named.kind(),
+            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
+        ));
+        assert!(
+            support_text(&named)
+                .iter()
+                .any(|text| text == "5.7.8 credentials rejected (mechanism SCRAM-SHA-256-PLUS)"),
+            "{:?}",
+            support_text(&named)
+        );
+        // The unnamed lane is unchanged: bare server text, no invented name.
+        assert!(
+            support_text(&unnamed)
+                .iter()
+                .any(|text| text == "5.7.8 credentials rejected"),
+            "{:?}",
+            support_text(&unnamed)
+        );
+        assert!(
+            !support_text(&unnamed)
+                .iter()
+                .any(|text| text.contains("mechanism")),
+            "{:?}",
+            support_text(&unnamed)
+        );
+
+        let refused = auth_error_named(
+            response(
+                Severity::PermanentNegativeCompletion,
+                Category::Syntax,
+                Detail::Four,
+                &["5.5.4 unrecognized authentication type"],
+            ),
+            "SCRAM-SHA-1-PLUS",
+        );
+        assert!(matches!(
+            refused.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        ));
+        assert!(
+            support_text(&refused).iter().any(|text| text
+                == "5.5.4 unrecognized authentication type (mechanism SCRAM-SHA-1-PLUS)"),
+            "{:?}",
+            support_text(&refused)
+        );
+    }
+
+    #[test]
+    fn a_textless_rejection_still_reports_the_refused_rung() {
+        // A bare `535\r\n` carries no message line at all, which is exactly
+        // the case where the operator has nothing else to go on. The name
+        // must stand alone rather than being dropped with the empty text.
+        let account = auth_error_named(
+            response(
+                Severity::PermanentNegativeCompletion,
+                Category::Unspecified3,
+                Detail::Five,
+                &[],
+            ),
+            "OAUTHBEARER",
+        );
+        assert_eq!(
+            support_text(&account),
+            ["server refused mechanism OAUTHBEARER"]
+        );
+    }
+
+    #[test]
+    fn a_scram_server_error_carries_its_rung_through_the_policy_lane() {
+        // The SCRAM `e=` failure arrives as InvalidInput on the auth lane
+        // (`From<SaslError>`), a different arm from the reply-code lane
+        // above, and it is the one local-input path that does know its rung
+        // because the driver's outer stamp fills it in.
+        let account = into_account_error(
+            crate::transport::smtp::error::invalid_input("invalid-proof").with_phase(
+                SmtpCommandPhase::Auth {
+                    mechanism: Some("SCRAM-SHA-256"),
+                },
+            ),
+            ctx_smtp_send(),
+        );
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        ));
+        assert!(
+            support_text(&account)
+                .iter()
+                .any(|text| text == "invalid-proof (mechanism SCRAM-SHA-256)"),
+            "{:?}",
+            support_text(&account)
+        );
+    }
+
+    #[test]
+    fn auth_lane_504_is_a_mechanism_refusal_not_an_unsupported_send() {
+        // RFC 4954 Section 6: 504 on the AUTH lane is "unrecognized
+        // authentication type". Routing it through `unsupported_send` told the
+        // consumer that SENDING MAIL is unsupported on a server that had only
+        // declined one SASL mechanism.
+        let account = auth_error(response(
+            Severity::PermanentNegativeCompletion,
+            Category::Syntax,
+            Detail::Four,
+            &["unrecognized authentication type"],
+        ));
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        ));
+        assert_eq!(account.message_key(), "authz.policy-blocked");
+    }
+
+    #[test]
+    fn auth_lane_504_5_5_4_is_a_mechanism_refusal_not_malformed() {
+        // Same reply carrying its enhanced code, which took the `(_, 5, 4)`
+        // arm and landed on `Request(Malformed)` -> ClientBug: a library-bug
+        // report for a server-side mechanism refusal.
+        let account = auth_error(response(
+            Severity::PermanentNegativeCompletion,
+            Category::Syntax,
+            Detail::Four,
+            &["5.5.4 unrecognized authentication type"],
+        ));
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        ));
+    }
+
+    #[test]
+    fn non_auth_504_and_501_5_5_4_keep_their_old_classification() {
+        // The fix is lane-scoped and code-scoped. A 504 outside the AUTH lane
+        // is still an unsupported send, and `501 5.5.4` - invalid command
+        // ARGUMENTS, not an unrecognized mechanism - stays malformed even on
+        // the AUTH lane.
+        let off_lane = into_account_error(
+            smtp_error::status(response(
+                Severity::PermanentNegativeCompletion,
+                Category::Syntax,
+                Detail::Four,
+                &["command not implemented"],
+            )),
+            ctx_smtp_send(),
+        );
+        assert!(matches!(
+            off_lane.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::Send)
+        ));
+
+        let bad_args = auth_error(response(
+            Severity::PermanentNegativeCompletion,
+            Category::Syntax,
+            Detail::One,
+            &["5.5.4 invalid command arguments"],
+        ));
+        assert!(matches!(
+            bad_args.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
+
+    #[test]
+    fn auth_lane_454_is_a_transient_auth_failure_not_a_server_outage() {
+        // RFC 4954 Section 6: `454 4.7.0` is "temporary authentication
+        // failure". It used to land on `Server(Unavailable)` (via both the
+        // status row and the `(_, 7, 0)` enhanced row), which loses that AUTH
+        // is what failed and retries without refreshing the credential.
+        for lines in [
+            ["temporary authentication failure"],
+            ["4.7.0 temporary authentication failure"],
+        ] {
+            let account = auth_error(response(
+                Severity::TransientNegativeCompletion,
+                Category::MailSystem,
+                Detail::Four,
+                &lines,
+            ));
+            assert!(
+                matches!(
+                    account.kind(),
+                    AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient)
+                ),
+                "got {:?} for {lines:?}",
+                account.kind()
+            );
+            assert!(matches!(
+                account.recovery(),
+                RecoveryClass::Retry(advice)
+                    if matches!(advice.reason, RetryReason::RefreshTransient)
+            ));
+        }
+    }
+
+    #[test]
+    fn non_auth_454_stays_server_unavailable() {
+        // Outside AUTH, RFC 5321 gives 454 to "TLS not available", which is a
+        // server condition and must keep its old answer.
+        let account = into_account_error(
+            smtp_error::status(response(
+                Severity::TransientNegativeCompletion,
+                Category::MailSystem,
+                Detail::Four,
+                &["TLS not available due to temporary reason"],
+            )),
+            ctx_smtp_send(),
+        );
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Server(ServerErrorKind::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn a_5_7_0_on_the_auth_lane_is_still_a_policy_block() {
+        // Only the TRANSIENT class carries the RFC 4954 meaning. `530 5.7.0`
+        // ("authentication required") must not follow 4.7.0 onto the retry
+        // lane.
+        let account = auth_error(response(
+            Severity::PermanentNegativeCompletion,
+            Category::Unspecified3,
+            Detail::Zero,
+            &["5.7.0 authentication required"],
+        ));
         assert!(matches!(
             account.kind(),
             AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)

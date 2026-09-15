@@ -5,10 +5,10 @@ use bifrost_sasl::{
 
 use crate::connection::NotifyFlags;
 use crate::error::Error;
-use crate::types::SecretString;
 use crate::types::response::{
     ContinuationRequest, ResponseCode, StatusKind, TaggedResponse, UntaggedResponse,
 };
+use crate::types::{AuthMechanism, SecretString};
 
 use super::{Consumer, ConsumerContext, ContinuationConsumer, ContinuationReply, Finalized};
 
@@ -34,10 +34,22 @@ impl From<bifrost_sasl::SaslError> for Error {
 /// Returns the response on OK, or an [`Error::Auth`] for NO / [`Error::Bad`]
 /// for BAD. AUTH commands need a more specific error than the generic
 /// [`Error::No`] that [`TaggedResponse::require_ok`] produces.
-fn require_ok_auth(tagged: TaggedResponse) -> Result<TaggedResponse, Error> {
+///
+/// `mechanism` is the wire name of the mechanism this consumer drove. The
+/// consumer is the last place that still knows it - by the time the error
+/// reaches the account boundary the command is gone - so it is stamped here
+/// and carried to the diagnostics tier rather than reconstructed later.
+fn require_ok_auth(
+    tagged: TaggedResponse,
+    mechanism: &'static str,
+) -> Result<TaggedResponse, Error> {
     match tagged.status {
         StatusKind::Ok => Ok(tagged),
-        StatusKind::No => Err(Error::auth_with_code(tagged.text, tagged.code)),
+        StatusKind::No => Err(Error::auth_with_mechanism(
+            tagged.text,
+            tagged.code,
+            mechanism,
+        )),
         StatusKind::Bad => Err(Error::bad_with_code(tagged.text, tagged.code)),
     }
 }
@@ -78,7 +90,7 @@ impl Consumer for LoginConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged)?;
+        let tagged = require_ok_auth(tagged, AuthMechanism::Login.name())?;
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
         Ok(Finalized {
             output: self.caps_seen || caps_in_tagged,
@@ -137,7 +149,7 @@ impl Consumer for AuthenticatePlainConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged)?;
+        let tagged = require_ok_auth(tagged, AuthMechanism::Plain.name())?;
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
         Ok(Finalized {
             output: self.caps_seen || caps_in_tagged,
@@ -183,15 +195,20 @@ pub(crate) struct AuthenticateXoauth2Consumer {
     /// Whether capability data arrived during the exchange.
     caps_seen: bool,
     buffered: Vec<UntaggedResponse>,
+    /// Wire mechanism token this consumer is driving. The consumer is shared
+    /// by XOAUTH2 and OAUTHBEARER (identical framing), so the token cannot be
+    /// inferred from the type and has to be carried.
+    mechanism: &'static str,
 }
 
 impl AuthenticateXoauth2Consumer {
-    pub(crate) fn new(encoded: SecretString, sasl_ir_used: bool) -> Self {
+    pub(crate) fn new(encoded: SecretString, sasl_ir_used: bool, mechanism: &'static str) -> Self {
         Self {
             encoded,
             initial_sent: sasl_ir_used,
             caps_seen: false,
             buffered: Vec::new(),
+            mechanism,
         }
     }
 }
@@ -216,7 +233,7 @@ impl Consumer for AuthenticateXoauth2Consumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged)?;
+        let tagged = require_ok_auth(tagged, self.mechanism)?;
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
         Ok(Finalized {
             output: self.caps_seen || caps_in_tagged,
@@ -289,7 +306,7 @@ impl Consumer for AuthenticateCramMd5Consumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged)?;
+        let tagged = require_ok_auth(tagged, AuthMechanism::CramMd5.name())?;
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
         Ok(Finalized {
             output: self.caps_seen || caps_in_tagged,
@@ -369,6 +386,35 @@ impl AuthenticateScramConsumer {
         })
     }
 
+    /// Wire mechanism token for this exchange, taken from the same
+    /// `bifrost_sasl` authority that built the AUTHENTICATE command line, so
+    /// the diagnostic can never name a different rung than the one sent.
+    fn mechanism_name(&self) -> &'static str {
+        self.mechanism.mechanism_name(self.binding.binding())
+    }
+
+    /// Re-message a `bifrost-sasl` failure so it names this rung, then route
+    /// it through the crate's `From<SaslError>` split. The classification is
+    /// untouched: `Protocol` stays protocol-class, `AuthFailed` stays on the
+    /// auth-failure lane. Only the message grows, and the account boundary
+    /// turns that message into SUPPORT-ONLY `DiagnosticText`. Mirrors
+    /// `bifrost_smtp`'s `named_sasl_error`; the two crates must not differ in
+    /// what a SCRAM refusal can tell an operator.
+    fn named_sasl_error(&self, error: bifrost_sasl::SaslError) -> Error {
+        let mechanism = self.mechanism_name();
+        match error {
+            bifrost_sasl::SaslError::Protocol(m) => {
+                Error::Protocol(format!("{m} (mechanism {mechanism})"))
+            }
+            bifrost_sasl::SaslError::AuthFailed(m) => {
+                Error::auth_with_mechanism(m, None, mechanism)
+            }
+            // `SaslError` is `#[non_exhaustive]`; any future variant is an
+            // unclassified auth failure, matching the `From` impl above.
+            other => Error::auth_with_mechanism(other.to_string(), None, mechanism),
+        }
+    }
+
     pub(crate) fn initial_response(&self) -> SecretString {
         use base64::Engine;
 
@@ -400,7 +446,7 @@ impl Consumer for AuthenticateScramConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged)?;
+        let tagged = require_ok_auth(tagged, self.mechanism_name())?;
         if self.state != ScramState::Done {
             return Err(Error::Protocol(
                 "SCRAM exchange ended before server-final verification".into(),
@@ -438,7 +484,8 @@ impl ContinuationConsumer for AuthenticateScramConsumer {
                     &self.client_first_bare,
                     &server_first,
                     &self.binding,
-                )?;
+                )
+                .map_err(|e| self.named_sasl_error(e))?;
                 self.expected_server_signature = Some(server_signature);
                 self.state = ScramState::AwaitServerFinal;
                 let mut bytes = Vec::with_capacity(client_final.as_str().len() + 2);
@@ -451,7 +498,8 @@ impl ContinuationConsumer for AuthenticateScramConsumer {
                 let expected = self.expected_server_signature.take().ok_or_else(|| {
                     Error::Protocol("SCRAM server signature missing from client state".into())
                 })?;
-                verify_server_final(&server_final, &expected)?;
+                verify_server_final(&server_final, &expected)
+                    .map_err(|e| self.named_sasl_error(e))?;
                 self.state = ScramState::Done;
                 Ok(ContinuationReply::Write(b"\r\n".to_vec()))
             }
@@ -504,6 +552,123 @@ mod tests {
             Ok(_) => panic!("tagged NO must reject authentication"),
         };
         assert!(matches!(err, Error::Auth { .. }));
+    }
+
+    #[test]
+    fn a_server_rejection_names_the_mechanism_it_refused() {
+        // The consumer is the last place that still knows which rung was on
+        // the wire. If it does not stamp the name here, "which mechanism was
+        // refused" is unrecoverable downstream - which is why it is asserted
+        // on every consumer rather than only on one.
+        fn mechanism_of(err: Error) -> Option<&'static str> {
+            match err {
+                Error::Auth { mechanism, .. } => mechanism,
+                other => panic!("tagged NO must be an auth failure, got {other:?}"),
+            }
+        }
+
+        let scram = AuthenticateScramConsumer::new(
+            ScramHash::Sha256,
+            "user".to_owned(),
+            "wrong".to_owned().into(),
+            "nonce123".to_owned(),
+            true,
+            ScramChannelBinding::TlsServerEndPoint(vec![1, 2, 3, 4]),
+        )
+        .unwrap();
+        assert_eq!(
+            mechanism_of(
+                Box::new(scram)
+                    .finalize(tagged(StatusKind::No), &context())
+                    .err()
+                    .unwrap()
+            ),
+            // The PLUS suffix must survive: an operator debugging a channel
+            // binding problem needs to see which of the two rungs was refused.
+            Some("SCRAM-SHA-256-PLUS"),
+        );
+
+        let plain = AuthenticatePlainConsumer::new("payload".to_owned().into(), true);
+        assert_eq!(
+            mechanism_of(
+                Box::new(plain)
+                    .finalize(tagged(StatusKind::No), &context())
+                    .err()
+                    .unwrap()
+            ),
+            Some("PLAIN"),
+        );
+
+        let cram = AuthenticateCramMd5Consumer::new("user".to_owned(), "pw".to_owned().into());
+        assert_eq!(
+            mechanism_of(
+                Box::new(cram)
+                    .finalize(tagged(StatusKind::No), &context())
+                    .err()
+                    .unwrap()
+            ),
+            Some("CRAM-MD5"),
+        );
+
+        let login = LoginConsumer::default();
+        assert_eq!(
+            mechanism_of(
+                Box::new(login)
+                    .finalize(tagged(StatusKind::No), &context())
+                    .err()
+                    .unwrap()
+            ),
+            Some("LOGIN"),
+        );
+
+        // The XOAUTH2 consumer is shared by two mechanisms, so its token is
+        // carried rather than inferred; both spellings must come back out.
+        for name in ["XOAUTH2", "OAUTHBEARER"] {
+            let oauth = AuthenticateXoauth2Consumer::new("payload".to_owned().into(), true, name);
+            assert_eq!(
+                mechanism_of(
+                    Box::new(oauth)
+                        .finalize(tagged(StatusKind::No), &context())
+                        .err()
+                        .unwrap()
+                ),
+                Some(name),
+            );
+        }
+    }
+
+    #[test]
+    fn a_sasl_failure_mid_exchange_names_the_rung_and_keeps_its_class() {
+        // The `?` on the SASL calls used to go through the context-free
+        // `From<SaslError>`, which cannot know the mechanism. Naming it must
+        // not move the protocol-class / auth-class split.
+        let mut consumer = AuthenticateScramConsumer::new(
+            ScramHash::Sha256,
+            "user".to_owned(),
+            "pw".to_owned().into(),
+            "nonce123".to_owned(),
+            true,
+            ScramChannelBinding::TlsServerEndPoint(vec![1, 2, 3, 4]),
+        )
+        .unwrap();
+
+        let cont = ContinuationRequest {
+            code: None,
+            data: base64::engine::general_purpose::STANDARD.encode("garbage-without-r="),
+        };
+        // Matched rather than `expect_err`: that would require `Debug` on
+        // `ContinuationReply`, whose `Write` arm carries SASL client-final
+        // proof bytes. Deriving `Debug` there puts credential material one
+        // `{:?}` away from a log line, so the test bends instead of the type.
+        let Err(err) = consumer.on_continuation(cont, &context()) else {
+            panic!("a non-SCRAM server-first is a protocol fault");
+        };
+        match err {
+            Error::Protocol(message) => {
+                assert!(message.contains("SCRAM-SHA-256-PLUS"), "got: {message}");
+            }
+            other => panic!("classification must stay protocol-class, got {other:?}"),
+        }
     }
 
     #[test]

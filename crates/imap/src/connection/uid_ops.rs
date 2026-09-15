@@ -154,7 +154,14 @@ impl ImapConnection {
         // RFC 7162 Section 3.2.6: VANISHED modifier requires QRESYNC to be ENABLEd.
         {
             let snap = self.state_rx.borrow();
-            if !snap.enabled.iter().any(|e| e == "QRESYNC") {
+            // The ENABLED echo is stored as the server spelled it, and RFC 9051
+            // Section 9 makes the name an atom, so match it case-insensitively
+            // exactly as `ServerProfile::enabled` does.
+            if !snap
+                .enabled
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
+            {
                 return Err(Error::MissingCapability("QRESYNC (not ENABLEd)".into()));
             }
         }
@@ -202,7 +209,14 @@ impl ImapConnection {
         }
         {
             let snap = self.state_rx.borrow();
-            if !snap.enabled.iter().any(|e| e == "QRESYNC") {
+            // The ENABLED echo is stored as the server spelled it, and RFC 9051
+            // Section 9 makes the name an atom, so match it case-insensitively
+            // exactly as `ServerProfile::enabled` does.
+            if !snap
+                .enabled
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
+            {
                 return Err(Error::MissingCapability("QRESYNC (not ENABLEd)".into()));
             }
         }

@@ -273,6 +273,52 @@ fn auth_with_expired_maps_to_expired() {
 }
 
 #[test]
+fn a_server_auth_rejection_carries_the_mechanism_at_the_support_tier() {
+    // `AuthPolicyFailure::Display` already names mechanisms on the LOCAL
+    // policy path. This is the server-rejection path, where "which mechanism
+    // was refused" used to be unavailable at every consent tier.
+    let err = Error::auth_with_mechanism(
+        "credentials rejected".into(),
+        Some(ResponseCode::AuthenticationFailed),
+        "SCRAM-SHA-256-PLUS",
+    );
+    let account = into_account_error(err, ImapErrorContext::operation(AccountOperation::Discover));
+
+    let consented = account.support_consented();
+    assert!(
+        consented
+            .support_text
+            .iter()
+            .any(|t| t.contains("SCRAM-SHA-256-PLUS")),
+        "support-consented export must name the refused mechanism: {:?}",
+        consented.support_text
+    );
+    // The original server text is not displaced by the attribution.
+    assert!(
+        consented
+            .support_text
+            .iter()
+            .any(|t| t.contains("credentials rejected")),
+        "{:?}",
+        consented.support_text
+    );
+
+    // Support-only, not user-safe: the mechanism is evidence for an operator,
+    // and the telemetry tier carries no free-form text at all.
+    assert!(consented.user_safe_text.is_empty());
+    assert_eq!(account.user_safe_text().count(), 0);
+}
+
+#[test]
+fn an_unattributed_auth_rejection_keeps_its_bare_text() {
+    // Producers that genuinely do not know the rung must not grow a fake one.
+    let err = Error::auth_with_code("credentials rejected".into(), None);
+    let account = into_account_error(err, ImapErrorContext::operation(AccountOperation::Discover));
+    let consented = account.support_consented();
+    assert_eq!(consented.support_text, ["credentials rejected"]);
+}
+
+#[test]
 fn auth_policy_maps_to_policy_blocked() {
     let err = Error::AuthPolicy(crate::error::AuthPolicyFailure::new(
         vec!["PLAIN".into()],

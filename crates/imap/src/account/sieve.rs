@@ -500,9 +500,8 @@ async fn authenticate(
             // Read the current token from the shared source at auth time,
             // mirroring the IMAP connect path, so a rotated token is
             // presented on every ManageSieve (re)authentication.
-            let access_token = token_source.current().await.map_err(|e| Error::Auth {
-                text: format!("failed to read OAuth access token: {e}"),
-                code: None,
+            let access_token = token_source.current().await.map_err(|e| {
+                Error::auth_with_code(format!("failed to read OAuth access token: {e}"), None)
             })?;
             (
                 AuthMechanism::XOAuth2,
@@ -548,10 +547,10 @@ async fn authenticate(
                 code: Some(code),
                 message,
             },
-            _ => Error::Auth {
-                text: message,
-                code: None,
-            },
+            // The mechanism is known here, so the refusal can say which rung
+            // the server turned down rather than only that one was turned
+            // down.
+            _ => Error::auth_with_mechanism(message, None, mechanism.name()),
         }),
         SieveStatus::Bye { code, message } => Err(Error::Sieve { code, message }),
     }

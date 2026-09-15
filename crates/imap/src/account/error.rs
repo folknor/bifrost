@@ -457,7 +457,11 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 ))),
             }),
         ),
-        Error::Auth { text, code } => classify_auth(text, code.as_ref()),
+        Error::Auth {
+            text,
+            code,
+            mechanism,
+        } => classify_auth(text, code.as_ref(), *mechanism),
         Error::AuthPolicy(failure) => {
             let mut t = Translation::new(
                 AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
@@ -656,7 +660,28 @@ fn classify_sieve(
     t
 }
 
-fn classify_auth(text: &str, code: Option<&ResponseCode>) -> Translation {
+/// Translate a server AUTHENTICATE / LOGIN rejection.
+///
+/// `mechanism` names the rung the server refused. It rides into the
+/// SUPPORT-ONLY diagnostic tier (`DetailVisibility::SupportOnly`), never the
+/// telemetry tier: not because the token is sensitive - it crosses the wire in
+/// clear on both the AUTHENTICATE line and the CAPABILITY advertisement - but
+/// because the telemetry tier carries no free-form text at all
+/// (`telemetry_has_no_free_form_text`), and a mechanism name is not a stable
+/// discriminant the shared error model declares. It is deliberately not a new
+/// typed field on `AccountError`: the failure information belongs in the
+/// existing diagnostics-consent machinery, reachable through
+/// `support_consented()`.
+///
+/// This closes the asymmetry with the LOCAL-policy path, where
+/// `AuthPolicyFailure::Display` already names mechanisms. Before this, the
+/// paths where a SERVER refused a mechanism were the only ones that could not
+/// say which one.
+fn classify_auth(
+    text: &str,
+    code: Option<&ResponseCode>,
+    mechanism: Option<&'static str>,
+) -> Translation {
     let (kind, cause) = match code {
         Some(ResponseCode::Expired) => (
             AccountErrorKind::Authentication(AuthErrorKind::Expired),
@@ -680,8 +705,14 @@ fn classify_auth(text: &str, code: Option<&ResponseCode>) -> Translation {
         ),
     };
     let mut t = Translation::new(kind, cause);
-    if !text.is_empty() {
-        t.diagnostic_text = Some(DiagnosticText::support_only(text.to_owned()));
+    let detail = match (text.is_empty(), mechanism) {
+        (false, Some(mechanism)) => Some(format!("{text} (mechanism {mechanism})")),
+        (true, Some(mechanism)) => Some(format!("server refused mechanism {mechanism}")),
+        (false, None) => Some(text.to_owned()),
+        (true, None) => None,
+    };
+    if let Some(detail) = detail {
+        t.diagnostic_text = Some(DiagnosticText::support_only(detail));
     }
     if let Some(code) = code {
         t.wire_code = Some(imap_response_code(code));

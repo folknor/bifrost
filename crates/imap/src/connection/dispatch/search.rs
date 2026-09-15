@@ -450,7 +450,13 @@ impl Consumer for MoveConsumer {
         let tagged = tagged.require_ok()?;
         // RFC 7162 Section3.2.10: when QRESYNC is enabled, the server sends
         // VANISHED instead of EXPUNGE.
-        let expunged = if ctx.enabled().iter().any(|e| e == "QRESYNC") {
+        // The ENABLED echo is stored verbatim; the name is an atom
+        // (RFC 9051 Section 9), so compare case-insensitively.
+        let expunged = if ctx
+            .enabled()
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
+        {
             ExpungeResult::Vanished(self.vanished)
         } else {
             ExpungeResult::Expunged(self.expunged)
@@ -521,7 +527,13 @@ impl Consumer for ExpungeConsumer {
         tagged.require_ok()?;
         // RFC 7162 Section3.2.10: when QRESYNC is enabled, the server sends
         // VANISHED instead of EXPUNGE.
-        let result = if ctx.enabled().iter().any(|e| e == "QRESYNC") {
+        // The ENABLED echo is stored verbatim; the name is an atom
+        // (RFC 9051 Section 9), so compare case-insensitively.
+        let result = if ctx
+            .enabled()
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
+        {
             ExpungeResult::Vanished(self.vanished)
         } else {
             ExpungeResult::Expunged(self.expunged)

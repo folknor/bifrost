@@ -1029,6 +1029,12 @@ impl SmtpConnection {
         credentials: &Credentials,
     ) -> Result<Response, Error> {
         let hash = scram_hash(mechanism).expect("auth_scram only called for SCRAM mechanisms");
+        // Every auth-phase stamp in this exchange names the rung that is
+        // running, derived from the same `Mechanism` that frames the AUTH
+        // command, so the reported name and the wire token cannot disagree.
+        let phase = SmtpCommandPhase::Auth {
+            mechanism: Some(mechanism.name()),
+        };
         let (username, password) = credentials.password_parts()?;
         let mut exchange = ScramExchange::new(hash, binding, username, password.into())?;
 
@@ -1036,16 +1042,16 @@ impl SmtpConnection {
         // `Mechanism::response` is never invoked and `Display` emits the bare
         // command.
         let auth = Auth::new(mechanism, credentials.clone(), None)?;
-        let response = try_smtp!(self.command(auth), self, SmtpCommandPhase::Auth);
+        let response = try_smtp!(self.command(auth), self, phase);
         // Server's first 334 (empty challenge): send client-first.
         if !response.has_code(334) {
             self.abort();
-            return Err(error::status(response).with_phase(SmtpCommandPhase::Auth));
+            return Err(error::status(response).with_phase(phase));
         }
         let response = try_smtp!(
             self.write_auth_continuation(&exchange.client_first()),
             self,
-            SmtpCommandPhase::Auth
+            phase
         );
 
         // 334 carrying server-first -> client-final. A malformed continuation
@@ -1053,12 +1059,10 @@ impl SmtpConnection {
         // Auth-phase tagged, but it must still abort the connection like every
         // other error path in this exchange.
         let server_first = try_smtp!(decode_auth_challenge(&response), self);
-        let response = match try_smtp!(exchange.step(&server_first), self, SmtpCommandPhase::Auth) {
-            ScramStep::Reply(client_final) => try_smtp!(
-                self.write_auth_continuation(&client_final),
-                self,
-                SmtpCommandPhase::Auth
-            ),
+        let response = match try_smtp!(exchange.step(&server_first), self, phase) {
+            ScramStep::Reply(client_final) => {
+                try_smtp!(self.write_auth_continuation(&client_final), self, phase)
+            }
             ScramStep::Complete => {
                 self.abort();
                 return Err(error::parse("SCRAM completed before server-final"));
@@ -1076,16 +1080,12 @@ impl SmtpConnection {
             try_smtp!(
                 Self::verify_scram_server_final(&mut exchange, &server_final),
                 self,
-                SmtpCommandPhase::Auth
+                phase
             );
-            let final_reply = try_smtp!(
-                self.write_auth_continuation(""),
-                self,
-                SmtpCommandPhase::Auth
-            );
+            let final_reply = try_smtp!(self.write_auth_continuation(""), self, phase);
             if !final_reply.is_positive() {
                 self.abort();
-                return Err(error::status(final_reply).with_phase(SmtpCommandPhase::Auth));
+                return Err(error::status(final_reply).with_phase(phase));
             }
             final_reply
         } else if response.is_positive() {
@@ -1093,12 +1093,12 @@ impl SmtpConnection {
             try_smtp!(
                 Self::verify_scram_server_final(&mut exchange, &server_final),
                 self,
-                SmtpCommandPhase::Auth
+                phase
             );
             response
         } else {
             self.abort();
-            return Err(error::status(response).with_phase(SmtpCommandPhase::Auth));
+            return Err(error::status(response).with_phase(phase));
         };
 
         let hello_name = self.hello_name.clone();
@@ -1134,17 +1134,19 @@ impl SmtpConnection {
         mechanism: Mechanism,
         credentials: &Credentials,
     ) -> Result<Response, Error> {
+        // Every auth-phase stamp in this exchange names the rung that is
+        // running, derived from the same `Mechanism` that frames the AUTH
+        // command, so the reported name and the wire token cannot disagree.
+        let phase = SmtpCommandPhase::Auth {
+            mechanism: Some(mechanism.name()),
+        };
         // The blocking transport has no async context, so it resolves the
         // OAuth token by polling the source once (see
         // `oauth2_token_blocking`): a `StaticTokenSource` or an
         // already-fresh `OAuthRefresher` resolves immediately; a source
         // needing a network refresh is rejected with a clear error.
         let oauth_token = if matches!(mechanism, Mechanism::Xoauth2 | Mechanism::OAuthBearer) {
-            Some(try_smtp!(
-                credentials.oauth2_token_blocking(),
-                self,
-                SmtpCommandPhase::Auth
-            ))
+            Some(try_smtp!(credentials.oauth2_token_blocking(), self, phase))
         } else {
             None
         };
@@ -1158,7 +1160,7 @@ impl SmtpConnection {
         // out; it must not be derived from the remaining-challenge budget.
         let mut challenge_index: usize = 0;
         let auth = Auth::new(mechanism, credentials.clone(), oauth_token)?;
-        let mut response = try_smtp!(self.command(auth), self, SmtpCommandPhase::Auth);
+        let mut response = try_smtp!(self.command(auth), self, phase);
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
@@ -1178,10 +1180,10 @@ impl SmtpConnection {
                     oauth_token,
                 ),
                 self,
-                SmtpCommandPhase::Auth
+                phase
             );
             challenge_index += 1;
-            response = try_smtp!(self.command(continuation), self, SmtpCommandPhase::Auth);
+            response = try_smtp!(self.command(continuation), self, phase);
         }
 
         if challenges == 0 {
@@ -1190,8 +1192,7 @@ impl SmtpConnection {
             // lane (InvalidInput + Auth -> Authorization), not an untagged
             // Protocol(ParseFailed).
             self.abort();
-            Err(error::invalid_input("Unexpected number of challenges")
-                .with_phase(SmtpCommandPhase::Auth))
+            Err(error::invalid_input("Unexpected number of challenges").with_phase(phase))
         } else {
             let hello_name = self.hello_name.clone();
             try_smtp!(self.hello(&hello_name), self);
@@ -1456,6 +1457,7 @@ mod transcript_tests {
         address::Envelope,
         transport::smtp::{
             Protocol,
+            account_error::{SmtpErrorContext, into_account_error},
             authentication::{Credentials, Mechanism},
             batch::SmtpBatchRecipient,
             extension::{
@@ -2745,6 +2747,61 @@ mod transcript_tests {
             .unwrap();
 
         assert!(response.has_code(235));
+        transcript.assert_exhausted();
+    }
+
+    #[test]
+    fn a_server_credential_rejection_names_the_mechanism_in_support_diagnostics() {
+        // The blocking half of the server-rejection naming. A 535 says only
+        // that authentication failed; without the rung on the phase stamp the
+        // consumer cannot tell an operator WHICH mechanism the server
+        // refused, while the local-policy path has always named mechanisms.
+        // The name rides the support-only tier and must not disturb the
+        // classification, which is still read from the reply code.
+        let hello = ClientId::Domain("client.example".to_owned());
+        let plain = format!(
+            "AUTH PLAIN {}\r\n",
+            crate::base64::encode("\u{0}user\u{0}pass")
+        );
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 AUTH PLAIN\r\n")
+            .expect(plain, "535 5.7.8 credentials rejected\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+
+        let error = connection
+            .auth(
+                &[Mechanism::Plain],
+                &Credentials::password("user".to_owned(), "pass".to_owned()),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.phase(),
+            Some(super::SmtpCommandPhase::Auth {
+                mechanism: Some("PLAIN")
+            })
+        );
+        let account = into_account_error(error, SmtpErrorContext::send(Protocol::Smtp));
+        assert!(
+            matches!(
+                account.kind(),
+                bifrost_types::error::AccountErrorKind::Authentication(
+                    bifrost_types::error::AuthErrorKind::ReauthorizationRequired
+                )
+            ),
+            "naming the mechanism must not move the classification: {:?}",
+            account.kind()
+        );
+        let consented = account.support_consented();
+        assert!(
+            consented
+                .support_text
+                .iter()
+                .any(|text| text.contains("mechanism PLAIN")),
+            "support text did not name the refused mechanism: {:?}",
+            consented.support_text
+        );
         transcript.assert_exhausted();
     }
 

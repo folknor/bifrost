@@ -51,10 +51,20 @@ pub(crate) enum Error {
     },
 
     /// Authentication was rejected by the server (RFC 3501 Section 6.2.2).
+    ///
+    /// `mechanism` is the wire name of the mechanism that was being driven
+    /// when the server refused (`AuthMechanism::name`), when the producer
+    /// knows it. The AUTHENTICATE consumers do; a `SaslError` mapped at a
+    /// context-free `From` boundary does not, hence the `Option`. The name
+    /// is the one piece of "which rung failed" evidence the server-rejection
+    /// path can carry, and the account boundary folds it into the
+    /// support-only diagnostic text - `AuthPolicyFailure` covers the same
+    /// question on the LOCAL-policy path only.
     #[error("authentication failed: {text}")]
     Auth {
         text: String,
         code: Option<ResponseCode>,
+        mechanism: Option<&'static str>,
     },
 
     /// Server returned a NO response to a command (RFC 3501 Section 7.1.2).
@@ -225,9 +235,18 @@ impl PartialEq for Error {
                     attempt: b_att,
                 },
             ) => a.kind() == b.kind() && a_att == b_att,
-            (Self::Auth { text: t1, code: c1 }, Self::Auth { text: t2, code: c2 }) => {
-                t1 == t2 && c1 == c2
-            }
+            (
+                Self::Auth {
+                    text: t1,
+                    code: c1,
+                    mechanism: m1,
+                },
+                Self::Auth {
+                    text: t2,
+                    code: c2,
+                    mechanism: m2,
+                },
+            ) => t1 == t2 && c1 == c2 && m1 == m2,
             (
                 Self::No {
                     text: t1,
@@ -452,9 +471,33 @@ impl Error {
         }
     }
 
-    /// Construct an [`Error::Auth`] with an optional response code.
+    /// Construct an [`Error::Auth`] with an optional response code and no
+    /// mechanism attribution. Used where the producer genuinely does not
+    /// know which rung was in flight.
     pub(crate) fn auth_with_code(text: String, code: Option<ResponseCode>) -> Self {
-        Self::Auth { text, code }
+        Self::Auth {
+            text,
+            code,
+            mechanism: None,
+        }
+    }
+
+    /// Construct an [`Error::Auth`] naming the mechanism that was refused.
+    ///
+    /// `mechanism` is a wire mechanism name (`AuthMechanism::name`, or the
+    /// SCRAM token `bifrost_sasl` emits). It is not a secret: it is the same
+    /// token that already travels in clear on the AUTHENTICATE command line
+    /// and in the server's CAPABILITY advertisement.
+    pub(crate) fn auth_with_mechanism(
+        text: String,
+        code: Option<ResponseCode>,
+        mechanism: &'static str,
+    ) -> Self {
+        Self::Auth {
+            text,
+            code,
+            mechanism: Some(mechanism),
+        }
     }
 
     /// Construct an [`Error::Bye`] with an optional response code.
@@ -479,6 +522,17 @@ impl Error {
 }
 
 /// Structured reason automatic authentication could not select a mechanism.
+///
+/// `offered` is a SNAPSHOT of the server's advertised mechanisms taken before
+/// the ladder ran, not a live reading at the moment of failure. Under
+/// capability skew (a post-STARTTLS CAPABILITY refetch racing the ladder) the
+/// two can disagree, so `offered` may name a mechanism the server no longer
+/// advertises. The `rejected` list is the authoritative per-rung record: a
+/// rung that vanished mid-ladder appears there as
+/// `UnavailableOnLiveSnapshot`, which is what lets an operator tell "the
+/// server never offered it" from "the server stopped offering it". Re-reading
+/// the profile at failure time would not fix this - it would only move the
+/// skew window - so the discrepancy is recorded rather than papered over.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthPolicyFailure {
@@ -519,7 +573,7 @@ impl std::fmt::Display for AuthPolicyFailure {
     }
 }
 
-/// Offered authentication mechanism rejected by local policy.
+/// Offered authentication mechanism that was not attempted to completion.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthMechanismRejection {
@@ -536,13 +590,18 @@ impl AuthMechanismRejection {
     }
 }
 
-/// Local policy reason for rejecting an offered authentication mechanism.
+/// Reason an offered authentication mechanism was not attempted to completion.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AuthMechanismRejectionReason {
     DisabledByPolicy,
     CleartextWithoutTls,
     ChannelBindingUnavailable,
+    /// The ladder snapshot advertised the mechanism but the live capability
+    /// snapshot no longer did, so the attempt came back
+    /// `MissingCapability` and the ladder moved on. Not a local policy
+    /// decision: the server's advertisement changed underneath the ladder.
+    UnavailableOnLiveSnapshot,
 }
 
 impl std::fmt::Display for AuthMechanismRejectionReason {
@@ -551,6 +610,9 @@ impl std::fmt::Display for AuthMechanismRejectionReason {
             Self::DisabledByPolicy => f.write_str("disabled by policy"),
             Self::CleartextWithoutTls => f.write_str("requires TLS by policy"),
             Self::ChannelBindingUnavailable => f.write_str("channel binding unavailable"),
+            Self::UnavailableOnLiveSnapshot => {
+                f.write_str("no longer advertised on the live capability snapshot")
+            }
         }
     }
 }

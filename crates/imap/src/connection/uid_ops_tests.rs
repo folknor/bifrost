@@ -109,6 +109,22 @@ async fn uid_fetch_vanished_requires_qresync_enabled() {
             .await,
         Err(Error::DriverGone { .. })
     ));
+    // The ENABLED echo is kept as the server spelled it, and RFC 9051
+    // Section 9 makes the extension name an atom. A server echoing
+    // `* ENABLED Qresync` has enabled QRESYNC: matching it byte-exactly here
+    // would refuse every VANISHED-bearing command for the whole session,
+    // while `ServerProfile::enabled` went on reporting it as enabled.
+    let odd_case = detached(
+        SessionState::Selected,
+        vec![Capability::QResync],
+        &["Qresync"],
+    );
+    assert!(matches!(
+        odd_case
+            .uid_fetch_vanished(&set("1:5"), &[FetchAttr::Uid], 10, T)
+            .await,
+        Err(Error::DriverGone { .. })
+    ));
 }
 
 #[tokio::test]

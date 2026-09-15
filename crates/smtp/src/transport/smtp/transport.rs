@@ -931,7 +931,9 @@ impl SmtpClient {
         if let Some(credentials) = &self.info.credentials {
             if let Err(error) = self.info.ensure_can_authenticate(conn.is_encrypted()) {
                 conn.abort();
-                return Err(error.with_phase(SmtpCommandPhase::Auth));
+                // Refused before any rung was picked, so there is no
+                // mechanism to name here.
+                return Err(error.with_phase(SmtpCommandPhase::Auth { mechanism: None }));
             }
             conn.auth(&self.info.authentication, credentials)?;
         }

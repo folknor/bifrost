@@ -222,7 +222,7 @@ impl Credentials {
                     Poll::Pending => Err(error::invalid_input(
                         "OAuth token source requires a network refresh; use the async SMTP transport",
                     )
-                    .with_phase(SmtpCommandPhase::Auth)),
+                    .with_phase(SmtpCommandPhase::Auth { mechanism: None })),
                 }
             }
             Credentials::Password { .. } => Err(error::invalid_input(
@@ -238,7 +238,7 @@ impl Credentials {
 /// model's concern downstream and is not refined here.
 fn oauth_token_error(error: bifrost_net::Error) -> Error {
     error::invalid_input(format!("failed to read OAuth access token: {error}"))
-        .with_phase(SmtpCommandPhase::Auth)
+        .with_phase(SmtpCommandPhase::Auth { mechanism: None })
 }
 
 impl Debug for Credentials {
@@ -284,10 +284,21 @@ pub enum Mechanism {
 
 impl Display for Mechanism {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        // The `-PLUS` suffix and the SCRAM token spelling have a single
-        // authority in `bifrost-sasl`, so the SMTP wire token can never drift
-        // from the value used in the proof math.
-        f.write_str(match *self {
+        f.write_str(self.name())
+    }
+}
+
+impl Mechanism {
+    /// The wire token for this mechanism, exactly as it is written on the
+    /// `AUTH` line and advertised in EHLO.
+    ///
+    /// The `-PLUS` suffix and the SCRAM token spelling have a single
+    /// authority in `bifrost-sasl`, so the SMTP wire token can never drift
+    /// from the value used in the proof math. This is also the string the
+    /// auth-phase error stamp carries into support diagnostics, so the name
+    /// an operator reads is the name that went out on the wire.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
             Mechanism::Plain => "PLAIN",
             Mechanism::Login => "LOGIN",
             Mechanism::Xoauth2 => "XOAUTH2",
@@ -304,11 +315,9 @@ impl Display for Mechanism {
             Mechanism::ScramSha256Plus => {
                 ScramHash::Sha256.mechanism_name(bifrost_sasl::ChannelBinding::TlsServerEndPoint)
             }
-        })
+        }
     }
-}
 
-impl Mechanism {
     /// Does the mechanism support initial response?
     pub fn supports_initial_response(self) -> bool {
         match self {
@@ -429,11 +438,12 @@ impl From<bifrost_sasl::SaslError> for Error {
         match e {
             bifrost_sasl::SaslError::Protocol(m) => error::parse(m),
             bifrost_sasl::SaslError::AuthFailed(m) => {
-                error::invalid_input(m).with_phase(SmtpCommandPhase::Auth)
+                error::invalid_input(m).with_phase(SmtpCommandPhase::Auth { mechanism: None })
             }
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
             // unclassified auth failure until it is mapped explicitly.
-            other => error::invalid_input(other.to_string()).with_phase(SmtpCommandPhase::Auth),
+            other => error::invalid_input(other.to_string())
+                .with_phase(SmtpCommandPhase::Auth { mechanism: None }),
         }
     }
 }
@@ -495,7 +505,7 @@ pub(crate) fn password_mechanism(
     } else {
         "no compatible authentication mechanism"
     };
-    Err(error::invalid_input(message).with_phase(SmtpCommandPhase::Auth))
+    Err(error::invalid_input(message).with_phase(SmtpCommandPhase::Auth { mechanism: None }))
 }
 
 /// First advertised OAuth mechanism in the caller's order, or `None`.
@@ -555,9 +565,38 @@ enum ScramExchangeState {
 /// client line from a decoded server continuation; it never owns the socket.
 /// The connection's `auth_scram` driver frames the wire `334` rounds and feeds
 /// each decoded continuation into [`ScramExchange::step`].
+/// Re-message a `bifrost-sasl` failure so it names the mechanism that was
+/// being driven, then route it through the existing `From<SaslError>` split.
+///
+/// The classification is untouched - `Protocol` stays parse-class, `AuthFailed`
+/// stays on the Auth-phase lane that `account_error.rs` maps to
+/// `Authorization(PolicyBlocked)`. Only the message grows, and that message is
+/// what the translation boundary turns into SUPPORT-ONLY `DiagnosticText`. A
+/// mechanism token is not secret (it travels in clear on the AUTH command line
+/// and in the EHLO advertisement); it is support-only because the telemetry
+/// tier carries no free-form text at all.
+fn named_sasl_error(mechanism: &'static str, error: bifrost_sasl::SaslError) -> Error {
+    let named = match error {
+        bifrost_sasl::SaslError::Protocol(m) => {
+            bifrost_sasl::SaslError::Protocol(format!("{m} (mechanism {mechanism})"))
+        }
+        bifrost_sasl::SaslError::AuthFailed(m) => {
+            bifrost_sasl::SaslError::AuthFailed(format!("{m} (mechanism {mechanism})"))
+        }
+        // `SaslError` is `#[non_exhaustive]`: a variant this arm cannot
+        // rebuild passes through unnamed rather than being reclassified.
+        other => other,
+    };
+    named.into()
+}
+
 pub(crate) struct ScramExchange {
     hash: ScramHash,
     binding: ScramChannelBinding,
+    /// Wire mechanism token for this exchange, from the single `bifrost-sasl`
+    /// authority, so a diagnostic can never name a rung other than the one
+    /// actually sent.
+    mechanism_name: &'static str,
     password: bifrost_sasl::Secret,
     client_nonce: String,
     client_first_bare: String,
@@ -578,6 +617,7 @@ impl ScramExchange {
             bifrost_sasl::prepare_scram_username(username)?
         );
         Ok(ScramExchange {
+            mechanism_name: hash.mechanism_name(binding.binding()),
             hash,
             binding,
             password,
@@ -611,7 +651,8 @@ impl ScramExchange {
                     &self.client_first_bare,
                     server_line,
                     &self.binding,
-                )?;
+                )
+                .map_err(|e| named_sasl_error(self.mechanism_name, e))?;
                 self.expected_server_signature = Some(server_signature);
                 self.state = ScramExchangeState::AwaitServerFinal;
                 Ok(ScramStep::Reply(crate::base64::encode(
@@ -622,7 +663,8 @@ impl ScramExchange {
                 let expected = self.expected_server_signature.take().ok_or_else(|| {
                     error::parse("SCRAM server signature missing from client state")
                 })?;
-                bifrost_sasl::verify_server_final(server_line, &expected)?;
+                bifrost_sasl::verify_server_final(server_line, &expected)
+                    .map_err(|e| named_sasl_error(self.mechanism_name, e))?;
                 self.state = ScramExchangeState::Done;
                 Ok(ScramStep::Complete)
             }
@@ -682,7 +724,7 @@ fn generate_scram_nonce() -> Result<String, Error> {
     let mut bytes = [0u8; 18];
     getrandom::fill(&mut bytes).map_err(|e| {
         error::invalid_input(format!("failed to generate SCRAM nonce: {e}"))
-            .with_phase(SmtpCommandPhase::Auth)
+            .with_phase(SmtpCommandPhase::Auth { mechanism: None })
     })?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
@@ -903,7 +945,10 @@ mod test {
         )
         .unwrap_err();
         assert!(err.is_invalid_input());
-        assert_eq!(err.phase(), Some(SmtpCommandPhase::Auth));
+        assert_eq!(
+            err.phase(),
+            Some(SmtpCommandPhase::Auth { mechanism: None })
+        );
         assert_eq!(
             err.diagnostic_text().as_deref(),
             Some("channel binding required but unavailable")
@@ -914,7 +959,10 @@ mod test {
         // PLUS rung was skipped).
         let err = password_mechanism(&[], &ServerInfo::default(), true).unwrap_err();
         assert!(err.is_invalid_input());
-        assert_eq!(err.phase(), Some(SmtpCommandPhase::Auth));
+        assert_eq!(
+            err.phase(),
+            Some(SmtpCommandPhase::Auth { mechanism: None })
+        );
         assert_eq!(
             err.diagnostic_text().as_deref(),
             Some("no compatible authentication mechanism")
@@ -941,7 +989,10 @@ mod test {
         let auth_failed: super::Error =
             bifrost_sasl::SaslError::AuthFailed("server rejected".into()).into();
         assert_eq!(auth_failed.kind(), &ErrorKind::InvalidInput);
-        assert_eq!(auth_failed.phase(), Some(SmtpCommandPhase::Auth));
+        assert_eq!(
+            auth_failed.phase(),
+            Some(SmtpCommandPhase::Auth { mechanism: None })
+        );
     }
 
     #[test]
@@ -1078,7 +1129,56 @@ mod test {
         // on the Auth-phase InvalidInput lane (Authorization(PolicyBlocked)).
         let err = exchange.step("e=invalid-proof").unwrap_err();
         assert!(err.is_invalid_input(), "got {err:?}");
-        assert_eq!(err.phase(), Some(SmtpCommandPhase::Auth));
+        assert_eq!(
+            err.phase(),
+            Some(SmtpCommandPhase::Auth { mechanism: None })
+        );
+        // The server refused THIS rung, and the exchange is the last place
+        // that still knows which one. The name rides the diagnostic message,
+        // which `account_error.rs` turns into support-only `DiagnosticText`;
+        // the classification above is unchanged by the attribution.
+        let text = err.diagnostic_text().unwrap_or_default();
+        assert!(text.contains("invalid-proof"), "got {text}");
+        assert!(text.contains("SCRAM-SHA-256"), "got {text}");
+    }
+
+    #[test]
+    fn a_named_scram_failure_keeps_the_plus_suffix() {
+        use super::{ScramExchange, ScramStep, scram_hash};
+        use bifrost_sasl::ScramChannelBinding;
+
+        // An operator debugging a channel-binding problem has to be able to
+        // tell the bound rung from the unbound one, so the `-PLUS` suffix must
+        // survive into the diagnostic rather than collapsing to the hash name.
+        let hash = scram_hash(Mechanism::ScramSha256Plus).unwrap();
+        let mut exchange = ScramExchange::new(
+            hash,
+            ScramChannelBinding::TlsServerEndPoint(vec![1, 2, 3, 4]),
+            "user",
+            "pencil".into(),
+        )
+        .unwrap();
+        let decoded =
+            String::from_utf8(crate::base64::decode(exchange.client_first()).unwrap()).unwrap();
+        let nonce = decoded.rsplit("r=").next().unwrap().to_owned();
+        let server_first = format!("r={nonce}srvextra,s=QSXCR+Q6sek8bf92,i=4096");
+        assert!(matches!(
+            exchange.step(&server_first).unwrap(),
+            ScramStep::Reply(_)
+        ));
+
+        let err = exchange.step("e=invalid-proof").unwrap_err();
+        let text = err.diagnostic_text().unwrap_or_default();
+        assert!(text.contains("SCRAM-SHA-256-PLUS"), "got {text}");
+
+        // A protocol-class failure is named too, and stays parse-class.
+        let mut exchange =
+            ScramExchange::new(hash, ScramChannelBinding::None, "user", "pw".into()).unwrap();
+        let err = exchange.step("garbage-without-r=").unwrap_err();
+        assert!(err.is_parse(), "got {err:?}");
+        let text = err.diagnostic_text().unwrap_or_default();
+        assert!(text.contains("SCRAM-SHA-256"), "got {text}");
+        assert!(!text.contains("-PLUS"), "got {text}");
     }
 
     #[test]

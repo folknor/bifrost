@@ -65,9 +65,14 @@ impl ImapConnection {
                 // Read the current token from the shared source at connect
                 // time. On a reconnect this re-enters here and re-reads, so
                 // a token rotated since the last connect is presented fresh.
-                let access_token = token_source.current().await.map_err(|e| Error::Auth {
-                    text: format!("failed to read OAuth access token: {e}"),
-                    code: None,
+                let access_token = token_source.current().await.map_err(|e| {
+                    // The mechanism was already selected above, so the
+                    // failure can name the rung it would have been used for.
+                    Error::auth_with_mechanism(
+                        format!("failed to read OAuth access token: {e}"),
+                        None,
+                        mechanism.name(),
+                    )
                 })?;
                 match mechanism {
                     AuthMechanism::OAuthBearer => {
@@ -154,6 +159,15 @@ impl ImapConnection {
                     // next rung rather than aborting the whole ladder, so a
                     // disappearing SCRAM rung still falls through to
                     // PLAIN-over-TLS instead of failing the connect.
+                    //
+                    // The rung must still be RECORDED. Falling through with
+                    // nothing pushed makes the rung vanish from the failure
+                    // entirely: it is not in `rejected` (nothing rejected it
+                    // locally) and it left no other trace, so if it was the
+                    // last rung the operator gets an `AuthPolicyFailure` whose
+                    // diagnostic omits the one mechanism that actually went
+                    // missing - and `offered`, snapshotted before the ladder
+                    // ran, still lists it as available.
                     match attempt {
                         Ok(()) => {}
                         Err(Error::MissingCapability(cap)) => {
@@ -163,6 +177,10 @@ impl ImapConnection {
                                 "auth mechanism unavailable on live snapshot \
                                  (capability skew); falling through to next rung"
                             );
+                            rejected.push(AuthMechanismRejection::new(
+                                mechanism,
+                                AuthMechanismRejectionReason::UnavailableOnLiveSnapshot,
+                            ));
                             continue;
                         }
                         Err(other) => return Err(other),
@@ -397,7 +415,11 @@ impl ImapConnection {
             },
         };
 
-        let consumer = AuthenticateXoauth2Consumer::new(encoded, has_sasl_ir);
+        let consumer = AuthenticateXoauth2Consumer::new(
+            encoded,
+            has_sasl_ir,
+            crate::types::AuthMechanism::XOAuth2.name(),
+        );
         let deadline = tokio::time::Instant::now() + timeout;
         let caps_provided =
             tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
@@ -473,7 +495,11 @@ impl ImapConnection {
             },
         };
 
-        let consumer = AuthenticateXoauth2Consumer::new(encoded, has_sasl_ir);
+        let consumer = AuthenticateXoauth2Consumer::new(
+            encoded,
+            has_sasl_ir,
+            crate::types::AuthMechanism::OAuthBearer.name(),
+        );
         let deadline = tokio::time::Instant::now() + timeout;
         let caps_provided =
             tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
@@ -1120,8 +1146,10 @@ fn offered_authentication(
 /// Check if `IMAP4rev2` behavior is active from a
 /// [`ConnectionStateSnapshot`](driver::ConnectionStateSnapshot).
 ///
-/// Mirrors `ImapConnection::is_rev2` but operates on the snapshot so it
-/// can be used while the borrow is held (RFC 9051 Section6.3.1).
+/// This is the rule, not a copy of it: `ImapConnection::is_rev2` borrows the
+/// snapshot and delegates here. Taking the snapshot as an argument is what lets
+/// a caller that already holds the borrow ask the question (RFC 9051
+/// Section6.3.1).
 pub(super) fn is_rev2_from_snapshot(snap: &driver::ConnectionStateSnapshot) -> bool {
     let has_rev2 = snap.capabilities.contains(&Capability::Imap4Rev2);
     let has_rev1 = snap.capabilities.contains(&Capability::Imap4Rev1);
@@ -1299,6 +1327,47 @@ mod ladder_tests {
         assert!(p256 < p1, "SHA-256-PLUS must precede SHA-1-PLUS");
         assert!(p1 < n256, "SHA-1-PLUS must precede non-PLUS SCRAM");
         assert!(n256 < plain, "non-PLUS SCRAM must precede PLAIN");
+    }
+
+    /// RFC 3501 Section 7.2.1: capability names are case-insensitive, so a
+    /// server advertising `AUTH=plain` advertises PLAIN. The rung gate
+    /// (`ServerProfile::supports_sasl_auth`, which lowercases nothing but
+    /// compares case-insensitively) and the live gate inside
+    /// `authenticate_plain` (`Capability::Auth("PLAIN")` membership) must agree
+    /// about that. If the live gate compared byte-exactly, such a server would
+    /// have PLAIN admitted onto the ladder and then refused `MissingCapability`
+    /// on every attempt: a permanent skew, not a race.
+    #[tokio::test]
+    async fn a_lowercase_auth_advertisement_satisfies_the_live_plain_gate() {
+        use crate::connection::SessionState;
+        use crate::connection::test_support::detached;
+        use crate::error::Error;
+        use std::time::Duration;
+
+        let connection = detached(
+            SessionState::NotAuthenticated,
+            vec![Capability::Auth("plain".to_owned())],
+            &[],
+        );
+        assert!(
+            connection
+                .server_profile()
+                .supports_sasl_auth(AuthMechanism::Plain),
+            "the rung gate admits a lowercase advertisement"
+        );
+
+        // The detached driver cannot answer, so this necessarily fails; what
+        // matters is WHERE. Anything past the capability gate means the gate
+        // accepted the advertisement.
+        let err = connection
+            .authenticate_plain("user", "pw", Duration::from_secs(5))
+            .await
+            .expect_err("a detached driver can never complete the exchange");
+        assert!(
+            matches!(err, Error::DriverGone { .. }),
+            "AUTH=plain must satisfy the live AUTH=PLAIN gate and reach the \
+             driver, got {err:?}"
+        );
     }
 
     #[test]
