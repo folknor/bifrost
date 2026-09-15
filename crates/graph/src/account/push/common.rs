@@ -98,6 +98,22 @@ pub(super) fn no_subscribable_push_scopes(failed: &[bifrost_types::BatchFailure]
 }
 
 /// Raise the account's push-down latch, emitting `Disconnected` on the edge.
+///
+/// The latch moves whether or not the send lands. `push_tx` is a broadcast
+/// sender, so a send with no subscriber is discarded, and a consumer that
+/// attaches mid-outage will later be handed a `Reconnected` whose matching
+/// `Disconnected` it never saw. That asymmetry is deliberate, because the
+/// surviving half is the conservative one: `Reconnected` costs the engine a
+/// whole-account `Coalesced` reconcile, while the lost `Disconnected` is an
+/// advisory warning carrying no coverage obligation (the sync reconciler
+/// answers it with a `Warning` and nothing else, and holds no connectivity
+/// state that the missing half could make WRONG).
+///
+/// Gating the latch on a successful send inverts that trade. The outage
+/// would go unrecorded, so the recovery would raise no edge, and a consumer
+/// present for the recovery would lose the reconcile that covers the gap -
+/// a missed reconcile in place of a superfluous one. The latch records the
+/// outage the account had, not the outage somebody was listening for.
 pub(super) fn mark_push_disconnected(account: &crate::account::GraphAccount) {
     if !account
         .push_disconnected

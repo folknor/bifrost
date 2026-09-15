@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use bifrost_types::{Account, CursorScope, MembershipScope, SyncEvent, Warning};
+use futures::StreamExt as _;
 
 use super::{ImapAccount, folder_scope, membership_scope};
 
@@ -29,12 +30,29 @@ pub(crate) fn discover_cursor_scopes(
         .into_iter()
         .flatten()
         .collect();
-    // Degraded-DAV warnings recorded at open (brick 5) surface here, on
-    // the first discovery, so the engine observes the degradation.
-    let degraded = account.take_dav_degraded_warnings();
-    fan_in_discovery(folder_scopes, degraded, subs, |sub| {
+    // Degraded-DAV warnings recorded at open (brick 5) surface here so the
+    // engine observes the degradation. The read is non-consuming and the
+    // clear is acknowledge-driven: the warnings ride inside a future that
+    // `merge_scope_streams` only runs on first poll, and a consumer that
+    // builds this stream and drops it un-polled (the engine's attach path
+    // can) would otherwise destroy the one and only record that a CardDAV
+    // or CalDAV half is missing, leaving the account presenting as
+    // mail-only with nothing left to re-read. Clearing on the terminal
+    // `Done` bounds re-reporting to at most one duplicate per dropped
+    // stream, and discovery is not a hot path.
+    let degraded = account.peek_dav_degraded_warnings();
+    let acknowledge = !degraded.is_empty();
+    let stream = fan_in_discovery(folder_scopes, degraded, subs, |sub| {
         sub.discover_cursor_scopes()
-    })
+    });
+    if !acknowledge {
+        return stream;
+    }
+    Box::pin(stream.inspect(move |event| {
+        if matches!(event, SyncEvent::Done(_)) {
+            account.clear_dav_degraded_warnings();
+        }
+    }))
 }
 
 pub(crate) fn discover_memberships(
@@ -351,5 +369,106 @@ mod tests {
         assert!(saw_done);
         assert_eq!(warnings, 1, "sub failure surfaces as exactly one warning");
         assert_eq!(items, vec![folder], "IMAP folder scopes still flow");
+    }
+
+    mod degraded_dav {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        use bifrost_types::{SyncEvent, Warning, WarningKind};
+        use futures::StreamExt as _;
+
+        use super::super::super::factory::ImapAccountConfig;
+        use super::super::super::{ImapAccount, ImapAccountParts, Pool};
+        use super::super::discover_cursor_scopes;
+        use crate::connection::test_support::{driver_pair, preauth_greeting};
+        use crate::types::{AuthPolicy, Credentials};
+
+        async fn degraded_account() -> (ImapAccount, tokio::io::DuplexStream) {
+            let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+            let config = Arc::new(ImapAccountConfig::new(
+                crate::ImapConfig::plaintext("test.invalid"),
+                Credentials::password("user", "pass"),
+                AuthPolicy::default(),
+            ));
+            let bandwidth_cap = Arc::new(AtomicU64::new(0));
+            let pool = Arc::new(Pool::new(
+                Arc::clone(&config),
+                conn,
+                1,
+                None,
+                Arc::clone(&bandwidth_cap),
+            ));
+            let account = ImapAccount::new(ImapAccountParts {
+                config,
+                capabilities: super::super::super::test_support::stub_capabilities(),
+                pool,
+                folders: Default::default(),
+                qresync_enabled: false,
+                qresync_negotiation_warning: None,
+                supports_notify: false,
+                bandwidth_cap,
+                contacts: None,
+                calendars: None,
+                dav_scopes: Default::default(),
+                submission: None,
+                dav_degraded: vec![Warning::support_only(
+                    WarningKind::Other,
+                    "CardDAV sub-account failed to attach; mail only",
+                )],
+            });
+            (account, server)
+        }
+
+        async fn drain_warnings(
+            mut stream: bifrost_types::AccountStream<SyncEvent<bifrost_types::CursorScope>>,
+        ) -> usize {
+            let mut warnings = 0;
+            while let Some(event) = stream.next().await {
+                match event {
+                    SyncEvent::Warning(_) => warnings += 1,
+                    SyncEvent::Done(_) => break,
+                    _ => {}
+                }
+            }
+            warnings
+        }
+
+        /// The degraded-DAV warnings are the only record that a configured
+        /// CardDAV/CalDAV half is missing. A discovery stream built and
+        /// dropped before its first poll - which the engine's attach path
+        /// can do - must not consume them, or the account presents as
+        /// mail-only with nothing left to re-read.
+        #[tokio::test]
+        async fn a_discovery_stream_dropped_unpolled_keeps_the_degraded_warnings() {
+            let (account, _server) = degraded_account().await;
+
+            drop(discover_cursor_scopes(account.clone()));
+
+            assert_eq!(
+                drain_warnings(discover_cursor_scopes(account.clone())).await,
+                1,
+                "the degradation must survive a discovery stream nobody polled",
+            );
+        }
+
+        /// The flip side: once a discovery stream has actually delivered
+        /// the warnings and its terminal `Done`, the next discovery is
+        /// silent. Without this the fix would re-report the same
+        /// degradation on every discovery.
+        #[tokio::test]
+        async fn a_fully_consumed_discovery_acknowledges_the_degraded_warnings() {
+            let (account, _server) = degraded_account().await;
+
+            assert_eq!(
+                drain_warnings(discover_cursor_scopes(account.clone())).await,
+                1
+            );
+            assert_eq!(
+                drain_warnings(discover_cursor_scopes(account.clone())).await,
+                0,
+                "a delivered degradation must not be re-reported",
+            );
+        }
     }
 }

@@ -11,9 +11,9 @@ use crate::types::{FetchAttr, MailboxName, SelectedMailbox, UidSet};
 
 use super::folder_registry::expand_range;
 use super::{
-    BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, ScopeHandler, batch,
-    boxed_receiver_stream, decode_cursor, encode_cursor, encode_object_id, folder_from_scope,
-    folder_scope, membership_scope, route_scope, terminated_event,
+    BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, ScopeHandler, batch, decode_cursor,
+    encode_cursor, encode_object_id, folder_from_scope, folder_scope, membership_scope,
+    route_scope, terminated_event,
 };
 
 pub(crate) fn describe_cursor(account: &ImapAccount, cursor: &ChangeCursor) -> CursorDescriptor {
@@ -83,7 +83,7 @@ pub(crate) fn changes_stream(
     }
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let scope_for_ctx = cursor.scope.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         match run_changes(account, cursor, tx.clone()).await {
             Ok(()) | Err(ChangeError::ChannelDropped) => {}
             Err(ChangeError::Account(err)) => {
@@ -124,7 +124,13 @@ pub(crate) fn changes_stream(
             }
         }
     });
-    boxed_receiver_stream(rx)
+    // Abort-on-drop, not fire-and-forget: the engine cuts a pending
+    // changes poll on every PAUSE and then calls back in on the same
+    // account, so a task that outlived its receiver would keep issuing
+    // IMAP commands beside its successor while sitting on a pool checkout
+    // it only releases at its next failed send. See
+    // `guarded_receiver_stream` for why aborting mid-command is safe.
+    super::guarded_receiver_stream(rx, task)
 }
 
 #[derive(Debug)]

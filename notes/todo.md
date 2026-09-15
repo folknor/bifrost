@@ -78,54 +78,51 @@ asked for; that review debt is listed under their crates below.
   close phases by the per-phase budgets. If it is wanted, the restaged test must
   keep the `Drop`-instant probe.
 
-- **imap: a paused `changes_stream` leaves an ORPHANED driver task on the
-  account.** Widened 2026-09-15 from a note that scoped this to a lost QRESYNC
-  warning; the warning was the symptom and this is the shape. IMAP's
-  `changes_stream` is channel-backed by a detached `tokio::spawn`, so dropping
-  the stream drops only the RECEIVER - the task runs on against the account's
-  connection until its next `tx.send` fails. The engine now cuts a pending poll
-  on every PAUSE, not only at teardown, and the poll loop then calls
-  `changes_stream` again on the same account, so pause/resume churn can leave
-  two spawned drivers issuing IMAP commands concurrently over one
-  `ImapAccount`, the older one holding a pool checkout it will not release until
-  it next tries to send.
-  Checked and NOT found: silent data loss. `record_modseq` feeds a per-UID cache
-  used for opportunistic `STORE UNCHANGEDSINCE`, not a sync cursor, and the
-  engine's cursor advances only on published checkpoints. So this is duplicated
-  work and a held connection, not lost mail.
-  Related and also true before this change: `SyncControl::pause` reports
-  quiescence while such a task is still talking to the server, because the
-  activity guard lives in the drive rather than in the provider's task. Reached
-  far more often now.
-  The QRESYNC half is FIXED: `run_changes` no longer takes the account-level
-  one-shot, because that take could not change a byte of what it emitted and
-  only spent the warning out from under `run_inventory`. What remains is that
-  `run_inventory` can still spend it and lose it in the same drop window, and
-  the structural fix is the orphan above rather than the one-shot.
+- **imap: `get_stream` and `push` use the unguarded detached-spawn shape.**
+  Found 2026-09-15 while guarding the changes and inventory streams. Those two
+  now hold an `AbortOnDrop` guard, so dropping the stream stops the spawned task
+  and returns its pool checkout; `get.rs` and `push.rs` still spawn detached.
+  `get_stream` is short-lived but carries the identical hazard - a dropped
+  receiver leaves it running against the account's connection until its next
+  failed send. `push.rs` is account-lifetime and owns its own shutdown token, so
+  it is probably fine as it stands. Wants a ruling on whether the guard should be
+  the crate-wide default for spawn-backed streams, or whether the two remaining
+  sites are deliberate.
 
-- **imap: `take_dav_degraded_warnings` drains with no fallback and no delivery
-  guarantee.** Found 2026-09-15 by the same audit, and strictly worse than the
-  QRESYNC case it was found beside. `discover_cursor_scopes` drains a
-  `Mutex<Vec<Warning>>` SYNCHRONOUSLY, before the stream is constructed, and the
-  drained warnings then ride inside a `stream::once` future. Drop that stream
-  un-polled and they are gone permanently - unlike the QRESYNC warning there is
-  no non-consuming sibling to re-read, because the `Vec` was emptied. These are
-  the warnings that tell a consumer its CardDAV or CalDAV half degraded to
-  IMAP-only for the cycle, so losing them means an account silently presents as
-  mail-only. Same class as the one-shot; the fix is the same question of where a
-  consume-on-read lives relative to a delivery that can fail.
+- **imap: three copies of a `Pool`-backed `ImapAccount` test builder.** Left by
+  the stream-guard work, because `account/test_support.rs` was outside the
+  editing scope at the time: `scripted_tests.rs` has one and two nested test
+  modules grew their own. Folding a single `scripted_account`-style helper into
+  `test_support.rs` removes all three. Pure test hygiene, no behaviour.
 
-- **graph: a push connectivity edge can be raised without being delivered.**
-  `mark_push_disconnected` / `mark_push_reconnected` flip `push_disconnected`
-  and then `let _ = push_tx.send(..)` on a `broadcast::Sender`. A send with no
-  receivers returns `Err` and is discarded while the latch has already moved, so
-  a consumer subscribing between a lost `Disconnected` and a later `Reconnected`
-  sees one half of an edge it never saw the other half of. Same shape as the two
-  above: state mutated independently of successful delivery.
-  The distinction worth keeping when this class is written up: a one-shot flag
-  is SAFE when the flag itself is the observable (`closed.swap(true)` and its
-  google/jmap equivalents are idempotent by design), and unsafe the moment the
-  flag guards a payload travelling over a channel someone else can drop.
+- **graph: a lost `Disconnected` costs a WARNING, and the obvious fix is a
+  trap.** INVESTIGATED 2026-09-15 and deliberately NOT fixed; the mechanism is
+  real but the consequence is nil, and that is recorded here so nobody
+  rediscovers it and "repairs" it.
+  `mark_push_disconnected` flips the `push_disconnected` latch and then does
+  `let _ = push_tx.send(..)` on a broadcast sender, which errs with zero
+  receivers. The latch is `pub(crate)` and reachable through no capability,
+  snapshot or query, so a late subscriber genuinely cannot recover the edge it
+  missed. What makes it harmless is the CONSUMER: bifrost-sync's reconciler
+  holds no connectivity state at all - `Disconnected` emits one advisory
+  `Warning` and nothing else, `Reconnected` triggers an account-wide reconcile -
+  so a surviving lone `Reconnected` yields a SUPERFLUOUS reconcile, never a
+  missed one. The dangerous mirror cannot occur: a live consumer IS a receiver,
+  so `Reconnected` cannot be lost while anyone is listening, and a `Lagged`
+  receiver is turned into the same `Coalesced` invalidation anyway. The latch
+  also never wedges, since a lost edge leaves it in the state that makes the
+  NEXT edge fire.
+  THE TRAP, pinned by an ablation test: gating the `swap(true)` on
+  `push_tx.send(..).is_ok()` - the obvious "only move the latch when delivery
+  succeeds" repair - is WORSE than the defect. An outage that begins with no
+  subscriber would go unrecorded, so `mark_push_reconnected` would find the
+  latch already down, emit nothing, and a consumer that attached mid-outage and
+  was present at recovery would get NO reconcile at all. That converts a
+  redundant reconcile into a missed one.
+  If the missing warning ever matters, the sound repair is prime-on-subscribe:
+  have `push_stream` yield `Disconnected` as its first item when the latch is
+  up. It adds no reconciles, only the advisory warning. Not built, because
+  nothing needs it yet.
 
 - **imap: a prebuilt APPEND or MULTIAPPEND can be encoded from a stale
   snapshot.** Found 2026-09-15 by the cold review of the `is_rev2` unification,

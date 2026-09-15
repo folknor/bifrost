@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 
 use bifrost_types::{ChangeCursor, CursorScope, MembershipScope};
 
@@ -57,6 +58,20 @@ struct RegistryState {
     /// would make them discard valid results and repeat their work from
     /// the cursors they started at.
     scope_generations: HashMap<CursorScope, u64>,
+    /// Per-scope liveness token, minted in `put_locked` in the same branch
+    /// that mints the incarnation and cancelled by `delete` under this same
+    /// write lock. Token identity therefore IS incarnation identity, and
+    /// token presence and cursor presence are one atomic fact.
+    ///
+    /// The generation fence refuses a dead drive's PUBLICATION; this is what
+    /// ends the drive itself. Without it a `drive_changes_stream` parked on a
+    /// wedged provider stream keeps the scope's drive lease after the scope is
+    /// gone, and the replacement incarnation waits on `claim_drive` forever.
+    /// It lives here rather than in the multiplexer's `ScopeTokens` because
+    /// what a drive needs bounded is the SCOPE's lifetime, not the poll
+    /// task's - and because the poll task is not the only drive path: the push
+    /// reconciler holds no poll token at all.
+    scope_cancels: HashMap<CursorScope, CancellationToken>,
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +157,12 @@ impl CursorRegistry {
         if !guard.cursors.contains_key(&cursor.scope) {
             let incarnation = self.next_incarnation.fetch_add(1, Ordering::Relaxed);
             guard.incarnations.insert(cursor.scope.clone(), incarnation);
+            // Same branch, same lock: a fresh incarnation gets a fresh,
+            // uncancelled token. Minting it anywhere else would let an
+            // incarnation inherit a token some earlier `delete` already fired.
+            guard
+                .scope_cancels
+                .insert(cursor.scope.clone(), CancellationToken::new());
         }
         guard.cursors.insert(cursor.scope.clone(), cursor);
     }
@@ -183,6 +204,16 @@ impl CursorRegistry {
         // publication is refused, and a later incarnation starts from a
         // generation it cannot match. Sibling scopes are untouched.
         *state.scope_generations.entry(scope.clone()).or_default() += 1;
+        // ...and END any drive already in flight for THIS scope. The fence
+        // above only refuses the publication; a drive parked on a provider
+        // stream that never yields would otherwise hold the lease forever and
+        // the next incarnation would never acquire it. Removing the token in
+        // the same breath keeps "cursor present" and "token present" the same
+        // fact, so a drive entering afterwards finds no cursor and never
+        // starts.
+        if let Some(cancel) = state.scope_cancels.remove(scope) {
+            cancel.cancel();
+        }
         drop(state);
         // The lease entry deliberately SURVIVES the delete. Removing it
         // would let a re-established scope mint a second, different
@@ -276,6 +307,18 @@ impl CursorRegistry {
             }
         }
         self.registry_generation.fetch_add(1, Ordering::SeqCst);
+        // A scope the replacement does not carry is gone exactly as if
+        // `delete` had run, so its in-flight drive has to end for the same
+        // reason: nothing will ever consume its result, and it is sitting on
+        // the scope lease. A RETAINED scope keeps its existing token, because
+        // it keeps its existing incarnation - the staging registry minted its
+        // own tokens under `put`, and adopting those would hand a live scope a
+        // token no delete path holds a handle to.
+        for (scope, cancel) in &current.scope_cancels {
+            if !replacement.cursors.contains_key(scope) {
+                cancel.cancel();
+            }
+        }
         for scope in replacement.cursors.keys() {
             let incarnation = current
                 .incarnations
@@ -283,6 +326,12 @@ impl CursorRegistry {
                 .copied()
                 .unwrap_or_else(|| self.next_incarnation.fetch_add(1, Ordering::Relaxed));
             replacement.incarnations.insert(scope.clone(), incarnation);
+            let cancel = current
+                .scope_cancels
+                .get(scope)
+                .cloned()
+                .unwrap_or_default();
+            replacement.scope_cancels.insert(scope.clone(), cancel);
         }
         *current = replacement;
     }
@@ -312,6 +361,22 @@ impl CursorRegistry {
             _guard: guard,
             generation: self.drive_generation(scope),
         }
+    }
+
+    /// The scope's liveness token: cancelled when the scope leaves the
+    /// registry, whether by `delete` (lifecycle deletion, `RestartScope`,
+    /// `DowngradeCapabilityForScope`, `DisableScope`) or by a topology
+    /// replacement that drops it.
+    ///
+    /// `None` means the registry does not hold this scope, which is the same
+    /// condition a cancelled token reports. A caller that wants a drive
+    /// bounded by scope lifetime should use [`CursorRegistry::with_drive`],
+    /// which does this already; this accessor exists for the paths that need
+    /// the token without the lease.
+    #[must_use]
+    pub fn scope_cancel(&self, scope: &CursorScope) -> Option<CancellationToken> {
+        let state = self.state.read().expect("poisoned");
+        state.scope_cancels.get(scope).cloned()
     }
 
     /// Current fence pair for a scope.
@@ -374,15 +439,53 @@ impl CursorRegistry {
     /// scope makes the next `with_drive` yield `None` rather than driving a
     /// cursor nobody owns. The lease entry itself survives a delete, so a
     /// re-established scope still waits for this drive to finish.
+    ///
+    /// The drive is also raced against the scope's liveness token, so a delete
+    /// landing MID-DRIVE ends it instead of waiting for a provider stream that
+    /// may never yield again. That is the difference between "the replacement
+    /// incarnation starts" and "the replacement incarnation blocks on
+    /// `claim_drive` for the life of the process": the fence alone rejects the
+    /// dead drive's result but leaves it holding the lease.
+    ///
+    /// `None` covers both "this scope is not in the registry" and "the drive
+    /// was cut because the scope left the registry". They are deliberately not
+    /// split, because under the registry's own locking they are one event
+    /// observed at two moments: `delete` removes the cursor and cancels the
+    /// token under a single write lock, so a cancelled drive's scope is gone
+    /// and a gone scope's drive is cancelled. A separate outcome would let a
+    /// caller branch on when it happened to look, not on what happened. Both
+    /// call sites want the same answer either way - stop touching this scope -
+    /// and both already give it.
     pub async fn with_drive<T, F, Fut>(&self, scope: &CursorScope, drive: F) -> Option<T>
     where
         F: FnOnce(ChangeCursor, DriveGeneration) -> Fut,
         Fut: Future<Output = T>,
     {
         let guard = self.claim_drive(scope).await;
-        let cursor = self.snapshot(scope)?;
+        // Cursor and token come out of ONE read: taken separately, a delete
+        // landing between them yields a cursor with no token, which is exactly
+        // the uncovered drive this method exists to rule out.
+        let (cursor, cancel) = {
+            let state = self.state.read().expect("poisoned");
+            let cursor = state.cursors.get(scope).cloned()?;
+            (cursor, state.scope_cancels.get(scope).cloned())
+        };
+        debug_assert!(
+            cancel.is_some(),
+            "every registered cursor carries a liveness token"
+        );
         let generation = guard.drive_generation();
-        Some(drive(cursor, generation).await)
+        let driving = drive(cursor, generation);
+        let Some(cancel) = cancel else {
+            return Some(driving.await);
+        };
+        tokio::select! {
+            // Biased so an already-dead scope never gets its drive polled
+            // once: the first poll is where the wire work starts.
+            biased;
+            () = cancel.cancelled() => None,
+            driven = driving => Some(driven),
+        }
     }
 }
 
@@ -600,6 +703,120 @@ mod tests {
         drop(first);
         acquired_rx.await.expect("contender acquires after release");
         contender.await.expect("contender task completes");
+    }
+
+    /// The point of the liveness token is not that a dead drive exits - that
+    /// only proves an arm fired. It is that the REPLACEMENT incarnation gets
+    /// the lease and drives the NEW cursor. Before the token, the wedged drive
+    /// below kept the lease and this `with_drive` never resolved.
+    #[tokio::test]
+    async fn a_replacement_incarnation_drives_after_a_wedged_drive_is_cut() {
+        let registry = Arc::new(CursorRegistry::new());
+        let scope = CursorScope::Account;
+        registry.put(cursor(scope.clone(), b"first"));
+
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let wedged_registry = Arc::clone(&registry);
+        let wedged_scope = scope.clone();
+        let wedged = tokio::spawn(async move {
+            wedged_registry
+                .with_drive(&wedged_scope, |cursor, _| async move {
+                    parked_tx
+                        .send(cursor.server_state.bytes)
+                        .expect("test receiver remains live");
+                    // A provider stream that never yields again.
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+        assert_eq!(
+            parked_rx.await.expect("the first drive parks"),
+            b"first".to_vec()
+        );
+
+        // The scope is deleted and immediately re-established.
+        registry.delete(&scope);
+        registry.put(cursor(scope.clone(), b"second"));
+
+        assert!(
+            wedged.await.expect("wedged task completes").is_none(),
+            "a cut drive reports no result"
+        );
+        let driven = registry
+            .with_drive(&scope, |cursor, _| async move { cursor.server_state.bytes })
+            .await;
+        assert_eq!(
+            driven.expect("the replacement incarnation drives"),
+            b"second".to_vec(),
+            "the replacement must acquire the lease and drive the NEW cursor"
+        );
+    }
+
+    /// The negative arm: a blanket "any registry mutation cancels every drive"
+    /// implementation would pass the test above. Deleting a DIFFERENT scope
+    /// must leave this drive running and let it finish normally.
+    #[tokio::test]
+    async fn deleting_another_scope_does_not_cut_this_drive() {
+        let registry = Arc::new(CursorRegistry::new());
+        let mine = CursorScope::Type(ObjectType::Email);
+        let other = CursorScope::Type(ObjectType::CalendarEvent);
+        registry.put(cursor(mine.clone(), b"mine"));
+        registry.put(cursor(other.clone(), b"other"));
+
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let drive_registry = Arc::clone(&registry);
+        let drive_scope = mine.clone();
+        let driving = tokio::spawn(async move {
+            drive_registry
+                .with_drive(&drive_scope, |cursor, _| async move {
+                    parked_tx.send(()).expect("test receiver remains live");
+                    release_rx.await.expect("test sender remains live");
+                    cursor.server_state.bytes
+                })
+                .await
+        });
+        parked_rx.await.expect("the drive parks");
+
+        registry.delete(&other);
+        tokio::task::yield_now().await;
+        release_tx.send(()).expect("the drive is still running");
+
+        assert_eq!(
+            driving
+                .await
+                .expect("drive task completes")
+                .expect("an unrelated delete must not cut this drive"),
+            b"mine".to_vec()
+        );
+    }
+
+    /// A topology replacement that DROPS a scope is a delete for that scope,
+    /// and has to end its drive for the same reason. A scope the replacement
+    /// retains keeps its token, so its drive survives the cutover.
+    #[tokio::test]
+    async fn a_topology_replacement_cuts_only_the_scopes_it_drops() {
+        let registry = Arc::new(CursorRegistry::new());
+        let dropped = CursorScope::Type(ObjectType::Email);
+        let kept = CursorScope::Type(ObjectType::CalendarEvent);
+        registry.put(cursor(dropped.clone(), b"dropped"));
+        registry.put(cursor(kept.clone(), b"kept"));
+
+        let replacement = CursorRegistry::new();
+        replacement.put(cursor(kept.clone(), b"staged"));
+        registry.replace_topology_preserving_cursors(&replacement);
+
+        assert!(
+            registry
+                .scope_cancel(&dropped)
+                .is_none_or(|token| token.is_cancelled()),
+            "a dropped scope's drive must be cut"
+        );
+        let kept_token = registry.scope_cancel(&kept).expect("retained scope token");
+        assert!(
+            !kept_token.is_cancelled(),
+            "a retained scope keeps a live token across the cutover"
+        );
     }
 
     /// The lease map must not grow without bound just because entries

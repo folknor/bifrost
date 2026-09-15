@@ -10,9 +10,8 @@ use futures::StreamExt as _;
 use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSet};
 
 use super::{
-    BATCH_ITEMS, CompactUidSet, ImapAccount, ScopeHandler, batch, boxed_receiver_stream,
-    encode_cursor, encode_object_id, folder_from_scope, folder_scope, membership_scope,
-    route_scope, terminated_event,
+    BATCH_ITEMS, CompactUidSet, ImapAccount, ScopeHandler, batch, encode_cursor, encode_object_id,
+    folder_from_scope, folder_scope, membership_scope, route_scope, terminated_event,
 };
 
 pub(crate) fn establish_initial_cursor(
@@ -57,8 +56,9 @@ pub(crate) fn inventory_stream(
     }
     let domain = bifrost_types::CoverageDomain::full(scope.clone());
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
-    tokio::spawn(async move {
-        match run_inventory(account, scope.clone(), tx.clone()).await {
+    let ticket = QresyncWarningTicket::new(account.clone(), tx.clone());
+    let task = tokio::spawn(async move {
+        match run_inventory(account, scope.clone(), tx.clone(), &ticket).await {
             Ok(()) | Err(InventoryError::ChannelDropped) => {}
             Err(InventoryError::Imap(err)) => {
                 let _ = tx
@@ -80,7 +80,54 @@ pub(crate) fn inventory_stream(
     });
     // The channel carries `SyncEvent<InventoryEntry>` internally; this walk
     // terminates wholesale on failure, so COMPLETE coverage is accurate.
-    Box::pin(boxed_receiver_stream(rx).map(bifrost_types::lift_complete_walk(domain)))
+    // Abort-on-drop for the same reason as `changes_stream`: a dropped
+    // stream must stop the work and release the pooled connection rather
+    // than leave a second driver running against the same account.
+    Box::pin(
+        super::guarded_receiver_stream(rx, task).map(bifrost_types::lift_complete_walk(domain)),
+    )
+}
+
+/// Ownership ticket for the account-level QRESYNC negotiation one-shot.
+///
+/// `run_inventory` is the only place that spends that one-shot for real,
+/// and it does so inside a spawned task whose receiver the engine may drop
+/// at any time. Taking it and then losing the stream would burn the
+/// warning with nobody informed, and there is no second chance: the flag
+/// is one-way. The ticket therefore un-spends the one-shot when the task
+/// ends with its output channel already closed - the only case in which
+/// the warning provably reached no one. If the receiver is still alive the
+/// warning is either delivered or sitting buffered in the channel, where
+/// it survives the sender being dropped, so nothing is restored and the
+/// no-per-folder-spam property of the one-shot is preserved.
+struct QresyncWarningTicket {
+    account: ImapAccount,
+    tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
+    taken: std::sync::atomic::AtomicBool,
+}
+
+impl QresyncWarningTicket {
+    fn new(account: ImapAccount, tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>) -> Self {
+        Self {
+            account,
+            tx,
+            taken: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn take(&self) -> Option<String> {
+        let reason = self.account.take_qresync_negotiation_warning()?;
+        self.taken.store(true, std::sync::atomic::Ordering::Release);
+        Some(reason)
+    }
+}
+
+impl Drop for QresyncWarningTicket {
+    fn drop(&mut self) {
+        if self.taken.load(std::sync::atomic::Ordering::Acquire) && self.tx.is_closed() {
+            self.account.restore_qresync_negotiation_warning();
+        }
+    }
 }
 
 /// Marker for an output-channel-dropped send failure. Per the IMAP plan,
@@ -115,8 +162,9 @@ async fn run_inventory(
     account: ImapAccount,
     scope: CursorScope,
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
+    qresync_warning: &QresyncWarningTicket,
 ) -> Result<(), InventoryError> {
-    if let Some(reason) = account.take_qresync_negotiation_warning() {
+    if let Some(reason) = qresync_warning.take() {
         tx.send(SyncEvent::Warning(
             Warning::support_only(WarningKind::StrategyDowngraded, reason).with_protocol_detail(
                 DiagnosticText::support_only(format!(
@@ -329,6 +377,86 @@ mod tests {
 
     fn folder() -> MailboxName {
         MailboxName::new("INBOX").expect("valid mailbox")
+    }
+
+    mod qresync_ticket {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        use super::super::super::factory::ImapAccountConfig;
+        use super::super::super::{ImapAccount, ImapAccountParts, Pool};
+        use super::super::QresyncWarningTicket;
+        use crate::connection::test_support::{driver_pair, preauth_greeting};
+        use crate::types::{AuthPolicy, Credentials};
+
+        async fn account() -> (ImapAccount, tokio::io::DuplexStream) {
+            let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+            let config = Arc::new(ImapAccountConfig::new(
+                crate::ImapConfig::plaintext("test.invalid"),
+                Credentials::password("user", "pass"),
+                AuthPolicy::default(),
+            ));
+            let bandwidth_cap = Arc::new(AtomicU64::new(0));
+            let pool = Arc::new(Pool::new(
+                Arc::clone(&config),
+                conn,
+                1,
+                None,
+                Arc::clone(&bandwidth_cap),
+            ));
+            let account = ImapAccount::new(ImapAccountParts {
+                config,
+                capabilities: super::super::super::test_support::stub_capabilities(),
+                pool,
+                folders: Default::default(),
+                qresync_enabled: false,
+                qresync_negotiation_warning: Some("QRESYNC refused by the server".to_string()),
+                supports_notify: false,
+                bandwidth_cap,
+                contacts: None,
+                calendars: None,
+                dav_scopes: Default::default(),
+                submission: None,
+                dav_degraded: Vec::new(),
+            });
+            (account, server)
+        }
+
+        /// A taker whose output channel is already gone un-spends the
+        /// one-shot: the warning reached nobody, and the flag is one-way.
+        #[tokio::test]
+        async fn a_ticket_whose_receiver_is_gone_restores_the_one_shot() {
+            let (account, _server) = account().await;
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let ticket = QresyncWarningTicket::new(account.clone(), tx);
+
+            assert!(ticket.take().is_some(), "the one-shot starts unspent");
+            drop(rx);
+            drop(ticket);
+
+            assert!(
+                account.take_qresync_negotiation_warning().is_some(),
+                "a warning delivered to nobody must remain available",
+            );
+        }
+
+        /// With the receiver still alive the warning is delivered, or
+        /// buffered in a channel that outlives its sender, so the one-shot
+        /// stays spent and no later folder re-reports it.
+        #[tokio::test]
+        async fn a_ticket_with_a_live_receiver_keeps_the_one_shot_spent() {
+            let (account, _server) = account().await;
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let ticket = QresyncWarningTicket::new(account.clone(), tx);
+
+            assert!(ticket.take().is_some());
+            drop(ticket);
+
+            assert!(
+                account.take_qresync_negotiation_warning().is_none(),
+                "a delivered warning must not be re-reported per folder",
+            );
+        }
     }
 
     fn keyword(name: &str) -> crate::types::Flag {

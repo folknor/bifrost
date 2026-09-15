@@ -1133,10 +1133,19 @@ fn spawn_and_track_scope_poll(
         // A terminally failed scope leaves its (uncancelled) token in the
         // map as a tombstone: the 1s scan sees a live entry and never
         // respawns the poll, so a terminal error really is terminal instead
-        // of a once-per-second re-drive. The scope-retiring paths
-        // (`cancel_scope_token` via lifecycle deletion or an engine restart,
-        // and multiplexer shutdown) still clear the entry, so a scope that
-        // is deleted-and-recreated or explicitly restarted respawns cleanly.
+        // of a once-per-second re-drive. The scope-retiring paths still clear
+        // the entry, so a scope that is deleted-and-recreated respawns cleanly.
+        //
+        // Those paths are narrower than this comment used to claim.
+        // `cancel_scope_token` has exactly ONE production caller: the
+        // lifecycle `Deleted` handler. An engine restart of a scope
+        // (`RestartScope`, and likewise `DowngradeCapabilityForScope` and
+        // `DisableScope`) calls `CursorRegistry::delete` and never touches this
+        // map, so on those paths the entry is cleared only when the task itself
+        // exits. What ends a STALLED drive on every one of them is the
+        // registry's own per-scope liveness token, which `with_drive` races -
+        // that token, not this map, is what also covers the push reconciler,
+        // which holds no entry here at all.
         match exit {
             PollExit::Retire => retire_scope_token(&cleanup_tokens, &cleanup_scope, generation),
             // Mark the tombstone as such, by identity, so the push reconciler
@@ -1343,10 +1352,14 @@ async fn spawn_scope_poll_inner(
         // the boundary cannot carry: scope deletion or restart, which cancels
         // `scope_cancel` while the ACCOUNT boundary stays `Run`, and root
         // cancellation, which lands before this account's own detach writes
-        // `Stop`. Without the scope arm a stalled drive keeps its drive lease
-        // and the replacement incarnation waits behind it on `claim_drive`
-        // indefinitely - the generation fence stops the stale publication but
-        // does not release the lease.
+        // `Stop`. The generation fence stops the stale publication but does not
+        // release the lease, so without a cancellation arm a stalled drive
+        // keeps it and the replacement incarnation waits behind it on
+        // `claim_drive` indefinitely. The registry's own per-scope token inside
+        // `with_drive` is the general answer to that (it covers the restart
+        // paths and the reconciler, neither of which has an entry in
+        // `ScopeTokens`); this arm remains because it also retires the poll
+        // task itself, which the registry knows nothing about.
         //
         // Safe to cut here precisely because it cannot cut anywhere
         // interesting: `with_drive` suspends only at `claim_drive` and at the
@@ -1396,7 +1409,9 @@ async fn spawn_scope_poll_inner(
         };
         drop(_admission);
         let Some((advanced, outcome)) = driven else {
-            // Scope was removed from the registry; exit cleanly.
+            // The scope left the registry - either before the drive started or
+            // while it ran, `with_drive` reporting both the same way. Exit
+            // cleanly; if the scope is re-established the 1s scan respawns us.
             return PollExit::Retire;
         };
         let recovered = handle_drive_outcome(
@@ -1662,8 +1677,15 @@ async fn apply_lifecycle_transition(
         membership: &bifrost_types::MembershipScope,
     ) {
         for scope in cursors.scopes_for_membership(membership) {
-            cancel_scope_token(tokens, &scope);
+            // Registry first. `delete` cancels the scope's liveness token as
+            // it drops the cursor, under one write lock, so there is no
+            // instant where the scope looks drivable to a producer that has
+            // not yet been stopped. The reverse order left exactly that
+            // window: the poll token was gone while the cursor was still
+            // live, and a reconciler entering it started a drive on a scope
+            // about to be deleted.
             cursors.delete(&scope);
+            cancel_scope_token(tokens, &scope);
             let _ = reopen_tx.send(ReopenRequest::ScopeDeleted { scope }).await;
         }
     }
@@ -1941,6 +1963,13 @@ mod tests {
         cursors.link_membership(membership.clone(), scope.clone());
         let tokens = scope_tokens();
         track(&tokens, &scope);
+        // The REGISTRY's own liveness token, captured before the transition.
+        // The poll token below covers only the poll task; this is what reaches
+        // a stalled drive belonging to the push reconciler, which never has an
+        // entry in `tokens`.
+        let registry_cancel = cursors
+            .scope_cancel(&scope)
+            .expect("registered scope token");
         let (reopen_tx, mut reopen_rx) = mpsc::channel(4);
 
         apply_lifecycle_transition(
@@ -1953,6 +1982,11 @@ mod tests {
 
         assert!(cursors.snapshot(&scope).is_none());
         assert!(!tokens.lock().expect("poisoned").contains_key(&scope));
+        assert!(
+            registry_cancel.is_cancelled(),
+            "a lifecycle delete must end any in-flight drive, including the \
+             reconciler's, not just the poll task"
+        );
         let request = reopen_rx.try_recv().expect("durable deletion requested");
         assert!(matches!(
             request,

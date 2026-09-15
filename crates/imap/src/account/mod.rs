@@ -106,9 +106,11 @@ pub(crate) struct ImapAccountInner {
     pub(crate) dav_scopes: DavScopeIndex,
     pub(crate) submission: Option<Arc<SubmissionTransport>>,
     /// Warnings recorded at open when a configured DAV sub-account could
-    /// not be attached (brick 5 fail-soft). Drained once, on the first
-    /// `discover_cursor_scopes`, so the engine observes the degradation
-    /// without taking mail offline.
+    /// not be attached (brick 5 fail-soft). Read (not drained) by every
+    /// `discover_cursor_scopes` and cleared only once a discovery stream
+    /// has actually yielded its terminal `Done` to the consumer, so the
+    /// engine observes the degradation without taking mail offline and
+    /// cannot lose it to a discovery stream that is dropped un-polled.
     pub(crate) dav_degraded: std::sync::Mutex<Vec<bifrost_types::Warning>>,
 }
 
@@ -156,15 +158,34 @@ impl ImapAccount {
         }
     }
 
-    /// Drain the degraded-DAV warnings recorded at open. Returns them
-    /// once; subsequent calls return empty (the engine re-runs discovery
-    /// on reopen, where a fresh open re-records the current state).
-    pub(crate) fn take_dav_degraded_warnings(&self) -> Vec<bifrost_types::Warning> {
-        let mut guard = self
-            .dav_degraded
+    /// Read the degraded-DAV warnings recorded at open WITHOUT consuming
+    /// them.
+    ///
+    /// These warnings are the only signal that a configured CardDAV or
+    /// CalDAV half failed to attach and the account is presenting as
+    /// mail-only. Draining them at stream-construction time put them
+    /// inside a future the consumer is free to drop un-polled, and unlike
+    /// the QRESYNC one-shot there is no second copy to fall back on: the
+    /// account would then look healthy forever. So the read is
+    /// non-consuming and `clear_dav_degraded_warnings` is the
+    /// acknowledgement, fired only when a discovery stream has handed its
+    /// terminal event to the consumer.
+    pub(crate) fn peek_dav_degraded_warnings(&self) -> Vec<bifrost_types::Warning> {
+        self.dav_degraded
             .lock()
-            .expect("dav_degraded lock poisoned");
-        std::mem::take(&mut *guard)
+            .expect("dav_degraded lock poisoned")
+            .clone()
+    }
+
+    /// Acknowledge delivery of the degraded-DAV warnings. Called once a
+    /// discovery stream has yielded them plus its terminal `Done`, so a
+    /// later discovery on the same account does not re-report a
+    /// degradation the consumer already saw.
+    pub(crate) fn clear_dav_degraded_warnings(&self) {
+        self.dav_degraded
+            .lock()
+            .expect("dav_degraded lock poisoned")
+            .clear();
     }
 }
 
@@ -292,6 +313,17 @@ impl ImapAccount {
             return None;
         }
         Some(warning.clone())
+    }
+
+    /// Un-spend the QRESYNC negotiation one-shot.
+    ///
+    /// The one-shot is taken inside a spawned streaming task, so a stream
+    /// dropped before the warning reaches the consumer would otherwise
+    /// burn it with nobody informed. The taker holds a ticket that calls
+    /// this if its output channel turns out to be gone.
+    pub(crate) fn restore_qresync_negotiation_warning(&self) {
+        self.qresync_negotiation_warning_sent
+            .store(false, Ordering::Release);
     }
 
     /// Non-consuming read of the QRESYNC negotiation reason. Unlike
@@ -951,6 +983,55 @@ pub(crate) fn boxed_receiver_stream<T: Send + 'static>(
     Box::pin(ReceiverStream { rx })
 }
 
+/// A receiver stream that aborts the task feeding it when the stream is
+/// dropped.
+///
+/// `Account::changes_stream` and `inventory_stream` are channel-backed by
+/// a detached `tokio::spawn`. Dropping the returned stream drops only the
+/// receiver, so without this the task runs on against the account's
+/// connection until its next `tx.send` fails - and the engine now cuts a
+/// pending poll on every PAUSE, not only at teardown, then calls back in
+/// on the same account. That let two drivers issue IMAP commands
+/// concurrently over one account while the older one sat on a pool
+/// checkout it would not release until it next tried to send.
+///
+/// Aborting is safe here precisely because the driver model already
+/// handles an abandoned command: every submit helper holds an
+/// `InFlightGuard` that marks the connection abandoned when its future is
+/// dropped mid-command, and `PooledConn::drop` parks only a member that is
+/// alive and not abandoned. So the abort returns the pooled connection (or
+/// retires it) rather than leaking it.
+pub(crate) fn guarded_receiver_stream<T: Send + 'static>(
+    rx: tokio::sync::mpsc::Receiver<T>,
+    task: tokio::task::JoinHandle<()>,
+) -> AccountStream<T> {
+    Box::pin(GuardedReceiverStream {
+        rx,
+        _guard: AbortOnDrop(task),
+    })
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct GuardedReceiverStream<T> {
+    rx: tokio::sync::mpsc::Receiver<T>,
+    _guard: AbortOnDrop,
+}
+
+impl<T> Stream for GuardedReceiverStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
 pub(crate) fn iter_stream<T: Send + Unpin + 'static>(items: Vec<T>) -> AccountStream<T> {
     Box::pin(IterStream {
         items: items.into(),
@@ -1416,6 +1497,81 @@ mod router_tests {
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+    }
+}
+
+#[cfg(test)]
+mod guarded_stream_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    use futures::StreamExt as _;
+
+    use super::factory::ImapAccountConfig;
+    use super::{Pool, guarded_receiver_stream};
+    use crate::connection::test_support::{driver_pair, preauth_greeting};
+    use crate::types::{AuthPolicy, Credentials};
+
+    fn pool_with(primed: crate::ImapConnection, data_cap: usize) -> Arc<Pool> {
+        let config = Arc::new(ImapAccountConfig {
+            pool_cap: data_cap,
+            ..ImapAccountConfig::new(
+                crate::ImapConfig::plaintext("test.invalid"),
+                Credentials::password("user", "pass"),
+                AuthPolicy::default(),
+            )
+        });
+        Arc::new(Pool::new(
+            config,
+            primed,
+            data_cap,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        ))
+    }
+
+    /// Dropping a guarded stream must stop the task feeding it AND give
+    /// the pooled connection back, not leave a detached driver running
+    /// against the account while the engine starts its successor.
+    ///
+    /// The pool holds exactly one permit and cannot dial (the duplex
+    /// transport has no peer to dial), so the second checkout succeeds
+    /// only if the aborted task actually released both its permit and its
+    /// connection. Without the abort the task parks forever holding both
+    /// and this checkout never returns.
+    #[tokio::test]
+    async fn dropping_a_guarded_stream_aborts_its_task_and_returns_the_connection() {
+        let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        let pool = pool_with(conn, 1);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<u8>(1);
+        let task_pool = Arc::clone(&pool);
+        let task = tokio::spawn(async move {
+            let _conn = task_pool.checkout_any().await.expect("primed checkout");
+            // Announce the checkout, then park forever: this is the
+            // shape of a changes/inventory task mid-poll.
+            tx.send(1).await.ok();
+            std::future::pending::<()>().await;
+        });
+
+        let mut stream = guarded_receiver_stream(rx, task);
+        assert_eq!(
+            stream.next().await,
+            Some(1),
+            "the task must have taken the pooled connection before the drop",
+        );
+        drop(stream);
+
+        let reclaimed = tokio::time::timeout(Duration::from_secs(5), pool.checkout_any())
+            .await
+            .expect("a dropped stream must release the task's pooled connection");
+        assert!(
+            reclaimed.is_ok(),
+            "the reclaimed connection must still be checkout-able",
         );
     }
 }

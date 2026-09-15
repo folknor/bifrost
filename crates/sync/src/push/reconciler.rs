@@ -256,9 +256,17 @@ impl Reconciler {
             };
             // Same reasoning as the poll loop's: the drive's own boundary arm
             // answers `Stop` and `Pause`, and this covers root cancellation
-            // arriving before this account's detach publishes `Stop`. The
-            // reconciler holds no per-scope token, so a scope deleted while
-            // one of its drives is stalled here still waits for the boundary.
+            // arriving before this account's detach publishes `Stop`.
+            //
+            // The reconciler has no entry in `ScopeTokens` - that map is the
+            // POLL TASK's lifetime keyed by scope, and this task is a second
+            // producer on the same lane - so scope deletion reaches a stalled
+            // drive of ours through the registry instead: `with_drive` races
+            // the drive against the scope's own liveness token, which
+            // `CursorRegistry::delete` cancels as it drops the cursor. Without
+            // that, a scope deleted while one of our drives was parked on a
+            // wedged provider stream kept the scope's drive lease, and the
+            // replacement incarnation waited on `claim_drive` forever.
             let driven = tokio::select! {
                 () = self.shutdown.cancelled() => return Ok(()),
                 driven = self
@@ -287,6 +295,8 @@ impl Reconciler {
                 }) => driven,
             };
             drop(_admission);
+            // No result: the scope is gone, or left mid-drive. Either way it is
+            // not ours to re-drive, and its siblings in this hint still are.
             let Some(outcome) = driven else {
                 continue;
             };
