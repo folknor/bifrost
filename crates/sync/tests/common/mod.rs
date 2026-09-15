@@ -203,6 +203,17 @@ pub struct StubAccount {
     pub inventory_stall_probe: Option<InventoryStallProbe>,
     /// `inventory_stream()` call count.
     pub inventory_calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// When set, `changes_stream` yields `changes_hook`'s events and then
+    /// parks forever instead of ending.
+    ///
+    /// The shape a provider wedge actually takes: the stream neither yields nor
+    /// ends, so a driver with no arm on its poll waits on it indefinitely. The
+    /// notify is the release valve, so a test can also prove the park was real
+    /// by letting it go.
+    pub changes_stall: Option<Arc<tokio::sync::Notify>>,
+    /// Same wedge for `inventory_partition_stream`, for the backfill runner's
+    /// poll arm.
+    pub partition_stall: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Observes the LIFETIME of the stalled inventory stream, not just its effects.
@@ -289,6 +300,8 @@ impl StubAccount {
             inventory_stall: None,
             inventory_stall_probe: None,
             inventory_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            changes_stall: None,
+            partition_stall: None,
         }
     }
 
@@ -451,10 +464,17 @@ impl Account for StubAccount {
             .lock()
             .expect("walked lock")
             .push((scope.clone(), partition.clone()));
-        match &self.partition_hook {
-            Some(hook) => Box::pin(stream::iter(hook(&scope, &partition))),
-            None => Box::pin(stream::empty()),
+        let items = match &self.partition_hook {
+            Some(hook) => hook(&scope, &partition),
+            None => Vec::new(),
+        };
+        if let Some(gate) = &self.partition_stall {
+            let gate = Arc::clone(gate);
+            let tail = stream::once(async move { gate.notified().await })
+                .filter_map(|()| async move { None::<InventoryEvent> });
+            return Box::pin(stream::iter(items).chain(tail));
         }
+        Box::pin(stream::iter(items))
     }
 
     fn get_stream(
@@ -479,10 +499,17 @@ impl Account for StubAccount {
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
-        match &self.changes_hook {
-            Some(hook) => Box::pin(stream::iter(hook(&cursor))),
-            None => Box::pin(stream::empty()),
+        let items = match &self.changes_hook {
+            Some(hook) => hook(&cursor),
+            None => Vec::new(),
+        };
+        if let Some(gate) = &self.changes_stall {
+            let gate = Arc::clone(gate);
+            let tail = stream::once(async move { gate.notified().await })
+                .filter_map(|()| async move { None::<SyncEvent<Change>> });
+            return Box::pin(stream::iter(items).chain(tail));
         }
+        Box::pin(stream::iter(items))
     }
 
     fn push_subscribe(

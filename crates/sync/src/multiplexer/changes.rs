@@ -54,8 +54,17 @@ pub enum ChangesEvent {
     Done,
     /// Driver was asked to stop (boundary request `Stop`).
     Stopped,
-    /// Driver was asked to pause; checkpoint flushed and the driver
-    /// parked the stream at a clean boundary.
+    /// Driver was asked to pause, reached a clean boundary BETWEEN stream
+    /// items, and released its activity guard.
+    ///
+    /// Deliberately does NOT promise a flushed checkpoint, which is what this
+    /// said before and was never true: `post_publish_boundary` answers `Pause`
+    /// after a checkpoint-free item as well, because a checkpoint-free stream
+    /// that only parked at checkpoints would never let the account reach
+    /// quiescence at all. A pause that cuts a pending poll is the same
+    /// guarantee one item earlier - nothing is half-published, and no
+    /// registration exists for the item that was never read.
+    /// `CheckpointNow` is the request that does need a durable cursor.
     Paused,
     /// Driver saw a terminating stream event and aborted. Carries the
     /// full `AccountError` so the engine dispatches via the derived
@@ -99,7 +108,7 @@ pub async fn drive_changes_stream(
     cursor: ChangeCursor,
     cursors: Arc<CursorRegistry>,
     delivery: Arc<ChangeDelivery>,
-    boundary: BoundaryView,
+    mut boundary: BoundaryView,
     control: Option<SyncControl>,
     registry_generation: Option<crate::cursor::DriveGeneration>,
 ) -> Result<ChangesEvent, Error> {
@@ -112,12 +121,12 @@ pub async fn drive_changes_stream(
         None => None,
     };
     let mut stream = account.changes_stream(cursor);
-    while let Some(event) = stream.next().await {
-        match boundary.peek() {
-            BoundaryRequest::Stop => return Ok(ChangesEvent::Stopped),
-            BoundaryRequest::Pause => {}
-            BoundaryRequest::CheckpointNow | BoundaryRequest::Run => {}
-        }
+    loop {
+        let event = match poll_next_event(&mut stream, &mut boundary).await {
+            PolledEvent::Event(event) => event,
+            PolledEvent::StreamEnded => return Ok(ChangesEvent::Done),
+            PolledEvent::Boundary(outcome) => return Ok(outcome),
+        };
         // A batch the account should never have produced. Returning a bare
         // engine error here would be a livelock: the poll loop logs it,
         // re-enters from the SAME unchanged cursor, and the account
@@ -255,8 +264,84 @@ pub async fn drive_changes_stream(
         if let Some(err) = terminated_error {
             return Ok(ChangesEvent::Terminated(err));
         }
+        // No fallthrough: a stream that ends is answered by
+        // `PolledEvent::StreamEnded` at the top of the loop.
     }
-    Ok(ChangesEvent::Done)
+}
+
+/// The result of asking the provider stream for one more event while watching
+/// the boundary.
+enum PolledEvent {
+    Event(SyncEvent<Change>),
+    StreamEnded,
+    /// The boundary asked the drive to stop before another event arrived.
+    Boundary(ChangesEvent),
+}
+
+/// Poll the provider stream for one event, cutting the poll short if the
+/// boundary asks the drive to stop or park.
+///
+/// Without this, a stream that neither yields nor ends parks the drive
+/// forever. That is worse here than the phrase "straggler worker" suggests: the
+/// per-scope poll tasks are spawned with their `JoinHandle` discarded, so a
+/// wedged drive is not in `slot.workers` and `detach` neither awaits nor aborts
+/// it. It costs detach no time at all and SURVIVES it, holding an
+/// `Arc<dyn Account>`, a scheduler admission and a `ChangeDelivery`, still able
+/// to publish and to register publications against a `PendingCoverage` nothing
+/// owns any more. And `SyncControl::pause` waits for quiescence while the
+/// drive's activity guard is held, so the same wedge hangs `pause` too.
+///
+/// The PEEK is not redundant with the select. `changed()` reports transitions
+/// the receiver has not seen, so a request already in force when the drive was
+/// built is never reported by it - only read. The SELECT is not redundant with
+/// the peek either: without it a request arriving mid-poll waits for an event
+/// that may never come.
+///
+/// `CheckpointNow` deliberately does NOT cut the poll. It is the one request
+/// whose meaning is "give me a durable cursor", which only a checkpoint-bearing
+/// event can satisfy, so interrupting the wait for one would answer it by
+/// abandoning it. `Stop` and `Pause` are lifecycle requests and neither needs a
+/// checkpoint to be honoured.
+///
+/// Cutting the poll abandons no data. An item only crosses the `Stream`
+/// boundary through `Poll::Ready(Some(_))`, and `StreamExt::next` borrows the
+/// stream rather than owning an item, so a poll that returned `Pending`
+/// produced nothing to lose. What it CAN abandon is provider-internal work,
+/// which is why `Account::changes_stream` requires its streams to tolerate
+/// being dropped while pending.
+async fn poll_next_event(
+    stream: &mut bifrost_types::AccountStream<SyncEvent<Change>>,
+    boundary: &mut BoundaryView,
+) -> PolledEvent {
+    loop {
+        match boundary.peek() {
+            BoundaryRequest::Stop => return PolledEvent::Boundary(ChangesEvent::Stopped),
+            BoundaryRequest::Pause => return PolledEvent::Boundary(ChangesEvent::Paused),
+            BoundaryRequest::Run | BoundaryRequest::CheckpointNow => {}
+        }
+        tokio::select! {
+            next = stream.next() => {
+                return match next {
+                    Some(event) => PolledEvent::Event(event),
+                    None => PolledEvent::StreamEnded,
+                };
+            }
+            request = boundary.changed() => match request {
+                // Every sender gone means nobody is left who could manage this
+                // drive, which is the same situation as a stop.
+                None | Some(BoundaryRequest::Stop) => {
+                    return PolledEvent::Boundary(ChangesEvent::Stopped);
+                }
+                Some(BoundaryRequest::Pause) => {
+                    return PolledEvent::Boundary(ChangesEvent::Paused);
+                }
+                // Not every transition is a cancellation: a checkpoint request,
+                // or a restoration to `Run`, must resume the poll rather than
+                // end the drive.
+                Some(BoundaryRequest::Run | BoundaryRequest::CheckpointNow) => continue,
+            },
+        }
+    }
 }
 
 /// What a drive reports when `begin_activity` refuses to admit it.

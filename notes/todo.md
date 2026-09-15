@@ -60,71 +60,37 @@ structural landings of the same week, the dav-core `ResponseParts` collapse
 and the smtp sans-I/O core, never received the cold review their rulings
 asked for; that review debt is listed under their crates below.
 
-- **Three stream-poll loops have no shutdown arm.** `drive_changes_stream`,
-  `InventoryFusion::run_stream` and `BackfillRunner::run_partition` poll a
-  provider stream with no select on the cancellation token, so a stream that
-  neither yields nor ends parks its worker until detach aborts it at the
-  deadline. `reference/sync.md` documents that the DELAYS around the drive
-  select on the token; the drive itself does not. This is the actual GENERATOR
-  of straggler workers, and the per-phase detach budgets that landed 2026-09-07
-  bound the damage without removing it: every detach of a wedged provider still
-  costs a full `detach_timeout` in the worker phase. Adding a shutdown arm to
-  the three would turn that into a prompt teardown. Two tests deliberately
-  exploit the current behaviour to hold a teardown window open and say so, so
-  closing it means restaging them. Wants a ruling; it is a behaviour change to
-  every detach, not a local fix.
+- **`InventoryFusion::run_stream` still has no shutdown arm.** The other two
+  loops were armed on 2026-09-15 (`drive_changes_stream` selects the account
+  BOUNDARY - `Stop` and `Pause`, never `CheckpointNow`, plus an entry peek for a
+  request the view has already consumed; `BackfillRunner::run_partition` selects
+  the `LaneGate` shutdown token and returns `Error::ShuttingDown`). Fusion was
+  left alone deliberately and still wants its own ruling, for the reasons it
+  always did: its fix moves published surface (a token field on a struct
+  consumers construct by literal), and it forces restaging all three tests that
+  park an inventory stream through fusion to hold a teardown window open. One of
+  them, `a_straggler_worker_does_not_cost_the_ack_writer_its_drain`, names this
+  exact change in its own doc as the ablation that breaks it, and it measures the
+  stalled stream's destruction instant from inside `Drop` precisely because
+  elapsed time cannot discriminate - a restaging that falls back to elapsed time
+  passes against the bug the test exists to pin. The cost being bought out is one
+  `detach_timeout` in the worker phase, already fenced off from the writer and
+  close phases by the per-phase budgets. If it is wanted, the restaged test must
+  keep the `Drop`-instant probe.
 
-  COSTED 2026-09-15, and the answer is to split the ruling three ways rather
-  than take this as one item. Two corrections to the framing above came out of
-  it. First, there are THREE such tests, not two, and none of them stages
-  against the drive or the runner - all three park an inventory stream through
-  fusion, because the deferred-inventory worker is the one detach actually
-  joins. Second, and this changes the item's premise: **the drive is not a
-  straggler, it is an ORPHAN.** Per-scope poll tasks are spawned with the
-  `JoinHandle` discarded, so they are not in `slot.workers` and `detach`
-  neither awaits nor aborts them. A poll wedged in `drive_changes_stream`
-  therefore costs detach ZERO time and SURVIVES the detach entirely, holding an
-  `Arc<dyn Account>`, a scheduler admission and a `ChangeDelivery`, still able
-  to publish and to register publications against a `PendingCoverage` the
-  detach has walked away from. So the cost here is an unbounded leak, not a
-  bounded `detach_timeout`.
-  - **`drive_changes_stream`: yes, highest value.** It already receives a
-    `BoundaryView`, and `BoundaryView::changed()` is an async signal on the
-    same watch `detach` publishes `Stop` on, so the arm needs no signature
-    change and no new outcome variant (`ChangesEvent::Stopped` already exists).
-    No test restaging. Contain the arm to the `stream.next()` poll; the body
-    has no await to cut.
-  - **`BackfillRunner::run_partition`: yes, conditionally.** `LaneGate` already
-    owns the account shutdown token, so a crate-internal accessor plus an arm
-    returns `Err(Error::ShuttingDown)`, a shape this function already produces
-    and the orchestrator already handles. No test restaging. TWO HARD
-    CONSTRAINTS: the arm goes around the poll only and never across the
-    `publish_checkpoint` / `publish_backfill` pair, since cancelling between
-    them mints a publication no acknowledgement can retire; and a cancelled
-    partition must NEVER return `complete: true` or `RequestNextPartition`,
-    because the orchestrator would then write a completion sentinel that makes
-    the next attach skip the scope entirely. That is silent data invisibility,
-    not re-work.
-  - **`InventoryFusion::run_stream`: no, or not yet.** It is the only one whose
-    fix moves published surface (a token field on a struct consumers construct
-    by literal), and the only one that forces restaging all three tests. One of
-    them, `a_straggler_worker_does_not_cost_the_ack_writer_its_drain`, names
-    this exact change in its own doc as the ablation that breaks it, and it
-    measures the stalled stream's destruction instant from inside `Drop`
-    precisely because elapsed time cannot discriminate. A restaging that falls
-    back to elapsed time passes against the bug the test exists to pin. The
-    straggler cost being bought out is one `detach_timeout` in the worker
-    phase, already fenced off from the writer and close phases by the per-phase
-    budgets. If it is wanted anyway, it gets its own ruling, and the restaged
-    test must keep the `Drop`-instant probe.
-  Cancellation-safety check came back clean for all three: `StreamExt::next`
-  borrows the stream so a dropped poll cannot swallow an item, and the
-  `_activity` guards are function-scope bindings rather than constructed inside
-  an async block - the shape that bit this crate before is not present.
-  Arming the drive does move a stated contract: `reference/sync.md`'s "Do not:"
-  list names all three loops and says a strict publication cutoff "would have to
-  be named as one". Arming the drive moves toward that cutoff without reaching
-  it, so the honest edit narrows the clause rather than deleting it.
+- **The push reconciler cannot release a stalled drive on SCOPE cancellation.**
+  Found 2026-09-15 by the cold review of the poll-arm work, and filed rather than
+  fixed because closing it needs a token the reconciler does not have. The poll
+  loop now selects both `shutdown` and its per-scope `scope_cancel` around the
+  whole drive, which is what releases the drive LEASE when a scope is deleted or
+  restarted while the account boundary is still `Run` - the generation fence
+  stops the stale publication but does not release the lease, so a replacement
+  incarnation waits behind it on `claim_drive`. The reconciler selects
+  `shutdown` only, because it holds no per-scope token: its scopes come from a
+  push hint, not from `ScopeTokens`. So a scope deleted while one of ITS drives
+  is stalled waits for the boundary rather than for the deletion. Closing it
+  means handing the reconciler the `ScopeTokens` map (or a lookup into it),
+  which is a plumbing change across the push lane rather than a local edit.
 
 - **Residuals of the bounded-backfill cold review.** P3 or P4 from that
     review; verify against the code before working any of it. The rest of

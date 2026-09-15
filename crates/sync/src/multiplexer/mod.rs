@@ -1338,7 +1338,26 @@ async fn spawn_scope_poll_inner(
                 }
             },
         };
-        let driven = cursors
+        // The drive's OWN boundary arm answers `Stop` and `Pause`, which is
+        // what a detach publishes. This outer select answers the two signals
+        // the boundary cannot carry: scope deletion or restart, which cancels
+        // `scope_cancel` while the ACCOUNT boundary stays `Run`, and root
+        // cancellation, which lands before this account's own detach writes
+        // `Stop`. Without the scope arm a stalled drive keeps its drive lease
+        // and the replacement incarnation waits behind it on `claim_drive`
+        // indefinitely - the generation fence stops the stale publication but
+        // does not release the lease.
+        //
+        // Safe to cut here precisely because it cannot cut anywhere
+        // interesting: `with_drive` suspends only at `claim_drive` and at the
+        // drive itself, the drive suspends only at its stream poll, and a
+        // select cannot destroy a branch mid-poll - so the page's registration
+        // and its broadcast, which are synchronous, cannot be split. Dropping
+        // the future releases the lease, the activity guard and the stream.
+        let driven = tokio::select! {
+            () = shutdown.cancelled() => return PollExit::Retire,
+            () = scope_cancel.cancelled() => return PollExit::Retire,
+            driven = cursors
             .with_drive(&scope, |cursor, registry_generation| {
                 let pre_advance_state = cursor.server_state.bytes.clone();
                 let acc_arc = account.load_full();
@@ -1373,8 +1392,8 @@ async fn spawn_scope_poll_inner(
                         .is_some_and(|c| c.server_state.bytes != pre_advance_state);
                     (advanced, outcome)
                 }
-            })
-            .await;
+            }) => driven,
+        };
         drop(_admission);
         let Some((advanced, outcome)) = driven else {
             // Scope was removed from the registry; exit cleanly.

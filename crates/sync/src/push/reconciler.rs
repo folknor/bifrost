@@ -254,7 +254,14 @@ impl Reconciler {
                     }
                 },
             };
-            let driven = self
+            // Same reasoning as the poll loop's: the drive's own boundary arm
+            // answers `Stop` and `Pause`, and this covers root cancellation
+            // arriving before this account's detach publishes `Stop`. The
+            // reconciler holds no per-scope token, so a scope deleted while
+            // one of its drives is stalled here still waits for the boundary.
+            let driven = tokio::select! {
+                () = self.shutdown.cancelled() => return Ok(()),
+                driven = self
                 .cursors
                 .with_drive(&scope, |cursor, registry_generation| {
                     let account_swap = self.account.load_full();
@@ -277,8 +284,8 @@ impl Reconciler {
                         )
                         .await
                     }
-                })
-                .await;
+                }) => driven,
+            };
             drop(_admission);
             let Some(outcome) = driven else {
                 continue;

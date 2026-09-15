@@ -377,7 +377,42 @@ impl BackfillRunner {
         // completion marker is judged against the incarnation its WALK started
         // under.
         let fence_at_pass_start = lane.map_or(0, |gate| gate.coverage().scope_fence(&scope));
-        while let Some(event) = stream.next().await {
+        loop {
+            // Cancellation is armed around the POLL and nowhere else.
+            //
+            // Not across the body: the page's registration and its broadcast
+            // are one indivisible step, and stopping between them would mint a
+            // publication no acknowledgement can ever retire. Everything the
+            // previous page did - `walk.accept`, the publish pair, the
+            // undelivered note and its retirement, the capacity wait and its
+            // scope-fence revalidation, barrier and debt recording - has
+            // therefore completed before control returns here.
+            //
+            // The outcome is an ERROR rather than a partial
+            // `BackfillPartitionOutcome`, which is what makes it safe: an
+            // outcome could only be reported as `complete: false` with
+            // `StopScopeWalk`, and getting either field wrong would have the
+            // orchestrator write a completion sentinel that makes the next
+            // attach skip the scope entirely. That is silent data
+            // invisibility, not re-work. `Error::ShuttingDown` is a shape this
+            // function already produces at the capacity wait, and the
+            // orchestrator already routes it to `driver.fail()`, which
+            // withholds the completion marker.
+            //
+            // Only armed when a lane is present. Production always passes one;
+            // a `lane: None` caller has no token, so the guarantee is about
+            // engine-driven partition walks rather than about this function.
+            let next = match lane {
+                Some(gate) => {
+                    tokio::select! {
+                        biased;
+                        () = gate.shutdown().cancelled() => return Err(Error::ShuttingDown),
+                        next = stream.next() => next,
+                    }
+                }
+                None => stream.next().await,
+            };
+            let Some(event) = next else { break };
             match event {
                 bifrost_types::InventoryEvent::Batch(batch) => {
                     if batch.validate_boundary().is_err() {

@@ -513,12 +513,25 @@ impl SyncEngine {
         // backfill and deferred inventory while in their subscriber / pause /
         // throttle / capacity / admission waits.
         //
-        // Do NOT: `InventoryFusion::run_stream` and
-        // `BackfillRunner::run_partition` do not select on cancellation while
-        // reading a provider stream, and `drive_changes_stream` checks
-        // `BoundaryRequest::Stop` only after a stream item arrives and never
-        // reads the root token. So a later account's in-flight changes drive can
-        // still publish after this cancel while its boundary is `Run`.
+        // Two of the three provider-stream reads now stop at their next poll
+        // boundary, and they answer DIFFERENT signals, which matters here.
+        // `BackfillRunner::run_partition` selects this token directly (through
+        // its `LaneGate`) and returns `Error::ShuttingDown`, which withholds
+        // both the partition outcome and the scope completion marker.
+        // `drive_changes_stream` selects the account BOUNDARY, not this token,
+        // so it stops when that account's own `detach` publishes `Stop` - which
+        // for a later account in this loop is some time after this cancel. Its
+        // poll task additionally selects this token around the whole drive. In
+        // both cases cancellation declines to read ANOTHER event; it never
+        // interrupts the processing or publication of an event the stream has
+        // already returned.
+        //
+        // Do NOT: `InventoryFusion::run_stream` still does not select on
+        // cancellation while reading its provider stream, so a wedged fusion
+        // stream keeps its worker alive until teardown aborts it at the
+        // deadline. And the push reconciler holds no per-scope token, so a
+        // scope deleted while one of its drives is stalled waits for the
+        // boundary rather than for the deletion.
         //
         // The reopen listener is BOTH, depending on what it is doing. Idle, its
         // select covers the wait for the next request and it exits at once. Once

@@ -272,6 +272,20 @@ impl LaneGate {
         self.capacity
     }
 
+    /// The account's shutdown token, for arming a provider-stream poll.
+    ///
+    /// Crate-internal on purpose. It is here so `BackfillRunner::run_partition`
+    /// can select its `inventory_partition_stream` poll against cancellation
+    /// without taking a token parameter that only the engine could supply;
+    /// every other wait in this gate already selects the same token. That makes
+    /// the cancellation guarantee a property of ENGINE-DRIVEN partition walks
+    /// rather than of `run_partition` itself, since a caller passing
+    /// `lane: None` has no token to be armed against.
+    #[must_use]
+    pub(crate) fn shutdown(&self) -> &CancellationToken {
+        &self.shutdown
+    }
+
     /// Take the account's sync admission for a partition pass.
     pub async fn admit(&self) -> Result<(), WaitFailed> {
         self.admission.acquire(&self.shutdown).await

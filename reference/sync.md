@@ -150,10 +150,9 @@ coincide. A consumer calling `detach` on the way out of a process is bounding it
 own shutdown by that number.
 
 The per-phase budget is not a nicety. A shared deadline silently zeroes whichever
-phase runs last, so a provider stream that neither yields nor ends - and three
-stream-poll loops in this crate have no shutdown arm (`drive_changes_stream`,
-`InventoryFusion::run_stream`, `BackfillRunner::run_partition`), so a wedged
-provider parks a worker until the deadline - burnt the whole budget in the worker
+phase runs last, so a provider stream that neither yields nor ends - and
+`InventoryFusion::run_stream` still has no shutdown arm, so a wedged provider
+parks that worker until the deadline - burnt the whole budget in the worker
 phase and left the writer to be aborted IMMEDIATELY, with `remaining == 0` and no
 drain at all. That is exactly the "writer aborted with unpersisted work" outcome
 the two-phase ordering and `take_ack_writer` exist to prevent, arrived at by a
@@ -231,11 +230,38 @@ forwarder, the multiplexer main loop, the push reconciler, and backfill and
 deferred inventory while in their subscriber / pause / throttle / capacity /
 admission waits.
 
-**Do not**: `InventoryFusion::run_stream` and `BackfillRunner::run_partition`
-do not select on cancellation while reading a provider stream, and
-`drive_changes_stream` checks `BoundaryRequest::Stop` only after a stream item
-arrives and never reads the root token. So a later account's in-flight changes
-drive can still publish after root cancellation while its boundary is `Run`.
+**Stop at the next poll boundary, but on different signals.**
+`BackfillRunner::run_partition` selects the account shutdown token at its
+`inventory_partition_stream` poll (through `LaneGate::shutdown`) and returns
+`Error::ShuttingDown`, which withholds both the partition outcome and the scope
+completion marker. `drive_changes_stream` selects the account BOUNDARY at its
+`changes_stream` poll - `Stop` and `Pause`, never `CheckpointNow`, which is the
+one request that genuinely needs a checkpoint-bearing item to satisfy - so it
+stops when that account's own `detach` publishes `Stop`, which for a later
+account in the shutdown loop is some time after root cancellation. The per-scope
+poll task and the push reconciler additionally select the shutdown token around
+the whole drive, and the poll task selects its per-scope token too, which is
+what releases the drive LEASE when a scope is deleted or restarted while the
+account boundary is still `Run`.
+
+In every case cancellation declines to read ANOTHER event. It never interrupts
+the processing or publication of an event the stream has already returned: the
+registration and the broadcast are synchronous and a `select!` cannot split
+them. The cost is that a provider item which was ready concurrently with the
+cancellation may be deferred to a later drive rather than published now - no
+publication is partial, and no cursor advanced past it, so the next drive
+re-reads it.
+
+**Do not**: `InventoryFusion::run_stream` still does not select on cancellation
+while reading its provider stream, so a wedged fusion stream keeps its worker
+alive until teardown aborts it at the deadline and can delay quiescence while
+its activity guard is held. The push reconciler holds no per-scope token, so a
+scope deleted while one of its drives is stalled waits for the boundary rather
+than for the deletion.
+
+Because the engine now drops pending provider streams as a matter of routine -
+on every pause, not only at teardown - `Account::changes_stream` requires its
+streams to tolerate that and leave the account usable, and states so.
 
 **The reopen listener is both**, and which one depends on what it is doing when
 the token fires. Idle, its select covers the wait for the next request and it

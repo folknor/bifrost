@@ -373,6 +373,18 @@ pub trait Account: Send + Sync {
 
     /// Post-cursor diff. Yields `Change` (the sum of `ObjectChange`
     /// and `ScopeChange`).
+    ///
+    /// **The stream must tolerate being dropped while a poll is pending, and
+    /// the account must remain usable afterwards.** This is not only a teardown
+    /// concern: `bifrost-sync` cuts a pending poll whenever the account is
+    /// asked to stop or pause, and it does so on a LIVE account that it then
+    /// keeps driving, so the next `changes_stream` on the same account must
+    /// succeed. Anything the abandoned stream borrowed - a pooled connection,
+    /// an in-flight request identity, a permit - has to come back, and progress
+    /// the provider made but never yielded has to be replayable from the last
+    /// published cursor, because nothing durable advanced for an item the
+    /// engine never saw. Losing an item that was never yielded is expected and
+    /// fine; losing the ability to read it again is not.
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>>;
 
     /// Server-side push subscription CRUD: create.
