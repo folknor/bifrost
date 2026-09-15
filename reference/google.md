@@ -289,6 +289,8 @@ may keep delivering until the 7-day watch expires.
     scheduled-send lever (web-UI only), so a scheduled `SendRequest` is
     rejected `Unsupported(Send)` before any wire call, and
     `cancel_scheduled_send` / `reschedule_send` are `Unsupported`.
+    `send_as` is likewise false, so a `Some(send_as)` request is the
+    `Unsupported(Send)` branch of the rule stated on `SendRequest::send_as`.
 - `filter_rule_shape: Rules`. Gmail filters are wired for
   list/create/delete plus local validation; `filter_update` is
   unsupported (no update/replace endpoint).
@@ -495,7 +497,20 @@ instances remain visible as `EventStatus::Cancelled` instead of disappearing
 from a range reread. Google may return such tombstones with only
 `originalStartTime`; the projection uses that value for both required time
 fields so the stable instance id and cancelled status can cross the shared
-`CalendarEvent` surface. `is_all_day` is read off that EFFECTIVE start rather
+`CalendarEvent` surface. A cancelled STANDALONE event is a different shape
+again - a bare stub carrying an id and `status: "cancelled"` and no `start`,
+`end` or `originalStartTime` at all - and it projects with an empty-valued
+`EventTime` on both bounds rather than being refused: a deletion notice is
+not a malformed event, and it is the notice `showDeleted=true` was asked
+for. The tolerance is gated on the cancelled status. A LIVE event the
+provider sends without times is still a projection error.
+Projection failures are per item, not per page. `page_from_events` routes a
+refused event onto `Page::failed_ids` under its composite native id and
+serves the rest of the page, matching how bifrost-jmap and bifrost-caldav
+treat per-item conversion failures; collecting through `Result` previously
+let one item destroy every neighbour in the page and left the walk no way
+past it. Cross-calendar search concatenates the per-calendar `failed_ids`
+into its aggregate `Page` rather than zeroing the lane. `is_all_day` is read off that EFFECTIVE start rather
 than off `event.start`, because a cancelled instance of an all-day recurrence
 carries only `originalStartTime.date` - reading `event.start` alone paired
 date-valued times with `is_all_day: false`, which the shared surface treats as

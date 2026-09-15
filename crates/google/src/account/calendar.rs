@@ -305,6 +305,10 @@ pub(crate) fn search(
             .unwrap_or(250)
             .min(2500);
         let mut items = Vec::new();
+        // The per-calendar pages can now carry refused ids, and this
+        // aggregate is the only Page the caller ever sees. Zeroing the lane
+        // here would reinstate the silent drop one layer up.
+        let mut failed_ids = Vec::new();
         while let Some(calendar_id) = calendar_ids.get(index) {
             let remaining = limit.saturating_sub(items.len());
             if remaining == 0 {
@@ -312,7 +316,7 @@ pub(crate) fn search(
                     items,
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &[])),
                     estimated_total: None,
-                    failed_ids: Vec::new(),
+                    failed_ids,
                     skipped_scopes: Vec::new(),
                 });
             }
@@ -338,6 +342,7 @@ pub(crate) fn search(
             // coordinate for a case that requires the provider to violate
             // its own documented cap. Low severity, deliberately left.
             let next_token = page.next_cursor;
+            failed_ids.extend(page.failed_ids);
             for item in page.items {
                 if items.len() >= limit {
                     break;
@@ -349,7 +354,7 @@ pub(crate) fn search(
                     items,
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &next_token)),
                     estimated_total: None,
-                    failed_ids: Vec::new(),
+                    failed_ids,
                     skipped_scopes: Vec::new(),
                 });
             }
@@ -361,7 +366,7 @@ pub(crate) fn search(
                         .get(index)
                         .map(|calendar_id| encode_cross_calendar_cursor(calendar_id, &[])),
                     estimated_total: None,
-                    failed_ids: Vec::new(),
+                    failed_ids,
                     skipped_scopes: Vec::new(),
                 });
             }
@@ -370,7 +375,7 @@ pub(crate) fn search(
             items,
             next_cursor: None,
             estimated_total: None,
-            failed_ids: Vec::new(),
+            failed_ids,
             skipped_scopes: Vec::new(),
         })
     })
@@ -415,22 +420,43 @@ async fn search_one_calendar(
     page_from_events(calendar_id, response, AccountOperation::EventSearch)
 }
 
+// A projection failure is a fact about ONE event, so it is isolated to that
+// event rather than destroying the page around it. Collecting through
+// `Result` meant a single item the projection refused failed every
+// neighbour Google had already returned, and the walk had no way to make
+// progress past it. The refused id rides `Page::failed_ids`, which exists
+// precisely so a consumer can tell "the provider could not give me this
+// one" apart from "this one is gone" - dropping it silently would let a
+// range reread read the absence as a deletion. The sibling calendar
+// providers (bifrost-jmap, bifrost-caldav) already route per-item
+// conversion failures the same way.
+//
+// This is not a licence to swallow a parse regression: a refused item is
+// still absent from `items` and still named in a lane the sync engine
+// turns into an operator warning. What it stops being is a page-level
+// error.
 fn page_from_events(
     calendar_id: String,
     response: EventsResponse,
     operation: AccountOperation,
 ) -> Result<Page<CalendarEvent>, AccountError> {
-    let items = response
-        .items
-        .unwrap_or_default()
-        .into_iter()
-        .map(|event| event_from_google(calendar_id.clone(), event, operation))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut items = Vec::new();
+    let mut failed_ids = Vec::new();
+    for event in response.items.unwrap_or_default() {
+        // Captured before the projection consumes the event, and in the
+        // same composite namespace as `CalendarEvent::native_id`, so a
+        // consumer can match a refused id against what it already holds.
+        let native = join_event_id(&calendar_id, event.id.as_deref().unwrap_or_default());
+        match event_from_google(calendar_id.clone(), event, operation) {
+            Ok(event) => items.push(event),
+            Err(_) => failed_ids.push(native),
+        }
+    }
     Ok(Page {
         items,
         next_cursor: response.next_page_token.map(String::into_bytes),
         estimated_total: None,
-        failed_ids: Vec::new(),
+        failed_ids,
         skipped_scopes: Vec::new(),
     })
 }
@@ -508,7 +534,8 @@ fn event_from_google(
 ) -> Result<CalendarEvent, AccountError> {
     let event_id = event.id.unwrap_or_default();
     let native = join_event_id(&calendar_id, &event_id);
-    let cancelled_instance_time = (event.status.as_deref() == Some("cancelled"))
+    let is_cancelled = event.status.as_deref() == Some("cancelled");
+    let cancelled_instance_time = is_cancelled
         .then(|| event.original_start_time.clone())
         .flatten();
     // `is_all_day` must be read off the EFFECTIVE start, not `event.start`.
@@ -521,16 +548,38 @@ fn event_from_google(
     let is_all_day = effective_start
         .as_ref()
         .is_some_and(|time| time.date.is_some() && time.date_time.is_none());
-    let start = effective_start.map(event_time).ok_or_else(|| {
-        local_error_with_field(operation, "start", "Google event missing start".to_string())
-    })?;
-    let end = event
-        .end
-        .or(cancelled_instance_time)
-        .map(event_time)
-        .ok_or_else(|| {
-            local_error_with_field(operation, "end", "Google event missing end".to_string())
-        })?;
+    // A tombstone is not a malformed event. Under `showDeleted=true` a
+    // cancelled INSTANCE of a recurrence arrives with only
+    // `originalStartTime`, and a cancelled STANDALONE event arrives as a
+    // bare stub: an id, `status: "cancelled"`, and no `start`, `end` or
+    // `originalStartTime` at all. Both are the deletion notice the caller
+    // asked for, and the only fact they carry is "this id is gone", so
+    // they project with whatever time the provider did send and an empty
+    // `EventTime` where it sent none. Refusing them would turn a normal
+    // deletion into a projection error. A LIVE event missing its times is
+    // still an error - that is a provider contract break, not a deletion.
+    let start = match effective_start.map(event_time) {
+        Some(start) => start,
+        None if is_cancelled => unknown_event_time(),
+        None => {
+            return Err(local_error_with_field(
+                operation,
+                "start",
+                "Google event missing start".to_string(),
+            ));
+        }
+    };
+    let end = match event.end.or(cancelled_instance_time).map(event_time) {
+        Some(end) => end,
+        None if is_cancelled => start.clone(),
+        None => {
+            return Err(local_error_with_field(
+                operation,
+                "end",
+                "Google event missing end".to_string(),
+            ));
+        }
+    };
     Ok(CalendarEvent {
         id: EventId(native.clone()),
         calendar_id: CalendarId(calendar_id.clone()),
@@ -758,6 +807,19 @@ fn event_time(time: GoogleEventTime) -> EventTime {
     EventTime {
         value: time.date_time.or(time.date).unwrap_or_default(),
         timezone: time.time_zone,
+    }
+}
+
+// The time a tombstone that carries no time at all projects to. Not a new
+// shape on the shared surface: `event_time` already yields an empty value
+// for any `GoogleEventTime` carrying neither `date` nor `dateTime`. An
+// empty value reads as "the provider did not say", which is the truth for
+// a cancelled standalone stub, and is distinguishable from any real
+// Google timestamp.
+fn unknown_event_time() -> EventTime {
+    EventTime {
+        value: String::new(),
+        timezone: None,
     }
 }
 
@@ -1323,6 +1385,225 @@ mod tests {
         assert!(
             event.is_all_day,
             "a date-valued tombstone must project as an all-day instance",
+        );
+    }
+
+    fn primary_range() -> EventRange {
+        EventRange {
+            calendar_id: CalendarId("primary".to_string()),
+            start: EventTime {
+                value: "2026-06-01T00:00:00Z".to_string(),
+                timezone: None,
+            },
+            end: EventTime {
+                value: "2026-06-03T00:00:00Z".to_string(),
+                timezone: None,
+            },
+            limit: None,
+            page_cursor: None,
+        }
+    }
+
+    /// A cancelled STANDALONE event is the shape `showDeleted=true` returns
+    /// for an ordinary deletion: an id, `status: "cancelled"`, and no times
+    /// whatsoever - not even `originalStartTime`, which only a cancelled
+    /// INSTANCE of a recurrence carries. It is a tombstone, not a malformed
+    /// event, so it must cross the surface carrying its id and its cancelled
+    /// status rather than being refused.
+    #[test]
+    fn a_cancelled_standalone_stub_projects_as_a_tombstone() {
+        let event = event_from_google(
+            "primary".to_string(),
+            GoogleEvent {
+                id: Some("deleted-standalone".to_string()),
+                status: Some("cancelled".to_string()),
+                ..GoogleEvent::default()
+            },
+            AccountOperation::EventsInRange,
+        )
+        .expect("a cancelled stub is a deletion notice, not a projection failure");
+
+        assert_eq!(event.id.0, "primary::deleted-standalone");
+        assert_eq!(event.status, EventStatus::Cancelled);
+        assert_eq!(event.start.value, "");
+        assert_eq!(event.end.value, "");
+        assert!(
+            !event.is_all_day,
+            "a stub with no times says nothing about all-day-ness",
+        );
+    }
+
+    /// The tolerance is gated on the cancelled status, not on the mere
+    /// absence of a start: a live event the provider sent without times is
+    /// a contract break and stays an error.
+    #[test]
+    fn a_live_event_missing_start_is_still_refused() {
+        let error = event_from_google(
+            "primary".to_string(),
+            GoogleEvent {
+                id: Some("live".to_string()),
+                status: Some("confirmed".to_string()),
+                original_start_time: Some(timed("2026-06-02T12:00:00Z")),
+                ..GoogleEvent::default()
+            },
+            AccountOperation::EventsInRange,
+        )
+        .expect_err("a confirmed event with no start is malformed");
+
+        assert_eq!(error.operation(), Some(AccountOperation::EventsInRange));
+    }
+
+    /// One unprojectable item used to fail the ENTIRE page, because the
+    /// projection collected through `Result`. A deleted standalone event
+    /// is reachable on this exact path (`showDeleted=true`), so a single
+    /// ordinary deletion could take a whole range page with it.
+    #[tokio::test]
+    async fn a_deleted_standalone_event_does_not_poison_the_range_page() {
+        let (client, _script) = scripted_client(vec![canned_json(
+            StatusCode::OK,
+            json!({
+                "items": [
+                    {
+                        "id": "deleted-standalone",
+                        "status": "cancelled",
+                        "etag": "\"tomb\""
+                    },
+                    {
+                        "id": "live",
+                        "status": "confirmed",
+                        "summary": "Planning",
+                        "start": {"dateTime": "2026-06-02T12:00:00Z"},
+                        "end": {"dateTime": "2026-06-02T13:00:00Z"}
+                    }
+                ]
+            }),
+        )]);
+
+        let page = events_in_range(client, primary_range())
+            .await
+            .expect("a deletion must not fail the page");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|event| event.native_id.as_str())
+                .collect::<Vec<_>>(),
+            ["primary::deleted-standalone", "primary::live"]
+        );
+        assert_eq!(page.items[0].status, EventStatus::Cancelled);
+        assert!(
+            page.failed_ids.is_empty(),
+            "a tombstone is not a failure to report",
+        );
+    }
+
+    /// The boundary, pinned in one page: a cancelled instance and a
+    /// cancelled standalone stub are tolerated as tombstones, a malformed
+    /// LIVE event is still a failure - but a per-item one, named on
+    /// `failed_ids` and absent from `items`, rather than one that destroys
+    /// every neighbour Google already returned.
+    #[tokio::test]
+    async fn a_malformed_live_event_rides_failed_ids_without_failing_the_page() {
+        let (client, _script) = scripted_client(vec![canned_json(
+            StatusCode::OK,
+            json!({
+                "items": [
+                    {"id": "broken", "status": "confirmed", "summary": "No times"},
+                    {
+                        "id": "cancelled-instance",
+                        "status": "cancelled",
+                        "originalStartTime": {"dateTime": "2026-06-02T12:00:00Z"}
+                    },
+                    {"id": "bare-tombstone", "status": "cancelled"},
+                    {
+                        "id": "live",
+                        "start": {"dateTime": "2026-06-02T14:00:00Z"},
+                        "end": {"dateTime": "2026-06-02T15:00:00Z"}
+                    }
+                ],
+                "nextPageToken": "page-2"
+            }),
+        )]);
+
+        let page = events_in_range(client, primary_range())
+            .await
+            .expect("one bad item must not fail the page");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|event| event.native_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "primary::cancelled-instance",
+                "primary::bare-tombstone",
+                "primary::live"
+            ]
+        );
+        // The cancelled instance keeps projecting off `originalStartTime`
+        // for both bounds, which is what makes the stub case a widening
+        // rather than a replacement.
+        assert_eq!(page.items[0].start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(page.items[0].end.value, "2026-06-02T12:00:00Z");
+        assert_eq!(page.failed_ids, vec!["primary::broken".to_string()]);
+        assert_eq!(page.next_cursor.as_deref(), Some(b"page-2".as_slice()));
+    }
+
+    /// Cross-calendar search assembles its own aggregate `Page`, so the
+    /// per-calendar `failed_ids` have to be carried across the join. A
+    /// literal `Vec::new()` there would reinstate the silent drop one layer
+    /// above the fix.
+    #[tokio::test]
+    async fn cross_calendar_search_carries_per_calendar_failed_ids() {
+        let (client, _script) = scripted_client(vec![
+            canned_json(
+                StatusCode::OK,
+                json!({"items": [{"id": "primary"}, {"id": "work"}]}),
+            ),
+            canned_json(
+                StatusCode::OK,
+                json!({"items": [{"id": "broken-a", "summary": "No times"}]}),
+            ),
+            canned_json(
+                StatusCode::OK,
+                json!({
+                    "items": [
+                        {"id": "broken-b", "summary": "No times"},
+                        {
+                            "id": "good",
+                            "start": {"dateTime": "2026-06-02T12:00:00Z"},
+                            "end": {"dateTime": "2026-06-02T13:00:00Z"}
+                        }
+                    ]
+                }),
+            ),
+        ]);
+
+        let page = search(
+            client,
+            EventSearchRequest {
+                calendar_id: None,
+                query: "planning".to_string(),
+                limit: None,
+                page_cursor: None,
+            },
+        )
+        .await
+        .expect("a bad item in one calendar must not fail the whole search");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|event| event.native_id.as_str())
+                .collect::<Vec<_>>(),
+            ["work::good"]
+        );
+        assert_eq!(
+            page.failed_ids,
+            vec![
+                "primary::broken-a".to_string(),
+                "work::broken-b".to_string()
+            ]
         );
     }
 
