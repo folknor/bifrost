@@ -516,25 +516,50 @@ impl ImapConnection {
     /// and the `BINARY` capability.
     /// RFC 6855 Section 4: after ENABLE UTF8=ACCEPT, APPEND message data with
     /// UTF-8 headers must use the `UTF8 (literal8)` wrapper.
-    pub(super) fn append_literal_kind(&self, message: &[u8]) -> Result<AppendLiteralKind, Error> {
-        if self.utf8_enabled() {
-            return Ok(AppendLiteralKind::Utf8Literal8);
-        }
-
-        if message.contains(&0) {
-            let snap = self.state_rx.borrow();
-            if snap.capabilities.contains(&Capability::Binary) {
-                Ok(AppendLiteralKind::Literal8)
-            } else {
-                Err(Error::Protocol(
-                    "APPEND data containing NUL requires BINARY literal8 support \
-                     (RFC 3516 Section 4.4)"
-                        .into(),
-                ))
-            }
+    // (see `AppendWirePolicy` below for the type this returns)
+    /// Every protocol decision an APPEND's wire bytes bake in, read from ONE
+    /// snapshot borrow.
+    ///
+    /// APPEND and MULTIAPPEND assemble their bytes by hand rather than through
+    /// the driver's encoder, and they used to read `utf8_enabled`,
+    /// `literal_mode`, `append_literal_kind` and the BINARY capability as four
+    /// INDEPENDENT `state_rx.borrow()` calls, some of them lines apart and -
+    /// in `multi_append` - across an `await` on the APPENDLIMIT `STATUS`. The
+    /// driver republishes the snapshot whenever a command completes, so those
+    /// reads could disagree with each other: `literal_kind == Utf8Literal8`
+    /// opening `UTF8 (~{` while `utf8_enabled == false` closed with a bare CRLF
+    /// produced a malformed APPEND missing its `)`, and the literal body then
+    /// desynchronized the server's parse. Reading everything once makes the
+    /// bytes internally consistent by construction.
+    ///
+    /// It does NOT make them consistent with the state they are eventually SENT
+    /// under - the command is queued and the driver writes it verbatim. That is
+    /// what `WireAssumptions` on the prebuilt payload is for.
+    pub(super) fn append_wire_policy(&self) -> AppendWirePolicy {
+        let snap = self.state_rx.borrow();
+        let utf8_enabled = snap
+            .enabled
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"));
+        let binary = snap.capabilities.contains(&Capability::Binary);
+        let rev2 = super::auth::is_rev2_from_snapshot(&snap);
+        let mode = if snap.capabilities.contains(&Capability::LiteralPlus) {
+            LiteralMode::LiteralPlus
+        } else if snap.capabilities.contains(&Capability::LiteralMinus) || rev2 {
+            LiteralMode::LiteralMinus
         } else {
-            Ok(AppendLiteralKind::Literal)
+            LiteralMode::Synchronizing
+        };
+        AppendWirePolicy {
+            utf8_enabled,
+            binary,
+            rev2,
+            mode,
         }
+    }
+
+    pub(super) fn append_literal_kind(&self, message: &[u8]) -> Result<AppendLiteralKind, Error> {
+        self.append_wire_policy().literal_kind(message)
     }
 
     /// Check if the server supports non-synchronizing literal8 of the given size.
@@ -564,12 +589,7 @@ impl ImapConnection {
     /// while `literal8` requires both `BINARY` and a compatible literal
     /// extension for the `+` suffix.
     pub(super) fn append_literal_is_non_sync(&self, kind: AppendLiteralKind, size: usize) -> bool {
-        match kind {
-            AppendLiteralKind::Literal => self.supports_non_sync_literal(size),
-            AppendLiteralKind::Literal8 | AppendLiteralKind::Utf8Literal8 => {
-                self.supports_non_sync_literal8(size)
-            }
-        }
+        self.append_wire_policy().literal_is_non_sync(kind, size)
     }
 
     /// Whether `UTF8=ACCEPT` has been enabled (RFC 6855 Section 3).
@@ -680,6 +700,79 @@ impl ImapConnection {
         )
         .await
         .map_err(|_| Error::timeout_inflight())?
+    }
+}
+
+/// The protocol decisions an APPEND's hand-assembled wire bytes depend on.
+///
+/// Snapshotted together by [`ImapConnection::append_wire_policy`] so the bytes
+/// cannot contradict themselves, and carried to the driver as
+/// [`WireAssumptions`](super::driver::WireAssumptions) so bytes built under one
+/// protocol revision cannot be written under another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AppendWirePolicy {
+    pub(super) utf8_enabled: bool,
+    pub(super) binary: bool,
+    pub(super) rev2: bool,
+    pub(super) mode: LiteralMode,
+}
+
+impl AppendWirePolicy {
+    /// The same decisions, in the form the driver re-derives and compares
+    /// against live state before writing a byte.
+    pub(super) fn wire_assumptions(self) -> super::driver::WireAssumptions {
+        super::driver::WireAssumptions {
+            utf8_enabled: self.utf8_enabled,
+            binary: self.binary,
+            rev2: self.rev2,
+            literal_mode: self.mode,
+        }
+    }
+
+    /// Which literal form this message needs (RFC 3516 Section 4.4,
+    /// RFC 6855 Section 3).
+    pub(super) fn literal_kind(self, message: &[u8]) -> Result<AppendLiteralKind, Error> {
+        if self.utf8_enabled {
+            return Ok(AppendLiteralKind::Utf8Literal8);
+        }
+        if !message.contains(&0) {
+            return Ok(AppendLiteralKind::Literal);
+        }
+        if self.binary {
+            Ok(AppendLiteralKind::Literal8)
+        } else {
+            Err(Error::Protocol(
+                "APPEND data containing NUL requires BINARY literal8 support \
+                 (RFC 3516 Section 4.4)"
+                    .into(),
+            ))
+        }
+    }
+
+    /// Whether this literal form may carry the non-synchronizing `+` marker.
+    ///
+    /// RFC 7888 Sections 4-6: classic literals follow the LITERAL+/LITERAL-
+    /// rules, while `literal8` needs BINARY as well. RFC 9051 Section 9
+    /// redefines literal8 for pure rev2 with no `+` modifier at all, so rev2
+    /// literal8 is always synchronizing.
+    pub(super) fn literal_is_non_sync(self, kind: AppendLiteralKind, size: usize) -> bool {
+        match kind {
+            AppendLiteralKind::Literal => match self.mode {
+                LiteralMode::LiteralPlus => true,
+                LiteralMode::LiteralMinus => size <= 4096,
+                LiteralMode::Synchronizing => false,
+            },
+            AppendLiteralKind::Literal8 | AppendLiteralKind::Utf8Literal8 => {
+                if !self.binary || self.rev2 {
+                    return false;
+                }
+                match self.mode {
+                    LiteralMode::LiteralPlus => true,
+                    LiteralMode::LiteralMinus => size <= 4096,
+                    LiteralMode::Synchronizing => false,
+                }
+            }
+        }
     }
 }
 

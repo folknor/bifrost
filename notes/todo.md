@@ -124,328 +124,47 @@ asked for; that review debt is listed under their crates below.
   up. It adds no reconciles, only the advisory warning. Not built, because
   nothing needs it yet.
 
-- **imap: a prebuilt APPEND or MULTIAPPEND can be encoded from a stale
-  snapshot.** Found 2026-09-15 by the cold review of the `is_rev2` unification,
-  and it is a protocol-correctness defect rather than the conservative skew the
-  rest of that neighbourhood has. Ordinary commands are re-encoded driver-side
-  from live `ProtocolState` immediately before they go out, so a stale
-  handle-side gate can only refuse something the driver would now accept, or
-  pick a legacy path that stays valid under either revision. APPEND and
-  MULTIAPPEND are built entirely handle-side from the published snapshot -
-  mailbox encoding from `utf8_enabled()`, literal mode from `literal_mode()`,
-  literal8 eligibility from `is_rev2_from_snapshot` - and the driver sends those
-  bytes without re-encoding. The driver republishes the snapshot only when a
-  command completes, so a concurrent handle can build bytes for one revision and
-  have them executed under another: queue `UNAUTHENTICATE` on handle A, build an
-  APPEND on handle B against the pre-clear snapshot, and the raw UTF-8 mailbox
-  or rev2 literal treatment goes out after `enabled` was cleared. The reverse
-  transition is worse than a refusal - modified UTF-7 bytes stay syntactically
-  ASCII under rev2 and can address the WRONG mailbox rather than failing.
-  MULTIAPPEND has the widest window, since it may await an APPENDLIMIT lookup
-  between snapshotting policy and building bytes. No disagreement between the
-  five former copies of the dual-mode rule is needed to reach this; unifying
-  them did not touch it.
-
-- **The reconciler/multiplexer `ScopeTokens` sharing has no test.** The wiring
-  defect itself was FIXED 2026-09-15 (attach built the map, cloned it into the
-  reconciler, and then handed the multiplexer a fresh empty one, so
-  `scope_is_parked` answered `false` unconditionally and the terminal tombstone
-  had never fired in a real engine). What did not land is a test that bites it.
-  `tests/push_reconcile_throttle.rs` cannot: it constructs the map itself and
-  inserts the tombstone, so it pins the reconciler's READING logic - the copy -
-  rather than whether the map it reads is the one the poll scan writes. Neither
-  the slot nor the engine retains a handle, so there is no cheap structural
-  assertion either.
-  The test that would bite is end-to-end: attach an account, drive one scope's
-  poll loop to a TERMINAL verdict so it parks a tombstone, then deliver a push
-  hint naming that scope and assert no drive occurs. That needs a stub emitting
-  a terminal `AccountError` on `changes_stream` plus a way to inject a hint into
-  the reconciler spawned inside `attach`, neither of which exists in the harness
-  today. Until it does, the fix is verified by reading rather than by the suite.
-
-- **The push reconciler cannot release a stalled drive on SCOPE cancellation.**
-  Found 2026-09-15 by the cold review of the poll-arm work, and filed rather than
-  fixed because closing it needs a token the reconciler does not have. The poll
-  loop now selects both `shutdown` and its per-scope `scope_cancel` around the
-  whole drive, which is what releases the drive LEASE when a scope is deleted or
-  restarted while the account boundary is still `Run` - the generation fence
-  stops the stale publication but does not release the lease, so a replacement
-  incarnation waits behind it on `claim_drive`. The reconciler selects
-  `shutdown` only, because it holds no per-scope token: its scopes come from a
-  push hint, not from `ScopeTokens`. So a scope deleted while one of ITS drives
-  is stalled waits for the boundary rather than for the deletion. Closing it
-  means handing the reconciler the `ScopeTokens` map (or a lookup into it),
-  which is a plumbing change across the push lane rather than a local edit.
-
-- **Residuals of the bounded-backfill cold review.** P3 or P4 from that
-    review; verify against the code before working any of it. The rest of
-    that list was worked on
-    2026-09-06 and its entries deleted: the discard request left outstanding
-    by a loss after a failed attempt (the scan now keeps a failed attempt's
-    baseline and the rescan reopens on it), the ack-time ceilinged discard
-    deleting a later attempt's rows (it now fences without deleting once the
-    scope has minted a publication above the ceiling), `claim_checkpoint`
-    answering `AlreadyPersisted` for a foreign segment, a completion marker
-    acknowledged with `publication: None` (now `Unvouchable`; a PAGE with
-    `None` still persists, deliberately), and the four P4 tidy-ups. One thing
-    found on the way: once a LATER attempt's own completion marker is durable,
-    a delayed marker acknowledgement from the earlier attempt resolves as
-    `AlreadyPersisted` on the shared `Lane::Backfill(scope, completion)` key
-    and never reaches the refusal at all, so the row-deleting variant of that
-    P3 could only ever bite a later attempt's PAGE rows.
-    - DEFERRED 2026-09-07, and the deferral is the ruling: this was put to the
-      repository owner as a representation choice (tally, park, forfeit, or
-      leave) and the choice was declined as premature. The reason is upstream of
-      every option on the list. The whole publication ledger - receipts,
-      per-publication acknowledgement, supersession, the boundary registration -
-      is the price of ONE bargain offered to a consumer: persist-then-
-      acknowledge, in exchange for a mirror that is provably complete or
-      precisely annotated where it is not. No consumer has ever paid that price.
-      `ratatoskr` is the intended one and has not wired it, and what it actually
-      needs from sync is open. Optimizing the internals of a contract whose
-      TERMS are unvalidated is the wrong activity: if the answer turns out to be
-      "tell me when you are degraded and I will re-walk", most of this ledger
-      evaporates and the memory question with it. Do not work this item, or
-      re-file it as a defect, until ratatoskr's requirement is known.
-      One observation banked from the read, because it survives whatever
-      ratatoskr wants and sharpens the item if it comes back: `reference/sync.md`
-      states that only ONE acknowledger is supported. With one acknowledger and
-      one sequential producer per lane, acknowledgements are already effectively
-      ordered - so the out-of-order acknowledgement that `subsumed` exists to
-      serve is a shape the contract does not admit in the first place. If that
-      holds under scrutiny (it was NOT verified against the code), the memory
-      growth is a symptom and the disease is that the ledger carries a mechanism
-      for a caller that is not allowed to exist. The candidate answer then is
-      per-lane monotonic acknowledgement, which deletes `subsumed`,
-      `SubsumedPage`, the `folded` map and the hot-path `absorb`, makes the
-      per-page stamp invariant true by construction, and removes the
-      `debt_only` demotion in `release_undelivered` - which is a live cost, not
-      tidiness: an undelivered subsumed page currently destroys its survivor's
-      clean proof and pays for it in re-walks. Its own tension, unresolved: a
-      watermark acknowledgement needs a CUMULATIVE receipt per lane to replay
-      across a writer restart, which wants `CoverageClaim` to merge reports by
-      domain instead of appending them.
-    - FILED by the receipt-bound landing, not fixed in it: a surviving
-      backfill entry's `subsumed` history is no longer bounded by
-      `lane_capacity`. It was, while the charge was the unacknowledged page -
-      the producer parked once the charge reached the bound, so no partition
-      could fold more than that many pages into one record. Under the receipt
-      bound a READ page carries no charge, so a consumer that reads without
-      acknowledging lets one partition's `subsumed` grow with the partition,
-      each retained `PublicationId` holding an `Arc<PublicationReceipt>` (a
-      checkpoint plus a whole coverage claim). Evidence:
-      `PendingCoverage::retained_history` counts exactly this, and
-      `reading_a_superseded_page_frees_the_charge_it_left_on_its_survivor`
-      shows a read page staying in `subsumed` at zero charge. The pages
-      cannot simply be dropped on receipt: the departure sweep and
-      `abandon_checkpoints` judge the completion guarantee one page at a
-      time, and a read-but-unacknowledged page whose reader leaves is still a
-      recorded loss. So a fix is a product decision about what to do at a cap
-      - forfeit the per-page loss record, or park the producer on retention -
-      and wants its own ruling. Growth is bounded per attachment by the pages
-      one partition publishes, and every path that retires the entry (ack,
-      lag, reset, departure, detach) clears it.
-      Two more faces of the same thing, found by the slowest-reader round and
-      filed here rather than fixed in it. (a) `register_in` folds each
-      superseded claim's `reports` into the survivor's claim via
-      `CoverageClaim::absorb`, so the survivor carries not only one
-      `Arc<PublicationReceipt>` per retained page but a report vector that
-      grows with the partition too - memory grows with the partition until the
-      last acknowledgement, not with `lane_capacity`. (b) the blast radius of a
-      lag grew with it: the ack bound capped the pages a live-lane burst could
-      abandon at `lane_capacity`, and under the receipt bound one burst that
-      lags a read-without-acking consumer abandons an unbounded number of READ
-      pages, each costing a re-walk. The CHEAP answer is written and needs no
-      ruling: the consumer-facing note now on `BackfillConfig::lane_capacity`
-      says coarse acking widens both memory and lag re-work. The STRUCTURAL
-      answer is the one for the owner - compress read subsumed pages into a
-      per-stamp `(delivered_at, count)` tally instead of retaining ids, since
-      the departure sweep and `abandon_checkpoints` need only the stamp and a
-      count, and an acknowledgement of a superseded id is already answered by
-      the `folded` watermark rather than by the retained page. That would keep
-      the per-page loss record while dropping the receipts, so it is not the
-      forfeit-or-park choice above; it is a representation change with its own
-      correctness argument and wants its own ruling.
-    - Cost, not defect, in the safe direction: an abandonment retires a
-      marker still in the ring, so a live burst that lags the acknowledging
-      consumer between a walk's last page and its marker acknowledgement
-      re-walks that scope from scratch. (The other half of this bullet, a lag
-      on an observer doing the same, was retired by the observer
-      subscription: an observer's lag abandons nothing.)
-    - FILED by the last (2026-09-06) pass, not fixed in it - **the
-      slowest-reader bound holds only on the READ path.**
-      `backfill_in_flight` sums live entries only, and every acknowledgement
-      path (`acknowledge_publication`, `acknowledge_checkpoint`,
-      `retire_publication`, and the supersession fold in `register_in`)
-      removes the entry, or strips the subsumed page, together with the
-      `readers` set that recorded a slower receiver having not read it. So if
-      the ACKNOWLEDGER is faster than a numbered observer: slow (seq 0) and
-      fast (seq 1) subscribe; P1 and P2 are published; fast reads and acks
-      both; `in_flight` is 0 while slow read nothing; the producer publishes
-      `RING` more; slow is overwritten and gets `Lagged`; `on_lag` abandons
-      every registration, including pages fast READ but did not ack; the
-      marker is withheld, the walk restarts, and this repeats for as long as
-      the observer stays slower. The structural close the reviewer proposed:
-      keep a residual `(id, delivered_at, readers)` record when an entry
-      leaves the ledger still unread by an eligible live receiver, sum it in
-      `backfill_in_flight`, update it from `mark_received` and
-      `receiver_departed`, and clear it on lag, on reset and on cap eviction.
-      Deliberately NOT built in that pass (the owner ruled the round closed,
-      and this is a second mechanism, not a correction to the one that
-      landed). Scope note before anyone works it: the explicit observer
-      subscription has since landed and an observer is unnumbered, so the
-      case where the slow receiver is an observer no longer arises; what
-      remains is two ACKNOWLEDGING receivers, which `reference/sync.md`'s
-      consumer contract already declares unsupported. So this is most likely
-      a residual the observer subscription retired rather than work to
-      schedule; delete it once someone confirms no supported shape reaches
-      it. What landed instead: `BoundaryEntry::readers`, the
-      `sync.md` contract paragraph and `BackfillConfig::lane_capacity` now
-      state the guarantee precisely ("the slowest live numbered reader among
-      pages not yet acknowledged; an acknowledgement frees a page for every
-      receiver") and name this failure.
-    - Also filed there: drop a read subsumed page's receipt claim once every
-      eligible reader has read it, as a bound on the unbounded `subsumed`
-      history above. Same shape as the `(delivered_at, count)` tally, and it
-      has the same obstacle - the departure sweep judges the completion
-      guarantee one page at a time - so it wants the same ruling.
-
-- **graph move concurrency verification.** `bulk_move` refreshes every missing
-  message etag with a GET and sends `If-Match` on
-  `POST /messages/{id}/move`, while Graph advertises
-  `mutation.concurrency: StateBased`. Microsoft does not document `If-Match`
-  for the move action, but that silence does not establish that the service
-  ignores it. Verify against a live Graph mailbox by moving a message with a
-  deliberately stale etag and observing whether the action rejects with a
-  precondition failure before changing either the concurrency capability or
-  removing the etag preflight. Until that experiment is recorded, the code
-  retains the header and the capability is an explicitly unverified promise.
-
-Open work surviving the close-out of the error-model project. Items
-here were either explicitly deferred during phase 5 or are tail
-cleanups the audit surfaced and the decisions doc marked "fix per
-spec" without scheduling. Verify against current code before working
-any item; some may already be obsolete.
-
-## bifrost-jmap
-
-- **jmap-D4.** Generic JMAP `Provider`. Wire `Provider::Fastmail` (and
-  any other JMAP host the factory needs) when documented. Continue
-  setting `Provider: None` until then.
-
-  This costs more than "wire it when documented" implies, found 2026-09-15.
-  `crates/net/src/account_error.rs` already has a LIVE branch keyed on
-  `ctx.protocol == Protocol::Jmap && ctx.provider == Some(Provider::Fastmail)`
-  awarding `ThrottleScope::Account`, and `ledger_envelope.rs` already
-  serializes `Provider::Fastmail`. Because jmap sets `provider: None`, that
-  branch cannot fire: a Fastmail JMAP 429 currently gets NO throttle scope at
-  all. So this is not only a deferred nicety, it is dead throttle-classification
-  code in a SHARED crate, kept alive by a decision in another one. Either wire
-  the provider or delete the unreachable branch; leaving both is the worst of
-  the three. Note the deletion half touches published surface and is the
-  owner's call.
-
-## bifrost-imap
-
-- **imap-G1.** (gap, feature-sized) Expose IMAP MIME-part downloads as
-  real `BlobHandle`s. Symptom: the account used to advertise
-  `BlobRangeSupport::Yes` and accept any `BlobHandle` in `open_blob` /
-  `open_blob_range`, but nothing in inventory or hydration ever minted
-  such a handle - no part identity, no part size, no encoding - so the
-  only handles that reached the openers were ones a caller had to invent
-  by hand from a private id encoding. What would have to ship: a
-  BODYSTRUCTURE-to-part traversal, a stable part-handle encoding (folder,
-  UIDVALIDITY, UID, part path, transfer encoding), and a consumer-facing
-  projection that attaches those handles to hydrated MIME parts so
-  `InventoryEntry::blob_id` and attachment metadata are populated.
-  `bifrost-types::mime` ships the decoded MIME part tree
-  (`ParsedMessage` / `MimePart`), which describes octets already held where
-  BODYSTRUCTURE describes octets not yet fetched - complementary, so the
-  traversal reuses its encoding vocabulary rather than its tree.
-
-  STAGE ONE LANDED 2026-09-07, deliberately UNWIRED. `account/parts.rs` has the
-  BODYSTRUCTURE traversal and the versioned part-handle codec, with 22 tests
-  over real wire bytes through the crate's own parser. `BlobRangeSupport` is
-  still `No` and both openers still return `Unsupported`: a capability that
-  claims a byte path before the projections mint handles is a promise the crate
-  cannot keep. `open_raw_rfc822` remains the supported byte path.
-
-  STAGE TWO, what is left:
-  1. Add `BODYSTRUCTURE` to the hydration attribute selection - the account
-     layer requests it NOWHERE today - and thread the parsed structure into the
-     projection. That selector is shared by the generic and PIM projections.
-  2. Mint a handle per part into `BlobHandle`, and decide there whether
-     `message/rfc822` parts appear as attachments or only as byte-path targets.
-  3. Restore `open_blob` / `open_blob_range` over `blob.rs::run_fetch` with
-     `FetchAttr::BodySection { peek: true, section, partial }` - `run_fetch`
-     already takes both, so the opener is thin. Route its existing UIDVALIDITY
-     recheck through `verify_uidvalidity` rather than keeping two.
-  4. Only then flip `BlobRangeSupport`.
-
-  TWO THINGS STAGE TWO MUST RULE ON, both surfaced by stage one:
-  (a) A range is over ENCODED octets - `MessagePart::size` is what the server
-  reported - so a byte range on a base64 part is NOT a range over decoded
-  content. The capability has to say which it means before it can honestly
-  claim ranges.
-  (b) An unmodelled transfer encoding now survives as a token beside the
-  classified `TransferEncoding`, because `BlobEncoding` has no unknown variant
-  and stage one refused to invent one from inside the imap crate. Stage two has
-  to decide the `bifrost-types` surface: an unknown variant carrying the token,
-  or such parts made ineligible for handles. Losing the token was the P2 that
-  forced this; do not re-lose it by mapping it to something modelled.
-
-## bifrost-sasl
-
-- **sasl-F1.** Typed public auth-outcome surface. The SASL/channel-binding
-  work landed the computation, mechanism selection, and downgrade protection,
-  but deferred a typed public record of *which mechanism + channel binding
-  were used* on success (useful for audit logs / enterprise debugging) and a
-  typed failure reason (mechanism rejected, channel binding required but
-  unavailable, credential rejected, server protocol violation). Today the
-  protocol crates map into their existing error types and expose no such
-  outcome record. Was step 5 ("Public API shape") of the deleted SASL plan;
-  build it when a consumer (ratatoskr) needs the audit surface. Lives in
-  `bifrost-imap` / `bifrost-smtp` (the public auth surfaces), not the private
-  `bifrost-sasl` crate.
-
-  Re-scoped 2026-07-31 against the question "shouldn't the error model
-  already give us this?". Partly yes, and the item is smaller than filed:
-
-  - SUCCESS half, genuinely unreachable that way. The error model only
-    speaks when something fails; there is no error object to hang
-    "authenticated with SCRAM-SHA-256 plus tls-exporter channel binding"
-    on. No amount of improving error plumbing produces a success record.
-    Still waiting on ratatoskr to need the audit trail; it should not be
-    designed as a mirror of the failure surface.
-  - FAILURE half, TRACED 2026-09-15 across both public auth surfaces. The
-    2026-07-31 re-scope guessed "largely redundant" and asked someone to
-    verify what the SERVER-rejection paths carry. They carry less than the
-    guess assumed, and the premise was wrong in a way that matters:
-    `AuthPolicyFailure`, `AuthMechanismRejection` and the whole IMAP `Error`
-    enum are `pub(crate)`, so nothing typed about mechanism rejection is
-    public in `bifrost-imap` at all. A consumer sees a support-only string on
-    the local-policy path too. The redundancy question therefore has to be
-    settled at the `AccountError` level, not at the "a typed struct exists"
-    level. What the trace established: credential rejection works and the two
-    crates agree on it (`Authentication(ReauthorizationRequired)`); channel
-    binding unavailable reaches the same kind on both but is not separable
-    from "no permitted mechanism at all" except by string; a SASL exchange
-    violation is Protocol-class on both but the two crates pick DIFFERENT
-    kinds for the identical condition (imap `ContractViolation`, smtp
-    `ParseFailed`), and `reference/error-model.md` gives no rule making one
-    right. Three gaps follow, all fixable inside the error model, none
-    needing a parallel typed surface. They are listed as their own items
-    below rather than left inside this one, since two are defects.
-
-- **sasl-F3 (gap, imap).** A `NO` or `BAD` answering `AUTHENTICATE` is
-  classified with no knowledge that the command was an auth command, so a
-  server rejecting the mechanism is indistinguishable from one rejecting the
-  credential (`NO`), or lands on the client-bug-flavoured `Request(Malformed)`
-  (`BAD`). SMTP has a command phase for exactly this and imap has no analogue.
-  `require_ok_auth` in `crates/imap/src/connection/dispatch/auth.rs` is
-  already the single choke point, so the context has one place to go.
-  Note that F4's mechanism threading landed through that same choke point on
-  2026-09-15, so the plumbing a phase would ride is already there.
+- **imap: the prebuilt-APPEND `WireAssumptions` guard is unpinned, and the
+  structured-command refactor behind it is unbuilt.** The DEFECT was fixed
+  2026-09-15 in two parts. First, `append` and `multi_append` read every
+  protocol decision from ONE snapshot borrow (`append_wire_policy`); they used
+  to take four independent borrows, in `multi_append`'s case across the
+  APPENDLIMIT `STATUS` await, so the bytes could contradict themselves - a
+  `UTF8 (~{` opened against one read and closed with a bare CRLF against
+  another, whose literal body then desynchronized the parse. Second, those
+  decisions ride to the driver as `WireAssumptions` and are compared against
+  live state before a byte is written, because prebuilt bytes are frozen at
+  build time while the snapshot they came from is republished only when a
+  command COMPLETES - so a command queued behind another could be written under
+  a revision it was not encoded for, and modified UTF-7 stays valid ASCII under
+  rev2, which lands the APPEND in a DIFFERENT mailbox rather than failing.
+  WHAT IS LEFT. (a) The guard itself has no test. Reaching it needs the state to
+  move AFTER the policy read, i.e. a command sitting QUEUED behind another,
+  which takes two handles on one connection and a withheld reply to stage
+  deterministically - `driver_pair` returns the connection by value so
+  `Arc::new` gives two handles, and `tokio::time::pause()` makes the ordering
+  hermetic, but it was not built. The transcript test that exists pins the
+  single-borrow half only and says so in its own doc.
+  (b) The architectural fix is still the right one and is not done: give
+  `Command` an `Append { mailbox, messages }` variant and let the DRIVER encode
+  it from live state, which deletes the whole prebuilt path and with it this
+  entire class. It also collapses a real duplication - single-APPEND
+  re-implements flag filtering, date quoting, UTF8-wrapper selection and RFC
+  7888 marker policy that the encoder already owns, and
+  `encode_multi_append_header` is `#[cfg(test)]` while the encoder suite
+  exercises THAT rather than any production path. Sparred and confirmed sound:
+  no obstacle in `Command`, the driver channel, response dispatch or the
+  continuation machinery, and APPEND is not special to the sender - N+1 segments
+  for N synchronizing literals is exactly what `send_encoded_segments` already
+  does. Two conditions on doing it. The driver must also VALIDATE at execution
+  (session legality, MULTIAPPEND capability, BINARY for NUL bodies), since
+  moving serialization alone does not give the state gate. And a naive version
+  through `EncodedCommand::from_flat_buffer` copies the body twice or three
+  times, a real transient 2-3x footprint on large messages; avoiding that means
+  ownership-preserving segmentation, and the cleanest form of it wants
+  `AppendMessage::data` to become `Bytes` - PUBLISHED SURFACE, hence the owner's
+  call. A `Vec<u8>`-preserving version is possible by encoding directly into
+  owned segments rather than flatten-then-split.
 
 - **imap: the rev2-IMPLIED-capability list is the next instance of the same
   drift.** The dual-mode ACTIVE rule was unified on 2026-09-15 (it had five

@@ -1086,6 +1086,68 @@ async fn append_checks_the_mailbox_specific_appendlimit_before_writing() {
     let _server = script.await.expect("STATUS transcript");
 }
 
+/// A capability that disappears while the APPENDLIMIT preflight is in flight
+/// must not leave MULTIAPPEND emitting bytes encoded for the old one.
+///
+/// This needs NO second handle and no task interleaving, which is what makes it
+/// the sharp case. `multi_append` used to snapshot `allow_literal8` BEFORE
+/// awaiting the `STATUS`, then patch its literal markers with that stale value.
+/// A server may send an unsolicited `* CAPABILITY` at any time (RFC 3501
+/// Section 7.2.1), so answering the STATUS with one that drops BINARY left the
+/// command still emitting the non-synchronizing `~{n+}` form. A server that does
+/// not accept non-synchronizing literal8 then reads the MESSAGE BODY as command
+/// lines - a desynchronized parse, not a clean rejection.
+///
+/// WHAT THIS TEST DOES AND DOES NOT PIN, because the distinction cost a
+/// wrong assertion on the way in. It pins that the policy is read ONCE and
+/// AFTER the await: the literal kind is therefore derived from the same state
+/// as everything else, so the vanished BINARY is caught locally and the command
+/// is refused before a byte is written. It does NOT reach the `WireAssumptions`
+/// guard in the driver - that one fires only when the state moves after the
+/// policy is read, i.e. while the command sits QUEUED behind another, which
+/// needs two handles and a withheld reply to stage. That guard is currently
+/// unpinned; see `notes/todo.md`.
+#[tokio::test]
+async fn multiappend_refuses_bytes_built_before_a_capability_vanished() {
+    use crate::types::AppendMessage;
+
+    let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
+        "IMAP4rev1 MULTIAPPEND BINARY LITERAL+ APPENDLIMIT",
+    ))
+    .await;
+    let script = tokio::spawn(async move {
+        let status = read_line(&mut server).await;
+        let tag = tag_of(&status).to_owned();
+        // The unsolicited CAPABILITY drops BINARY, so literal8 loses its `+`
+        // eligibility (RFC 7888 Section 6) the instant this lands.
+        respond(
+            &mut server,
+            &format!(
+                "* STATUS INBOX (APPENDLIMIT 9999)\r\n\
+                 * CAPABILITY IMAP4rev1 MULTIAPPEND LITERAL+ APPENDLIMIT\r\n\
+                 {tag} OK STATUS completed\r\n"
+            ),
+        )
+        .await;
+        server
+    });
+
+    // NUL forces literal8, which is the form whose `+` eligibility BINARY
+    // governs.
+    let messages = vec![AppendMessage::new(b"a\0b".to_vec())];
+    let result = conn
+        .multi_append("INBOX", &messages, Duration::from_secs(5))
+        .await;
+    let _server = script.await.expect("STATUS transcript");
+
+    let err = result.expect_err("bytes built against the pre-CAPABILITY state must not be sent");
+    assert!(
+        matches!(err, Error::Protocol(ref m) if m.contains("requires BINARY literal8 support")),
+        "the literal kind must be derived from the SAME state as the rest of \
+         the policy, so a vanished BINARY is caught here; got {err:?}"
+    );
+}
+
 /// The APPENDLIMIT STATUS is a preflight. Its own transmission evidence is
 /// about the STATUS, not about the APPEND, and APPEND is non-idempotent: a
 /// preflight failure that reported `InFlight` would send DraftCreate recovery

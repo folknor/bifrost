@@ -138,7 +138,56 @@ pub(super) enum DriverCommandPayload {
         cmd_kind: crate::types::CommandKind,
         /// Optional mailbox target for classification context.
         cmd_target: Option<MailboxName>,
+        /// The protocol state these bytes were encoded against.
+        ///
+        /// Checked against LIVE state before a single byte goes out. A
+        /// `Standard` command is re-encoded by the driver immediately before
+        /// sending, so it cannot be stale; prebuilt bytes are frozen at build
+        /// time and the snapshot they were built from is only republished when
+        /// a command COMPLETES, so anything queued behind another command can
+        /// be written under a protocol revision it was not encoded for.
+        assumptions: WireAssumptions,
     },
+}
+
+/// What a set of prebuilt wire bytes assumed about the connection.
+///
+/// Deliberately the DECISIONS rather than a generation counter. A counter needs
+/// a bump rule that fires on capability, `enabled` and session changes but not
+/// on every `EXISTS`, and gets that rule wrong in one direction or the other; a
+/// decision record cannot over-fire, because an unsolicited response that does
+/// not change any of these leaves them all equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WireAssumptions {
+    /// `UTF8=ACCEPT` was enabled. Governs mailbox encoding (modified UTF-7
+    /// versus raw UTF-8) AND the RFC 6855 `UTF8 (` wrapper.
+    pub(super) utf8_enabled: bool,
+    /// BINARY was advertised: literal8 was eligible for the `+` marker.
+    pub(super) binary: bool,
+    /// The connection was in pure `IMAP4rev2` mode, where literal8 is always
+    /// synchronizing (RFC 9051 Section 9).
+    pub(super) rev2: bool,
+    /// The literal mode the markers were emitted for.
+    pub(super) literal_mode: crate::codec::encode::LiteralMode,
+}
+
+impl WireAssumptions {
+    /// Re-derive the same decisions from live protocol state.
+    fn from_live(state: &super::state::ProtocolState) -> Self {
+        let rev2 = is_rev2(state);
+        let capabilities = state.capabilities();
+        let binary = capabilities.contains(&Capability::Binary);
+        let literal_mode = build_encode_options(state).literal_mode;
+        Self {
+            utf8_enabled: state
+                .enabled()
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT")),
+            binary,
+            rev2,
+            literal_mode,
+        }
+    }
 }
 
 /// Payload for a [`DriverCommand::Upgrade`].
@@ -425,7 +474,7 @@ pub(super) async fn driver_task(
                                 ).await
                             }
                             DriverCommandPayload::PreBuilt {
-                                wire_bytes, tag, cmd_kind, cmd_target,
+                                wire_bytes, tag, cmd_kind, cmd_target, assumptions,
                             } => {
                                 run_prebuilt_command(
                                     &mut wire_reader,
@@ -435,6 +484,7 @@ pub(super) async fn driver_task(
                                     &tag,
                                     cmd_kind,
                                     cmd_target,
+                                    assumptions,
                                     consumer,
                                 ).await
                             }
@@ -784,9 +834,51 @@ pub(in crate::connection) async fn run_prebuilt_command(
     tag: &str,
     cmd_kind: crate::types::CommandKind,
     cmd_target: Option<MailboxName>,
+    assumptions: WireAssumptions,
     consumer: DriverConsumer,
 ) -> Result<Box<dyn std::any::Any + Send>, Error> {
     trace!(tag, ?cmd_kind, "driver: sending pre-built command");
+
+    // REFUSE BYTES ENCODED FOR A DIFFERENT CONNECTION STATE.
+    //
+    // A `Standard` command is re-encoded here from live state, so a stale
+    // handle-side gate can only refuse something the driver would now accept.
+    // Prebuilt bytes are frozen at build time and the snapshot they came from
+    // is republished only when a command completes, so anything queued behind
+    // another command can be written under a revision it was not encoded for.
+    // That is not a loud failure: modified UTF-7 stays syntactically valid
+    // ASCII under rev2, so the APPEND lands in a DIFFERENT mailbox; and a
+    // `UTF8 (` wrapper or a non-synchronizing literal8 emitted to a server that
+    // no longer has them desynchronizes the parse, because the message body is
+    // then read as command lines.
+    //
+    // Refusing here is `Unsent`: nothing has been written, and APPEND is
+    // non-idempotent, so the safe direction is to make the caller re-issue
+    // against the new state rather than to guess.
+    let live = WireAssumptions::from_live(state);
+    if live != assumptions {
+        return Err(Error::Protocol(format!(
+            "connection state changed between building and sending {cmd_kind:?} \
+             (built for {assumptions:?}, now {live:?}); re-issue the command"
+        ))
+        .with_attempt(TransmissionState::Unsent));
+    }
+    // Session legality is checked SEPARATELY rather than folded into the
+    // equality above, because it is not an encoding decision. Both prebuilt
+    // commands are legal in Authenticated AND Selected (RFC 3501 Section 6.3.11,
+    // RFC 3502 Section 3), so a SELECT completing between build and send is a
+    // legal transition that must not refuse the command - an equality check on
+    // the session would have over-fired on exactly that.
+    if !matches!(
+        state.session_state(),
+        super::SessionState::Authenticated | super::SessionState::Selected
+    ) {
+        return Err(Error::Protocol(format!(
+            "session left the Authenticated/Selected states before {cmd_kind:?} \
+             could be sent"
+        ))
+        .with_attempt(TransmissionState::Unsent));
+    }
 
     // Send pre-built bytes with literal synchronization.
     // Errors before a tagged response are Unsent or InFlight depending

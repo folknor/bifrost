@@ -966,6 +966,7 @@ impl ImapConnection {
         tag: String,
         cmd_kind: crate::types::CommandKind,
         cmd_target: Option<crate::types::validated::MailboxName>,
+        assumptions: driver::WireAssumptions,
         consumer: C,
     ) -> Result<C::Output, Error>
     where
@@ -978,6 +979,7 @@ impl ImapConnection {
                 tag,
                 cmd_kind,
                 cmd_target,
+                assumptions,
             },
             consumer: driver::DriverConsumer::Regular(
                 Box::new(consumer) as Box<dyn driver::ConsumerErased>

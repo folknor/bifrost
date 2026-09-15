@@ -59,11 +59,17 @@ impl ImapConnection {
             self.check_append_limit(message.len(), limit)?;
         }
 
-        let utf8_enabled = self.utf8_enabled();
-        let literal_kind = self.append_literal_kind(message)?;
-        let effective_non_sync = self.append_literal_is_non_sync(literal_kind, message.len());
+        // ONE snapshot read for every decision these bytes bake in. Taken
+        // separately, `utf8_enabled` and the literal kind could disagree - a
+        // publish landing between them opened `UTF8 (~{` and closed with a bare
+        // CRLF, a malformed APPEND whose literal body then desynchronized the
+        // server's parse.
+        let policy = self.append_wire_policy();
+        let utf8_enabled = policy.utf8_enabled;
+        let literal_kind = policy.literal_kind(message)?;
+        let effective_non_sync = policy.literal_is_non_sync(literal_kind, message.len());
         // RFC 7888 Sections 4-5: determine the literal mode for the encoder.
-        let mode = self.literal_mode();
+        let mode = policy.mode;
 
         // Build the complete wire bytes as a single buffer.
         // The driver will send them with literal synchronization handling.
@@ -148,6 +154,7 @@ impl ImapConnection {
                 tag,
                 crate::types::CommandKind::Append,
                 None,
+                policy.wire_assumptions(),
                 AppendConsumer::default(),
             ),
         )
@@ -184,18 +191,12 @@ impl ImapConnection {
         // Require MULTIAPPEND capability (RFC 3502 Section 3).
         // Also snapshot APPENDLIMIT and BINARY behavior before any STATUS
         // lookup for a mailbox-specific limit.
-        let (has_multiappend, advertised_limits, allow_literal8) = {
+        let (has_multiappend, advertised_limits) = {
             let snap = self.state_rx.borrow();
             let has_multiappend = snap.capabilities.contains(&Capability::MultiAppend);
             let advertised_limits = AdvertisedAppendLimits::from_capabilities(&snap.capabilities);
-            // RFC 7888 Section 6 / RFC 9051 Section 9: literal8 may use
-            // non-synchronizing `+` only when BINARY is advertised AND the
-            // connection is NOT pure IMAP4rev2 (rev2 literal8 is always
-            // synchronizing).
-            let allow_literal8 = snap.capabilities.contains(&Capability::Binary)
-                && !super::auth::is_rev2_from_snapshot(&snap);
             drop(snap);
-            (has_multiappend, advertised_limits, allow_literal8)
+            (has_multiappend, advertised_limits)
         };
 
         if !has_multiappend {
@@ -218,19 +219,28 @@ impl ImapConnection {
             }
         }
 
+        // ONE snapshot read, taken AFTER the APPENDLIMIT `STATUS` await above.
+        // `allow_literal8` was previously snapshotted BEFORE that await and then
+        // used to patch the literal markers, so an unsolicited `* CAPABILITY`
+        // dropping BINARY while the STATUS was in flight still emitted `~{n+}`.
+        // A server that does not take non-synchronizing literal8 then reads the
+        // message body as command lines. That needed no second handle: one task
+        // and a scripted server reach it.
+        let policy = self.append_wire_policy();
+        let allow_literal8 = policy.binary && !policy.rev2;
         let literal_kinds: Vec<AppendLiteralKind> = messages
             .iter()
-            .map(|msg| self.append_literal_kind(&msg.data))
+            .map(|msg| policy.literal_kind(&msg.data))
             .collect::<Result<_, _>>()?;
 
-        let utf8_enabled = self.utf8_enabled();
+        let utf8_enabled = policy.utf8_enabled;
         let tag = self.next_prebuilt_tag();
         // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: encode mailbox name
         // with INBOX normalization and MUTF-7 when not in UTF-8 mode.
         let wire_mailbox = crate::codec::encode::encode_mailbox_str(mailbox, utf8_enabled);
 
         // RFC 7888 Sections 4-5: determine the literal mode for the encoder.
-        let mode = self.literal_mode();
+        let mode = policy.mode;
 
         // Build the complete wire bytes for all messages.
         let mut buf = BytesMut::new();
@@ -296,6 +306,7 @@ impl ImapConnection {
                 tag,
                 crate::types::CommandKind::Append,
                 None,
+                policy.wire_assumptions(),
                 MultiAppendConsumer::default(),
             ),
         )
