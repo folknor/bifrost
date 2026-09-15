@@ -58,7 +58,8 @@ pub(super) async fn send_command_on_wire(
 /// Send bytes that may contain synchronizing literals, handling
 /// continuation requests at each literal boundary (RFC 3501 Section4.3).
 ///
-/// Mirrors `ImapConnection::send_with_literal_sync`.
+/// The driver owns this send path outright. It was lifted out of the
+/// pre-driver connection layer, which retains no copy of it.
 pub(super) async fn send_with_literal_sync(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
@@ -112,7 +113,8 @@ pub(super) async fn send_with_literal_sync(
 /// segments, waiting for a `+` continuation response between each pair
 /// of consecutive segments (RFC 3501 Section4.3).
 ///
-/// Mirrors `ImapConnection::send_encoded_segments`.
+/// The driver owns this send path outright. It was lifted out of the
+/// pre-driver connection layer, which retains no copy of it.
 pub(super) async fn send_encoded_segments(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
@@ -148,7 +150,35 @@ pub(super) async fn send_encoded_segments(
 /// Reads responses until the definitive signal arrives. Untagged
 /// responses are emitted as events. BYE transitions state to Logout.
 ///
-/// Mirrors `ImapConnection::wait_for_continuation`.
+/// The driver owns this wait outright. It was lifted out of the pre-driver
+/// connection layer, which retains no copy of it.
+///
+/// KNOWN DEFECT, ruling pending - do not "fix" this in passing.
+///
+/// This function does not know its own tag, so ANY tagged response ends the
+/// wait and is attributed to the command currently being written: `NO`/`BAD`
+/// become that command's error, `OK` becomes a protocol violation. That is
+/// correct only while exactly one command is outstanding, which holds for
+/// single-command dispatch and for IDLE. It does not hold for the pipeline:
+/// when `literal_mode` is `Synchronizing` (no LITERAL+, no LITERAL-, not
+/// IMAP4rev2), and likewise for a `LiteralMinus` literal too large to patch,
+/// `run_pipeline_batch` sends the batch command by command, so commands
+/// already on the wire have tags still pending. A later command's
+/// synchronizing literal can then consume an EARLIER command's tagged
+/// response: the earlier command's real result is destroyed, the whole batch
+/// aborts on the `?` at the send site before the response loop ever runs, and
+/// a `NO` belonging to command #1 is reported as a failure of command #2.
+/// Every other read loop in the crate distinguishes its own tag from a
+/// foreign one.
+///
+/// Two remedies exist and the choice is a product decision, not a local one.
+/// The narrow one passes the expected tag in and ignores a foreign tagged
+/// response, which is cheap but silently discards a result the server DID
+/// legitimately deliver. The broader one parks the foreign response and routes
+/// it into the owning command's result slot, which is the behaviour a caller
+/// would expect but needs the pipeline's tag-to-index map to be reachable from
+/// the send phase. Both change an observed error class and a batch
+/// termination, so neither is applied until the repository owner rules.
 pub(super) async fn wait_for_continuation(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,

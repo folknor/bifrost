@@ -23,18 +23,35 @@ pub(super) fn take_ack_writer(workers: &mut Vec<WorkerTask>) -> Option<WorkerTas
         .map(|position| workers.remove(position))
 }
 
-pub(super) async fn await_worker_until(deadline: tokio::time::Instant, worker: WorkerTask) {
+/// Await one stream worker's exit on the worker phase's shared deadline.
+///
+/// Takes the account id purely so the timeout line can name it. Detach is
+/// per-account but the log stream is not: in a multi-account process an
+/// unattributed "worker exceeded detach timeout" says only that some worker
+/// somewhere wedged, which is not actionable. Every other teardown line in
+/// `detach_inner` carries `account = ?account_id`; this one matches them.
+///
+/// The ROLE rides both lines for the same reason. It is captured before the
+/// match because `worker.join` moves into the timeout call.
+pub(super) async fn await_worker_until(
+    deadline: tokio::time::Instant,
+    worker: WorkerTask,
+    account_id: &AccountId,
+) {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         worker.abort.abort();
         return;
     }
+    let role = worker.role;
     match tokio::time::timeout(remaining, worker.join).await {
         Ok(Ok(())) => {}
         Ok(Err(join)) => {
             if !join.is_cancelled() {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    role = ?role,
                     error = ?join,
                     "worker panic during detach"
                 );
@@ -44,6 +61,8 @@ pub(super) async fn await_worker_until(deadline: tokio::time::Instant, worker: W
             worker.abort.abort();
             tracing::warn!(
                 target: "bifrost.sync.changes",
+                account = ?account_id,
+                role = ?role,
                 "worker exceeded detach timeout; aborted"
             );
         }

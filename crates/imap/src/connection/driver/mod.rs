@@ -925,7 +925,8 @@ fn literal_mode(state: &super::state::ProtocolState) -> LiteralMode {
 
 /// Build an [`EncodeOptions`] snapshot from protocol state.
 ///
-/// Mirrors `ImapConnection::encode_options`.
+/// The driver builds encode options from the state it owns; there is no
+/// second builder on the connection handle.
 fn build_encode_options(state: &super::state::ProtocolState) -> EncodeOptions {
     EncodeOptions {
         utf8_mode: utf8_mode(state),
@@ -937,9 +938,8 @@ fn build_encode_options(state: &super::state::ProtocolState) -> EncodeOptions {
 
 /// Build a [`ConsumerContext`] from protocol state.
 ///
-/// Mirrors `ImapConnection::build_consumer_context`. The driver
-/// constructs this inline instead of going through a method on
-/// `ImapConnection`.
+/// The driver constructs this inline from the state it owns; there is no
+/// method on `ImapConnection` that builds one.
 fn build_consumer_context<'a>(
     state: &'a super::state::ProtocolState,
     command_target: Option<&'a MailboxName>,

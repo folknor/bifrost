@@ -28,7 +28,15 @@ pub struct EngineConfig {
     pub backfill: BackfillConfig,
     pub push: PushConfig,
     pub mutation: MutationConfig,
-    /// Detach / drop timeout for awaiting spawned workers (see `H1`).
+    /// Per-PHASE detach / drop timeout (see `H1`). This is not the cost of a
+    /// detach: teardown runs three phases, each with its own fresh budget -
+    /// awaiting the stream workers, draining the ack writer, then
+    /// `Account::close()` - so a worst-case detach costs `3 * detach_timeout`
+    /// (15s at the default), and only when all three phases wedge.
+    ///
+    /// `SyncEngine::shutdown()` detaches attached accounts SEQUENTIALLY, so
+    /// worst-case engine shutdown is `3 * detach_timeout * n_accounts` plus
+    /// overhead. Size this knob against that product, not against one phase.
     pub detach_timeout: Duration,
     /// Per-lane cap on the scheduler's `VecDeque`. On overflow the
     /// oldest item is shed and a counter incremented (see `H4`).

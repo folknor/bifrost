@@ -38,9 +38,10 @@ const RAW_FETCH_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Open a message's assembled RFC822 octets (`BODY.PEEK[]`).
 ///
-/// Mirrors `open_blob` but decodes an `ObjectId` (folder / uidvalidity /
-/// uid, no section) and fetches the whole message with no section or
-/// partial, tagging transport errors `OpenRawRfc822`.
+/// Decodes an `ObjectId` (folder / uidvalidity / uid, no section) and fetches
+/// the whole message with no section or partial, tagging transport errors
+/// `OpenRawRfc822`. It shares no code with the `Account::open_blob` entry
+/// point, which IMAP answers `Unsupported`.
 ///
 /// The FETCH is streamed: each response's body sections are forwarded to
 /// the consumer as they arrive off the socket, under `RAW_FETCH_BUDGET`.

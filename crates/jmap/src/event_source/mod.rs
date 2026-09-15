@@ -34,6 +34,22 @@ impl URLParser for URLParameter {
 #[non_exhaustive]
 pub(crate) enum PushNotification {
     StateChange(Changes),
+    /// An alert carries no resume token, and that is an accepted limit.
+    ///
+    /// Only `StateChange` carries the block id a consumer checkpoints, so a
+    /// push block containing ONLY alerts advances no checkpoint: after a
+    /// reconnect the server replays from the last checkpointed position and
+    /// those alerts arrive again. Repeated alerts after a reconnect are
+    /// therefore expected behaviour, not a bug.
+    ///
+    /// This is accepted rather than fixed because it is the safe half of the
+    /// ordering rule `flatten_push_object` enforces: token-free notifications
+    /// are emitted before the token-bearing `StateChange`, so interrupted
+    /// processing can only REPLAY an alert, never skip one. Silent loss would
+    /// be the alternative failure, and it is the worse one. Closing the gap
+    /// means giving the alert a checkpoint position of its own, which reshapes
+    /// this type and its wire contract, so it is the repository owner's call
+    /// and not a local fix.
     #[cfg(feature = "calendars")]
     CalendarAlert(CalendarAlert),
     /// An `EmailPush` payload, forwarded as what it is rather than dropped.

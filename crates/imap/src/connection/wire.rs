@@ -74,9 +74,9 @@ impl WireReader {
 
     /// Read and parse a single IMAP response from the wire.
     ///
-    /// Mirrors the existing `helpers::read_parsed_response` behavior:
-    /// accumulate bytes into the internal buffer, run the nom parser,
-    /// and return the first complete response.
+    /// Accumulates bytes into the internal buffer, runs the nom parser, and
+    /// returns the first complete response. This is the only response reader
+    /// in the crate.
     ///
     /// * On parse error -> `Err(Error::Parse)`
     /// * On I/O error -> `Err(Error::Io)`

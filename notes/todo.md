@@ -36,9 +36,14 @@ every one of them, it has not wired them, and what it needs is open. Deciding
 them now means guessing on the consumer's behalf and then defending the guess.
 
 Known members of the class: the backfill `subsumed` history (see below),
-**google-B13**, **types-B1** (the rewrite half), **types-B2**, **sync-B6**. The
-tell is that the remedy is a default, a shape, or a policy that only the caller
-can evaluate.
+**types-B1** (the rewrite half), **types-B2**, **sync-B6**. The tell is that the
+remedy is a default, a shape, or a policy that only the caller can evaluate.
+
+**google-B13 LEFT this class on 2026-09-15** by taking the first way out below.
+Its blocking prerequisite was verified and cleared: all three calendar backends
+can honour an `include_cancelled` field truthfully, so the surface can stop
+deciding instead of guessing a default. See the item itself for the per-backend
+work, and note that Google's half is gated on the google-C4 defect.
 
 Two ways out, both better than ruling blind. Where the surface can simply STOP
 deciding - google-B13 is the clean case, an additive `include_cancelled` request
@@ -69,24 +74,58 @@ asked for; that review debt is listed under their crates below.
   closing it means restaging them. Wants a ruling; it is a behaviour change to
   every detach, not a local fix.
 
-- **`detach` now costs up to `3 * detach_timeout`, and `shutdown()` is
-  sequential.** Recorded 2026-09-07 with the per-phase budgets rather than
-  buried in them. Three sequential phases - worker awaits, writer phase, close -
-  each with a fresh budget, so a detach that hits a wedged worker AND a
-  non-answering store AND a hung provider close costs 15s at the default. That
-  is stated in the `detach` rustdoc and in `reference/sync.md`. Two consequences
-  somebody should look at: `EngineConfig::detach_timeout` is still documented in
-  `crates/sync/src/types.rs` as "timeout for awaiting spawned workers", which is
-  now one phase of three and is the natural place for a consumer to learn the
-  total; and `SyncEngine::shutdown()` detaches accounts SEQUENTIALLY, so engine
-  shutdown is worst-case `3 * detach_timeout * n_accounts`. Whether that should
-  be concurrent is a product decision, not a defect - but the number just got
-  larger.
+  COSTED 2026-09-15, and the answer is to split the ruling three ways rather
+  than take this as one item. Two corrections to the framing above came out of
+  it. First, there are THREE such tests, not two, and none of them stages
+  against the drive or the runner - all three park an inventory stream through
+  fusion, because the deferred-inventory worker is the one detach actually
+  joins. Second, and this changes the item's premise: **the drive is not a
+  straggler, it is an ORPHAN.** Per-scope poll tasks are spawned with the
+  `JoinHandle` discarded, so they are not in `slot.workers` and `detach`
+  neither awaits nor aborts them. A poll wedged in `drive_changes_stream`
+  therefore costs detach ZERO time and SURVIVES the detach entirely, holding an
+  `Arc<dyn Account>`, a scheduler admission and a `ChangeDelivery`, still able
+  to publish and to register publications against a `PendingCoverage` the
+  detach has walked away from. So the cost here is an unbounded leak, not a
+  bounded `detach_timeout`.
+  - **`drive_changes_stream`: yes, highest value.** It already receives a
+    `BoundaryView`, and `BoundaryView::changed()` is an async signal on the
+    same watch `detach` publishes `Stop` on, so the arm needs no signature
+    change and no new outcome variant (`ChangesEvent::Stopped` already exists).
+    No test restaging. Contain the arm to the `stream.next()` poll; the body
+    has no await to cut.
+  - **`BackfillRunner::run_partition`: yes, conditionally.** `LaneGate` already
+    owns the account shutdown token, so a crate-internal accessor plus an arm
+    returns `Err(Error::ShuttingDown)`, a shape this function already produces
+    and the orchestrator already handles. No test restaging. TWO HARD
+    CONSTRAINTS: the arm goes around the poll only and never across the
+    `publish_checkpoint` / `publish_backfill` pair, since cancelling between
+    them mints a publication no acknowledgement can retire; and a cancelled
+    partition must NEVER return `complete: true` or `RequestNextPartition`,
+    because the orchestrator would then write a completion sentinel that makes
+    the next attach skip the scope entirely. That is silent data invisibility,
+    not re-work.
+  - **`InventoryFusion::run_stream`: no, or not yet.** It is the only one whose
+    fix moves published surface (a token field on a struct consumers construct
+    by literal), and the only one that forces restaging all three tests. One of
+    them, `a_straggler_worker_does_not_cost_the_ack_writer_its_drain`, names
+    this exact change in its own doc as the ablation that breaks it, and it
+    measures the stalled stream's destruction instant from inside `Drop`
+    precisely because elapsed time cannot discriminate. A restaging that falls
+    back to elapsed time passes against the bug the test exists to pin. The
+    straggler cost being bought out is one `detach_timeout` in the worker
+    phase, already fenced off from the writer and close phases by the per-phase
+    budgets. If it is wanted anyway, it gets its own ruling, and the restaged
+    test must keep the `Drop`-instant probe.
+  Cancellation-safety check came back clean for all three: `StreamExt::next`
+  borrows the stream so a dropped poll cannot swallow an item, and the
+  `_activity` guards are function-scope bindings rather than constructed inside
+  an async block - the shape that bit this crate before is not present.
+  Arming the drive does move a stated contract: `reference/sync.md`'s "Do not:"
+  list names all three loops and says a strict publication cutoff "would have to
+  be named as one". Arming the drive moves toward that cutoff without reaching
+  it, so the honest edit narrows the clause rather than deleting it.
 
-- **`await_worker_until`'s timeout warning carries no account.** Every other
-  teardown log line in `detach_inner` names the account; this one logs "worker
-  exceeded detach timeout; aborted" with nothing to attribute it to, which is
-  unusable in a multi-account process. One line in `engine/ack.rs`.
 - **Residuals of the bounded-backfill cold review.** P3 or P4 from that
     review; verify against the code before working any of it. The rest of
     that list was worked on
@@ -220,18 +259,6 @@ asked for; that review debt is listed under their crates below.
       has the same obstacle - the departure sweep judges the completion
       guarantee one page at a time - so it wants the same ruling.
 
-- **sync tenant throttle identity.** `ThrottleScope::Tenant` cannot be enforced
-  across sibling accounts because `AccountError` carries no tenant identity.
-  `bifrost-sync` can key mailbox throttles from `ErrorScope::Mailbox` and
-  provider throttles from `AccountError::provider`, but tenant errors always
-  fall back to the reporting account. This silently under-throttles siblings
-  when a provider issues a tenant-wide 429. `bifrost-types` would need a
-  bounded, non-secret tenant identity on `AccountError` or its throttle advice,
-  protocol error translators would need to populate it, and sync could then
-  enroll accounts under `ThrottleKey::Tenant`. Round 5 stopped widening a
-  mailbox throttle with no mailbox identity to the whole account; tenant scope
-  remains account-local until that cross-crate identity channel exists.
-
 - **graph move concurrency verification.** `bulk_move` refreshes every missing
   message etag with a GET and sends `If-Match` on
   `POST /messages/{id}/move`, while Graph advertises
@@ -254,6 +281,18 @@ any item; some may already be obsolete.
 - **jmap-D4.** Generic JMAP `Provider`. Wire `Provider::Fastmail` (and
   any other JMAP host the factory needs) when documented. Continue
   setting `Provider: None` until then.
+
+  This costs more than "wire it when documented" implies, found 2026-09-15.
+  `crates/net/src/account_error.rs` already has a LIVE branch keyed on
+  `ctx.protocol == Protocol::Jmap && ctx.provider == Some(Provider::Fastmail)`
+  awarding `ThrottleScope::Account`, and `ledger_envelope.rs` already
+  serializes `Provider::Fastmail`. Because jmap sets `provider: None`, that
+  branch cannot fire: a Fastmail JMAP 429 currently gets NO throttle scope at
+  all. So this is not only a deferred nicety, it is dead throttle-classification
+  code in a SHARED crate, kept alive by a decision in another one. Either wire
+  the provider or delete the unreachable branch; leaving both is the worst of
+  the three. Note the deletion half touches published surface and is the
+  owner's call.
 
 ## bifrost-imap
 
@@ -304,14 +343,6 @@ any item; some may already be obsolete.
   or such parts made ineligible for handles. Losing the token was the P2 that
   forced this; do not re-lose it by mapping it to something modelled.
 
-## bifrost-caldav / bifrost-carddav
-
-- **dav-F7 (P4, filed 2026-09-06, cold review).** Page-size default drift:
-  CalDAV `event_search` and `events_in_range` use `usize::MAX` when `limit`
-  is `None` (`account.rs`, two sites), CardDAV `contact_search` defaults to
-  `CONTACT_PAGE_SIZE` (250). Neither reference states the CalDAV default, so
-  a consumer omitting `limit` gets an unbounded page from one crate and a
-  250-entry page from its twin with nothing documenting either.
 ## bifrost-sasl
 
 - **sasl-F1.** Typed public auth-outcome surface. The SASL/channel-binding
@@ -329,72 +360,72 @@ any item; some may already be obsolete.
   Re-scoped 2026-07-31 against the question "shouldn't the error model
   already give us this?". Partly yes, and the item is smaller than filed:
 
-  - FAILURE half, largely redundant. `crates/imap/src/error.rs` already
-    carries `AuthPolicyFailure` with the offered mechanism list and
-    per-mechanism `AuthMechanismRejection { mechanism, reason }`, which
-    reaches `AccountError` as support-only diagnostic text. So "which
-    mechanisms were rejected and why" is already available on the
-    local-policy path. Verify what the SERVER-rejection paths carry, then
-    close this half rather than building a parallel typed surface beside
-    the error model.
   - SUCCESS half, genuinely unreachable that way. The error model only
     speaks when something fails; there is no error object to hang
     "authenticated with SCRAM-SHA-256 plus tls-exporter channel binding"
     on. No amount of improving error plumbing produces a success record.
+    Still waiting on ratatoskr to need the audit trail; it should not be
+    designed as a mirror of the failure surface.
+  - FAILURE half, TRACED 2026-09-15 across both public auth surfaces. The
+    2026-07-31 re-scope guessed "largely redundant" and asked someone to
+    verify what the SERVER-rejection paths carry. They carry less than the
+    guess assumed, and the premise was wrong in a way that matters:
+    `AuthPolicyFailure`, `AuthMechanismRejection` and the whole IMAP `Error`
+    enum are `pub(crate)`, so nothing typed about mechanism rejection is
+    public in `bifrost-imap` at all. A consumer sees a support-only string on
+    the local-policy path too. The redundancy question therefore has to be
+    settled at the `AccountError` level, not at the "a typed struct exists"
+    level. What the trace established: credential rejection works and the two
+    crates agree on it (`Authentication(ReauthorizationRequired)`); channel
+    binding unavailable reaches the same kind on both but is not separable
+    from "no permitted mechanism at all" except by string; a SASL exchange
+    violation is Protocol-class on both but the two crates pick DIFFERENT
+    kinds for the identical condition (imap `ContractViolation`, smtp
+    `ParseFailed`), and `reference/error-model.md` gives no rule making one
+    right. Three gaps follow, all fixable inside the error model, none
+    needing a parallel typed surface. They are listed as their own items
+    below rather than left inside this one, since two are defects.
 
-  So the real remaining item is the success-path outcome record, and it
-  should not be designed as a mirror of the failure surface that already
-  exists. Still waiting on ratatoskr to need the audit trail.
+- **sasl-F3 (gap, imap).** A `NO` or `BAD` answering `AUTHENTICATE` is
+  classified with no knowledge that the command was an auth command, so a
+  server rejecting the mechanism is indistinguishable from one rejecting the
+  credential (`NO`), or lands on the client-bug-flavoured `Request(Malformed)`
+  (`BAD`). SMTP has a command phase for exactly this and imap has no analogue.
+  `require_ok_auth` in `crates/imap/src/connection/dispatch/auth.rs` is
+  already the single choke point, so the context has one place to go.
+  Note that F4's mechanism threading landed through that same choke point on
+  2026-09-15, so the plumbing a phase would ride is already there.
 
-## bifrost-smtp
+- **imap: `is_rev2` is restated in two places.** Found 2026-09-15.
+  `driver/mod.rs::is_rev2(&ProtocolState)` and
+  `connection/auth.rs::is_rev2_from_snapshot(&ConnectionStateSnapshot)` both
+  implement the RFC 9051 dual-mode rule, over different inputs, with no
+  cross-reference between them. The snapshot is DERIVED from the state, so this
+  is a genuine live restatement rather than two views of one rule, and it is the
+  real drift risk in the neighbourhood the now-deleted stale "Mirrors" comments
+  were vaguely gesturing at. Unifying is a small refactor, not a comment fix.
 
-Filed 2026-09-06 from the cold review of `client/core.rs`, both I/O adapters,
-the pool and the batch callers. The two P2s from that review (the batch
-DATA-final-negative `uncertain` lane, and the async body upload bounded by one
-per-operation timeout) were fixed in the same pass; everything below is
-verified against the code and awaiting its own ruling.
+- **imap: `UnavailableOnLiveSnapshot` is unreachable by construction.** The
+  rung-fall-through that records it landed 2026-09-15 and is correct and
+  defensive, but it cannot be pinned hermetically today. Reaching it needs the
+  LIVE snapshot to lack a capability the ladder's profile snapshot had, and
+  (a) the profile and the per-site gates are now provably governed by the same
+  comparison, and (b) the snapshot only moves when a command completes, while a
+  rung that completes either succeeds and returns or fails non-`MissingCapability`
+  and aborts the ladder. The only real path is a second handle on the same driver
+  refetching CAPABILITY concurrently, which is nondeterministic to script. Keep
+  the code; do not delete it for want of a test, and do not write a test that
+  fakes the shape - an earlier attempt at exactly that asserted a premise the
+  code contradicts and had never been run.
 
-- **smtp-CR7 (P4, doc).** Two reference corrections, plus one unreachable
-  shape. (a) The "Transport types" list of deliberate half-differences is now
-  three, not two: the async setup deadline is ONE shared `AsyncDeadline` across
-  DNS, connect, TLS, banner and EHLO, while the blocking half has a connect
-  timeout plus per-operation `SO_RCVTIMEO`, so blocking setup can take roughly
-  3x the configured timeout where async setup cannot exceed it. That is a real
-  behavioural difference and it is documented only as two separate mechanisms.
-  (b) `DirectSmtpStage::Start` on the pipelined path with an EMPTY recipient
-  list calls `start_window(0)`, which immediately falls through to
-  `after_envelope()` and writes `DATA` with no `MAIL FROM` ahead of it.
-  Unreachable through `Envelope::new`, which requires at least one recipient,
-  but the machine itself does not enforce it.
-
-Filed 2026-09-06 from the third cold review of the same diff. Its two other
-findings (the batch machine parking a 421'd connection, and a cap retune
-re-pricing outstanding metering debt) were fixed in that pass.
-
-- **smtp-CR11 (P3).** With a per-operation timeout of about one second or
-  less, every capped write after the first waits its parked ~1 s of debt
-  INSIDE `with_timeout` and times out. The offer clamp bounds parked debt at
-  one second of cap, which is only helpful while the timeout is comfortably
-  larger than a second. Fix direction: clamp the offer to a FRACTION of the
-  timeout's worth of cap (the clamp already re-reads the cap per call, so it
-  could read the timeout too), or document the constraint as a lower bound on
-  a usable `timeout` under a cap.
-
-- **smtp-CR12 (P3).** There is no TOTAL bound on a body write. The re-armed
-  per-write timeout deliberately bounds only a write that made no progress, so
-  a peer draining one byte per `timeout - epsilon` keeps an upload alive
-  indefinitely. The read side explicitly closed the same shape - the per-reply
-  deadline exists precisely because a peer trickling one line per period could
-  stretch one reply - so the asymmetry is deliberate on one side and unstated
-  on the other. Either add an outer bound or a minimum-progress rule, or state
-  the asymmetry in `reference/smtp.md` beside the per-reply read deadline
-  section.
-
-- **smtp-CR13 (P4).** TLS record overhead is not counted. `charge` meters
-  PLAINTEXT bytes, and under a small cap each clamped `poll_write` becomes its
-  own TLS record, so the bytes actually on the wire exceed the cap by the
-  per-record overhead - and the smaller the cap, the worse the ratio. Note
-  only; charging ciphertext would need the meter below the TLS layer.
+- **sasl-F5 residual: the stale `offered` snapshot.** The vanishing rung was
+  fixed 2026-09-15 (the `MissingCapability` fallthrough now records an
+  `UnavailableOnLiveSnapshot` rejection before advancing). What survives is
+  that `AuthPolicyFailure::Display` still renders `offered` from a snapshot
+  taken BEFORE the ladder ran, so under skew the reported offer list can name a
+  mechanism the live snapshot no longer advertises. Documented on the type:
+  `rejected` is the authoritative per-rung record, and re-reading the profile at
+  failure time would move the skew window rather than close it.
 
 ## bifrost-graph
 
@@ -421,7 +452,9 @@ re-pricing outstanding metering debt) were fixed in that pass.
 
 - **sync-F6.** (residuals of the closed F4+F5 throttle wiring) What
   bounds the now-wired `ThrottleBucket`:
-  (a) `ThrottleScope::Tenant` degrades to the `Account` key because the
+  (a) This is the SINGLE home for the tenant-identity item; a near-identical
+  duplicate filed under "Sync residuals" was deleted 2026-09-15, so do not
+  re-file it there. `ThrottleScope::Tenant` degrades to the `Account` key because the
   error contract carries no tenant identity string - `ThrottleKey::
   Tenant(String)` exists but nothing can mint one, so a Graph tenant
   429 pauses only the observing account, not tenant siblings. Fixing it
@@ -564,26 +597,6 @@ confirm against the code before working any of them.
   last `std::env::var` read in the workspace and the last place a bifrost crate
   names a downstream consumer. Coordinate with those two repos; there is nothing
   to do here until they are ready.
-- **sync-B5. Ledger compaction and audit retention.** RULED 2026-09-07, not yet
-  landed. Discharged entries are retained forever for audit, so the ledger grows
-  monotonically, and repair churns entries faster than when the retention rule
-  was written. Note that two neighbours are already bounded and must not be
-  confused with this: `proved` prunes (a proof older than newly-raised debt
-  cannot discharge it, and proofs whose load-bearing debt closed are discarded)
-  and so do `barriers`. It is `entries` that never shrinks.
-
-  Compact `Discharged` entries ONLY, into a per-scope count plus an audit root.
-  Every `Unresolved` entry stays a live entry, WAIVED ONES INCLUDED. The line
-  falls out of `ProofStatus`: `Discharged` is terminal, since something proved
-  the coverage and nothing will transition it again, while a waiver leaves the
-  entry `Unresolved` forever by design, and a later walk with a covering domain
-  can still discharge it. Compacting a waived entry would destroy an
-  `ObligationKey` an operator may still need and a proof may still land on.
-  This satisfies the constraint the item names - preserve the proved/waived
-  distinction rather than flattening it - by construction rather than by
-  bookkeeping: only the proved side compacts, so the waived entries are exactly
-  the ones left sitting there in full.
-
 - **sync-B6. Repair is caller-driven, with no scheduler.** [C4]
   `SyncEngine::repair_debt(account, max_requests)` runs exactly one pass when a
   consumer asks. Nothing schedules it, so debt sits until someone calls. That is
@@ -613,15 +626,24 @@ confirm against the code before working any of them.
 ### Cross-crate shaping questions
 
 - **No concurrency governor in `bifrost-net`.** Nothing bounds the number of
-  simultaneously in-flight requests, per account or globally. The only
-  overlapping-request site in the workspace is JMAP's foreign probing at open,
-  which solves it locally: `foreign_probe_concurrency` bounds a
+  simultaneously in-flight requests, per account or globally. JMAP's foreign
+  probing at open solves it locally: `api_request_concurrency` (bound to a local
+  `probe_concurrency` in `crates/jmap/src/sync/factory.rs`) bounds a
   `buffer_unordered` by the server's `maxConcurrentRequests` clamped to `[1, 8]`,
   serial when the core capability is unreadable, with results sorted by
   `accountId` before installation so topology and skip ordering stay
-  deterministic. Any new concurrent call site has to solve it again from scratch.
-  This is a new permit-pool feature with its own API and test-bite obligations,
-  not a defect - it stays a recorded deferral until someone wants the feature.
+  deterministic. This is a new permit-pool feature with its own API and
+  test-bite obligations, not a defect - it stays a recorded deferral until
+  someone wants the feature.
+
+  CORRECTED 2026-09-15 on two counts, and the correction strengthens the case.
+  The symbol was named `foreign_probe_concurrency` here and does not exist. More
+  importantly, the claim that the JMAP probe is the workspace's ONLY overlapping
+  -request site is false: there are now at least four more - two google inventory
+  fanouts (`buffer_unordered(HYDRATE_BATCH_SIZE)`), the jmap `filters::list`
+  fanout that jmap-C4 itself describes, and the caldav/carddav client fanouts.
+  So "any new concurrent call site has to solve it again from scratch" is not a
+  prediction, it has already happened four times without anyone recording it.
 - **Inventory exhaustion is an inferred count, not a declared flag.** The email
   inventory contract on both sides of the JMAP/sync boundary rests on "a
   partition yields zero entries only when the scope has no results past `from`".
@@ -695,6 +717,51 @@ PUBLISHED SURFACE fence apply.
   types-B1 test, which drives methods. Decide whether the uniform answer is
   worth it, or document the split. Related: c3-2.
 
+  AUDITED 2026-09-15, and **the premise above is wrong**: this is not jmap
+  versus everyone. Graph draws exactly the same line and says so in its own
+  rustdoc at `send_as_unknown_mailbox` ("The provider supports send-as; this
+  specific mailbox is just not configured, so it is a caller error"). The split
+  is two coherent groups separated precisely by the capability flag:
+  `pim_methods.send_as == false` means the FEATURE is absent, so
+  `Unsupported(Send)`; `== true` means the feature is present, so an unheld
+  mailbox id is a bad ARGUMENT, hence `Request(Malformed)` with
+  `RequestCause::InvalidArgument { field: Some("send_as.mailbox"), .. }`.
+  imap and google genuinely cannot draw that line - with no routing table there
+  is no known id to fail against - so `Unsupported` is the only honest answer
+  available to them. RULING WANTED: document the split, do not unify it.
+  Unifying has to break one of the two groups, and forcing graph/jmap to
+  `Unsupported` would tell a consumer "this account cannot send-as" about an
+  account that demonstrably can, while discarding the field pointer a UI needs.
+  Both kinds classify terminal (`ClientBug` and `Unsupported`), so no automatic
+  machinery branches on the difference; the distinction is for the consumer's
+  remediation, correct-the-request versus reconfigure-the-feature.
+  LANDED 2026-09-15: the governing statement is now the rustdoc on
+  `SendRequest::send_as`, abbreviated on `PimMethodSupport::send_as`, with
+  one-line branch pointers in `reference/imap.md`, `reference/google.md` and a
+  corrected paragraph in `reference/graph.md`. Graph's unconditional `send_as:
+  true` was fixed in the same pass (derived from the shared-client map, with a
+  refresh at the one post-construction replacement site). One correction banked
+  from that work: the audit claimed Graph already carried
+  `RequestCause::InvalidArgument { field: Some("send_as.mailbox") }`. It did
+  NOT - only JMAP did; Graph built a bare `Malformed { detail }`. Graph was
+  brought up to the documented contract rather than the doc hedged down to
+  Graph. What remains open here is only types-B1d below.
+
+- **types-B1d. The published `send_as` contract contradicts two of six crates.**
+  [found 2026-09-15] `crates/types/src/compose.rs` states the rejection is
+  `Unsupported(Send)` on both `SendAs` and the field itself, and never mentions
+  `Request(Malformed)` - which is what graph and jmap actually answer. Meanwhile
+  `send_as_guard` is duplicated in structure between imap and google, each with
+  its own local `send_as_rejected_unsupported` test exercising the copy. Textbook
+  standing-lesson shape: the copies agree indefinitely while only the original
+  disagrees, and nothing asks the original. `capability_contract_tests.rs` cannot
+  reach it - its own comment concedes it drives methods, not request fields, and
+  it always passes `send_as: None`. The structural close, additive: a
+  `refuses_field!` arm beside `refuses!` that drives a `Some(send_as)` request
+  and asserts the kind IMPLIED BY THAT CRATE'S OWN `pim_methods.send_as` flag.
+  That tests the rule instead of the copies, is expressible in all six crates
+  today, and would have caught types-B1c automatically.
+
 - **types-B2. `InventoryBatch::checkpoint` cannot express a withheld
   checkpoint.** [C2, PUBLISHED SURFACE] It is `Option<Checkpoint>`, with no way
   to distinguish "this page has no checkpoint" from "I stripped this
@@ -706,16 +773,6 @@ PUBLISHED SURFACE fence apply.
   from ignoring it - which is the same risk sync-F3 records, one layer down
   and closable by a type. Carried out of the sync arc; `bifrost-types` was not
   touched there.
-
-- **types-B3. The `Reconcile` advice lane lacks the fields `Retry` has.** [C3]
-  Both `retry_hint` and `throttle_scope` describe WHEN a failure applies and
-  HOW WIDELY, regardless of which lane it lands in, so the two advice types
-  want a shared carrier rather than one of them carrying the pair. Coupled to
-  types-B1: the audit's premise that optional lanes have defaults is what
-  makes the capability mirror necessary, so solving the capability problem is
-  what would eventually make a narrower handle possible - not a supertrait
-  split of the 94-method trait, which was considered and rejected on its own
-  merits.
 
 - **google-B13. `events_search_url` sends `singleEvents=true` with no
   `showDeleted`.** [C4] `crates/google/src/account/calendar.rs`, exactly as
@@ -739,6 +796,41 @@ PUBLISHED SURFACE fence apply.
   whether CalDAV's `calendar-query` filter and JMAP's `CalendarEvent/query` can
   express it is UNVERIFIED. A field that two of three backends silently ignore
   is a worse API than no field, so verify that before adding it.
+
+  PREREQUISITE VERIFIED 2026-09-15, and it clears: all three backends can
+  honour the field truthfully, so the "two of three silently ignore it"
+  objection does not apply and the additive field is viable. The work is not
+  symmetric, and it is inverted from what this item assumed.
+  - JMAP CANNOT express it server-side, and not because the crate
+    under-models draft-26: there is no `status` filter condition in the
+    draft, since event status is a plain object property rather than a
+    filterable condition. But `get_events` restricts no properties, so
+    `status` is always hydrated and a client-side filter is CORRECT rather
+    than lossy. Precedent sits in the same function: `search` already
+    post-filters by `calendar_id` client-side. The one subtlety is that the
+    precedent also suppresses `estimated_total`, and `include_cancelled:
+    false` needs the same suppression or the total over-counts by the
+    dropped events.
+  - CalDAV is one line on an existing closure. RFC 4791 CAN express it (a
+    sibling `prop-filter` on `STATUS` with `negate-condition`), but the crate
+    has no general filter builder and, more to the point, already treats the
+    server-side text-match as an advisory PREFILTER with the local match as
+    authority - and a 403 `CALDAV:supported-filter` on any text leg degrades
+    the whole search to an unfiltered walk, where a server-side status filter
+    would be lost anyway. A CalDAV server returns cancelled events
+    unconditionally, so `include_cancelled: false` is honestly a client-side
+    filter here, which is the shape this lane already uses.
+  - Google is the parameter alone, now that the page-poisoning projection
+    defect that would have gated it was fixed on 2026-09-15 (cancelled
+    tombstones project with empty times, and per-item projection failures
+    ride `Page::failed_ids` instead of failing the page).
+
+- **Absent event status reads as `Unknown` on all three backends.** Noticed
+  2026-09-15 across the same three projections. Both iCalendar and JMAP
+  draft-26 make the default for a missing status effectively confirmed, but
+  all three `event_status` helpers map absent to `EventStatus::Unknown`.
+  Harmless for an is-cancelled filter, but it means "no STATUS line" and
+  "STATUS:X-WEIRD" are indistinguishable in the shared type everywhere.
 
 ## Open items folded in from the third bug-hunt wave (2026-09-04)
 
@@ -770,13 +862,6 @@ PUBLISHED SURFACE fence apply.
   `filters_list` return type, i.e. a published-surface decision, so it is
   filed rather than fixed. Same shape applies to `pim`'s upload paths, but
   those are outbound and the tally is inbound-only.
-
-- **jmap-C3. Generic requests fall back to the lowest-capability primary
-  account.** [C4] `Session::default_account_id` picks the lowest capability
-  URI in `primaryAccounts`, so a session advertising only calendars serves a
-  mail-shaped generic request off the calendar account. The empty-id half
-  (no `primaryAccounts` at all) is refused before the wire; narrowing the
-  fallback itself is a product decision, recorded at the function.
 
 ## The outbound cap is evadable by reconnecting
 
@@ -838,7 +923,7 @@ Found while resolving the dav-F, smtp-CR and jmap-C2 items and the two cold
 reviews over them. Everything the reviews found at P1 or P2 was fixed in that
 wave; these are what was left. Verify before working any of them.
 
-- **Four owner rulings, none blocking.**
+- **Three owner rulings, none blocking.**
   (a) Move `should_fallback_discovery` into `bifrost-dav-core`, parameterised by
   the existing `DavProtocol` (the only difference between the copies is
   `ResourceKind::Calendar` versus `Contact`, which `DavProtocol` already
@@ -846,7 +931,9 @@ wave; these are what was left. Verify before working any of them.
   the second time the twins needed the SAME edit, and the first time they needed
   DIFFERENT edits to reach the same behaviour - the CardDAV copy parsed the probe
   body inside its `Ok(response)` arm and lifted the failure with `?`, so the
-  parse error never reached the predicate at all. Eleventh measured divergence.
+  parse error never reached the predicate at all. One more measured divergence
+  (the ordinals were retired on 2026-09-15; see `reference/carddav.md` on why
+  the running tally stopped being maintainable).
   (b) Bound the STARTTLS handshake under `timeout(None)`. `AsyncSmtpConnection::
   starttls` passes `self.timeout` to `upgrade_tls`, so a transport built with no
   timeout has an unbounded TLS handshake on the explicit-STARTTLS path. Same root
@@ -856,20 +943,37 @@ wave; these are what was left. Verify before working any of them.
   `TimeoutBudget::SetupDeadline` yielding `None` slack when built from
   `AsyncDeadline::new(None)`; any future "everything is bounded" claim starts
   there.
-  (c) Add `[check] consumer_features` to `brokkr.toml`. Two tests landed this
-  wave under `#[cfg(not(feature = "calendars"))]` - the feature-off SSE path,
-  which is exactly where the alert ruling was silently failing - and
-  `brokkr check` runs `--all-features` with no second sweep, so their bodies are
-  not even typechecked, let alone run. A cold reviewer's verdict: they earn their
-  place as executable assertions and provide ZERO automated protection until a
-  feature-off sweep exists. Deleting them would keep the gap and lose the
-  assertions.
-  (d) `PushNotification::CalendarAlert` carries no resume token, so a block
-  containing ONLY alerts advances no checkpoint and is replayed in full after
-  every reconnect. Inherent to the type and consistent with the ordering rule
-  that puts the token-bearing notification last; closing it is a change to that
-  type's shape.
+  (c) LANDED 2026-09-15, and it needs one clean verifying run. The gap was real:
+  nothing compiled this workspace with features OFF, so the two tests under
+  `#[cfg(not(feature = "calendars"))]` were never typechecked, and
+  `flatten_push_object`'s `#[allow(unreachable_patterns)] _ => {}` arm existed
+  for a configuration that was never built. `brokkr.toml` now declares three
+  `[[check]]` sweeps, the featureless leg scoped to `bifrost-jmap` under
+  `no_default_features` with `feature_unification = "selected"` so a sibling
+  cannot donate `jmap/sync` back and make it a fourth copy of the default sweep.
+  Doctests were turned on in the same pass; they default OFF, and 24 files carry
+  `///` examples on a published API that had never been compiled.
 
+  TWO THINGS TO RULE ON, both raised by the agent that wired it. Declaring ANY
+  `[[check]]` entry REPLACES brokkr's implicit `--all-features` sweep, so those
+  three entries have to reconstruct that coverage - the claim that they do is
+  reasoning about the feature graph, not a measurement. And none of it is
+  verified by a build: whether `jmap-featureless` compiles at all is unknown,
+  and if it does not, that is the defect the sweep exists to surface rather than
+  a config error.
+
+  KEEP THE PHANTOM-KEY STORY, because it explains a class of error rather than
+  one mistake. This item used to propose `[check] consumer_features` as "one
+  line closes both". Brokkr rejects it: sweeps are the `[[check]]` ARRAY and the
+  legacy table form is refused at parse. `AGENTS.md` asserted the key existed,
+  and it got that from brokkr's OWN long help text, which still repeats it while
+  the man page and the parser both disagree. So a stale upstream help string
+  propagated into a binding project document, then into a filed ruling, then
+  into a recommendation to the repository owner, with nothing in the loop
+  checking it against the tool. Report the stale help text upstream to brokkr.
+  The reusable lesson: a config-load failure is raised before any phase runs, so
+  brokkr validates a config far more cheaply than a build does. Validate a key
+  that way before writing it into any document.
 - **Three rulings from the ledger-compaction landing (2026-09-07).**
   (a) After compaction a re-raised key becomes a NEW entry:
   `first_seen_unix_seconds` resets to now and the retry budget to zero, where an
@@ -917,18 +1021,87 @@ wave; these are what was left. Verify before working any of them.
   response and route it into the right command's result slot - ignoring it
   discards a result that was legitimately delivered, which is the actual loss.
 
-- **imap: two smaller divergences between the response loops**, both found in
-  the same pass and both left alone because each changes something observable.
-  (a) `logout_best_effort` is the only loop whose tagged arm does not call
-  `emit_tagged_response_code_events`, so an `ALERT` on the LOGOUT completion is
-  dropped; low impact, since the sink is about to be torn down, but it is an
-  undocumented deviation rather than a stated one. (b)
-  `has_critical_response_code` excludes `UntaggedStatus::Bye` while
-  `emit_untagged_response_code_events` publishes for it, though the two are
-  meant to be exact complements. Latent only because the prologue makes a BYE
-  fatal before any consumer sees it, so a BYE never reaches the one caller - but
-  the exclusion is dead as written and becomes a double-emit the moment the BYE
-  short-circuit moves after classification.
+  RE-VERIFIED 2026-09-15, holds, and the ruling is now easier because one
+  option turns out not to exist. **The narrow fix is not safe standalone.**
+  Ignoring a foreign tag leaves `run_pipeline_batch`'s step-4 tag-matching
+  loop waiting forever for a tag the server has already answered, so the
+  narrow fix converts a wrong error into a HANG unless it is combined with
+  parking. Parking is therefore the only complete remedy. Its shape: build
+  `tag_to_idx`, `consumers`, `targets`, `tags` and `results` BEFORE the send
+  phase rather than after it, and give the send phase a sink (or a shared
+  parked-response buffer that step 4 drains first). That restructures steps 2
+  to 4 and leaves single-command dispatch and IDLE untouched.
+  Also: the trigger condition above is too narrow. `LiteralMinus` is exposed
+  too, because `patch_small_literals_to_plus_with_binary` only patches
+  literals up to 4096 bytes and larger ones stay synchronizing, so a LITERAL-
+  server still hits this on any pipelined APPEND-sized literal. Only the
+  `LiteralPlus` arm is immune, since it is a single batched write with no
+  waits. Independently, an untagged BYE during a pipelined literal send
+  aborts the batch with the same total result loss, whatever the tag question
+  is decided.
+
+  DESIGNED 2026-09-15, ready to rule on. Two findings make the item bigger and
+  more urgent than the text above.
+  - **There is a second, INVISIBLE half of this defect.** The untagged arm of
+    `wait_for_continuation` calls `process_untagged_as_event`, the shared
+    consumerless arm, whose own doc says it is for loops with no consumer to
+    route to. But the pipeline send phase HAS consumers, so a `* MYRIGHTS`,
+    `* LIST` or `* ESEARCH` legitimately solicited by an earlier pipelined
+    command is downgraded to an anonymous typed event and its owner never sees
+    it. The batch then still COMPLETES, so the caller gets a silently short or
+    empty result rather than an error. That is worse than the tagged case,
+    which at least fails loudly, and the current inline comment does not name
+    it. Parking must cover the untagged arm or the fix is half a fix.
+  - **A naive parking implementation is a state-corruption regression.**
+    `wait_for_continuation` calls `state.apply_side_effects` before it matches,
+    and so does step 4. Park a bare `Response` and let step 4 treat it as
+    freshly read, and side effects apply TWICE: a parked `* 3 EXPUNGE`
+    decrements twice. So the parked record must be four fields -
+    `{ resp, digest, notify_before, code_emitted }` - and the drain path must
+    re-apply nothing. `notify_before` is load-bearing because step 4 reads
+    `state.notify()` BEFORE applying effects and feeds it to classification;
+    `code_emitted` is load-bearing because a parked untagged response has
+    already had its code events emitted in the send phase. There is no smaller
+    correct record. THE RULING SHOULD APPROVE THE FOUR-FIELD RECORD EXPLICITLY,
+    not "the parking fix" in the abstract, since an implementer following the
+    one-line sketch lands the regression.
+  Shape: `wait_for_continuation` gains one `park: Option<&mut Vec<Parked>>`
+  parameter; the three single-command call sites pass `None` and are unchanged.
+  Do NOT route inside the send phase - that contagions five arguments into a
+  function IDLE also calls. Step 4 drains the buffer before reading the socket.
+  Buffer stays frame-local in `run_pipeline_batch`; hoisting it into
+  `ProtocolState` would outlive the tag namespace that gives it meaning.
+  Blast radius: IDLE verified genuinely unaffected (it sends one command and
+  its own loop already discriminates `t.tag == tag`). Nothing published moves;
+  everything involved is `pub(super)` or private. Size 60-80 lines net plus
+  roughly 250 of tests.
+  The reproducer is the fiddly part and is worked out: it needs `Synchronizing`
+  mode, two commands of DISTINCT `CommandKind` (same kind gets split into
+  sub-batches by `group_into_sub_batches` and the bug does not fire), and the
+  SECOND command must carry a synchronizing literal. Most pipelinable commands
+  cannot produce one, because mailbox names go through mUTF-7 and come out
+  ASCII-quotable. The one that can is `LISTRIGHTS` with a non-ASCII identifier,
+  which is passed raw. Greet with `* PREAUTH [CAPABILITY IMAP4rev1 ACL]` to
+  force `Synchronizing`. Assert the POSITIVE post-fix shape including that the
+  literal body bytes reached the wire - a narrow-fix implementation hangs there
+  rather than passing, which is worth pinning too. The untagged test must
+  assert on the payload, not `is_ok()`, because today it passes `is_ok()`.
+  BYE stays unfixed deliberately: `short_circuit_on_bye` must stay ahead of the
+  park, since a BYE means the connection is closing and delivering partial
+  results while tearing down is a more confusing contract than failing. Record
+  it as considered-and-declined rather than letting it look handled; partial-on
+  -BYE needs `run_pipeline_batch` to return `(PipelineResults, Option<Error>)`,
+  which ripples into `run_pipeline`'s sub-batch loop and the driver's fatal
+  check.
+
+- **imap: `emit_untagged_response_code_events` and `has_critical_response_code`
+  are complements maintained by hand.** Both handle exactly `Alert` and
+  `NotificationOverflow`, with no compiler link between them, so a third
+  critical code added to one and not the other silently reproduces the
+  dead-guard/double-emit bug the `Bye` exclusion already demonstrates. A
+  shared helper returning `Option<TypedEvent>`, with the predicate defined as
+  `.is_some()`, would make them structurally complementary. Refactor
+  proposal, not a defect, so it wants a ruling rather than a fix.
 
 - **smtp: a 421 masked by an earlier 550 in the same RCPT window.** Found
   2026-09-07 while documenting `DirectSmtpStage::RcptWindowReply`, which keeps
@@ -944,11 +1117,99 @@ wave; these are what was left. Verify before working any of them.
   making the direct path scan every reply for a 421 changes an observed
   termination nobody ruled on.
 
-- **`flatten_push_object`'s `#[allow(unreachable_patterns)] _ => {}` arm now
-  covers nothing** when both `mail` and `calendars` are on, since every
-  `PushObject` variant has a real arm. It is still needed for feature-off builds,
-  so it stays, but a reader can misread it as "something is still being dropped".
-  Worth a clarifying comment or a cfg-shaped alternative.
+## Surfaced by the first per-feature check run (2026-09-15)
+
+The sweeps landed the same day and their very first run found two things, which
+is the argument for having them.
+
+- **`bifrost-jmap` does not compile with `--no-default-features`, and never
+  has.** `tokio` and `bifrost-types` are optional dependencies and the `mailbox`
+  module is feature-gated, but `client.rs` uses `tokio` at four sites and
+  `mailbox` at one unconditionally, `core/tests.rs` names `bifrost_types`
+  directly, and four macros plus their re-export in `lib.rs` are consumed only
+  by feature-gated modules so they read as unused. There is also an
+  `irrefutable_let_patterns` in `event_source/stream.rs` under that
+  configuration.
+  NOT a regression, and not what the new sweep is for: the sweep was narrowed
+  the same day to default-minus-`calendars`, which is the configuration the code
+  actually branches on. Whether a zero-feature build should be SUPPORTED at all
+  is the open question, and it is a product decision rather than a defect - the
+  crate has never claimed it, no consumer has asked, and "make it compile" means
+  either gating five more sites or making optional dependencies mandatory. Rule
+  on the promise before anyone writes the `cfg`s.
+
+- **The blocking SMTP transport did not compile without the `tokio` feature.**
+  FIXED 2026-09-15. `error::timeout` carried a `#[cfg(feature = "tokio")]` since
+  the per-reply-deadline commit, while the BLOCKING reader called it for the
+  spent-deadline case (a zero `SO_RCVTIMEO` means block forever, so an expired
+  deadline has to be an error rather than a zero re-arm). Nothing caught it
+  because nothing had ever built `bifrost-smtp` without `tokio`; the in-workspace
+  consumer is async, so unification always donated the feature. Worth keeping as
+  the reference example of why "nothing calls it in this workspace" says nothing
+  about a library crate: the blocking half is published API, it is deliberately
+  independent of tokio, and it was broken in exactly the configuration no
+  in-workspace consumer exercises.
+
+## Surfaced by the 2026-09-15 fix wave
+
+- **`WorkerRole` cannot distinguish the eight non-writer workers.** The enum is
+  `{ AckWriter, Stream }`, and `take_ack_writer` removes the writer BEFORE the
+  worker phase runs, so every worker reaching `await_worker_until` is
+  `WorkerRole::Stream` and the `role` field now on its two warn lines is a
+  constant. The field is free and correct but it does not deliver the
+  diagnostic it looks like it delivers: all eight non-writer spawns in
+  `attach.rs` (control applier, push reconciler, push forwarder, multiplexer,
+  backfill orchestrator, deferred inventory, reopen listener, bandwidth feed)
+  pass the same variant, so a wedged-detach log line still cannot say WHICH
+  worker wedged. Getting that means splitting `Stream` into per-task variants,
+  which RENAMES a variant and therefore stops and asks. It is crate-private
+  (`pub(crate)`, not re-exported), the eight call sites are mechanical, and the
+  only test churn is `engine/tests.rs`'s `else { WorkerRole::Stream }` becoming
+  any non-writer variant while pinning the same property. Owner's call.
+
+- **google: `end` falls back to `originalStartTime` but never to `start`.** So a
+  live event carrying a start and no end is refused rather than projected as
+  zero-length. Untouched by the 2026-09-15 tombstone work, which deliberately
+  scoped itself to cancelled events; this is live-event behaviour and a
+  candidate second reading of "malformed". Note that under the per-item
+  isolation that landed with it, such an event now rides `failed_ids` instead of
+  failing its page, so the blast radius is smaller than it was.
+
+## Surfaced by the 2026-09-15 documentation pass
+
+Found while discharging dav-F7, smtp-CR7/12/13, the two imap response-loop
+divergences and the jmap push-arm items. Verify before working any of them.
+
+- **The unbounded CalDAV page default is arguably a live risk, not a doc gap.**
+  A `limit`-less `event_search` or `events_in_range` issues
+  O(collection / `MULTIGET_BATCH_SIZE`) REPORTs and materializes the whole
+  projected event set, and because a recurring resource expands into one event
+  per override the item count is not even bounded by the resource count.
+  Nothing between the account and the consumer clamps it. dav-F7 documented the
+  default rather than changing it, because bounding a published method's
+  no-`limit` behaviour is the owner's call - but if that alignment is ever
+  ruled, this is the argument for bounding CalDAV rather than unbounding
+  CardDAV.
+
+- **CardDAV's `contact_search` saturates an unrepresentable `limit` to
+  `usize::MAX`**, so an absurd explicit limit becomes unbounded on the crate
+  whose DEFAULT is bounded. Unreachable on 64-bit, and left alone during
+  dav-F7 because naming it `UNBOUNDED_PAGE_SIZE` would imply a constant that
+  crate does not otherwise have. It is now the only bare `usize::MAX` page
+  size across the twins.
+
+- **`reference/smtp.md` states the write-timeout/cap interaction in three
+  places** ("Transport types", "Per-reply read deadline", "Bandwidth
+  metering") across 1062 lines. Not a defect, and the cross-references are
+  deliberate, but it is the restatement shape the standing lessons name: any
+  behaviour change there needs three edits and nothing enforces that.
+
+- **`notes/todo.md` is running behind the code in bifrost-smtp.** Working the
+  smtp items on 2026-09-15 found smtp-CR7(b) already FIXED (with a test
+  pinning it), and smtp-CR7(a), CR12 and CR13 already absorbed into
+  `reference/smtp.md`, in CR7(a)'s case in stronger and more accurate terms
+  than the bullet carried. Check the remaining smtp bullets against the
+  reference before working them.
 
 ## Notes
 

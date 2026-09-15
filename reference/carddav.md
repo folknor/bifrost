@@ -184,7 +184,7 @@ Supported contact primitives:
   unknown and is assumed writable. The three flags were hardcoded `true` for a
   long time, so a read-only shared book advertised writable and a consumer's
   capability gate passed a PUT the server was always going to refuse - the same
-  defect class as the phantom book below, and the tenth measured divergence
+  defect class as the phantom book below, and one more measured divergence
   between the twins. A home enumerating zero addressbook collections yields an
   EMPTY list, never a fabricated placeholder. The depth-1 parse returns the
   home's own response too, so a home that is itself an addressbook collection
@@ -264,7 +264,7 @@ Supported contact primitives:
   derived parent that is not a collection is a 404/501, and some servers reject
   absolute-URI hrefs in a multiget body. The multiget's only advantage was
   carrying the etag in a prop, which the header supplies. CalDAV's `get_event`
-  had the simpler shape all along, so this was the ninth measured divergence
+  had the simpler shape all along, so this was another measured divergence
   between the twins; pinned by
   `contact_get_addresses_the_resource_with_a_plain_get`, which asserts the
   method and URL against the request transcript.
@@ -294,7 +294,7 @@ Supported contact primitives:
   halves are pinned now
   (`contact_update_moves_across_address_books_and_updates_in_place_otherwise`
   and `a_contact_move_without_server_move_support_copies_then_deletes`). That
-  gap is the eighth measured divergence between these two crates.
+  gap is another measured divergence between these two crates.
 - `contact_delete` - deletes the DAV resource. A target already gone (404 /
   410) is a success with no validator, and the DELETE replays after a
   mid-flight drop; the ruling is in `reference/caldav.md`, "DELETE is
@@ -565,6 +565,18 @@ nothing compared the copies, so divergence was silent: eight separate defects
 were exactly that. The transport, credential gate, error ladder, 207 parser and
 polling cursor have all been collapsed into `bifrost-dav-core` and can no longer
 drift.
+
+Individual divergences are no longer NUMBERED. They used to be ("the eighth
+measured divergence", and so on), and the running tally stopped being true: the
+ordinals were maintained by hand in two reference documents with no owner, new
+divergences landed unnumbered, and the highest ordinal in a durable doc fell
+behind the one being quoted elsewhere. A count that is wrong is worse than no
+count, because the whole point of counting was to measure how often these two
+drift. What matters is the standing conclusion, which does not depend on the
+number: this pair drifts repeatedly, it has done so across discovery, privilege
+reporting, resource fetch, move fallback and page-size defaults, and every one
+was found by comparison rather than by a test. So each divergence is still
+recorded where it happened, and still says it is one.
 
 What remains duplicated is smaller but still real: the query bodies and property
 constants, the discovery walk (duplicated but no longer divergent: both crates

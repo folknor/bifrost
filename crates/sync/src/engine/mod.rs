@@ -684,7 +684,7 @@ impl SyncEngine {
         let ack_worker = take_ack_writer(&mut drained);
         let deadline = tokio::time::Instant::now() + timeout;
         for worker in drained {
-            await_worker_until(deadline, worker).await;
+            await_worker_until(deadline, worker, account_id).await;
         }
         // Every loss recorded during this attachment asked for that scope's
         // backfill rows to be dropped, and the walk drains those requests at its

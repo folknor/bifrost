@@ -92,6 +92,13 @@ fn flatten_push_object(object: PushObject, id: Option<&str>) -> Vec<PushNotifica
                 notifications.push(PushNotification::EmailPush { account_id, email });
             }
             PushObject::Group { entries } => pending.extend(entries.into_iter().rev()),
+            // Nothing is dropped here. With both `mail` and `calendars` on,
+            // every `PushObject` variant already has a real arm above and this
+            // one is genuinely unreachable, hence the lint allowance. It exists
+            // only for feature-off builds, where the cfg'd arms above vanish and
+            // the corresponding variants vanish with them, leaving the match
+            // non-exhaustive without a catch-all. Deleting it breaks those
+            // builds; reading it as silent loss is a misreading.
             #[allow(unreachable_patterns)]
             _ => {}
         }

@@ -80,12 +80,28 @@ impl CardDavAccount {
     /// its own and would dominate a test about what one call does.
     #[cfg(test)]
     pub(crate) fn for_tests(client: Arc<CardDavClient>, addressbook_home: &str) -> Self {
+        Self::for_tests_with_collections(client, addressbook_home, Vec::new())
+    }
+
+    /// An account whose home enumerated several address books.
+    ///
+    /// Twin of `CalDavAccount::for_tests_with_collections`: the default book is
+    /// the first discovered collection, and the extra urls follow it in
+    /// discovery order.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_collections(
+        client: Arc<CardDavClient>,
+        default_addressbook_url: &str,
+        additional_addressbook_urls: Vec<String>,
+    ) -> Self {
         Self {
             client,
             capabilities: carddav_capabilities(),
-            addressbook_home: addressbook_home.to_string(),
-            default_addressbook_url: Some(addressbook_home.to_string()),
-            addressbook_urls: vec![addressbook_home.to_string()],
+            addressbook_home: default_addressbook_url.to_string(),
+            default_addressbook_url: Some(default_addressbook_url.to_string()),
+            addressbook_urls: std::iter::once(default_addressbook_url.to_string())
+                .chain(additional_addressbook_urls.iter().cloned())
+                .collect(),
         }
     }
 
@@ -1162,6 +1178,14 @@ impl Account for CardDavAccount {
         })
     }
 
+    /// Searches contacts by text, one page at a time.
+    ///
+    /// **An omitted `limit` defaults to `CONTACT_PAGE_SIZE` (250)**, so a
+    /// consumer that leaves the field unset still walks the collection a page at
+    /// a time and receives a `next_cursor` for the remainder. Note that the
+    /// CalDAV twin's `events_in_range` and `event_search` instead treat an
+    /// omitted `limit` as UNBOUNDED; the two crates differ on the default while
+    /// handling an explicit limit identically.
     fn contact_search(
         &self,
         request: ContactSearchRequest,
@@ -1179,6 +1203,16 @@ impl Account for CardDavAccount {
             // up to one. Clamping silently served a contact the caller had
             // asked not to receive; the shared watermark slicer is what makes
             // the zero case terminate instead of pointing at itself.
+            //
+            // An EXPLICIT limit too large for a `usize` (reachable only where
+            // `usize` is narrower than `u32`) saturates to `usize::MAX`, which
+            // the slicer reads as "truncate nothing". That is deliberately NOT
+            // clamped to `CONTACT_PAGE_SIZE`: the bounded default above is this
+            // crate's answer for a caller who expressed no preference, while a
+            // caller who names a limit larger than the machine can index has
+            // asked for as much as it can give, and the two crates are pinned to
+            // handle an explicit limit identically - clamping here would put a
+            // divergence into the one half of the contract that has none.
             let page_size = request.limit.map_or(CONTACT_PAGE_SIZE, |limit| {
                 usize::try_from(limit).unwrap_or(usize::MAX)
             });
@@ -2201,6 +2235,85 @@ mod tests {
         );
     }
 
+    /// The BOUNDED default (dav-F7), pinned by what a consumer observes rather
+    /// than by the constant's value: a `contact_search` with no `limit` serves
+    /// at most 250 candidates and issues a cursor for the remainder. The
+    /// collection is deliberately larger than the bound, because a fixture that
+    /// fits inside it would pass against an unbounded default too.
+    ///
+    /// This is the test that fails if this default is ever aligned with the
+    /// CalDAV twin's unbounded one: 300 members would then all be served in a
+    /// continuation-less page, and the sixth multiget chunk would exhaust the
+    /// script and panic.
+    #[tokio::test]
+    async fn an_omitted_search_limit_serves_one_bounded_page_and_a_cursor() {
+        const MEMBERS: usize = 300;
+        const DEFAULT_PAGE: usize = 250;
+        let names = (0..MEMBERS)
+            .map(|index| format!("c{index:03}"))
+            .collect::<Vec<_>>();
+        let listing = book_document(
+            &names
+                .iter()
+                .map(|name| listed_vcard(name))
+                .collect::<Vec<_>>(),
+        );
+        let mut responses = vec![book_multistatus(listing)];
+        // One scripted answer per multiget chunk, each hydrating its own share
+        // of the page, so the merged result is the same set however the
+        // bounded-concurrency dispatch pairs legs with answers. Exactly the
+        // chunks a 250-card page needs are scripted: a lane that pages the
+        // whole collection asks for a sixth and starves the script.
+        for chunk in names[..DEFAULT_PAGE].chunks(50) {
+            responses.push(book_multistatus(book_document(
+                &chunk
+                    .iter()
+                    .map(|name| hydrated_vcard(name))
+                    .collect::<Vec<_>>(),
+            )));
+        }
+        let script = dav_script(responses);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account =
+            CardDavAccount::for_tests(Arc::new(client), "https://dav.example.test/books/");
+
+        let page = account
+            .contact_search(ContactSearchRequest {
+                query: String::new(),
+                address_book_id: None,
+                limit: None,
+                page_cursor: None,
+            })
+            .await
+            .expect("an omitted limit is a bounded page, not a failure");
+
+        assert_eq!(
+            page.items.len(),
+            DEFAULT_PAGE,
+            "an omitted limit is bounded by the crate's own page size"
+        );
+        assert_eq!(
+            page.items.first().map(|card| card.native_id.clone()),
+            Some("https://dav.example.test/books/c000.vcf".to_string())
+        );
+        assert_eq!(
+            page.items.last().map(|card| card.native_id.clone()),
+            Some("https://dav.example.test/books/c249.vcf".to_string())
+        );
+        assert_eq!(
+            page.next_cursor,
+            Some(b"https://dav.example.test/books/c249.vcf".to_vec()),
+            "a bounded default must hand back a continuation for the remainder"
+        );
+        assert_eq!(page.estimated_total, Some(300));
+        assert_eq!(
+            transcripts(&script).len(),
+            6,
+            "one listing and five multiget chunks: the page, not the collection"
+        );
+    }
+
     fn book_document(responses: &[String]) -> String {
         format!(
             "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">{}</D:multistatus>",
@@ -2455,16 +2568,11 @@ mod tests {
             "https://dav.example.test",
             scripted_dav_net(&dav_script_empty()),
         ));
-        let account = CardDavAccount {
+        let account = CardDavAccount::for_tests_with_collections(
             client,
-            capabilities: carddav_capabilities(),
-            addressbook_home: "https://dav.example.test/books/".to_string(),
-            default_addressbook_url: Some("https://dav.example.test/books/work/".to_string()),
-            addressbook_urls: vec![
-                "https://dav.example.test/books/work/".to_string(),
-                "https://dav.example.test/books/personal/".to_string(),
-            ],
-        };
+            "https://dav.example.test/books/work/",
+            vec!["https://dav.example.test/books/personal/".to_string()],
+        );
 
         let mut stream = account.discover_cursor_scopes();
         let SyncEvent::Batch(batch) = stream.next().await.expect("scope batch") else {

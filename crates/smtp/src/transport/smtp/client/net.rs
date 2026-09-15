@@ -87,6 +87,15 @@ impl NetworkStream {
 
     /// Record `n` transferred bytes and sleep off any debt the cap
     /// imposes. Blocking, matching this transport's contract.
+    ///
+    /// `n` is PLAINTEXT bytes, never ciphertext. This stream sits above
+    /// native-tls, so the record header, MAC and padding the TLS layer adds are
+    /// never seen or charged, and the bytes actually on the wire exceed the cap
+    /// by that overhead - negligible for large transfers, proportionally worse
+    /// the smaller the cap and the smaller the writes. Metering real wire bytes
+    /// would mean putting this meter BELOW the TLS layer, which native-tls does
+    /// not expose, so the gap is recorded rather than closed. A consumer sizing
+    /// a cap against a hard link budget should leave headroom for it.
     fn charge(&mut self, n: usize, inbound: bool) {
         if n == 0 || !self.metering.is_enabled() {
             return;

@@ -266,7 +266,18 @@ pub(super) async fn logout_best_effort(
         let resp = wire_reader.read_one(utf8).await?;
         let digest = state.apply_side_effects(&resp);
         match resp {
+            // Accepted deviation: this is the only tagged arm in the crate that
+            // does not call `emit_tagged_response_code_events`, so an [ALERT] or
+            // [NOTIFICATIONOVERFLOW] code riding the LOGOUT completion is
+            // dropped instead of published. It is deliberate and low impact:
+            // the event sink is torn down immediately after this function
+            // returns, so an event emitted here would very likely never be
+            // observed by anyone. If the shutdown path ever grows a drain that
+            // flushes pending events to the consumer before the sink closes,
+            // this arm should emit like every other tagged arm does.
             crate::types::Response::Tagged(t) if t.tag == tag => break,
+            // A foreign tag also ends the drain: nothing is still outstanding
+            // that we care about, and the connection is going away.
             crate::types::Response::Tagged(_) => break,
             crate::types::Response::Untagged(u) => {
                 super::process_untagged_as_event(digest, u, event_sink)?;

@@ -112,6 +112,17 @@ returns `Error::Method` for JMAP method-level errors. RFC 8620 s3.2 lets one cal
   next block's checkpoint would let a consumer resume past a state change it
   never saw. Every failure is yielded either way.
 
+  Flattening a push block emits the token-free notifications (`CalendarAlert`,
+  `EmailPush`) first, in wire order, and the merged `StateChange` last, because
+  only the state change carries the block id a consumer checkpoints. Interrupted
+  processing can therefore only replay, never skip. The accepted consequence is
+  that a block containing ONLY alerts advances no checkpoint, so after a
+  reconnect the server resumes from the last checkpointed position and those
+  alerts are delivered again. Repeated calendar alerts across a reconnect are
+  expected, not a defect; closing the gap would mean giving an alert a
+  checkpoint position of its own, which reshapes the notification type and its
+  wire contract.
+
   Exempting a "content-free" overflow so a megabyte keepalive comment could not
   kill a working stream was tried and rejected; it is unsound in the unsafe
   direction and should not be rebuilt. The verdict is not computable where the

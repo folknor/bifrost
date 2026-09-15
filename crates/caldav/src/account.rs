@@ -43,6 +43,16 @@ const CURSOR_MAGIC: &[u8] = b"CALDAVET1";
 /// reporting truncation must not hold one poll on the wire forever, and what is
 /// left over is picked up by the next poll from the checkpointed token.
 const SYNC_TRUNCATION_ROUNDS: usize = 16;
+/// The page size an OMITTED `limit` means on the paging lanes: unbounded.
+///
+/// This value reaches `bifrost_dav_core::slice_after_watermark`, which then
+/// truncates nothing, so only the server's own page limits (and whatever the
+/// query matched) bound the result. It is a named constant rather than a bare
+/// `usize::MAX` because the two call sites read as a policy decision, not as an
+/// arithmetic saturation: the CardDAV twin's `contact_search` defaults the same
+/// field to a bounded 250 instead, and that divergence is deliberate rather than
+/// an oversight. Changing this value changes what a published method returns.
+const UNBOUNDED_PAGE_SIZE: usize = usize::MAX;
 
 #[derive(Debug)]
 pub(crate) struct CalDavAccount {
@@ -924,6 +934,15 @@ impl Account for CalDavAccount {
         })
     }
 
+    /// Lists events overlapping a window, one page at a time.
+    ///
+    /// **An omitted `limit` means UNBOUNDED** (`UNBOUNDED_PAGE_SIZE`): the
+    /// page carries every event the range query matched, in one continuation-less
+    /// page, and nothing downstream clamps it. Only the server's own page limits
+    /// apply. A consumer that wants a bounded page must ask for one. Note that
+    /// the CardDAV twin's `contact_search` instead defaults an omitted `limit` to
+    /// 250, so the two crates differ on the default while handling an explicit
+    /// limit identically.
     fn events_in_range(
         &self,
         range: EventRange,
@@ -947,8 +966,8 @@ impl Account for CalDavAccount {
             // CardDAV twin defaults `contact_search` to `CONTACT_PAGE_SIZE`
             // instead; the divergence is deliberate for now and recorded in
             // `reference/caldav.md`, not an oversight to be quietly aligned.
-            let page_size = range.limit.map_or(usize::MAX, |value| {
-                usize::try_from(value).unwrap_or(usize::MAX)
+            let page_size = range.limit.map_or(UNBOUNDED_PAGE_SIZE, |value| {
+                usize::try_from(value).unwrap_or(UNBOUNDED_PAGE_SIZE)
             });
             // The time-range filter runs on the SERVER and answers with hrefs
             // only, so the page is sliced before anything is hydrated. The
@@ -1165,6 +1184,14 @@ impl Account for CalDavAccount {
         })
     }
 
+    /// Searches events by text, one page at a time.
+    ///
+    /// **An omitted `limit` means UNBOUNDED** (`UNBOUNDED_PAGE_SIZE`), exactly
+    /// as in `events_in_range`: every candidate the text
+    /// legs (or the degrade listing) named is hydrated into one continuation-less
+    /// page, bounded only by the server's own page limits. The CardDAV twin's
+    /// `contact_search` defaults to 250 instead; an explicit limit behaves
+    /// identically on both.
     fn event_search(
         &self,
         request: EventSearchRequest,
@@ -1188,8 +1215,8 @@ impl Account for CalDavAccount {
             // text legs (or the degrade listing) named, in one page with no
             // continuation. See the comment there for what does and does not
             // clamp it, and for the CardDAV divergence.
-            let page_size = request.limit.map_or(usize::MAX, |value| {
-                usize::try_from(value).unwrap_or(usize::MAX)
+            let page_size = request.limit.map_or(UNBOUNDED_PAGE_SIZE, |value| {
+                usize::try_from(value).unwrap_or(UNBOUNDED_PAGE_SIZE)
             });
             // Both lanes below page the same way: get candidate hrefs, slice at
             // the watermark, multiget only the page. They differ only in where
@@ -2551,6 +2578,64 @@ mod tests {
             !requests[1].body.contains("/cal/c.ics"),
             "the multiget must not hydrate a member this page does not serve: {}",
             requests[1].body
+        );
+    }
+
+    /// The UNBOUNDED default (dav-F7), pinned by what a consumer observes
+    /// rather than by the constant's value: a `limit: None` range serves every
+    /// candidate in ONE page and carries no continuation. The collection is
+    /// deliberately larger than the CardDAV twin's 250-member default page, so
+    /// a fixture that fits inside that bound cannot make this pass either way.
+    ///
+    /// This is the test that fails if this default is ever aligned with that
+    /// twin: only 250 of the 300 would be served, and the page would name a
+    /// watermark.
+    #[tokio::test]
+    async fn an_omitted_range_limit_serves_the_whole_collection_in_one_page() {
+        const MEMBERS: usize = 300;
+        let names = (0..MEMBERS)
+            .map(|index| format!("e{index:03}"))
+            .collect::<Vec<_>>();
+        let query = wrap(&names.iter().map(|name| queried(name)).collect::<Vec<_>>());
+        let mut responses = vec![cal_multistatus(query)];
+        // One scripted answer per multiget chunk, each hydrating its own share
+        // of the page, so the merged page is the same set however the
+        // bounded-concurrency dispatch pairs legs with answers.
+        for chunk in names.chunks(50) {
+            responses.push(cal_multistatus(wrap(
+                &chunk.iter().map(|name| hydrated(name)).collect::<Vec<_>>(),
+            )));
+        }
+        let script = dav_script(responses);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .events_in_range(EventRange {
+                calendar_id: CalendarId("https://dav.example.test/cal/".to_string()),
+                start: time("2026-01-01T00:00:00Z"),
+                end: time("2027-01-01T00:00:00Z"),
+                limit: None,
+                page_cursor: None,
+            })
+            .await
+            .expect("an omitted limit is one unbounded page");
+
+        assert_eq!(
+            page.items.len(),
+            MEMBERS,
+            "an omitted limit truncates nothing"
+        );
+        assert_eq!(
+            page.next_cursor, None,
+            "an unbounded page has no remainder to continue from"
+        );
+        assert_eq!(page.estimated_total, Some(300));
+        assert_eq!(
+            transcripts(&script).len(),
+            7,
+            "one query and six multiget chunks: the whole collection, hydrated"
         );
     }
 

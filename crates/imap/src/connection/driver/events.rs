@@ -89,6 +89,18 @@ pub(super) fn has_critical_response_code(u: &UntaggedResponse) -> bool {
             code: Some(ResponseCode::NotificationOverflow(_)),
             ..
         }
+        // TRIP-WIRE. This BYE exclusion makes the predicate NOT an exact
+        // complement of `emit_untagged_response_code_events`, which publishes
+        // for a BYE carrying [ALERT] just like any other status. It is inert
+        // today only because `process_untagged_prefix` emits the code event and
+        // then short-circuits a BYE into a fatal error before any consumer sees
+        // the response, so a BYE can never reach a `reclassified_as_events`
+        // list and this guard is dead code. The moment the BYE short-circuit
+        // is moved to AFTER classification (or a consumer is allowed to
+        // reclassify a BYE), this exclusion turns into a live double-emit: the
+        // prologue publishes the ALERT and then the reclassified copy is
+        // published again because this returns false. Whoever moves that
+        // short-circuit must delete this guard in the same change.
         if !matches!(status, crate::types::response::UntaggedStatus::Bye)
     )
 }
