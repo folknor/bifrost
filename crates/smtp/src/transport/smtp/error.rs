@@ -93,7 +93,19 @@ pub(crate) enum SmtpCommandPhase {
     Greeting,
     Hello,
     StartTls,
-    Auth,
+    /// The AUTH exchange. `mechanism` is the SASL rung the exchange was
+    /// running when it failed, as it appears on the wire (`PLAIN`,
+    /// `SCRAM-SHA-256-PLUS`, ...), or `None` for auth-phase faults raised
+    /// before a rung was chosen (local policy refusing plaintext AUTH, no
+    /// compatible mechanism, an OAuth token source that cannot resolve).
+    ///
+    /// It is a payload on the variant rather than a separate field on
+    /// `Error` so that stamping the AUTH phase forces a decision about the
+    /// mechanism at every call site, the same reason the phase itself lives
+    /// on the value rather than on `SmtpErrorContext`.
+    Auth {
+        mechanism: Option<&'static str>,
+    },
     MailFrom,
     RcptTo,
     DataCommand,
@@ -160,11 +172,21 @@ impl Error {
     /// wrap a multi-phase exchange use this so an inner, more specific tag
     /// (e.g. `DataBody` on a body-upload write) survives the outer wrapper's
     /// coarser tag.
+    ///
+    /// One exception to set-if-absent: an AUTH stamp that carries no
+    /// mechanism accepts the mechanism from an outer AUTH stamp that has
+    /// one. Inner constructors such as `From<SaslError>` know they are on
+    /// the auth lane but not which rung is running; the wrapper in the
+    /// connection driver knows the rung. Without this the SCRAM server-error
+    /// path would keep the unnamed stamp and lose the name the driver holds.
     pub(crate) fn or_phase(self, phase: SmtpCommandPhase) -> Self {
-        if self.inner.phase.is_some() {
-            self
-        } else {
-            self.with_phase(phase)
+        match (self.inner.phase, phase) {
+            (None, _) => self.with_phase(phase),
+            (
+                Some(SmtpCommandPhase::Auth { mechanism: None }),
+                SmtpCommandPhase::Auth { mechanism: Some(_) },
+            ) => self.with_phase(phase),
+            _ => self,
         }
     }
 
@@ -466,7 +488,13 @@ pub(crate) fn connection<E: Into<BoxError>>(e: E) -> Error {
     Error::new(ErrorKind::Connection, Some(e))
 }
 
-#[cfg(feature = "tokio")]
+// NOT gated on the `tokio` feature: the BLOCKING reader calls this too, for the
+// spent-deadline case where a zero `SO_RCVTIMEO` would mean "block forever"
+// rather than "already expired". It carried a `#[cfg(feature = "tokio")]` from
+// the per-reply-deadline work until 2026-09-15, which made the blocking half of
+// a deliberately async-independent transport fail to compile with the feature
+// off. Nothing caught it because nothing built this crate without `tokio` until
+// the per-feature check sweeps existed.
 pub(crate) fn timeout(message: &'static str) -> Error {
     Error::new(
         ErrorKind::Timeout,
@@ -486,8 +514,42 @@ pub(crate) fn transport_shutdown() -> Error {
 mod tests {
     use std::io;
 
-    use super::{ErrorKind, connection, connection_io, internal, network, policy, status};
+    use super::{
+        ErrorKind, SmtpCommandPhase, connection, connection_io, internal, invalid_input, network,
+        policy, status,
+    };
     use crate::transport::smtp::response::{Category, Code, Detail, Response, Severity};
+
+    #[test]
+    fn an_unnamed_auth_stamp_takes_the_rung_from_the_driver_wrapper() {
+        // `From<SaslError>` knows it is on the auth lane but not which rung
+        // is running; the connection driver knows. Plain set-if-absent would
+        // keep the unnamed stamp and throw the name away, which is how the
+        // SCRAM server-error path would silently lose it.
+        let named = SmtpCommandPhase::Auth {
+            mechanism: Some("SCRAM-SHA-256"),
+        };
+        let inner =
+            invalid_input("invalid-proof").with_phase(SmtpCommandPhase::Auth { mechanism: None });
+        assert_eq!(inner.or_phase(named).phase(), Some(named));
+
+        // An already-named stamp is not overwritten, and a non-auth stamp
+        // keeps set-if-absent: the auth upgrade is the only exception.
+        let inner = invalid_input("invalid-proof").with_phase(SmtpCommandPhase::Auth {
+            mechanism: Some("PLAIN"),
+        });
+        assert_eq!(
+            inner.or_phase(named).phase(),
+            Some(SmtpCommandPhase::Auth {
+                mechanism: Some("PLAIN")
+            })
+        );
+        let inner = invalid_input("body").with_phase(SmtpCommandPhase::DataBody);
+        assert_eq!(
+            inner.or_phase(SmtpCommandPhase::DataCommand).phase(),
+            Some(SmtpCommandPhase::DataBody)
+        );
+    }
 
     #[test]
     fn exposes_connection_kind() {

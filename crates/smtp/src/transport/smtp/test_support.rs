@@ -25,6 +25,10 @@ struct TranscriptState {
     /// Reads then report EOF and writes fail the way a real closed socket
     /// does, so a driver cannot keep talking to a hung-up peer.
     closed: bool,
+    /// The peer never completes a shutdown, so `poll_shutdown` parks forever.
+    /// Async-only: it is set by `stall_shutdown` and read by the `AsyncWrite`
+    /// impl, both of which are gated, so the field is dead without the feature.
+    #[cfg(feature = "tokio")]
     shutdown_stalled: bool,
     /// Every read timeout the blocking driver armed on this stream, in order.
     /// The transcript never enforces them - it has no clock - but recording
@@ -61,6 +65,7 @@ impl Transcript {
                 stalled,
                 coalesced: false,
                 closed: false,
+                #[cfg(feature = "tokio")]
                 shutdown_stalled: false,
                 read_timeouts: Vec::new(),
             })),

@@ -130,6 +130,11 @@ impl WireMetering {
     /// than protect it.)
     ///
     /// Re-read per call for the same reason `cap_now` is.
+    ///
+    /// Async-only: the clamp exists for `poll_write`, which hands the socket a
+    /// bounded slice. The blocking writer charges after a full write instead,
+    /// so it has no use for this and the method is dead without the feature.
+    #[cfg(feature = "tokio")]
     pub(crate) fn write_chunk_limit(&self) -> Option<usize> {
         self.cap_now()
             .map(|cap| usize::try_from(cap).unwrap_or(usize::MAX))

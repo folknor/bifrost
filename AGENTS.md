@@ -49,20 +49,94 @@ The line is hermeticity, not size. A test belongs here if it is deterministic an
 
 ## Commands
 
-Use `brokkr` (not `cargo`) for check/test. By default output is filtered to changed files and capped at 20 diagnostics per phase.
+Use `brokkr` (not `cargo`) for check/test. `brokkr man` is the authoritative
+documentation and ships with the binary; read it rather than trusting a
+restatement, including this one.
 
-- `brokkr check` - gremlins + clippy + all tests (changed-files scope)
-- `brokkr check --triage` - show every gremlins/clippy diagnostic, no cap, no scope filter, sorted by (level, lint code, file, line). Does not widen the test phase; the failure list was never capped or scoped. (There is no `--all` flag - `brokkr check` rejects it. `--gate` exists but needs a `[test] gate_profile` in `brokkr.toml`, which this project does not define.)
-- `brokkr check -p <crate>` - scope to one package (e.g. `-p app`). You generally do not want to run this; a single `brokkr check` is faster than 2-3 `-p` runs, and brokkr intelligently filters which warnings and errors to show you
-- `brokkr check -- --test <file>` - forward args to `cargo test` (args after the second `--` go to the test binary)
-- `brokkr test -p <crate> <NAME>` - focused single-test runner. Always passes `--include-ignored --nocapture --test-threads=1`. Profile comes from `[test] debug` in `brokkr.toml`, which is currently `true`, so it builds dev by default. `<NAME>` is a case-sensitive substring filter (matches both unit and integration tests). Streams the test's own stdout/stderr live and prints a `[test] PASS/FAIL` footer with wall time. Defaults to `--all-features`; runs a second sweep if `[check].consumer_features` is set in `brokkr.toml`. Gated off for litehtml/sluggrs (use `brokkr visual` there).
-  - `-p, --package <PKG>` - cargo package. Required in this workspace - no default package, and overrides `[test] default_package` in `brokkr.toml` if set.
-  - `-N, --repeat <N>` - run the test N times per sweep (flaky-test hunting).
-  - `-j, --jobs <N>` - parallel cargo compile jobs.
-  - `--raw` - bypass output filtering, print everything cargo emits.
-  - `--debug` - force the dev profile. Redundant while `[test] debug = true` is set in `brokkr.toml`, which is the current default; it matters only if that is flipped back. `BROKKR_TEST_BIN_DIR` points at `<target>/debug` accordingly.
-  - Example: `brokkr test -p common truncates_without_splitting` or `brokkr test -p calendar extract_tag_value_flattens_nested_text -N 5` or `brokkr test -p app terminal_failure_at_initial_boot_does_not_respawn --debug`.
-- `cargo run -p app` - run the iced app
+### Sweeps
+
+`brokkr.toml` declares three `[[check]]` sweeps, and every `brokkr check` and
+`brokkr test` runs all three:
+
+- `workspace` - every member, default features. Cargo unification across the
+  workspace selection donates the non-default features in-workspace consumers
+  ask for (`bifrost-jmap/sync` via bifrost-sync, `bifrost-smtp/tokio` via
+  bifrost-imap, `bifrost-net/test-support` via dav-core's dev-dependency).
+- `smtp-dkim` - `bifrost-smtp` with `dkim`, the one optional feature no member
+  enables.
+- `jmap-calendars-off` - `bifrost-jmap` with its default features minus
+  `calendars`, pinned to `feature_unification = "selected"`. This is the only
+  leg that typechecks `#[cfg(not(feature = "calendars"))]` code and the
+  exhaustiveness arms that exist only for a calendars-off build. It is not a
+  bare no-default build: this crate does not compile with zero features, which
+  is a separate open item rather than something this sweep asserts.
+
+Declaring `[[check]]` entries replaced brokkr's implicit single `--all-features`
+sweep, so those three are the coverage, not an addition to it. A new optional
+feature that no workspace member enables is unchecked until a sweep names it.
+
+### brokkr check
+
+- `brokkr check` - the full pipeline, in order: gremlins, header, textlint,
+  manifest, script_check, dependency_rules, publish_cycle, clippy, tests.
+  Each phase short-circuits the next. Doctests run too (`[test] doctests = true`).
+- A tree holding **only markdown edits** runs the gremlins, textlint and
+  script_check phases and stops; pass `--force-rust` to run clippy and the tests
+  anyway.
+- Output: gremlins, clippy and the `--timings` list are capped at `--limit N`
+  (default 20), and when the cap bites, diagnostics in files changed on the
+  current branch sort first. Clippy *errors* are never elided by the cap. The
+  test failure list is never capped and never scoped.
+- `brokkr check --triage` - show every gremlins/clippy diagnostic, no cap, no
+  changed-files scoping, sorted by (level, lint code, file, line). Does not
+  widen the test phase; the failure list was never capped or scoped. (There is
+  no `--all` flag - `brokkr check` rejects it. `--gate` exists but needs a
+  `[test] gate_profile` in `brokkr.toml`, which this project does not define.)
+- `brokkr check -p <crate>` - scope every sweep to one package; repeatable. The
+  set is intersected with each sweep's own scope, so a sweep that admits none of
+  the named packages is skipped. You generally do not want this; a single
+  `brokkr check` is faster than 2-3 `-p` runs.
+- `brokkr check -- --test <file>` - forward args to `cargo test`. The leading
+  `--` is required, and args after a *second* `--` go to libtest
+  (`brokkr check -- -- --ignored`).
+- `--timings` - after the check, list every test that ran by descending wall
+  time. `--json` appends one machine-readable summary line. `--fix-gremlins`
+  rewrites banned Unicode in place before scanning.
+- A `cargo test` that succeeds having run zero tests fails the phase, so a
+  too-narrow filter cannot green-light a check.
+
+### brokkr test
+
+`brokkr test -p <crate> <NAME>` - focused single-test runner. Always passes
+`--include-ignored --nocapture --test-threads=1` (nightly is a prerequisite).
+Profile comes from `[test] debug` in `brokkr.toml`, which is currently `true`,
+so it builds dev by default. `<NAME>` is a case-sensitive substring filter
+matching both unit and integration tests within the package. Streams the test's
+own stdout/stderr live and prints a `[test] PASS/FAIL/BUILD FAILED/SKIP` footer
+per sweep with wall time.
+
+A sweep reports `SKIP` when the name matched nothing in it (feature-gated out)
+or when the `-p` target is outside that sweep's `packages` - both expected here,
+since two of the three sweeps are single-crate. `SKIP` alongside at least one
+`PASS` exits 0; *every* sweep skipping means the name was wrong and exits
+non-zero.
+
+- `-p, --package <PKG>` - cargo package. Required in this workspace - no
+  `[test] default_package` is set and there is no built-in default.
+- `-N, --repeat <N>` - run the test N times per sweep (flaky-test hunting).
+- `-j, --jobs <N>` - parallel cargo compile jobs.
+- `--sweep <LABEL>` - run only one sweep (`--sweep workspace`,
+  `--sweep jmap-calendars-off`) instead of all three.
+- `--raw` - bypass output filtering, print everything cargo emits.
+- `--debug` / `--release` - force a profile. `--debug` is redundant while
+  `[test] debug = true`; it matters only if that is flipped back.
+  `BROKKR_TEST_BIN_DIR` points at the matching `target/` subdirectory.
+- `--timeout <SECS>` - raise the per-test watchdog, 1-280s. Brokkr kills any
+  test running past 20s by default, here and in `brokkr check`'s test phase;
+  this flag is the only exception, and it only applies when `<NAME>` resolves to
+  exactly one test.
+- Example: `brokkr test -p bifrost-jmap session_roundtrip` or
+  `brokkr test -p bifrost-sync backfill_checkpoint -N 5`.
 
 ## Code style
 

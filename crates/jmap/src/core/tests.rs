@@ -368,6 +368,14 @@ fn problem_details_from_every_body_bearing_transport_error() {
 /// `AuthLost` is the deliberate exception: its 401 classification and
 /// transmission evidence belong to bifrost-net, so its body is not
 /// lifted into a status-derived problem guess.
+///
+/// Gated on `sync` only because that is what pulls in the optional
+/// `bifrost-types` dependency this test needs to NAME `TransmissionState`;
+/// bifrost-net depends on it unconditionally, so the behaviour under test is
+/// present in every configuration and it is the spelling that is unavailable.
+/// bifrost-net does not re-export the type, which is what would let this run
+/// everywhere.
+#[cfg(feature = "sync")]
 #[test]
 fn auth_lost_stays_a_transport_error() {
     use crate::core::transport::TransportError;

@@ -2824,24 +2824,48 @@ mod session_capability_fallbacks {
         assert_eq!(absent.malformed_capabilities().count(), 0);
     }
 
+    /// The capability URIs this crate MODELS, which is feature-dependent by
+    /// construction: `Capabilities::parse` gates its match arms, so a URI whose
+    /// feature is off is genuinely not modelled and correctly falls back to
+    /// `Other` rather than taking the malformed lane.
+    ///
+    /// This mirrors those arms, and the mirror is the point: both tests below
+    /// used to carry their own unconditional copy of this list, which passed
+    /// for as long as nothing ever built the crate with a capability feature
+    /// off. The first run that did (calendars off) failed both.
+    // `mut` is unused in a build with every capability feature off, since every
+    // extend below is gated.
+    #[allow(unused_mut)]
+    fn modelled_capability_uris() -> Vec<&'static str> {
+        let mut uris = vec![
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:websocket",
+            "urn:ietf:params:jmap:principals",
+            "urn:ietf:params:jmap:principals:owner",
+        ];
+        #[cfg(feature = "mail")]
+        uris.extend([
+            "urn:ietf:params:jmap:mail",
+            "urn:ietf:params:jmap:submission",
+            "urn:ietf:params:jmap:sieve",
+        ]);
+        #[cfg(feature = "quota")]
+        uris.push("urn:ietf:params:jmap:quota");
+        #[cfg(feature = "blob")]
+        uris.push("urn:ietf:params:jmap:blob");
+        #[cfg(feature = "calendars")]
+        uris.push("urn:ietf:params:jmap:calendars");
+        #[cfg(feature = "contacts")]
+        uris.push("urn:ietf:params:jmap:contacts");
+        uris
+    }
+
     /// Every typed capability the crate models, not a hand-picked few:
     /// a recognized URI carrying a value that cannot possibly be its
     /// object must land in `Malformed`, never in `Other`.
     #[test]
     fn every_modelled_capability_uri_has_a_malformed_lane() {
-        for uri in [
-            "urn:ietf:params:jmap:core",
-            "urn:ietf:params:jmap:mail",
-            "urn:ietf:params:jmap:submission",
-            "urn:ietf:params:jmap:websocket",
-            "urn:ietf:params:jmap:sieve",
-            "urn:ietf:params:jmap:quota",
-            "urn:ietf:params:jmap:blob",
-            "urn:ietf:params:jmap:calendars",
-            "urn:ietf:params:jmap:contacts",
-            "urn:ietf:params:jmap:principals",
-            "urn:ietf:params:jmap:principals:owner",
-        ] {
+        for uri in modelled_capability_uris() {
             let session = session_with(json!({uri: "not an object at all"}));
             assert!(
                 matches!(session.capability(uri), Some(Capabilities::Malformed(_))),
@@ -2865,19 +2889,7 @@ mod session_capability_fallbacks {
     fn a_capability_sent_as_an_array_is_malformed_and_not_present() {
         use crate::core::session::CoreCapabilityState;
 
-        for uri in [
-            "urn:ietf:params:jmap:core",
-            "urn:ietf:params:jmap:mail",
-            "urn:ietf:params:jmap:submission",
-            "urn:ietf:params:jmap:websocket",
-            "urn:ietf:params:jmap:sieve",
-            "urn:ietf:params:jmap:quota",
-            "urn:ietf:params:jmap:blob",
-            "urn:ietf:params:jmap:calendars",
-            "urn:ietf:params:jmap:contacts",
-            "urn:ietf:params:jmap:principals",
-            "urn:ietf:params:jmap:principals:owner",
-        ] {
+        for uri in modelled_capability_uris() {
             let session = session_with(json!({uri: []}));
             assert!(
                 matches!(session.capability(uri), Some(Capabilities::Malformed(v)) if v.is_array()),

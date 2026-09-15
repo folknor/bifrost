@@ -2,3 +2,52 @@ project = "bifrost"
 
 [test]
 debug = true
+# This workspace is a set of published library crates and its doc examples are
+# part of the documented API surface. Brokkr leaves doctests off by default
+# because a nextest CI lane cannot run them; bifrost has no such lane, so
+# leaving them off means the examples in ~24 source files are never compiled.
+doctests = true
+
+# Declaring any [[check]] entry replaces brokkr's implicit single `--all-features`
+# sweep, so the three entries below have to reconstruct that coverage between
+# them. bifrost is a *virtual* workspace (no root package), so `features` is only
+# legal on an entry that also names `packages`; the workspace-wide baseline
+# therefore rides default features plus cargo's own unification across the
+# selected members.
+
+# Baseline: every member, default features. Unification across the workspace
+# selection donates the non-default features that in-workspace consumers ask
+# for - bifrost-sync pulls `bifrost-jmap/sync`, bifrost-imap pulls
+# `bifrost-smtp/tokio`, and dav-core's dev-dependency pulls
+# `bifrost-net/test-support`. The one all-features flag nothing donates is
+# smtp's `dkim`, which the next entry covers.
+[[check]]
+name = "workspace"
+
+# smtp's DKIM signer is behind an optional feature no workspace member enables,
+# so it is invisible to the baseline sweep above.
+[[check]]
+name = "smtp-dkim"
+packages = ["bifrost-smtp"]
+features = ["dkim"]
+
+# The feature-OFF leg. Everything above compiles bifrost-jmap with its default
+# feature set, so the `#[cfg(not(feature = "calendars"))]` code and the
+# exhaustiveness arms that only exist for a calendars-off build are never
+# typechecked. `feature_unification = "selected"` pins the resolution so a
+# sibling member cannot donate the features back and quietly turn this into a
+# fourth copy of the default sweep.
+#
+# This is the default feature set MINUS `calendars`, deliberately, rather than
+# `no_default_features` on its own. A bare no-default build of this crate does
+# not compile and never has: `tokio`, `bifrost-types` and the `mailbox` module
+# are optional-dependency-gated while `client.rs` and `core/tests.rs` use them
+# unconditionally. Making the crate build with zero features is a real piece of
+# work nobody has ruled on, and it is NOT what this sweep is for. What this
+# sweep is for is the one cfg the code actually branches on.
+[[check]]
+name = "jmap-calendars-off"
+packages = ["bifrost-jmap"]
+no_default_features = true
+features = ["websockets", "mail", "contacts", "blob", "quota"]
+feature_unification = "selected"
