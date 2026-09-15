@@ -4,7 +4,8 @@
 use crate::account::GraphAccount;
 use crate::account::GraphClient;
 use crate::account::graph_error::{
-    GraphErrorContext, into_account_error, invalid_account_error, unsupported_account_error,
+    GraphErrorContext, into_account_error, invalid_argument_account_error,
+    unsupported_account_error,
 };
 use base64::Engine;
 use bifrost_types::{AccountError, AccountOperation, DraftHandle, MailboxId, ObjectId, SendAs};
@@ -176,13 +177,22 @@ pub(super) fn apply_send_as(message: &mut Value, send_as: &SendAs, user_email: O
 }
 
 /// A `send_as` request targeting a mailbox not registered on this
-/// account (`shared_clients` is seeded at construction). The provider
-/// supports send-as; this specific mailbox is just not configured, so
-/// it is a caller error (`Request(Malformed)`), not `Unsupported`.
+/// account (`shared_clients` is seeded at construction, and the account
+/// advertises `pim_methods.send_as` only when it is non-empty). The
+/// provider supports send-as; this specific mailbox is just not
+/// configured, so it is a caller error (`Request(Malformed)`), not
+/// `Unsupported`.
+///
+/// `InvalidArgument` rather than the plain `Malformed` detail, and with
+/// the same `send_as.mailbox` field pointer JMAP uses on this rejection:
+/// the two backends that advertise the flag are the two a consumer can
+/// get this answer from, and a UI that highlights the offending input
+/// should not have to know which one it is talking to.
 #[must_use]
 pub(super) fn send_as_unknown_mailbox(mailbox: &MailboxId) -> AccountError {
-    invalid_account_error(
+    invalid_argument_account_error(
         AccountOperation::Send,
+        "send_as.mailbox",
         format!(
             "shared mailbox not configured on this account: {}",
             mailbox.0

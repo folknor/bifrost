@@ -337,10 +337,16 @@ impl GraphAccount {
         user_email: Option<String>,
     ) -> Self {
         let (push_tx, _) = broadcast::channel(256);
+        let shared_clients = shared_clients_map(&client, shared_mailboxes);
+        // `pim_methods.send_as` mirrors this map, so derive it from the map
+        // AFTER `shared_clients_map` has dropped unroutable keys: a config
+        // of nothing but empty strings leaves no reachable mailbox and must
+        // not advertise the flag.
+        let has_shared_mailboxes = !shared_clients.is_empty();
         Self {
-            shared_clients: Arc::new(shared_clients_map(&client, shared_mailboxes)),
+            shared_clients: Arc::new(shared_clients),
             client,
-            capabilities: capabilities::build_capabilities(push_mode),
+            capabilities: capabilities::build_capabilities(push_mode, has_shared_mailboxes),
             push_endpoint,
             push_mode,
             push_tx,
@@ -362,6 +368,18 @@ impl GraphAccount {
             user_email,
             open_folder_seed: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Re-derive the capability flags that mirror `shared_clients` after that
+    /// map has been replaced.
+    ///
+    /// `capabilities()` hands out a snapshot taken at construction, and
+    /// delegate Autodiscover can widen the map once, during `open`, before
+    /// the account is published. Every later reader sees a settled map, so
+    /// one refresh at the point of replacement is enough; a consumer that
+    /// read the flag never has to re-read it.
+    pub(crate) fn refresh_shared_mailbox_capabilities(&mut self) {
+        self.capabilities.pim_methods.send_as = !self.shared_clients.is_empty();
     }
 
     #[cfg(test)]
@@ -400,6 +418,7 @@ impl GraphAccount {
     ) -> Self {
         let mut account = Self::new(client, push_mode, None, &[], None, None);
         account.shared_clients = Arc::new(shared_clients);
+        account.refresh_shared_mailbox_capabilities();
         account
     }
 
@@ -757,6 +776,7 @@ impl AccountFactory for GraphAccountFactory {
                         let merged =
                             autodiscover::merge_shared_mailboxes(&shared_mailboxes, &discovered);
                         account.shared_clients = Arc::new(shared_clients_map(&client, &merged));
+                        account.refresh_shared_mailbox_capabilities();
                     }
                     Err(error) => {
                         tracing::warn!(

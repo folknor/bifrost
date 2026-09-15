@@ -430,6 +430,8 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   A relay without FUTURERELEASE yields a stable `Unsupported(Send)`; a HOLD over
   the advertised max arrives as `Request(Malformed)`. RFC 4865 has no recall
   verb, so `cancel_scheduled_send` / `reschedule_send` are `Unsupported`.
+- `pim_methods.send_as` is false, so a `Some(send_as)` request is the
+  `Unsupported(Send)` branch of the rule stated on `SendRequest::send_as`.
 - MIME assembly is the shared `bifrost-types::mime` serializer
   (`send_request_to_rfc5322` for send, `render_rfc5322` for drafts; shared with
   Google's `MailDocument`): text/html/`multipart/alternative` bodies, a

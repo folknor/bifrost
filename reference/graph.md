@@ -575,11 +575,14 @@ invalidation is exactly what `PushSource::Coalesced` exists for.
   InvalidDeltaToken).
 - `pim_methods`: true for the container/category/extended-property/
   importance/is-read writes, send/draft lifecycle, `scheduled_send`,
-  `send_as`, search, mail folder CRUD, `identities_list`, vacation, typed hydration,
+  search, mail folder CRUD, `identities_list`, vacation, typed hydration,
   contact/calendar primitives, `directory_search` (org directory via
   `/users`), and `host_attachment`. False for
   `remove_from_container`, `set_keyword`, `set_label_membership`,
   standalone `attachment_upload`, `identity_update`, `quota_get`.
+  `send_as` is the one flag derived per account rather than fixed: true
+  only while `shared_clients` is non-empty, refreshed once if delegate
+  Autodiscover widens that map during `open`.
 - `filter_rule_shape: Rules`; all 5 filter flags true (Graph Inbox
   `messageRules` CRUD + local `filter_validate`).
 - `conveniences`: `starred = Category` (reserved `$flagged` ->
@@ -1320,14 +1323,19 @@ Scheduled send PATCHes `PidTagDeferredSendTime` (`SystemTime 0x3FEF`, ISO-8601
 UTC) onto the draft between create and send; the draft id is the
 cancel/reschedule handle.
 
-`SendRequest::send_as` (gated by `pim_methods.send_as`; Graph and JMAP both
-advertise it, see `reference/jmap.md` for the JMAP foreign-submission leg)
+`SendRequest::send_as` (gated by `pim_methods.send_as`, which Graph advertises
+only while `shared_clients` is non-empty, so an account with no shared mailbox
+configured does not promise a path on which every request would fail; see
+`reference/jmap.md` for the JMAP foreign-submission leg)
 routes create/deferred-stamp/send through the shared mailbox's `shared_clients`
 entry (keyed by `MailboxId`); the three helpers take an explicit
 `&GraphClient`. `apply_send_as` stamps `from`/`sender`: `As` forces both to
 the mailbox; `OnBehalfOf` keeps `from` = mailbox (honoring an explicit
 `from`), `sender` = `user_email` (omitted when `None`). An unconfigured
-mailbox is `Request(Malformed)`.
+mailbox is `Request(Malformed)` carrying `RequestCause::InvalidArgument`
+with `field: Some("send_as.mailbox")` - the capability is present, so the
+mailbox is a bad argument rather than a missing feature. The rustdoc on
+`SendRequest::send_as` is the governing statement of that split.
 
 Search uses `/messages` (`$filter`/`$search`/`$top`). It walks the primary
 mailbox first, then configured shared mailboxes in sorted routing-key

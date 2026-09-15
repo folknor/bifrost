@@ -8,7 +8,19 @@ use bifrost_types::{
 
 use super::PushMode;
 
-pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
+/// Build the capability snapshot for a Graph account.
+///
+/// `has_shared_mailboxes` is the live emptiness of the account's
+/// `shared_clients` map, not a static property of the provider. Graph CAN
+/// route a send-as, but only through a mailbox it holds a `/users/{id}`
+/// client for, and that map is seeded from configuration (plus, optionally,
+/// delegate Autodiscover). An account with no shared mailboxes can satisfy
+/// no `send_as` request at all, so advertising the flag there would promise
+/// a path on which every request is a guaranteed `Request(Malformed)`.
+pub(crate) fn build_capabilities(
+    push_mode: PushMode,
+    has_shared_mailboxes: bool,
+) -> AccountCapabilities {
     AccountCapabilities {
         cursor_freshness: CursorFreshness::ServerIssued,
         blob_range: BlobRangeSupport::Conditional,
@@ -53,8 +65,9 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             // send via the PidTagDeferredSendTime extended property.
             scheduled_send: true,
             // Graph routes a shared-mailbox send through the mailbox's
-            // /users/{id} draft-create-and-send and stamps from/sender.
-            send_as: true,
+            // /users/{id} draft-create-and-send and stamps from/sender,
+            // so the feature exists exactly when such a mailbox is held.
+            send_as: has_shared_mailboxes,
             search: true,
             search_messages: true,
             containers_list: true,
@@ -124,6 +137,25 @@ mod tests {
     };
 
     use super::*;
+
+    /// Every test below that is not about `send_as` wants the snapshot of a
+    /// fully configured account, so it shadows the real constructor with the
+    /// shared-mailbox arm fixed. The `send_as` tests call `super::` directly
+    /// and pin both arms.
+    fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
+        super::build_capabilities(push_mode, true)
+    }
+
+    #[test]
+    fn send_as_requires_a_shared_mailbox() {
+        // The flag mirrors a routing table, not a provider feature list.
+        // Advertised with an empty table it would promise a send path on
+        // which `send_as_unknown_mailbox` rejects EVERY request.
+        for mode in [PushMode::GraphSubscriptions, PushMode::EwsStreaming] {
+            assert!(!super::build_capabilities(mode, false).pim_methods.send_as);
+            assert!(super::build_capabilities(mode, true).pim_methods.send_as);
+        }
+    }
 
     #[test]
     fn host_attachment_capability_true() {

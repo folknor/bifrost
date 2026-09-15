@@ -212,11 +212,21 @@ pub struct PimMethodSupport {
     /// delegate mailbox (Microsoft Graph: route the draft-create-and-send
     /// through the shared mailbox's `/users/{id}` client and stamp the
     /// `from`/`sender` fields; JMAP routes through a foreign submission-
-    /// capable account). Gates `SendRequest::send_as`. `true` on Graph and
-    /// JMAP when a foreign submission-capable account is available; `false`
-    /// elsewhere -> a `Some(send_as)` request is
-    /// rejected `Unsupported(Send)`, never silently sent from the
-    /// authenticated user's own mailbox.
+    /// capable account). Gates `SendRequest::send_as`.
+    ///
+    /// Derived from the account's mailbox routing table, not from the
+    /// provider: `true` only where that table is non-empty, so a Graph
+    /// account with no shared mailboxes configured and a JMAP account with
+    /// no seeded foreign submission account both report `false`. A revoked
+    /// share must not leave an advertised but unreachable send path.
+    ///
+    /// The flag selects which rejection a `Some(send_as)` request that
+    /// cannot be honored gets: `false` -> `Unsupported(Send)`, the feature
+    /// is absent; `true` -> `Request(Malformed)` naming
+    /// `send_as.mailbox`, the feature is present and the mailbox is wrong.
+    /// Both are terminal, and neither is ever silently downgraded to a send
+    /// from the authenticated user's own mailbox. `SendRequest::send_as`
+    /// carries the full rule.
     pub send_as: bool,
     // Search primitives.
     pub search: bool,

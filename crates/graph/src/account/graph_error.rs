@@ -1028,6 +1028,33 @@ pub(crate) fn invalid_account_error(
     .expect("valid account error classification")
 }
 
+/// As `invalid_account_error`, but naming the request field at fault.
+///
+/// Same classification (`Request(Malformed)` -> `ClientBug`); the difference
+/// is that `RequestCause::InvalidArgument` carries a machine-readable
+/// `field`, which a consumer UI can use to highlight the offending input
+/// instead of surfacing prose. Use it wherever the bad input is one
+/// identifiable field of the request.
+#[must_use]
+pub(crate) fn invalid_argument_account_error(
+    operation: AccountOperation,
+    field: &'static str,
+    detail: impl Into<String>,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some(field),
+            message: Some(DiagnosticText::support_only(detail.into())),
+        }),
+    )
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Build an `AccountError` for ONE item whose input was malformed before any
 /// wire traffic (e.g. a Move whose destination does not resolve to a
 /// same-mailbox folder). Classifies `Request(Malformed)` -> `ClientBug`: the

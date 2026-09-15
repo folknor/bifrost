@@ -97,9 +97,9 @@ pub struct AttachmentInline {
 /// `send_as` selects the *sending mailbox / API path*, which on some
 /// providers (Microsoft Graph) is a routing dimension separate from
 /// the From header. Gated by `PimMethodSupport.send_as`; a request
-/// carrying `Some(..)` on a provider with `send_as == false` is
-/// rejected `Unsupported(Send)`, never silently sent from the
-/// authenticated user's own mailbox.
+/// carrying `Some(..)` is never silently sent from the authenticated
+/// user's own mailbox. See `SendRequest::send_as` for how a rejection
+/// is classified on each branch of that flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SendAs {
@@ -182,10 +182,33 @@ pub struct SendRequest {
     /// is in the future and within the provider's max-delay window.
     pub scheduled: Option<std::time::SystemTime>,
     /// Send-as / send-on-behalf-of a shared or delegate mailbox.
-    /// `None` is an ordinary personal send. See `SendAs`. Honored only
-    /// where `capabilities().pim_methods.send_as` is `true` (Graph or JMAP
-    /// with a foreign submission-capable account);
-    /// `Some(..)` elsewhere is rejected `Unsupported(Send)`.
+    /// `None` is an ordinary personal send. See `SendAs`.
+    ///
+    /// This is the governing statement of how a `Some(..)` request that
+    /// cannot be honored is classified. `capabilities().pim_methods.send_as`
+    /// decides which of two answers the consumer gets, and the two mean
+    /// different things:
+    ///
+    /// - `send_as == false` (imap, google, caldav, carddav): the feature is
+    ///   absent. The backend holds no mailbox routing table, so it has no id
+    ///   to judge the request against and `Unsupported(Send)` is the only
+    ///   honest answer. Remediation is to reconfigure the account, or the
+    ///   provider, so the feature exists.
+    /// - `send_as == true` (graph with at least one shared mailbox
+    ///   configured; jmap with a seeded, submission-capable foreign
+    ///   account): the feature is present, so naming a mailbox the account
+    ///   does not hold is a bad argument, not a missing capability. It is
+    ///   rejected `Request(Malformed)` with `RequestCause::InvalidArgument`
+    ///   carrying `field: Some("send_as.mailbox")`, which a UI can use to
+    ///   point at the offending input. Remediation is to correct the
+    ///   request. JMAP still answers `Unsupported(Send)` for its genuine
+    ///   capability gaps on this path: a known account that does not
+    ///   advertise submission, and a scheduled foreign send.
+    ///
+    /// Both kinds are terminal (`ClientBug` and `Unsupported` respectively),
+    /// so nothing retries either; the distinction exists to tell the
+    /// consumer whether to fix the request or reconfigure the feature.
+    /// A `Some(..)` request is never silently downgraded to a personal send.
     pub send_as: Option<SendAs>,
     /// Request a read receipt (message disposition notification) for this
     /// send. `true` makes each provider ask the recipient's MUA to confirm
