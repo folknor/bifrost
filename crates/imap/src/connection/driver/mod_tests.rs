@@ -23,11 +23,8 @@ impl super::super::dispatch::Consumer for DummyConsumer {
         self: Box<Self>,
         _tagged: crate::types::response::TaggedResponse,
         _ctx: &super::super::dispatch::ConsumerContext,
-    ) -> Result<super::super::dispatch::Finalized<Self::Output>, crate::error::Error> {
-        Ok(super::super::dispatch::Finalized {
-            output: (),
-            reclassified_as_events: Vec::new(),
-        })
+    ) -> super::super::dispatch::Finalized<Self::Output> {
+        super::super::dispatch::Finalized::success((), Vec::new())
     }
 }
 

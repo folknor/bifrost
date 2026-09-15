@@ -260,7 +260,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::SearchSaveConsumer::new()),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())??
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// STORE by sequence number (RFC 3501 Section 6.4.6).

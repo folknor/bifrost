@@ -77,15 +77,37 @@ pub(crate) trait Consumer: Send {
         ctx: &ConsumerContext,
     );
 
-    /// Called when the tagged response arrives. Produces the
-    /// command's output and optionally returns responses that the
-    /// consumer determined were not actually part of its result (for
-    /// `Either` cases  -  the dispatcher re-emits them as events).
+    /// Called when the tagged response arrives. Produces the command's
+    /// outcome AND the responses the consumer decided were not part of its
+    /// result (for `Either` cases - the dispatcher re-emits those as events).
+    ///
+    /// INFALLIBLE ON PURPOSE. This used to return
+    /// `Result<Finalized<Self::Output>, Error>`, and 24 of the 32 consumers
+    /// opened with `tagged.require_ok()?` - which returns BEFORE the
+    /// `Finalized` is built, dropping the consumer and every untagged response
+    /// it had buffered. That is not a cosmetic loss: those responses were
+    /// classified `Either`, `ProtocolState` models none of EXISTS / EXPUNGE /
+    /// VANISHED, and the typed event stream is their only carrier, so a
+    /// discarded EXPUNGE leaves a per-folder modseq cache entry that is never
+    /// cleared. A tagged `NO` on EXPUNGE or MOVE could destroy the evidence of
+    /// a mutation the server had already performed.
+    ///
+    /// With no `Result` here there is no `?` to write, so every path has to
+    /// construct a `Finalized` and therefore has to SAY what becomes of the
+    /// buffers. The command error moved into `Finalized::output`, which is
+    /// where the eight consumers that were already correct kept it.
+    ///
+    /// This makes the loss visible, not impossible - a consumer can still pass
+    /// `Vec::new()`. That is the achievable bar: a consumer that genuinely must
+    /// discard has to be able to, so the goal is a reviewable decision rather
+    /// than an unwritable one. Reviewing a failure arm still means checking the
+    /// consumer's OTHER fields too: the compiler requires a `Finalized`, not
+    /// that every accumulator was accounted for.
     fn finalize(
         self: Box<Self>,
         tagged: TaggedResponse,
         ctx: &ConsumerContext,
-    ) -> Result<Finalized<Self::Output>, Error>;
+    ) -> Finalized<Self::Output>;
 }
 
 /// Current downstream-capacity state for a streaming consumer.
@@ -113,14 +135,47 @@ pub(crate) trait StreamingConsumer: Consumer {
 
 /// Output of [`Consumer::finalize`].
 pub(crate) struct Finalized<T> {
-    /// The command's typed result.
-    pub output: T,
+    /// The command's outcome.
+    ///
+    /// The error lives HERE rather than outside the envelope so that a failing
+    /// command still carries its events - but it stays a real `Result`, not
+    /// something buried in the erased `Box<dyn Any>`, because the driver reads
+    /// it: `is_connection_fatal` decides whether to close the command receiver
+    /// and move protocol state BEFORE the result is published. A consumer
+    /// failure can be `Error::Protocol` (CAPABILITY with no capability data,
+    /// STATUS with no matching response, SCRAM completing before the
+    /// server-final verification), and hiding one inside `Any` would disable
+    /// that handling.
+    pub output: Result<T, Error>,
     /// Responses the consumer decided were not actually part of its
     /// solicited result. Dispatcher re-emits these to the event sink.
     /// For most consumers this is empty; for consumers that receive
     /// `Either` responses it may contain the responses the consumer
     /// determined were asynchronous notifications.
     pub reclassified_as_events: Vec<UntaggedResponse>,
+}
+
+impl<T> Finalized<T> {
+    /// The command succeeded.
+    pub(crate) fn success(value: T, reclassified_as_events: Vec<UntaggedResponse>) -> Self {
+        Self {
+            output: Ok(value),
+            reclassified_as_events,
+        }
+    }
+
+    /// The command failed, and these are the responses that survive it.
+    ///
+    /// The events argument is mandatory and there is deliberately no
+    /// `failure(error)` shorthand defaulting to none: an empty disposition is
+    /// exactly the thing that used to happen silently, so it has to be typed
+    /// out as `Vec::new()` at the site that chooses it.
+    pub(crate) fn failure(error: Error, reclassified_as_events: Vec<UntaggedResponse>) -> Self {
+        Self {
+            output: Err(error),
+            reclassified_as_events,
+        }
+    }
 }
 
 /// Consumer that handles `+` continuations (RFC 3501 Section7.5).
@@ -220,16 +275,15 @@ impl Consumer for TaggedOkConsumer {
         self.buffered.push(resp);
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Result<Finalized<()>, Error> {
-        tagged.require_ok()?;
-        Ok(Finalized {
-            output: (),
-            reclassified_as_events: self.buffered,
-        })
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
+        // Everything this consumer holds is `Either` data it has no use for,
+        // so the buffer is surrendered identically on both arms. A tagged NO
+        // is if anything stronger evidence that the buffered responses were
+        // asynchronous rather than solicited.
+        match tagged.require_ok() {
+            Ok(_) => Finalized::success((), self.buffered),
+            Err(e) => Finalized::failure(e, self.buffered),
+        }
     }
 }
 
@@ -266,8 +320,18 @@ impl Consumer for CapabilityConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<Capability>>, Error> {
-        let tagged = tagged.require_ok()?;
+    ) -> Finalized<Vec<Capability>> {
+        // `buffered` is pure `Either` data, surrendered on every arm. The
+        // solicited half (`self.caps`) is not re-emittable: `on_response`
+        // destructured the untagged CAPABILITY into a `Vec<Capability>`, so
+        // there is no `UntaggedResponse` left to hand back. Dropping it is
+        // also correct on its merits - capability data that arrived under a
+        // failed CAPABILITY must not be published as an event, because the
+        // dispatcher's capability cache would then adopt it.
+        let tagged = match tagged.require_ok() {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
 
         // RFC 3501 Section6.1.1: capabilities may appear as an untagged
         // response or in the tagged OK response code.
@@ -276,17 +340,19 @@ impl Consumer for CapabilityConsumer {
         } else if let Some(ResponseCode::Capability(c)) = tagged.code {
             c
         } else {
-            return Err(Error::Protocol(
-                "CAPABILITY OK but no capability data in response \
-                 (RFC 3501 Section 6.1.1)"
-                    .into(),
-            ));
+            // Stays a real `Error` in `output`: the driver inspects it with
+            // `is_connection_fatal` before publishing the result.
+            return Finalized::failure(
+                Error::Protocol(
+                    "CAPABILITY OK but no capability data in response \
+                     (RFC 3501 Section 6.1.1)"
+                        .into(),
+                ),
+                self.buffered,
+            );
         };
 
-        Ok(Finalized {
-            output: caps,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(caps, self.buffered)
     }
 }
 
@@ -323,25 +389,26 @@ impl Consumer for LogoutConsumer {
         self.buffered.push(resp);
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Result<Finalized<()>, Error> {
-        // Check BYE first  -  if the server omitted it, that is a protocol
-        // error even when the tagged status is OK.
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
+        // Two discard sites, not one: the missing-BYE protocol error below
+        // used to return ahead of `require_ok` and dropped the buffer just as
+        // silently. Both arms surrender it. LOGOUT buffers everything it sees
+        // (including the BYE itself, which `on_response` only flags rather
+        // than consuming), and all of it is `Either` data.
         if !self.saw_bye {
-            return Err(Error::Protocol(
-                "LOGOUT: server did not send mandatory BYE \
-                 (RFC 3501 Section 6.1.3)"
-                    .into(),
-            ));
+            return Finalized::failure(
+                Error::Protocol(
+                    "LOGOUT: server did not send mandatory BYE \
+                     (RFC 3501 Section 6.1.3)"
+                        .into(),
+                ),
+                self.buffered,
+            );
         }
-        tagged.require_ok()?;
-        Ok(Finalized {
-            output: (),
-            reclassified_as_events: self.buffered,
-        })
+        match tagged.require_ok() {
+            Ok(_) => Finalized::success((), self.buffered),
+            Err(e) => Finalized::failure(e, self.buffered),
+        }
     }
 }
 
@@ -373,17 +440,18 @@ impl Consumer for CreateConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Option<String>>, Error> {
-        let tagged = tagged.require_ok()?;
+    ) -> Finalized<Option<String>> {
+        // CREATE holds nothing but `Either` data; surrendered on both arms.
+        let tagged = match tagged.require_ok() {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
         // RFC 8474 Section4.1: MAILBOXID in the tagged OK response code.
         let mailbox_id = match tagged.code {
             Some(ResponseCode::MailboxId(id)) => Some(id),
             _ => None,
         };
-        Ok(Finalized {
-            output: mailbox_id,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(mailbox_id, self.buffered)
     }
 }
 
@@ -434,8 +502,17 @@ impl Consumer for AppendConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Option<(u32, u32)>>, Error> {
-        let tagged = tagged.require_ok()?;
+    ) -> Finalized<Option<(u32, u32)>> {
+        // `buffered` is all `Either` data and is surrendered on both arms.
+        // `self.code` is DROPPED on failure, deliberately: it is a solicited
+        // accumulator, an APPENDUID naming a message the server has just told
+        // us it did not append is not a state change anyone should act on, and
+        // `on_response` kept only the code - the untagged OK's text is already
+        // gone, so no faithful `UntaggedResponse` can be rebuilt from it.
+        let tagged = match tagged.require_ok() {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
         // RFC 4315 Section3: extract APPENDUID from the tagged OK response code.
         // Servers without UIDPLUS may omit it.
         let code = tagged.code.or(self.code);
@@ -446,10 +523,7 @@ impl Consumer for AppendConsumer {
             }
             _ => None,
         };
-        Ok(Finalized {
-            output: append_uid,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(append_uid, self.buffered)
     }
 }
 
@@ -495,8 +569,14 @@ impl Consumer for MultiAppendConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<(u32, u32)>>, Error> {
-        let tagged = tagged.require_ok()?;
+    ) -> Finalized<Vec<(u32, u32)>> {
+        // Same disposition as `AppendConsumer`: `buffered` is surrendered,
+        // `self.code` is dropped on failure (solicited, unusable after a NO,
+        // and no longer reconstructible as an `UntaggedResponse`).
+        let tagged = match tagged.require_ok() {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
         // RFC 4315 Section3: for MULTIAPPEND, the uid-set contains one
         // UID per appended message, possibly as ranges.
         let mut results = Vec::new();
@@ -513,10 +593,7 @@ impl Consumer for MultiAppendConsumer {
                 }
             }
         }
-        Ok(Finalized {
-            output: results,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(results, self.buffered)
     }
 }
 
@@ -556,15 +633,21 @@ impl Consumer for IdConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<(String, Option<String>)>>, Error> {
-        tagged.require_ok()?;
-        let pairs = self.pairs.ok_or_else(|| {
-            Error::Protocol("ID OK but no untagged ID response (RFC 2971 Section 3.2)".into())
-        })?;
-        Ok(Finalized {
-            output: pairs,
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<Vec<(String, Option<String>)>> {
+        // `buffered` surrendered on every arm. `self.pairs` is dropped on the
+        // failure arms: it was destructured out of `UntaggedResponse::Id`, so
+        // it cannot be re-emitted as an event, and server identity data is not
+        // a mailbox state change anything downstream tracks.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
+        match self.pairs {
+            Some(pairs) => Finalized::success(pairs, self.buffered),
+            None => Finalized::failure(
+                Error::Protocol("ID OK but no untagged ID response (RFC 2971 Section 3.2)".into()),
+                self.buffered,
+            ),
+        }
     }
 }
 
@@ -608,21 +691,30 @@ impl Consumer for NamespaceConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<crate::types::NamespaceResponse>, Error> {
-        tagged.require_ok()?;
-        let (personal, other, shared) = self.namespace.ok_or_else(|| {
-            Error::Protocol(
-                "NAMESPACE OK but no untagged NAMESPACE response (RFC 2342 Section 5)".into(),
-            )
-        })?;
-        Ok(Finalized {
-            output: crate::types::NamespaceResponse {
-                personal,
-                other,
-                shared,
-            },
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<crate::types::NamespaceResponse> {
+        // `buffered` surrendered on every arm. `self.namespace` is dropped on
+        // failure: already destructured out of `UntaggedResponse::Namespace`
+        // and therefore not re-emittable, and namespace descriptors attached
+        // to a failed NAMESPACE describe nothing the event stream carries.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
+        match self.namespace {
+            Some((personal, other, shared)) => Finalized::success(
+                crate::types::NamespaceResponse {
+                    personal,
+                    other,
+                    shared,
+                },
+                self.buffered,
+            ),
+            None => Finalized::failure(
+                Error::Protocol(
+                    "NAMESPACE OK but no untagged NAMESPACE response (RFC 2342 Section 5)".into(),
+                ),
+                self.buffered,
+            ),
+        }
     }
 }
 
@@ -659,8 +751,14 @@ impl Consumer for EnableConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<String>>, Error> {
-        tagged.require_ok()?;
+    ) -> Finalized<Vec<String>> {
+        // `buffered` surrendered on both arms. `self.caps` is dropped on
+        // failure: destructured out of `UntaggedResponse::Enabled` so not
+        // re-emittable, and an ENABLED list under a failed ENABLE must not
+        // reach anything that would treat those extensions as active.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
         // RFC 5161 Section 3.2: the server MUST send an ENABLED response.
         // Tolerate omission per Postel's law  -  warn and return empty.
         let exts = self.caps.unwrap_or_else(|| {
@@ -670,10 +768,7 @@ impl Consumer for EnableConsumer {
             );
             Vec::new()
         });
-        Ok(Finalized {
-            output: exts,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(exts, self.buffered)
     }
 }
 

@@ -89,13 +89,16 @@ impl Consumer for LoginConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged, AuthMechanism::Login.name())?;
+    ) -> Finalized<bool> {
+        // `buffered` is `Either`-classified data whose only carrier is the
+        // event stream, so a rejected LOGIN surrenders it rather than
+        // dropping it with the consumer.
+        let tagged = match require_ok_auth(tagged, AuthMechanism::Login.name()) {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Ok(Finalized {
-            output: self.caps_seen || caps_in_tagged,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
     }
 }
 
@@ -148,13 +151,14 @@ impl Consumer for AuthenticatePlainConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged, AuthMechanism::Plain.name())?;
+    ) -> Finalized<bool> {
+        // Surrender the `Either` buffer on both arms.
+        let tagged = match require_ok_auth(tagged, AuthMechanism::Plain.name()) {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Ok(Finalized {
-            output: self.caps_seen || caps_in_tagged,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
     }
 }
 
@@ -232,13 +236,14 @@ impl Consumer for AuthenticateXoauth2Consumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged, self.mechanism)?;
+    ) -> Finalized<bool> {
+        // Surrender the `Either` buffer on both arms.
+        let tagged = match require_ok_auth(tagged, self.mechanism) {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Ok(Finalized {
-            output: self.caps_seen || caps_in_tagged,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
     }
 }
 
@@ -305,13 +310,14 @@ impl Consumer for AuthenticateCramMd5Consumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged, AuthMechanism::CramMd5.name())?;
+    ) -> Finalized<bool> {
+        // Surrender the `Either` buffer on both arms.
+        let tagged = match require_ok_auth(tagged, AuthMechanism::CramMd5.name()) {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Ok(Finalized {
-            output: self.caps_seen || caps_in_tagged,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
     }
 }
 
@@ -445,18 +451,24 @@ impl Consumer for AuthenticateScramConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<bool>, Error> {
-        let tagged = require_ok_auth(tagged, self.mechanism_name())?;
+    ) -> Finalized<bool> {
+        // Surrender the `Either` buffer on every arm.
+        let tagged = match require_ok_auth(tagged, self.mechanism_name()) {
+            Ok(t) => t,
+            Err(e) => return Finalized::failure(e, self.buffered),
+        };
         if self.state != ScramState::Done {
-            return Err(Error::Protocol(
-                "SCRAM exchange ended before server-final verification".into(),
-            ));
+            // Stays `Error::Protocol`, not a command failure: the driver reads
+            // this class to decide the failure is connection-fatal before the
+            // result is published. A tagged OK here means the server claimed
+            // success without proving it knew the password.
+            return Finalized::failure(
+                Error::Protocol("SCRAM exchange ended before server-final verification".into()),
+                self.buffered,
+            );
         }
         let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Ok(Finalized {
-            output: self.caps_seen || caps_in_tagged,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
     }
 }
 
@@ -547,7 +559,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = match Box::new(consumer).finalize(tagged(StatusKind::No), &context()) {
+        let finalized = Box::new(consumer).finalize(tagged(StatusKind::No), &context());
+        let err = match finalized.output {
             Err(err) => err,
             Ok(_) => panic!("tagged NO must reject authentication"),
         };
@@ -580,6 +593,7 @@ mod tests {
             mechanism_of(
                 Box::new(scram)
                     .finalize(tagged(StatusKind::No), &context())
+                    .output
                     .err()
                     .unwrap()
             ),
@@ -593,6 +607,7 @@ mod tests {
             mechanism_of(
                 Box::new(plain)
                     .finalize(tagged(StatusKind::No), &context())
+                    .output
                     .err()
                     .unwrap()
             ),
@@ -604,6 +619,7 @@ mod tests {
             mechanism_of(
                 Box::new(cram)
                     .finalize(tagged(StatusKind::No), &context())
+                    .output
                     .err()
                     .unwrap()
             ),
@@ -615,6 +631,7 @@ mod tests {
             mechanism_of(
                 Box::new(login)
                     .finalize(tagged(StatusKind::No), &context())
+                    .output
                     .err()
                     .unwrap()
             ),
@@ -629,6 +646,7 @@ mod tests {
                 mechanism_of(
                     Box::new(oauth)
                         .finalize(tagged(StatusKind::No), &context())
+                        .output
                         .err()
                         .unwrap()
                 ),
@@ -683,7 +701,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = match Box::new(consumer).finalize(tagged(StatusKind::Ok), &context()) {
+        let finalized = Box::new(consumer).finalize(tagged(StatusKind::Ok), &context());
+        let err = match finalized.output {
             Err(err) => err,
             Ok(_) => panic!("tagged OK must not bypass server-final verification"),
         };

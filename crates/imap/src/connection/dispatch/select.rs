@@ -24,11 +24,9 @@ use super::{Consumer, ConsumerContext, Finalized};
 /// constraint  -  the server may legitimately return expunged UIDs outside
 /// the known set based on its own `seq-match-data` computation.
 ///
-/// `Output` is `Result<SelectedMailbox, Error>` rather than
-/// `SelectedMailbox` so that NO / BAD / validation-failure paths can
-/// still reclassify accumulated responses as events (the outer
-/// `Finalized` always succeeds). The connection method unwraps the
-/// inner `Result` for the caller.
+/// The NO / BAD / validation-failure paths put their error in
+/// `Finalized::output` and still reclassify every accumulated response as
+/// an event, so old-mailbox notifications survive a failed SELECT.
 pub(crate) struct SelectConsumer {
     /// Whether this is EXAMINE (always read-only) or SELECT.
     is_examine: bool,
@@ -47,7 +45,7 @@ impl SelectConsumer {
 }
 
 impl Consumer for SelectConsumer {
-    type Output = Result<SelectedMailbox, Error>;
+    type Output = SelectedMailbox;
 
     fn on_response(
         &mut self,
@@ -64,19 +62,19 @@ impl Consumer for SelectConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         ctx: &ConsumerContext,
-    ) -> Result<Finalized<Result<SelectedMailbox, Error>>, Error> {
+    ) -> Finalized<SelectedMailbox> {
         match tagged.status {
             // NO / BAD: reclassify all accumulated responses as events.
             // They may be legitimate unsolicited updates for the previously
             // selected mailbox (RFC 3501 Section7).
-            StatusKind::No => Ok(Finalized {
-                output: Err(Error::no_with_code(tagged.text, tagged.code)),
-                reclassified_as_events: self.responses,
-            }),
-            StatusKind::Bad => Ok(Finalized {
-                output: Err(Error::bad_with_code(tagged.text, tagged.code)),
-                reclassified_as_events: self.responses,
-            }),
+            StatusKind::No => Finalized::failure(
+                Error::no_with_code(tagged.text, tagged.code),
+                self.responses,
+            ),
+            StatusKind::Bad => Finalized::failure(
+                Error::bad_with_code(tagged.text, tagged.code),
+                self.responses,
+            ),
             StatusKind::Ok => {
                 let read_only = if self.is_examine {
                     true
@@ -93,10 +91,7 @@ impl Consumer for SelectConsumer {
                 if let Err(e) = validate_select_responses(effective, self.is_examine, ctx) {
                     // Validation failed. Reclassify everything as events so
                     // legitimate unsolicited updates are not lost.
-                    return Ok(Finalized {
-                        output: Err(e),
-                        reclassified_as_events: self.responses,
-                    });
+                    return Finalized::failure(e, self.responses);
                 }
 
                 // Build the SelectedMailbox from accumulated responses. The
@@ -108,10 +103,7 @@ impl Consumer for SelectConsumer {
                 // and NOTIFY-marked LIST are async notifications -> events.
                 let reclassified = reclassify_select_responses(self.responses, ctx);
 
-                Ok(Finalized {
-                    output: Ok(result),
-                    reclassified_as_events: reclassified,
-                })
+                Finalized::success(result, reclassified)
             }
         }
     }

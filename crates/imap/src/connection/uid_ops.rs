@@ -389,7 +389,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::SearchConsumer::new()),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())??
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID SEARCH with RETURN options (RFC 4731 Section 3.2).
@@ -459,7 +459,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::EsearchConsumer::new()),
         )
         .await
-        .map_err(|_| Error::timeout_inflight())??
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID STORE (RFC 3501 Section 6.4.6).

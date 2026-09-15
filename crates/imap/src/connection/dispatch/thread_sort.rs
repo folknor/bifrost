@@ -1,5 +1,4 @@
 use crate::connection::{NotifyFlags, SearchResult};
-use crate::error::Error;
 use crate::types::response::{TaggedResponse, ThreadNode, UntaggedResponse};
 
 use super::{Consumer, ConsumerContext, Finalized};
@@ -36,16 +35,17 @@ impl Consumer for ThreadConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<ThreadNode>>, Error> {
-        tagged.require_ok()?;
+    ) -> Finalized<Vec<ThreadNode>> {
+        // `buffered` is `Either`-classified data that only the event stream
+        // carries, so it is surrendered on both arms.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
         // RFC 5256 Section 4: an empty THREAD result (no matching
         // messages) may be represented by the server omitting the
         // untagged THREAD response entirely and sending only tagged OK.
         let threads = self.result.unwrap_or_default();
-        Ok(Finalized {
-            output: threads,
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(threads, self.buffered)
     }
 }
 
@@ -82,15 +82,16 @@ impl Consumer for SortConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<SearchResult>, Error> {
-        tagged.require_ok()?;
+    ) -> Finalized<SearchResult> {
+        // `buffered` is `Either`-classified data that only the event stream
+        // carries, so it is surrendered on both arms.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
         // RFC 5256 Section 4: an empty SORT result (no matching
         // messages) may be represented by the server omitting the
         // untagged SORT response entirely and sending only tagged OK.
         let (ids, mod_seq) = self.result.unwrap_or_default();
-        Ok(Finalized {
-            output: SearchResult { ids, mod_seq },
-            reclassified_as_events: self.buffered,
-        })
+        Finalized::success(SearchResult { ids, mod_seq }, self.buffered)
     }
 }

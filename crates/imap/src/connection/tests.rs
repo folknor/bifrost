@@ -104,11 +104,8 @@ impl dispatch::Consumer for PanickingConsumer {
         self: Box<Self>,
         _tagged: TaggedResponse,
         _ctx: &dispatch::ConsumerContext,
-    ) -> Result<dispatch::Finalized<()>, Error> {
-        Ok(dispatch::Finalized {
-            output: (),
-            reclassified_as_events: vec![],
-        })
+    ) -> dispatch::Finalized<()> {
+        dispatch::Finalized::success((), Vec::new())
     }
 }
 

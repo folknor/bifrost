@@ -182,11 +182,15 @@ pub(super) trait ConsumerErased: Send {
     );
 
     /// Forwards to [`Consumer::finalize`], boxing the output.
+    /// Infallible, like [`Consumer::finalize`]. Only the SUCCESS value is
+    /// erased into `Any`; the error stays a typed `Error` in
+    /// `Finalized::output` so the driver can still see whether it is
+    /// connection-fatal.
     fn finalize_erased(
         self: Box<Self>,
         tagged: crate::types::response::TaggedResponse,
         ctx: &ConsumerContext,
-    ) -> Result<Finalized<Box<dyn std::any::Any + Send>>, Error>;
+    ) -> Finalized<Box<dyn std::any::Any + Send>>;
 }
 
 /// Object-safe wrapper for streaming consumers that can await
@@ -232,12 +236,17 @@ where
         self: Box<Self>,
         tagged: crate::types::response::TaggedResponse,
         ctx: &ConsumerContext,
-    ) -> Result<Finalized<Box<dyn std::any::Any + Send>>, Error> {
-        let finalized = <C as Consumer>::finalize(self, tagged, ctx)?;
-        Ok(Finalized {
-            output: Box::new(finalized.output) as Box<dyn std::any::Any + Send>,
+    ) -> Finalized<Box<dyn std::any::Any + Send>> {
+        let finalized = <C as Consumer>::finalize(self, tagged, ctx);
+        Finalized {
+            // Only the SUCCESS value is erased. Boxing the error too would put
+            // it behind a downcast the driver cannot perform before it decides
+            // whether the failure is connection-fatal.
+            output: finalized
+                .output
+                .map(|value| Box::new(value) as Box<dyn std::any::Any + Send>),
             reclassified_as_events: finalized.reclassified_as_events,
-        })
+        }
     }
 }
 
@@ -305,7 +314,7 @@ impl DriverConsumer {
         self,
         tagged: crate::types::response::TaggedResponse,
         ctx: &ConsumerContext,
-    ) -> Result<Finalized<Box<dyn std::any::Any + Send>>, Error> {
+    ) -> Finalized<Box<dyn std::any::Any + Send>> {
         match self {
             Self::Regular(c) => c.finalize_erased(tagged, ctx),
             Self::StreamingRegular(c) => c.finalize_erased(tagged, ctx),
@@ -679,10 +688,13 @@ async fn dispatch_response_loop(
                 // command. Errors from finalization (NO/BAD status) carry
                 // Acknowledged so recovery can distinguish them from
                 // in-flight drops.
-                let finalized = consumer
-                    .finalize_erased(t, &ctx)
-                    .map_err(|e| e.with_attempt(TransmissionState::Acknowledged))?;
-                // Re-emit any responses the consumer marked as events.
+                let finalized = consumer.finalize_erased(t, &ctx);
+                // Re-emit any responses the consumer marked as events, on the
+                // FAILURE path as much as the success one. That ordering is the
+                // fix: finalization used to be able to return `Err` before this
+                // loop ran, so a command that failed took its consumer's
+                // buffered `Either` responses down with it.
+                //
                 // Skip those whose critical code (ALERT/NOTIFICATIONOVERFLOW)
                 // was already emitted in the pre-classification pass
                 //  -  re-emitting would double-deliver the alert.
@@ -691,7 +703,9 @@ async fn dispatch_response_loop(
                         let _ = event_sink.emit(resp.into());
                     }
                 }
-                return Ok(finalized.output);
+                return finalized
+                    .output
+                    .map_err(|e| e.with_attempt(TransmissionState::Acknowledged));
             }
             crate::types::Response::Tagged(t) => {
                 return Err(Error::Protocol(format!(

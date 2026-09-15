@@ -31,7 +31,7 @@ impl ImapConnection {
         // snapshots have list=false.
         tokio::time::timeout(timeout, self.submit_regular(cmd, ListConsumer::new()))
             .await
-            .map_err(|_| Error::timeout_inflight())??
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// LIST mailboxes with RFC 5258 selection options, multiple patterns, and
@@ -97,7 +97,7 @@ impl ImapConnection {
         );
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::timeout_inflight())??
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// LIST with STATUS return option (RFC 5819 Section 2).
@@ -139,7 +139,7 @@ impl ImapConnection {
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, ListStatusConsumer::new()))
             .await
-            .map_err(|_| Error::timeout_inflight())??
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// SELECT a mailbox (RFC 3501 Section 6.3.1).
@@ -255,15 +255,17 @@ impl ImapConnection {
         };
 
         let consumer = SelectConsumer::new(is_examine);
-        // Consumer::Output is Result<SelectedMailbox, Error>  -  the inner
-        // Result carries NO/BAD/validation errors so that the consumer can
-        // reclassify accumulated responses as events on those paths.
-        let inner = tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
-            .await
-            .map_err(|_| Error::timeout_inflight())??;
+        // NO/BAD and validation failures arrive as the ordinary `Err` of this
+        // call now that `Finalized::output` carries them. The consumer still
+        // reclassifies its accumulated responses as events on those paths -
+        // that is the point of the envelope - but the caller no longer has to
+        // unwrap a second, inner `Result` to see the failure.
+        //
         // State transitions (Selected on OK, Authenticated on NO) are
         // handled by the driver's apply_tagged via the in_select flag.
-        inner
+        tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
+            .await
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// Validate QRESYNC parameters before SELECT/EXAMINE (RFC 7162 Section 3.2.5.2).

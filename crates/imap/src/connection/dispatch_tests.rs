@@ -63,7 +63,8 @@ async fn streaming_fetch_consumer_does_not_drop_slow_receiver_backlog() {
         );
     }
 
-    let finalized = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    let finalized = Box::new(consumer).finalize(tagged_ok(), &ctx);
+    assert!(finalized.output.is_ok());
     assert!(finalized.reclassified_as_events.is_empty());
 
     let mut received = Vec::new();
@@ -96,11 +97,19 @@ fn fetch_byte_estimate_counts_gmail_labels() {
     );
 }
 
+/// A tagged NO still fails the command after partial FETCH data, AND the
+/// `Either` response that arrived before it survives the failure. `* N EXISTS`
+/// is routed to the in-flight consumer as ambiguous data, and `ProtocolState`
+/// models none of EXISTS / EXPUNGE / VANISHED, so `reclassified_as_events` is
+/// the only way out. The solicited FETCH payload is deliberately NOT surrendered
+/// (see `FetchConsumer::finalize`): it is read-only query data the caller was
+/// never going to get, and re-emitting it would flood the event sink.
 #[test]
-fn fetch_consumer_propagates_terminal_no_after_data() {
+fn fetch_consumer_propagates_terminal_no_and_surrenders_buffered_events() {
     let mut consumer = FetchConsumer::new();
     let ctx = default_ctx();
 
+    consumer.on_response(UntaggedResponse::Exists(12), NotifyFlags::default(), &ctx);
     consumer.on_response(
         UntaggedResponse::Fetch(Box::new(FetchResponse {
             seq: 1,
@@ -111,19 +120,30 @@ fn fetch_consumer_propagates_terminal_no_after_data() {
         &ctx,
     );
 
-    let err = match Box::new(consumer).finalize(tagged_no(), &ctx) {
+    let finalized = Box::new(consumer).finalize(tagged_no(), &ctx);
+    let err = match finalized.output {
         Err(err) => err,
         Ok(_) => panic!("terminal NO must fail FETCH"),
     };
     assert!(matches!(err, Error::No { text, .. } if text == "Rejected"));
+    assert_eq!(
+        finalized.reclassified_as_events,
+        vec![UntaggedResponse::Exists(12)],
+        "the ambiguous EXISTS must be surrendered exactly once, and the \
+         solicited FETCH payload must not join it"
+    );
 }
 
+/// Three requirements at once: the tagged NO fails the command, the delivery
+/// channel still closes (dropping the consumer drops the sender on every path),
+/// and the pre-failure `Either` response is surrendered.
 #[tokio::test]
 async fn streaming_fetch_consumer_propagates_terminal_no_and_closes_channel() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut consumer = StreamingFetchConsumer::new(tx);
     let ctx = default_ctx();
 
+    consumer.on_response(UntaggedResponse::Exists(12), NotifyFlags::default(), &ctx);
     consumer.on_response(
         UntaggedResponse::Fetch(Box::new(FetchResponse {
             seq: 1,
@@ -134,29 +154,48 @@ async fn streaming_fetch_consumer_propagates_terminal_no_and_closes_channel() {
         &ctx,
     );
 
-    let err = match Box::new(consumer).finalize(tagged_no(), &ctx) {
+    let finalized = Box::new(consumer).finalize(tagged_no(), &ctx);
+    let err = match finalized.output {
         Err(err) => err,
         Ok(_) => panic!("terminal NO must fail streaming FETCH"),
     };
     assert!(matches!(err, Error::No { text, .. } if text == "Rejected"));
+    assert_eq!(
+        finalized.reclassified_as_events,
+        vec![UntaggedResponse::Exists(12)],
+        "a failed streaming FETCH must not swallow an EXISTS the server volunteered"
+    );
 
     let first = rx.recv().await.expect("first FETCH should be delivered");
     assert_eq!(first.unwrap().seq, 1);
     assert!(rx.recv().await.is_none());
 }
 
+/// A tagged BAD fails EXPUNGE, and BOTH accumulators survive it. Unlike FETCH,
+/// `ExpungeConsumer` surrenders its solicited `mutations` too (see its
+/// `finalize`): the server may have expunged before failing, and an EXPUNGE the
+/// client never hears about leaves the per-folder modseq permanently ahead of
+/// the mailbox. Verbatim and in order - `buffered` first, then `mutations`.
 #[test]
-fn expunge_consumer_propagates_terminal_bad_after_data() {
+fn expunge_consumer_propagates_terminal_bad_and_surrenders_both_buffers() {
     let mut consumer = ExpungeConsumer::new();
     let ctx = default_ctx();
 
+    consumer.on_response(UntaggedResponse::Exists(12), NotifyFlags::default(), &ctx);
     consumer.on_response(UntaggedResponse::Expunge(3), NotifyFlags::default(), &ctx);
 
-    let err = match Box::new(consumer).finalize(tagged_bad(), &ctx) {
+    let finalized = Box::new(consumer).finalize(tagged_bad(), &ctx);
+    let err = match finalized.output {
         Err(err) => err,
         Ok(_) => panic!("terminal BAD must fail EXPUNGE"),
     };
     assert!(matches!(err, Error::Bad { text, .. } if text == "Bad command"));
+    assert_eq!(
+        finalized.reclassified_as_events,
+        vec![UntaggedResponse::Exists(12), UntaggedResponse::Expunge(3)],
+        "a failed EXPUNGE must surrender the ambiguous buffer and the \
+         expunges the server already performed, exactly once each"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -169,9 +208,10 @@ fn sort_consumer_empty_result_returns_ok() {
     // response (permitted by RFC 5256 when no messages match),
     // `SortConsumer::finalize` should return an empty SearchResult.
     let consumer = Box::new(SortConsumer::default());
-    let result = consumer.finalize(tagged_ok(), &default_ctx()).unwrap();
-    assert!(result.output.ids.is_empty());
-    assert_eq!(result.output.mod_seq, None);
+    let result = consumer.finalize(tagged_ok(), &default_ctx());
+    let sorted = result.output.expect("an empty SORT result is not an error");
+    assert!(sorted.ids.is_empty());
+    assert_eq!(sorted.mod_seq, None);
     assert!(result.reclassified_as_events.is_empty());
 }
 
@@ -206,7 +246,7 @@ fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() 
     );
     consumer.on_response(UntaggedResponse::Expunge(7), NotifyFlags::default(), &ctx);
 
-    let result = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
     assert!(matches!(
         result.output,
         Err(Error::SearchResultTruncated {
@@ -239,7 +279,7 @@ fn search_consumer_reclassifies_only_the_extra_esearch() {
         &ctx,
     );
 
-    let result = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
     assert_eq!(result.output.unwrap().ids, vec![4]);
     assert_eq!(
         result.reclassified_as_events,
@@ -271,10 +311,7 @@ fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
     );
     assert!(
         matches!(
-            Box::new(consumer)
-                .finalize(tagged_ok(), &ctx)
-                .unwrap()
-                .output,
+            Box::new(consumer).finalize(tagged_ok(), &ctx).output,
             Err(Error::SearchResultTruncated { omitted: None, .. })
         ),
         "a standalone `*` must not expand to the literal id 4294967295"
@@ -300,7 +337,6 @@ fn search_consumer_rejects_a_bare_star_and_counts_overlap_once() {
     );
     let ids = Box::new(consumer)
         .finalize(tagged_ok(), &ctx)
-        .unwrap()
         .output
         .expect("an overlapping set of 600000 UIDs is under the cap");
     assert_eq!(ids.ids.len(), 600_000);
@@ -317,8 +353,13 @@ fn thread_consumer_empty_result_returns_ok() {
     // Same as SortConsumer  -  when no messages match the THREAD criteria
     // the server may omit the untagged THREAD response entirely.
     let consumer = Box::new(ThreadConsumer::default());
-    let result = consumer.finalize(tagged_ok(), &default_ctx()).unwrap();
-    assert!(result.output.is_empty());
+    let result = consumer.finalize(tagged_ok(), &default_ctx());
+    assert!(
+        result
+            .output
+            .expect("an empty THREAD result is not an error")
+            .is_empty()
+    );
     assert!(result.reclassified_as_events.is_empty());
 }
 
@@ -342,14 +383,15 @@ fn id_consumer_solicited_response_not_leaked() {
         &ctx,
     );
 
-    let result = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
+    let pairs = result.output.expect("tagged OK must yield the ID pairs");
 
     // The ID pairs must be captured.
-    assert_eq!(result.output.len(), 2);
-    assert_eq!(result.output[0].0, "name");
-    assert_eq!(result.output[0].1.as_deref(), Some("Dovecot"));
-    assert_eq!(result.output[1].0, "version");
-    assert_eq!(result.output[1].1.as_deref(), Some("2.3"));
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(pairs[0].0, "name");
+    assert_eq!(pairs[0].1.as_deref(), Some("Dovecot"));
+    assert_eq!(pairs[1].0, "version");
+    assert_eq!(pairs[1].1.as_deref(), Some("2.3"));
 
     // The solicited `* ID` must NOT leak into reclassified_as_events.
     assert!(
@@ -383,14 +425,17 @@ fn namespace_consumer_solicited_response_not_leaked() {
         &ctx,
     );
 
-    let result = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
+    let ns = result
+        .output
+        .expect("tagged OK must yield the NAMESPACE data");
 
     // The namespace data must be captured.
-    assert_eq!(result.output.personal.len(), 1);
-    assert_eq!(result.output.personal[0].prefix, "");
-    assert_eq!(result.output.personal[0].delimiter, Some('/'));
-    assert!(result.output.other.is_empty());
-    assert!(result.output.shared.is_empty());
+    assert_eq!(ns.personal.len(), 1);
+    assert_eq!(ns.personal[0].prefix, "");
+    assert_eq!(ns.personal[0].delimiter, Some('/'));
+    assert!(ns.other.is_empty());
+    assert!(ns.shared.is_empty());
 
     // The solicited `* NAMESPACE` must NOT leak into reclassified_as_events.
     assert!(
@@ -416,9 +461,14 @@ fn enable_consumer_captures_extensions() {
         &ctx,
     );
 
-    let result = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
 
-    assert_eq!(result.output, vec!["CONDSTORE", "QRESYNC"]);
+    assert_eq!(
+        result
+            .output
+            .expect("tagged OK must yield the ENABLED list"),
+        vec!["CONDSTORE", "QRESYNC"]
+    );
 
     // The solicited `* ENABLED` must NOT leak into reclassified_as_events.
     assert!(
@@ -436,7 +486,12 @@ fn enable_consumer_missing_enabled_returns_empty() {
     // When the server omits the ENABLED response (non-conformant per
     // RFC 5161 Section 3.2), the consumer tolerates it and returns empty.
     let consumer = Box::new(EnableConsumer::default());
-    let result = consumer.finalize(tagged_ok(), &default_ctx()).unwrap();
-    assert!(result.output.is_empty());
+    let result = consumer.finalize(tagged_ok(), &default_ctx());
+    assert!(
+        result
+            .output
+            .expect("a missing ENABLED response is tolerated")
+            .is_empty()
+    );
     assert!(result.reclassified_as_events.is_empty());
 }

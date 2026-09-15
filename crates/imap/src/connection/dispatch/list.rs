@@ -21,8 +21,8 @@ use super::{Consumer, ConsumerContext, Finalized};
 /// the manual `first_notification_overflow_index` approach used by the
 /// old hand-rolled loop.
 ///
-/// `Output` is `Result<Vec<MailboxInfo>, Error>` so that NOTIFY marker
-/// events can be reclassified even when the tagged response is NO/BAD.
+/// The command error travels in `Finalized::output`, so NOTIFY marker
+/// events are still reclassified when the tagged response is NO/BAD.
 pub(crate) struct ListConsumer {
     /// Solicited LIST entries (marker-less, accumulated on success).
     mailboxes: Vec<MailboxInfo>,
@@ -44,7 +44,7 @@ impl ListConsumer {
 }
 
 impl Consumer for ListConsumer {
-    type Output = Result<Vec<MailboxInfo>, Error>;
+    type Output = Vec<MailboxInfo>;
 
     fn on_response(
         &mut self,
@@ -72,25 +72,21 @@ impl Consumer for ListConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Result<Vec<MailboxInfo>, Error>>, Error> {
+    ) -> Finalized<Vec<MailboxInfo>> {
         // Marker events are reclassified as events on both success and
-        // failure paths. Non-LIST buffered responses are also reclassified.
+        // failure paths, and so is the generic `Either` buffer: nothing in
+        // it is LIST output, so it carries no solicited ambiguity.
         let mut reclassified = self.marker_events;
         reclassified.extend(self.buffered);
 
         match tagged.require_ok() {
-            Ok(_) => Ok(Finalized {
-                output: Ok(self.mailboxes),
-                reclassified_as_events: reclassified,
-            }),
+            Ok(_) => Finalized::success(self.mailboxes, reclassified),
             Err(e) => {
-                // On failure: marker-less LIST may be the failed solicited
-                // result. Drop it rather than leaking as a notification
-                // (RFC 5465 Section5.4). Marker events are still emitted.
-                Ok(Finalized {
-                    output: Err(e),
-                    reclassified_as_events: reclassified,
-                })
+                // On failure the marker-less LIST accumulator - and only it -
+                // is dropped: those entries may be the failed command's own
+                // output, and must not leak out as though they were
+                // unsolicited notifications (RFC 5465 Section5.4).
+                Finalized::failure(e, reclassified)
             }
         }
     }
@@ -129,12 +125,16 @@ impl Consumer for LsubConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<MailboxInfo>>, Error> {
-        tagged.require_ok()?;
-        Ok(Finalized {
-            output: self.mailboxes,
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<Vec<MailboxInfo>> {
+        match tagged.require_ok() {
+            Ok(_) => Finalized::success(self.mailboxes, self.buffered),
+            // The generic `Either` buffer holds no LSUB, so it is surrendered.
+            // The LSUB accumulator itself is dropped: an LSUB line after a
+            // failed LSUB may be that command's own partial output, and the
+            // same reasoning as RFC 5465 Section5.4 applies - do not re-emit
+            // it as an unsolicited notification.
+            Err(e) => Finalized::failure(e, self.buffered),
+        }
     }
 }
 
@@ -179,7 +179,7 @@ impl ListExtendedConsumer {
 }
 
 impl Consumer for ListExtendedConsumer {
-    type Output = Result<Vec<MailboxInfo>, Error>;
+    type Output = Vec<MailboxInfo>;
 
     fn on_response(
         &mut self,
@@ -214,26 +214,23 @@ impl Consumer for ListExtendedConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Result<Vec<MailboxInfo>, Error>>, Error> {
+    ) -> Finalized<Vec<MailboxInfo>> {
         // Marker events and mismatch events are reclassified on both
         // success and failure paths. They are provably NOTIFY events
-        // and must not be dropped.
+        // and must not be dropped. The generic `Either` buffer holds no
+        // LIST at all and is surrendered on both paths too.
         let mut reclassified = self.marker_events;
         reclassified.extend(self.mismatch_events);
         reclassified.extend(self.buffered);
 
         match tagged.require_ok() {
-            Ok(_) => Ok(Finalized {
-                output: Ok(self.mailboxes),
-                reclassified_as_events: reclassified,
-            }),
+            Ok(_) => Finalized::success(self.mailboxes, reclassified),
             Err(e) => {
-                // On failure: marker-less, non-mismatch LIST may be
-                // the failed solicited result. Drop it.
-                Ok(Finalized {
-                    output: Err(e),
-                    reclassified_as_events: reclassified,
-                })
+                // On failure only the marker-less, non-mismatch LIST
+                // accumulator is dropped: it may be the failed command's own
+                // output and must not leak out as an unsolicited notification
+                // (RFC 5465 Section5.4).
+                Finalized::failure(e, reclassified)
             }
         }
     }
@@ -274,7 +271,7 @@ impl ListStatusConsumer {
 }
 
 impl Consumer for ListStatusConsumer {
-    type Output = Result<Vec<(MailboxInfo, Vec<StatusItem>)>, Error>;
+    type Output = Vec<(MailboxInfo, Vec<StatusItem>)>;
 
     fn on_response(
         &mut self,
@@ -317,19 +314,21 @@ impl Consumer for ListStatusConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Result<Vec<(MailboxInfo, Vec<StatusItem>)>, Error>>, Error> {
-        // Marker events are reclassified regardless of success/failure.
+    ) -> Finalized<Vec<(MailboxInfo, Vec<StatusItem>)>> {
+        // Marker events are reclassified regardless of success/failure, and
+        // so is the generic `Either` buffer - it holds neither LIST nor
+        // STATUS, so none of it can be this command's own output.
         let mut reclassified = self.marker_events;
         reclassified.extend(self.buffered);
 
         if let Err(e) = tagged.require_ok() {
-            // On failure: drop all accumulated LIST and STATUS
-            // (STATUS is wire-identical to NOTIFY per RFC 5465 Section4).
-            // Only NOTIFY marker events survive.
-            return Ok(Finalized {
-                output: Err(e),
-                reclassified_as_events: reclassified,
-            });
+            // On failure: drop the solicited accumulators - both the
+            // marker-less LIST entries and every STATUS, pending or paired.
+            // STATUS is wire-identical to a NOTIFY event (RFC 5465 Section4),
+            // and a LIST that may be the failed command's own output must not
+            // leak out as though it were unsolicited (RFC 5465 Section5.4).
+            // Only NOTIFY marker events and the generic buffer survive.
+            return Finalized::failure(e, reclassified);
         }
 
         // Second pass: pair STATUS that arrived before their LIST.
@@ -359,10 +358,7 @@ impl Consumer for ListStatusConsumer {
             })
             .collect();
 
-        Ok(Finalized {
-            output: Ok(paired),
-            reclassified_as_events: reclassified,
-        })
+        Finalized::success(paired, reclassified)
     }
 }
 
@@ -375,9 +371,11 @@ impl Consumer for ListStatusConsumer {
 /// from NOTIFY. These are surfaced in [`StatusResult::ambiguous`] rather
 /// than silently reclassified.
 ///
-/// On failure: all same-mailbox STATUS is dropped. Buffering as
-/// unsolicited would leak potentially-solicited data into the event
-/// channel (RFC 5465 Section4, RFC 3501 Section6.3.10).
+/// On failure the `matching` accumulator is dropped: same-mailbox STATUS is
+/// wire-identical to a NOTIFY event (RFC 5465 Section4, RFC 3501
+/// Section6.3.10), so re-emitting it would leak potentially-solicited data
+/// into the event channel. The separate `buffered` field never holds STATUS
+/// for this mailbox, so it is surrendered instead.
 pub(crate) struct StatusConsumer {
     /// Same-mailbox STATUS responses with their per-response notify
     /// snapshot flag. The last entry becomes the primary result;
@@ -420,12 +418,17 @@ impl Consumer for StatusConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         ctx: &ConsumerContext,
-    ) -> Result<Finalized<StatusResult>, Error> {
-        // On failure: drop all matching STATUS AND any Either-classified
-        // responses (e.g., * OK [ALERT]). Same pattern as other consumers.
-        // Leaking potentially-solicited STATUS as unsolicited events is
-        // worse than losing a transient alert (RFC 5465 Section4).
-        tagged.require_ok()?;
+    ) -> Finalized<StatusResult> {
+        // On failure the `matching` accumulator is dropped: leaking
+        // potentially-solicited STATUS as an unsolicited event is worse than
+        // losing it (RFC 5465 Section4). That reasoning is about STATUS, and
+        // `on_response` puts every `MailboxStatus` in `matching`, so the
+        // `Either` buffer provably contains none of it - it holds things like
+        // `* OK [ALERT]`, EXISTS or EXPUNGE, whose only carrier is the event
+        // stream. It is surrendered.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
 
         let mut matching = self.matching;
 
@@ -435,10 +438,16 @@ impl Consumer for StatusConsumer {
             let target = ctx
                 .command_target()
                 .map_or_else(|| "<unknown>".to_owned(), |t| t.as_str().to_owned());
-            return Err(Error::Protocol(format!(
-                "STATUS OK but no matching untagged STATUS response \
-                 for mailbox '{target}' (RFC 3501 Sections 5.2, 6.3.10)"
-            )));
+            // Stays a real `Error` in `output`: the driver reads it through
+            // `is_connection_fatal` before publishing the result. Nothing
+            // solicited exists to drop, so the buffer is surrendered.
+            return Finalized::failure(
+                Error::Protocol(format!(
+                    "STATUS OK but no matching untagged STATUS response \
+                     for mailbox '{target}' (RFC 3501 Sections 5.2, 6.3.10)"
+                )),
+                self.buffered,
+            );
         };
 
         // Extract the primary items from the last response.
@@ -447,11 +456,14 @@ impl Consumer for StatusConsumer {
             ..
         } = last_resp
         else {
-            return Err(Error::Protocol(
-                "internal: matching predicate returned non-MailboxStatus \
-                 variant"
-                    .into(),
-            ));
+            return Finalized::failure(
+                Error::Protocol(
+                    "internal: matching predicate returned non-MailboxStatus \
+                     variant"
+                        .into(),
+                ),
+                self.buffered,
+            );
         };
 
         // RFC 5465 Section4 / Section5.8: classify remaining extras.
@@ -472,12 +484,12 @@ impl Consumer for StatusConsumer {
         let mut reclassified = self.buffered;
         reclassified.extend(non_notify_extras);
 
-        Ok(Finalized {
-            output: StatusResult {
+        Finalized::success(
+            StatusResult {
                 items: primary_items,
                 ambiguous,
             },
-            reclassified_as_events: reclassified,
-        })
+            reclassified,
+        )
     }
 }

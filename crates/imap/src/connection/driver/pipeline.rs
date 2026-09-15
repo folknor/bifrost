@@ -238,19 +238,16 @@ pub(super) fn route_pipeline_response(
                     routing.targets[idx].as_ref(),
                     &routing.tags[idx],
                 );
-                match consumer.finalize_erased(t, &ctx) {
-                    Ok(finalized) => {
-                        for ev in finalized.reclassified_as_events {
-                            if !super::has_critical_response_code(&ev) {
-                                let _ = event_sink.emit(ev.into());
-                            }
-                        }
-                        routing.results[idx] = Some(Ok(finalized.output));
-                    }
-                    Err(e) => {
-                        routing.results[idx] = Some(Err(e));
+                let finalized = consumer.finalize_erased(t, &ctx);
+                // One emission path for both outcomes. These used to be two
+                // arms, and the failure arm did not emit at all, so a command
+                // that failed destroyed whatever its consumer had buffered.
+                for ev in finalized.reclassified_as_events {
+                    if !super::has_critical_response_code(&ev) {
+                        let _ = event_sink.emit(ev.into());
                     }
                 }
+                routing.results[idx] = Some(finalized.output);
                 *routing.completed += 1;
             }
             // Duplicate tagged response for an already-finalized command:

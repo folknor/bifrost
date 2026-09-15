@@ -135,15 +135,24 @@ impl Consumer for FetchConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<FetchResponse>>, Error> {
-        tagged.require_ok()?;
-        if let Some(error) = self.limit_exceeded {
-            return Err(error);
+    ) -> Finalized<Vec<FetchResponse>> {
+        // The `Either` buffer is surrendered on every failure path: a tagged
+        // NO/BAD is the strongest evidence those responses were asynchronous
+        // server data, and the typed event stream is their only carrier.
+        //
+        // The accumulated `fetches` are NOT re-emitted as events. They are
+        // solicited read-only query payload the caller was never going to
+        // receive on a failed FETCH, and they can be arbitrarily large
+        // (bodies, binary sections); pushing them into the event sink would
+        // turn a failed bulk fetch into an event-stream flood without telling
+        // any listener anything it did not already know.
+        if let Err(err) = tagged.require_ok() {
+            return Finalized::failure(err, self.buffered);
         }
-        Ok(Finalized {
-            output: self.fetches,
-            reclassified_as_events: self.buffered,
-        })
+        if let Some(error) = self.limit_exceeded {
+            return Finalized::failure(error, self.buffered);
+        }
+        Finalized::success(self.fetches, self.buffered)
     }
 }
 
@@ -282,16 +291,16 @@ impl Consumer for BoundedStreamingFetchConsumer {
         }
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Result<Finalized<()>, Error> {
-        tagged.require_ok()?;
-        Ok(Finalized {
-            output: (),
-            reclassified_as_events: self.ambiguous_buffer,
-        })
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
+        // Consuming `self` drops the pipe either way, which closes the
+        // delivery channel and ends the stream - that is unchanged. Items
+        // already delivered stay delivered. Only the ambiguous buffer has a
+        // choice to make, and it is surrendered: a failed FETCH is no reason
+        // to swallow an EXPUNGE the server volunteered mid-command.
+        if let Err(err) = tagged.require_ok() {
+            return Finalized::failure(err, self.ambiguous_buffer);
+        }
+        Finalized::success((), self.ambiguous_buffer)
     }
 }
 
@@ -327,17 +336,14 @@ impl Consumer for StreamingFetchConsumer {
         }
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Result<Finalized<()>, Error> {
-        tagged.require_ok()?;
-        // Drop self.tx by consuming self; this signals end of stream.
-        Ok(Finalized {
-            output: (),
-            reclassified_as_events: self.ambiguous_buffer,
-        })
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
+        // Dropping self.tx by consuming self signals end of stream on both
+        // paths. The ambiguous buffer survives a failure for the same reason
+        // as the bounded variant.
+        if let Err(err) = tagged.require_ok() {
+            return Finalized::failure(err, self.ambiguous_buffer);
+        }
+        Finalized::success((), self.ambiguous_buffer)
     }
 }
 
@@ -401,22 +407,20 @@ impl Consumer for BoundedStreamingFetchVanishedConsumer {
         }
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Result<Finalized<()>, Error> {
-        tagged.require_ok()?;
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         if self.dropped_vanished_count > 0 {
             tracing::debug!(
                 dropped = self.dropped_vanished_count,
                 "filtered out-of-set VANISHED (EARLIER) UIDs per RFC 7162 Section 3.2.6",
             );
         }
-        Ok(Finalized {
-            output: (),
-            reclassified_as_events: self.buffered,
-        })
+        // VANISHED (EARLIER) that already went down the pipe stays delivered;
+        // nothing is retained here to re-emit. The generic `Either` buffer is
+        // surrendered on failure.
+        if let Err(err) = tagged.require_ok() {
+            return Finalized::failure(err, self.buffered);
+        }
+        Finalized::success((), self.buffered)
     }
 }
 
@@ -493,26 +497,58 @@ impl Consumer for StoreConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<StoreResult>, Error> {
-        let tagged = if self.conditional {
-            // RFC 7162 Section3.1.3: `NO [MODIFIED ...]` is a partial success
-            // whose per-UID evidence must reach the caller. `BAD` is still a
-            // command error.
-            if matches!(tagged.status, crate::types::response::StatusKind::Bad) {
-                return Err(Error::bad_with_code(tagged.text, tagged.code));
-            }
-            tagged
-        } else {
-            tagged.require_ok()?
+    ) -> Finalized<StoreResult> {
+        // Failure disposition for STORE, which is the one consumer here whose
+        // solicited accumulator is mutation evidence rather than query payload.
+        //
+        // The implicit FETCHes a non-`.SILENT` STORE produces are the server
+        // telling us flags it has ALREADY changed (RFC 3501 Section6.4.6).
+        // That is true whether the command then ends OK, NO or BAD - a BAD on
+        // a multi-UID STORE does not un-apply the updates the server already
+        // reported. Today's code special-cases exactly this evidence for the
+        // conditional `NO [MODIFIED]` path and then destroys it on `BAD`,
+        // which is the same evidence treated two ways. Ruling: on every error
+        // path the accumulated FETCHes are re-emitted as `FetchUpdate` events
+        // alongside the generic `Either` buffer, so the flag state reaches the
+        // typed event stream even though no `StoreResult` reaches the caller.
+        // This is the opposite call from `FetchConsumer`, deliberately: there
+        // the accumulator is read-only payload nobody's cache depends on.
+        let surrender = |fetches: Vec<FetchResponse>, buffered: Vec<UntaggedResponse>| {
+            let mut events: Vec<UntaggedResponse> = fetches
+                .into_iter()
+                .map(|fr| UntaggedResponse::Fetch(Box::new(fr)))
+                .collect();
+            events.extend(buffered);
+            events
         };
-        Ok(Finalized {
-            output: StoreResult {
+
+        if matches!(tagged.status, crate::types::response::StatusKind::Bad) {
+            // RFC 7162 Section3.1.3 makes `NO [MODIFIED ...]` meaningful; it
+            // says nothing that would make a `BAD` anything but a command
+            // error, on either path.
+            let events = surrender(self.fetches, self.buffered);
+            return Finalized::failure(Error::bad_with_code(tagged.text, tagged.code), events);
+        }
+
+        if !self.conditional && matches!(tagged.status, crate::types::response::StatusKind::No) {
+            // Without UNCHANGEDSINCE a tagged NO is a plain refusal. Callers of
+            // the unconditional STORE APIs read Ok as "the server accepted
+            // this" and act on it (`\Deleted` followed by EXPUNGE), so the
+            // refusal must stay an error rather than becoming a StoreResult.
+            let events = surrender(self.fetches, self.buffered);
+            return Finalized::failure(Error::no_with_code(tagged.text, tagged.code), events);
+        }
+
+        // OK on either path, or the conditional `NO [MODIFIED ...]` partial
+        // success, whose per-UID conflict evidence rides in `status` / `code`.
+        Finalized::success(
+            StoreResult {
                 fetches: self.fetches,
                 status: tagged.status,
                 code: tagged.code,
             },
-            reclassified_as_events: self.buffered,
-        })
+            self.buffered,
+        )
     }
 }
 
@@ -623,18 +659,41 @@ impl Consumer for FetchVanishedConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<(Vec<FetchResponse>, Vec<UidRange>)>, Error> {
-        tagged.require_ok()?;
+    ) -> Finalized<(Vec<FetchResponse>, Vec<UidRange>)> {
         if self.dropped_vanished_count > 0 {
             tracing::debug!(
                 dropped = self.dropped_vanished_count,
                 "filtered out-of-set VANISHED (EARLIER) UIDs per RFC 7162 Section 3.2.6",
             );
         }
-        Ok(Finalized {
-            output: (self.fetches, self.vanished_uids),
-            reclassified_as_events: self.buffered,
-        })
+        if let Err(err) = tagged.require_ok() {
+            // Two accumulators, two rulings. `vanished_uids` is expunge
+            // evidence: the server already removed those messages, and a
+            // failed tagged response does not bring them back, so it is
+            // surrendered as a VANISHED (EARLIER) event - dropping it is
+            // exactly the stale-modseq-cache hole this trait change exists to
+            // close. `fetches` is read-only query payload and is dropped, for
+            // the same reason as in `FetchConsumer`.
+            //
+            // This one event is a UNION, not a replay: several VANISHED
+            // responses were folded into `vanished_uids` at accumulation time,
+            // already filtered to the requested set. That is faithful because
+            // the only thing a reader takes from it is "these UIDs are gone",
+            // which merging preserves exactly - no flag is being guessed, since
+            // only `earlier: true` responses ever reach this field. Contrast
+            // `ExpungeConsumer`, which had to STOP flattening and keep its
+            // responses verbatim, because there both `earlier` values are
+            // admissible and a synthesised flag would have been a fabrication.
+            let mut events = self.buffered;
+            if !self.vanished_uids.is_empty() {
+                events.push(UntaggedResponse::Vanished {
+                    earlier: true,
+                    uids: self.vanished_uids,
+                });
+            }
+            return Finalized::failure(err, events);
+        }
+        Finalized::success((self.fetches, self.vanished_uids), self.buffered)
     }
 }
 
@@ -671,8 +730,8 @@ mod store_tests {
     fn tagged_no_modified_reaches_the_store_result() {
         let result = Box::new(StoreConsumer::new(Some(42)))
             .finalize(tagged(StatusKind::No, modified()), &context())
-            .expect("tagged NO is a typed STORE result")
-            .output;
+            .output
+            .expect("tagged NO is a typed STORE result");
         assert_eq!(result.status, StatusKind::No);
         assert!(matches!(
             result.code,
@@ -688,6 +747,7 @@ mod store_tests {
         for code in [None, modified()] {
             let err = match Box::new(StoreConsumer::new(None))
                 .finalize(tagged(StatusKind::No, code), &context())
+                .output
             {
                 Err(err) => err,
                 Ok(_) => panic!("unconditional STORE must not report a tagged NO as success"),
@@ -701,6 +761,7 @@ mod store_tests {
         for unchanged_since in [None, Some(42)] {
             let err = match Box::new(StoreConsumer::new(unchanged_since))
                 .finalize(tagged(StatusKind::Bad, None), &context())
+                .output
             {
                 Err(err) => err,
                 Ok(_) => panic!("tagged BAD is always a command error"),
@@ -716,8 +777,44 @@ mod store_tests {
     fn conditional_store_tagged_ok_still_reports_ok() {
         let result = Box::new(StoreConsumer::new(Some(42)))
             .finalize(tagged(StatusKind::Ok, None), &context())
-            .expect("tagged OK is a STORE result")
-            .output;
+            .output
+            .expect("tagged OK is a STORE result");
         assert_eq!(result.status, StatusKind::Ok);
+    }
+
+    /// The implicit FETCHes a non-`.SILENT` STORE already produced describe
+    /// flag changes the server has applied. A tagged BAD arriving afterwards
+    /// does not un-apply them, so they must reach the event stream rather
+    /// than dying with the consumer.
+    #[test]
+    fn tagged_bad_surrenders_the_implicit_fetches_as_events() {
+        let mut consumer = StoreConsumer::new(None);
+        let fetch = FetchResponse {
+            seq: 7,
+            uid: Some(7),
+            ..FetchResponse::default()
+        };
+        consumer.on_response(
+            UntaggedResponse::Fetch(Box::new(fetch)),
+            NotifyFlags::default(),
+            &context(),
+        );
+        consumer.on_response(
+            UntaggedResponse::Expunge(4),
+            NotifyFlags::default(),
+            &context(),
+        );
+
+        let finalized = Box::new(consumer).finalize(tagged(StatusKind::Bad, None), &context());
+        assert!(finalized.output.is_err());
+        assert_eq!(finalized.reclassified_as_events.len(), 2);
+        assert!(matches!(
+            finalized.reclassified_as_events[0],
+            UntaggedResponse::Fetch(_)
+        ));
+        assert!(matches!(
+            finalized.reclassified_as_events[1],
+            UntaggedResponse::Expunge(4)
+        ));
     }
 }

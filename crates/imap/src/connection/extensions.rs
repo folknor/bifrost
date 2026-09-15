@@ -91,12 +91,13 @@ impl ImapConnection {
         let consumer = super::dispatch::NotifySetConsumer::default();
         // Driver sets in_notify_set before sending; apply_tagged updates
         // notify flags on tagged OK. NOTIFICATIONOVERFLOW clears them.
-        // submit_regular returns Result<Result<bool, Error>, Error>.
-        // Inner Result: consumer wraps NO/BAD as output (not finalize
-        // error) so reclassified_as_events is always emitted.
+        // NO/BAD arrive as the ordinary `Err` of this call: they ride
+        // `Finalized::output`, so the consumer's `reclassified_as_events` is
+        // emitted on that path too, and the caller no longer unwraps a second
+        // inner `Result` to find out.
         let overflow = tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::timeout_inflight())???;
+            .map_err(|_| Error::timeout_inflight())??;
 
         if overflow {
             // RFC 5465 Section 5.8: server cannot keep up. Notify flags

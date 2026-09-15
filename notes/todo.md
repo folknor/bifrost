@@ -1085,88 +1085,29 @@ wave; these are what was left. Verify before working any of them.
   consumer chose the cap, so this is not a defect - but if that ever needs a
   ceiling it is a separate ruling and should not be folded into the refund.
 
-- **imap: a failing command destroys the untagged responses its consumer
-  buffered.** [C1 live defect, and far bigger than first filed] Audited across
-  the whole dispatch layer 2026-09-15. `Consumer::finalize` implementations call
-  `tagged.require_ok()?` BEFORE constructing their `Finalized`, so the `?` drops
-  the consumer and the `Vec<UntaggedResponse>` it holds. **24 of 32 consumers do
-  this**; the 8 that do not carry the command error INSIDE `Finalized.output`
-  instead (NotifySetConsumer, SelectConsumer, the three List consumers, the
-  three Search consumers).
+- **imap: SearchConsumer publishes surplus SEARCH/ESEARCH as events on the
+  SUCCESS path.** [found 2026-09-15 while landing the infallible-finalize work]
+  `reclassified_extras` emits extra tag-correlated ESEARCH beyond the first, all
+  tagless ESEARCH when a correlated one won, and all legacy SEARCH. By the same
+  classifier argument that settled the FAILURE path - SEARCH and ESEARCH are
+  `OnlySolicited` inside a search command and `Impossible` outside one, so they
+  are not asynchronous notifications and publishing them says they are - those
+  arguably should be dropped too. The method's own doc comment rules
+  deliberately the other way, which is why it was left alone: this is a
+  published behaviour with a stated reason, not an oversight. Wants its own
+  ruling. Note a pipelined foreign-tag-correlated ESEARCH is a third case again
+  and probably wants correlation to the command its tag names rather than either
+  answer.
 
-  NOT cosmetic. Everything in those buffers was classified `Either`, and
-  `ProtocolState` has NO handling for Exists, Expunge or Vanished - the typed
-  event stream is their only carrier. Downstream they drive `clear_modseqs` and
-  cursor-scope invalidation in the account push path, so a dropped EXPUNGE or
-  VANISHED leaves a per-folder modseq cache entry that is never cleared.
-  ExpungeConsumer and MoveConsumer are sharpest: a tagged NO after the server
-  already emitted `* 3 EXPUNGE` destroys evidence of a mutation the server
-  actually performed. The read-time routing that landed 2026-09-15 made this
-  reachable at MORE wire positions, since responses read during a literal
-  negotiation now reach consumers where they previously became events.
-
-  THE OBVIOUS FIX IS INSUFFICIENT, AND SO IS THE CLEVER ONE. Converting all 24
-  to `Output = Result<T, Error>` fixes today's instances and leaves the trap
-  armed: `require_ok()?` is the obvious thing to write and nothing would complain
-  for consumer #33. Moving the `Either` buffer out of the consumers and into the
-  dispatcher that classified it was sparred and BROKEN by a counterexample.
-  `MoveConsumer` CLAIMS its `Either` EXPUNGE/VANISHED into its typed
-  `MoveResult`, so under a "the consumer hands back what it did not claim"
-  contract the dispatcher forgets it and the tagged NO loses it exactly as
-  today. Ownership cannot be "claimed means forgotten".
-
-  THE DESIGN THAT SURVIVED, for whoever builds it. The dispatcher ESCROWS an
-  `Either` response until its disposition is final, the consumer choosing among
-  `Event`, `ConsumeRegardless`, and - the load-bearing one - `ConsumeOnSuccess`:
-  discarded as solicited on tagged OK, emitted as an event on tagged NO/BAD or
-  on a finalization error. Escrow is per command index, beside the existing
-  `tags` / `kinds` / `targets` / `consumers` / `results` tables in
-  `run_pipeline_batch`, and in the command frame for single dispatch. It must be
-  flushed on BOTH result branches of `route_pipeline_response` - today the
-  `Err(e)` arm only writes into `results[idx]`, which is exactly where the new
-  invariant goes. A response no consumer claims keeps being emitted immediately;
-  it has no command completion to defer against.
-  `Finalized.reclassified_as_events` survives for genuinely delayed consumer
-  judgements: SELECT's `[CLOSED]` temporal partition and the NOTIFY-marked LIST
-  lane, both of which are about `OnlySolicited` data rather than the `Either`
-  buffer and are therefore orthogonal to the escrow.
-
-  THREE SUB-RULINGS IT DEPENDS ON, each separable:
-  (a) `SearchConsumer::drain_all_into_buffered()` on tagged failure is WRONG and
-  should drop its solicited SEARCH/ESEARCH results instead. LIST's
-  drop-on-failure is right and Search's re-emit is not, and the crate's own
-  classifier settles it: SEARCH/ESEARCH are `OnlySolicited` inside a search
-  command and `Impossible` outside one, so a tagged NO cannot retroactively turn
-  partial SEARCH output into an unsolicited notification. The two consumers
-  answer one question opposite ways today.
-  (b) `ExpungeConsumer` needs an explicit failure rule. Its EXPUNGE responses
-  are classified `OnlySolicited`, not `Either`, so an escrow limited to `Either`
-  cannot preserve them - and a failed EXPUNGE may still have expunged something.
-  (c) `StatusConsumer` deliberately drops its generic `Either` buffer on
-  failure, reasoning that potentially-solicited STATUS must not leak. Its
-  MATCHING status responses live in a separate `matching` field, so the generic
-  buffer does not contain them and the reasoning does not apply to it. Escrow
-  changes that behaviour, correctly.
-
-  THE EXISTING TESTS PIN THE BUG. `fetch_consumer_propagates_terminal_no_after_
-  data`, `streaming_fetch_consumer_propagates_terminal_no_and_closes_channel`
-  and `expunge_consumer_propagates_terminal_bad_after_data` all assert the outer
-  `Err` that has to go away, and none supplies a buffered `Either` response
-  first, so none observes the buffer at all. What they are reaching for is real
-  - a tagged NO must fail the command even after partial data, and the streaming
-  channel must still close - but that `Consumer::finalize` returns an outer
-  `Err` is internal plumbing, not the contract. Replacements belong at the
-  driver boundary and must assert BOTH halves together: the command result is
-  `Err`, AND an `Either` response received before the failure is emitted exactly
-  once.
-
-  Two smaller things from the same audit. `LogoutConsumer` has a SECOND discard
-  site, a missing-BYE `Err` ahead of `require_ok`, easy to miss in a mechanical
-  conversion. And `StoreConsumer` is inconsistent with itself: it treats
-  `NO [MODIFIED]` as partial success and keeps its buffer, but a `BAD` on the
-  same conditional command destroys both `fetches` and `buffered` - if the
-  per-UID evidence is worth special-casing for `NO`, the implicit FETCHes on the
-  way to a `BAD` are the same evidence.
+- **imap: AppendConsumer narrows an untagged OK lossily on the SUCCESS path.**
+  `on_response` swallows an untagged `OK [APPENDUID ...]` whole, keeping only
+  its `ResponseCode` and discarding `text` and the rest of the `Status` variant.
+  That is why its failure arm cannot surrender the response - there is no
+  faithful `UntaggedResponse` left to publish - but the narrowing happens on the
+  success path too, so an untagged OK that this consumer sees is silently not
+  reclassified the way other untagged OKs are. `MultiAppendConsumer` and
+  `CopyConsumer` have the same shape. Restructuring them to retain the whole
+  response is available and was deliberately not done in the finalize pass.
 
 - **imap: `emit_untagged_response_code_events` and `has_critical_response_code`
   are complements maintained by hand.** Both handle exactly `Alert` and

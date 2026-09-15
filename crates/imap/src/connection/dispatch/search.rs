@@ -41,20 +41,6 @@ impl SearchConsumer {
         }
     }
 
-    /// Drain all accumulated responses into `buffered` for reclassification.
-    fn drain_all_into_buffered(&mut self) {
-        for e in self.tag_correlated.drain(..) {
-            self.buffered.push(UntaggedResponse::Esearch(e));
-        }
-        for e in self.tagless_esearch.drain(..) {
-            self.buffered.push(UntaggedResponse::Esearch(e));
-        }
-        for (uids, mod_seq) in self.search_responses.drain(..) {
-            self.buffered
-                .push(UntaggedResponse::Search { uids, mod_seq });
-        }
-    }
-
     /// Everything except the response this command consumed.
     ///
     /// The chosen ESEARCH is solicited: it answers this tag, so it belongs to
@@ -86,10 +72,7 @@ enum Chosen {
 }
 
 impl Consumer for SearchConsumer {
-    /// `Result` wrapper ensures `reclassified_as_events` is always
-    /// processed even when the command-level outcome is an error
-    /// (e.g., no solicited response found). Callers flatten with `??`.
-    type Output = Result<SearchResult, Error>;
+    type Output = SearchResult;
 
     fn on_response(
         &mut self,
@@ -115,16 +98,21 @@ impl Consumer for SearchConsumer {
     }
 
     fn finalize(
-        mut self: Box<Self>,
+        self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Result<SearchResult, Error>>, Error> {
+    ) -> Finalized<SearchResult> {
         if let Err(e) = tagged.require_ok() {
-            self.drain_all_into_buffered();
-            return Ok(Finalized {
-                output: Err(e),
-                reclassified_as_events: self.buffered,
-            });
+            // The generic `Either` buffer is surrendered; the accumulated
+            // SEARCH/ESEARCH is dropped. `classify` makes both of those
+            // `OnlySolicited` inside SEARCH/UID SEARCH and `Impossible`
+            // anywhere else, so they are not asynchronous mailbox
+            // notifications and a tagged NO cannot retroactively make them
+            // into one. Re-emitting them would publish an event the
+            // classifier says cannot exist. Same answer `ListConsumer` gives
+            // its marker-less LIST entries for the RFC 5465 Section5.4
+            // reason.
+            return Finalized::failure(e, self.buffered);
         }
 
         // Priority: tag-correlated ESEARCH > tagless ESEARCH > legacy
@@ -139,10 +127,10 @@ impl Consumer for SearchConsumer {
                 ids,
                 mod_seq: esearch.mod_seq,
             });
-            return Ok(Finalized {
+            return Finalized {
                 output,
                 reclassified_as_events: (*self).reclassified_extras(Chosen::TagCorrelated),
-            });
+            };
         }
 
         // Pass 2: tagless ESEARCH.
@@ -151,10 +139,10 @@ impl Consumer for SearchConsumer {
                 ids,
                 mod_seq: esearch.mod_seq,
             });
-            return Ok(Finalized {
+            return Finalized {
                 output,
                 reclassified_as_events: (*self).reclassified_extras(Chosen::Tagless),
-            });
+            };
         }
 
         // Pass 3: legacy SEARCH.
@@ -164,20 +152,17 @@ impl Consumer for SearchConsumer {
             for (uids, mod_seq) in search_iter {
                 buffered.push(UntaggedResponse::Search { uids, mod_seq });
             }
-            return Ok(Finalized {
-                output: Ok(SearchResult { ids: uids, mod_seq }),
-                reclassified_as_events: buffered,
-            });
+            return Finalized::success(SearchResult { ids: uids, mod_seq }, buffered);
         }
 
-        Ok(Finalized {
-            output: Err(Error::Protocol(
+        Finalized::failure(
+            Error::Protocol(
                 "SEARCH OK but no untagged SEARCH/ESEARCH response \
                  (RFC 3501 Section 6.4.4)"
                     .into(),
-            )),
-            reclassified_as_events: self.buffered,
-        })
+            ),
+            self.buffered,
+        )
     }
 }
 
@@ -202,9 +187,7 @@ impl EsearchConsumer {
 }
 
 impl Consumer for EsearchConsumer {
-    /// `Result` wrapper ensures `reclassified_as_events` is always
-    /// processed even when the command-level outcome is an error.
-    type Output = Result<EsearchResponse, Error>;
+    type Output = EsearchResponse;
 
     fn on_response(
         &mut self,
@@ -231,14 +214,14 @@ impl Consumer for EsearchConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Result<EsearchResponse, Error>>, Error> {
+    ) -> Finalized<EsearchResponse> {
         let buffered = self.buffered;
 
         if let Err(e) = tagged.require_ok() {
-            return Ok(Finalized {
-                output: Err(e),
-                reclassified_as_events: buffered,
-            });
+            // Surrender the generic `Either` buffer, drop the accumulated
+            // ESEARCH: it is `OnlySolicited` here and `Impossible` outside a
+            // search command, so it has no life as an asynchronous event.
+            return Finalized::failure(e, buffered);
         }
 
         let output = self.result.ok_or_else(|| {
@@ -249,10 +232,10 @@ impl Consumer for EsearchConsumer {
             )
         });
 
-        Ok(Finalized {
+        Finalized {
             output,
             reclassified_as_events: buffered,
-        })
+        }
     }
 }
 
@@ -277,9 +260,7 @@ impl SearchSaveConsumer {
 }
 
 impl Consumer for SearchSaveConsumer {
-    /// `Result` wrapper ensures `reclassified_as_events` is always
-    /// processed even when the command-level outcome is an error.
-    type Output = Result<(), Error>;
+    type Output = ();
 
     fn on_response(
         &mut self,
@@ -300,15 +281,14 @@ impl Consumer for SearchSaveConsumer {
         }
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Result<(), Error>>, Error> {
-        Ok(Finalized {
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
+        // The SEARCH/ESEARCH data was already discarded at accumulation time
+        // (RFC 5182 Section2 SAVE-only), so only the generic `Either` buffer
+        // is left, and it is surrendered on both arms.
+        Finalized {
             output: tagged.require_ok().map(|_| ()),
             reclassified_as_events: self.buffered,
-        })
+        }
     }
 }
 
@@ -365,15 +345,23 @@ impl Consumer for CopyConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<CopyResult>, Error> {
+    ) -> Finalized<CopyResult> {
         // RFC 4315 Section3: server SHOULD return COPYUID response code.
-        let tagged = tagged.require_ok()?;
-        Ok(Finalized {
-            output: CopyResult {
-                code: tagged.code.or(self.code),
-            },
-            reclassified_as_events: self.buffered,
-        })
+        match tagged.require_ok() {
+            Ok(tagged) => Finalized::success(
+                CopyResult {
+                    code: tagged.code.or(self.code),
+                },
+                self.buffered,
+            ),
+            // The `Either` buffer is surrendered: COPY solicits no untagged
+            // response, so everything in it is an asynchronous notification
+            // and survives the failure. The captured untagged
+            // `OK [COPYUID ...]` is not re-emitted: it is this command's own
+            // answer, and only its response code was retained anyway, so
+            // there is nothing faithful left to publish.
+            Err(e) => Finalized::failure(e, self.buffered),
+        }
     }
 }
 
@@ -389,10 +377,18 @@ impl Consumer for CopyConsumer {
 /// variants and selects the appropriate [`ExpungeResult`] variant
 /// based on the QRESYNC enabled state in `finalize`.
 pub(crate) struct MoveConsumer {
-    /// Expunged sequence numbers from `* N EXPUNGE` responses.
-    expunged: Vec<u32>,
-    /// Vanished UID ranges from `* VANISHED ...` responses.
-    vanished: Vec<UidRange>,
+    /// `* N EXPUNGE` and `* VANISHED ...` responses, kept verbatim and in
+    /// arrival order.
+    ///
+    /// These are stored as whole responses rather than as pre-flattened
+    /// `Vec<u32>` / `Vec<UidRange>` accumulators because the failure arm has
+    /// to re-emit them: MOVE CLAIMS them into its typed [`MoveResult`], so
+    /// nothing upstream can preserve them on its behalf. Flattening at
+    /// accumulation time would have destroyed the `earlier` flag, the
+    /// per-response boundaries, and the arrival order between EXPUNGE and
+    /// VANISHED - and a reconstruction that guesses any of those
+    /// misrepresents what the server sent.
+    mutations: Vec<UntaggedResponse>,
     /// Non-EXPUNGE/VANISHED responses for reclassification.
     buffered: Vec<UntaggedResponse>,
     /// COPYUID response code extracted from an untagged `* OK [COPYUID ...]`.
@@ -404,8 +400,7 @@ pub(crate) struct MoveConsumer {
 impl MoveConsumer {
     pub(crate) fn new() -> Self {
         Self {
-            expunged: Vec::new(),
-            vanished: Vec::new(),
+            mutations: Vec::new(),
             buffered: Vec::new(),
             code: None,
         }
@@ -423,12 +418,9 @@ impl Consumer for MoveConsumer {
     ) {
         match resp {
             // RFC 6851 Section3: EXPUNGE responses for moved messages.
-            UntaggedResponse::Expunge(n) => {
-                self.expunged.push(n);
-            }
-            // RFC 7162 Section3.2.10: VANISHED responses when QRESYNC is enabled.
-            UntaggedResponse::Vanished { uids, .. } => {
-                self.vanished.extend(uids);
+            // RFC 7162 Section3.2.10: VANISHED instead, when QRESYNC is on.
+            resp @ (UntaggedResponse::Expunge(_) | UntaggedResponse::Vanished { .. }) => {
+                self.mutations.push(resp);
             }
             // RFC 4315 Section3: some servers send COPYUID in an untagged OK.
             UntaggedResponse::Status {
@@ -446,29 +438,32 @@ impl Consumer for MoveConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         ctx: &ConsumerContext,
-    ) -> Result<Finalized<MoveResult>, Error> {
-        let tagged = tagged.require_ok()?;
-        // RFC 7162 Section3.2.10: when QRESYNC is enabled, the server sends
-        // VANISHED instead of EXPUNGE.
-        // The ENABLED echo is stored verbatim; the name is an atom
-        // (RFC 9051 Section 9), so compare case-insensitively.
-        let expunged = if ctx
-            .enabled()
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
-        {
-            ExpungeResult::Vanished(self.vanished)
-        } else {
-            ExpungeResult::Expunged(self.expunged)
-        };
-        Ok(Finalized {
-            output: MoveResult {
-                // RFC 6851 Section4.3: MOVE SHOULD return COPYUID response code.
-                code: tagged.code.or(self.code),
-                expunged,
-            },
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<MoveResult> {
+        match tagged.require_ok() {
+            Ok(tagged) => Finalized::success(
+                MoveResult {
+                    // RFC 6851 Section4.3: MOVE SHOULD return COPYUID.
+                    code: tagged.code.or(self.code),
+                    expunged: fold_mutations(self.mutations, qresync_enabled(ctx)),
+                },
+                self.buffered,
+            ),
+            Err(e) => {
+                // The sharpest failure arm in the crate. A tagged NO can
+                // follow `* 3 EXPUNGE`: the server really did expunge, and
+                // MOVE claims those responses into its typed result, so if
+                // this arm drops them the evidence of a performed mutation is
+                // gone for good and a per-folder modseq cache entry is never
+                // cleared. They are `Either`-classified here anyway
+                // (`(_, Expunge)` and `(_, Vanished { earlier: false })`), so
+                // the generic rule reaches them: surrender both the buffer and
+                // the mutations, in that order. They are re-emitted verbatim,
+                // not reconstructed, which is why they were never flattened.
+                let mut reclassified = self.buffered;
+                reclassified.extend(self.mutations);
+                Finalized::failure(e, reclassified)
+            }
+        }
     }
 }
 
@@ -478,10 +473,13 @@ impl Consumer for MoveConsumer {
 /// When QRESYNC is enabled the server sends VANISHED instead of
 /// EXPUNGE (RFC 7162 Section3.2.10).
 pub(crate) struct ExpungeConsumer {
-    /// Expunged sequence numbers from `* N EXPUNGE` responses.
-    expunged: Vec<u32>,
-    /// Vanished UID ranges from `* VANISHED (EARLIER) ...` responses.
-    vanished: Vec<UidRange>,
+    /// `* N EXPUNGE` and `* VANISHED [(EARLIER)] ...` responses, verbatim and
+    /// in arrival order. See `MoveConsumer::mutations` for why these are not
+    /// flattened at accumulation time; here the `earlier` flag matters even
+    /// more, because `classify` admits BOTH `VANISHED` and `VANISHED
+    /// (EARLIER)` under `CK::Expunge` and the two mean different things to a
+    /// downstream reader.
+    mutations: Vec<UntaggedResponse>,
     /// Non-EXPUNGE/VANISHED responses for reclassification.
     buffered: Vec<UntaggedResponse>,
 }
@@ -489,10 +487,44 @@ pub(crate) struct ExpungeConsumer {
 impl ExpungeConsumer {
     pub(crate) fn new() -> Self {
         Self {
-            expunged: Vec::new(),
-            vanished: Vec::new(),
+            mutations: Vec::new(),
             buffered: Vec::new(),
         }
+    }
+}
+
+/// Whether QRESYNC was successfully `ENABLE`d (RFC 7162 Section3.2.10:
+/// the server then sends VANISHED instead of EXPUNGE).
+///
+/// The ENABLED echo is stored verbatim; the name is an atom (RFC 9051
+/// Section 9), so compare case-insensitively.
+fn qresync_enabled(ctx: &ConsumerContext) -> bool {
+    ctx.enabled()
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
+}
+
+/// Flatten accumulated EXPUNGE/VANISHED responses into the typed result.
+///
+/// Selects the variant by QRESYNC enabled state rather than by what actually
+/// arrived, matching the RFC 7162 Section3.2.10 contract.
+fn fold_mutations(mutations: Vec<UntaggedResponse>, qresync: bool) -> ExpungeResult {
+    if qresync {
+        let mut vanished: Vec<UidRange> = Vec::new();
+        for resp in mutations {
+            if let UntaggedResponse::Vanished { uids, .. } = resp {
+                vanished.extend(uids);
+            }
+        }
+        ExpungeResult::Vanished(vanished)
+    } else {
+        let mut expunged = Vec::new();
+        for resp in mutations {
+            if let UntaggedResponse::Expunge(n) = resp {
+                expunged.push(n);
+            }
+        }
+        ExpungeResult::Expunged(expunged)
     }
 }
 
@@ -506,14 +538,11 @@ impl Consumer for ExpungeConsumer {
         _ctx: &ConsumerContext,
     ) {
         match resp {
-            // RFC 3501 Section7.4.1: EXPUNGE responses with sequence numbers.
-            UntaggedResponse::Expunge(n) => {
-                self.expunged.push(n);
-            }
-            // RFC 7162 Section3.2.10: VANISHED (EARLIER) with UID ranges when
-            // QRESYNC is enabled.
-            UntaggedResponse::Vanished { uids, .. } => {
-                self.vanished.extend(uids);
+            // RFC 3501 Section7.4.1: EXPUNGE with sequence numbers.
+            // RFC 7162 Section3.2.10: VANISHED with UID ranges when QRESYNC
+            // is enabled.
+            resp @ (UntaggedResponse::Expunge(_) | UntaggedResponse::Vanished { .. }) => {
+                self.mutations.push(resp);
             }
             other => self.buffered.push(other),
         }
@@ -523,24 +552,27 @@ impl Consumer for ExpungeConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         ctx: &ConsumerContext,
-    ) -> Result<Finalized<ExpungeResult>, Error> {
-        tagged.require_ok()?;
-        // RFC 7162 Section3.2.10: when QRESYNC is enabled, the server sends
-        // VANISHED instead of EXPUNGE.
-        // The ENABLED echo is stored verbatim; the name is an atom
-        // (RFC 9051 Section 9), so compare case-insensitively.
-        let result = if ctx
-            .enabled()
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
-        {
-            ExpungeResult::Vanished(self.vanished)
-        } else {
-            ExpungeResult::Expunged(self.expunged)
-        };
-        Ok(Finalized {
-            output: result,
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<ExpungeResult> {
+        match tagged.require_ok() {
+            Ok(_) => Finalized::success(
+                fold_mutations(self.mutations, qresync_enabled(ctx)),
+                self.buffered,
+            ),
+            Err(e) => {
+                // A failed EXPUNGE may still have expunged something: the
+                // server can report `* 1 EXPUNGE` and then fail the command
+                // partway. These accumulators are `OnlySolicited` under
+                // `CK::Expunge`, so the `Either` rule does not reach them and
+                // this is a decision on its own merits - but an EXPUNGE that
+                // the client never hears about leaves the message cache and
+                // the per-folder modseq permanently ahead of the mailbox,
+                // which is worse than publishing an event for a mutation the
+                // server did perform. Surrendered verbatim, so the `earlier`
+                // flag and the arrival order are intact.
+                let mut reclassified = self.buffered;
+                reclassified.extend(self.mutations);
+                Finalized::failure(e, reclassified)
+            }
+        }
     }
 }

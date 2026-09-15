@@ -20,13 +20,12 @@ pub(crate) struct NotifySetConsumer {
 }
 
 impl Consumer for NotifySetConsumer {
-    /// `Ok(true)` when NOTIFICATIONOVERFLOW was detected (RFC 5465 Section5.8).
-    /// `Err(...)` when the server rejected the command (NO/BAD).
-    /// Wrapping the error in `Output` instead of `finalize`'s `Result`
-    /// ensures that `reclassified_as_events` is always emitted, even
-    /// on the failure path (EXISTS/RECENT classified as `Either` during
-    /// NOTIFY SET must not be silently dropped).
-    type Output = Result<bool, Error>;
+    /// `true` when NOTIFICATIONOVERFLOW was detected (RFC 5465 Section5.8).
+    /// The rejection (NO/BAD) travels in `Finalized::output`, so
+    /// `reclassified_as_events` is always emitted, even on the failure
+    /// path (EXISTS/RECENT classified as `Either` during NOTIFY SET must
+    /// not be silently dropped).
+    type Output = bool;
 
     fn on_response(
         &mut self,
@@ -53,26 +52,22 @@ impl Consumer for NotifySetConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Result<bool, Error>>, Error> {
+    ) -> Finalized<bool> {
         match tagged.status {
             StatusKind::Ok => {
                 // RFC 5465 Section5.8: NOTIFICATIONOVERFLOW can also appear in
                 // the tagged response code.
                 let overflow = self.saw_overflow
                     || matches!(tagged.code, Some(ResponseCode::NotificationOverflow(_)));
-                Ok(Finalized {
-                    output: Ok(overflow),
-                    reclassified_as_events: self.buffered,
-                })
+                Finalized::success(overflow, self.buffered)
             }
-            StatusKind::No => Ok(Finalized {
-                output: Err(Error::no_with_code(tagged.text, tagged.code)),
-                reclassified_as_events: self.buffered,
-            }),
-            StatusKind::Bad => Ok(Finalized {
-                output: Err(Error::bad_with_code(tagged.text, tagged.code)),
-                reclassified_as_events: self.buffered,
-            }),
+            StatusKind::No => {
+                Finalized::failure(Error::no_with_code(tagged.text, tagged.code), self.buffered)
+            }
+            StatusKind::Bad => Finalized::failure(
+                Error::bad_with_code(tagged.text, tagged.code),
+                self.buffered,
+            ),
         }
     }
 }

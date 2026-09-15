@@ -57,19 +57,24 @@ impl Consumer for QuotaConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<QuotaResource>>, Error> {
-        tagged.require_ok()?;
-        let resources = self.result.ok_or_else(|| {
-            Error::Protocol(format!(
-                "server sent OK but no QUOTA response for root '{}' \
-                 (RFC 2087 Section 4.2)",
-                self.root,
-            ))
-        })?;
-        Ok(Finalized {
-            output: resources,
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<Vec<QuotaResource>> {
+        // `buffered` is the generic `Either` catch-all: the solicited QUOTA
+        // for this root lives in `result`, so nothing here is this command's
+        // own output and it is surrendered on every path.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
+        let Some(resources) = self.result else {
+            return Finalized::failure(
+                Error::Protocol(format!(
+                    "server sent OK but no QUOTA response for root '{}' \
+                     (RFC 2087 Section 4.2)",
+                    self.root,
+                )),
+                self.buffered,
+            );
+        };
+        Finalized::success(resources, self.buffered)
     }
 }
 
@@ -132,16 +137,23 @@ impl Consumer for QuotaRootConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<QuotaRootResponse>, Error> {
-        tagged.require_ok()?;
+    ) -> Finalized<QuotaRootResponse> {
+        // `buffered` holds only responses this command never solicited, so it
+        // is surrendered on every path, failure included.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
 
-        let roots = self.roots.ok_or_else(|| {
-            Error::Protocol(format!(
-                "server sent OK but no QUOTAROOT response for mailbox '{}' \
-                 (RFC 2087 Section 4.3)",
-                self.mailbox,
-            ))
-        })?;
+        let Some(roots) = self.roots else {
+            return Finalized::failure(
+                Error::Protocol(format!(
+                    "server sent OK but no QUOTAROOT response for mailbox '{}' \
+                     (RFC 2087 Section 4.3)",
+                    self.mailbox,
+                )),
+                self.buffered,
+            );
+        };
 
         // Partition QUOTA responses: matching roots are the result,
         // non-matching are reclassified as events.
@@ -159,23 +171,23 @@ impl Consumer for QuotaRootConsumer {
         }
 
         if roots.is_empty() {
-            return Ok(Finalized {
-                output: QuotaRootResponse { roots, resources },
-                reclassified_as_events: buffered,
-            });
+            return Finalized::success(QuotaRootResponse { roots, resources }, buffered);
         }
         if resources.is_empty() {
-            return Err(Error::Protocol(format!(
-                "server sent OK but no QUOTA response for QUOTAROOT mailbox \
-                 '{}' (RFC 2087 Section 4.3)",
-                self.mailbox,
-            )));
+            // Real `Error` in `output` - the driver classifies it before the
+            // result is published. `buffered` still goes out; the only thing
+            // lost is the (empty) resource partition.
+            return Finalized::failure(
+                Error::Protocol(format!(
+                    "server sent OK but no QUOTA response for QUOTAROOT mailbox \
+                     '{}' (RFC 2087 Section 4.3)",
+                    self.mailbox,
+                )),
+                buffered,
+            );
         }
 
-        Ok(Finalized {
-            output: QuotaRootResponse { roots, resources },
-            reclassified_as_events: buffered,
-        })
+        Finalized::success(QuotaRootResponse { roots, resources }, buffered)
     }
 }
 
@@ -226,19 +238,23 @@ impl Consumer for AclConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<Vec<AclEntry>>, Error> {
-        tagged.require_ok()?;
-        let entries = self.result.ok_or_else(|| {
-            Error::Protocol(format!(
-                "server sent OK but no ACL response for mailbox '{}' \
-                 (RFC 4314 Section 3.3)",
-                self.mailbox,
-            ))
-        })?;
-        Ok(Finalized {
-            output: entries,
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<Vec<AclEntry>> {
+        // The solicited ACL lives in `result`; `buffered` is the generic
+        // `Either` catch-all and is surrendered on every path.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
+        let Some(entries) = self.result else {
+            return Finalized::failure(
+                Error::Protocol(format!(
+                    "server sent OK but no ACL response for mailbox '{}' \
+                     (RFC 4314 Section 3.3)",
+                    self.mailbox,
+                )),
+                self.buffered,
+            );
+        };
+        Finalized::success(entries, self.buffered)
     }
 }
 
@@ -298,19 +314,23 @@ impl Consumer for ListRightsConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<ListRightsResponse>, Error> {
-        tagged.require_ok()?;
-        let result = self.result.ok_or_else(|| {
-            Error::Protocol(format!(
-                "server sent OK but no LISTRIGHTS response for mailbox '{}' \
-                 and identifier '{}' (RFC 4314 Section 3.4)",
-                self.mailbox, self.identifier,
-            ))
-        })?;
-        Ok(Finalized {
-            output: result,
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<ListRightsResponse> {
+        // The solicited LISTRIGHTS lives in `result`; `buffered` is the
+        // generic `Either` catch-all and is surrendered on every path.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
+        let Some(result) = self.result else {
+            return Finalized::failure(
+                Error::Protocol(format!(
+                    "server sent OK but no LISTRIGHTS response for mailbox '{}' \
+                     and identifier '{}' (RFC 4314 Section 3.4)",
+                    self.mailbox, self.identifier,
+                )),
+                self.buffered,
+            );
+        };
+        Finalized::success(result, self.buffered)
     }
 }
 
@@ -360,19 +380,23 @@ impl Consumer for MyRightsConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<String>, Error> {
-        tagged.require_ok()?;
-        let rights = self.result.ok_or_else(|| {
-            Error::Protocol(format!(
-                "server sent OK but no MYRIGHTS response for mailbox '{}' \
-                 (RFC 4314 Section 3.5)",
-                self.mailbox,
-            ))
-        })?;
-        Ok(Finalized {
-            output: rights,
-            reclassified_as_events: self.buffered,
-        })
+    ) -> Finalized<String> {
+        // The solicited MYRIGHTS lives in `result`; `buffered` is the generic
+        // `Either` catch-all and is surrendered on every path.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
+        let Some(rights) = self.result else {
+            return Finalized::failure(
+                Error::Protocol(format!(
+                    "server sent OK but no MYRIGHTS response for mailbox '{}' \
+                     (RFC 4314 Section 3.5)",
+                    self.mailbox,
+                )),
+                self.buffered,
+            );
+        };
+        Finalized::success(rights, self.buffered)
     }
 }
 
@@ -450,28 +474,35 @@ impl Consumer for MetadataConsumer {
         self: Box<Self>,
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
-    ) -> Result<Finalized<MetadataResult>, Error> {
-        // On failure: drop all matching same-mailbox METADATA rather than
-        // buffering as unsolicited. Same-mailbox METADATA is wire-identical
-        // between the solicited reply and a NOTIFY event (RFC 5465
-        // Section5.6-5.7, RFC 5464 Section4.2). Buffering as unsolicited would
-        // leak potentially-solicited data into the NOTIFY event channel.
-        tagged.require_ok()?;
-
-        if !self.saw_matching {
-            return Err(Error::Protocol(
-                "server completed GETMETADATA without the required METADATA \
-                 response for the requested mailbox (RFC 5464 Section 4.2)"
-                    .into(),
-            ));
+    ) -> Finalized<MetadataResult> {
+        // On failure the `entries` accumulator is dropped: same-mailbox
+        // METADATA is wire-identical between the solicited reply and a NOTIFY
+        // event (RFC 5465 Section5.6-5.7, RFC 5464 Section4.2), so re-emitting
+        // it would leak potentially-solicited data into the NOTIFY event
+        // channel. `buffered` is a different set - different-mailbox METADATA
+        // and non-METADATA `Either` responses, none of which this command
+        // solicited - so it is surrendered.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
         }
 
-        Ok(Finalized {
-            output: MetadataResult {
+        if !self.saw_matching {
+            return Finalized::failure(
+                Error::Protocol(
+                    "server completed GETMETADATA without the required METADATA \
+                     response for the requested mailbox (RFC 5464 Section 4.2)"
+                        .into(),
+                ),
+                self.buffered,
+            );
+        }
+
+        Finalized::success(
+            MetadataResult {
                 entries: self.entries,
                 notify_ambiguity: self.notify_ambiguity,
             },
-            reclassified_as_events: self.buffered,
-        })
+            self.buffered,
+        )
     }
 }
