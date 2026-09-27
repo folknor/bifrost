@@ -29,10 +29,6 @@ CalDAV composes into IMAP-shaped accounts when configured.
 
 ### Bash rules
 
-- Never chain commands with `&&`.
-- Never chain commands with `;`.
-- Never chain/pipe commands with `|`. Exception: piping into `review` is allowed (writing scratch prompt files is wasteful).
-- Never capture stdout into env vars (`UUID=$(...)`).
 - Never read or write from `/tmp`. All data lives in the project.
 - Never run raw `cargo`, `curl`, `pkill`. Use `brokkr`.
 
@@ -83,15 +79,10 @@ feature that no workspace member enables is unchecked until a sweep names it.
 - A tree holding **only markdown edits** runs the gremlins, textlint and
   script_check phases and stops; pass `--force-rust` to run clippy and the tests
   anyway.
-- Output: gremlins, clippy and the `--timings` list are capped at `--limit N`
-  (default 20), and when the cap bites, diagnostics in files changed on the
-  current branch sort first. Clippy *errors* are never elided by the cap. The
-  test failure list is never capped and never scoped.
-- `brokkr check --triage` - show every gremlins/clippy diagnostic, no cap, no
-  changed-files scoping, sorted by (level, lint code, file, line). Does not
-  widen the test phase; the failure list was never capped or scoped. (There is
-  no `--all` flag - `brokkr check` rejects it. `--gate` exists but needs a
-  `[test] gate_profile` in `brokkr.toml`, which this project does not define.)
+- Output is never capped or scoped: every diagnostic prints, every time.
+  Errors in files with unstaged changes are listed first.
+- `--gate` exists but needs a `[test] gate_profile` in `brokkr.toml`, which
+  this project does not define.
 - `brokkr check -p <crate>` - scope every sweep to one package; repeatable. The
   set is intersected with each sweep's own scope, so a sweep that admits none of
   the named packages is skipped. You generally do not want this; a single
@@ -320,15 +311,11 @@ Scoped runs miss cross-crate breakage, and feature unification makes them
 non-equivalent to the real thing. A fix pass that verifies with `-p <crate>` has
 not verified.
 
-### Two smaller mechanics
+### A smaller mechanic
 
 - **`git add -N` every untracked source file before a cold review.** A reviewer
   reads the unstaged diff, so a round whose central deliverable is a new module
   gets reviewed with that file invisible. This has happened.
-- **A `review` prompt over roughly 8k characters is rejected by the permission
-  layer.** Two ~10k briefs were denied outright; the same content trimmed to ~7k
-  went through unchanged. This bites hardest on exactly the large documents whose
-  briefs most want to be long.
 
 ### A review loop needs a scope fence and a stopping rule
 
