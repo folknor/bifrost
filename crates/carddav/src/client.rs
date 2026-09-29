@@ -2,14 +2,11 @@ use std::fmt;
 
 use bifrost_dav_core::{
     DavDispatch, DavProtocol, DavRequest, escape_xml, filter_unsupported, normalize_http_etag,
-    prepare_if_match, worse_recovery,
+    prepare_if_match, should_fallback_discovery, worse_recovery,
 };
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
 use bifrost_net::{AccountId, AccountNet};
-use bifrost_types::{
-    AccountError, AccountErrorKind, AccountOperation, ErrorScope, ProtocolErrorKind,
-    RequestErrorKind, ResourceKind, ServerErrorKind,
-};
+use bifrost_types::{AccountError, AccountOperation, ErrorScope};
 use reqwest::header::{CONTENT_TYPE, ETAG};
 use reqwest::{Method, StatusCode};
 
@@ -104,7 +101,9 @@ impl CardDavClient {
                     return self.addressbook_home_for_principal(principal).await;
                 }
                 Ok(None) => self.dav.base_url().to_string(),
-                Err(error) if should_fallback_discovery(&error) => self.dav.base_url().to_string(),
+                Err(error) if should_fallback_discovery(&error, DAV) => {
+                    self.dav.base_url().to_string()
+                }
                 Err(error) => return Err(error),
             },
         };
@@ -602,46 +601,6 @@ fn addressbook_text_query_body(property: &str, query: &str) -> String {
     )
 }
 
-/// Does this well-known PROBE failure mean "this is not a discovery endpoint"?
-///
-/// Twin of `bifrost-caldav::should_fallback_discovery`, which carries the full
-/// reasoning: applied to the `/.well-known/carddav` attempt only; 401/403 still
-/// fail the open, while 404, a 405 from a static site or proxy sitting on the
-/// origin root, and a locally-refused cross-origin redirect (RFC 6764's
-/// canonical shape, which the credential-origin gate cannot admit before
-/// discovery has authenticated anything) all mean the probe found no discovery
-/// endpoint and the configured base URL should be tried. A body that will not
-/// parse as DAV XML (`Protocol(ParseFailed)`) joins them: a front end
-/// answering a PROPFIND on the origin root with `200 text/html` and its index
-/// page is the same deployment shape one status apart, and an HTML document
-/// fails the XML parse rather than decoding as an empty multistatus.
-///
-/// Do NOT narrow that last arm. ANY `Protocol(ParseFailed)` from the well-known
-/// principal lookup triggers the fallback, INCLUDING malformed or truncated DAV
-/// XML from a genuine discovery endpoint. The predicate cannot distinguish that
-/// from a non-DAV body - both arrive as an XML parse failure with no headers
-/// available - so the distinction is unobtainable at this seam rather than
-/// merely unimplemented. It is safe because the fallback cannot accept bad data:
-/// `discover_addressbook_home` falls back to a FRESH principal lookup against
-/// the configured base URL, requires its result, and runs the rest of discovery
-/// normally, reusing nothing partially parsed from the probe and admitting no
-/// origin from it, while the base leg and every step after the principal still
-/// propagate their failures. So a fallback can only prefer the user-configured
-/// endpoint over a probe that would not parse. The cost is a lost DIAGNOSTIC -
-/// an operator does not learn that the well-known endpoint is serving truncated
-/// XML - and that cost is deliberately accepted here, not an open defect. The
-/// configured-base leg never consults this predicate, so a parse failure there
-/// remains a real contract violation.
-fn should_fallback_discovery(error: &AccountError) -> bool {
-    matches!(
-        error.kind(),
-        AccountErrorKind::NotFound(ResourceKind::Contact)
-            | AccountErrorKind::Request(RequestErrorKind::Malformed)
-            | AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
-            | AccountErrorKind::Server(ServerErrorKind::Error { status: Some(405) })
-    )
-}
-
 /// A multi-REPORT fetch: everything that came back usable, plus the
 /// recovery classification of any single REPORT that failed wholly.
 ///
@@ -842,7 +801,10 @@ const PROPFIND_CONTACTS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 mod tests {
     use super::*;
 
-    use bifrost_types::{Protocol, ProtocolErrorKind, RecoveryClass};
+    use bifrost_types::{
+        AccountErrorKind, Protocol, ProtocolErrorKind, RecoveryClass, RequestErrorKind,
+        ResourceKind,
+    };
 
     /// Every error this crate mints is stamped CardDAV, and names contacts.
     ///
@@ -2275,37 +2237,6 @@ mod tests {
             client.resolve_url("/addressbook/one.vcf"),
             "not a url/addressbook/one.vcf"
         );
-    }
-
-    /// Twin of the CalDAV test: fall back on "not a discovery endpoint"
-    /// answers, never on a credential refusal.
-    #[test]
-    fn discovery_falls_back_on_not_found_405_and_a_refused_redirect() {
-        let status = |status| status_error(AccountOperation::Discover, status, String::new());
-
-        assert!(!should_fallback_discovery(&status(
-            StatusCode::UNAUTHORIZED
-        )));
-        assert!(!should_fallback_discovery(&status(StatusCode::FORBIDDEN)));
-        assert!(!should_fallback_discovery(&status(
-            StatusCode::INTERNAL_SERVER_ERROR
-        )));
-
-        assert!(should_fallback_discovery(&status(StatusCode::NOT_FOUND)));
-        assert!(should_fallback_discovery(&status(
-            StatusCode::METHOD_NOT_ALLOWED
-        )));
-        assert!(should_fallback_discovery(&local_error(
-            AccountOperation::Discover,
-            "redirect to an unadmitted origin",
-        )));
-        // The origin root answered 200 with a body that will not parse as DAV
-        // XML. An index page is the readable case; a truncated DAV document
-        // reaches the predicate identically, which is why it admits both.
-        assert!(should_fallback_discovery(&parse_error(
-            AccountOperation::Discover,
-            "XML parse error",
-        )));
     }
 
     #[test]

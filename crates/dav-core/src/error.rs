@@ -356,9 +356,141 @@ pub fn filter_unsupported(status: StatusCode, body: &str) -> bool {
         .any(|precondition| body.contains(precondition))
 }
 
+/// Does this well-known PROBE failure mean "this is not a discovery endpoint"?
+///
+/// Applied to the `/.well-known/<dialect>` attempt ONLY, never to a request
+/// against the configured base URL, so widening it cannot mask a real failure
+/// of the account itself. Both protocol crates feed it the raw `Err` of a
+/// principal lookup whose XML decode is part of the lookup, so a body that will
+/// not parse reaches it as an error like any other probe answer.
+///
+/// A 401 or 403 still fails the open: those are answers from a discovery
+/// endpoint that exists and refused the credential, and quietly retrying the
+/// base URL would turn a reauthorization signal into a confusing later failure.
+///
+/// Four answers mean the endpoint simply is not there:
+/// - 404, the spec-correct one (`NotFound` naming the dialect's own resource).
+/// - 405 Method Not Allowed, what a static site or a proxy in front of the DAV
+///   path answers a PROPFIND on the origin root with. Accepting only 404 failed
+///   the open on deployments whose configured base URL works perfectly.
+/// - A locally-refused redirect (`Request(Malformed)` from the redirect walk).
+///   RFC 6764's canonical shape is a well-known that redirects to another host,
+///   and that host cannot be admitted to the credential-origin set before
+///   discovery has authenticated anything - so the walk refuses it locally, and
+///   that refusal is evidence about the probe, not about the account.
+/// - A body that will not parse as DAV XML (`Protocol(ParseFailed)`). A front
+///   end sitting on the origin root answers a PROPFIND with `200 text/html` and
+///   its index page as often as it answers 404 or 405 - the same deployment
+///   shape, one status apart - and an HTML document fails the XML parse rather
+///   than decoding as an empty multistatus. Without this arm that deployment
+///   fails the open while the identical one answering an empty 207 falls back
+///   and works.
+///
+/// Do NOT narrow that last arm. ANY `Protocol(ParseFailed)` from the well-known
+/// principal lookup triggers the fallback, INCLUDING malformed or truncated DAV
+/// XML from a genuine discovery endpoint. The predicate cannot distinguish that
+/// from a non-DAV body: both arrive here as an XML parse failure with no headers
+/// available, so the distinction is unobtainable at this seam rather than merely
+/// unimplemented. It is safe because the fallback cannot accept bad data - it
+/// performs a FRESH principal lookup against the configured base URL, requires
+/// its result, and runs the subsequent discovery normally; nothing partially
+/// parsed from the failed probe is reused, no origin from it is admitted, and
+/// both the base leg and everything after the principal still propagate their
+/// failures. The most a fallback can do is prefer the user-configured endpoint
+/// over a probe that would not parse. The cost is a lost DIAGNOSTIC: an operator
+/// does not learn that the well-known endpoint is serving truncated XML. That
+/// cost is deliberately accepted here; it is not an open defect.
+///
+/// The arm stays safe precisely because it is probe-scoped: a garbage document
+/// from the CONFIGURED base URL is a real contract violation and still fails,
+/// because the base leg never consults this predicate.
+#[must_use]
+pub fn should_fallback_discovery(error: &AccountError, protocol: DavProtocol) -> bool {
+    match error.kind() {
+        AccountErrorKind::NotFound(resource) => *resource == protocol.resource(),
+        AccountErrorKind::Request(RequestErrorKind::Malformed)
+        | AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
+        | AccountErrorKind::Server(ServerErrorKind::Error { status: Some(405) }) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Migrated from both crates, which each pinned it for one dialect. The
+    /// probe falls back on "not a discovery endpoint" answers and only those: a
+    /// credential refusal must still fail the open.
+    #[test]
+    fn discovery_falls_back_on_not_found_405_and_a_refused_redirect() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            let status =
+                |status| status_error(AccountOperation::Discover, status, String::new(), protocol);
+
+            assert!(!should_fallback_discovery(
+                &status(StatusCode::UNAUTHORIZED),
+                protocol
+            ));
+            assert!(!should_fallback_discovery(
+                &status(StatusCode::FORBIDDEN),
+                protocol
+            ));
+            assert!(!should_fallback_discovery(
+                &status(StatusCode::INTERNAL_SERVER_ERROR),
+                protocol
+            ));
+
+            assert!(should_fallback_discovery(
+                &status(StatusCode::NOT_FOUND),
+                protocol
+            ));
+            // A static site or proxy in front of the DAV path answers a
+            // PROPFIND on the origin root with 405.
+            assert!(should_fallback_discovery(
+                &status(StatusCode::METHOD_NOT_ALLOWED),
+                protocol
+            ));
+            // RFC 6764's canonical redirect to another host, refused locally
+            // by the credential-origin gate before any request went out.
+            assert!(should_fallback_discovery(
+                &local_error(
+                    AccountOperation::Discover,
+                    "redirect to an unadmitted origin",
+                    protocol,
+                ),
+                protocol
+            ));
+            // The origin root answered 200 with a body that will not parse as
+            // DAV XML. An index page is the readable case; a truncated DAV
+            // document reaches the predicate identically, which is why it
+            // admits both.
+            assert!(should_fallback_discovery(
+                &parse_error(AccountOperation::Discover, "XML parse error", protocol),
+                protocol
+            ));
+        }
+    }
+
+    /// A 404 names the dialect's own resource, so the predicate keys on it: a
+    /// CardDAV-stamped not-found is not a CalDAV probe answer.
+    #[test]
+    fn discovery_fallback_reads_the_dialects_own_not_found() {
+        let contact_missing = status_error(
+            AccountOperation::Discover,
+            StatusCode::NOT_FOUND,
+            String::new(),
+            DavProtocol::CardDav,
+        );
+        assert!(should_fallback_discovery(
+            &contact_missing,
+            DavProtocol::CardDav
+        ));
+        assert!(!should_fallback_discovery(
+            &contact_missing,
+            DavProtocol::CalDav
+        ));
+    }
 
     #[test]
     fn a_refused_filter_is_told_apart_from_a_refused_caller() {

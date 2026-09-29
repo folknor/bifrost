@@ -3,14 +3,13 @@ use std::fmt;
 pub(crate) use bifrost_dav_core::PutCondition;
 use bifrost_dav_core::{
     DavDispatch, DavProtocol, escape_xml, filter_unsupported, prepare_if_match, response_etag,
-    worse_recovery,
+    should_fallback_discovery, worse_recovery,
 };
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery};
 use bifrost_net::{AccountId, AccountNet};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ErrorScope, FolderId, Protocol, ProtocolErrorKind, RequestErrorKind,
-    ResourceKind, ServerErrorKind, StateCause, SyncStateErrorKind,
+    DiagnosticText, ErrorScope, FolderId, Protocol, StateCause, SyncStateErrorKind,
 };
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
@@ -120,7 +119,7 @@ impl CalDavClient {
         {
             Some(well_known) => match self.discover_principal(&well_known).await {
                 Ok(principal) => principal,
-                Err(error) if should_fallback_discovery(&error) => None,
+                Err(error) if should_fallback_discovery(&error, DAV) => None,
                 Err(error) => return Err(error),
             },
             None => None,
@@ -777,64 +776,6 @@ fn cursor_invalid_error(calendar_url: &str, status: StatusCode, body: String) ->
         .expect("valid account error classification")
 }
 
-/// Does this well-known PROBE failure mean "this is not a discovery endpoint"?
-///
-/// Applied to the `/.well-known/caldav` attempt ONLY, never to a request
-/// against the configured base URL, so widening it cannot mask a real failure
-/// of the account itself.
-///
-/// A 401 or 403 still fails the open: those are answers from a discovery
-/// endpoint that exists and refused the credential, and quietly retrying the
-/// base URL would turn a reauthorization signal into a confusing later failure.
-///
-/// Three answers mean the endpoint simply is not there:
-/// - 404, the spec-correct one.
-/// - 405 Method Not Allowed, what a static site or a proxy in front of the DAV
-///   path answers a PROPFIND on the origin root with. This is common enough
-///   that accepting only 404 failed the open on deployments whose configured
-///   base URL works perfectly.
-/// - A locally-refused redirect (`Request(Malformed)` from the redirect walk).
-///   RFC 6764's canonical shape is a well-known that redirects to another host,
-///   and that host cannot be admitted to the credential-origin set before
-///   discovery has authenticated anything - so the walk refuses it locally, and
-///   that refusal is evidence about the probe, not about the account.
-/// - A body that will not parse as DAV XML (`Protocol(ParseFailed)`). A front
-///   end sitting on the origin root answers a PROPFIND with `200 text/html` and
-///   its index page as often as it answers 404 or 405 - the same deployment
-///   shape, one status apart - and an HTML document fails the XML parse rather
-///   than decoding as an empty multistatus. Without this arm that deployment
-///   fails the open while the identical one answering an empty 207 falls back
-///   and works.
-///
-/// Do NOT narrow that last arm. ANY `Protocol(ParseFailed)` from the well-known
-/// principal lookup triggers the fallback, INCLUDING malformed or truncated DAV
-/// XML from a genuine discovery endpoint. The predicate cannot distinguish that
-/// from a non-DAV body: both arrive here as an XML parse failure with no headers
-/// available, so the distinction is unobtainable at this seam rather than merely
-/// unimplemented. It is safe because the fallback cannot accept bad data - it
-/// performs a FRESH principal lookup against the configured base URL
-/// (`discover_principal_from_base`), requires its result, and runs the
-/// subsequent principal discovery normally; nothing partially parsed from the
-/// failed probe is reused, no origin from it is admitted, and both the base leg
-/// and everything after the principal still propagate their failures. The most
-/// a fallback can do is prefer the user-configured endpoint over a probe that
-/// would not parse. The cost is a lost DIAGNOSTIC: an operator does not learn
-/// that the well-known endpoint is serving truncated XML. That cost is
-/// deliberately accepted here; it is not an open defect.
-///
-/// The arm stays safe precisely because it is probe-scoped: a garbage document
-/// from the CONFIGURED base URL is a real contract violation and still fails,
-/// because `discover_principal_from_base` never consults this predicate.
-fn should_fallback_discovery(error: &AccountError) -> bool {
-    matches!(
-        error.kind(),
-        AccountErrorKind::NotFound(ResourceKind::Calendar)
-            | AccountErrorKind::Request(RequestErrorKind::Malformed)
-            | AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
-            | AccountErrorKind::Server(ServerErrorKind::Error { status: Some(405) })
-    )
-}
-
 /// A multi-REPORT fetch: everything that came back usable, plus the
 /// recovery classification of any single REPORT that failed wholly.
 ///
@@ -1053,7 +994,10 @@ mod tests {
         dav_script_yielding, scripted_dav_net, transcripts,
     };
     use bifrost_net::test_support::{Canned, ScriptedDispatch};
-    use bifrost_types::{ProtocolErrorKind, ReconcileAction, RecoveryClass, ServerErrorKind};
+    use bifrost_types::{
+        ProtocolErrorKind, ReconcileAction, RecoveryClass, RequestErrorKind, ResourceKind,
+        ServerErrorKind,
+    };
     use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
     /// Every error this crate mints is stamped CalDAV, and names calendars.
@@ -2409,41 +2353,6 @@ mod tests {
             client.resolve_url("/calendar/one.ics"),
             "not a url/calendar/one.ics"
         );
-    }
-
-    /// The probe falls back on "not a discovery endpoint" answers and only
-    /// those: a credential refusal must still fail the open.
-    #[test]
-    fn discovery_falls_back_on_not_found_405_and_a_refused_redirect() {
-        let status = |status| status_error(AccountOperation::Discover, status, String::new());
-
-        assert!(!should_fallback_discovery(&status(
-            StatusCode::UNAUTHORIZED
-        )));
-        assert!(!should_fallback_discovery(&status(StatusCode::FORBIDDEN)));
-        assert!(!should_fallback_discovery(&status(
-            StatusCode::INTERNAL_SERVER_ERROR
-        )));
-
-        assert!(should_fallback_discovery(&status(StatusCode::NOT_FOUND)));
-        // A static site or proxy in front of the DAV path answers a PROPFIND
-        // on the origin root with 405.
-        assert!(should_fallback_discovery(&status(
-            StatusCode::METHOD_NOT_ALLOWED
-        )));
-        // RFC 6764's canonical redirect to another host, refused locally by
-        // the credential-origin gate before any request went out.
-        assert!(should_fallback_discovery(&local_error(
-            AccountOperation::Discover,
-            "redirect to an unadmitted origin",
-        )));
-        // The origin root answered 200 with a body that will not parse as DAV
-        // XML. An index page is the readable case; a truncated DAV document
-        // reaches the predicate identically, which is why it admits both.
-        assert!(should_fallback_discovery(&parse_error(
-            AccountOperation::Discover,
-            "XML parse error",
-        )));
     }
 
     #[test]
