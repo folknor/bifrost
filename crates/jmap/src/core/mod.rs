@@ -49,7 +49,9 @@ pub(crate) trait SetCreate: Sized {
 /// allows dotted-path keys for nested patches).
 ///
 /// Each type wraps a `serde_json::Map` so vendor extension properties
-/// survive round-trip. Used for CalendarEvent and ContactCard.
+/// survive round-trip. Used for CalendarEvent and ContactCard, and compiled
+/// only for those features, so a reduced-feature build carries no dead macro.
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 macro_rules! json_object_struct {
     ($name:ident, $create:ident, $patch:ident, $expecting:expr) => {
         #[derive(Debug, Clone)]
@@ -122,6 +124,7 @@ macro_rules! json_object_struct {
     };
 }
 
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 macro_rules! __json_object_serde {
     ($name:ident, $expecting:expr, with_deserialize) => {
         impl serde::Serialize for $name {
@@ -174,5 +177,7 @@ macro_rules! __json_object_serde {
     };
 }
 
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 pub(crate) use __json_object_serde;
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 pub(crate) use json_object_struct;

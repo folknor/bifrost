@@ -889,8 +889,12 @@ fn default_time() -> EventTime {
     }
 }
 
+/// An absent `STATUS` projects as `Confirmed`. RFC 5545 defines NO default for
+/// `STATUS`; this follows universal practice (every calendar client treats an
+/// event with no `STATUS` as confirmed) rather than spec text. `Unknown` then
+/// means only an unrecognized value, such as `STATUS:X-WEIRD`.
 fn event_status(value: Option<&str>) -> EventStatus {
-    match value.unwrap_or_default().to_ascii_uppercase().as_str() {
+    match value.unwrap_or("CONFIRMED").to_ascii_uppercase().as_str() {
         "CONFIRMED" => EventStatus::Confirmed,
         "TENTATIVE" => EventStatus::Tentative,
         "CANCELLED" => EventStatus::Cancelled,
@@ -2197,6 +2201,25 @@ mod tests {
 
         assert_eq!(event.availability, EventAvailability::Unknown);
         assert_eq!(event.visibility, EventVisibility::Default);
+    }
+
+    #[test]
+    fn absent_status_is_confirmed_and_unrecognized_status_is_unknown() {
+        let status_of = |status_line: &str| {
+            parse_event(
+                "/cal/one.ics".to_string(),
+                CalendarId("/cal/".to_string()),
+                None,
+                &format!(
+                    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\n{status_line}END:VEVENT\r\nEND:VCALENDAR\r\n"
+                ),
+            )
+            .status
+        };
+
+        assert_eq!(status_of(""), EventStatus::Confirmed);
+        assert_eq!(status_of("STATUS:CANCELLED\r\n"), EventStatus::Cancelled);
+        assert_eq!(status_of("STATUS:X-WEIRD\r\n"), EventStatus::Unknown);
     }
 
     #[test]

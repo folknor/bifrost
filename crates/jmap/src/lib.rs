@@ -75,12 +75,18 @@ use std::fmt::Display;
 #[cfg(feature = "websockets")]
 pub(crate) mod client_ws;
 
+pub(crate) use crate::core::method::{
+    define_changes_method, define_get_method, define_query_changes_method, define_query_method,
+    define_set_method,
+};
+// The remaining macros are gated to exactly the features whose object modules
+// invoke them (see their definitions), so the re-exports follow the same gates.
+#[cfg(any(feature = "mail", feature = "contacts", feature = "calendars"))]
+pub(crate) use crate::core::method::define_copy_method;
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 pub(crate) use crate::core::{
     __json_object_serde, json_object_struct,
-    method::{
-        define_changes_method, define_copy_method, define_get_method, define_open_property_enum,
-        define_parse_method, define_query_changes_method, define_query_method, define_set_method,
-    },
+    method::{define_open_property_enum, define_parse_method},
 };
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]

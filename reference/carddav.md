@@ -50,8 +50,13 @@ runs the PROPFIND and the `current-user-principal` decode together, returning
 configured-base leg call it. Keeping the decode at the call site is what let
 this crate diverge - it parsed the probe body inside the `Ok(response)` arm and
 lifted the failure with `?`, so a probe answer that would not parse never
-reached `should_fallback_discovery` at all and failed the open, while the same
+reached the fallback predicate at all and failed the open, while the same
 deployment answering an empty 207 fell back and worked.
+
+The predicate itself is no longer a twin: `should_fallback_discovery` lives in
+`bifrost-dav-core` (`error.rs`), parameterized by `DavProtocol`, and this crate
+calls it with `DavProtocol::CardDav`. It falls back on the dialect's own
+`NotFound` resource kind, a malformed request, a parse failure and a 405.
 
 ## Module layout
 
@@ -346,18 +351,12 @@ Supported contact primitives:
   or emitted as an empty page naming its own watermark again (which loops a
   cursor-following consumer forever). The CalDAV twin pins the same rule.
 
-  **An OMITTED `limit` defaults to `CONTACT_PAGE_SIZE` (250), and that is where
-  the twins diverge (dav-F7).** `contact_search` with `limit: None` serves at
-  most 250 candidates and carries a `next_cursor` for the remainder, so a
-  consumer that omits the field still walks the collection a page at a time.
-  `bifrost-caldav`'s `events_in_range` and `event_search` instead map
-  `limit: None` to `usize::MAX`, which truncates nothing and hydrates the whole
-  matching set into one continuation-less page; the two crates handle an
-  EXPLICIT limit identically, so the default is the only difference. Both
-  behaviours are now stated on both sides; choosing one is a product decision
-  about a published surface and is left to the repository owner.
-  `reference/caldav.md` carries the same note with the unbounded lane's cost.
-  Every page
+  **An OMITTED `limit` defaults to `CONTACT_PAGE_SIZE` (250).**
+  `contact_search` with `limit: None` serves at most 250 candidates and carries
+  a `next_cursor` for the remainder, so a consumer that omits the field still
+  walks the collection a page at a time. `bifrost-caldav`'s `events_in_range`
+  and `event_search` do the same with their own `EVENT_PAGE_SIZE`; the twins
+  handle both an omitted and an explicit limit alike. Every page
   reruns the remote search, so `failed_ids` reports what that page's fetch
   observed - a resource that only starts failing on page three is news on
   page three, and one failing throughout is named on every page. The lane is

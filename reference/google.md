@@ -472,7 +472,13 @@ while `PolicyBlocked` (a real admin refusal) propagates.
 Google Calendar RSVP fetches the raw event, updates only the matching
 account attendee's `responseStatus`, and sends the attendee array back
 with unmodeled attendee fields preserved. Event status maps through Google
-Calendar `status` on read, create, and update. Event search uses the
+Calendar `status` on read, create, and update; an absent `status` reads as
+`Confirmed` (Google's documented default), so `Unknown` means only an
+unrecognized value. Event search sends `showDeleted=true` only when
+`EventSearchRequest::include_cancelled` is set (default `false`, where Google
+hides cancelled events), on both the single-calendar and cross-calendar paths;
+the cancelled stubs that returns cross the tombstone-tolerant projection
+described below. Event search uses the
 requested calendar when supplied; otherwise it walks the calendar list and
 searches each, using an internal cursor that records the calendar id plus
 the provider page token. `calendars_list` walks every `calendarList` page at

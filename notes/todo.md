@@ -27,6 +27,43 @@ has not made, and ruled work that has not landed. Nothing else.
   `net`, `sasl`, `sync`) is verified with the full-workspace `brokkr
   check`, never `-p`.
 
+## Ruled 2026-09-29, not yet built
+
+The owner ruled on twelve items in one serial pass on 2026-09-29, and every one
+was built the same day except the entry below. Several had been ruled in
+earlier sessions without the ruling reaching this file, so they were presented
+again as open; recording the ruling at the item is what stops that.
+
+- **sync ledger: `record_attempt` charges only open entries.** RULED: make it a
+  no-op on an entry that is not `is_open()`, then establish whether the
+  lineage-root pin is still needed. NOT BUILT: the ruling rests on a premise
+  the implementing agent showed to be false, verified against the code.
+  `replace_obligation` ALWAYS discharges the parent, so every lineage with
+  children has a discharged root, and that discharged root's
+  `Retrying { attempts }` IS the lineage's retry budget - it has no other home
+  (`record_attempt` charges `lineage_root(key)`;
+  `attempts_accrue_at_the_lineage_root` pins exactly that). Charging a
+  discharged entry is the design, not an accident the pin compensates for.
+  Gating on `is_open()` would stop every lineage budget accruing after its
+  first replacement, removing the only cap on an account that loops forever
+  by rotating keys over the same extent; the narrower reading (gate only the
+  key's own entry) opens the same hole through the `Stalled` and
+  `StaleGeneration` callers in `engine/ack.rs`. The pin stays necessary for
+  as long as the counter lives on a discharged entry. WANTS A FRESH RULING:
+  either withdraw this, or move the lineage counter off discharged entries
+  (onto an open entry or a per-lineage map, with a decision for the durable
+  envelope and `from_parts`), which is a redesign rather than a gate.
+
+- **imap: the driver-built APPEND lives on `DriverCommandPayload`, not on
+  `Command`.** The ruling said "give `Command` an `Append` variant". The build
+  put it on the driver's own payload enum instead
+  (`DriverCommandPayload::Append { mailbox, messages, multi }`, executed by
+  `run_append_command`), because `types/command.rs` was outside the building
+  agent's files. Behaviourally the ruling holds - the driver encodes from live
+  state and validates at execution, and the prebuilt path and
+  `WireAssumptions` are gone - but `Command` is published surface, so whether
+  APPEND should ALSO be expressible as a public `Command` is the owner's call.
+
 ## Blocked on an unvalidated consumer contract
 
 Recorded 2026-09-07, while working the open rulings serially. Several items in
@@ -39,11 +76,10 @@ Known members of the class: the backfill `subsumed` history (see below),
 **types-B1** (the rewrite half), **types-B2**, **sync-B6**. The tell is that the
 remedy is a default, a shape, or a policy that only the caller can evaluate.
 
-**google-B13 LEFT this class on 2026-09-15** by taking the first way out below.
-Its blocking prerequisite was verified and cleared: all three calendar backends
-can honour an `include_cancelled` field truthfully, so the surface can stop
-deciding instead of guessing a default. See the item itself for the per-backend
-work, and note that Google's half is gated on the google-C4 defect.
+**google-B13 LEFT this class** by taking the first way out below: all three
+calendar backends can honour an `include_cancelled` field truthfully, so the
+surface stops deciding instead of guessing a default. It was ruled on
+2026-09-29 and is listed above.
 
 Two ways out, both better than ruling blind. Where the surface can simply STOP
 deciding - google-B13 is the clean case, an additive `include_cancelled` request
@@ -58,77 +94,80 @@ The three items ruled on 2026-09-06 (the receipt bound, the explicit
 observer subscription, the teardown window) have all landed. Two earlier
 structural landings of the same week, the dav-core `ResponseParts` collapse
 and the smtp sans-I/O core, never received the cold review their rulings
-asked for; that review debt is listed under their crates below.
+asked for. That review debt is still owed, and nothing else in this file
+tracks it.
 
-- **imap: the driver's two prebuilt-command refusals lose their `Unsent`
-  evidence.** Found 2026-09-29 by the test that finally reached the
-  `WireAssumptions` guard. `run_prebuilt_command` returns
-  `Error::Protocol(..).with_attempt(TransmissionState::Unsent)` for both the
-  stale-encoding refusal and the session-legality refusal, but `Protocol(String)`
-  has no attempt field and `with_attempt` is a documented no-op on it, so
-  `attempt()` reads `None`. The caller of a non-idempotent APPEND that provably
-  wrote nothing then falls back to `ImapErrorContext::transmission_state`, and
-  an unknown attempt takes the conservative reconcile path rather than a clean
-  retry. `Protocol` is also the wrong kind: its doc says "protocol violation by
-  the server", and these are local refusals. That has a second, worse
-  consequence: `Error::is_connection_fatal` lists `Protocol(_)`, so the driver
-  closes its command channel after refusing, and a connection whose framing is
-  provably intact - nothing was written - is retired. The guard's stated intent
-  is "make the caller re-issue against the new state"; today the re-issue needs
-  a fresh connection. The fix is a variant that carries an attempt and is not
-  connection-fatal, either a reshaped `Protocol` or a new local-refusal variant,
-  and `Error` is PUBLISHED SURFACE, hence the owner's call. Once it lands, the
-  test `a_queued_append_is_refused_when_the_state_it_was_built_for_moved`
-  should assert `Unsent` and a working follow-up command on the same
-  connection.
+- **imap: the driver's APPEND refusals lose their `Unsent` evidence.** Found
+  2026-09-29. `prepare_append` (driver) refuses an APPEND before the first
+  byte - a session that left Authenticated/Selected while it was queued, a
+  NUL body without BINARY, a malformed flag - with `Error::Protocol`,
+  `MissingCapability` or `InvalidInput`, none of which has an attempt field
+  (`with_attempt` is a documented no-op on them). So a non-idempotent APPEND
+  that provably wrote nothing reports `attempt() == None` and takes the
+  conservative reconcile path rather than a clean retry. `Protocol` is also
+  the wrong kind for a local refusal: its doc says "protocol violation by the
+  server". The CONNECTION half is fixed: the driver loop no longer applies
+  `is_connection_fatal` to a refusal made before the first byte, pinned by
+  `a_refused_append_leaves_the_connection_usable`. What remains wants a
+  variant that carries an attempt, either a reshaped `Protocol` or a new
+  local-refusal variant; `Error` is PUBLISHED SURFACE, hence the owner's call.
+  NOT yet ruled.
 
-- **imap: the structured-command APPEND refactor is unbuilt.** The prebuilt
-  path is guarded (one snapshot borrow per APPEND, plus the driver's
-  `WireAssumptions` comparison against live state, both pinned by transcript
-  tests), but the guard patches a class the architecture still has.
-  The architectural fix is still the right one and is not done: give
-  `Command` an `Append { mailbox, messages }` variant and let the DRIVER encode
-  it from live state, which deletes the whole prebuilt path and with it this
-  entire class. It also collapses a real duplication - single-APPEND
-  re-implements flag filtering, date quoting, UTF8-wrapper selection and RFC
-  7888 marker policy that the encoder already owns, and
-  `encode_multi_append_header` is `#[cfg(test)]` while the encoder suite
-  exercises THAT rather than any production path. Sparred and confirmed sound:
-  no obstacle in `Command`, the driver channel, response dispatch or the
-  continuation machinery, and APPEND is not special to the sender - N+1 segments
-  for N synchronizing literals is exactly what `send_encoded_segments` already
-  does. Two conditions on doing it. The driver must also VALIDATE at execution
-  (session legality, MULTIAPPEND capability, BINARY for NUL bodies), since
-  moving serialization alone does not give the state gate. And a naive version
-  through `EncodedCommand::from_flat_buffer` copies the body twice or three
-  times, a real transient 2-3x footprint on large messages; avoiding that means
-  ownership-preserving segmentation, and the cleanest form of it wants
-  `AppendMessage::data` to become `Bytes` - PUBLISHED SURFACE, hence the owner's
-  call. A `Vec<u8>`-preserving version is possible by encoding directly into
-  owned segments rather than flatten-then-split.
+- **imap: small findings from the 2026-09-29 builds, none a live defect.**
+  `EncodeOptions`'s doc still says it is constructed by
+  `ImapConnection::encode_options()`, which no longer exists.
+  `supports_non_sync_literal` and `supports_non_sync_literal8` in
+  `connection/helpers.rs` have no non-test callers. The rev2 baseline list
+  (`types/profile.rs::rev2_baseline_includes`) contains LITERAL+, so
+  `ServerProfile::supports(LiteralPlus)` is true on pure rev2 although the wire
+  path negotiates LITERAL-, never unbounded LITERAL+. The `STATUS DELETED`
+  gate is `rev2 || QUOTA=RES-MESSAGE` and was deliberately NOT routed through
+  the capability authority, which would also accept an advertised
+  `STATUS=DELETED` on rev1; whether it should is unexamined.
 
-- **imap: the rev2-IMPLIED-capability list is the next instance of the same
-  drift.** The dual-mode ACTIVE rule was unified on 2026-09-15 (it had five
-  copies, not the two filed; `types/profile.rs::imap4rev2_active` is now the
-  single authority and the four views delegate). This is the adjacent question -
-  "given active rev2, which extension capabilities are part of the rev2
-  baseline?" - and it is a strictly larger surface: the list is enumerated
-  centrally TWICE, in `ServerProfile::rev2_implies` and
-  `EncodeOptions::rev2_implies`, which are byte-identical today, and then
-  re-derived ad hoc at roughly 15 connection-handle sites as
-  `snap.capabilities.contains(&X) || is_rev2_from_snapshot(&snap)`. An audit
-  found NO live mismatch - every gate that should carry the `|| is_rev2` clause
-  does, and every capability correctly absent from the rev2 base set lacks it -
-  but the invariant is maintained by hand at 15 sites with nothing checking it,
-  so adding a capability to the two central lists silently fails to reach any
-  handle gate.
-  Deliberately NOT folded into the active-rule unification, because it has a
-  different correctness argument: it moves a policy boundary spanning encoder
-  command admission, handle-side validation, account-facing
-  `ServerProfile::supports`, special cases like QRESYNC implying CONDSTORE, and
-  extensions that are advertised but not rev2-implied. It wants its own
-  authority (a shared `supports(capabilities, enabled, capability)`) and a
-  capability-by-capability test matrix, not a fold.
+- **smtp: the blocking implicit-TLS handshake at connect time is unbounded
+  even with a timeout configured.** Noticed 2026-09-29 while bounding STARTTLS.
+  Documented as the blocking transport's structural difference, and its
+  address resolution is unbounded too. Recorded so the STARTTLS bound is not
+  mistaken for "every TLS handshake is bounded".
+
+- **brokkr: an install-boundary sweep for every published crate.** Proposal,
+  2026-09-29, from exploring brokkr's config. `feature_unification =
+  "package"` resolves each crate the way `cargo install` does, and is the only
+  mode that catches a crate compiling in the workspace solely because a sibling
+  donates a feature - the shape of the blocking-SMTP-without-`tokio` break. It
+  is applied today only to `bifrost-jmap`'s zero-feature leg. A default-feature
+  `package`-unified sweep over every published crate would close the class;
+  its cost is one isolated target dir and one cargo invocation per package.
+  Wants a ruling on whether that cost is worth it.
+
+- **sync: a worker aborted on an already-spent deadline is never named.**
+  Found 2026-09-29 while splitting `WorkerRole`. In `await_worker_until`
+  (`engine/ack.rs`), when the worker phase's shared deadline has already
+  passed (`remaining.is_zero()`), the worker is aborted with no log line, so
+  only the FIRST straggler of a slow detach gets a `role`-bearing warning and
+  every later one is aborted silently. The per-worker variants cannot help
+  there. A warn line on that branch would close it.
+
+- **imap: `MoveConsumer` narrows an untagged COPYUID OK lossily, like the
+  three the success-path fidelity ruling covered.** Found 2026-09-29 while
+  that ruling was built. It keeps only the code from an untagged `OK
+  [COPYUID ...]` and drops the response on failure - the exact shape the
+  ruling fixed in `CopyConsumer` (same file, `connection/dispatch/search.rs`).
+  The original note listed three consumers and missed this one. Presumably
+  wants the same treatment; not done without a ruling.
+
+- **dav: `discover_principal` is still a caldav/carddav twin.** Noticed
+  2026-09-29 while moving `should_fallback_discovery` into dav-core. The two
+  bodies are identical apart from the crate-local helper wrappers, and the
+  CardDAV copy already once diverged (the probe-body parse that never reached
+  the predicate). A further dav-core candidate; not done without a ruling.
+
+- **imap: a pipelined ESEARCH correlated to a FOREIGN tag.** Split out of the
+  ruled success-path consumer item on 2026-09-29. An ESEARCH whose tag names a
+  different in-flight command is neither surplus to drop nor an event to
+  publish; it probably wants routing to the command its tag names. Not
+  investigated beyond that; wants its own look and ruling.
 
 ## bifrost-sync
 
@@ -284,27 +323,6 @@ confirm against the code before working any of them.
   inferred rather than declared, and a short-page-means-done inference has been
   reintroduced on the resume half once already. A declared exhaustion flag would
   remove the whole class - it reshapes a published stream contract.
-### Refactor backlog
-
-Nothing in this section misbehaves. None of it is a bug, and none of it blocks a
-defect fix - in particular, do not let a unification proposal become a
-prerequisite for the small local fixes above.
-
-- **jmap page-cursor machinery is duplicated between `contacts.rs` and
-  `calendar_ops.rs`.** Landed 2026-09-07 and immediately flagged by the agent
-  that wrote the second copy. `PageCursor`, the `2:` prefix, `anchor_query`,
-  `verify_query_state`, `next_cursor`, `decode_page_cursor`, the
-  `anchorNotFound` mapping and the error constructors are near-identical,
-  differing only in the id type, the query builder type and diagnostic wording -
-  and both modules carry their own parallel unit tests. This is the exact shape
-  the standing lessons name: a local restatement of a rule that lives elsewhere,
-  kept alive by a test that exercises the copy rather than the original, so the
-  copy and its test agree indefinitely while only the original disagrees. It is
-  not hypothetical here - the absent-`total` truncation had to be fixed in three
-  places in one day, and the same reviewer found the three walks answering one
-  termination question three ways. A shared generic helper would make the next
-  such fix one edit. Wants a ruling because it is a new module in `sync/`, not a
-  local edit.
 
 ## Open items folded in from the second bug-hunt wave (2026-08-29)
 
@@ -341,29 +359,6 @@ PUBLISHED SURFACE fence apply.
   the same value read twice, and a new trait method defaults to unsupported
   instead of needing a bool nobody sets. That DELETES a published struct.
 
-- **send_message and send_as cannot both be honest about a JMAP account with
-  foreign submission only.** [found 2026-09-15 by the cold review of the
-  types-B1d work; PUBLISHED SURFACE] `send_message: support.submission` and
-  `send_as: support.foreign_submission` are independent, and
-  `JmapAccount::send_message` takes its send_as branch BEFORE the
-  `self.submission` check. So a session whose primary account lacks Submission
-  while a seeded foreign account has it yields `send_message == false` with
-  `send_as == true`, and a send_as request through it genuinely works - while a
-  consumer respecting `send_message` never offers the operation.
-  The obvious remedy is WRONG and was rejected in the spar: widening to
-  `send_message: support.submission || support.foreign_submission` makes the
-  flag advertise a method that still refuses the ORDINARY request, since the
-  personal path has no fallback to `foreign_mail`. That is the exact
-  false-advertisement `capability_contract_tests.rs` exists to catch, so it
-  trades a gap for a lie. Pinning `assert!(!send_as || send_message)` is also
-  wrong: it asserts an invariant nobody has ruled on, and the state it forbids
-  is one JMAP can legitimately be in.
-  The real question is what `send_message` MEANS - does it gate the whole
-  method, or describe ordinary personal sending? - and that is a published
-  contract question for the owner, not something to settle inside a
-  test-hardening pass. Note it may be answerable with documentation alone; the
-  evidence does not force a struct change.
-
 - **types-B2. `InventoryBatch::checkpoint` cannot express a withheld
   checkpoint.** [C2, PUBLISHED SURFACE] It is `Option<Checkpoint>`, with no way
   to distinguish "this page has no checkpoint" from "I stripped this
@@ -375,64 +370,6 @@ PUBLISHED SURFACE fence apply.
   from ignoring it - which is the same risk sync-F3 records, one layer down
   and closable by a type. Carried out of the sync arc; `bifrost-types` was not
   touched there.
-
-- **google-B13. `events_search_url` sends `singleEvents=true` with no
-  `showDeleted`.** [C4] `crates/google/src/account/calendar.rs`, exactly as
-  `events_in_range` did before G8. Deliberately NOT filed as the same defect,
-  and a reflex copy of the G8 fix is the wrong move: a range reread is a
-  COVERAGE question, where a missing tombstone is indistinguishable from a
-  page boundary, whereas a SEARCH returning cancelled instances is a PRODUCT
-  decision about what a query surface should answer.
-
-  Considered 2026-09-07 and NOT ruled, deliberately: the choice belongs to the
-  consumer, not to us, so picking a default either way is the error. See
-  "Blocked on an unvalidated consumer contract" at the top of this file. The
-  direction, when someone works it, is to stop deciding - an additive
-  `include_cancelled: bool` on `EventSearchRequest`
-  (`crates/types/src/calendar.rs`), defaulting to `false`, which is exactly
-  today's behaviour, so nothing changes until a consumer asks. That is purely
-  additive to a plain struct with a `new()` constructor, so it does not hit the
-  published-surface fence. The prerequisite, and the reason it was not just
-  done: `event_search` is on the shared `Account` trait, so a request field is
-  a promise JMAP and CalDAV must honour too. Google is a one-parameter change;
-  whether CalDAV's `calendar-query` filter and JMAP's `CalendarEvent/query` can
-  express it is UNVERIFIED. A field that two of three backends silently ignore
-  is a worse API than no field, so verify that before adding it.
-
-  PREREQUISITE VERIFIED 2026-09-15, and it clears: all three backends can
-  honour the field truthfully, so the "two of three silently ignore it"
-  objection does not apply and the additive field is viable. The work is not
-  symmetric, and it is inverted from what this item assumed.
-  - JMAP CANNOT express it server-side, and not because the crate
-    under-models draft-26: there is no `status` filter condition in the
-    draft, since event status is a plain object property rather than a
-    filterable condition. But `get_events` restricts no properties, so
-    `status` is always hydrated and a client-side filter is CORRECT rather
-    than lossy. Precedent sits in the same function: `search` already
-    post-filters by `calendar_id` client-side. The one subtlety is that the
-    precedent also suppresses `estimated_total`, and `include_cancelled:
-    false` needs the same suppression or the total over-counts by the
-    dropped events.
-  - CalDAV is one line on an existing closure. RFC 4791 CAN express it (a
-    sibling `prop-filter` on `STATUS` with `negate-condition`), but the crate
-    has no general filter builder and, more to the point, already treats the
-    server-side text-match as an advisory PREFILTER with the local match as
-    authority - and a 403 `CALDAV:supported-filter` on any text leg degrades
-    the whole search to an unfiltered walk, where a server-side status filter
-    would be lost anyway. A CalDAV server returns cancelled events
-    unconditionally, so `include_cancelled: false` is honestly a client-side
-    filter here, which is the shape this lane already uses.
-  - Google is the parameter alone, now that the page-poisoning projection
-    defect that would have gated it was fixed on 2026-09-15 (cancelled
-    tombstones project with empty times, and per-item projection failures
-    ride `Page::failed_ids` instead of failing the page).
-
-- **Absent event status reads as `Unknown` on all three backends.** Noticed
-  2026-09-15 across the same three projections. Both iCalendar and JMAP
-  draft-26 make the default for a missing status effectively confirmed, but
-  all three `event_status` helpers map absent to `EventStatus::Unknown`.
-  Harmless for an is-cancelled filter, but it means "no STATUS line" and
-  "STATUS:X-WEIRD" are indistinguishable in the shared type everywhere.
 
 ## Open items folded in from the third bug-hunt wave (2026-09-04)
 
@@ -519,112 +456,7 @@ throttling; and TLS handshake, record overhead and shutdown traffic bypass
 plaintext accounting entirely. The honest guarantee is therefore about
 admission of METERED PLAINTEXT writes, not about every byte on the wire.
 
-## Surfaced by the 2026-09-07 fix wave
-
-Found while resolving the dav-F, smtp-CR and jmap-C2 items and the two cold
-reviews over them. Everything the reviews found at P1 or P2 was fixed in that
-wave; these are what was left. Verify before working any of them.
-
-- **Two owner rulings, none blocking.**
-  (a) Move `should_fallback_discovery` into `bifrost-dav-core`, parameterised by
-  the existing `DavProtocol` (the only difference between the copies is
-  `ResourceKind::Calendar` versus `Contact`, which `DavProtocol` already
-  carries). Internal only, but it touches three crates. The case: this wave was
-  the second time the twins needed the SAME edit, and the first time they needed
-  DIFFERENT edits to reach the same behaviour - the CardDAV copy parsed the probe
-  body inside its `Ok(response)` arm and lifted the failure with `?`, so the
-  parse error never reached the predicate at all. One more measured divergence
-  (the ordinals were retired on 2026-09-15; see `reference/carddav.md` on why
-  the running tally stopped being maintainable).
-  (b) Bound the STARTTLS handshake under `timeout(None)`. `AsyncSmtpConnection::
-  starttls` passes `self.timeout` to `upgrade_tls`, so a transport built with no
-  timeout has an unbounded TLS handshake on the explicit-STARTTLS path. Same root
-  cause as the teardown cap that landed, but a handshake is a PROTOCOL operation,
-  so the teardown reasoning ("nothing left to accomplish past this point") does
-  not carry over and a default bound is a new policy. The mechanism underneath is
-  `TimeoutBudget::SetupDeadline` yielding `None` slack when built from
-  `AsyncDeadline::new(None)`; any future "everything is bounded" claim starts
-  there.
-- **Ledger: `record_attempt` charges an entry regardless of `is_open()`**, so a
-  discharged-but-`Retrying` entry can still take charges. Pre-existing, and it is
-  precisely what makes the lineage-root pin necessary. Worth deciding whether
-  that is the intended contract or an accident the pin is now compensating for.
-
-- **imap: SearchConsumer publishes surplus SEARCH/ESEARCH as events on the
-  SUCCESS path.** [found 2026-09-15 while landing the infallible-finalize work]
-  `reclassified_extras` emits extra tag-correlated ESEARCH beyond the first, all
-  tagless ESEARCH when a correlated one won, and all legacy SEARCH. By the same
-  classifier argument that settled the FAILURE path - SEARCH and ESEARCH are
-  `OnlySolicited` inside a search command and `Impossible` outside one, so they
-  are not asynchronous notifications and publishing them says they are - those
-  arguably should be dropped too. The method's own doc comment rules
-  deliberately the other way, which is why it was left alone: this is a
-  published behaviour with a stated reason, not an oversight. Wants its own
-  ruling. Note a pipelined foreign-tag-correlated ESEARCH is a third case again
-  and probably wants correlation to the command its tag names rather than either
-  answer.
-
-- **imap: AppendConsumer narrows an untagged OK lossily on the SUCCESS path.**
-  `on_response` swallows an untagged `OK [APPENDUID ...]` whole, keeping only
-  its `ResponseCode` and discarding `text` and the rest of the `Status` variant.
-  That is why its failure arm cannot surrender the response - there is no
-  faithful `UntaggedResponse` left to publish - but the narrowing happens on the
-  success path too, so an untagged OK that this consumer sees is silently not
-  reclassified the way other untagged OKs are. `MultiAppendConsumer` and
-  `CopyConsumer` have the same shape. Restructuring them to retain the whole
-  response is available and was deliberately not done in the finalize pass.
-
-- **smtp: a 421 masked by an earlier 550 in the same RCPT window.** Found
-  2026-09-07 while documenting `DirectSmtpStage::RcptWindowReply`, which keeps
-  only the first negative reply. `closing_channel` at `WindowClosing` therefore
-  tests the RETAINED failure only, so a window whose first negative is a 550 and
-  whose second is a 421 takes `Epilogue::reset` instead of the abort that
-  commit e5a15b7a established for a 421 at every envelope boundary. NOT a
-  correctness hole - `Epilogue::reset` aborts anyway when the peer does not
-  positively acknowledge the RSET, so the connection still goes and the cost is
-  one wasted command on a channel the server is closing. But it is a real
-  divergence from the direct/batch symmetry, since `BatchSmtpStage::
-  RcptWindowReply` tests every reply for it. Filed rather than fixed because
-  making the direct path scan every reply for a 421 changes an observed
-  termination nobody ruled on.
-
-## Surfaced by the first per-feature check run (2026-09-15)
-
-The sweeps landed the same day and their very first run found two things, which
-is the argument for having them.
-
-- **`bifrost-jmap` does not compile with `--no-default-features`, and never
-  has.** `tokio` and `bifrost-types` are optional dependencies and the `mailbox`
-  module is feature-gated, but `client.rs` uses `tokio` at four sites and
-  `mailbox` at one unconditionally, `core/tests.rs` names `bifrost_types`
-  directly, and four macros plus their re-export in `lib.rs` are consumed only
-  by feature-gated modules so they read as unused. There is also an
-  `irrefutable_let_patterns` in `event_source/stream.rs` under that
-  configuration.
-  NOT a regression, and not what the new sweep is for: the sweep was narrowed
-  the same day to default-minus-`calendars`, which is the configuration the code
-  actually branches on. Whether a zero-feature build should be SUPPORTED at all
-  is the open question, and it is a product decision rather than a defect - the
-  crate has never claimed it, no consumer has asked, and "make it compile" means
-  either gating five more sites or making optional dependencies mandatory. Rule
-  on the promise before anyone writes the `cfg`s.
-
 ## Surfaced by the 2026-09-15 fix wave
-
-- **`WorkerRole` cannot distinguish the eight non-writer workers.** The enum is
-  `{ AckWriter, Stream }`, and `take_ack_writer` removes the writer BEFORE the
-  worker phase runs, so every worker reaching `await_worker_until` is
-  `WorkerRole::Stream` and the `role` field now on its two warn lines is a
-  constant. The field is free and correct but it does not deliver the
-  diagnostic it looks like it delivers: all eight non-writer spawns in
-  `attach.rs` (control applier, push reconciler, push forwarder, multiplexer,
-  backfill orchestrator, deferred inventory, reopen listener, bandwidth feed)
-  pass the same variant, so a wedged-detach log line still cannot say WHICH
-  worker wedged. Getting that means splitting `Stream` into per-task variants,
-  which RENAMES a variant and therefore stops and asks. It is crate-private
-  (`pub(crate)`, not re-exported), the eight call sites are mechanical, and the
-  only test churn is `engine/tests.rs`'s `else { WorkerRole::Stream }` becoming
-  any non-writer variant while pinning the same property. Owner's call.
 
 - **google: `end` falls back to `originalStartTime` but never to `start`.** So a
   live event carrying a start and no end is refused rather than projected as
@@ -633,22 +465,6 @@ is the argument for having them.
   candidate second reading of "malformed". Note that under the per-item
   isolation that landed with it, such an event now rides `failed_ids` instead of
   failing its page, so the blast radius is smaller than it was.
-
-## Surfaced by the 2026-09-15 documentation pass
-
-Found while discharging dav-F7, smtp-CR7/12/13, the two imap response-loop
-divergences and the jmap push-arm items. Verify before working any of them.
-
-- **The unbounded CalDAV page default is arguably a live risk, not a doc gap.**
-  A `limit`-less `event_search` or `events_in_range` issues
-  O(collection / `MULTIGET_BATCH_SIZE`) REPORTs and materializes the whole
-  projected event set, and because a recurring resource expands into one event
-  per override the item count is not even bounded by the resource count.
-  Nothing between the account and the consumer clamps it. dav-F7 documented the
-  default rather than changing it, because bounding a published method's
-  no-`limit` behaviour is the owner's call - but if that alignment is ever
-  ruled, this is the argument for bounding CalDAV rather than unbounding
-  CardDAV.
 
 ## Notes
 

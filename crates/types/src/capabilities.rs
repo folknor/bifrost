@@ -188,6 +188,16 @@ pub struct PimMethodSupport {
     pub set_importance: bool,
     pub set_is_read: bool,
     // Mail composition primitives.
+    /// Ordinary sending from the account's own identity: `send_message` with
+    /// `SendRequest::send_as` left `None`. `false` -> such a request returns
+    /// `Unsupported(Send)`.
+    ///
+    /// This flag describes one PATH of the `send_message` method, not the whole
+    /// method. Send-as is a field on the same request, with prerequisites of its
+    /// own, and whether a `Some(send_as)` request can succeed is `send_as`'s
+    /// answer - which may be yes while this is `false`. A JMAP session whose
+    /// primary account lacks Submission while a seeded foreign account has it
+    /// is exactly that: ordinary sends are refused, routed sends work.
     pub send_message: bool,
     pub attachment_upload: bool,
     /// Native large-attachment hosting + share-link generation (Google
@@ -227,6 +237,9 @@ pub struct PimMethodSupport {
     /// Both are terminal, and neither is ever silently downgraded to a send
     /// from the authenticated user's own mailbox. `SendRequest::send_as`
     /// carries the full rule.
+    ///
+    /// Independent of `send_message`, which covers only the ordinary path:
+    /// this flag can be `true` while that one is `false`.
     pub send_as: bool,
     // Search primitives.
     pub search: bool,

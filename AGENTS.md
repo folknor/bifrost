@@ -51,8 +51,8 @@ restatement, including this one.
 
 ### Sweeps
 
-`brokkr.toml` declares three `[[check]]` sweeps, and every `brokkr check` and
-`brokkr test` runs all three:
+`brokkr.toml` declares these `[[check]]` sweeps, and every `brokkr check` and
+`brokkr test` runs all of them:
 
 - `workspace` - every member, default features. Cargo unification across the
   workspace selection donates the non-default features in-workspace consumers
@@ -63,13 +63,20 @@ restatement, including this one.
 - `jmap-calendars-off` - `bifrost-jmap` with its default features minus
   `calendars`, pinned to `feature_unification = "selected"`. This is the only
   leg that typechecks `#[cfg(not(feature = "calendars"))]` code and the
-  exhaustiveness arms that exist only for a calendars-off build. It is not a
-  bare no-default build: this crate does not compile with zero features, which
-  is a separate open item rather than something this sweep asserts.
+  exhaustiveness arms that exist only for a calendars-off build.
+- `jmap-no-default` - `bifrost-jmap` with no features at all, pinned to
+  `feature_unification = "package"`: resolved per package, the way
+  `cargo install` resolves, so no sibling member can donate a feature back.
+  Every default feature of this crate is optional, so the zero-feature build is
+  a promise to consumers.
 
 Declaring `[[check]]` entries replaced brokkr's implicit single `--all-features`
-sweep, so those three are the coverage, not an addition to it. A new optional
+sweep, so these sweeps are the coverage, not an addition to it. A new optional
 feature that no workspace member enables is unchecked until a sweep names it.
+`feature_unification = "package"` is the tool for the other blind spot: a
+crate that compiles in the workspace only because a sibling donates a feature
+(the blocking SMTP transport once failed to build without `tokio` for exactly
+that reason). `brokkr man config check` documents every sweep key.
 
 Validate a `brokkr.toml` key by running brokkr before writing it into any
 document: a config-load failure is raised before any phase runs, so it costs
@@ -113,7 +120,7 @@ per sweep with wall time.
 
 A sweep reports `SKIP` when the name matched nothing in it (feature-gated out)
 or when the `-p` target is outside that sweep's `packages` - both expected here,
-since two of the three sweeps are single-crate. `SKIP` alongside at least one
+since every sweep but `workspace` is single-crate. `SKIP` alongside at least one
 `PASS` exits 0; *every* sweep skipping means the name was wrong and exits
 non-zero.
 
@@ -122,7 +129,7 @@ non-zero.
 - `-N, --repeat <N>` - run the test N times per sweep (flaky-test hunting).
 - `-j, --jobs <N>` - parallel cargo compile jobs.
 - `--sweep <LABEL>` - run only one sweep (`--sweep workspace`,
-  `--sweep jmap-calendars-off`) instead of all three.
+  `--sweep jmap-calendars-off`) instead of all of them.
 - `--raw` - bypass output filtering, print everything cargo emits.
 - `--debug` / `--release` - force a profile. `--debug` is redundant while
   `[test] debug = true`; it matters only if that is flipped back.

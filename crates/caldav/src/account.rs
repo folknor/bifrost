@@ -43,16 +43,17 @@ const CURSOR_MAGIC: &[u8] = b"CALDAVET1";
 /// reporting truncation must not hold one poll on the wire forever, and what is
 /// left over is picked up by the next poll from the checkpointed token.
 const SYNC_TRUNCATION_ROUNDS: usize = 16;
-/// The page size an OMITTED `limit` means on the paging lanes: unbounded.
+/// The page size an OMITTED `limit` means on the paging lanes
+/// (`events_in_range` and `event_search`), in candidate RESOURCES.
 ///
-/// This value reaches `bifrost_dav_core::slice_after_watermark`, which then
-/// truncates nothing, so only the server's own page limits (and whatever the
-/// query matched) bound the result. It is a named constant rather than a bare
-/// `usize::MAX` because the two call sites read as a policy decision, not as an
-/// arithmetic saturation: the CardDAV twin's `contact_search` defaults the same
-/// field to a bounded 250 instead, and that divergence is deliberate rather than
-/// an oversight. Changing this value changes what a published method returns.
-const UNBOUNDED_PAGE_SIZE: usize = usize::MAX;
+/// An unbounded default would dispatch one REPORT per multiget batch across the
+/// whole collection and materialize every projected event, and a recurring
+/// resource expands into one event per override, so even the item count is not
+/// bounded by the resource count. The value mirrors the CardDAV twin's
+/// `CONTACT_PAGE_SIZE`. An explicit `limit` is honoured as given, however large,
+/// and continuation rides `page_cursor`. Changing this value changes what a
+/// published method returns.
+const EVENT_PAGE_SIZE: usize = 250;
 
 #[derive(Debug)]
 pub(crate) struct CalDavAccount {
@@ -936,13 +937,12 @@ impl Account for CalDavAccount {
 
     /// Lists events overlapping a window, one page at a time.
     ///
-    /// **An omitted `limit` means UNBOUNDED** (`UNBOUNDED_PAGE_SIZE`): the
-    /// page carries every event the range query matched, in one continuation-less
-    /// page, and nothing downstream clamps it. Only the server's own page limits
-    /// apply. A consumer that wants a bounded page must ask for one. Note that
-    /// the CardDAV twin's `contact_search` instead defaults an omitted `limit` to
-    /// 250, so the two crates differ on the default while handling an explicit
-    /// limit identically.
+    /// **An omitted `limit` defaults to `EVENT_PAGE_SIZE` (250)** candidate
+    /// resources, as the CardDAV twin's `contact_search` does with
+    /// `CONTACT_PAGE_SIZE`. The page counts RESOURCES, so a recurring resource
+    /// that expands into overrides can carry more items than that. An explicit
+    /// `limit` is honoured as given, however large, and a page with more
+    /// candidates behind it carries a `page_cursor` continuation.
     fn events_in_range(
         &self,
         range: EventRange,
@@ -955,19 +955,11 @@ impl Account for CalDavAccount {
             )?;
             let calendar_url = client.resolve_url(&range.calendar_id.0);
             let (range_start, range_end) = caldav_query_range(&range.start, &range.end)?;
-            // An omitted `limit` means UNBOUNDED, and it means it literally:
-            // `usize::MAX` reaches `slice_after_watermark`, which then truncates
-            // nothing, so the page carries every candidate the range query named
-            // and the multiget hydrates all of them (chunked at
-            // `MULTIGET_BATCH_SIZE`, but every chunk is dispatched and merged
-            // into one page, with no continuation cursor). Nothing downstream
-            // clamps this - not the batch size, not the `Page` boundary - so the
-            // caller decides the page size or gets the whole matching set. The
-            // CardDAV twin defaults `contact_search` to `CONTACT_PAGE_SIZE`
-            // instead; the divergence is deliberate for now and recorded in
-            // `reference/caldav.md`, not an oversight to be quietly aligned.
-            let page_size = range.limit.map_or(UNBOUNDED_PAGE_SIZE, |value| {
-                usize::try_from(value).unwrap_or(UNBOUNDED_PAGE_SIZE)
+            // An omitted `limit` means `EVENT_PAGE_SIZE`; an explicit one is
+            // honoured as given (a `u32` that does not fit `usize` saturates,
+            // which truncates nothing).
+            let page_size = range.limit.map_or(EVENT_PAGE_SIZE, |value| {
+                usize::try_from(value).unwrap_or(usize::MAX)
             });
             // The time-range filter runs on the SERVER and answers with hrefs
             // only, so the page is sliced before anything is hydrated. The
@@ -1186,12 +1178,14 @@ impl Account for CalDavAccount {
 
     /// Searches events by text, one page at a time.
     ///
-    /// **An omitted `limit` means UNBOUNDED** (`UNBOUNDED_PAGE_SIZE`), exactly
-    /// as in `events_in_range`: every candidate the text
-    /// legs (or the degrade listing) named is hydrated into one continuation-less
-    /// page, bounded only by the server's own page limits. The CardDAV twin's
-    /// `contact_search` defaults to 250 instead; an explicit limit behaves
-    /// identically on both.
+    /// **An omitted `limit` defaults to `EVENT_PAGE_SIZE` (250)** candidate
+    /// resources, exactly as in `events_in_range`; an explicit `limit` is
+    /// honoured as given and continuation rides `page_cursor`.
+    ///
+    /// Unless `include_cancelled` is set, events whose status is `Cancelled`
+    /// are dropped by a client-side filter on the local match. `estimated_total`
+    /// stays the number of candidate resources the server named, an upper bound
+    /// on the items that the text match and this filter can only lower.
     fn event_search(
         &self,
         request: EventSearchRequest,
@@ -1210,14 +1204,11 @@ impl Account for CalDavAccount {
                 AccountOperation::EventSearch,
             )?;
             let needle = request.query.to_lowercase();
-            // Same unbounded default as `events_in_range`, deliberately kept
-            // identical to it: an omitted `limit` hydrates every candidate the
-            // text legs (or the degrade listing) named, in one page with no
-            // continuation. See the comment there for what does and does not
-            // clamp it, and for the CardDAV divergence.
-            let page_size = request.limit.map_or(UNBOUNDED_PAGE_SIZE, |value| {
-                usize::try_from(value).unwrap_or(UNBOUNDED_PAGE_SIZE)
+            // Same bounded default as `events_in_range`.
+            let page_size = request.limit.map_or(EVENT_PAGE_SIZE, |value| {
+                usize::try_from(value).unwrap_or(usize::MAX)
             });
+            let include_cancelled = request.include_cancelled;
             // Both lanes below page the same way: get candidate hrefs, slice at
             // the watermark, multiget only the page. They differ only in where
             // the candidates come from - a server-side text-match for a real
@@ -1248,8 +1239,13 @@ impl Account for CalDavAccount {
                 AccountOperation::EventSearch,
                 // The server-side text-match is a PREFILTER; the local match
                 // stays the authority over the page. An empty needle matches
-                // everything, which is the match-all lane.
-                |event| needle.is_empty() || event_matches(event, &needle),
+                // everything, which is the match-all lane. The cancelled filter
+                // is client-side for the same reason: a server-side status
+                // filter would be lost on the degrade lane anyway.
+                |event| {
+                    (include_cancelled || event.status != EventStatus::Cancelled)
+                        && (needle.is_empty() || event_matches(event, &needle))
+                },
             )
             .await
         })
@@ -2222,6 +2218,7 @@ mod tests {
                 calendar_id: None,
                 limit: Some(2),
                 page_cursor: None,
+                include_cancelled: false,
             })
             .await
             .expect("match-all page");
@@ -2297,6 +2294,7 @@ mod tests {
                 calendar_id: None,
                 limit: Some(2),
                 page_cursor: Some(b"https://dav.example.test/cal/b.ics".to_vec()),
+                include_cancelled: false,
             })
             .await
             .expect("continued page");
@@ -2581,27 +2579,128 @@ mod tests {
         );
     }
 
-    /// The UNBOUNDED default (dav-F7), pinned by what a consumer observes
-    /// rather than by the constant's value: a `limit: None` range serves every
-    /// candidate in ONE page and carries no continuation. The collection is
-    /// deliberately larger than the CardDAV twin's 250-member default page, so
-    /// a fixture that fits inside that bound cannot make this pass either way.
-    ///
-    /// This is the test that fails if this default is ever aligned with that
-    /// twin: only 250 of the 300 would be served, and the page would name a
-    /// watermark.
-    #[tokio::test]
-    async fn an_omitted_range_limit_serves_the_whole_collection_in_one_page() {
-        const MEMBERS: usize = 300;
-        let names = (0..MEMBERS)
-            .map(|index| format!("e{index:03}"))
-            .collect::<Vec<_>>();
+    /// Builds a 300-member collection and a script answering: one range query
+    /// naming all of it, then one multiget answer per 50-member chunk of the
+    /// first `served` members. The collection is deliberately larger than the
+    /// 250-member default page, so a fixture that fits inside that bound cannot
+    /// make the default tests pass either way.
+    fn large_collection_script(names: &[String], served: usize) -> Vec<DavResponse> {
         let query = wrap(&names.iter().map(|name| queried(name)).collect::<Vec<_>>());
         let mut responses = vec![cal_multistatus(query)];
         // One scripted answer per multiget chunk, each hydrating its own share
         // of the page, so the merged page is the same set however the
         // bounded-concurrency dispatch pairs legs with answers.
-        for chunk in names.chunks(50) {
+        for chunk in names[..served].chunks(50) {
+            responses.push(cal_multistatus(wrap(
+                &chunk.iter().map(|name| hydrated(name)).collect::<Vec<_>>(),
+            )));
+        }
+        responses
+    }
+
+    fn large_range(limit: Option<u32>, page_cursor: Option<Vec<u8>>) -> EventRange {
+        EventRange {
+            calendar_id: CalendarId("https://dav.example.test/cal/".to_string()),
+            start: time("2026-01-01T00:00:00Z"),
+            end: time("2027-01-01T00:00:00Z"),
+            limit,
+            page_cursor,
+        }
+    }
+
+    /// The bounded default, pinned by what a consumer observes rather than by
+    /// the constant's value: a `limit: None` range serves 250 of 300
+    /// candidates, names a watermark, and the continuation serves the rest.
+    /// It fails against the former unbounded default, which served all 300 in
+    /// one continuation-less page.
+    #[tokio::test]
+    async fn an_omitted_range_limit_serves_a_bounded_page_and_continues() {
+        const MEMBERS: usize = 300;
+        let names = (0..MEMBERS)
+            .map(|index| format!("e{index:03}"))
+            .collect::<Vec<_>>();
+        let mut responses = large_collection_script(&names, EVENT_PAGE_SIZE);
+        // The continuation re-queries the whole collection and multigets the
+        // 50-member tail after the watermark.
+        responses.push(cal_multistatus(wrap(
+            &names.iter().map(|name| queried(name)).collect::<Vec<_>>(),
+        )));
+        responses.push(cal_multistatus(wrap(
+            &names[EVENT_PAGE_SIZE..]
+                .iter()
+                .map(|name| hydrated(name))
+                .collect::<Vec<_>>(),
+        )));
+        let script = dav_script(responses);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let first = account
+            .events_in_range(large_range(None, None))
+            .await
+            .expect("an omitted limit is one bounded page");
+
+        assert_eq!(first.items.len(), EVENT_PAGE_SIZE);
+        assert!(
+            first.next_cursor.is_some(),
+            "a bounded page with candidates behind it must continue"
+        );
+        assert_eq!(first.estimated_total, Some(300));
+        assert_eq!(
+            transcripts(&script).len(),
+            6,
+            "one query and five multiget chunks: only the page is hydrated"
+        );
+
+        let second = account
+            .events_in_range(large_range(None, first.next_cursor))
+            .await
+            .expect("the continuation serves the remainder");
+
+        assert_eq!(second.items.len(), MEMBERS - EVENT_PAGE_SIZE);
+        assert_eq!(second.next_cursor, None);
+    }
+
+    /// An explicit large `limit` still serves the whole collection in one
+    /// continuation-less page.
+    #[tokio::test]
+    async fn an_explicit_large_range_limit_still_serves_the_whole_collection() {
+        const MEMBERS: usize = 300;
+        let names = (0..MEMBERS)
+            .map(|index| format!("e{index:03}"))
+            .collect::<Vec<_>>();
+        let script = dav_script(large_collection_script(&names, MEMBERS));
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+
+        let page = account
+            .events_in_range(large_range(Some(10_000), None))
+            .await
+            .expect("an explicit limit is honoured");
+
+        assert_eq!(page.items.len(), MEMBERS);
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(page.estimated_total, Some(300));
+        assert_eq!(
+            transcripts(&script).len(),
+            7,
+            "one query and six multiget chunks: the whole collection, hydrated"
+        );
+    }
+
+    /// `event_search` shares the bounded default: an empty-query match-all
+    /// with no `limit` lists 300 members and multigets only the first 250.
+    #[tokio::test]
+    async fn an_omitted_search_limit_serves_a_bounded_page() {
+        const MEMBERS: usize = 300;
+        let names = (0..MEMBERS)
+            .map(|index| format!("e{index:03}"))
+            .collect::<Vec<_>>();
+        let listing = wrap(&names.iter().map(|name| queried(name)).collect::<Vec<_>>());
+        let mut responses = vec![cal_multistatus(listing)];
+        for chunk in names[..EVENT_PAGE_SIZE].chunks(50) {
             responses.push(cal_multistatus(wrap(
                 &chunk.iter().map(|name| hydrated(name)).collect::<Vec<_>>(),
             )));
@@ -2612,30 +2711,77 @@ mod tests {
         let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
 
         let page = account
-            .events_in_range(EventRange {
-                calendar_id: CalendarId("https://dav.example.test/cal/".to_string()),
-                start: time("2026-01-01T00:00:00Z"),
-                end: time("2027-01-01T00:00:00Z"),
-                limit: None,
-                page_cursor: None,
-            })
+            .event_search(EventSearchRequest::new(""))
             .await
-            .expect("an omitted limit is one unbounded page");
+            .expect("an omitted limit is one bounded page");
 
-        assert_eq!(
-            page.items.len(),
-            MEMBERS,
-            "an omitted limit truncates nothing"
-        );
-        assert_eq!(
-            page.next_cursor, None,
-            "an unbounded page has no remainder to continue from"
-        );
+        assert_eq!(page.items.len(), EVENT_PAGE_SIZE);
+        assert!(page.next_cursor.is_some());
         assert_eq!(page.estimated_total, Some(300));
+    }
+
+    fn status_event(name: &str, status_line: &str) -> String {
+        format!(
+            "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
+<D:getetag>\"{name}\"</D:getetag>\
+<C:calendar-data>BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:{name}\nDTSTART:20260101T090000Z\nDTEND:20260101T100000Z\n{status_line}END:VEVENT\nEND:VCALENDAR</C:calendar-data>\
+</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+        )
+    }
+
+    /// Match-all search over three resources: a cancelled one, one with no
+    /// STATUS at all, and another cancelled one.
+    async fn search_cancelled_fixture(include_cancelled: bool) -> Vec<String> {
+        let listed = |name: &str| {
+            format!(
+                "<D:response><D:href>/cal/{name}.ics</D:href><D:propstat><D:prop>\
+<D:getetag>\"{name}\"</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status>\
+</D:propstat></D:response>"
+            )
+        };
+        let envelope = |body: String| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: format!(
+                "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">{body}</D:multistatus>"
+            ),
+            url: "https://dav.example.test/cal/".to_string(),
+        };
+        let script = dav_script([
+            envelope(format!("{}{}{}", listed("a"), listed("b"), listed("c"))),
+            envelope(format!(
+                "{}{}{}",
+                status_event("a", "STATUS:CANCELLED\n"),
+                status_event("b", ""),
+                status_event("c", "STATUS:CANCELLED\n"),
+            )),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let account = CalDavAccount::for_tests(Arc::new(client), "https://dav.example.test/cal/");
+        let mut request = EventSearchRequest::new("");
+        request.include_cancelled = include_cancelled;
+        let page = account.event_search(request).await.expect("search loads");
+        page.items.into_iter().map(|event| event.id.0).collect()
+    }
+
+    #[tokio::test]
+    async fn search_drops_cancelled_events_by_default() {
         assert_eq!(
-            transcripts(&script).len(),
-            7,
-            "one query and six multiget chunks: the whole collection, hydrated"
+            search_cancelled_fixture(false).await,
+            vec!["https://dav.example.test/cal/b.ics".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_keeps_cancelled_events_when_included() {
+        assert_eq!(
+            search_cancelled_fixture(true).await,
+            vec![
+                "https://dav.example.test/cal/a.ics".to_string(),
+                "https://dav.example.test/cal/b.ics".to_string(),
+                "https://dav.example.test/cal/c.ics".to_string(),
+            ]
         );
     }
 
@@ -2783,6 +2929,7 @@ mod tests {
                 calendar_id: None,
                 limit: Some(2),
                 page_cursor: None,
+                include_cancelled: false,
             })
             .await
             .expect("text search page");
@@ -2851,6 +2998,7 @@ mod tests {
                 calendar_id: None,
                 limit: Some(2),
                 page_cursor: None,
+                include_cancelled: false,
             })
             .await
             .expect("a refused filter degrades rather than failing");

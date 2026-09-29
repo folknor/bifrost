@@ -296,7 +296,11 @@ Calendar/contact update/delete fetch-then-`If-Match` and send sparse PATCH
 organizer/status are server-derived. Event search uses the Graph Search API for
 unscoped non-empty default-mailbox searches, else local; composite `EventId`s
 embed the calendar (`{calendar}::{event}`), Search hits use the `$mailbox`
-sentinel routed through `/me/events/{id}`. Contact search uses exact email
+sentinel routed through `/me/events/{id}`. `EventSearchRequest::include_cancelled`
+(default `false`) is honoured client-side on both lanes off the selected
+`isCancelled`; the Search API cursor advances by the RAW hit count so dropped
+hits are not re-read, and `estimated_total` is `None` on both lanes so the
+filter cannot over-count. Contact search uses exact email
 `$filter` for email-shaped queries, else local. `ContactEmail.kind` maps
 to and from Graph `emailAddress.name`, which is a DISPLAY NAME, not a type
 label - Graph's contact schema has no per-address type. The round trip is

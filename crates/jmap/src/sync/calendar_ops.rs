@@ -14,10 +14,10 @@
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AttendeeRole, Calendar, CalendarEvent,
-    CalendarId, CalendarProvenance, DiagnosticText, EventAttendee, EventAvailability, EventCreate,
-    EventId, EventOrganizer, EventPatch, EventRange, EventRecurrence, EventReminder,
-    EventSearchRequest, EventStatus, EventTime, EventVisibility, Page, ProtocolKind,
-    ReminderRelativeTo, ReminderTrigger, RsvpStatus,
+    CalendarId, CalendarProvenance, EventAttendee, EventAvailability, EventCreate, EventId,
+    EventOrganizer, EventPatch, EventRange, EventRecurrence, EventReminder, EventSearchRequest,
+    EventStatus, EventTime, EventVisibility, Page, ProtocolKind, ReminderRelativeTo,
+    ReminderTrigger, RsvpStatus,
 };
 use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Span, Timestamp, civil};
@@ -35,6 +35,7 @@ use crate::calendar_event::{
 use crate::core::SetCreate;
 use crate::core::query::Filter as QueryFilter;
 use crate::core::transport::HttpTransport;
+use crate::sync::page_cursor::PageKind;
 
 type CalendarAccount<T> = JmapProtoAccount<T>;
 
@@ -63,21 +64,26 @@ pub(crate) fn events_in_range<T: HttpTransport>(
 ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
     Box::pin(async move {
         let calendars = require_calendars(calendars, AccountOperation::EventsInRange)?;
-        let cursor =
-            decode_page_cursor(range.page_cursor.clone(), AccountOperation::EventsInRange)?;
+        let cursor = CalendarPages::decode_page_cursor(
+            range.page_cursor.clone(),
+            AccountOperation::EventsInRange,
+        )?;
         let filter = range_filter(&range);
         let query = crate::calendar_event::CalendarEventQuery::new()
             .filter(filter)
             .limit(limit(range.limit))
             .calculate_total(true);
-        let query = anchor_query(query, cursor.as_ref());
-        let response = calendars.call(query).await.map_err(page_call_err(
-            AccountOperation::EventsInRange,
-            cursor.is_some(),
-        ))?;
+        let query = CalendarPages::anchor_query(query, cursor.as_ref());
+        let response = calendars
+            .call(query)
+            .await
+            .map_err(CalendarPages::page_call_err(
+                AccountOperation::EventsInRange,
+                cursor.is_some(),
+            ))?;
         // Before the total, before the cursor, before hydration: an
         // inconsistent continuation must expose no items and no successor.
-        verify_query_state(
+        CalendarPages::verify_query_state(
             cursor.as_ref(),
             response.query_state(),
             AccountOperation::EventsInRange,
@@ -86,7 +92,7 @@ pub(crate) fn events_in_range<T: HttpTransport>(
             .total()
             .map(|total| usize_to_u64(total, AccountOperation::EventsInRange))
             .transpose()?;
-        let next_cursor = next_cursor(
+        let next_cursor = CalendarPages::next_cursor(
             cursor.as_ref(),
             response.position(),
             response.ids(),
@@ -275,19 +281,23 @@ pub(crate) fn search<T: HttpTransport>(
 ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
     Box::pin(async move {
         let calendars = require_calendars(calendars, AccountOperation::EventSearch)?;
-        let cursor = decode_page_cursor(request.page_cursor, AccountOperation::EventSearch)?;
+        let cursor =
+            CalendarPages::decode_page_cursor(request.page_cursor, AccountOperation::EventSearch)?;
         let query = crate::calendar_event::CalendarEventQuery::new()
             .filter(EventFilter::text(request.query.clone()))
             .limit(limit(request.limit))
             .calculate_total(true);
-        let query = anchor_query(query, cursor.as_ref());
-        let response = calendars.call(query).await.map_err(page_call_err(
-            AccountOperation::EventSearch,
-            cursor.is_some(),
-        ))?;
+        let query = CalendarPages::anchor_query(query, cursor.as_ref());
+        let response = calendars
+            .call(query)
+            .await
+            .map_err(CalendarPages::page_call_err(
+                AccountOperation::EventSearch,
+                cursor.is_some(),
+            ))?;
         // Before the total, before the cursor, before hydration: an
         // inconsistent continuation must expose no items and no successor.
-        verify_query_state(
+        CalendarPages::verify_query_state(
             cursor.as_ref(),
             response.query_state(),
             AccountOperation::EventSearch,
@@ -305,12 +315,17 @@ pub(crate) fn search<T: HttpTransport>(
         // it addresses the server-side result set, and a page whose every
         // hit belonged to another calendar is legitimately empty with more
         // pages behind it.
-        let reported_total = if request.calendar_id.is_some() {
+        //
+        // The cancelled filter is client-side for the same reason
+        // (draft-26 has no status filter condition, and `get_events` always
+        // hydrates `status`), and suppresses the total by the same argument:
+        // the server's count includes the cancelled events dropped here.
+        let reported_total = if request.calendar_id.is_some() || !request.include_cancelled {
             None
         } else {
             total
         };
-        let next_cursor = next_cursor(
+        let next_cursor = CalendarPages::next_cursor(
             cursor.as_ref(),
             response.position(),
             response.ids(),
@@ -332,6 +347,7 @@ pub(crate) fn search<T: HttpTransport>(
                     .calendar_id
                     .as_ref()
                     .is_none_or(|calendar| event.calendar_id == *calendar)
+                    && (request.include_cancelled || event.status != EventStatus::Cancelled)
             })
             .collect();
         Ok(Page {
@@ -1735,7 +1751,9 @@ fn rights_can_delete(rights: Option<&CalendarRights>) -> bool {
 }
 
 fn event_status(value: Option<&str>) -> EventStatus {
-    match value.unwrap_or_default() {
+    // An absent status is `confirmed`, the JMAP calendars default, so
+    // `Unknown` means only an unrecognized value.
+    match value.unwrap_or("confirmed") {
         "confirmed" => EventStatus::Confirmed,
         "tentative" => EventStatus::Tentative,
         "cancelled" => EventStatus::Cancelled,
@@ -1824,317 +1842,33 @@ fn validate_shared_attendees(
     Ok(())
 }
 
-/// Version tag of the calendar page-cursor payload. v1 was a bare integer
-/// POSITION into a `CalendarEvent/query` result order; v2 is `2:` followed by
-/// a JSON two-element array of the anchor event id and the `queryState` that
-/// order belonged to.
-///
-/// The payload after the tag is JSON, not two delimited strings: a JMAP id
-/// and a `queryState` are both opaque and either may contain any character a
-/// delimiter could be, so a delimited pair has no unambiguous split. JSON
-/// escapes its own contents, so both fields round-trip verbatim.
-const PAGE_CURSOR_V2_PREFIX: &str = "2:";
+/// The calendar page walk's parameters for the shared anchored, state-pinned
+/// page cursor (`page_cursor`): the id marker, the query builder, and the
+/// wording of its diagnostics. Behaviour is not a parameter.
+struct CalendarPages;
 
-/// A decoded calendar page cursor: the event the next page resumes strictly
-/// after, plus the `queryState` the order that anchor was chosen from
-/// belonged to. Both fields are mandatory - see `decode_page_cursor`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PageCursor {
-    anchor: String,
-    query_state: String,
-}
+impl PageKind for CalendarPages {
+    type ItemId = CalendarEventId;
+    type Query = crate::calendar_event::CalendarEventQuery;
 
-/// Point a page query at its continuation.
-///
-/// The first page starts at position zero; every later page resolves its
-/// start server-side from the previous page's last id (`anchor` +
-/// `anchorOffset: 1`, RFC 8620 s5.5) rather than from an integer offset.
-///
-/// This used to be an integer position, which is only meaningful if the
-/// result ORDER is the same list it was when the cursor was minted.
-/// `CalendarEvent/query` is served without an explicit comparator here, so
-/// its order is server-defined and guaranteed stable across calls by nothing
-/// at all: an event created or destroyed BEHIND the cursor shifts every later
-/// position by one, and the consumer's next page silently skips or repeats an
-/// event. The anchor closes that half: the server resolves it against
-/// whatever order it is serving now, so churn behind the cursor cannot move
-/// the window.
-///
-/// The anchor alone is NOT sufficient, which is why every page also carries
-/// the `queryState` (`verify_query_state`). An anchor survives REORDERING
-/// AROUND IT: if an event ahead of the anchor moves behind it the walk
-/// returns it twice, and if an event behind the anchor moves ahead of it the
-/// walk never returns it at all. Neither is visible from the anchor, because
-/// the anchor is still exactly where the server says it is.
-fn anchor_query(
-    query: crate::calendar_event::CalendarEventQuery,
-    cursor: Option<&PageCursor>,
-) -> crate::calendar_event::CalendarEventQuery {
-    match cursor {
-        Some(cursor) => query.anchor(cursor.anchor.as_str()).anchor_offset(1),
-        None => query.position(0),
+    const COLLECTION: &'static str = "calendar";
+    const ITEM: &'static str = "event";
+    const ID_LABEL: &'static str = "event";
+    const METHOD: &'static str = "CalendarEvent/query";
+    const REPEAT: &'static str = "walk";
+
+    fn query_from_start(
+        query: crate::calendar_event::CalendarEventQuery,
+    ) -> crate::calendar_event::CalendarEventQuery {
+        query.position(0)
     }
-}
 
-/// Refuse a continuation whose result set moved under it.
-///
-/// `queryState` identifies the ordered list of matching ids (RFC 8620 s5.5).
-/// If it differs from the one the cursor was minted against, the anchor is
-/// being resolved in a DIFFERENT list than the one the earlier page came
-/// from, and neither the anchor nor the position can tell us what moved
-/// across it. An event that overtook the anchor is lost; one that fell
-/// behind it is repeated.
-///
-/// Be precise about what refusing buys. It prevents SILENT acceptance of an
-/// inconsistent continuation - the caller learns the walk broke instead of
-/// receiving a page it cannot tell is short. It does NOT recover the missing
-/// events, and it does not guarantee the walk ever finishes: a busy calendar
-/// can move the state on every attempt and fail repeatedly, the same
-/// limitation mail search already carries. A restart re-reads the earlier
-/// pages, so a consumer must replace its prior result set or deduplicate
-/// against it. And a stable `queryState` pins the ordered ID LIST only - the
-/// hydrated properties of those events can still have changed underneath it.
-///
-/// A server is not required to move the state for every edit either: it
-/// describes the matching ids in order, so an unrelated property change need
-/// not touch it, though RFC 8620 s5.5 permits a server that cannot tell to
-/// invalidate conservatively.
-///
-/// This runs BEFORE the page's total, cursor and hydration, including on an
-/// empty or apparently final page: an implementation that checks afterwards
-/// has already handed the caller items from a list it just decided was the
-/// wrong one.
-fn verify_query_state(
-    cursor: Option<&PageCursor>,
-    served: &str,
-    operation: AccountOperation,
-) -> Result<(), AccountError> {
-    match cursor {
-        Some(cursor) if cursor.query_state != served => Err(result_set_superseded(operation)),
-        _ => Ok(()),
+    fn query_after(
+        query: crate::calendar_event::CalendarEventQuery,
+        anchor: &str,
+    ) -> crate::calendar_event::CalendarEventQuery {
+        query.anchor(anchor).anchor_offset(1)
     }
-}
-
-/// The result set this page cursor addresses is not the one it was minted
-/// against. Ordinary concurrent activity, not a server defect:
-/// `ConcurrencyConflict` derives `Retry(AfterStateRefresh)`, and refreshing
-/// here means walking again from the first page.
-fn result_set_superseded(operation: AccountOperation) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::ConcurrencyConflict,
-        bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(operation)
-    .text(DiagnosticText::support_only(
-        "calendar result set changed between pages \
-         (CalendarEvent/query queryState moved); repeat the walk",
-    ))
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// Mint the cursor for the page after this one, `Ok(None)` when this page
-/// reached the end, and `Err` when the envelope it reached that conclusion
-/// from does not hold together.
-///
-/// Termination has two rules, and which one applies depends on whether the
-/// server answered with a `total`. With one (both walks ask, via
-/// `calculateTotal: true`), `position + served == total` is the end and is
-/// exact. WITHOUT one the walk continues until an EMPTY page: every nonempty
-/// page mints a successor.
-///
-/// Page fullness is deliberately NOT the fallback, but the reason is narrower
-/// than this comment used to claim. RFC 8620 s5.5 does not permit an
-/// arbitrary short non-final page: `ids` runs to the end of the result list
-/// or to the effective limit, and a server that clamps the requested limit
-/// must RETURN the `limit` it actually used. The honest argument is the other
-/// one: an absent `total` is not evidence of completion (treating it as "end
-/// of walk" truncates the walk at page ONE), while a conforming EMPTY page is
-/// conclusive. Fullness would additionally have to trust a `limit` echo that
-/// a server may omit, for no gain over asking once more.
-///
-/// Note `total` here is the RAW server total, before `event_search`
-/// suppresses it for a client-side calendar filter: the suppression is about
-/// what the consumer is told, not about where the server-side result set
-/// ends.
-///
-/// The three refusals, all `Protocol(ContractViolation)`
-/// (`page_envelope_violation`), all checked BEFORE any termination test so
-/// that a broken envelope can never present as a completed walk:
-///
-/// - A NEGATIVE position. RFC 8620 s5.5 types the response `position` as an
-///   UnsignedInt; a negative one indexes nothing.
-/// - `position + served > total` on a NONEMPTY page. `position` is the index
-///   of the first returned id and `total` is the length of the whole result
-///   list, so the last id sits at index `position + served - 1` and
-///   `position + served <= total` must hold. A response that claims to have
-///   served past the end of the list it just measured is CONTRADICTORY, and
-///   `>= total` alone reads that contradiction as a clean completion.
-/// - A continuation page that CONTAINS the anchor it resumed after.
-///   `anchorOffset: 1` means strictly after, and `verify_query_state` has
-///   already pinned the ordered result list, so the anchor cannot have moved
-///   into this window. This is what makes a non-advancing walk detectable
-///   rather than indistinguishable from an unbounded result set: under an
-///   unmoved `queryState` the list is stable and finite, so a server that
-///   re-serves the page the anchor came from is violating its own contract.
-///   It subsumes the narrower "the successor anchor equals the incoming
-///   anchor" rule, which is the same condition restricted to the last id.
-///
-/// The anchor is this page's LAST id, which is what `anchorOffset: 1` resumes
-/// strictly after - and it is deliberately taken from the QUERY answer, not
-/// from the events that survived hydration and the client-side range /
-/// calendar filters. The cursor addresses the server-side result set, so a
-/// page whose every hit was discarded locally still has to name where the
-/// server should continue from.
-///
-/// `position` is the server's echo of where it actually served from, so a
-/// server that clamped the anchored start still reports a truthful base for
-/// the "is there more" test.
-///
-/// `query_state` is the state THIS response was served under, which by the
-/// time this is called `verify_query_state` has already confirmed matches
-/// the incoming cursor's pin (on a continuation) or is the walk's first
-/// observation (on a first page).
-fn next_cursor(
-    cursor: Option<&PageCursor>,
-    position: i32,
-    ids: &[CalendarEventId],
-    total: Option<u64>,
-    query_state: &str,
-    operation: AccountOperation,
-) -> Result<Option<Vec<u8>>, AccountError> {
-    let base = u64::try_from(position).map_err(|_| {
-        page_envelope_violation(
-            operation,
-            format!("CalendarEvent/query answered with a negative position ({position})"),
-        )
-    })?;
-    // The comparison happens in `u64` deliberately: narrowing either side to
-    // `i32` first (which is what this did) turned an out-of-range `total`
-    // into an ABSENT one and silently switched termination modes, and a
-    // saturating `position + served` hid an overflowing position instead of
-    // catching it. Both saturations below are unreachable on a 64-bit target,
-    // and where they are reachable they saturate toward `next > total`, which
-    // is a REFUSAL - never toward a false completion.
-    let served = u64::try_from(ids.len()).unwrap_or(u64::MAX);
-    let next = base.saturating_add(served);
-    if let Some(cursor) = cursor
-        && ids.iter().any(|id| id.as_str() == cursor.anchor)
-    {
-        return Err(page_envelope_violation(
-            operation,
-            format!(
-                "CalendarEvent/query returned the anchor {} it was asked to resume strictly \
-                 after, under an unmoved queryState",
-                cursor.anchor
-            ),
-        ));
-    }
-    if let Some(total) = total {
-        if served > 0 && next > total {
-            return Err(page_envelope_violation(
-                operation,
-                format!(
-                    "CalendarEvent/query served {served} ids from position {position} of a \
-                     result list it reports as {total} long"
-                ),
-            ));
-        }
-        if next >= total {
-            return Ok(None);
-        }
-    }
-    let Some(anchor) = ids.last().map(CalendarEventId::as_str) else {
-        return Ok(None);
-    };
-    // A JMAP id is at least one character (RFC 8620 s1.2), so a conforming
-    // server never reaches this arm. An empty id is a malformed envelope, and
-    // it gets the same treatment as the other three: ending the walk here
-    // would report a response we cannot page from as a completed walk.
-    if anchor.is_empty() {
-        return Err(page_envelope_violation(
-            operation,
-            "CalendarEvent/query returned an empty event id".to_string(),
-        ));
-    }
-    let payload = serde_json::to_string(&(anchor, query_state)).map_err(|error| {
-        page_envelope_violation(
-            operation,
-            format!("calendar page cursor is not encodable: {error}"),
-        )
-    })?;
-    Ok(Some(
-        format!("{PAGE_CURSOR_V2_PREFIX}{payload}").into_bytes(),
-    ))
-}
-
-/// The server's own page envelope is internally inconsistent, or it
-/// contradicts the result list the pinned `queryState` promises is stable.
-///
-/// `Protocol(ContractViolation)` -> `RecoveryClass::ProviderContractViolation`.
-/// The three classifications it is deliberately not:
-///
-/// - `None` (walk complete) is what these cases used to produce, and it is
-///   the silent-truncation shape the anchored cursor exists to end.
-/// - `ConcurrencyConflict` (what a moved `queryState` gets) says "repeat the
-///   walk and it will work". Here the state did NOT move, so a repeat
-///   re-issues the identical request and gets the identical broken envelope;
-///   the caller would spin.
-/// - `SyncState(SchemaIncompatible)` (what a stale cursor payload gets) also
-///   directs a restart, and it points the blame at OUR cursor when the defect
-///   is in the response.
-///
-/// `ProviderContractViolation` is the one a consumer can act on: it is
-/// terminal for this walk and it names the server.
-fn page_envelope_violation(operation: AccountOperation, message: String) -> AccountError {
-    super::error::contract_violation(operation, None, message)
-}
-
-/// Error mapping for a paged query call, aware of whether the call carried an
-/// anchor.
-///
-/// `anchorNotFound` means the event this cursor resumed after was destroyed
-/// between the two pages. The crate's central mapping classifies that as
-/// `Protocol(ContractViolation)` outside a cursor scope, which is right for a
-/// walk that never asked for an anchor and wrong here: an event deleted while
-/// a consumer pages a range is ordinary concurrent activity, not a server
-/// defect. `ConcurrencyConflict` derives `Retry(AfterStateRefresh)`, and
-/// refreshing this caller's state means walking the range again from the
-/// first page - which then succeeds.
-fn page_call_err(
-    operation: AccountOperation,
-    anchored: bool,
-) -> impl Fn(crate::Error) -> AccountError {
-    move |error| {
-        if anchored && is_anchor_not_found(&error) {
-            return anchor_lost(operation);
-        }
-        super::error::into_account_error(error, super::error::JmapErrorContext::new(operation))
-    }
-}
-
-fn is_anchor_not_found(error: &crate::Error) -> bool {
-    matches!(error, crate::Error::Method(method)
-    if matches!(
-        method.error_type(),
-        crate::core::error::MethodErrorType::AnchorNotFound
-    ))
-}
-
-fn anchor_lost(operation: AccountOperation) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::ConcurrencyConflict,
-        bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(operation)
-    .text(DiagnosticText::support_only(
-        "the event this page cursor resumes after was removed \
-         (CalendarEvent/query anchorNotFound); repeat the walk",
-    ))
-    .try_build()
-    .expect("valid account error classification")
 }
 
 fn limit(value: Option<u32>) -> usize {
@@ -2151,65 +1885,6 @@ fn usize_to_u64(value: usize, operation: AccountOperation) -> Result<u64, Accoun
             format!("JMAP calendar total does not fit u64: {error}"),
         )
     })
-}
-
-/// Decode a page cursor into the continuation it names.
-///
-/// Anything that is not a v2 payload is REFUSED, not reinterpreted. That
-/// covers the v1 bare integer (a position, which under anchored paging would
-/// mean either a stale offset or an id named "100") and, just as
-/// deliberately, an anchor-only payload: a cursor with no pinned
-/// `queryState` cannot be checked for reordering, so honouring it would be
-/// exactly the unchecked paging the pin exists to end.
-/// `SyncState(SchemaIncompatible)` is the crate's standing answer for an
-/// older cursor payload version (see the mail search cursor), and it tells
-/// the consumer what to do: restart the walk from the first page.
-fn decode_page_cursor(
-    page_cursor: Option<Vec<u8>>,
-    operation: AccountOperation,
-) -> Result<Option<PageCursor>, AccountError> {
-    let Some(cursor) = page_cursor else {
-        return Ok(None);
-    };
-    let cursor =
-        String::from_utf8(cursor).map_err(|error| cursor_error(operation, error.to_string()))?;
-    let Some(payload) = cursor.strip_prefix(PAGE_CURSOR_V2_PREFIX) else {
-        return Err(cursor_error(
-            operation,
-            "calendar page cursor predates the anchored, state-pinned encoding".to_string(),
-        ));
-    };
-    let (anchor, query_state): (String, String) =
-        serde_json::from_str(payload).map_err(|error| {
-            cursor_error(
-                operation,
-                format!("malformed calendar page cursor: {error}"),
-            )
-        })?;
-    if anchor.is_empty() {
-        return Err(cursor_error(
-            operation,
-            "calendar page cursor carries an empty anchor id".to_string(),
-        ));
-    }
-    Ok(Some(PageCursor {
-        anchor,
-        query_state,
-    }))
-}
-
-fn cursor_error(operation: AccountOperation, message: String) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(operation)
-    .text(DiagnosticText::support_only(message))
-    .try_build()
-    .expect("valid account error classification")
 }
 
 fn require_calendars<T: HttpTransport>(
@@ -2264,7 +1939,7 @@ mod tests {
                     "canCalculateChanges": false,
                     "position": 0,
                     "total": 9,
-                    "ids": ["e1"]
+                    "ids": ["e1", "e2"]
                 }),
                 "CalendarEvent/get" => json!({
                     "accountId": "primary",
@@ -2273,6 +1948,12 @@ mod tests {
                         "id": "e1",
                         "calendarIds": {"other": true},
                         "start": "2026-06-01T09:00:00",
+                        "duration": "PT1H"
+                    }, {
+                        "id": "e2",
+                        "calendarIds": {"other": true},
+                        "status": "cancelled",
+                        "start": "2026-06-02T09:00:00",
                         "duration": "PT1H"
                     }],
                     "notFound": []
@@ -2353,16 +2034,23 @@ mod tests {
     /// own pages can never add up to.
     #[tokio::test]
     async fn a_calendar_filtered_search_reports_no_server_total() {
-        let unfiltered = search(Some(search_account()), EventSearchRequest::new("standup"))
-            .await
-            .expect("search");
-        assert_eq!(unfiltered.items.len(), 1);
+        let unfiltered = search(
+            Some(search_account()),
+            EventSearchRequest {
+                include_cancelled: true,
+                ..EventSearchRequest::new("standup")
+            },
+        )
+        .await
+        .expect("search");
+        assert_eq!(unfiltered.items.len(), 2);
         assert_eq!(unfiltered.estimated_total, Some(9));
 
         let filtered = search(
             Some(search_account()),
             EventSearchRequest {
                 calendar_id: Some(CalendarId("wanted".to_string())),
+                include_cancelled: true,
                 ..EventSearchRequest::new("standup")
             },
         )
@@ -2370,6 +2058,48 @@ mod tests {
         .expect("search");
         assert!(filtered.items.is_empty());
         assert_eq!(filtered.estimated_total, None);
+    }
+
+    /// The default search drops cancelled events client-side, and the
+    /// server total (which counts them) is suppressed for the same reason as
+    /// the calendar post-filter.
+    #[tokio::test]
+    async fn a_default_search_drops_cancelled_events_and_reports_no_total() {
+        let page = search(Some(search_account()), EventSearchRequest::new("standup"))
+            .await
+            .expect("search");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].native_id, "e1");
+        assert_eq!(page.items[0].status, EventStatus::Confirmed);
+        assert_eq!(page.estimated_total, None);
+    }
+
+    #[tokio::test]
+    async fn an_include_cancelled_search_keeps_cancelled_events() {
+        let page = search(
+            Some(search_account()),
+            EventSearchRequest {
+                include_cancelled: true,
+                ..EventSearchRequest::new("standup")
+            },
+        )
+        .await
+        .expect("search");
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|event| event.native_id.as_str())
+                .collect::<Vec<_>>(),
+            ["e1", "e2"]
+        );
+        assert_eq!(page.items[1].status, EventStatus::Cancelled);
+    }
+
+    #[test]
+    fn jmap_event_status_absent_is_confirmed_and_unrecognized_is_unknown() {
+        assert_eq!(event_status(None), EventStatus::Confirmed);
+        assert_eq!(event_status(Some("tentative")), EventStatus::Tentative);
+        assert_eq!(event_status(Some("x-weird")), EventStatus::Unknown);
     }
 
     fn create_payload(event: &EventCreate) -> CalendarEventCreate {
@@ -2533,280 +2263,26 @@ mod tests {
         values.iter().map(|id| CalendarEventId::new(*id)).collect()
     }
 
-    fn cursor(anchor: &str, query_state: &str) -> PageCursor {
-        PageCursor {
+    fn cursor(anchor: &str, query_state: &str) -> crate::sync::page_cursor::PageCursor {
+        crate::sync::page_cursor::PageCursor {
             anchor: anchor.to_string(),
             query_state: query_state.to_string(),
         }
     }
 
-    /// `next_cursor` for a FIRST page (no incoming anchor), which is what
-    /// most of these cases exercise.
-    fn mint(
-        position: i32,
-        page: &[CalendarEventId],
-        total: Option<u64>,
-        query_state: &str,
-    ) -> Result<Option<Vec<u8>>, AccountError> {
-        next_cursor(
-            None,
-            position,
-            page,
-            total,
-            query_state,
-            AccountOperation::EventsInRange,
-        )
-    }
-
     /// Build a page cursor the way a real page would have minted it, so no
     /// test hand-writes the encoding.
     fn page_cursor(anchor: &str, query_state: &str) -> Vec<u8> {
-        mint(0, &event_ids(&[anchor]), Some(1_000), query_state)
-            .expect("valid envelope")
-            .expect("cursor")
-    }
-
-    /// The minted cursor names the page's LAST id and pins the state that
-    /// order was served under; when the server sent a total, that total
-    /// decides whether there is a next page at all.
-    #[test]
-    fn next_cursor_anchors_on_the_last_id_and_pins_the_state() {
-        let minted = mint(0, &event_ids(&["e1", "e2"]), Some(250), "q1")
-            .expect("valid envelope")
-            .expect("cursor");
-        assert_eq!(
-            decode_page_cursor(Some(minted), AccountOperation::EventsInRange).expect("decodes"),
-            Some(cursor("e2", "q1"))
-        );
-        assert_eq!(
-            mint(200, &event_ids(&["e9"]), Some(201), "q1").expect("valid envelope"),
-            None
-        );
-    }
-
-    /// A server that ignores `calculateTotal` must not truncate the walk. With
-    /// no `total`, a NONEMPTY page mints a successor anchored on its last id
-    /// (whatever the page's length - fullness is not a completion test), and
-    /// only an EMPTY page ends the walk.
-    ///
-    /// Reverting the fallback to `let total = total...?` fails the first two
-    /// assertions. The short page is here to state the rule, not to catch a
-    /// fullness fallback: `next_cursor` is not handed the limit, so fullness
-    /// is not expressible at this seam at all.
-    #[test]
-    fn without_a_total_the_walk_continues_until_an_empty_page() {
-        assert_eq!(
-            decode_page_cursor(
-                mint(0, &event_ids(&["e1", "e2"]), None, "q1").expect("valid envelope"),
-                AccountOperation::EventsInRange
-            )
-            .expect("decodes"),
-            Some(cursor("e2", "q1")),
-            "a full page with no total continues"
-        );
-        assert_eq!(
-            decode_page_cursor(
-                mint(40, &event_ids(&["e9"]), None, "q1").expect("valid envelope"),
-                AccountOperation::EventsInRange
-            )
-            .expect("decodes"),
-            Some(cursor("e9", "q1")),
-            "a SHORT page with no total is not evidence of the end"
-        );
-        assert_eq!(
-            mint(80, &event_ids(&[]), None, "q1").expect("valid envelope"),
+        CalendarPages::next_cursor(
             None,
-            "the empty page is what ends it"
-        );
-    }
-
-    /// BITES. `position` is the index of a nonempty page's FIRST id and
-    /// `total` is the length of the whole result list, so
-    /// `position + served > total` is a contradiction, not an ending. The old
-    /// `next >= total` arm read every one of these as a cleanly completed
-    /// walk; restoring it turns all four `expect_err` calls into `Ok(None)`.
-    ///
-    /// The `i32::MAX` row is the one that also pins the arithmetic: the old
-    /// SATURATING `i32` addition clamped `position + served` back to
-    /// `i32::MAX`, which compares `>=` against every total and so completed
-    /// the walk silently.
-    ///
-    /// The empty-page row is the boundary the rule must NOT catch: with no
-    /// first id there is no index for `position` to be, so a server that
-    /// echoes a position past the end of an empty page is left alone.
-    #[test]
-    fn an_envelope_that_contradicts_its_own_total_is_a_contract_violation() {
-        for (position, page, total) in [
-            (0, event_ids(&["e1", "e2"]), 1_u64),
-            (5, event_ids(&["e1"]), 5),
-            (0, event_ids(&["e1"]), 0),
-            (i32::MAX, event_ids(&["e1"]), 9),
-        ] {
-            let error = mint(position, &page, Some(total), "q1")
-                .expect_err("a contradictory envelope is not a completed walk");
-            assert!(
-                matches!(
-                    error.kind(),
-                    bifrost_types::AccountErrorKind::Protocol(
-                        bifrost_types::ProtocolErrorKind::ContractViolation
-                    )
-                ),
-                "position {position} + {} ids against total {total} must be refused",
-                page.len()
-            );
-        }
-        assert_eq!(
-            mint(90, &event_ids(&[]), Some(4), "q1").expect("an empty page indexes nothing"),
-            None
-        );
-    }
-
-    /// BITES. A negative `position` indexes nothing (RFC 8620 s5.5 types the
-    /// response field as an UnsignedInt). Under the old saturating `i32`
-    /// arithmetic `-5 + 2 = -3` compared below every total, so this envelope
-    /// minted a successor and the walk carried on from a base that means
-    /// nothing. Deleting the `u64::try_from` guard restores that.
-    #[test]
-    fn a_negative_position_is_a_contract_violation() {
-        for total in [Some(50_u64), None] {
-            let error = mint(-5, &event_ids(&["e1", "e2"]), total, "q1")
-                .expect_err("a negative position is not a base to page from");
-            assert!(matches!(
-                error.kind(),
-                bifrost_types::AccountErrorKind::Protocol(
-                    bifrost_types::ProtocolErrorKind::ContractViolation
-                )
-            ));
-        }
-    }
-
-    /// BITES the non-termination detection. `anchorOffset: 1` resumes
-    /// STRICTLY after the anchor, and `verify_query_state` has already
-    /// established that the ordered result list did not move, so a page that
-    /// contains the anchor again is a server re-serving the window it was
-    /// asked to leave - the shape that used to page forever without
-    /// terminating. Deleting the containment check makes rows one and two
-    /// mint a successor instead of failing.
-    ///
-    /// Row two is the narrower "the successor anchor equals the incoming
-    /// anchor" case; it is a strict subset of containment, which is why one
-    /// rule covers both. Row three is the control: a page that genuinely
-    /// moved past the anchor still mints.
-    #[test]
-    fn a_continuation_that_re_serves_its_own_anchor_is_a_contract_violation() {
-        let incoming = cursor("e2", "q1");
-        for page in [event_ids(&["e2", "e3"]), event_ids(&["e3", "e2"])] {
-            let error = next_cursor(
-                Some(&incoming),
-                2,
-                &page,
-                None,
-                "q1",
-                AccountOperation::EventsInRange,
-            )
-            .expect_err("a page must not contain the anchor it resumes after");
-            assert!(matches!(
-                error.kind(),
-                bifrost_types::AccountErrorKind::Protocol(
-                    bifrost_types::ProtocolErrorKind::ContractViolation
-                )
-            ));
-        }
-        assert!(
-            next_cursor(
-                Some(&incoming),
-                2,
-                &event_ids(&["e3", "e4"]),
-                None,
-                "q1",
-                AccountOperation::EventsInRange,
-            )
-            .expect("an advancing page is fine")
-            .is_some()
-        );
-    }
-
-    /// CHARACTERISES ONLY, deliberately. The old code narrowed `total` to
-    /// `i32` and treated a failed conversion exactly like an ABSENT total,
-    /// which reads as a silent mode switch - but at THIS seam it cannot be
-    /// observed: `position` is an `i32`, so `position + served` can never
-    /// reach a total above `i32::MAX`, and the exact test and the
-    /// absent-total rule both say "keep walking" for every such envelope. No
-    /// input distinguishes them. The half that WAS observable is the
-    /// saturating addition, pinned by the `i32::MAX` row of
-    /// `an_envelope_that_contradicts_its_own_total_is_a_contract_violation`.
-    #[test]
-    fn a_total_above_i32_max_is_not_read_as_an_absent_total() {
-        let total = u64::from(u32::MAX) + 7;
-        assert!(
-            mint(0, &event_ids(&["e1", "e2"]), Some(total), "q1")
-                .expect("valid envelope")
-                .is_some(),
-            "two ids out of four billion is not the end of the list"
-        );
-    }
-
-    /// Every payload that is not a v2 anchor-plus-state pair is refused
-    /// rather than reinterpreted. Two cases carry the weight: the v1 bare
-    /// position (reading it as an anchor would page from an event named
-    /// "100"), and the anchor-ONLY v2 shape - a cursor with no pinned state
-    /// cannot be checked for reordering, so accepting it would reinstate the
-    /// hole the pin closes.
-    #[test]
-    fn a_page_cursor_refuses_every_shape_without_a_pinned_state() {
-        for refused in [
-            "100",
-            "-1",
-            "not-a-number",
-            "2:e2",
-            "2:[\"e2\"]",
-            "2:[\"e2\",\"q1\",\"extra\"]",
-            "2:[\"\",\"q1\"]",
-            "3:[\"e2\",\"q1\"]",
-            "2:",
-        ] {
-            let error =
-                decode_page_cursor(Some(Vec::from(refused)), AccountOperation::EventsInRange)
-                    .expect_err("older or malformed cursor should fail");
-            assert!(
-                matches!(
-                    error.kind(),
-                    bifrost_types::AccountErrorKind::SyncState(
-                        bifrost_types::SyncStateErrorKind::SchemaIncompatible
-                    )
-                ),
-                "{refused} must be refused as SchemaIncompatible"
-            );
-        }
-    }
-
-    /// Both halves are opaque strings that may contain anything a delimiter
-    /// could be. JSON quoting is what makes the split unambiguous, so an id
-    /// and a state full of separators, quotes and brackets round-trip.
-    #[test]
-    fn a_page_cursor_round_trips_opaque_halves() {
-        let minted = mint(0, &event_ids(&["a:b\",\"c"]), Some(9), "[\"q:1\"]")
-            .expect("valid envelope")
-            .expect("cursor");
-        assert_eq!(
-            decode_page_cursor(Some(minted), AccountOperation::EventsInRange).expect("decodes"),
-            Some(cursor("a:b\",\"c", "[\"q:1\"]"))
-        );
-    }
-
-    /// The state check refuses a moved state, accepts an unmoved one, and
-    /// has nothing to compare on a first page.
-    #[test]
-    fn verify_query_state_refuses_only_a_moved_state() {
-        let op = AccountOperation::EventsInRange;
-        assert!(verify_query_state(None, "q1", op).is_ok());
-        assert!(verify_query_state(Some(&cursor("e2", "q1")), "q1", op).is_ok());
-        let error = verify_query_state(Some(&cursor("e2", "q1")), "q2", op)
-            .expect_err("a moved state must be refused");
-        assert_eq!(
-            error.kind(),
-            &bifrost_types::AccountErrorKind::ConcurrencyConflict
-        );
+            0,
+            &event_ids(&[anchor]),
+            Some(1_000),
+            query_state,
+            AccountOperation::EventsInRange,
+        )
+        .expect("valid envelope")
+        .expect("cursor")
     }
 
     /// The first page positions at zero; a continuation carries the anchor
@@ -2814,7 +2290,7 @@ mod tests {
     /// the window.
     #[test]
     fn a_continuation_page_queries_by_anchor_not_position() {
-        let first = serde_json::to_value(anchor_query(
+        let first = serde_json::to_value(CalendarPages::anchor_query(
             crate::calendar_event::CalendarEventQuery::new().limit(2),
             None,
         ))
@@ -2822,7 +2298,7 @@ mod tests {
         assert_eq!(first.get("position"), Some(&json!(0)));
         assert_eq!(first.get("anchor"), None);
 
-        let next = serde_json::to_value(anchor_query(
+        let next = serde_json::to_value(CalendarPages::anchor_query(
             crate::calendar_event::CalendarEventQuery::new().limit(2),
             Some(&cursor("e2", "q1")),
         ))
@@ -3176,7 +2652,8 @@ mod tests {
         let page = walk_range(&transport, None).await.expect("first page");
         let minted = page.next_cursor.expect("a second page is promised");
         assert_eq!(
-            decode_page_cursor(Some(minted), AccountOperation::EventsInRange).expect("decodes"),
+            CalendarPages::decode_page_cursor(Some(minted), AccountOperation::EventsInRange)
+                .expect("decodes"),
             Some(cursor("e1", "q-first"))
         );
     }

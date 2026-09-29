@@ -275,6 +275,10 @@ pub struct EventSearchRequest {
     pub calendar_id: Option<CalendarId>,
     pub page_cursor: Option<Vec<u8>>,
     pub limit: Option<u32>,
+    /// When `false` (the default) events whose status is
+    /// [`EventStatus::Cancelled`] are excluded from the results; when `true`
+    /// they are returned. Every `event_search` implementation must honour it.
+    pub include_cancelled: bool,
 }
 
 impl EventSearchRequest {
@@ -285,6 +289,7 @@ impl EventSearchRequest {
             calendar_id: None,
             page_cursor: None,
             limit: None,
+            include_cancelled: false,
         }
     }
 }

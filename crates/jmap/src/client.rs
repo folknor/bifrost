@@ -149,6 +149,12 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     state: std::sync::Mutex<Arc<SessionState>>,
     session_url: String,
     session_updated: AtomicBool,
+    /// Wakes the account layer's scope-lifecycle poller when a response
+    /// reports a moved `sessionState`. Behind `tokio` because only that
+    /// async layer listens, and `tokio` is an optional dependency of this
+    /// crate; without it the divergence is still recorded in
+    /// `session_updated`.
+    #[cfg(feature = "tokio")]
     session_changes: tokio::sync::watch::Sender<u64>,
 
     timeout: Duration,
@@ -346,6 +352,7 @@ impl ClientBuilder {
                 state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
                 session_url,
                 session_updated: true.into(),
+                #[cfg(feature = "tokio")]
                 session_changes: tokio::sync::watch::channel(0).0,
                 timeout: self.timeout,
                 transport,
@@ -432,6 +439,7 @@ mod session_state_tests {
     /// `"accountId": ""` - a malformed request answered with an opaque
     /// server error, for a fault that is entirely local. It must fail
     /// here instead, naming the capability whose account is missing.
+    #[cfg(feature = "mail")]
     #[test]
     fn a_session_without_a_primary_account_refuses_to_build_a_request() {
         let session: Session = serde_json::from_value(json!({
@@ -614,6 +622,7 @@ impl<T: HttpTransport> Client<T> {
                 state: std::sync::Mutex::new(Arc::new(SessionState::derive(session)?)),
                 session_url,
                 session_updated: true.into(),
+                #[cfg(feature = "tokio")]
                 session_changes: tokio::sync::watch::channel(0).0,
                 timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 transport,
@@ -705,6 +714,7 @@ impl<T: HttpTransport> Client<T> {
     pub(crate) fn note_session_state(&self, session_state: &str) {
         if session_state != self.session_state().session().state() {
             self.inner.session_updated.store(false, Ordering::Release);
+            #[cfg(feature = "tokio")]
             self.inner.session_changes.send_modify(|generation| {
                 *generation = generation.wrapping_add(1);
             });
@@ -740,6 +750,7 @@ impl<T: HttpTransport> Client<T> {
     }
 
     /// Subscribe to session-state divergence detected at the response boundary.
+    #[cfg(feature = "tokio")]
     pub(crate) fn session_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.inner.session_changes.subscribe()
     }

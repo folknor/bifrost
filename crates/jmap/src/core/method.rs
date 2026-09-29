@@ -414,6 +414,10 @@ macro_rules! define_query_changes_method {
 }
 
 /// Generates a JMAP /copy method struct that wraps `CopyRequest<O>`.
+///
+/// Compiled only for the features whose object modules invoke it, so a
+/// reduced-feature build of the crate carries no dead macro.
+#[cfg(any(feature = "mail", feature = "contacts", feature = "calendars"))]
 macro_rules! define_copy_method {
     ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
@@ -485,6 +489,7 @@ macro_rules! define_copy_method {
 
 /// Generates a Property enum with `as_str()`, `Display`, `Serialize`,
 /// `Deserialize`, and `From<&str>` impls, plus an `Other(String)` catch-all.
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 macro_rules! define_open_property_enum {
     (
         $(#[$meta:meta])*
@@ -548,6 +553,7 @@ macro_rules! define_open_property_enum {
 }
 
 /// Generates a JMAP /parse method struct.
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 macro_rules! define_parse_method {
     ($name:ident, $property:ty, $method_name:expr, $cap:ty, $response:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
@@ -611,9 +617,12 @@ macro_rules! define_parse_method {
 }
 
 pub(crate) use define_changes_method;
+#[cfg(any(feature = "mail", feature = "contacts", feature = "calendars"))]
 pub(crate) use define_copy_method;
 pub(crate) use define_get_method;
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 pub(crate) use define_open_property_enum;
+#[cfg(any(feature = "contacts", feature = "calendars"))]
 pub(crate) use define_parse_method;
 pub(crate) use define_query_changes_method;
 pub(crate) use define_query_method;

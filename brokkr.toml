@@ -9,8 +9,7 @@ debug = true
 doctests = true
 
 # Declaring any [[check]] entry replaces brokkr's implicit single `--all-features`
-# sweep, so the three entries below have to reconstruct that coverage between
-# them. bifrost is a *virtual* workspace (no root package), so `features` is only
+# sweep, so the entries below have to reconstruct that coverage between them. bifrost is a *virtual* workspace (no root package), so `features` is only
 # legal on an entry that also names `packages`; the workspace-wide baseline
 # therefore rides default features plus cargo's own unification across the
 # selected members.
@@ -38,16 +37,21 @@ features = ["dkim"]
 # sibling member cannot donate the features back and quietly turn this into a
 # fourth copy of the default sweep.
 #
-# This is the default feature set MINUS `calendars`, deliberately, rather than
-# `no_default_features` on its own. A bare no-default build of this crate does
-# not compile and never has: `tokio`, `bifrost-types` and the `mailbox` module
-# are optional-dependency-gated while `client.rs` and `core/tests.rs` use them
-# unconditionally. Making the crate build with zero features is a real piece of
-# work nobody has ruled on, and it is NOT what this sweep is for. What this
-# sweep is for is the one cfg the code actually branches on.
+# This is the default feature set MINUS `calendars`, deliberately: the one cfg
+# the code actually branches on. The zero-feature build is the next entry's job.
 [[check]]
 name = "jmap-calendars-off"
 packages = ["bifrost-jmap"]
 no_default_features = true
 features = ["websockets", "mail", "contacts", "blob", "quota"]
 feature_unification = "selected"
+
+# bifrost-jmap with NO features, resolved as `cargo install` would - per package,
+# so no sibling member can donate a feature back. Every default feature of this
+# crate is optional, and a consumer turning them off must still get a crate that
+# builds; before this sweep existed it never had.
+[[check]]
+name = "jmap-no-default"
+packages = ["bifrost-jmap"]
+no_default_features = true
+feature_unification = "package"

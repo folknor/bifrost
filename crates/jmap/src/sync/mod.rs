@@ -21,6 +21,7 @@ mod foreign;
 mod hydrate;
 mod inventory;
 mod mutation;
+mod page_cursor;
 mod pim;
 mod push;
 mod state;

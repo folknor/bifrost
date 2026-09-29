@@ -288,6 +288,7 @@ pub(crate) fn search(
                 &request.query,
                 request.limit,
                 decode_page_token(request.page_cursor, AccountOperation::EventSearch)?,
+                request.include_cancelled,
             )
             .await;
         }
@@ -326,6 +327,7 @@ pub(crate) fn search(
                 &request.query,
                 Some(u32::try_from(remaining).unwrap_or(2500)),
                 page_token.take(),
+                request.include_cancelled,
             )
             .await?;
             // Google honours `maxResults`, but guard the cap defensively so
@@ -381,27 +383,28 @@ pub(crate) fn search(
     })
 }
 
-/// Note the query deliberately sends `singleEvents=true` with NO
-/// `showDeleted`, which is what the range walk above did before it was
-/// corrected to carry tombstones.
-///
-/// That is not the same omission and must not be "fixed" by copying the range
-/// walk's parameters. A range reread is a COVERAGE question - a missing
-/// tombstone there is indistinguishable from a page boundary, so the walk can
-/// silently under-report deletions. A search is a query surface, and whether it
-/// should answer with cancelled instances is a PRODUCT decision about what the
-/// consumer asked for. It wants a deliberate ruling from the repository
-/// owner, not a reflex copy.
+/// The query sends `showDeleted=true` only when the caller set
+/// `include_cancelled`. A search is a query surface, so by default it answers
+/// with live events only (Google hides cancelled events unless asked); the
+/// range walk above is a COVERAGE question and always carries tombstones.
+/// Cancelled stubs project through `event_from_google`'s tombstone tolerance,
+/// so they cannot poison the page.
 async fn search_one_calendar(
     client: &GmailClient,
     calendar_id: String,
     query: &str,
     limit: Option<u32>,
     page_token: Option<String>,
+    include_cancelled: bool,
 ) -> Result<Page<CalendarEvent>, AccountError> {
     let encoded = bifrost_net::url::encode_path_component(&calendar_id);
+    let show_deleted = if include_cancelled {
+        "&showDeleted=true"
+    } else {
+        ""
+    };
     let mut url = format!(
-        "{}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&q={}",
+        "{}/calendars/{encoded}/events?singleEvents=true{show_deleted}&orderBy=startTime&q={}",
         client.calendar_base(),
         bifrost_net::url::encode_query_value(query)
     );
@@ -999,7 +1002,9 @@ fn prefixed_values(values: Option<&[String]>, prefix: &str) -> Vec<String> {
 }
 
 fn event_status(value: Option<&str>) -> EventStatus {
-    match value.unwrap_or_default() {
+    // An absent status is `confirmed`, the documented Google default, so
+    // `Unknown` means only an unrecognized value.
+    match value.unwrap_or("confirmed") {
         "confirmed" => EventStatus::Confirmed,
         "tentative" => EventStatus::Tentative,
         "cancelled" => EventStatus::Cancelled,
@@ -1586,6 +1591,7 @@ mod tests {
                 query: "planning".to_string(),
                 limit: None,
                 page_cursor: None,
+                include_cancelled: false,
             },
         )
         .await
@@ -1605,6 +1611,84 @@ mod tests {
                 "work::broken-b".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn search_omits_show_deleted_by_default() {
+        let (client, script) =
+            scripted_client(vec![canned_json(StatusCode::OK, json!({"items": []}))]);
+        let mut request = EventSearchRequest::new("planning");
+        request.calendar_id = Some(CalendarId("primary".to_string()));
+
+        search(client, request).await.expect("search loads");
+
+        assert!(
+            script.requests()[0]
+                .url
+                .query()
+                .is_some_and(|query| !query.contains("showDeleted")),
+            "a default search must not ask for tombstones",
+        );
+    }
+
+    #[tokio::test]
+    async fn search_sends_show_deleted_when_include_cancelled() {
+        let (client, script) = scripted_client(vec![canned_json(
+            StatusCode::OK,
+            json!({
+                "items": [{"id": "gone", "status": "cancelled"}]
+            }),
+        )]);
+        let mut request = EventSearchRequest::new("planning");
+        request.calendar_id = Some(CalendarId("primary".to_string()));
+        request.include_cancelled = true;
+
+        let page = search(client, request).await.expect("search loads");
+
+        assert!(
+            script.requests()[0]
+                .url
+                .query()
+                .is_some_and(|query| query.contains("showDeleted=true")),
+        );
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].status, EventStatus::Cancelled);
+        assert!(page.failed_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_calendar_search_sends_show_deleted_to_every_calendar() {
+        let (client, script) = scripted_client(vec![
+            canned_json(
+                StatusCode::OK,
+                json!({"items": [{"id": "primary"}, {"id": "work"}]}),
+            ),
+            canned_json(StatusCode::OK, json!({"items": []})),
+            canned_json(StatusCode::OK, json!({"items": []})),
+        ]);
+        let mut request = EventSearchRequest::new("planning");
+        request.include_cancelled = true;
+
+        search(client, request).await.expect("search loads");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        for request in &requests[1..] {
+            assert!(
+                request
+                    .url
+                    .query()
+                    .is_some_and(|query| query.contains("showDeleted=true")),
+            );
+        }
+    }
+
+    #[test]
+    fn event_status_absent_is_confirmed_and_unrecognized_is_unknown() {
+        assert_eq!(event_status(None), EventStatus::Confirmed);
+        assert_eq!(event_status(Some("confirmed")), EventStatus::Confirmed);
+        assert_eq!(event_status(Some("cancelled")), EventStatus::Cancelled);
+        assert_eq!(event_status(Some("x-weird")), EventStatus::Unknown);
     }
 
     #[test]

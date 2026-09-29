@@ -292,6 +292,7 @@ async fn search_locally(
         )
     });
     let needle = request.query.to_ascii_lowercase();
+    let include_cancelled = request.include_cancelled;
     let limit = request
         .limit
         .and_then(|limit| usize::try_from(limit).ok())
@@ -308,7 +309,13 @@ async fn search_locally(
         let page_len = page.value.len();
         for (index, value) in page.value.into_iter().enumerate().skip(skip) {
             let event = event_from_graph(calendar_id.0.clone(), value);
-            if event_matches(&event, &needle) {
+            // `isCancelled` is selected on every page, so the cancelled
+            // filter is client-side. Dropped events still count toward
+            // `consumed`, which indexes the raw page, and `estimated_total`
+            // is `None` here so nothing over-counts them.
+            if (include_cancelled || event.status != EventStatus::Cancelled)
+                && event_matches(&event, &needle)
+            {
                 items.push(event);
                 if items.len() == limit {
                     let consumed = index + 1;
@@ -375,7 +382,7 @@ async fn search_with_graph_api(
         .iter()
         .flat_map(|set| set.hits_containers.iter())
         .any(|container| container.more_results_available.unwrap_or(false));
-    let items: Vec<CalendarEvent> = response
+    let all_items: Vec<CalendarEvent> = response
         .value
         .into_iter()
         .flat_map(|set| set.hits_containers)
@@ -383,8 +390,21 @@ async fn search_with_graph_api(
         .filter_map(|hit| hit.resource)
         .map(|event| event_from_graph(MAILBOX_SCOPE.to_string(), event))
         .collect();
-    let next_cursor = (more_results && !items.is_empty())
-        .then(|| search_api_cursor(from + u32::try_from(items.len()).unwrap_or(size)));
+    // The next `from` offset counts the RAW hits the server returned, not
+    // the ones surviving the client-side cancelled filter, or the next page
+    // would re-read the dropped hits. `estimated_total` stays `None`, so the
+    // filter cannot over-count.
+    let raw_len = all_items.len();
+    let items: Vec<CalendarEvent> = if request.include_cancelled {
+        all_items
+    } else {
+        all_items
+            .into_iter()
+            .filter(|event| event.status != EventStatus::Cancelled)
+            .collect()
+    };
+    let next_cursor = (more_results && raw_len > 0)
+        .then(|| search_api_cursor(from + u32::try_from(raw_len).unwrap_or(size)));
     Ok(Page {
         items,
         next_cursor,
@@ -2145,6 +2165,7 @@ mod tests {
                 query: "planning".to_string(),
                 page_cursor: None,
                 limit: None,
+                include_cancelled: false,
             }
         ));
         assert!(!graph_search_api_supported(
@@ -2154,6 +2175,7 @@ mod tests {
                 query: "planning".to_string(),
                 page_cursor: None,
                 limit: None,
+                include_cancelled: false,
             }
         ));
         assert!(!graph_search_api_supported(
@@ -2163,6 +2185,7 @@ mod tests {
                 query: " ".to_string(),
                 page_cursor: None,
                 limit: None,
+                include_cancelled: false,
             }
         ));
 
@@ -2177,6 +2200,7 @@ mod tests {
                 query: "planning".to_string(),
                 page_cursor: None,
                 limit: None,
+                include_cancelled: false,
             }
         ));
     }
@@ -2200,6 +2224,131 @@ mod tests {
         assert_eq!(value["requests"][0]["query"]["queryString"], "planning");
         assert_eq!(value["requests"][0]["size"], 10);
         assert_eq!(value["requests"][0]["fields"][0], "id");
+    }
+
+    fn scripted_search_account(
+        body: serde_json::Value,
+    ) -> (
+        GraphAccount,
+        std::sync::Arc<bifrost_net::test_support::ScriptedDispatch>,
+    ) {
+        use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
+        use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
+        use std::sync::Arc;
+
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: reqwest::StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: bytes::Bytes::from(body.to_string()),
+        }]);
+        let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
+        let net = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::clone(&token_source),
+            RetryPolicy::disabled(),
+        );
+        let client = crate::client::GraphClient::with_account_net(
+            net,
+            "https://graph.contoso.test/v1.0",
+            token_source,
+        );
+        let account =
+            GraphAccount::new_for_tests(client, crate::account::PushMode::GraphSubscriptions);
+        (account, script)
+    }
+
+    fn local_search_request(include_cancelled: bool) -> EventSearchRequest {
+        let mut request = EventSearchRequest::new("planning");
+        request.calendar_id = Some(CalendarId("calendar".to_string()));
+        request.include_cancelled = include_cancelled;
+        request
+    }
+
+    fn cancelled_and_live_page() -> serde_json::Value {
+        json!({
+            "value": [
+                {"id": "gone", "subject": "Planning", "isCancelled": true},
+                {"id": "live", "subject": "Planning", "isCancelled": false}
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn local_search_drops_cancelled_events_by_default() {
+        let (account, _script) = scripted_search_account(cancelled_and_live_page());
+
+        let page = search(account, local_search_request(false))
+            .await
+            .expect("search loads");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].native_id, "calendar::live");
+        assert_eq!(page.estimated_total, None);
+    }
+
+    #[tokio::test]
+    async fn local_search_keeps_cancelled_events_when_included() {
+        let (account, _script) = scripted_search_account(cancelled_and_live_page());
+
+        let page = search(account, local_search_request(true))
+            .await
+            .expect("search loads");
+
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].status, EventStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn local_search_limit_counts_only_surviving_events() {
+        let (account, _script) = scripted_search_account(cancelled_and_live_page());
+        let mut request = local_search_request(false);
+        request.limit = Some(1);
+
+        let page = search(account, request).await.expect("search loads");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].native_id, "calendar::live");
+    }
+
+    fn search_api_page() -> serde_json::Value {
+        json!({
+            "value": [{
+                "hitsContainers": [{
+                    "hits": [
+                        {"resource": {"id": "gone", "subject": "Planning", "isCancelled": true}},
+                        {"resource": {"id": "live", "subject": "Planning"}}
+                    ],
+                    "moreResultsAvailable": true
+                }]
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn search_api_drops_cancelled_but_advances_offset_by_raw_hits() {
+        let (account, _script) = scripted_search_account(search_api_page());
+
+        let page = search(account, EventSearchRequest::new("planning"))
+            .await
+            .expect("search loads");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].status, EventStatus::Confirmed);
+        assert_eq!(page.estimated_total, None);
+        assert_eq!(page.next_cursor, Some(search_api_cursor(2)));
+    }
+
+    #[tokio::test]
+    async fn search_api_keeps_cancelled_when_included() {
+        let (account, _script) = scripted_search_account(search_api_page());
+        let mut request = EventSearchRequest::new("planning");
+        request.include_cancelled = true;
+
+        let page = search(account, request).await.expect("search loads");
+
+        assert_eq!(page.items.len(), 2);
     }
 
     #[test]

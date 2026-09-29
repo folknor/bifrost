@@ -396,6 +396,9 @@ mod tests {
             .await
             .expect("a state change")
             .expect("no decode error");
+        // `PushNotification` has more than one variant only when `websockets`
+        // is on; without it this pattern is irrefutable, which is fine here.
+        #[allow(irrefutable_let_patterns)]
         let PushNotification::StateChange(changes) = notification else {
             panic!("expected a state change");
         };

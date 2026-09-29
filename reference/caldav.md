@@ -344,30 +344,30 @@ Supported calendar primitives:
   rather than an empty page that names its own watermark again and loops a
   cursor-following consumer forever.
 
-  **An OMITTED `limit` means unbounded, on both paging lanes, and it means it
-  literally (dav-F7).** `events_in_range` and `event_search` both map
-  `limit: None` to `usize::MAX`, which reaches
-  `bifrost_dav_core::slice_after_watermark` and truncates nothing: the page
-  carries every candidate href the query (or the degrade listing) named, the
-  multiget hydrates all of them, and `next_cursor` is `None` because there is no
-  remainder. Nothing downstream clamps it. `MULTIGET_BATCH_SIZE` chunks the
-  REPORTs but every chunk is dispatched and merged into the one page,
-  `MULTIGET_LEG_CONCURRENCY` bounds only how many are in flight at once, and
-  `Page` imposes no boundary of its own. So a `limit`-less call against a large
-  collection issues O(collection / batch) REPORTs and materializes the whole
-  collection's projected events in memory - and because a recurring resource
-  expands into an event per override, the item count is not even bounded by the
-  resource count. A consumer that wants a bounded page must ask for one.
+  **An OMITTED `limit` means `EVENT_PAGE_SIZE` (250) candidate resources, on both
+  paging lanes.** `events_in_range` and `event_search` map `limit: None` to that
+  constant, matching the CardDAV twin's `CONTACT_PAGE_SIZE`; the page carries a
+  `next_cursor` whenever more candidates remain, so a consumer that omits the
+  field still walks the collection a page at a time. The bound exists because an
+  unbounded default would issue O(collection / `MULTIGET_BATCH_SIZE`) REPORTs and
+  materialize the whole collection's projected events in memory. The page counts
+  RESOURCES, and a recurring resource expands into an event per override, so a
+  page can still carry more than 250 items. An EXPLICIT `limit` is honoured as
+  given, however large (`usize::MAX` reaches
+  `bifrost_dav_core::slice_after_watermark` and truncates nothing), and
+  continuation rides `page_cursor`.
 
-  **This does not match the CardDAV twin, and the divergence is recorded rather
-  than resolved.** `bifrost-carddav::contact_search` defaults `limit: None` to
-  `CONTACT_PAGE_SIZE` (250); the two crates handle an explicit limit
-  identically, so the default is the only difference. Aligning them is a product
-  decision about a published surface - one direction silently truncates results
-  a consumer currently receives whole, the other removes a bound a consumer
-  currently relies on - and it belongs to the repository owner, not to whoever
-  next reads this paragraph. What is settled is that neither behaviour is
-  undocumented any more.
+  `event_search` honours `EventSearchRequest::include_cancelled`. When it is
+  `false` (the default) events whose status is `Cancelled` are dropped by a
+  client-side filter on the local match, which is the authority over the page:
+  the server-side text match is only an advisory prefilter, and a server that
+  refuses the filter degrades the search to an unfiltered listing where a
+  server-side status filter would be lost anyway. `estimated_total` stays the
+  number of candidate resources the server named, an upper bound that the text
+  match and this filter can only lower. A missing `STATUS` projects as
+  `Confirmed`, following universal practice (RFC 5545 defines no default);
+  `Unknown` means only an unrecognized value. IMAP-shaped accounts delegate
+  `event_search` here unchanged, so they inherit all of this.
 
   **The key is the href, never the event id, and that is load-bearing.** The
   recurrence-qualified `EventId` (`{uri}#{RECURRENCE-ID}`) survives on the

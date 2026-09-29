@@ -7,12 +7,12 @@
 //! through these functions proves the two directions agree with each other,
 //! which is strictly weaker than proving either agrees with a real server.
 
+use bifrost_types::AddressBookId as SharedAddressBookId;
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AddressBook, ContactAddress, ContactCard,
     ContactCorpus, ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch,
     ContactPhone, ContactProvenance, ContactSearchRequest, Page, ProtocolKind,
 };
-use bifrost_types::{AddressBookId as SharedAddressBookId, DiagnosticText};
 use serde_json::{Map, Value, json};
 
 use crate::account::Account as JmapProtoAccount;
@@ -24,6 +24,7 @@ use crate::contact_card::{
 };
 use crate::core::SetCreate;
 use crate::core::transport::HttpTransport;
+use crate::sync::page_cursor::PageKind;
 
 type ContactAccount<T> = JmapProtoAccount<T>;
 
@@ -53,23 +54,26 @@ pub(crate) fn list<T: HttpTransport>(
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
     Box::pin(async move {
         let contacts = require_contacts(contacts, AccountOperation::ContactsList)?;
-        let cursor = decode_page_cursor(page_cursor, AccountOperation::ContactsList)?;
+        let cursor = ContactPages::decode_page_cursor(page_cursor, AccountOperation::ContactsList)?;
         let mut query = ContactCardQuery::new()
             .limit(PAGE_LIMIT)
             .calculate_total(true);
-        query = anchor_query(query, cursor.as_ref());
+        query = ContactPages::anchor_query(query, cursor.as_ref());
         if let Some(book) = address_book {
             query = query.filter(ContactFilter::in_address_book(JmapAddressBookId::new(
                 book.0,
             )));
         }
-        let query_response = contacts.call(query).await.map_err(page_call_err(
-            AccountOperation::ContactsList,
-            cursor.is_some(),
-        ))?;
+        let query_response = contacts
+            .call(query)
+            .await
+            .map_err(ContactPages::page_call_err(
+                AccountOperation::ContactsList,
+                cursor.is_some(),
+            ))?;
         // Before the total, before the cursor, before hydration: an
         // inconsistent continuation must expose no items and no successor.
-        verify_query_state(
+        ContactPages::verify_query_state(
             cursor.as_ref(),
             query_response.query_state(),
             AccountOperation::ContactsList,
@@ -78,7 +82,7 @@ pub(crate) fn list<T: HttpTransport>(
             .total()
             .map(|total| usize_to_u64(total, AccountOperation::ContactsList))
             .transpose()?;
-        let next_cursor = next_cursor(
+        let next_cursor = ContactPages::next_cursor(
             cursor.as_ref(),
             query_response.position(),
             query_response.ids(),
@@ -224,7 +228,8 @@ pub(crate) fn search<T: HttpTransport>(
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
     Box::pin(async move {
         let contacts = require_contacts(contacts, AccountOperation::ContactSearch)?;
-        let cursor = decode_page_cursor(request.page_cursor, AccountOperation::ContactSearch)?;
+        let cursor =
+            ContactPages::decode_page_cursor(request.page_cursor, AccountOperation::ContactSearch)?;
         let limit = request
             .limit
             .and_then(|limit| usize::try_from(limit).ok())
@@ -233,14 +238,17 @@ pub(crate) fn search<T: HttpTransport>(
             .limit(limit)
             .filter(ContactFilter::text(request.query))
             .calculate_total(true);
-        let query = anchor_query(query, cursor.as_ref());
-        let query_response = contacts.call(query).await.map_err(page_call_err(
-            AccountOperation::ContactSearch,
-            cursor.is_some(),
-        ))?;
+        let query = ContactPages::anchor_query(query, cursor.as_ref());
+        let query_response = contacts
+            .call(query)
+            .await
+            .map_err(ContactPages::page_call_err(
+                AccountOperation::ContactSearch,
+                cursor.is_some(),
+            ))?;
         // Before the total, before the cursor, before hydration: an
         // inconsistent continuation must expose no items and no successor.
-        verify_query_state(
+        ContactPages::verify_query_state(
             cursor.as_ref(),
             query_response.query_state(),
             AccountOperation::ContactSearch,
@@ -249,7 +257,7 @@ pub(crate) fn search<T: HttpTransport>(
             .total()
             .map(|total| usize_to_u64(total, AccountOperation::ContactSearch))
             .transpose()?;
-        let next_cursor = next_cursor(
+        let next_cursor = ContactPages::next_cursor(
             cursor.as_ref(),
             query_response.position(),
             query_response.ids(),
@@ -951,350 +959,28 @@ fn first_feature(value: Option<&Value>) -> Option<String> {
         .find_map(|(key, value)| value.as_bool().unwrap_or(false).then(|| key.clone()))
 }
 
-/// Version tag of the contact page-cursor payload. v1 was a bare integer
-/// POSITION into a `ContactCard/query` result order; v2 is `2:` followed by a
-/// JSON two-element array of the anchor card id and the `queryState` that
-/// order belonged to.
-///
-/// The payload after the tag is JSON, not two delimited strings: a JMAP id
-/// and a `queryState` are both opaque and either may contain any character a
-/// delimiter could be, so a delimited pair has no unambiguous split. JSON
-/// escapes its own contents, so both fields round-trip verbatim.
-const PAGE_CURSOR_V2_PREFIX: &str = "2:";
+/// The contact page walk's parameters for the shared anchored, state-pinned
+/// page cursor (`page_cursor`): the id marker, the query builder, and the
+/// wording of its diagnostics. Behaviour is not a parameter.
+struct ContactPages;
 
-/// A decoded contact page cursor: the card the next page resumes strictly
-/// after, plus the `queryState` the order that anchor was chosen from
-/// belonged to. Both fields are mandatory - see `decode_page_cursor`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PageCursor {
-    anchor: String,
-    query_state: String,
-}
+impl PageKind for ContactPages {
+    type ItemId = ContactCardId;
+    type Query = ContactCardQuery;
 
-/// Point a page query at its continuation.
-///
-/// The first page starts at position zero; every later page resolves its
-/// start server-side from the previous page's last id (`anchor` +
-/// `anchorOffset: 1`, RFC 8620 s5.5) rather than from an integer offset.
-///
-/// This used to be an integer position, which is only meaningful if the
-/// result ORDER is the same list it was when the cursor was minted.
-/// `ContactCard/query` is served without an explicit comparator here, so its
-/// order is server-defined and guaranteed stable across calls by nothing at
-/// all: a card created or destroyed BEHIND the cursor shifts every later
-/// position by one, and the consumer's next page silently skips or repeats a
-/// card. The anchor closes that half: the server resolves it against
-/// whatever order it is serving now, so churn behind the cursor cannot move
-/// the window.
-///
-/// The anchor alone is NOT sufficient, which is why every page also carries
-/// the `queryState` (`verify_query_state`). An anchor survives REORDERING
-/// AROUND IT: if a card ahead of the anchor moves behind it the walk returns
-/// it twice, and if a card behind the anchor moves ahead of it the walk never
-/// returns it at all. Neither is visible from the anchor, because the anchor
-/// is still exactly where the server says it is.
-fn anchor_query(query: ContactCardQuery, cursor: Option<&PageCursor>) -> ContactCardQuery {
-    match cursor {
-        Some(cursor) => query.anchor(cursor.anchor.as_str()).anchor_offset(1),
-        None => query.position(0),
+    const COLLECTION: &'static str = "contact";
+    const ITEM: &'static str = "contact";
+    const ID_LABEL: &'static str = "card";
+    const METHOD: &'static str = "ContactCard/query";
+    const REPEAT: &'static str = "listing";
+
+    fn query_from_start(query: ContactCardQuery) -> ContactCardQuery {
+        query.position(0)
     }
-}
 
-/// Decode a page cursor into the continuation it names.
-///
-/// Anything that is not a v2 payload is REFUSED, not reinterpreted. That
-/// covers the v1 bare integer (a position, which under anchored paging would
-/// mean either a stale offset or an id named "100") and, just as
-/// deliberately, an anchor-only payload: a cursor with no pinned
-/// `queryState` cannot be checked for reordering, so honouring it would be
-/// exactly the unchecked paging the pin exists to end.
-/// `SyncState(SchemaIncompatible)` is the crate's standing answer for an
-/// older cursor payload version (see the mail search cursor), and it tells
-/// the consumer what to do: restart the listing from the first page.
-fn decode_page_cursor(
-    page_cursor: Option<Vec<u8>>,
-    operation: AccountOperation,
-) -> Result<Option<PageCursor>, AccountError> {
-    let Some(cursor) = page_cursor else {
-        return Ok(None);
-    };
-    let cursor =
-        String::from_utf8(cursor).map_err(|error| cursor_error(operation, error.to_string()))?;
-    let Some(payload) = cursor.strip_prefix(PAGE_CURSOR_V2_PREFIX) else {
-        return Err(cursor_error(
-            operation,
-            "contact page cursor predates the anchored, state-pinned encoding".to_string(),
-        ));
-    };
-    let (anchor, query_state): (String, String) =
-        serde_json::from_str(payload).map_err(|error| {
-            cursor_error(operation, format!("malformed contact page cursor: {error}"))
-        })?;
-    if anchor.is_empty() {
-        return Err(cursor_error(
-            operation,
-            "contact page cursor carries an empty anchor id".to_string(),
-        ));
+    fn query_after(query: ContactCardQuery, anchor: &str) -> ContactCardQuery {
+        query.anchor(anchor).anchor_offset(1)
     }
-    Ok(Some(PageCursor {
-        anchor,
-        query_state,
-    }))
-}
-
-/// Refuse a continuation whose result set moved under it.
-///
-/// `queryState` identifies the ordered list of matching ids (RFC 8620 s5.5).
-/// If it differs from the one the cursor was minted against, the anchor is
-/// being resolved in a DIFFERENT list than the one the earlier page came
-/// from, and neither the anchor nor the position can tell us what moved
-/// across it. A card that overtook the anchor is lost; one that fell behind
-/// it is repeated.
-///
-/// Be precise about what refusing buys. It prevents SILENT acceptance of an
-/// inconsistent continuation - the caller learns the walk broke instead of
-/// receiving a page it cannot tell is short. It does NOT recover the missing
-/// cards, and it does not guarantee the walk ever finishes: a busy address
-/// book can move the state on every attempt and fail repeatedly, the same
-/// limitation mail search already carries. A restart re-reads the earlier
-/// pages, so a consumer must replace its prior result set or deduplicate
-/// against it. And a stable `queryState` pins the ordered ID LIST only - the
-/// hydrated properties of those cards can still have changed underneath it.
-///
-/// A server is not required to move the state for every edit either: it
-/// describes the matching ids in order, so an unrelated property change need
-/// not touch it, though RFC 8620 s5.5 permits a server that cannot tell to
-/// invalidate conservatively.
-///
-/// This runs BEFORE the page's total, cursor and hydration, including on an
-/// empty or apparently final page: an implementation that checks afterwards
-/// has already handed the caller items from a list it just decided was the
-/// wrong one.
-fn verify_query_state(
-    cursor: Option<&PageCursor>,
-    served: &str,
-    operation: AccountOperation,
-) -> Result<(), AccountError> {
-    match cursor {
-        Some(cursor) if cursor.query_state != served => Err(result_set_superseded(operation)),
-        _ => Ok(()),
-    }
-}
-
-/// Mint the cursor for the page after this one, `Ok(None)` when this page
-/// reached the end, and `Err` when the envelope it reached that conclusion
-/// from does not hold together.
-///
-/// Termination has two rules, and which one applies depends on whether the
-/// server answered with a `total`. With one (this query always asks, via
-/// `calculateTotal: true`), `position + served == total` is the end and is
-/// exact. WITHOUT one the walk continues until an EMPTY page: every nonempty
-/// page mints a successor.
-///
-/// Page fullness is deliberately NOT the fallback, but the reason is narrower
-/// than this comment used to claim. RFC 8620 s5.5 does not permit an
-/// arbitrary short non-final page: `ids` runs to the end of the result list
-/// or to the effective limit, and a server that clamps the requested limit
-/// must RETURN the `limit` it actually used. The honest argument is the other
-/// one: an absent `total` is not evidence of completion (treating it as "end
-/// of walk" truncates the walk at page ONE), while a conforming EMPTY page is
-/// conclusive. Fullness would additionally have to trust a `limit` echo that
-/// a server may omit, for no gain over asking once more. The cost of
-/// continue-until-empty is one extra round trip on a `total`-less server
-/// whose final page happened to land exactly on the end.
-///
-/// The three refusals, all `Protocol(ContractViolation)`
-/// (`page_envelope_violation`), all checked BEFORE any termination test so
-/// that a broken envelope can never present as a completed walk:
-///
-/// - A NEGATIVE position. RFC 8620 s5.5 types the response `position` as an
-///   UnsignedInt; a negative one indexes nothing.
-/// - `position + served > total` on a NONEMPTY page. `position` is the index
-///   of the first returned id and `total` is the length of the whole result
-///   list, so the last id sits at index `position + served - 1` and
-///   `position + served <= total` must hold. A response that claims to have
-///   served past the end of the list it just measured is CONTRADICTORY, and
-///   `>= total` alone reads that contradiction as a clean completion.
-/// - A continuation page that CONTAINS the anchor it resumed after.
-///   `anchorOffset: 1` means strictly after, and `verify_query_state` has
-///   already pinned the ordered result list, so the anchor cannot have moved
-///   into this window. This is what makes a non-advancing walk detectable
-///   rather than indistinguishable from an unbounded result set: under an
-///   unmoved `queryState` the list is stable and finite, so a server that
-///   re-serves the page the anchor came from is violating its own contract.
-///   It subsumes the narrower "the successor anchor equals the incoming
-///   anchor" rule, which is the same condition restricted to the last id.
-///
-/// The anchor is this page's LAST QUERY-RESULT id - taken from the ids the
-/// query answered with, never from whichever of them survived hydration or
-/// local filtering. The cursor addresses the server-side result set, so a
-/// page that hydrated nothing still has to name where the server continues
-/// from. `position` is the server's echo of where it actually served from,
-/// so a server that clamped the anchored start still reports a truthful base
-/// for the "is there more" test.
-///
-/// `query_state` is the state THIS response was served under, which by the
-/// time this is called `verify_query_state` has already confirmed matches
-/// the incoming cursor's pin (on a continuation) or is the walk's first
-/// observation (on a first page).
-fn next_cursor(
-    cursor: Option<&PageCursor>,
-    position: i32,
-    ids: &[ContactCardId],
-    total: Option<u64>,
-    query_state: &str,
-    operation: AccountOperation,
-) -> Result<Option<Vec<u8>>, AccountError> {
-    let base = u64::try_from(position).map_err(|_| {
-        page_envelope_violation(
-            operation,
-            format!("ContactCard/query answered with a negative position ({position})"),
-        )
-    })?;
-    // The comparison happens in `u64` deliberately: narrowing either side to
-    // `i32` first (which is what this did) turned an out-of-range `total`
-    // into an ABSENT one and silently switched termination modes, and a
-    // saturating `position + served` hid an overflowing position instead of
-    // catching it. Both saturations below are unreachable on a 64-bit target,
-    // and where they are reachable they saturate toward `next > total`, which
-    // is a REFUSAL - never toward a false completion.
-    let served = u64::try_from(ids.len()).unwrap_or(u64::MAX);
-    let next = base.saturating_add(served);
-    if let Some(cursor) = cursor
-        && ids.iter().any(|id| id.as_str() == cursor.anchor)
-    {
-        return Err(page_envelope_violation(
-            operation,
-            format!(
-                "ContactCard/query returned the anchor {} it was asked to resume strictly after, \
-                 under an unmoved queryState",
-                cursor.anchor
-            ),
-        ));
-    }
-    if let Some(total) = total {
-        if served > 0 && next > total {
-            return Err(page_envelope_violation(
-                operation,
-                format!(
-                    "ContactCard/query served {served} ids from position {position} of a result \
-                     list it reports as {total} long"
-                ),
-            ));
-        }
-        if next >= total {
-            return Ok(None);
-        }
-    }
-    let Some(anchor) = ids.last().map(ContactCardId::as_str) else {
-        return Ok(None);
-    };
-    // A JMAP id is at least one character (RFC 8620 s1.2), so a conforming
-    // server never reaches this arm. An empty id is a malformed envelope, and
-    // it gets the same treatment as the other three: ending the walk here
-    // would report a response we cannot page from as a completed listing.
-    if anchor.is_empty() {
-        return Err(page_envelope_violation(
-            operation,
-            "ContactCard/query returned an empty card id".to_string(),
-        ));
-    }
-    let payload = serde_json::to_string(&(anchor, query_state)).map_err(|error| {
-        page_envelope_violation(
-            operation,
-            format!("contact page cursor is not encodable: {error}"),
-        )
-    })?;
-    Ok(Some(
-        format!("{PAGE_CURSOR_V2_PREFIX}{payload}").into_bytes(),
-    ))
-}
-
-/// The server's own page envelope is internally inconsistent, or it
-/// contradicts the result list the pinned `queryState` promises is stable.
-///
-/// `Protocol(ContractViolation)` -> `RecoveryClass::ProviderContractViolation`.
-/// The three classifications it is deliberately not:
-///
-/// - `None` (walk complete) is what these cases used to produce, and it is
-///   the silent-truncation shape the anchored cursor exists to end.
-/// - `ConcurrencyConflict` (what a moved `queryState` gets) says "repeat the
-///   listing and it will work". Here the state did NOT move, so a repeat
-///   re-issues the identical request and gets the identical broken envelope;
-///   the caller would spin.
-/// - `SyncState(SchemaIncompatible)` (what a stale cursor payload gets) also
-///   directs a restart, and it points the blame at OUR cursor when the defect
-///   is in the response.
-///
-/// `ProviderContractViolation` is the one a consumer can act on: it is
-/// terminal for this walk and it names the server.
-fn page_envelope_violation(operation: AccountOperation, message: String) -> AccountError {
-    super::error::contract_violation(operation, None, message)
-}
-
-/// The result set this page cursor addresses is not the one it was minted
-/// against. Ordinary concurrent activity, not a server defect:
-/// `ConcurrencyConflict` derives `Retry(AfterStateRefresh)`, and refreshing
-/// here means listing again from the first page.
-fn result_set_superseded(operation: AccountOperation) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::ConcurrencyConflict,
-        bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(operation)
-    .text(DiagnosticText::support_only(
-        "contact result set changed between pages \
-         (ContactCard/query queryState moved); repeat the listing",
-    ))
-    .try_build()
-    .expect("valid account error classification")
-}
-
-/// Error mapping for a paged query call, aware of whether the call carried an
-/// anchor.
-///
-/// `anchorNotFound` means the card this cursor resumed after was destroyed
-/// between the two pages. The crate's central mapping classifies that as
-/// `Protocol(ContractViolation)` outside a cursor scope, which is right for a
-/// walk that never asked for an anchor and wrong here: a contact deleted
-/// while a consumer pages its address book is ordinary concurrent activity,
-/// not a server defect. `ConcurrencyConflict` derives
-/// `Retry(AfterStateRefresh)`, and refreshing this caller's state means
-/// listing again from the first page - which then succeeds.
-fn page_call_err(
-    operation: AccountOperation,
-    anchored: bool,
-) -> impl Fn(crate::Error) -> AccountError {
-    move |error| {
-        if anchored && is_anchor_not_found(&error) {
-            return anchor_lost(operation);
-        }
-        super::error::into_account_error(error, super::error::JmapErrorContext::new(operation))
-    }
-}
-
-fn is_anchor_not_found(error: &crate::Error) -> bool {
-    matches!(error, crate::Error::Method(method)
-    if matches!(
-        method.error_type(),
-        crate::core::error::MethodErrorType::AnchorNotFound
-    ))
-}
-
-fn anchor_lost(operation: AccountOperation) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::ConcurrencyConflict,
-        bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(operation)
-    .text(DiagnosticText::support_only(
-        "the contact this page cursor resumes after was removed \
-         (ContactCard/query anchorNotFound); repeat the listing",
-    ))
-    .try_build()
-    .expect("valid account error classification")
 }
 
 fn usize_to_u64(value: usize, operation: AccountOperation) -> Result<u64, AccountError> {
@@ -1316,20 +1002,6 @@ fn require_contacts<T: HttpTransport>(
 
 fn unsupported(operation: AccountOperation, message: &str) -> AccountError {
     super::error::unsupported_error(operation, None, message)
-}
-
-fn cursor_error(operation: AccountOperation, message: String) -> AccountError {
-    bifrost_types::AccountErrorBuilder::new(
-        bifrost_types::AccountErrorKind::SyncState(
-            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
-        ),
-        bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
-    )
-    .protocol(bifrost_types::Protocol::Jmap)
-    .operation(operation)
-    .text(DiagnosticText::support_only(message))
-    .try_build()
-    .expect("valid account error classification")
 }
 
 fn to_acct_err(operation: AccountOperation) -> impl Fn(crate::Error) -> AccountError {
@@ -1550,7 +1222,7 @@ mod tests {
     /// Build a page cursor the way a real page would have minted it, so no
     /// test hand-writes the encoding.
     fn page_cursor(anchor: &str, query_state: &str) -> Vec<u8> {
-        next_cursor(
+        ContactPages::next_cursor(
             None,
             0,
             &ids(&[anchor]),
@@ -1766,7 +1438,8 @@ mod tests {
             .expect("first page");
         let minted = page.next_cursor.expect("a second page is promised");
         assert_eq!(
-            decode_page_cursor(Some(minted), AccountOperation::ContactsList).expect("decodes"),
+            ContactPages::decode_page_cursor(Some(minted), AccountOperation::ContactsList)
+                .expect("decodes"),
             Some(cursor("c1", "q-first"))
         );
     }
@@ -1861,8 +1534,9 @@ mod tests {
     fn a_lost_anchor_off_an_anchored_page_keeps_the_contract_violation() {
         let wire: crate::core::error::MethodError =
             serde_json::from_value(json!({"type": "anchorNotFound"})).expect("method error parses");
-        let mapped =
-            page_call_err(AccountOperation::ContactsList, false)(crate::Error::Method(wire));
+        let mapped = ContactPages::page_call_err(AccountOperation::ContactsList, false)(
+            crate::Error::Method(wire),
+        );
         assert_eq!(
             mapped.kind(),
             &bifrost_types::AccountErrorKind::Protocol(
@@ -2193,278 +1867,11 @@ mod tests {
         values.iter().map(|id| ContactCardId::new(*id)).collect()
     }
 
-    fn cursor(anchor: &str, query_state: &str) -> PageCursor {
-        PageCursor {
+    fn cursor(anchor: &str, query_state: &str) -> crate::sync::page_cursor::PageCursor {
+        crate::sync::page_cursor::PageCursor {
             anchor: anchor.to_string(),
             query_state: query_state.to_string(),
         }
-    }
-
-    /// `next_cursor` for a FIRST page (no incoming anchor), which is what
-    /// most of these cases exercise.
-    fn mint(
-        position: i32,
-        page: &[ContactCardId],
-        total: Option<u64>,
-        query_state: &str,
-    ) -> Result<Option<Vec<u8>>, AccountError> {
-        next_cursor(
-            None,
-            position,
-            page,
-            total,
-            query_state,
-            AccountOperation::ContactsList,
-        )
-    }
-
-    /// The minted cursor names the page's LAST id and pins the state that
-    /// order was served under; when the server sent a total, that total
-    /// decides whether there is a next page at all.
-    #[test]
-    fn next_cursor_anchors_on_the_last_id_and_pins_the_state() {
-        let minted = mint(0, &ids(&["c1", "c2"]), Some(250), "q1")
-            .expect("valid envelope")
-            .expect("cursor");
-        assert_eq!(
-            decode_page_cursor(Some(minted), AccountOperation::ContactsList).expect("decodes"),
-            Some(cursor("c2", "q1"))
-        );
-        assert_eq!(
-            mint(200, &ids(&["c9"]), Some(201), "q1").expect("valid envelope"),
-            None
-        );
-    }
-
-    /// A server that ignores `calculateTotal` must not truncate the walk. With
-    /// no `total`, a NONEMPTY page mints a successor anchored on its last id
-    /// (whatever the page's length - fullness is not a completion test), and
-    /// only an EMPTY page ends the walk.
-    ///
-    /// Reverting the fallback to `let total = total...?` fails the first two
-    /// assertions. The short page is here to state the rule, not to catch a
-    /// fullness fallback: `next_cursor` is not handed the limit, so fullness
-    /// is not expressible at this seam at all - which is itself part of why
-    /// the rule is sound here.
-    #[test]
-    fn without_a_total_the_walk_continues_until_an_empty_page() {
-        assert_eq!(
-            decode_page_cursor(
-                mint(0, &ids(&["c1", "c2"]), None, "q1").expect("valid envelope"),
-                AccountOperation::ContactsList
-            )
-            .expect("decodes"),
-            Some(cursor("c2", "q1")),
-            "a full page with no total continues"
-        );
-        assert_eq!(
-            decode_page_cursor(
-                mint(40, &ids(&["c9"]), None, "q1").expect("valid envelope"),
-                AccountOperation::ContactsList
-            )
-            .expect("decodes"),
-            Some(cursor("c9", "q1")),
-            "a SHORT page with no total is not evidence of the end"
-        );
-        assert_eq!(
-            mint(80, &ids(&[]), None, "q1").expect("valid envelope"),
-            None,
-            "the empty page is what ends it"
-        );
-    }
-
-    /// BITES. `position` is the index of a nonempty page's FIRST id and
-    /// `total` is the length of the whole result list, so
-    /// `position + served > total` is a contradiction, not an ending. The
-    /// old `next >= total` arm read every one of these as a cleanly
-    /// completed walk; restoring it turns all four `expect_err` calls into
-    /// `Ok(None)` and the test fails.
-    ///
-    /// The empty-page row is the boundary the rule must NOT catch: with no
-    /// first id there is no index for `position` to be, so a server that
-    /// echoes a position past the end of an empty page is left alone and
-    /// terminates normally.
-    #[test]
-    fn an_envelope_that_contradicts_its_own_total_is_a_contract_violation() {
-        for (position, page, total) in [
-            (0, ids(&["c1", "c2"]), 1_u64),
-            (5, ids(&["c1"]), 5),
-            (0, ids(&["c1"]), 0),
-            (i32::MAX, ids(&["c1"]), 9),
-        ] {
-            let error = mint(position, &page, Some(total), "q1")
-                .expect_err("a contradictory envelope is not a completed walk");
-            assert!(
-                matches!(
-                    error.kind(),
-                    bifrost_types::AccountErrorKind::Protocol(
-                        bifrost_types::ProtocolErrorKind::ContractViolation
-                    )
-                ),
-                "position {position} + {} ids against total {total} must be refused",
-                page.len()
-            );
-        }
-        assert_eq!(
-            mint(90, &ids(&[]), Some(4), "q1").expect("an empty page indexes nothing"),
-            None
-        );
-    }
-
-    /// BITES. A negative `position` indexes nothing (RFC 8620 s5.5 types the
-    /// response field as an UnsignedInt). Under the old saturating `i32`
-    /// arithmetic `-5 + 2 = -3` compared BELOW every total, so this envelope
-    /// minted a successor and the walk carried on from a base that means
-    /// nothing; with no total it did the same. Deleting the `u64::try_from`
-    /// guard restores that and both `expect_err`s fail.
-    #[test]
-    fn a_negative_position_is_a_contract_violation() {
-        for total in [Some(50_u64), None] {
-            let error = mint(-5, &ids(&["c1", "c2"]), total, "q1")
-                .expect_err("a negative position is not a base to page from");
-            assert!(matches!(
-                error.kind(),
-                bifrost_types::AccountErrorKind::Protocol(
-                    bifrost_types::ProtocolErrorKind::ContractViolation
-                )
-            ));
-        }
-    }
-
-    /// BITES the non-termination detection. `anchorOffset: 1` resumes
-    /// STRICTLY after the anchor, and `verify_query_state` has already
-    /// established that the ordered result list did not move, so a page that
-    /// contains the anchor again is a server re-serving the window it was
-    /// asked to leave - the shape that used to page forever without
-    /// terminating. Deleting the containment check makes rows one and two
-    /// mint a successor instead of failing.
-    ///
-    /// Row two is the narrower "the successor anchor equals the incoming
-    /// anchor" case; it is a strict subset of containment, which is why one
-    /// rule covers both. Row three is the control: the same walk, a page
-    /// that genuinely moved past the anchor, still mints.
-    #[test]
-    fn a_continuation_that_re_serves_its_own_anchor_is_a_contract_violation() {
-        let incoming = cursor("c2", "q1");
-        for page in [ids(&["c2", "c3"]), ids(&["c3", "c2"])] {
-            let error = next_cursor(
-                Some(&incoming),
-                2,
-                &page,
-                None,
-                "q1",
-                AccountOperation::ContactsList,
-            )
-            .expect_err("a page must not contain the anchor it resumes after");
-            assert!(matches!(
-                error.kind(),
-                bifrost_types::AccountErrorKind::Protocol(
-                    bifrost_types::ProtocolErrorKind::ContractViolation
-                )
-            ));
-        }
-        assert!(
-            next_cursor(
-                Some(&incoming),
-                2,
-                &ids(&["c3", "c4"]),
-                None,
-                "q1",
-                AccountOperation::ContactsList,
-            )
-            .expect("an advancing page is fine")
-            .is_some()
-        );
-    }
-
-    /// CHARACTERISES ONLY - deliberately, and the reason is worth writing
-    /// down because it contradicts part of the finding this batch came from.
-    ///
-    /// The old code narrowed `total` to `i32` and treated a failed conversion
-    /// exactly like an ABSENT total. That reads as a silent mode switch, but
-    /// at THIS seam it cannot be observed: `position` is an `i32`, so
-    /// `position + served` can never reach a total above `i32::MAX`, and both
-    /// the exact test and the absent-total rule therefore say "keep walking"
-    /// for every such envelope. No input distinguishes the two, so no test
-    /// can bite on the total conversion alone.
-    ///
-    /// What WAS observable is the other half - the saturating `i32` addition,
-    /// which turned an overflowing position into `next == i32::MAX` and so
-    /// into a silent completion against any total. That case bites, and it is
-    /// the `i32::MAX` row of
-    /// `an_envelope_that_contradicts_its_own_total_is_a_contract_violation`.
-    #[test]
-    fn a_total_above_i32_max_is_not_read_as_an_absent_total() {
-        let total = u64::from(u32::MAX) + 7;
-        assert!(
-            mint(0, &ids(&["c1", "c2"]), Some(total), "q1")
-                .expect("valid envelope")
-                .is_some(),
-            "two ids out of four billion is not the end of the list"
-        );
-    }
-
-    /// Every payload that is not a v2 anchor-plus-state pair is refused
-    /// rather than reinterpreted. Two cases carry the weight: the v1 bare
-    /// position (reading it as an anchor would page from a contact named
-    /// "100"), and the anchor-ONLY v2 shape - a cursor with no pinned state
-    /// cannot be checked for reordering, so accepting it would reinstate the
-    /// hole the pin closes.
-    #[test]
-    fn a_page_cursor_refuses_every_shape_without_a_pinned_state() {
-        for refused in [
-            "100",
-            "-1",
-            "not-a-number",
-            "2:c2",
-            "2:[\"c2\"]",
-            "2:[\"c2\",\"q1\",\"extra\"]",
-            "2:[\"\",\"q1\"]",
-            "3:[\"c2\",\"q1\"]",
-            "2:",
-        ] {
-            let error =
-                decode_page_cursor(Some(Vec::from(refused)), AccountOperation::ContactsList)
-                    .expect_err("older or malformed cursor should fail");
-            assert!(
-                matches!(
-                    error.kind(),
-                    bifrost_types::AccountErrorKind::SyncState(
-                        bifrost_types::SyncStateErrorKind::SchemaIncompatible
-                    )
-                ),
-                "{refused} must be refused as SchemaIncompatible"
-            );
-        }
-    }
-
-    /// Both halves are opaque strings that may contain anything a delimiter
-    /// could be. JSON quoting is what makes the split unambiguous, so an id
-    /// and a state full of separators, quotes and brackets round-trip.
-    #[test]
-    fn a_page_cursor_round_trips_opaque_halves() {
-        let minted = mint(0, &ids(&["a:b\",\"c"]), Some(9), "[\"q:1\"]")
-            .expect("valid envelope")
-            .expect("cursor");
-        assert_eq!(
-            decode_page_cursor(Some(minted), AccountOperation::ContactsList).expect("decodes"),
-            Some(cursor("a:b\",\"c", "[\"q:1\"]"))
-        );
-    }
-
-    /// The state check refuses a moved state, accepts an unmoved one, and
-    /// has nothing to compare on a first page.
-    #[test]
-    fn verify_query_state_refuses_only_a_moved_state() {
-        let op = AccountOperation::ContactsList;
-        assert!(verify_query_state(None, "q1", op).is_ok());
-        assert!(verify_query_state(Some(&cursor("c2", "q1")), "q1", op).is_ok());
-        let error = verify_query_state(Some(&cursor("c2", "q1")), "q2", op)
-            .expect_err("a moved state must be refused");
-        assert_eq!(
-            error.kind(),
-            &bifrost_types::AccountErrorKind::ConcurrencyConflict
-        );
     }
 
     /// The first page positions at zero; a continuation carries the anchor
@@ -2472,12 +1879,15 @@ mod tests {
     /// the window.
     #[test]
     fn a_continuation_page_queries_by_anchor_not_position() {
-        let first = serde_json::to_value(anchor_query(ContactCardQuery::new().limit(2), None))
-            .expect("query serializes");
+        let first = serde_json::to_value(ContactPages::anchor_query(
+            ContactCardQuery::new().limit(2),
+            None,
+        ))
+        .expect("query serializes");
         assert_eq!(first.get("position"), Some(&json!(0)));
         assert_eq!(first.get("anchor"), None);
 
-        let next = serde_json::to_value(anchor_query(
+        let next = serde_json::to_value(ContactPages::anchor_query(
             ContactCardQuery::new().limit(2),
             Some(&cursor("c2", "q1")),
         ))
