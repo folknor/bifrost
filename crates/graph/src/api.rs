@@ -16,19 +16,15 @@ impl GraphClient {
         let prefix = self.api_path_prefix();
         let mut folders = Vec::new();
         let mut walk = PageWalk::new("mailFolders");
-        let mut next_url = Some(format!(
+        let mut next_url = Some(self.api_url(&format!(
             "{prefix}/mailFolders?$select=id,displayName,parentFolderId,childFolderCount&$top=100"
-        ));
+        ))?);
 
         while let Some(url) = next_url {
             walk.enter(&url)?;
-            let page: ODataCollection<GraphMailFolder> = if url.starts_with("http") {
-                self.get_absolute(&url).await?
-            } else {
-                self.get_json(&url).await?
-            };
+            let page: ODataCollection<GraphMailFolder> = self.get(&url).await?;
             folders.extend(page.value);
-            next_url = page.next_link;
+            next_url = self.admit_next(page.next_link.as_ref())?;
         }
 
         Ok(folders)
@@ -58,24 +54,20 @@ impl GraphClient {
             }
             let enc_parent_id = bifrost_net::url::encode_path_component(&parent_id);
             let mut walk = PageWalk::new("childFolders");
-            let mut next_url = Some(format!(
+            let mut next_url = Some(self.api_url(&format!(
                 "{prefix}/mailFolders/{enc_parent_id}/childFolders?$select=id,displayName,parentFolderId,childFolderCount&$top=100"
-            ));
+            ))?);
 
             while let Some(url) = next_url {
                 walk.enter(&url)?;
-                let page: ODataCollection<GraphMailFolder> = if url.starts_with("http") {
-                    self.get_absolute(&url).await?
-                } else {
-                    self.get_json(&url).await?
-                };
+                let page: ODataCollection<GraphMailFolder> = self.get(&url).await?;
                 for folder in page.value {
                     if folder.child_folder_count.unwrap_or(0) > 0 {
                         queue.push_back(folder.id.clone());
                     }
                     folders.push(folder);
                 }
-                next_url = page.next_link;
+                next_url = self.admit_next(page.next_link.as_ref())?;
             }
         }
 
@@ -86,17 +78,13 @@ impl GraphClient {
         let prefix = self.api_path_prefix();
         let mut rules = Vec::new();
         let mut walk = PageWalk::new("messageRules");
-        let mut next_url = Some(format!("{prefix}/mailFolders/inbox/messageRules"));
+        let mut next_url = Some(self.api_url(&format!("{prefix}/mailFolders/inbox/messageRules"))?);
 
         while let Some(url) = next_url {
             walk.enter(&url)?;
-            let page: ODataCollection<GraphMessageRule> = if url.starts_with("http") {
-                self.get_absolute(&url).await?
-            } else {
-                self.get_json(&url).await?
-            };
+            let page: ODataCollection<GraphMessageRule> = self.get(&url).await?;
             rules.extend(page.value);
-            next_url = page.next_link;
+            next_url = self.admit_next(page.next_link.as_ref())?;
         }
 
         Ok(rules)

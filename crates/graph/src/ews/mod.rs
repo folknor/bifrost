@@ -12,13 +12,17 @@ use std::pin::Pin;
 pub(crate) use self::parse::*;
 pub(crate) use self::xml_helpers::*;
 
-/// The EWS SOAP endpoint under a given Outlook origin. Derived rather than
-/// hardcoded so the harness api-base override reaches EWS too (the
-/// production origin lives on `outlook.office365.com`, not on the Graph
-/// host, so redirecting the Graph base alone left EWS pointed at the real
-/// service).
+/// The EWS SOAP path under the Outlook origin. Resolved against the client's
+/// Outlook base rather than hardcoded so the harness api-base override
+/// reaches EWS too (the production origin lives on `outlook.office365.com`,
+/// not on the Graph host, so redirecting the Graph base alone left EWS
+/// pointed at the real service).
+pub(crate) const EWS_PATH: &str = "/EWS/Exchange.asmx";
+
+/// The EWS SOAP endpoint under a given Outlook origin.
+#[cfg(test)]
 pub(crate) fn ews_url(outlook_base: &str) -> String {
-    format!("{}/EWS/Exchange.asmx", outlook_base.trim_end_matches('/'))
+    format!("{}{EWS_PATH}", outlook_base.trim_end_matches('/'))
 }
 
 /// EWS request routing headers. Public-folder operations route by
@@ -145,6 +149,10 @@ pub(crate) enum EwsError {
     /// XML body could not be parsed. Surfaces at the boundary as
     /// `WireCause::MalformedResponse { protocol: Protocol::Ews, .. }`.
     MalformedXml(DiagnosticText),
+
+    /// The configured Outlook origin is unusable, so no request was sent.
+    /// The consumer's configuration, classified `Request(Malformed)`.
+    Configuration(String),
 }
 
 impl std::fmt::Display for EwsError {
@@ -156,6 +164,7 @@ impl std::fmt::Display for EwsError {
                 write!(f, "EWS SOAP fault {code:?}: {}", detail.as_str())
             }
             Self::MalformedXml(detail) => write!(f, "EWS malformed XML: {}", detail.as_str()),
+            Self::Configuration(message) => write!(f, "EWS not configured: {message}"),
         }
     }
 }
@@ -238,7 +247,9 @@ impl SoapFaultCode {
 
 pub(crate) struct EwsClient {
     net: AccountNet,
-    ews_url: String,
+    /// The admitted SOAP endpoint, or why the configured Outlook origin is
+    /// unusable - in which case every request fails closed before any byte.
+    ews_url: Result<crate::origin::AdmittedUrl, String>,
     tally: Option<crate::client::ByteTally>,
 }
 

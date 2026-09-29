@@ -1,12 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+use crate::origin::ProviderLink;
+
+/// Both links are untrusted server output: they become request targets,
+/// caller cursors or persisted checkpoints only through admission (see
+/// `crate::origin`).
 #[derive(Debug, Deserialize)]
 pub(crate) struct ODataCollection<T> {
     pub(crate) value: Vec<T>,
     #[serde(rename = "@odata.nextLink")]
-    pub(crate) next_link: Option<String>,
+    pub(crate) next_link: Option<ProviderLink>,
     #[serde(rename = "@odata.deltaLink")]
-    pub(crate) delta_link: Option<String>,
+    pub(crate) delta_link: Option<ProviderLink>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
 use crate::error::{GraphError, GraphResponseError};
+use crate::origin::{AdmittedUrl, Base, ProviderLink, Refusal};
 
 pub(crate) const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
 
@@ -54,11 +55,13 @@ pub struct GraphClient {
 struct ClientInner {
     net: Option<Net>,
     account_net: RwLock<Option<AccountNet>>,
-    api_base: String,
+    /// The Graph REST base, and the only origin a REST or blob request may
+    /// carry the bearer to (see `crate::origin`).
+    api_base: Base,
     /// Origin for the Autodiscover + EWS surfaces. Derived from `api_base`
     /// (see [`derive_outlook_base`]) unless a consumer overrode it with
     /// [`GraphClient::with_outlook_base`].
-    outlook_base: String,
+    outlook_base: Base,
     rate_limit_host: String,
     token_source: Arc<dyn TokenSource>,
     mailbox_id: Option<String>,
@@ -166,6 +169,17 @@ impl WireBody {
             bytes,
         }
     }
+}
+
+/// Where an auxiliary request goes, and therefore whether it carries the
+/// account bearer: only an admitted URL may, so the choice is made by type,
+/// not by a flag a caller could set next to any string.
+pub(crate) enum AuxTarget<'a> {
+    /// Carries the bearer; admitted onto a configured origin.
+    Bearer(&'a AdmittedUrl),
+    /// Carries no bearer: a URL that is its own credential (the OneDrive
+    /// pre-authenticated upload session).
+    Anonymous(&'a str),
 }
 
 #[cfg(test)]
@@ -404,7 +418,7 @@ impl GraphClient {
     // refresh-token store) so a token it refreshes and persists is read
     // live at every wire authentication without reopening the client.
     pub fn with_source(api_base: impl Into<String>, source: Arc<dyn TokenSource>) -> Self {
-        let api_base = trim_base(api_base.into());
+        let api_base = Base::parse(api_base);
         let rate_limit_host = host_from_api_base(&api_base);
         let outlook_base = derive_outlook_base(&api_base);
         Self {
@@ -430,7 +444,7 @@ impl GraphClient {
         api_base: impl Into<String>,
         token_source: Arc<dyn TokenSource>,
     ) -> Self {
-        let api_base = trim_base(api_base.into());
+        let api_base = Base::parse(api_base);
         let outlook_base = derive_outlook_base(&api_base);
         // Derived from the supplied base like every other constructor,
         // not hardcoded: an injected net against a redirected base must
@@ -527,13 +541,76 @@ impl GraphClient {
             .and_then(|slot| slot.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn api_base(&self) -> &str {
-        &self.inner.api_base
+        self.inner.api_base.as_str()
     }
 
     /// Origin for the Autodiscover + EWS surfaces.
+    #[cfg(test)]
     pub(crate) fn outlook_base(&self) -> &str {
-        &self.inner.outlook_base
+        self.inner.outlook_base.as_str()
+    }
+
+    /// A crate-built Graph path, admitted onto the api-base. The only way
+    /// it fails is an unusable configured base, which is the consumer's
+    /// configuration, so it surfaces as `GraphError::Configuration`.
+    pub(crate) fn api_url(&self, path: &str) -> Result<AdmittedUrl, GraphError> {
+        self.inner
+            .api_base
+            .admit(path)
+            .map_err(configuration_refusal)
+    }
+
+    /// Admit a link a Graph response supplied. Called at RECEIPT - before
+    /// the link is followed, minted into a caller cursor, or persisted - so
+    /// a refusal is attributed to the response that carried it.
+    pub(crate) fn admit_link(&self, link: &ProviderLink) -> Result<AdmittedUrl, GraphError> {
+        self.inner
+            .api_base
+            .admit_link(link)
+            .map_err(|refusal| match refusal {
+                Refusal::InvalidBase(_) => configuration_refusal(refusal),
+                Refusal::Target(reason) => GraphError::ProviderLinkRefused { reason },
+            })
+    }
+
+    /// Admit a page's optional `@odata.nextLink`, the step every walk takes
+    /// before following it.
+    pub(crate) fn admit_next(
+        &self,
+        link: Option<&ProviderLink>,
+    ) -> Result<Option<AdmittedUrl>, GraphError> {
+        link.map(|link| self.admit_link(link)).transpose()
+    }
+
+    /// Admit a target whose provenance the CALLER knows (a caller page
+    /// cursor, a persisted sync cursor) and will classify itself.
+    pub(crate) fn admit_target(&self, target: &str) -> Result<AdmittedUrl, Refusal> {
+        self.inner.api_base.admit(target)
+    }
+
+    /// A crate-built Autodiscover / EWS path, admitted onto the Outlook
+    /// origin.
+    pub(crate) fn outlook_url(&self, path: &str) -> Result<AdmittedUrl, GraphError> {
+        self.inner
+            .outlook_base
+            .admit(path)
+            .map_err(configuration_refusal)
+    }
+
+    /// The EWS SOAP endpoint on the Outlook origin, or why there is none.
+    pub(crate) fn ews_url(&self) -> Result<AdmittedUrl, String> {
+        self.inner
+            .outlook_base
+            .admit(crate::ews::EWS_PATH)
+            .map_err(|refusal| refusal.to_string())
+    }
+
+    /// Admit an endpoint an Autodiscover response named, onto the Outlook
+    /// origin. The caller classifies the refusal.
+    pub(crate) fn admit_outlook_target(&self, target: &str) -> Result<AdmittedUrl, Refusal> {
+        self.inner.outlook_base.admit(target)
     }
 
     /// Override the Autodiscover / EWS origin independently of the Graph
@@ -554,7 +631,7 @@ impl GraphClient {
                 net: self.inner.net.clone(),
                 account_net: RwLock::new(self.account_net()),
                 api_base: self.inner.api_base.clone(),
-                outlook_base: trim_base(outlook_base.into()),
+                outlook_base: Base::parse(outlook_base),
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: self.inner.mailbox_id.clone(),
@@ -617,8 +694,8 @@ impl GraphClient {
     }
 
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, GraphError> {
-        let url = self.api_url(path);
-        self.request::<T, ()>(&url, "GET", None).await
+        let url = self.api_url(path)?;
+        self.get(&url).await
     }
 
     pub(crate) async fn get_json_prefer<T: DeserializeOwned>(
@@ -626,21 +703,22 @@ impl GraphClient {
         path: &str,
         prefer: &str,
     ) -> Result<T, GraphError> {
-        let url = self.api_url(path);
-        self.request_prefer::<T, ()>(&url, "GET", prefer, None)
-            .await
+        let url = self.api_url(path)?;
+        self.get_prefer(&url, prefer).await
     }
 
-    pub(crate) async fn get_absolute<T: DeserializeOwned>(
+    /// GET an admitted URL: a crate-built path (`api_url`) or an admitted
+    /// cursor / server link. There is no string-taking twin on purpose.
+    pub(crate) async fn get<T: DeserializeOwned>(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
     ) -> Result<T, GraphError> {
         self.request::<T, ()>(url, "GET", None).await
     }
 
-    pub(crate) async fn get_absolute_prefer<T: DeserializeOwned>(
+    pub(crate) async fn get_prefer<T: DeserializeOwned>(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         prefer: &str,
     ) -> Result<T, GraphError> {
         self.request_prefer::<T, ()>(url, "GET", prefer, None).await
@@ -651,12 +729,12 @@ impl GraphClient {
         path: &str,
         body: &B,
     ) -> Result<T, GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         self.request(&url, "POST", Some(body)).await
     }
 
     pub(crate) async fn post_empty(&self, path: &str) -> Result<(), GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         let response = self.execute(&url, "POST", None::<&()>).await?;
         check_response_status(response)
     }
@@ -666,7 +744,7 @@ impl GraphClient {
         path: &str,
         body: &B,
     ) -> Result<(), GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         let response = self.execute(&url, "POST", Some(body)).await?;
         check_response_status(response)
     }
@@ -681,7 +759,7 @@ impl GraphClient {
         path: &str,
         base64_mime: Bytes,
     ) -> Result<T, GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         let response = self
             .execute_wire(&url, "POST", None, None, Some(WireBody::mime(base64_mime)))
             .await?;
@@ -689,7 +767,7 @@ impl GraphClient {
     }
 
     pub(crate) async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         let response = self.execute(&url, "PATCH", Some(body)).await?;
         check_response_status(response)
     }
@@ -700,7 +778,7 @@ impl GraphClient {
         etag: &str,
         body: &B,
     ) -> Result<(), GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         let response = self
             .execute_if_match(&url, "PATCH", etag, Some(body))
             .await?;
@@ -712,18 +790,18 @@ impl GraphClient {
         path: &str,
         body: &B,
     ) -> Result<T, GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         self.request(&url, "PATCH", Some(body)).await
     }
 
     pub(crate) async fn delete(&self, path: &str) -> Result<(), GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         let response = self.execute(&url, "DELETE", None::<&()>).await?;
         check_response_status(response)
     }
 
     pub(crate) async fn delete_if_match(&self, path: &str, etag: &str) -> Result<(), GraphError> {
-        let url = self.api_url(path);
+        let url = self.api_url(path)?;
         let response = self
             .execute_if_match(&url, "DELETE", etag, None::<&()>)
             .await?;
@@ -737,13 +815,9 @@ impl GraphClient {
         self.post("/$batch", batch).await
     }
 
-    fn api_url(&self, path: &str) -> String {
-        build_url(&self.inner.api_base, path)
-    }
-
     async fn request<T: DeserializeOwned, B: Serialize>(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         method: &str,
         body: Option<&B>,
     ) -> Result<T, GraphError> {
@@ -753,7 +827,7 @@ impl GraphClient {
 
     async fn request_prefer<T: DeserializeOwned, B: Serialize>(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         method: &str,
         prefer: &str,
         body: Option<&B>,
@@ -766,7 +840,7 @@ impl GraphClient {
 
     async fn execute<B: Serialize>(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         method: &str,
         body: Option<&B>,
     ) -> Result<RestResponse, GraphError> {
@@ -775,7 +849,7 @@ impl GraphClient {
 
     async fn execute_if_match<B: Serialize>(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         method: &str,
         etag: &str,
         body: Option<&B>,
@@ -786,7 +860,7 @@ impl GraphClient {
 
     async fn execute_request<B: Serialize>(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         method: &str,
         if_match: Option<&str>,
         prefer: Option<&str>,
@@ -802,14 +876,19 @@ impl GraphClient {
     /// The one place a Graph REST request leaves this crate. Every helper
     /// above funnels through here, raw MIME included, so the scripted seam
     /// covers the whole surface and no path can quietly bypass it.
+    ///
+    /// It takes an `AdmittedUrl` and nothing else: bifrost-net attaches the
+    /// bearer to the first request whatever its host, so the origin decision
+    /// has to be made before this point, and the type proves it was.
     async fn execute_wire(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         method: &str,
         if_match: Option<&str>,
         prefer: Option<&str>,
         body: Option<WireBody>,
     ) -> Result<RestResponse, GraphError> {
+        let url = url.as_str();
         // Records the request in this crate's richer shape and does not
         // answer it: the response comes back from the scripted transport
         // below, through the production retry loop.
@@ -881,11 +960,14 @@ impl GraphClient {
     pub(crate) async fn execute_aux(
         &self,
         method: &str,
-        url: &str,
+        target: AuxTarget<'_>,
         headers: &[(&str, &str)],
-        bearer: bool,
         body: Bytes,
     ) -> Result<RestResponse, GraphError> {
+        let (url, bearer) = match target {
+            AuxTarget::Bearer(url) => (url.as_str(), true),
+            AuxTarget::Anonymous(url) => (url, false),
+        };
         #[cfg(test)]
         self.record_aux(method, url, headers, bearer, &body);
         let account_net = self.wire_net().ok_or_else(|| {
@@ -976,9 +1058,10 @@ impl GraphClient {
     /// open failure.
     pub(crate) async fn download_stream(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         range: Option<bifrost_types::ByteRange>,
     ) -> Result<bifrost_net::ByteStream, bifrost_net::Error> {
+        let url = url.as_str();
         #[cfg(test)]
         self.record_download(url, range);
         let account_net = self.wire_net().ok_or(bifrost_net::Error::Network {
@@ -1219,13 +1302,20 @@ impl GraphClient {
     }
 }
 
-fn trim_base(base: String) -> String {
-    base.trim_end_matches('/').to_string()
+/// Where a request that could not name its own target goes: an unusable
+/// configured base is the consumer's configuration, so it is a malformed
+/// request, not a transport or provider condition.
+fn configuration_refusal(refusal: Refusal) -> GraphError {
+    GraphError::Configuration {
+        message: refusal.to_string(),
+    }
 }
 
-fn host_from_api_base(api_base: &str) -> String {
-    reqwest::Url::parse(api_base)
-        .ok()
+/// The rate-limit bucket host. An unusable base falls back to the production
+/// Graph host only for bookkeeping: no request can be admitted against it.
+fn host_from_api_base(api_base: &Base) -> String {
+    api_base
+        .url()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| GRAPH_HOST.to_string())
 }
@@ -1240,30 +1330,25 @@ fn host_from_api_base(api_base: &str) -> String {
 /// the only sane target for the sibling surfaces: a harness that redirects
 /// Graph but leaves Autodiscover/EWS pointing at the real
 /// `outlook.office365.com` cannot exercise the public-folder or EWS-streaming
-/// legs at all. An unparseable base falls back to production rather than
-/// inventing an origin.
-fn derive_outlook_base(api_base: &str) -> String {
-    let Ok(url) = reqwest::Url::parse(api_base) else {
-        return OUTLOOK_BASE.to_string();
+/// legs at all.
+///
+/// An UNUSABLE api-base derives an unusable Outlook origin rather than
+/// falling back to production: a consumer that misconfigured Graph must not
+/// be left with Autodiscover and EWS sending its bearer to the real
+/// `outlook.office365.com`. `with_outlook_base` can still name one
+/// explicitly.
+fn derive_outlook_base(api_base: &Base) -> Base {
+    let Some(url) = api_base.url() else {
+        return Base::invalid(
+            api_base.as_str(),
+            "Outlook origin derived from an unusable Graph api-base",
+        );
     };
     if url.host_str() == Some(GRAPH_HOST) {
-        return OUTLOOK_BASE.to_string();
+        return Base::parse(OUTLOOK_BASE);
     }
-    match (url.host_str(), url.port()) {
-        (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
-        (Some(host), None) => format!("{}://{host}", url.scheme()),
-        (None, _) => OUTLOOK_BASE.to_string(),
-    }
-}
-
-fn build_url(base: &str, path: &str) -> String {
-    if path.starts_with("http://") || path.starts_with("https://") {
-        path.to_string()
-    } else if path.starts_with('/') {
-        format!("{base}{path}")
-    } else {
-        format!("{base}/{path}")
-    }
+    // `validate` guarantees a host on a usable base.
+    Base::parse(url.origin().ascii_serialization())
 }
 
 /// Parse a Graph JSON success response. On a non-success status,
@@ -1397,42 +1482,46 @@ mod tests {
     }
 
     #[test]
-    fn build_url_joins_relative_paths_and_passes_absolute_urls_through() {
+    fn api_url_joins_paths_and_admits_only_the_api_origin() {
         // The `@odata.nextLink` / `@odata.deltaLink` walk feeds absolute
         // URLs back in; rewriting them onto the api-base would break
-        // pagination.
+        // pagination, so a same-origin absolute URL passes through. One on
+        // any other origin is refused: the request would carry the bearer.
+        let client = GraphClient::with_api_base("https://x/v1.0", "token");
         assert_eq!(
-            build_url("https://x/v1.0", "/me/messages"),
+            client.api_url("/me/messages").expect("path").as_str(),
             "https://x/v1.0/me/messages"
         );
         assert_eq!(
-            build_url("https://x/v1.0", "me/messages"),
+            client.api_url("me/messages").expect("bare path").as_str(),
             "https://x/v1.0/me/messages"
         );
         assert_eq!(
-            build_url("https://x/v1.0", "https://graph.example/next?$skiptoken=a"),
-            "https://graph.example/next?$skiptoken=a"
+            client
+                .api_url("https://x/v1.0/next?$skiptoken=a")
+                .expect("same origin")
+                .as_str(),
+            "https://x/v1.0/next?$skiptoken=a"
         );
-        assert_eq!(
-            build_url("https://x/v1.0", "http://graph.example/next"),
-            "http://graph.example/next"
-        );
+        assert!(matches!(
+            client.api_url("https://graph.example/next?$skiptoken=a"),
+            Err(GraphError::Configuration { .. })
+        ));
+        assert!(matches!(
+            client.admit_link(&ProviderLink::for_tests("http://x/v1.0/next")),
+            Err(GraphError::ProviderLinkRefused { .. })
+        ));
     }
 
     #[test]
     fn rate_limit_host_tracks_the_api_base_host() {
         // The per-host token bucket must follow a redirected base, or a
         // harness run would meter against `graph.microsoft.com`.
-        assert_eq!(
-            host_from_api_base("https://graph.microsoft.com/v1.0"),
-            GRAPH_HOST
-        );
-        assert_eq!(
-            host_from_api_base("http://127.0.0.1:8181/v1.0"),
-            "127.0.0.1"
-        );
+        let host = |base: &str| host_from_api_base(&Base::parse(base));
+        assert_eq!(host("https://graph.microsoft.com/v1.0"), GRAPH_HOST);
+        assert_eq!(host("http://127.0.0.1:8181/v1.0"), "127.0.0.1");
         // An unparseable base falls back to production rather than panicking.
-        assert_eq!(host_from_api_base("not a url"), GRAPH_HOST);
+        assert_eq!(host("not a url"), GRAPH_HOST);
     }
 
     /// nc-9's shape: `with_account_net` was the one constructor that
@@ -1454,15 +1543,31 @@ mod tests {
 
     #[test]
     fn outlook_base_keeps_the_scheme_and_port_of_a_redirected_api_base() {
+        let derive = |base: &str| derive_outlook_base(&Base::parse(base));
         assert_eq!(
-            derive_outlook_base("https://graph.contoso-cloud.test/v1.0"),
+            derive("https://graph.contoso-cloud.test/v1.0").as_str(),
             "https://graph.contoso-cloud.test"
         );
         assert_eq!(
-            derive_outlook_base("http://127.0.0.1:8181/v1.0"),
+            derive("http://127.0.0.1:8181/v1.0").as_str(),
             "http://127.0.0.1:8181"
         );
-        assert_eq!(derive_outlook_base("nonsense"), OUTLOOK_BASE);
+        // An unusable Graph base derives an unusable Outlook origin rather
+        // than falling back to production: the fallback would have left
+        // Autodiscover and EWS sending the bearer to the real service.
+        assert!(derive("nonsense").url().is_none());
+        assert!(
+            GraphClient::with_api_base("nonsense", "token")
+                .ews_url()
+                .is_err()
+        );
+        // An explicit Outlook origin still repairs it.
+        assert!(
+            GraphClient::with_api_base("nonsense", "token")
+                .with_outlook_base("https://ews.test")
+                .ews_url()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1556,15 +1661,8 @@ mod tests {
     ) -> Result<RestResponse, GraphError> {
         let client = GraphClient::new("token");
         client.script_rest(responses);
-        client
-            .execute_wire(
-                "https://graph.microsoft.com/v1.0/me",
-                "GET",
-                None,
-                None,
-                None,
-            )
-            .await
+        let url = client.api_url("/me").expect("api url");
+        client.execute_wire(&url, "GET", None, None, None).await
     }
 
     /// `bifrost-net` returns `Ok(Response)` for 2xx and a passed-through
@@ -1672,14 +1770,9 @@ mod tests {
             ScriptedRestResponse::json(StatusCode::OK, serde_json::json!({"ok": true})),
         ]);
 
+        let url = client.api_url("/me").expect("api url");
         let response = client
-            .execute_wire(
-                "https://graph.microsoft.com/v1.0/me",
-                "GET",
-                None,
-                None,
-                None,
-            )
+            .execute_wire(&url, "GET", None, None, None)
             .await
             .expect("the retried 503 succeeds on the second attempt");
 

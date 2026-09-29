@@ -1776,7 +1776,7 @@ mod tests {
             messages_scope.clone(),
             GraphCursorPayload::new(
                 kind_for_scope(&messages_scope).unwrap(),
-                "https://graph.example/delta".to_string(),
+                &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
                 None,
             ),
         )

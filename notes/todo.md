@@ -48,22 +48,24 @@ item is what stops that.
   continuations interleaving with other commands), would treat APPEND, and
   what submits raw `Command`s at all.
 
-- **SECURITY - graph: a page or delta cursor can send the bearer token to
-  any host.** Found 2026-09-29 by the error-model audit, NOT fixed: outside
-  that ruling, wants its own. `paging::decode_paged_cursor` turns a caller's
-  page cursor into a URL verbatim (the JSON form's `url`, or on a decode
-  failure the raw bytes as a string), and Graph calendar and contacts search
-  fetch it. `client.rs build_url` passes an absolute URL straight through, and
-  bifrost-net attaches the bearer to the first request whatever its host (the
-  trusted-host allowlist and `Authorization` stripping apply only to
-  REDIRECT hops). So a cursor naming `https://elsewhere/...` is fetched with
-  the account's access token. Persisted change cursors resume from a stored
-  `@odata.deltaLink` the same way (`GraphCursorPayload::resume_url`) and
-  want the same check. Exploiting it needs control of the cursor bytes (the
-  consumer's storage, or a caller of the API), but the token is the whole
-  account. Likely fix shape: refuse any cursor URL whose origin is not the
-  client's API base origin, as `Request(Malformed)` for a page cursor and
-  `SyncState(SchemaIncompatible)` for a change cursor, before any request.
+- **graph: the OneDrive upload session URL is followed unvalidated.** Found
+  2026-09-29 by the spar on the bearer-origin fix, NOT fixed: it carries no
+  account bearer (`AuxTarget::Anonymous`), so it is outside that fix. The
+  `uploadUrl` a `createUploadSession` answer names receives the attachment
+  bytes and the session's own pre-authenticated credential wherever it
+  points, plain `http://` and userinfo included. Same-origin admission does
+  not fit (real session hosts differ from the Graph host); the likely shape is
+  https-only with no userinfo, perhaps an allowlist of documented upload
+  origins. Wants its own ruling.
+
+- **graph: a malformed Autodiscover answer reads as an empty one.** Found
+  2026-09-29 by the cold review of the bearer-origin fix, NOT fixed (it
+  predates that fix). `parse_user_settings_response` treats a quick-xml parse
+  error like EOF, so a truncated or malformed HTTP 200 reads as an answer with
+  no settings and no error: the public-folder lookups then report a missing
+  setting (`Request(Malformed)`) where the provider sent a malformed response,
+  and `discover_shared_mailboxes` (whose parser does the same) degrades
+  silently.
 
 - **errors: findings from the local-refusal audit (part c) not covered by
   the ruling.** Filed 2026-09-29. Parts (a) and (b), and the covered part of

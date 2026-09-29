@@ -695,7 +695,7 @@ fn now_unix_secs() -> u64 {
 
 pub(crate) fn ews_client(account: &GraphAccount) -> Option<EwsClient> {
     account.client.account_net().map(|net| {
-        EwsClient::new(net, account.client.outlook_base()).with_tally(account.client.batch_tally())
+        EwsClient::new(net, account.client.ews_url()).with_tally(account.client.batch_tally())
     })
 }
 

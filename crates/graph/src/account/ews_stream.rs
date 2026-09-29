@@ -73,7 +73,7 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
         tracing::warn!("[Graph EWS] Streaming worker started before account attach");
         return;
     };
-    let ews = EwsClient::new(account_net, account.client.outlook_base());
+    let ews = EwsClient::new(account_net, account.client.ews_url());
     run_worker(account, ews).await;
 }
 

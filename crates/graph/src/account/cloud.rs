@@ -253,9 +253,8 @@ async fn upload_chunks(
         let response = client
             .execute_aux(
                 "PUT",
-                upload_url,
+                crate::client::AuxTarget::Anonymous(upload_url),
                 &[("Content-Range", content_range.as_str())],
-                false,
                 chunk,
             )
             .await?;
@@ -574,7 +573,9 @@ mod tests {
         assert!(
             rest[0]
                 .url
-                .ends_with("/me/drive/root:/Attachments/report %231.pdf:/createUploadSession"),
+                // The recorded URL is the admitted one, exactly as sent: the
+                // URL parser (the same one reqwest applies) encodes the space.
+                .ends_with("/me/drive/root:/Attachments/report%20%231.pdf:/createUploadSession"),
             "{}",
             rest[0].url
         );

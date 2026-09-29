@@ -99,27 +99,33 @@ pub(super) async fn search_message_rows(
     // on the returned page. See the skip arm below for why they are not the
     // call's `Err`.
     let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
-    let page = loop {
+    let (client, page) = loop {
         let client = account
             .client_for_owner(owner.as_deref())
             .map_err(|error| {
                 into_account_error(error, GraphErrorContext::graph(AccountOperation::Search))
             })?;
+        let ctx = GraphErrorContext::graph(AccountOperation::Search);
         let url = match next_link.take() {
-            Some(next_link) => next_link,
+            // The caller's cursor bytes: admitted onto the owning mailbox
+            // client's origin before anything is sent, or refused as the
+            // caller's malformed input.
+            Some(next_link) => client.admit_target(&next_link).map_err(|refusal| {
+                invalid_account_error(
+                    AccountOperation::Search,
+                    format!("Graph search cursor {refusal}"),
+                )
+            })?,
             // No `next_link` means "start this mailbox at its first page":
             // either the whole search, or the mailbox after one whose own
             // pagination ran out.
-            None => search_url(&client.api_path_prefix(), &request)?,
+            None => client
+                .api_url(&search_url(&client.api_path_prefix(), &request)?)
+                .map_err(|error| into_account_error(error, ctx.clone()))?,
         };
-        let ctx = GraphErrorContext::graph(AccountOperation::Search);
-        let result: Result<ODataCollection<Value>, _> = if url.starts_with("http") {
-            client.get_absolute(&url).await
-        } else {
-            client.get_json(&url).await
-        };
+        let result: Result<ODataCollection<Value>, _> = client.get(&url).await;
         match result {
-            Ok(page) => break page,
+            Ok(page) => break (client, page),
             Err(error) => {
                 // A shared mailbox this account has lost delegate access to
                 // must not end the walk for the mailboxes behind it. The
@@ -186,11 +192,18 @@ pub(super) async fn search_message_rows(
             });
         rows.push(SearchRow { id, thread_id });
     }
-    let next_cursor = match page.next_link {
+    // Admitted at receipt by the client that fetched the page, before it
+    // can be minted into the caller's cursor.
+    let next_link = client
+        .admit_next(page.next_link.as_ref())
+        .map_err(|error| {
+            into_account_error(error, GraphErrorContext::graph(AccountOperation::Search))
+        })?;
+    let next_cursor = match next_link {
         Some(next_link) => Some(encode_search_cursor(
             account,
             owner.as_deref(),
-            Some(next_link),
+            Some(next_link.as_str().to_string()),
         )),
         None => next_search_owner(account, owner.as_deref())
             .map(|owner| encode_search_cursor(account, Some(&owner), None)),
@@ -242,6 +255,20 @@ pub(super) fn decode_search_cursor(
         return Err(invalid_account_error(
             AccountOperation::Search,
             "Graph search cursor was minted against a different shared-mailbox set",
+        ));
+    }
+    // Every link this crate mints into a search cursor is an admitted,
+    // absolute server link. Anything else is not a cursor it produced; the
+    // origin itself is checked against the owning mailbox's client when the
+    // walk resumes.
+    if cursor
+        .next_link
+        .as_deref()
+        .is_some_and(|link| reqwest::Url::parse(link).is_err())
+    {
+        return Err(invalid_account_error(
+            AccountOperation::Search,
+            "Graph search cursor link is not an absolute URL",
         ));
     }
     Ok(Some(cursor))

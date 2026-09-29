@@ -18,29 +18,67 @@ use quick_xml::events::Event;
 use super::GraphAccount;
 use super::cursor::PublicFolderRouting;
 use super::graph_error::{GraphErrorContext, into_account_error, response_to_account_error_pub};
+use crate::client::AuxTarget;
 use crate::error::GraphResponseError;
 use crate::ews::push_general_ref;
+use crate::origin::AdmittedUrl;
 
-/// The POX (`autodiscover.xml`) Autodiscover endpoint under a given Outlook
-/// origin. Derived rather than hardcoded so the harness api-base override
-/// reaches Autodiscover too: production Autodiscover lives on
-/// `outlook.office365.com`, not on the Graph host, so redirecting only the
-/// Graph base left delegate/public-folder discovery hitting the real
-/// service.
+/// The POX (`autodiscover.xml`) Autodiscover path under the Outlook origin.
+/// Resolved against the client's Outlook base rather than hardcoded so the
+/// harness api-base override reaches Autodiscover too: production
+/// Autodiscover lives on `outlook.office365.com`, not on the Graph host, so
+/// redirecting only the Graph base left delegate/public-folder discovery
+/// hitting the real service.
+const AUTODISCOVER_XML_PATH: &str = "/autodiscover/autodiscover.xml";
+
+/// The SOAP (`autodiscover.svc` / `GetUserSettings`) Autodiscover path under
+/// the Outlook origin. See [`AUTODISCOVER_XML_PATH`].
+const AUTODISCOVER_SOAP_PATH: &str = "/autodiscover/autodiscover.svc";
+
+const REDIRECT_ADDRESS: &str = "RedirectAddress";
+const REDIRECT_URL: &str = "RedirectUrl";
+
+/// The POX Autodiscover endpoint under a given Outlook origin.
+#[cfg(test)]
 pub(crate) fn autodiscover_xml_url(outlook_base: &str) -> String {
     format!(
-        "{}/autodiscover/autodiscover.xml",
+        "{}{AUTODISCOVER_XML_PATH}",
         outlook_base.trim_end_matches('/')
     )
 }
 
-/// The SOAP (`autodiscover.svc` / `GetUserSettings`) Autodiscover endpoint
-/// under a given Outlook origin. See [`autodiscover_xml_url`].
+/// The SOAP Autodiscover endpoint under a given Outlook origin.
+#[cfg(test)]
 pub(crate) fn autodiscover_soap_url(outlook_base: &str) -> String {
     format!(
-        "{}/autodiscover/autodiscover.svc",
+        "{}{AUTODISCOVER_SOAP_PATH}",
         outlook_base.trim_end_matches('/')
     )
+}
+
+/// What one `GetUserSettings` answer asks the lookup to do next.
+enum SoapStep {
+    /// The answer carries the settings.
+    Settings,
+    /// `RedirectAddress`: query this mailbox against the same endpoint.
+    Mailbox(String),
+    /// `RedirectUrl`: query the same mailbox at this admitted endpoint.
+    Endpoint(AdmittedUrl),
+}
+
+/// The code, when it reports anything other than success.
+fn failing_code(code: Option<&str>) -> Option<&str> {
+    code.filter(|code| !code.is_empty() && !code.eq_ignore_ascii_case("NoError"))
+}
+
+fn is_redirect(code: &str) -> bool {
+    code.eq_ignore_ascii_case(REDIRECT_ADDRESS) || code.eq_ignore_ascii_case(REDIRECT_URL)
+}
+
+/// Whether a redirect target is written as an http or https URL, judged by
+/// the URL parser (so the scheme's case does not matter).
+fn is_http_url(target: &str) -> bool {
+    reqwest::Url::parse(target).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 /// A shared/delegate mailbox discovered via Exchange Autodiscover.
@@ -153,7 +191,11 @@ impl GraphAccount {
   </Request>
 </Autodiscover>"#
         );
-        let url = autodiscover_xml_url(self.client.outlook_base());
+        let ctx = GraphErrorContext::graph(AccountOperation::Discover);
+        let url = self
+            .client
+            .outlook_url(AUTODISCOVER_XML_PATH)
+            .map_err(|error| into_account_error(error, ctx))?;
         let xml = self.autodiscover_post(&url, "text/xml", None, body).await?;
         Ok(parse_alternative_mailboxes(&xml))
     }
@@ -163,12 +205,16 @@ impl GraphAccount {
         email: &str,
         settings: &[&str],
     ) -> Result<Vec<(String, String)>, AccountError> {
-        // Autodiscover redirects (`RedirectAddr` to a new email,
+        // Autodiscover redirects (`RedirectAddress` to a new email,
         // `RedirectUrl` to a new endpoint) are common for hybrid /
         // on-prem tenants and ride in-body, not as an HTTP 3xx. Follow a
         // bounded chain; the cap guards against a redirect loop.
         const MAX_REDIRECTS: usize = 5;
-        let mut url = autodiscover_soap_url(self.client.outlook_base());
+        let ctx = GraphErrorContext::graph(AccountOperation::Discover);
+        let mut url = self
+            .client
+            .outlook_url(AUTODISCOVER_SOAP_PATH)
+            .map_err(|error| into_account_error(error, ctx.clone()))?;
         let mut email = email.to_string();
 
         for _ in 0..=MAX_REDIRECTS {
@@ -186,36 +232,11 @@ impl GraphAccount {
                 .await?;
             let parsed = parse_user_settings_response(&xml);
 
-            // A redirect target reroutes the lookup. `RedirectAddr`
-            // (or any non-URL target) is a new mailbox to query against
-            // the same endpoint; `RedirectUrl` is a new endpoint for the
-            // same mailbox.
-            if let Some(target) = parsed.redirect_target.as_deref() {
-                if target.starts_with("http://") || target.starts_with("https://") {
-                    url = target.to_string();
-                } else {
-                    email = target.to_string();
-                }
-                continue;
+            match self.next_step(&parsed, &ctx)? {
+                SoapStep::Settings => return Ok(parsed.settings),
+                SoapStep::Mailbox(next) => email = next,
+                SoapStep::Endpoint(next) => url = next,
             }
-
-            // An in-body error other than `NoError` is a real failure,
-            // not an empty result. Surface it classified rather than
-            // returning an empty settings vec the caller misreads as
-            // "missing PublicFolderInformation".
-            if let Some(code) = parsed
-                .error_code
-                .as_deref()
-                .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("NoError"))
-            {
-                let detail = parsed.error_message.as_deref().unwrap_or("");
-                return Err(super::graph_error::invalid_account_error(
-                    AccountOperation::Discover,
-                    format!("Autodiscover GetUserSettings error {code}: {detail}"),
-                ));
-            }
-
-            return Ok(parsed.settings);
         }
 
         Err(super::graph_error::invalid_account_error(
@@ -224,12 +245,113 @@ impl GraphAccount {
         ))
     }
 
+    /// Decide what one `GetUserSettings` answer asks for.
+    ///
+    /// The redirect KIND is read from the protocol's own `ErrorCode`, never
+    /// guessed from the shape of the target text: `RedirectAddress` names a
+    /// mailbox to query against the same endpoint, `RedirectUrl` names an
+    /// endpoint for the same mailbox. The user-level answer wins over the
+    /// response-level one, because that is where Exchange puts a per-user
+    /// redirect or refusal.
+    ///
+    /// A `RedirectUrl` endpoint must sit on the configured Outlook origin.
+    /// The request carries the account bearer, which bifrost-net attaches
+    /// whatever the host, and that token was issued for the configured
+    /// resource: following a cross-origin endpoint with it could only hand
+    /// it to another host. A hybrid tenant whose Autodiscover points at
+    /// another origin needs trust this client does not establish, so that
+    /// is `Unsupported(Discover)`, not a provider fault; a redirect answer
+    /// that contradicts itself (a code with no target, a target with no
+    /// redirect code, a URL named as a mailbox, an endpoint that is not a
+    /// URL) is the provider's malformed response.
+    fn next_step(
+        &self,
+        parsed: &UserSettingsResponse,
+        ctx: &GraphErrorContext,
+    ) -> Result<SoapStep, AccountError> {
+        let malformed = |message: String| {
+            into_account_error(
+                crate::error::GraphError::Json {
+                    message,
+                    body: None,
+                },
+                ctx.clone(),
+            )
+        };
+        let failure = |code: &str, message: Option<&str>| {
+            super::graph_error::invalid_account_error(
+                AccountOperation::Discover,
+                format!(
+                    "Autodiscover GetUserSettings error {code}: {}",
+                    message.unwrap_or("")
+                ),
+            )
+        };
+
+        // A response-level failure other than a redirect ends the lookup.
+        if let Some(code) = failing_code(parsed.response.code.as_deref())
+            && !is_redirect(code)
+        {
+            return Err(failure(code, parsed.response.message.as_deref()));
+        }
+        // A user element that says anything - a code OR a target - is the
+        // answer, so a user-level target with no user-level code is judged
+        // as the contradiction it is rather than masked by a response-level
+        // `NoError`.
+        let answer = if parsed.user.code.is_some() || parsed.user.redirect_target.is_some() {
+            &parsed.user
+        } else {
+            &parsed.response
+        };
+        let code = failing_code(answer.code.as_deref());
+        match (code, answer.redirect_target.as_deref()) {
+            (None, None) => Ok(SoapStep::Settings),
+            (None, Some(_)) => Err(malformed(
+                "Autodiscover named a redirect target without a redirect code".to_string(),
+            )),
+            (Some(code), target) if is_redirect(code) => {
+                let Some(target) = target else {
+                    return Err(malformed(format!(
+                        "Autodiscover {code} carried no redirect target"
+                    )));
+                };
+                if code.eq_ignore_ascii_case(REDIRECT_ADDRESS) {
+                    if is_http_url(target) {
+                        return Err(malformed(
+                            "Autodiscover RedirectAddress named a URL, not a mailbox".to_string(),
+                        ));
+                    }
+                    return Ok(SoapStep::Mailbox(target.to_string()));
+                }
+                if !is_http_url(target) {
+                    return Err(malformed(
+                        "Autodiscover RedirectUrl did not name an http or https URL".to_string(),
+                    ));
+                }
+                self.client
+                    .admit_outlook_target(target)
+                    .map(SoapStep::Endpoint)
+                    .map_err(|refusal| {
+                        super::graph_error::unsupported_account_error(AccountOperation::Discover)
+                            .into_builder()
+                            .text(bifrost_types::DiagnosticText::support_only(format!(
+                                "Autodiscover redirected to an endpoint this client will not \
+                                 send the account credential to: {refusal}"
+                            )))
+                            .try_build()
+                            .expect("valid account error classification")
+                    })
+            }
+            (Some(code), _) => Err(failure(code, answer.message.as_deref())),
+        }
+    }
+
     /// Shared transport for both Autodiscover endpoints. Routes the
     /// Bearer through `AccountNet`; classifies failures through the REST
     /// error path with `Protocol::Graph`.
     async fn autodiscover_post(
         &self,
-        url: &str,
+        url: &AdmittedUrl,
         content_type: &str,
         extra_header: Option<(&str, &str)>,
         body: String,
@@ -241,7 +363,12 @@ impl GraphAccount {
         }
         let resp = self
             .client
-            .execute_aux("POST", url, &headers, true, bytes::Bytes::from(body))
+            .execute_aux(
+                "POST",
+                AuxTarget::Bearer(url),
+                &headers,
+                bytes::Bytes::from(body),
+            )
             .await
             .map_err(|error| into_account_error(error, ctx.clone()))?;
 
@@ -299,11 +426,24 @@ fn build_get_user_settings_soap(email: &str, settings: &[&str]) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct UserSettingsResponse {
     pub(crate) settings: Vec<(String, String)>,
-    /// In-body `<a:ErrorCode>` (`NoError` / empty when absent).
-    pub(crate) error_code: Option<String>,
-    pub(crate) error_message: Option<String>,
-    /// In-body `<a:RedirectTarget>` (the SMTP address or URL to retry
-    /// against; common for hybrid / on-prem tenants).
+    /// The `<a:Response>`-level markers. In a real answer this level is
+    /// usually `NoError` even when the user-level answer is a redirect or
+    /// a refusal, which is why the two levels are kept apart: reading only
+    /// the first `ErrorCode` in document order saw `NoError` and missed
+    /// every per-user error and redirect.
+    pub(crate) response: SoapAnswer,
+    /// The first `<a:UserResponse>`'s markers (one user is requested).
+    pub(crate) user: SoapAnswer,
+}
+
+/// One level's in-body error and redirect markers.
+#[derive(Debug, Default)]
+pub(crate) struct SoapAnswer {
+    /// `<a:ErrorCode>` (`NoError` / absent on success).
+    pub(crate) code: Option<String>,
+    pub(crate) message: Option<String>,
+    /// `<a:RedirectTarget>`: the SMTP address or URL to retry against;
+    /// common for hybrid / on-prem tenants.
     pub(crate) redirect_target: Option<String>,
 }
 
@@ -323,6 +463,13 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
     let mut out = UserSettingsResponse::default();
 
     let mut in_user_setting = false;
+    // Inside the first `<a:UserResponse>`; later ones are ignored, since one
+    // user is requested.
+    let mut in_user_response = false;
+    let mut seen_user_response = false;
+    // Inside `<a:UserSettingErrors>`, whose per-setting `ErrorCode`s are
+    // not the user's answer.
+    let mut in_setting_errors = false;
     let mut current_name = String::new();
     let mut current_value = String::new();
     let mut current_tag = String::new();
@@ -332,10 +479,15 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 let name = e.name().local_name().as_ref().to_owned();
-                if name == "UserSetting" {
-                    in_user_setting = true;
-                    current_name.clear();
-                    current_value.clear();
+                match name.as_str() {
+                    "UserSetting" => {
+                        in_user_setting = true;
+                        current_name.clear();
+                        current_value.clear();
+                    }
+                    "UserResponse" if !seen_user_response => in_user_response = true,
+                    "UserSettingErrors" => in_setting_errors = true,
+                    _ => {}
                 }
                 current_tag = name;
                 buf.clear();
@@ -354,31 +506,46 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
                         "Value" => current_value = trimmed.to_string(),
                         _ => {}
                     }
-                } else {
-                    // Response-level (not per-UserSetting) markers.
+                } else if !in_setting_errors && (in_user_response || !seen_user_response) {
+                    // Response-level or user-level markers, never a
+                    // per-setting error and never a second user's answer.
+                    let answer = if in_user_response {
+                        &mut out.user
+                    } else {
+                        &mut out.response
+                    };
                     match current_tag.as_str() {
-                        "ErrorCode" if out.error_code.is_none() => {
-                            out.error_code = Some(trimmed.to_string());
+                        "ErrorCode" if answer.code.is_none() => {
+                            answer.code = Some(trimmed.to_string());
                         }
-                        "ErrorMessage" if out.error_message.is_none() && !trimmed.is_empty() => {
-                            out.error_message = Some(trimmed.to_string());
+                        "ErrorMessage" if answer.message.is_none() && !trimmed.is_empty() => {
+                            answer.message = Some(trimmed.to_string());
                         }
                         "RedirectTarget"
-                            if out.redirect_target.is_none() && !trimmed.is_empty() =>
+                            if answer.redirect_target.is_none() && !trimmed.is_empty() =>
                         {
-                            out.redirect_target = Some(trimmed.to_string());
+                            answer.redirect_target = Some(trimmed.to_string());
                         }
                         _ => {}
                     }
                 }
-                if name == "UserSetting" {
-                    in_user_setting = false;
-                    // Keep the pair when a Name is present; an empty Value
-                    // is a legitimate setting, not a reason to drop it.
-                    if !current_name.is_empty() {
-                        out.settings
-                            .push((current_name.clone(), current_value.clone()));
+                match name.as_str() {
+                    "UserSetting" => {
+                        in_user_setting = false;
+                        // Keep the pair when a Name is present; an empty
+                        // Value is a legitimate setting, not a reason to
+                        // drop it.
+                        if !current_name.is_empty() {
+                            out.settings
+                                .push((current_name.clone(), current_value.clone()));
+                        }
                     }
+                    "UserResponse" if in_user_response => {
+                        in_user_response = false;
+                        seen_user_response = true;
+                    }
+                    "UserSettingErrors" => in_setting_errors = false,
+                    _ => {}
                 }
                 buf.clear();
                 current_tag.clear();
@@ -524,7 +691,12 @@ mod tests {
         )
     }
 
-    fn redirect_xml(target: &str) -> String {
+    /// A per-user answer in the shape Exchange sends it: the response level
+    /// reports `NoError` and the user level carries the code and target.
+    fn user_answer_xml(code: &str, target: Option<&str>) -> String {
+        let target = target
+            .map(|target| format!("<a:RedirectTarget>{target}</a:RedirectTarget>"))
+            .unwrap_or_default();
         format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
@@ -532,13 +704,37 @@ mod tests {
   <s:Body>
     <a:GetUserSettingsResponseMessage>
       <a:Response>
-        <a:ErrorCode>RedirectAddress</a:ErrorCode>
-        <a:RedirectTarget>{target}</a:RedirectTarget>
+        <a:ErrorCode>NoError</a:ErrorCode>
+        <a:ErrorMessage />
+        <a:UserResponses>
+          <a:UserResponse>
+            <a:ErrorCode>{code}</a:ErrorCode>
+            <a:ErrorMessage>per-user answer</a:ErrorMessage>
+            {target}
+            <a:UserSettingErrors />
+            <a:UserSettings />
+          </a:UserResponse>
+        </a:UserResponses>
       </a:Response>
     </a:GetUserSettingsResponseMessage>
   </s:Body>
 </s:Envelope>"#
         )
+    }
+
+    fn redirect_xml(code: &str, target: &str) -> String {
+        user_answer_xml(code, Some(target))
+    }
+
+    async fn content_mailbox_error(answer: String) -> (bifrost_types::AccountError, usize) {
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::text(reqwest::StatusCode::OK, &answer)]);
+        let account = test_account(client.clone());
+        let error = account
+            .discover_content_mailbox("replica@contoso.com")
+            .await
+            .expect_err("the answer must fail the lookup");
+        (error, client.take_aux_requests().len())
     }
 
     /// The Autodiscover POST itself, which is not a Graph REST call: it
@@ -627,18 +823,23 @@ mod tests {
     /// `RedirectAddress` inside an HTTP 200 - bifrost-net never sees a 3xx,
     /// so nothing below this crate follows it. The walk must reissue the
     /// SOAP call for the NEW mailbox against the SAME endpoint, and a
-    /// `RedirectTarget` that is a URL must move the endpoint instead.
+    /// `RedirectUrl` on the configured Outlook origin must move the endpoint
+    /// instead. Both redirects ride at the USER level under a response-level
+    /// `NoError`, which is how Exchange sends them.
     #[tokio::test]
     async fn a_soap_redirect_chain_reissues_against_the_new_mailbox_then_endpoint() {
         let client = GraphClient::new("token");
         client.script_aux([
             ScriptedRestResponse::text(
                 reqwest::StatusCode::OK,
-                &redirect_xml("replica@contoso.mail.onmicrosoft.com"),
+                &redirect_xml("RedirectAddress", "replica@contoso.mail.onmicrosoft.com"),
             ),
             ScriptedRestResponse::text(
                 reqwest::StatusCode::OK,
-                &redirect_xml("https://autodiscover.contoso.com/autodiscover/autodiscover.svc"),
+                &redirect_xml(
+                    "RedirectUrl",
+                    "HTTPS://outlook.office365.com/autodiscover/tenant/autodiscover.svc",
+                ),
             ),
             ScriptedRestResponse::text(
                 reqwest::StatusCode::OK,
@@ -662,10 +863,11 @@ mod tests {
         assert_eq!(requests[0].url, soap_url);
         // The address redirect keeps the endpoint and changes the mailbox.
         assert_eq!(requests[1].url, soap_url);
-        // The URL redirect moves the endpoint and keeps the mailbox.
+        // The URL redirect moves the endpoint and keeps the mailbox; the
+        // admitted URL is the parser's serialization, scheme lower-cased.
         assert_eq!(
             requests[2].url,
-            "https://autodiscover.contoso.com/autodiscover/autodiscover.svc"
+            "https://outlook.office365.com/autodiscover/tenant/autodiscover.svc"
         );
         let mailboxes: Vec<String> = requests
             .iter()
@@ -732,6 +934,132 @@ mod tests {
             bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         ));
         assert_eq!(client.take_aux_requests().len(), 1);
+    }
+
+    /// The token leak this closes: the Autodiscover POST carries the account
+    /// bearer, and bifrost-net attaches it to the first request whatever the
+    /// host, so following a `RedirectUrl` off the Outlook origin would hand
+    /// the token to whoever the response named. However the endpoint is
+    /// spelled, the lookup stops after the one request that returned it.
+    #[tokio::test]
+    async fn a_cross_origin_redirect_url_is_refused_before_any_request() {
+        for target in [
+            "https://autodiscover.contoso.com/autodiscover/autodiscover.svc",
+            "HTTPS://attacker.example/autodiscover.svc",
+            "https://outlook.office365.com@attacker.example/autodiscover.svc",
+            "http://outlook.office365.com/autodiscover/autodiscover.svc",
+            "https://@outlook.office365.com/autodiscover/autodiscover.svc",
+        ] {
+            let (error, requests) =
+                content_mailbox_error(redirect_xml("RedirectUrl", target)).await;
+            assert_eq!(requests, 1, "{target} must not be requested");
+            assert!(
+                matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Discover)
+                ),
+                "{target}: {:?}",
+                error.kind()
+            );
+        }
+    }
+
+    /// A redirect answer that contradicts itself is the provider's malformed
+    /// response, never guessed into a mailbox or an endpoint.
+    #[tokio::test]
+    async fn an_inconsistent_redirect_answer_is_a_provider_fault() {
+        for answer in [
+            // A URL named as a mailbox.
+            redirect_xml("RedirectAddress", "https://attacker.example/x"),
+            // An endpoint that is not a URL (it must not become a mailbox).
+            redirect_xml("RedirectUrl", "https://"),
+            redirect_xml("RedirectUrl", "someone@contoso.com"),
+            // A redirect code with no target.
+            user_answer_xml("RedirectUrl", None),
+            // A target with no redirect code.
+            redirect_xml("NoError", "someone@contoso.com"),
+            // A user-level target with no user-level code at all, under a
+            // response-level `NoError` that must not mask it.
+            redirect_xml("Omitted", "https://attacker.example/x")
+                .replace("<a:ErrorCode>Omitted</a:ErrorCode>", ""),
+        ] {
+            let (error, requests) = content_mailbox_error(answer).await;
+            assert_eq!(requests, 1);
+            assert!(
+                matches!(error.kind(), bifrost_types::AccountErrorKind::Protocol(_)),
+                "{:?}",
+                error.kind()
+            );
+        }
+    }
+
+    /// Exchange reports a per-user refusal under a response-level `NoError`.
+    /// Reading only the first `ErrorCode` in the document saw `NoError`, so
+    /// an unknown user came back as an empty settings list and the caller
+    /// reported a missing setting instead of the refusal.
+    #[tokio::test]
+    async fn a_user_level_error_under_a_response_level_no_error_fails_the_lookup() {
+        let (error, requests) = content_mailbox_error(user_answer_xml("InvalidUser", None)).await;
+        assert_eq!(requests, 1);
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(
+            format!("{error:?}").contains("InvalidUser"),
+            "the refusal names its code: {error:?}"
+        );
+    }
+
+    /// A per-setting `ErrorCode` inside `UserSettingErrors` is not the
+    /// user's answer: the requested setting that did resolve is returned.
+    #[test]
+    fn a_per_setting_error_is_not_the_user_answer() {
+        let xml = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            xmlns:a="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+  <s:Body><a:GetUserSettingsResponseMessage><a:Response>
+    <a:ErrorCode>NoError</a:ErrorCode>
+    <a:UserResponses><a:UserResponse>
+      <a:ErrorCode>NoError</a:ErrorCode>
+      <a:UserSettingErrors><a:UserSettingError>
+        <a:ErrorCode>SettingIsNotAvailable</a:ErrorCode>
+        <a:SettingName>InternalRpcClientServer</a:SettingName>
+      </a:UserSettingError></a:UserSettingErrors>
+      <a:UserSettings><a:UserSetting>
+        <a:Name>PublicFolderInformation</a:Name><a:Value>pf@contoso.com</a:Value>
+      </a:UserSetting></a:UserSettings>
+    </a:UserResponse></a:UserResponses>
+  </a:Response></a:GetUserSettingsResponseMessage></s:Body>
+</s:Envelope>"#;
+        let parsed = parse_user_settings_response(xml);
+        assert_eq!(parsed.user.code.as_deref(), Some("NoError"));
+        assert_eq!(parsed.response.code.as_deref(), Some("NoError"));
+        assert_eq!(
+            parsed.settings,
+            vec![(
+                "PublicFolderInformation".to_string(),
+                "pf@contoso.com".to_string()
+            )]
+        );
+    }
+
+    /// An unusable Graph api-base must not leave Autodiscover pointing at the
+    /// production Outlook origin: the derived origin is unusable too, and
+    /// nothing is sent.
+    #[tokio::test]
+    async fn an_unusable_api_base_sends_no_autodiscover_request() {
+        let client = GraphClient::with_api_base("not a url", "token");
+        client.script_aux([]);
+        let account = test_account(client.clone());
+        let error = account
+            .discover_shared_mailboxes("user@contoso.com")
+            .await
+            .expect_err("an unusable base refuses");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert_eq!(client.wire_attempts(), 0);
     }
 
     #[test]
@@ -1002,11 +1330,13 @@ mod tests {
 </s:Envelope>"#;
         let parsed = parse_user_settings_response(xml);
         assert!(parsed.settings.is_empty());
-        assert_eq!(parsed.error_code.as_deref(), Some("InvalidUser"));
+        assert_eq!(parsed.response.code.as_deref(), Some("InvalidUser"));
         assert_eq!(
-            parsed.error_message.as_deref(),
+            parsed.response.message.as_deref(),
             Some("The user could not be found.")
         );
+        // The user element carried no code of its own.
+        assert_eq!(parsed.user.code, None);
     }
 
     #[test]
@@ -1025,7 +1355,7 @@ mod tests {
 </s:Envelope>"#;
         let parsed = parse_user_settings_response(xml);
         assert_eq!(
-            parsed.redirect_target.as_deref(),
+            parsed.response.redirect_target.as_deref(),
             Some("user@redirected.contoso.com")
         );
     }

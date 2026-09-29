@@ -14,14 +14,15 @@
 
 use bifrost_types::{
     AccountError, AccountOperation, DirectoryGroup, DirectoryGroupId, DirectoryGroupKind,
-    DirectoryGroupMember, ErrorScope, Page, ProtocolKind,
+    DirectoryGroupMember, Page, ProtocolKind,
 };
 use serde::Deserialize;
 
+use crate::origin::AdmittedUrl;
 use crate::types::ODataCollection;
 
 use super::GraphAccount;
-use super::contacts::get_page;
+use super::contacts::{admit_next, decode_link_cursor, get_page, link_cursor};
 use super::graph_error;
 
 const GROUP_SELECT: &str = "id,displayName,mail,groupTypes,mailEnabled,securityEnabled";
@@ -31,18 +32,19 @@ pub(crate) async fn directory_groups_list(
     account: GraphAccount,
     page_cursor: Option<Vec<u8>>,
 ) -> Result<Page<DirectoryGroup>, AccountError> {
-    let url = match decode_cursor(page_cursor, AccountOperation::DirectoryGroupsList)? {
+    let operation = AccountOperation::DirectoryGroupsList;
+    let url = match decode_link_cursor(&account, page_cursor, operation)? {
         Some(next) => next,
         None => {
             let prefix = account.client.api_path_prefix();
-            groups_list_path(&prefix)
+            first_page(&account, &groups_list_path(&prefix), operation)?
         }
     };
-    let page: ODataCollection<GraphDirectoryGroup> =
-        get_page(&account, &url, AccountOperation::DirectoryGroupsList).await?;
+    let page: ODataCollection<GraphDirectoryGroup> = get_page(&account, &url, operation).await?;
+    let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
         items: page.value.into_iter().filter_map(classify_group).collect(),
-        next_cursor: page.next_link.map(String::into_bytes),
+        next_cursor,
         estimated_total: None,
         failed_ids: Vec::new(),
         skipped_scopes: Vec::new(),
@@ -54,40 +56,32 @@ pub(crate) async fn directory_group_expand(
     group: DirectoryGroupId,
     page_cursor: Option<Vec<u8>>,
 ) -> Result<Page<DirectoryGroupMember>, AccountError> {
-    let url = match decode_cursor(page_cursor, AccountOperation::DirectoryGroupExpand)? {
+    let operation = AccountOperation::DirectoryGroupExpand;
+    let url = match decode_link_cursor(&account, page_cursor, operation)? {
         Some(next) => next,
-        None => transitive_members_path(&group),
+        None => first_page(&account, &transitive_members_path(&group), operation)?,
     };
-    let page: ODataCollection<GraphGroupMember> =
-        get_page(&account, &url, AccountOperation::DirectoryGroupExpand).await?;
+    let page: ODataCollection<GraphGroupMember> = get_page(&account, &url, operation).await?;
+    let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
         items: page.value.into_iter().filter_map(member_to_row).collect(),
-        next_cursor: page.next_link.map(String::into_bytes),
+        next_cursor,
         estimated_total: None,
         failed_ids: Vec::new(),
         skipped_scopes: Vec::new(),
     })
 }
 
-/// A page cursor is the verbatim `@odata.nextLink` URL as bytes, the
-/// same convention `directory_search` and `contacts_list` use.
-fn decode_cursor(
-    page_cursor: Option<Vec<u8>>,
+/// A page cursor is the verbatim `@odata.nextLink` URL as bytes, the same
+/// convention `contacts_list` uses, decoded and admitted the same way.
+fn first_page(
+    account: &GraphAccount,
+    path: &str,
     operation: AccountOperation,
-) -> Result<Option<String>, AccountError> {
-    page_cursor
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(|error| {
-            graph_error::unsupported_account_error(operation)
-                .into_builder()
-                .scope(ErrorScope::ContactCollection)
-                .text(bifrost_types::DiagnosticText::support_only(
-                    error.to_string(),
-                ))
-                .try_build()
-                .expect("valid account error classification")
-        })
+) -> Result<AdmittedUrl, AccountError> {
+    account.client.api_url(path).map_err(|error| {
+        graph_error::into_account_error(error, graph_error::GraphErrorContext::graph(operation))
+    })
 }
 
 fn groups_list_path(prefix: &str) -> String {

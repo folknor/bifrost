@@ -407,18 +407,22 @@ pub(super) async fn fetch_paged_values(
     let ctx = GraphErrorContext::graph(AccountOperation::Hydrate);
     let mut values = Vec::new();
     let mut walk = crate::paging::PageWalk::new("hydration values");
-    let mut next_url = Some(first_url);
+    let mut next_url = Some(
+        client
+            .api_url(&first_url)
+            .map_err(|e| into_account_error(e, ctx.clone()))?,
+    );
     while let Some(url) = next_url {
         walk.enter(&url)
             .map_err(|e| into_account_error(e, ctx.clone()))?;
-        let page: ODataCollection<Value> = if url.starts_with("http") {
-            client.get_absolute(&url).await
-        } else {
-            client.get_json(&url).await
-        }
-        .map_err(|e| into_account_error(e, ctx.clone()))?;
+        let page: ODataCollection<Value> = client
+            .get(&url)
+            .await
+            .map_err(|e| into_account_error(e, ctx.clone()))?;
         values.extend(page.value);
-        next_url = page.next_link;
+        next_url = client
+            .admit_next(page.next_link.as_ref())
+            .map_err(|e| into_account_error(e, ctx.clone()))?;
     }
     Ok(values)
 }

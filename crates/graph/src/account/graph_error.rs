@@ -121,6 +121,23 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
         GraphError::Net(net) => net_to_account_error(net, &ctx),
         GraphError::Response(response) => response_to_account_error(response, &ctx),
         GraphError::Json { message, body } => json_parse_to_account_error(&message, body, &ctx),
+        // Graph answered with a link off the configured origin. The answer
+        // is provider output (so `Acknowledged`), and following it would
+        // hand the account bearer to another host, so it is a contract
+        // violation rather than something to retry.
+        GraphError::ProviderLinkRefused { reason } => {
+            let detail = DiagnosticText::support_only(format!("Graph response link {reason}"));
+            let builder = base_builder(
+                &ctx,
+                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                Cause::Wire(WireCause::MalformedResponse {
+                    protocol: ctx.protocol,
+                    detail: Some(detail.clone()),
+                }),
+            )
+            .text(detail);
+            finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
+        }
     }
 }
 
@@ -243,6 +260,18 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
             let builder = push_attempt(builder, TransmissionState::Acknowledged);
             finish(builder, &ctx)
         }
+        // An unusable configured Outlook origin: nothing was sent, and the
+        // fix is the consumer's configuration.
+        EwsError::Configuration(message) => finish(
+            base_builder(
+                &ctx,
+                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only(message),
+                }),
+            ),
+            &ctx,
+        ),
     }
 }
 

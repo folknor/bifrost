@@ -7,6 +7,7 @@ use bifrost_types::{
 };
 use serde_json::Value;
 
+use crate::origin::AdmittedUrl;
 use crate::types::{CONTACT_SELECT, MESSAGE_SELECT, ODataCollection};
 
 use super::GraphAccount;
@@ -71,9 +72,14 @@ fn inventory_stream_from(
                 return;
             }
         };
-        let (mut current_url, calendar_window_end) = match resume {
+        let start = match resume {
+            // The persisted page link is re-admitted onto this scope's
+            // client: it is the consumer's durable state, and following a
+            // link that does not admit would send the bearer wherever it
+            // names.
             Some(payload) => match payload.advanced_through {
-                Some(marker) => (marker.next_link, payload.calendar_window_end),
+                Some(marker) => super::cursor::admit_resume_url(&client, &marker.next_link)
+                    .map(|url| (url, payload.calendar_window_end)),
                 None => {
                     yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(
                         super::cursor::CursorError::SchemaIncompatible,
@@ -84,13 +90,24 @@ fn inventory_stream_from(
                 }
             },
             None => match initial_delta_request(&account, &scope, jiff::Timestamp::now()) {
-                Ok(request) => request,
-                Err(error) => {
-                    yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
-                    return;
-                }
+                Ok((path, window_end)) => match client.api_url(&path) {
+                    Ok(url) => Ok((url, window_end)),
+                    Err(error) => {
+                        yield bifrost_types::InventoryEvent::Terminated(super::graph_error::into_account_error(error, sync_ctx));
+                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                        return;
+                    }
+                },
+                Err(error) => Err(error),
             },
+        };
+        let (mut current_url, calendar_window_end) = match start {
+            Ok(start) => start,
+            Err(error) => {
+                yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                return;
+            }
         };
         let (client, tally) = client.metered();
         // A foreign (shared) scope tags every inventory item with its
@@ -138,6 +155,22 @@ fn inventory_stream_from(
                     return;
                 }
             };
+            // Both links are admitted at receipt, before either is followed
+            // or persisted into a checkpoint. A refused link ends the walk
+            // before this page's entries are emitted, so no checkpoint moves.
+            let links = client
+                .admit_next(page.next_link.as_ref())
+                .and_then(|next| Ok((next, client.admit_next(page.delta_link.as_ref())?)));
+            let (next_link, delta_link) = match links {
+                Ok(links) => links,
+                Err(error) => {
+                    yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
+                        error, &scope, owner.as_ref(), sync_ctx.clone(),
+                    ));
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                    return;
+                }
+            };
             let mut entries = Vec::new();
             let mut etags = Vec::new();
             let mut removed_etag_ids = Vec::new();
@@ -178,7 +211,7 @@ fn inventory_stream_from(
                         // forever, and an operator waiver keyed on that would
                         // silently accept all future ones.
                         key: bifrost_types::ObligationKey(
-                            format!("graph:unidentifiable-value:{current_url}").into_bytes(),
+                            format!("graph:unidentifiable-value:{}", current_url.as_str()).into_bytes(),
                         ),
                         failure_label: format!("{scope:?}:unidentifiable-value"),
                         error: super::graph_error::unsupported_account_error(
@@ -186,7 +219,7 @@ fn inventory_stream_from(
                         ),
                         recovery: bifrost_types::RegionRecovery::CheckpointBarrier {
                             transient_replay: Some(bifrost_types::TransientReplayHint {
-                                token: current_url.clone().into_bytes(),
+                                token: current_url.as_str().as_bytes().to_vec(),
                                 note: "delta-session page link; dies with the enumeration".into(),
                             }),
                         },
@@ -214,12 +247,12 @@ fn inventory_stream_from(
                 }
             }
 
-            if let Some(next_link) = page.next_link {
+            if let Some(next_link) = next_link {
                 let checkpoint_cursor = match encode_cursor(
                     scope.clone(),
                     GraphCursorPayload::inventory_page(
                         kind.clone(),
-                        page_marker(next_link.clone(), entries.last().map(|entry| entry.id.0.clone())),
+                        page_marker(&next_link, entries.last().map(|entry| entry.id.0.clone())),
                         calendar_window_end,
                     ),
                 ) {
@@ -234,10 +267,10 @@ fn inventory_stream_from(
                 };
                 yield inventory_batch(entries, PageBoundary::Page, Some(checkpoint_cursor), coverage_of(&scope, &obligations), tally.take());
                 current_url = next_link;
-            } else if let Some(delta_link) = page.delta_link {
+            } else if let Some(delta_link) = delta_link {
                 let cursor = match encode_cursor(
                     scope.clone(),
-                    GraphCursorPayload::new(kind.clone(), delta_link, None)
+                    GraphCursorPayload::new(kind.clone(), &delta_link, None)
                         .with_calendar_window_end_option(calendar_window_end),
                 ) {
                     Ok(cursor) => cursor,
@@ -272,7 +305,7 @@ fn inventory_stream_from(
 
 pub(crate) async fn fetch_delta_page(
     client: &crate::client::GraphClient,
-    url: &str,
+    url: &AdmittedUrl,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
     fetch_page(client, url).await
 }
@@ -380,9 +413,14 @@ fn calendar_view_bound(now: jiff::Timestamp, days: i64) -> String {
     format_calendar_timestamp(calendar_view_timestamp(now, days))
 }
 
-pub(crate) fn page_marker(next_link: String, last_seen_id: Option<String>) -> GraphPageMarker {
+/// A page marker names a resumable page, so it takes an admitted link: an
+/// unadmitted server link cannot be persisted.
+pub(crate) fn page_marker(
+    next_link: &AdmittedUrl,
+    last_seen_id: Option<String>,
+) -> GraphPageMarker {
     GraphPageMarker {
-        next_link,
+        next_link: next_link.as_str().to_string(),
         last_seen_id,
     }
 }
@@ -531,13 +569,9 @@ fn event_aliases(a: &CursorScope, b: &CursorScope) -> bool {
 
 async fn fetch_page(
     client: &crate::client::GraphClient,
-    url: &str,
+    url: &AdmittedUrl,
 ) -> Result<ODataCollection<Value>, crate::error::GraphError> {
-    if url.starts_with("http") {
-        client.get_absolute(url).await
-    } else {
-        client.get_json(url).await
-    }
+    client.get(url).await
 }
 
 fn internet_header(value: &Value, name: &str) -> Option<String> {
@@ -713,7 +747,7 @@ mod tests {
                 reqwest::StatusCode::OK,
                 json!({
                     "value": [{"id": "one", "changeKey": "ck-one"}],
-                    "@odata.nextLink": "https://graph.example/next?page=2"
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/next?page=2"
                 }),
             ),
             ScriptedRestResponse::json(
@@ -755,7 +789,10 @@ mod tests {
                 .url
                 .contains("/me/mailFolders/inbox/messages/delta?")
         );
-        assert_eq!(requests[1].url, "https://graph.example/next?page=2");
+        assert_eq!(
+            requests[1].url,
+            "https://graph.microsoft.com/v1.0/next?page=2"
+        );
     }
 
     /// A delta server that hands back a `nextLink` the walk has already
@@ -770,14 +807,14 @@ mod tests {
                 reqwest::StatusCode::OK,
                 json!({
                     "value": [{"id": "one", "changeKey": "ck-one"}],
-                    "@odata.nextLink": "https://graph.example/next?page=2"
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/next?page=2"
                 }),
             ),
             ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
                 json!({
                     "value": [{"id": "two", "changeKey": "ck-two"}],
-                    "@odata.nextLink": "https://graph.example/next?page=2"
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/next?page=2"
                 }),
             ),
         ]);
@@ -830,7 +867,7 @@ mod tests {
             reqwest::StatusCode::OK,
             json!({
                 "value": [{"id": "one", "changeKey": "ck-one"}],
-                "@odata.nextLink": "https://graph.example/next?page=2"
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/next?page=2"
             }),
         )]);
         let first = GraphAccount::new_for_tests(first_client, PushMode::GraphSubscriptions);
@@ -848,7 +885,7 @@ mod tests {
             reqwest::StatusCode::OK,
             json!({
                 "value": [{"id": "two", "changeKey": "ck-two"}],
-                "@odata.deltaLink": "https://graph.example/delta"
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta"
             }),
         )]);
         let resumed =
@@ -865,7 +902,10 @@ mod tests {
         ));
         let requests = resumed_client.take_rest_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://graph.example/next?page=2");
+        assert_eq!(
+            requests[0].url,
+            "https://graph.microsoft.com/v1.0/next?page=2"
+        );
     }
 
     #[tokio::test]
@@ -875,7 +915,7 @@ mod tests {
             reqwest::StatusCode::OK,
             json!({
                 "value": [{"id":"gone", "@removed":{"reason":"deleted"}}],
-                "@odata.deltaLink":"https://graph.example/delta"
+                "@odata.deltaLink":"https://graph.microsoft.com/v1.0/delta"
             }),
         )]);
         let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
@@ -936,14 +976,14 @@ mod tests {
                 reqwest::StatusCode::OK,
                 json!({
                     "value": [{ "id": "m1", "changeKey": "ck1" }],
-                    "@odata.nextLink": "https://graph.example/users/shared%40contoso.com/delta?$skiptoken=p2"
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta?$skiptoken=p2"
                 }),
             ),
             ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
                 json!({
                     "value": [],
-                    "@odata.deltaLink": "https://graph.example/users/shared%40contoso.com/delta?$deltatoken=d1"
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta?$deltatoken=d1"
                 }),
             ),
         ]);
@@ -982,7 +1022,7 @@ mod tests {
         );
         assert_eq!(
             requests[1].url,
-            "https://graph.example/users/shared%40contoso.com/delta?$skiptoken=p2"
+            "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta?$skiptoken=p2"
         );
         assert!(
             primary.take_rest_requests().is_empty(),
@@ -1054,7 +1094,7 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&calendar_event_scope).expect("calendar event scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
 
@@ -1074,7 +1114,7 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&other_scope).expect("event scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
 
@@ -1089,7 +1129,7 @@ mod tests {
             GraphCursorKind::Events {
                 calendar_id: "calendar-a".to_string(),
             },
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let scope = CursorScope::FolderType {
@@ -1375,7 +1415,7 @@ mod tests {
                     { "id": "m1", "changeKey": "CK1" },
                     { "changeKey": "CK2" },
                 ],
-                "@odata.deltaLink": "https://graph.example/delta?token=final"
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=final"
             }),
         )]);
         let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);

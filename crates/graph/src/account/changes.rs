@@ -106,7 +106,20 @@ pub(crate) fn changes_stream(
         let (client, tally) = client.metered();
 
         let scope = cursor.scope.clone();
-        let mut current_url = payload.resume_url().to_string();
+        // The persisted link is the consumer's durable state, re-admitted
+        // here because serde cannot know the client's origin. A link that
+        // does not admit would otherwise be fetched with the account bearer;
+        // refusing it as an unreadable cursor reseeds the scope.
+        let mut current_url = match super::cursor::admit_resume_url(&client, payload.resume_url()) {
+            Ok(url) => url,
+            Err(error) => {
+                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                    .with_scope(ErrorScope::Cursor(scope.clone()));
+                yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                yield SyncEvent::Done(None);
+                return;
+            }
+        };
         let mut walk = crate::paging::PageWalk::new("changes delta");
 
         loop {
@@ -228,8 +241,29 @@ pub(crate) fn changes_stream(
                 return;
             }
 
-            if let Some(next_link) = page.next_link {
-                payload.advanced_through = Some(page_marker(next_link.clone(), last_seen_id));
+            // Both links are admitted at receipt, before either is followed
+            // or persisted into the checkpoint below.
+            let links = client
+                .admit_next(page.next_link.as_ref())
+                .and_then(|next| Ok((next, client.admit_next(page.delta_link.as_ref())?)));
+            let (next_link, delta_link) = match links {
+                Ok(links) => links,
+                Err(error) => {
+                    let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                        .with_scope(ErrorScope::Cursor(scope.clone()));
+                    let owner = account.owner_of_scope(&scope);
+                    if !changes.is_empty() {
+                        yield batch(changes, PageBoundary::Page, None, tally.take());
+                    }
+                    yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
+                        error, &scope, owner.as_ref(), ctx,
+                    ));
+                    yield SyncEvent::Done(None);
+                    return;
+                }
+            };
+            if let Some(next_link) = next_link {
+                payload.advanced_through = Some(page_marker(&next_link, last_seen_id));
                 let checkpoint_cursor =
                     match encode_cursor(scope.clone(), payload.clone()) {
                         Ok(cursor) => cursor,
@@ -243,8 +277,8 @@ pub(crate) fn changes_stream(
                     };
                 yield batch(changes, PageBoundary::Page, Some(checkpoint_cursor), tally.take());
                 current_url = next_link;
-            } else if let Some(delta_link) = page.delta_link {
-                payload.delta_link = delta_link;
+            } else if let Some(delta_link) = delta_link {
+                payload.delta_link = delta_link.as_str().to_string();
                 payload.advanced_through = None;
                 let checkpoint_cursor =
                     match encode_cursor(scope.clone(), payload.clone()) {
@@ -323,7 +357,7 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("event scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         )
         .with_calendar_window_end_option(Some(1_000));
@@ -351,7 +385,7 @@ mod tests {
                     ty: ObjectType::Event,
                 })
                 .expect("event scope maps"),
-                "https://graph.example/delta".to_string(),
+                &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
                 None,
             )
             .with_calendar_window_end_option(Some(0)),
@@ -380,7 +414,9 @@ mod tests {
             GraphCursorPayload::inventory_page(
                 kind_for_scope(&scope).expect("email scope maps"),
                 super::super::inventory::page_marker(
-                    "https://graph.example/next?page=2".to_string(),
+                    &crate::origin::AdmittedUrl::for_tests(
+                        "https://graph.microsoft.com/v1.0/next?page=2",
+                    ),
                     None,
                 ),
                 None,
@@ -465,7 +501,7 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let cursor = ChangeCursor {
@@ -532,7 +568,7 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&contact_scope).expect("contact scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         // `encode_cursor` does not cross-check, so the mismatch is
@@ -549,7 +585,7 @@ mod tests {
     async fn a_payload_for_a_different_folder_terminates() {
         let payload = GraphCursorPayload::new(
             kind_for_scope(&email_scope("archive")).expect("email scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let cursor = encode_cursor(email_scope("inbox"), payload).expect("encode");
@@ -577,7 +613,9 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&stale_scope).expect("email scope maps"),
-            "https://graph.example/users/gone@contoso.com/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests(
+                "https://graph.microsoft.com/v1.0/users/gone@contoso.com/delta",
+            ),
             None,
         );
         let cursor = encode_cursor(stale_scope.clone(), payload).expect("encode");
@@ -614,14 +652,14 @@ mod tests {
                 reqwest::StatusCode::OK,
                 json!({
                     "value": [{ "id": "m1", "changeKey": "ck1" }],
-                    "@odata.nextLink": "https://graph.example/users/shared%40contoso.com/delta?$skiptoken=p2"
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta?$skiptoken=p2"
                 }),
             ),
             ScriptedRestResponse::json(
                 reqwest::StatusCode::OK,
                 json!({
                     "value": [],
-                    "@odata.deltaLink": "https://graph.example/users/shared%40contoso.com/delta?$deltatoken=d1"
+                    "@odata.deltaLink": "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta?$deltatoken=d1"
                 }),
             ),
         ]);
@@ -636,7 +674,9 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("email scope maps"),
-            "https://graph.example/users/shared%40contoso.com/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests(
+                "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta",
+            ),
             None,
         );
         let cursor = encode_cursor(scope, payload).expect("cursor encodes");
@@ -653,11 +693,11 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(
             requests[0].url,
-            "https://graph.example/users/shared%40contoso.com/delta"
+            "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta"
         );
         assert_eq!(
             requests[1].url,
-            "https://graph.example/users/shared%40contoso.com/delta?$skiptoken=p2"
+            "https://graph.microsoft.com/v1.0/users/shared%40contoso.com/delta?$skiptoken=p2"
         );
         assert!(
             primary.take_rest_requests().is_empty(),
@@ -676,13 +716,13 @@ mod tests {
             reqwest::StatusCode::OK,
             json!({
                 "value": [{ "id": "m1", "changeKey": "ck1" }],
-                "@odata.nextLink": "https://graph.example/delta"
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/delta"
             }),
         )]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         let payload = GraphCursorPayload::new(
             kind_for_scope(&email_scope("inbox")).expect("email scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let cursor = encode_cursor(email_scope("inbox"), payload).expect("cursor encodes");
@@ -724,13 +764,13 @@ mod tests {
                     { "id": "m1", "changeKey": "ck1" },
                     { "subject": "no id at all" }
                 ],
-                "@odata.deltaLink": "https://graph.example/delta?token=next"
+                "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta?token=next"
             }),
         )]);
         let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
         let payload = GraphCursorPayload::new(
             kind_for_scope(&email_scope("inbox")).expect("email scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let cursor = encode_cursor(email_scope("inbox"), payload).expect("cursor encodes");
@@ -757,6 +797,92 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    /// A persisted delta link is the consumer's durable state; one that does
+    /// not admit onto the client's origin (a forged or corrupted cursor, or
+    /// one minted against another api-base) was resumed verbatim with the
+    /// account bearer. It is refused before any request as an unreadable
+    /// cursor, so the engine reseeds the scope.
+    #[tokio::test]
+    async fn a_persisted_link_off_the_api_origin_is_refused_before_any_request() {
+        for link in [
+            "https://elsewhere.example/v1.0/delta?$deltatoken=d",
+            "https://graph.microsoft.com@elsewhere.example/v1.0/delta",
+            "http://graph.microsoft.com/v1.0/delta",
+        ] {
+            let client = GraphClient::new("token");
+            client.script_rest([]);
+            let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+            let mut payload = GraphCursorPayload::new(
+                kind_for_scope(&email_scope("inbox")).expect("email scope maps"),
+                &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
+                None,
+            );
+            payload.delta_link = link.to_string();
+            let cursor = encode_cursor(email_scope("inbox"), payload).expect("cursor encodes");
+
+            let mut stream = changes_stream(account, cursor);
+            let Some(SyncEvent::Terminated(error)) = stream.next().await else {
+                panic!("{link}: expected a terminal refusal");
+            };
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+                ),
+                "{link}: {:?}",
+                error.kind()
+            );
+            assert_eq!(client.wire_attempts(), 0, "{link} must not be requested");
+        }
+    }
+
+    /// A delta link a Graph page hands back on another origin is refused at
+    /// receipt: never persisted into the checkpoint, never followed.
+    #[tokio::test]
+    async fn a_foreign_delta_link_is_refused_at_receipt() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [{ "id": "m1", "changeKey": "ck1" }],
+                "@odata.deltaLink": "https://elsewhere.example/v1.0/delta?token=next"
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&email_scope("inbox")).expect("email scope maps"),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
+            None,
+        );
+        let cursor = encode_cursor(email_scope("inbox"), payload).expect("cursor encodes");
+
+        let events: Vec<_> = changes_stream(account, cursor).collect().await;
+        for event in &events {
+            if let SyncEvent::Batch(batch) = event {
+                assert!(
+                    batch.checkpoint.is_none(),
+                    "no checkpoint may carry the link"
+                );
+            }
+        }
+        let Some(SyncEvent::Terminated(error)) = events
+            .iter()
+            .find(|event| matches!(event, SyncEvent::Terminated(_)))
+        else {
+            panic!("expected a terminal refusal: {events:?}");
+        };
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation)
+        ));
+        assert!(matches!(events.last(), Some(SyncEvent::Done(None))));
+        assert_eq!(
+            client.wire_attempts(),
+            1,
+            "the foreign link is not followed"
+        );
+    }
+
     #[tokio::test]
     async fn the_event_calendar_event_alias_is_accepted_at_the_changes_door() {
         // A cursor minted from a `CalendarEvent` scope must not be rejected
@@ -770,7 +896,7 @@ mod tests {
                 ty: ObjectType::CalendarEvent,
             })
             .expect("calendar event scope maps"),
-            "https://graph.example/delta".to_string(),
+            &crate::origin::AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let cursor = encode_cursor(

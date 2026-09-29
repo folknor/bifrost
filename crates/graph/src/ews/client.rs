@@ -1,6 +1,6 @@
 use super::{
     EwsBodyStream, EwsClient, EwsError, EwsExecute, EwsHeaders, build_soap_envelope,
-    check_response_error, check_soap_fault, ews_url,
+    check_response_error, check_soap_fault,
 };
 use futures::TryStreamExt;
 
@@ -19,7 +19,7 @@ impl EwsExecute for EwsClient {
         let envelope = build_soap_envelope(body_xml);
         let mut req = self
             .net
-            .post(&self.ews_url)
+            .post(self.endpoint()?)
             .header("Content-Type", "text/xml; charset=utf-8");
         for (name, value) in headers.pairs() {
             req = req.header(name, &value);
@@ -37,15 +37,26 @@ impl EwsExecute for EwsClient {
 }
 
 impl EwsClient {
-    /// Build a client whose SOAP endpoint sits under `outlook_base` (the
-    /// client's Autodiscover/EWS origin, which honors the harness api-base
-    /// override).
-    pub(crate) fn new(net: bifrost_net::AccountNet, outlook_base: &str) -> Self {
+    /// Build a client over the account's admitted EWS endpoint (see
+    /// `GraphClient::ews_url`), or over the reason there is none, in which
+    /// case every request fails closed.
+    pub(crate) fn new(
+        net: bifrost_net::AccountNet,
+        ews_url: Result<crate::origin::AdmittedUrl, String>,
+    ) -> Self {
         Self {
             net,
-            ews_url: ews_url(outlook_base),
+            ews_url,
             tally: None,
         }
+    }
+
+    /// The endpoint every request carries the bearer to.
+    fn endpoint(&self) -> Result<&str, EwsError> {
+        self.ews_url
+            .as_ref()
+            .map(crate::origin::AdmittedUrl::as_str)
+            .map_err(|reason| EwsError::Configuration(reason.clone()))
     }
 
     /// Enroll buffered SOAP responses in an existing batch accumulator.
@@ -72,7 +83,7 @@ impl EwsClient {
         let envelope = build_soap_envelope(body_xml);
         let mut req = self
             .net
-            .post(&self.ews_url)
+            .post(self.endpoint()?)
             .header("Content-Type", "text/xml; charset=utf-8");
         for (name, value) in headers.pairs() {
             req = req.header(name, &value);

@@ -43,6 +43,12 @@ pub(crate) enum GraphError {
         message: String,
         body: Option<Bytes>,
     },
+
+    /// A link a Graph response supplied (`@odata.nextLink`,
+    /// `@odata.deltaLink`) named a URL the bearer must not go to. Raised at
+    /// receipt, so the provider's answer has been read and the refused
+    /// follow-up was never sent.
+    ProviderLinkRefused { reason: String },
 }
 
 /// Parsed Graph error response.
@@ -131,7 +137,10 @@ impl GraphError {
                     ..
                 },
             ) => Some(final_response.status),
-            Self::Configuration { .. } | Self::Net(_) | Self::Json { .. } => None,
+            Self::Configuration { .. }
+            | Self::Net(_)
+            | Self::Json { .. }
+            | Self::ProviderLinkRefused { .. } => None,
         }
     }
 }

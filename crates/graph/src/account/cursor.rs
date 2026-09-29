@@ -4,6 +4,8 @@ use bifrost_types::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::origin::AdmittedUrl;
+
 /// Internal cursor-layer errors. Callers translate these to
 /// `AccountError` via `cursor_error_to_account_error` before
 /// emitting them at the account boundary.
@@ -269,15 +271,41 @@ pub(crate) struct GraphCursorPayload {
     pub(crate) calendar_window_end: Option<i64>,
 }
 
+/// Re-admit a persisted resume link (a delta link or a page marker's next
+/// link) onto the resuming client's api-base.
+///
+/// Persisted links are the consumer's durable state: serde reads them back
+/// as plain text, because the origin they must match belongs to the client,
+/// not to the bytes. Every link this crate persists is an admitted absolute
+/// server link, so anything else - an empty link, a path, another origin -
+/// is a cursor this crate did not produce, refused before any request as
+/// `Decode` (`SyncState(SchemaIncompatible)`, which reseeds the scope).
+/// Following it instead would send the account bearer wherever it names.
+pub(crate) fn admit_resume_url(
+    client: &crate::client::GraphClient,
+    link: &str,
+) -> Result<AdmittedUrl, CursorError> {
+    if reqwest::Url::parse(link).is_err() {
+        return Err(CursorError::Decode(
+            "persisted resume link is not an absolute URL".to_string(),
+        ));
+    }
+    client
+        .admit_target(link)
+        .map_err(|refusal| CursorError::Decode(format!("persisted resume link {refusal}")))
+}
+
 impl GraphCursorPayload {
+    /// A live delta cursor. Takes the delta link as an `AdmittedUrl`, so an
+    /// unadmitted server link cannot be persisted.
     pub(crate) fn new(
         kind: GraphCursorKind,
-        delta_link: String,
+        delta_link: &AdmittedUrl,
         advanced_through: Option<GraphPageMarker>,
     ) -> Self {
         Self {
             kind,
-            delta_link,
+            delta_link: delta_link.as_str().to_string(),
             advanced_through,
             inventory_in_progress: false,
             calendar_window_end: None,
@@ -441,12 +469,12 @@ mod tests {
             ty: ObjectType::Email,
         };
         let marker = GraphPageMarker {
-            next_link: "https://graph.example/next".to_string(),
+            next_link: "https://graph.microsoft.com/v1.0/next".to_string(),
             last_seen_id: Some("m1".to_string()),
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("scope should map"),
-            "https://graph.example/delta".to_string(),
+            &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             Some(marker.clone()),
         );
 
@@ -460,7 +488,10 @@ mod tests {
 
         let decoded = decode_cursor(&cursor).expect("cursor should decode");
         assert_eq!(decoded.advanced_through, Some(marker));
-        assert_eq!(decoded.resume_url(), "https://graph.example/next");
+        assert_eq!(
+            decoded.resume_url(),
+            "https://graph.microsoft.com/v1.0/next"
+        );
     }
 
     #[test]
@@ -547,7 +578,7 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("scope should map"),
-            "https://graph.example/delta".to_string(),
+            &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let cursor = ChangeCursor {
@@ -639,7 +670,7 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("scope should map"),
-            "https://graph.example/delta".to_string(),
+            &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let cursor = encode_cursor(scope, payload).expect("encode");
@@ -659,16 +690,16 @@ mod tests {
             ty: ObjectType::Email,
         };
         let stale = GraphPageMarker {
-            next_link: "https://graph.example/page-1".to_string(),
+            next_link: "https://graph.microsoft.com/v1.0/page-1".to_string(),
             last_seen_id: Some("m1".to_string()),
         };
         let acked = GraphPageMarker {
-            next_link: "https://graph.example/page-9".to_string(),
+            next_link: "https://graph.microsoft.com/v1.0/page-9".to_string(),
             last_seen_id: Some("m9".to_string()),
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("scope should map"),
-            "https://graph.example/delta".to_string(),
+            &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             Some(stale),
         );
         let mut cursor = encode_cursor(scope, payload).expect("encode");
@@ -676,7 +707,10 @@ mod tests {
 
         let decoded = decode_cursor(&cursor).expect("decode");
         assert_eq!(decoded.advanced_through, Some(acked));
-        assert_eq!(decoded.resume_url(), "https://graph.example/page-9");
+        assert_eq!(
+            decoded.resume_url(),
+            "https://graph.microsoft.com/v1.0/page-9"
+        );
     }
 
     /// The other half of the same rule: the outer progress is authoritative
@@ -690,12 +724,12 @@ mod tests {
             ty: ObjectType::Email,
         };
         let unacked = GraphPageMarker {
-            next_link: "https://graph.example/page-1".to_string(),
+            next_link: "https://graph.microsoft.com/v1.0/page-1".to_string(),
             last_seen_id: Some("m1".to_string()),
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("scope should map"),
-            "https://graph.example/delta".to_string(),
+            &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             Some(unacked),
         );
         let mut cursor = encode_cursor(scope, payload).expect("encode");
@@ -703,7 +737,10 @@ mod tests {
 
         let decoded = decode_cursor(&cursor).expect("decode");
         assert_eq!(decoded.advanced_through, None);
-        assert_eq!(decoded.resume_url(), "https://graph.example/delta");
+        assert_eq!(
+            decoded.resume_url(),
+            "https://graph.microsoft.com/v1.0/delta"
+        );
     }
 
     #[test]
@@ -714,10 +751,13 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("scope should map"),
-            "https://graph.example/delta".to_string(),
+            &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
-        assert_eq!(payload.resume_url(), "https://graph.example/delta");
+        assert_eq!(
+            payload.resume_url(),
+            "https://graph.microsoft.com/v1.0/delta"
+        );
     }
 
     #[test]
@@ -738,7 +778,7 @@ mod tests {
         };
         let payload = GraphCursorPayload::new(
             kind_for_scope(&contact_scope).expect("contact scope maps"),
-            "https://graph.example/delta".to_string(),
+            &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
         let cursor = encode_cursor(email_scope.clone(), payload).expect("encode");
@@ -752,19 +792,20 @@ mod tests {
     #[test]
     fn an_empty_delta_link_survives_the_round_trip() {
         // Nothing in the codec rejects a delta-less delta cursor. It is
-        // reachable only from a corrupted or hand-written cursor; the walk
-        // then requests the API root and fails as a parse error rather than
-        // looping, so this is pinned as a known-benign hole, not a
-        // guarantee that empty is meaningful.
+        // reachable only from a corrupted or hand-written cursor, and the
+        // resume refuses it before any request (`admit_resume_url`), so this
+        // pins only that the codec itself stays permissive, not that empty
+        // is meaningful.
         let scope = CursorScope::FolderType {
             folder: FolderId("inbox".to_string()),
             ty: ObjectType::Email,
         };
-        let payload = GraphCursorPayload::new(
+        let mut payload = GraphCursorPayload::new(
             kind_for_scope(&scope).expect("scope should map"),
-            String::new(),
+            &AdmittedUrl::for_tests("https://graph.microsoft.com/v1.0/delta"),
             None,
         );
+        payload.delta_link = String::new();
         let cursor = encode_cursor(scope, payload).expect("encode");
         let decoded = decode_cursor(&cursor).expect("decode");
         assert_eq!(decoded.resume_url(), "");

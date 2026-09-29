@@ -268,7 +268,9 @@ Graph REST JSON calls. Both now share the REST dispatcher:
   production behavior from the one this path has always had. The recorded
   request keeps the header list verbatim (`Content-Range`, `SOAPAction`) plus
   whether a bearer was attached, so "the pre-authed session URL never carries
-  the Graph token" is an assertion rather than a comment.
+  the Graph token" is an assertion rather than a comment. Whether a bearer is
+  attached is decided by the `AuxTarget` variant, not a flag: only an
+  admitted URL can carry it (see "Which URLs may carry the bearer").
 
 The REST, aux, and download surfaces no longer have the graph-T1 limitation:
 because they script at the wire, retry, backoff, the rate-limit permit, the
@@ -360,7 +362,68 @@ cloud) becomes the origin for `/autodiscover/autodiscover.{xml,svc}` and
 `/EWS/Exchange.asmx` too. `with_outlook_base(base)` overrides it explicitly.
 Without this, redirecting the Graph api-base left Autodiscover and EWS
 pointed at the real service, so the public-folder and EWS-streaming legs
-could not be exercised against a mock at all.
+could not be exercised against a mock at all. An UNUSABLE api-base derives
+an unusable Outlook origin rather than falling back to production, so a
+misconfigured Graph base cannot leave Autodiscover and EWS sending the bearer
+to the real `outlook.office365.com`; `with_outlook_base` can still name one.
+
+### Which URLs may carry the bearer (`origin.rs`)
+
+bifrost-net attaches the token source's bearer to the FIRST request of every
+call, whatever its host; its trusted-host allowlist and `Authorization`
+stripping apply only to redirect hops. So the origin decision is made here,
+once. Each configured base (the api-base, the Outlook origin) is parsed into
+a `Base` at construction: http or https, a host, and no userinfo, or it is
+stored as unusable and every request on that surface fails closed before any
+byte (`Request(Malformed)`, consumer configuration; the published
+constructors stay infallible). A target is resolved against a base - a path
+starting with `/` is concatenated (an RFC 3986 join would drop `/v1.0`), any
+other text that parses as an absolute URL is taken as is, anything else is
+concatenated with a slash - and the decision is made on the FINAL parsed URL:
+exact origin equality with the base, no userinfo in the parsed fields or in
+the authority as written. The result is an `AdmittedUrl`, sent as its own
+serialization so the admitted URL is the sent one.
+
+The bearer-carrying send paths accept nothing else: `execute_wire`,
+`download_stream`, `EwsClient` (which holds its admitted endpoint or the
+reason there is none), and `execute_aux`, whose `AuxTarget::Bearer` takes an
+`AdmittedUrl` while `AuxTarget::Anonymous` (the pre-authenticated OneDrive
+chunk PUT) takes a string and never carries the bearer. Server links
+deserialize as `ProviderLink`, which has no accessor yielding a requestable
+string, so a link cannot be followed, minted into a caller cursor, or
+persisted into a checkpoint without admission. Each provenance is admitted
+where it is known, and classified there:
+
+- A server `@odata.nextLink` / `@odata.deltaLink` is admitted at RECEIPT,
+  before it is followed or minted; a refusal is `GraphError::ProviderLinkRefused`
+  -> `Protocol(ContractViolation)` with `Acknowledged` evidence.
+- A caller page cursor is admitted at decode (`paging::decode_paged_cursor`,
+  `decode_link_cursor`, the search cursor's link against the owning mailbox's
+  client); a refusal is `Request(Malformed)`. Bare link cursors must be
+  absolute URLs; paged JSON cursors may also be a `/` path (older cursors
+  named their first page that way). Invalid UTF-8 is malformed too, where two
+  list surfaces used to answer `Unsupported`.
+- A persisted delta link or page marker is re-admitted at resume
+  (`cursor::admit_resume_url`); anything that is not an admitted absolute
+  link is `CursorError::Decode` -> `SyncState(SchemaIncompatible)`, which
+  reseeds the scope. Payload and marker constructors take an `AdmittedUrl`.
+
+Graph documents its links as complete URLs on the service root that issued
+them, and a national cloud is a separately configured base, so exact origin
+equality breaks no documented flow. A reverse proxy that rewrites the base
+but not the links Graph returns is the setup it does refuse.
+
+Autodiscover `GetUserSettings` redirects are read from the protocol's own
+`ErrorCode`, user level before response level (Exchange reports a per-user
+redirect or refusal under a response-level `NoError`, and reading only the
+first `ErrorCode` in the document once hid every per-user answer):
+`RedirectAddress` names a mailbox, `RedirectUrl` an endpoint that must admit
+onto the Outlook origin. A cross-origin `RedirectUrl` is
+`Unsupported(Discover)`: the bearer was issued for the configured resource,
+and a hybrid endpoint on another origin needs trust this client does not
+establish. A self-contradicting answer (a code without a target, a target
+without a redirect code, a URL named as a mailbox, an endpoint that is not an
+http URL) is the provider's malformed response.
 
 `AccountFactory::open(account_id)` attaches the `GraphClient` to `bifrost-net`
 under the engine `AccountId`, validates the token with a `users/me` profile

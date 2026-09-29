@@ -1,12 +1,12 @@
 use bifrost_types::{
     AccountError, AccountOperation, AddressBook, AddressBookId, ContactAddress, ContactCard,
     ContactCorpus, ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch,
-    ContactPhone, ContactProvenance, ContactSearchRequest, DirectoryCard, ErrorScope, Page,
-    ProtocolKind,
+    ContactPhone, ContactProvenance, ContactSearchRequest, DirectoryCard, Page, ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::origin::AdmittedUrl;
 use crate::types::ODataCollection;
 
 use super::GraphAccount;
@@ -34,17 +34,22 @@ pub(crate) async fn address_books_list(
         can_update_contacts: true,
         can_delete_contacts: true,
     }];
+    let operation = AccountOperation::AddressBooksList;
     let mut walk = crate::paging::PageWalk::new("contactFolders");
-    let mut next = Some(format!(
-        "{prefix}/contactFolders?$select=id,displayName,parentFolderId&$top=250"
-    ));
+    let mut next = Some(
+        account
+            .client
+            .api_url(&format!(
+                "{prefix}/contactFolders?$select=id,displayName,parentFolderId&$top=250"
+            ))
+            .map_err(|error| into_error(error, operation))?,
+    );
     while let Some(url) = next {
         walk.enter(&url)
-            .map_err(|error| into_error(error, AccountOperation::AddressBooksList))?;
-        let page: ODataCollection<GraphContactFolder> =
-            get_page(&account, &url, AccountOperation::AddressBooksList).await?;
+            .map_err(|error| into_error(error, operation))?;
+        let page: ODataCollection<GraphContactFolder> = get_page(&account, &url, operation).await?;
+        next = admit_next(&account, &page, operation)?;
         books.extend(page.value.into_iter().map(folder_to_address_book));
-        next = page.next_link;
     }
     Ok(books)
 }
@@ -63,28 +68,19 @@ async fn contact_page(
     page_cursor: Option<Vec<u8>>,
     top: u32,
 ) -> Result<Page<ContactCard>, AccountError> {
-    let next_url = page_cursor
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(|error| {
-            graph_error::unsupported_account_error(AccountOperation::ContactsList)
-                .into_builder()
-                .scope(ErrorScope::ContactCollection)
-                .text(bifrost_types::DiagnosticText::support_only(
-                    error.to_string(),
-                ))
-                .try_build()
-                .expect("valid account error classification")
-        })?;
-    let url = match next_url {
+    let operation = AccountOperation::ContactsList;
+    let url = match decode_link_cursor(&account, page_cursor, operation)? {
         Some(url) => url,
-        None => contacts_url(&account, address_book.as_ref(), top),
+        None => account
+            .client
+            .api_url(&contacts_url(&account, address_book.as_ref(), top))
+            .map_err(|error| into_error(error, operation))?,
     };
-    let page: ODataCollection<GraphContact> =
-        get_page(&account, &url, AccountOperation::ContactsList).await?;
+    let page: ODataCollection<GraphContact> = get_page(&account, &url, operation).await?;
+    let next_cursor = link_cursor(admit_next(&account, &page, operation)?);
     Ok(Page {
         items: page.value.into_iter().map(contact_from_graph).collect(),
-        next_cursor: page.next_link.map(String::into_bytes),
+        next_cursor,
         estimated_total: None,
         failed_ids: Vec::new(),
         skipped_scopes: Vec::new(),
@@ -171,15 +167,22 @@ pub(crate) async fn search(
         .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(250)
         .max(1);
-    let (next_url, mut skip) = crate::paging::decode_paged_cursor(request.page_cursor);
-    let mut url = next_url.unwrap_or_else(|| {
-        contact_search_url(
-            &account,
-            request.address_book_id.as_ref(),
-            &request.query,
-            top_for_limit(request.limit, 250),
-        )
-    });
+    let operation = AccountOperation::ContactSearch;
+    let (mut url, mut skip) = match decode_paged_cursor(&account, request.page_cursor, operation)? {
+        Some(position) => position,
+        None => {
+            let first = account
+                .client
+                .api_url(&contact_search_url(
+                    &account,
+                    request.address_book_id.as_ref(),
+                    &request.query,
+                    top_for_limit(request.limit, 250),
+                ))
+                .map_err(|error| into_error(error, operation))?;
+            (first, 0)
+        }
+    };
     let needle = request.query.to_ascii_lowercase();
     let mut items = Vec::new();
     let mut walk = crate::paging::PageWalk::new("contact search");
@@ -191,8 +194,8 @@ pub(crate) async fn search(
                 graph_error::GraphErrorContext::graph(AccountOperation::ContactSearch),
             )
         })?;
-        let page: ODataCollection<GraphContact> =
-            get_page(&account, &url, AccountOperation::ContactSearch).await?;
+        let page: ODataCollection<GraphContact> = get_page(&account, &url, operation).await?;
+        let next_link = admit_next(&account, &page, operation)?;
         let page_len = page.value.len();
         for (index, value) in page.value.into_iter().enumerate().skip(skip) {
             let contact = contact_from_graph(value);
@@ -201,9 +204,10 @@ pub(crate) async fn search(
                 if items.len() == limit {
                     let consumed = index + 1;
                     next_cursor = if consumed < page_len {
-                        Some(crate::paging::encode_paged_cursor(url.clone(), consumed))
+                        Some(crate::paging::encode_paged_cursor(&url, consumed))
                     } else {
-                        page.next_link
+                        next_link
+                            .as_ref()
                             .map(|next| crate::paging::encode_paged_cursor(next, 0))
                     };
                     return Ok(Page {
@@ -216,7 +220,7 @@ pub(crate) async fn search(
                 }
             }
         }
-        let Some(next) = page.next_link else {
+        let Some(next) = next_link else {
             next_cursor = None;
             break;
         };
@@ -253,12 +257,19 @@ pub(crate) async fn directory_search(
         .and_then(|limit| usize::try_from(limit).ok())
         .unwrap_or(250)
         .max(1);
-    let (next_url, mut skip) = crate::paging::decode_paged_cursor(page_cursor);
-    let mut url = next_url.unwrap_or_else(|| {
-        let prefix = account.client.api_path_prefix();
-        let top = top_for_limit(limit, 999);
-        directory_search_path(&prefix, &query, top)
-    });
+    let operation = AccountOperation::DirectorySearch;
+    let (mut url, mut skip) = match decode_paged_cursor(&account, page_cursor, operation)? {
+        Some(position) => position,
+        None => {
+            let prefix = account.client.api_path_prefix();
+            let top = top_for_limit(limit, 999);
+            let first = account
+                .client
+                .api_url(&directory_search_path(&prefix, &query, top))
+                .map_err(|error| into_error(error, operation))?;
+            (first, 0)
+        }
+    };
     let mut items = Vec::new();
     let mut walk = crate::paging::PageWalk::new("directory search");
     let next_cursor;
@@ -269,8 +280,8 @@ pub(crate) async fn directory_search(
                 graph_error::GraphErrorContext::graph(AccountOperation::DirectorySearch),
             )
         })?;
-        let page: ODataCollection<GraphDirectoryUser> =
-            get_page(&account, &url, AccountOperation::DirectorySearch).await?;
+        let page: ODataCollection<GraphDirectoryUser> = get_page(&account, &url, operation).await?;
+        let next_link = admit_next(&account, &page, operation)?;
         let page_len = page.value.len();
         for (index, value) in page.value.into_iter().enumerate().skip(skip) {
             if let Some(card) = directory_user_to_card(value) {
@@ -278,9 +289,10 @@ pub(crate) async fn directory_search(
                 if items.len() == limit_cap {
                     let consumed = index + 1;
                     next_cursor = if consumed < page_len {
-                        Some(crate::paging::encode_paged_cursor(url.clone(), consumed))
+                        Some(crate::paging::encode_paged_cursor(&url, consumed))
                     } else {
-                        page.next_link
+                        next_link
+                            .as_ref()
                             .map(|next| crate::paging::encode_paged_cursor(next, 0))
                     };
                     return Ok(Page {
@@ -293,7 +305,7 @@ pub(crate) async fn directory_search(
                 }
             }
         }
-        let Some(next) = page.next_link else {
+        let Some(next) = next_link else {
             next_cursor = None;
             break;
         };
@@ -515,22 +527,52 @@ fn directory_user_to_card(user: GraphDirectoryUser) -> Option<DirectoryCard> {
 
 pub(crate) async fn get_page<T: serde::de::DeserializeOwned>(
     account: &GraphAccount,
-    url: &str,
+    url: &AdmittedUrl,
     operation: AccountOperation,
 ) -> Result<ODataCollection<T>, AccountError> {
-    if url.starts_with("http") {
-        account
-            .client
-            .get_absolute(url)
-            .await
-            .map_err(|error| into_error(error, operation))
-    } else {
-        account
-            .client
-            .get_json(url)
-            .await
-            .map_err(|error| into_error(error, operation))
-    }
+    account
+        .client
+        .get(url)
+        .await
+        .map_err(|error| into_error(error, operation))
+}
+
+/// Admit a page's `@odata.nextLink` at receipt, before it is followed or
+/// minted into the caller's cursor.
+pub(crate) fn admit_next<T>(
+    account: &GraphAccount,
+    page: &ODataCollection<T>,
+    operation: AccountOperation,
+) -> Result<Option<AdmittedUrl>, AccountError> {
+    account
+        .client
+        .admit_next(page.next_link.as_ref())
+        .map_err(|error| into_error(error, operation))
+}
+
+/// A list surface's `next_cursor`: the admitted link's bytes.
+pub(crate) fn link_cursor(next: Option<AdmittedUrl>) -> Option<Vec<u8>> {
+    next.map(|next| next.as_str().as_bytes().to_vec())
+}
+
+/// Decode a caller's bare link cursor; a refusal is the caller's malformed
+/// input.
+pub(crate) fn decode_link_cursor(
+    account: &GraphAccount,
+    page_cursor: Option<Vec<u8>>,
+    operation: AccountOperation,
+) -> Result<Option<AdmittedUrl>, AccountError> {
+    crate::paging::decode_link_cursor(&account.client, page_cursor)
+        .map_err(|detail| graph_error::invalid_account_error(operation, detail))
+}
+
+fn decode_paged_cursor(
+    account: &GraphAccount,
+    page_cursor: Option<Vec<u8>>,
+    operation: AccountOperation,
+) -> Result<Option<(AdmittedUrl, usize)>, AccountError> {
+    crate::paging::decode_paged_cursor(&account.client, page_cursor)
+        .map_err(|detail| graph_error::invalid_account_error(operation, detail))
 }
 
 fn contacts_url(account: &GraphAccount, address_book: Option<&AddressBookId>, top: u32) -> String {
@@ -1093,7 +1135,7 @@ mod tests {
         }
         let page = serde_json::json!({
             "value": [row("c1"), row("c2"), row("c3")],
-            "@odata.nextLink": "https://graph.test/next"
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/next"
         });
         let client = crate::client::GraphClient::new("token");
         client.script_rest([
@@ -1136,6 +1178,130 @@ mod tests {
         assert_eq!(
             requests[0].url, requests[1].url,
             "the resume re-reads the same page rather than following nextLink"
+        );
+    }
+
+    fn test_account() -> (crate::client::GraphClient, GraphAccount) {
+        let client = crate::client::GraphClient::new("token");
+        let account =
+            GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions);
+        (client, account)
+    }
+
+    /// The token leak: a caller's page cursor naming another origin was
+    /// fetched verbatim with the account bearer. Every cursor-taking list
+    /// and search surface refuses it before any request, as the caller's
+    /// malformed input.
+    #[tokio::test]
+    async fn a_foreign_origin_page_cursor_is_refused_before_any_request() {
+        let foreign = b"https://elsewhere.example/v1.0/me/contacts?$skiptoken=x".to_vec();
+        let paged = br#"{"url":"HTTPS://elsewhere.example/v1.0/users","skip":1}"#.to_vec();
+        let (client, account) = test_account();
+        client.script_rest([]);
+
+        let errors = [
+            list(account.clone(), None, Some(foreign.clone()))
+                .await
+                .expect_err("contacts list"),
+            search(
+                account.clone(),
+                ContactSearchRequest {
+                    page_cursor: Some(paged.clone()),
+                    ..ContactSearchRequest::new("ada")
+                },
+            )
+            .await
+            .expect_err("contact search"),
+            directory_search(account.clone(), "ada".to_string(), None, Some(paged))
+                .await
+                .expect_err("directory search"),
+            super::super::groups::directory_groups_list(account.clone(), Some(foreign.clone()))
+                .await
+                .expect_err("groups list"),
+            super::super::calendar::events_in_range(
+                account,
+                bifrost_types::EventRange {
+                    calendar_id: bifrost_types::CalendarId("calendar".to_string()),
+                    start: bifrost_types::EventTime {
+                        value: "2026-01-01T00:00:00Z".to_string(),
+                        timezone: None,
+                    },
+                    end: bifrost_types::EventTime {
+                        value: "2026-02-01T00:00:00Z".to_string(),
+                        timezone: None,
+                    },
+                    page_cursor: Some(foreign),
+                    limit: None,
+                },
+            )
+            .await
+            .expect_err("events in range"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::Request(
+                        bifrost_types::RequestErrorKind::Malformed
+                    )
+                ),
+                "{:?}",
+                error.kind()
+            );
+        }
+        assert_eq!(client.wire_attempts(), 0, "nothing may be sent");
+    }
+
+    /// A server `@odata.nextLink` on another origin is refused at receipt:
+    /// it is neither followed nor handed to the caller as a cursor, and the
+    /// refusal blames the response that carried it.
+    #[tokio::test]
+    async fn a_foreign_origin_next_link_is_refused_at_receipt() {
+        let (client, account) = test_account();
+        client.script_rest([
+            crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({
+                    "value": [{ "id": "c1", "displayName": "Ada" }],
+                    "@odata.nextLink": "https://elsewhere.example/v1.0/me/contacts?$skiptoken=x"
+                }),
+            ),
+            crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({
+                    "value": [],
+                    "@odata.nextLink": "https://graph.microsoft.com@elsewhere.example/v1.0/x"
+                }),
+            ),
+        ]);
+
+        for error in [
+            list(account.clone(), None, None)
+                .await
+                .expect_err("a foreign next link must not become the caller's cursor"),
+            address_books_list(account)
+                .await
+                .expect_err("a foreign next link must not be followed"),
+        ] {
+            assert!(
+                matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::Protocol(
+                        bifrost_types::ProtocolErrorKind::ContractViolation
+                    )
+                ),
+                "{:?}",
+                error.kind()
+            );
+            assert!(
+                format!("{error:?}").contains("Acknowledged"),
+                "the provider answered: {error:?}"
+            );
+        }
+        assert_eq!(
+            client.wire_attempts(),
+            2,
+            "one request per surface, nothing followed"
         );
     }
 

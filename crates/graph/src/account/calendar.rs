@@ -49,16 +49,27 @@ pub(crate) async fn calendars_list(account: GraphAccount) -> Result<Vec<Calendar
     let prefix = account.client.api_path_prefix();
     let mut calendars = Vec::new();
     let mut walk = crate::paging::PageWalk::new("calendars");
-    let mut next = Some(format!(
-        "{prefix}/calendars?$select=id,name,canEdit,isDefaultCalendar&$top=250"
-    ));
+    let mut next = Some(
+        account
+            .client
+            .api_url(&format!(
+                "{prefix}/calendars?$select=id,name,canEdit,isDefaultCalendar&$top=250"
+            ))
+            .map_err(|error| into_error(error, AccountOperation::CalendarsList))?,
+    );
     while let Some(url) = next {
         walk.enter(&url)
             .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
-        let page: ODataCollection<GraphCalendar> =
-            get_page(&account, &url, AccountOperation::CalendarsList).await?;
+        let page: ODataCollection<GraphCalendar> = account
+            .client
+            .get(&url)
+            .await
+            .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
         calendars.extend(page.value.into_iter().map(calendar_from_graph));
-        next = page.next_link;
+        next = account
+            .client
+            .admit_next(page.next_link.as_ref())
+            .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
     }
     Ok(calendars)
 }
@@ -67,30 +78,38 @@ pub(crate) async fn events_in_range(
     account: GraphAccount,
     range: EventRange,
 ) -> Result<Page<CalendarEvent>, AccountError> {
-    let next_url = range
-        .page_cursor
-        .map(String::from_utf8)
-        .transpose()
-        .map_err(|error| local_error(AccountOperation::EventsInRange, error.to_string()))?;
-    let url = next_url.unwrap_or_else(|| {
-        let prefix = account.client.api_path_prefix();
-        let calendar = bifrost_net::url::encode_path_component(&range.calendar_id.0);
-        format!(
-            "{prefix}/calendars/{calendar}/calendarView?startDateTime={}&endDateTime={}&$select={EVENT_SELECT}&$top={}",
-            bifrost_net::url::encode_query_value(&range.start.value),
-            bifrost_net::url::encode_query_value(&range.end.value),
-            range.limit.unwrap_or(250).clamp(1, 250)
-        )
-    });
-    let page: ODataCollection<GraphEvent> =
-        get_event_page(&account, &url, AccountOperation::EventsInRange).await?;
+    let operation = AccountOperation::EventsInRange;
+    let cursor = crate::paging::decode_link_cursor(&account.client, range.page_cursor)
+        .map_err(|detail| graph_error::invalid_account_error(operation, detail))?;
+    let url = match cursor {
+        Some(url) => url,
+        None => {
+            let prefix = account.client.api_path_prefix();
+            let calendar = bifrost_net::url::encode_path_component(&range.calendar_id.0);
+            account
+                .client
+                .api_url(&format!(
+                    "{prefix}/calendars/{calendar}/calendarView?startDateTime={}&endDateTime={}&$select={EVENT_SELECT}&$top={}",
+                    bifrost_net::url::encode_query_value(&range.start.value),
+                    bifrost_net::url::encode_query_value(&range.end.value),
+                    range.limit.unwrap_or(250).clamp(1, 250)
+                ))
+                .map_err(|error| into_error(error, operation))?
+        }
+    };
+    let page: ODataCollection<GraphEvent> = get_event_page(&account, &url, operation).await?;
+    let next_cursor = account
+        .client
+        .admit_next(page.next_link.as_ref())
+        .map_err(|error| into_error(error, operation))?
+        .map(|next| next.as_str().as_bytes().to_vec());
     Ok(Page {
         items: page
             .value
             .into_iter()
             .map(|event| event_from_graph(range.calendar_id.0.clone(), event))
             .collect(),
-        next_cursor: page.next_link.map(String::into_bytes),
+        next_cursor,
         estimated_total: None,
         failed_ids: Vec::new(),
         skipped_scopes: Vec::new(),
@@ -282,15 +301,24 @@ async fn search_locally(
     let calendar_id = explicit_calendar_id
         .clone()
         .unwrap_or_else(|| CalendarId(DEFAULT_CALENDAR_ID.to_string()));
-    let (next_url, mut skip) = crate::paging::decode_paged_cursor(request.page_cursor);
-    let mut url = next_url.unwrap_or_else(|| {
-        let prefix = account.client.api_path_prefix();
-        format!(
-            "{}?$select={EVENT_SELECT}&$top={}",
-            event_search_path(&prefix, explicit_calendar_id.as_ref()),
-            request.limit.unwrap_or(250).min(250)
-        )
-    });
+    let operation = AccountOperation::EventSearch;
+    let cursor = crate::paging::decode_paged_cursor(&account.client, request.page_cursor)
+        .map_err(|detail| graph_error::invalid_account_error(operation, detail))?;
+    let (mut url, mut skip) = match cursor {
+        Some(position) => position,
+        None => {
+            let prefix = account.client.api_path_prefix();
+            let first = account
+                .client
+                .api_url(&format!(
+                    "{}?$select={EVENT_SELECT}&$top={}",
+                    event_search_path(&prefix, explicit_calendar_id.as_ref()),
+                    request.limit.unwrap_or(250).min(250)
+                ))
+                .map_err(|error| into_error(error, operation))?;
+            (first, 0)
+        }
+    };
     let needle = request.query.to_ascii_lowercase();
     let include_cancelled = request.include_cancelled;
     let limit = request
@@ -306,6 +334,12 @@ async fn search_locally(
             .map_err(|error| local_error(AccountOperation::EventSearch, format!("{error:?}")))?;
         let page: ODataCollection<GraphEvent> =
             get_event_page(&account, &url, AccountOperation::EventSearch).await?;
+        // Admitted at receipt, before it can be followed or minted into the
+        // caller's cursor below.
+        let next_link = account
+            .client
+            .admit_next(page.next_link.as_ref())
+            .map_err(|error| into_error(error, operation))?;
         let page_len = page.value.len();
         for (index, value) in page.value.into_iter().enumerate().skip(skip) {
             let event = event_from_graph(calendar_id.0.clone(), value);
@@ -320,9 +354,10 @@ async fn search_locally(
                 if items.len() == limit {
                     let consumed = index + 1;
                     next_cursor = if consumed < page_len {
-                        Some(crate::paging::encode_paged_cursor(url.clone(), consumed))
+                        Some(crate::paging::encode_paged_cursor(&url, consumed))
                     } else {
-                        page.next_link
+                        next_link
+                            .as_ref()
                             .map(|next| crate::paging::encode_paged_cursor(next, 0))
                     };
                     return Ok(Page {
@@ -335,7 +370,7 @@ async fn search_locally(
                 }
             }
         }
-        let Some(next) = page.next_link else {
+        let Some(next) = next_link else {
             next_cursor = None;
             break;
         };
@@ -421,44 +456,16 @@ fn graph_search_api_supported(account: &GraphAccount, request: &EventSearchReque
         && account.client.uses_default_mailbox()
 }
 
-async fn get_page<T: serde::de::DeserializeOwned>(
-    account: &GraphAccount,
-    url: &str,
-    operation: AccountOperation,
-) -> Result<ODataCollection<T>, AccountError> {
-    if url.starts_with("http") {
-        account
-            .client
-            .get_absolute(url)
-            .await
-            .map_err(|error| into_error(error, operation))
-    } else {
-        account
-            .client
-            .get_json(url)
-            .await
-            .map_err(|error| into_error(error, operation))
-    }
-}
-
 async fn get_event_page<T: serde::de::DeserializeOwned>(
     account: &GraphAccount,
-    url: &str,
+    url: &crate::origin::AdmittedUrl,
     operation: AccountOperation,
 ) -> Result<ODataCollection<T>, AccountError> {
-    if url.starts_with("http") {
-        account
-            .client
-            .get_absolute_prefer(url, EVENT_TIMEZONE_PREFER)
-            .await
-            .map_err(|error| into_error(error, operation))
-    } else {
-        account
-            .client
-            .get_json_prefer(url, EVENT_TIMEZONE_PREFER)
-            .await
-            .map_err(|error| into_error(error, operation))
-    }
+    account
+        .client
+        .get_prefer(url, EVENT_TIMEZONE_PREFER)
+        .await
+        .map_err(|error| into_error(error, operation))
 }
 
 fn calendar_from_graph(calendar: GraphCalendar) -> Calendar {
