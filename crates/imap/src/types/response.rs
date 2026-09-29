@@ -540,13 +540,16 @@ impl Default for ExpungeResult {
 ///
 /// RFC 6851 Section 3 specifies that the server sends EXPUNGE (or VANISHED
 /// when QRESYNC is enabled per RFC 7162 Section 3.2.10) responses *before*
-/// the tagged OK, followed by a COPYUID response code in the tagged OK
-/// (RFC 6851 Section 4.3). This struct captures both pieces of information.
+/// the tagged OK. RFC 6851 Section 4.3 asks a UIDPLUS server to send the
+/// COPYUID response code in an untagged OK before those expunges, though
+/// some servers put it on the tagged OK instead. This struct captures both
+/// pieces of information.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct MoveResult {
-    /// The response code from the tagged OK, typically `COPYUID`
-    /// (RFC 6851 Section 4.3).
+    /// The response code from the tagged OK when it carries one, otherwise
+    /// the code from the first untagged `OK [COPYUID ...]`; typically
+    /// `COPYUID` (RFC 6851 Section 4.3).
     pub code: Option<ResponseCode>,
     /// The EXPUNGE or VANISHED responses that preceded the tagged OK
     /// (RFC 6851 Section 3 / RFC 7162 Section 3.2.10).

@@ -260,23 +260,23 @@ fn validate_select_responses(
     }
 
     if !saw_flags {
-        return Err(Error::Protocol(format!(
+        return Err(Error::ProtocolMissing(format!(
             "{command_name} completed without the required FLAGS response ({section})"
         )));
     }
     if !saw_exists {
-        return Err(Error::Protocol(format!(
+        return Err(Error::ProtocolMissing(format!(
             "{command_name} completed without the required EXISTS response ({section})"
         )));
     }
     if is_rev2 {
         if !saw_list {
-            return Err(Error::Protocol(format!(
+            return Err(Error::ProtocolMissing(format!(
                 "{command_name} completed without the required LIST response ({section})"
             )));
         }
     } else if !saw_recent {
-        return Err(Error::Protocol(format!(
+        return Err(Error::ProtocolMissing(format!(
             "{command_name} completed without the required RECENT response ({section})"
         )));
     }

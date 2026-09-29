@@ -1573,7 +1573,7 @@ fn mailbox_append_limit_reads_every_plausible_status_reply() {
     };
     assert!(matches!(
         mailbox_append_limit(&status),
-        Err(Error::Protocol(_))
+        Err(Error::ProtocolMissing(_))
     ));
 }
 

@@ -142,10 +142,10 @@ pub(crate) struct Finalized<T> {
     /// something buried in the erased `Box<dyn Any>`, because the driver reads
     /// it: `is_connection_fatal` decides whether to close the command receiver
     /// and move protocol state BEFORE the result is published. A consumer
-    /// failure can be `Error::Protocol` (CAPABILITY with no capability data,
-    /// STATUS with no matching response, SCRAM completing before the
-    /// server-final verification), and hiding one inside `Any` would disable
-    /// that handling.
+    /// failure can be `Error::Protocol` (SCRAM completing before the
+    /// server-final verification) or `Error::ProtocolMissing` (CAPABILITY
+    /// with no capability data, STATUS with no matching response), and hiding
+    /// one inside `Any` would disable that handling.
     pub output: Result<T, Error>,
     /// Responses the consumer decided were not actually part of its
     /// solicited result. Dispatcher re-emits these to the event sink.
@@ -343,7 +343,7 @@ impl Consumer for CapabilityConsumer {
             // Stays a real `Error` in `output`: the driver inspects it with
             // `is_connection_fatal` before publishing the result.
             return Finalized::failure(
-                Error::Protocol(
+                Error::ProtocolMissing(
                     "CAPABILITY OK but no capability data in response \
                      (RFC 3501 Section 6.1.1)"
                         .into(),
@@ -397,7 +397,7 @@ impl Consumer for LogoutConsumer {
         // than consuming), and all of it is `Either` data.
         if !self.saw_bye {
             return Finalized::failure(
-                Error::Protocol(
+                Error::ProtocolMissing(
                     "LOGOUT: server did not send mandatory BYE \
                      (RFC 3501 Section 6.1.3)"
                         .into(),
@@ -677,7 +677,9 @@ impl Consumer for IdConsumer {
         match self.pairs {
             Some(pairs) => Finalized::success(pairs, self.buffered),
             None => Finalized::failure(
-                Error::Protocol("ID OK but no untagged ID response (RFC 2971 Section 3.2)".into()),
+                Error::ProtocolMissing(
+                    "ID OK but no untagged ID response (RFC 2971 Section 3.2)".into(),
+                ),
                 self.buffered,
             ),
         }
@@ -742,7 +744,7 @@ impl Consumer for NamespaceConsumer {
                 self.buffered,
             ),
             None => Finalized::failure(
-                Error::Protocol(
+                Error::ProtocolMissing(
                     "NAMESPACE OK but no untagged NAMESPACE response (RFC 2342 Section 5)".into(),
                 ),
                 self.buffered,

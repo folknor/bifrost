@@ -30,7 +30,9 @@ pub(crate) enum LiteralMode {
 /// - reject commands whose prerequisite capability is not advertised (I6),
 /// - select the correct wire encoding for mailbox names and literals.
 ///
-/// Constructed by `ImapConnection::encode_options()`.
+/// Constructed in production by the driver from the protocol state it owns
+/// (`connection::driver::build_encode_options`), at the moment a command is
+/// encoded; the connection handle has no builder of its own.
 #[derive(Debug, Clone)]
 pub(crate) struct EncodeOptions {
     /// RFC 6855 / RFC 9051 `UTF8=ACCEPT` mode.

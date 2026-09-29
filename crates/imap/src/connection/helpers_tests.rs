@@ -355,6 +355,14 @@ fn status_deleted_requires_rev2_or_quota_res_message() {
             .validate_requested_status_items("DELETED")
             .is_ok()
     );
+    // No RFC defines a `STATUS=DELETED` capability, so advertising that
+    // token on rev1 opens no route to the item: the gate is rev2 or
+    // QUOTA=RES-MESSAGE, not the capability authority.
+    assert!(
+        conn(vec![Capability::Imap4Rev1, Capability::StatusDeleted])
+            .validate_requested_status_items("DELETED")
+            .is_err()
+    );
 }
 
 #[test]
@@ -532,39 +540,6 @@ fn literal_mode_prefers_literal_plus() {
         conn(vec![Capability::Imap4Rev1]).literal_mode(),
         LiteralMode::Synchronizing
     ));
-}
-
-#[test]
-fn non_sync_literal_size_gate() {
-    let plus = conn(vec![Capability::LiteralPlus]);
-    assert!(plus.supports_non_sync_literal(1_000_000));
-
-    let minus = conn(vec![Capability::LiteralMinus]);
-    assert!(minus.supports_non_sync_literal(4096));
-    assert!(!minus.supports_non_sync_literal(4097));
-
-    assert!(!conn(vec![]).supports_non_sync_literal(1));
-}
-
-#[test]
-fn non_sync_literal8_requires_binary_and_is_off_for_pure_rev2() {
-    // RFC 7888 Section 6: literal8 needs BINARY as well.
-    assert!(!conn(vec![Capability::LiteralPlus]).supports_non_sync_literal8(1));
-    assert!(
-        conn(vec![Capability::LiteralPlus, Capability::Binary]).supports_non_sync_literal8(100_000)
-    );
-    // RFC 9051 Section 9: rev2 literal8 is always synchronizing.
-    assert!(
-        !conn(vec![
-            Capability::LiteralPlus,
-            Capability::Binary,
-            Capability::Imap4Rev2
-        ])
-        .supports_non_sync_literal8(1)
-    );
-    let minus = conn(vec![Capability::LiteralMinus, Capability::Binary]);
-    assert!(minus.supports_non_sync_literal8(4096));
-    assert!(!minus.supports_non_sync_literal8(4097));
 }
 
 // ---------------------------------------------------------------------------

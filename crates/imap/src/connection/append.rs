@@ -245,7 +245,7 @@ pub(super) fn mailbox_append_limit(status: &StatusResult) -> Result<Option<u64>,
         }
     }
     if !saw_append_limit {
-        return Err(Error::Protocol(
+        return Err(Error::ProtocolMissing(
             "APPENDLIMIT capability but STATUS response omitted APPENDLIMIT".into(),
         ));
     }

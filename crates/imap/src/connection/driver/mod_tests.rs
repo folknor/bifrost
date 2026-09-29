@@ -385,3 +385,41 @@ fn consumerless_arm_fails_on_bye_after_publishing_its_alert() {
         "the ALERT reaches the queue and the BYE is not also forwarded, got {events:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Literal-mode selection (RFC 7888, RFC 9051 Section 4.3)
+// ---------------------------------------------------------------------------
+
+fn literal_mode_for(caps: Vec<Capability>) -> LiteralMode {
+    let mut state = super::super::state::ProtocolState::new();
+    state.apply_capability_fetch(caps);
+    literal_mode(&state)
+}
+
+/// The driver's literal negotiation, which decides the wire bytes. Pure rev2
+/// lands on the 4096-octet LITERAL- behaviour (RFC 9051 Appendix E folds in
+/// LITERAL-, not LITERAL+), and unbounded LITERAL+ needs the advertised token
+/// on either revision.
+#[test]
+fn driver_literal_mode_follows_the_capability_authority() {
+    assert_eq!(
+        literal_mode_for(vec![Capability::LiteralPlus, Capability::LiteralMinus]),
+        LiteralMode::LiteralPlus
+    );
+    assert_eq!(
+        literal_mode_for(vec![Capability::LiteralMinus]),
+        LiteralMode::LiteralMinus
+    );
+    assert_eq!(
+        literal_mode_for(vec![Capability::Imap4Rev2]),
+        LiteralMode::LiteralMinus
+    );
+    assert_eq!(
+        literal_mode_for(vec![Capability::Imap4Rev2, Capability::LiteralPlus]),
+        LiteralMode::LiteralPlus
+    );
+    assert_eq!(
+        literal_mode_for(vec![Capability::Imap4Rev1]),
+        LiteralMode::Synchronizing
+    );
+}

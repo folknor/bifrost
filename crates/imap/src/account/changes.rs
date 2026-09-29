@@ -936,7 +936,7 @@ fn validate_uidvalidity(
 fn selected_uidvalidity(selected: &SelectedMailbox) -> Result<u32, ChangeError> {
     selected
         .uid_validity
-        .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()).into())
+        .ok_or_else(|| crate::Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()).into())
 }
 
 fn validate_modseq_not_reset(

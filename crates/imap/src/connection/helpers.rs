@@ -304,6 +304,14 @@ impl ImapConnection {
                     }
                 }
                 "DELETED" => {
+                    // Deliberately NOT `snapshot_supports(StatusDeleted)`. The
+                    // two agree under active rev2; they differ only on rev1,
+                    // where the authority would also accept an advertised
+                    // `STATUS=DELETED` token. No RFC defines that token: RFC
+                    // 9051 Section 6.3.11 makes DELETED a base rev2 item, and
+                    // the only rev1 route is RFC 9208 Section 4.1.4's
+                    // QUOTA=RES-MESSAGE. The gate therefore names exactly
+                    // those two sources.
                     if !self.is_rev2() && !self.has_quota_resource("MESSAGE") {
                         return Err(Error::MissingCapability(
                             "STATUS item DELETED requires IMAP4rev2 or \
@@ -476,41 +484,6 @@ impl ImapConnection {
             ));
         }
         Ok(tokens)
-    }
-
-    /// Check if the server supports non-synchronizing literals of the given size.
-    ///
-    /// RFC 7888 Section 4: LITERAL+ allows any size.
-    /// RFC 7888 Section 5 / RFC 9051 Section 4.3: LITERAL- style
-    /// non-synchronizing literals are limited to 4096 octets.
-    /// RFC 9051 Appendix E item 2 folds LITERAL- into pure `IMAP4rev2`.
-    pub(super) fn supports_non_sync_literal(&self, size: usize) -> bool {
-        let snap = self.state_rx.borrow();
-        // LITERAL+ stays advertised-only: rev2 folds in LITERAL-, and the
-        // authority answers that half.
-        snap.capabilities.contains(&Capability::LiteralPlus)
-            || (super::auth::snapshot_supports(&snap, &Capability::LiteralMinus) && size <= 4096)
-    }
-
-    /// Check if the server supports non-synchronizing literal8 of the given size.
-    ///
-    /// RFC 7888 Section 6: on `IMAP4rev1`, literal8 may use the
-    /// non-synchronizing form only when BOTH BINARY and a compatible
-    /// literal extension are advertised.
-    ///
-    /// RFC 9051 Section 9 redefines `literal8` for pure `IMAP4rev2` as
-    /// `~{" number64 "}" CRLF *OCTET`, with no `+` modifier, so rev2
-    /// literal8 is always synchronizing.
-    pub(super) fn supports_non_sync_literal8(&self, size: usize) -> bool {
-        let snap = self.state_rx.borrow();
-        if !snap.capabilities.contains(&Capability::Binary)
-            || super::auth::is_rev2_from_snapshot(&snap)
-        {
-            return false;
-        }
-
-        snap.capabilities.contains(&Capability::LiteralPlus)
-            || (snap.capabilities.contains(&Capability::LiteralMinus) && size <= 4096)
     }
 
     /// Whether `UTF8=ACCEPT` has been enabled (RFC 6855 Section 3).

@@ -442,7 +442,7 @@ impl Consumer for StatusConsumer {
             // `is_connection_fatal` before publishing the result. Nothing
             // solicited exists to drop, so the buffer is surrendered.
             return Finalized::failure(
-                Error::Protocol(format!(
+                Error::ProtocolMissing(format!(
                     "STATUS OK but no matching untagged STATUS response \
                      for mailbox '{target}' (RFC 3501 Sections 5.2, 6.3.10)"
                 )),

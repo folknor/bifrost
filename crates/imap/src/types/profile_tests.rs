@@ -187,7 +187,6 @@ fn imap4rev2_profile_implies_base_extensions() {
         Capability::ListExtended,
         Capability::ListStatus,
         Capability::LiteralMinus,
-        Capability::LiteralPlus,
         Capability::Move,
         Capability::Namespace,
         Capability::ObjectId,
@@ -204,6 +203,24 @@ fn imap4rev2_profile_implies_base_extensions() {
     for capability in implied {
         assert!(profile.supports(capability));
     }
+}
+
+/// RFC 9051 Appendix E folds LITERAL- into rev2, never LITERAL+: a pure rev2
+/// server takes non-synchronizing literals up to 4096 octets only (RFC 9051
+/// Section 4.3). The profile must not report unbounded LITERAL+ there, and
+/// must still report it when the rev2 server advertises it.
+///
+/// Against the old baseline list, which contained LITERAL+, the first
+/// assertion fails.
+#[test]
+fn imap4rev2_profile_does_not_imply_literal_plus() {
+    let pure_rev2 = ServerProfile::new(vec![Capability::Imap4Rev2], vec![]);
+    assert!(!pure_rev2.supports(Capability::LiteralPlus));
+    assert!(pure_rev2.supports(Capability::LiteralMinus));
+
+    let advertised =
+        ServerProfile::new(vec![Capability::Imap4Rev2, Capability::LiteralPlus], vec![]);
+    assert!(advertised.supports(Capability::LiteralPlus));
 }
 
 #[test]

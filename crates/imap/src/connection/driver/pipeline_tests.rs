@@ -321,6 +321,62 @@ async fn a_completion_for_an_unsent_command_is_a_protocol_error() {
     );
 }
 
+/// A tag-correlated ESEARCH for the SECOND pipelined search, arriving while
+/// the first search is still the head, reaches the command its tag names.
+///
+/// Head routing used to hand it to the first search's consumer, which
+/// buffers a foreign-tagged ESEARCH and surrenders it as an event, so the
+/// second search finalized on its tagged OK with no ESEARCH at all and failed
+/// with "SEARCH RETURN OK but no ESEARCH response" - for a server that did
+/// nothing but interleave two pipelined searches, which is exactly what the
+/// search-correlator exists to allow (RFC 4466, RFC 4731 Section 3.1).
+///
+/// The two searches have distinct `CommandKind`s (`Search`, `SearchReturn`),
+/// so `group_into_sub_batches` keeps them in one batch with both tags
+/// outstanding. No literal is involved; this is the step 4 response loop.
+#[tokio::test]
+async fn a_tag_correlated_esearch_reaches_the_search_its_tag_names() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ESEARCH")).await;
+
+    let task = tokio::spawn(async move {
+        conn.pipeline()
+            .uid_search("ALL".to_owned())
+            .uid_search_return("ALL".to_owned(), vec!["ALL".to_owned()])
+            .execute_dynamic()
+            .await
+    });
+
+    let search = read_line(&mut server).await;
+    let tag1 = tag_of(&search).to_owned();
+    let search_return = read_line(&mut server).await;
+    let tag2 = tag_of(&search_return).to_owned();
+
+    // Command #2's ESEARCH comes FIRST, while command #1 is still the head.
+    respond(
+        &mut server,
+        &format!(
+            "* ESEARCH (TAG \"{tag2}\") UID ALL 7\r\n* SEARCH 3\r\n\
+             {tag1} OK search done\r\n{tag2} OK search return done\r\n"
+        ),
+    )
+    .await;
+
+    let results = task.await.unwrap().expect("the batch must not abort");
+    let first = results[0]
+        .as_ref()
+        .expect("command #1 completes normally")
+        .downcast_ref::<crate::connection::SearchResult>()
+        .expect("SEARCH output is a SearchResult");
+    assert_eq!(first.ids, vec![3]);
+    let second = results[1]
+        .as_ref()
+        .expect("command #2's correlated ESEARCH must reach command #2")
+        .downcast_ref::<crate::types::EsearchResponse>()
+        .expect("SEARCH RETURN output is an EsearchResponse");
+    assert_eq!(second.tag.as_deref(), Some(tag2.as_str()));
+    assert_eq!(second.all, vec![crate::types::UidRange::single(7)]);
+}
+
 /// The tag the generator will produce after `tag`.
 ///
 /// `TagGenerator` emits `{prefix:08x}{counter:08x}` from a per-connection

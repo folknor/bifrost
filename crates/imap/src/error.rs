@@ -132,6 +132,20 @@ pub(crate) enum Error {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// The narrower `Protocol` case where the evidence is an OMISSION: the
+    /// server completed a command without a response or field the protocol
+    /// makes mandatory (SELECT without UIDVALIDITY, a tagged OK without the
+    /// untagged STATUS / QUOTA / ACL / SEARCH it owes, a STATUS reply
+    /// without the item asked for).
+    ///
+    /// Behaves exactly like `Protocol` everywhere (connection-fatal, same
+    /// display text, same `ProviderContractViolation` recovery); only the
+    /// account kind is finer, `Protocol(MissingField)` instead of
+    /// `Protocol(ContractViolation)`, so diagnostics can tell "the server
+    /// left something out" from "the server sent something wrong".
+    #[error("protocol error: {0}")]
+    ProtocolMissing(String),
+
     /// Failed to parse a server response.
     #[error("parse error: {0}")]
     Parse(String),
@@ -348,6 +362,7 @@ impl PartialEq for Error {
                 },
             ) => t1 == t2 && c1 == c2 && a1 == a2,
             (Self::Protocol(a), Self::Protocol(b))
+            | (Self::ProtocolMissing(a), Self::ProtocolMissing(b))
             | (Self::Parse(a), Self::Parse(b))
             | (Self::InvalidInput(a), Self::InvalidInput(b))
             | (Self::InvalidState(a), Self::InvalidState(b))
@@ -435,6 +450,7 @@ impl Error {
             Self::Io { .. }
                 | Self::Bye { .. }
                 | Self::Protocol(_)
+                | Self::ProtocolMissing(_)
                 | Self::Parse(_)
                 | Self::Closed { .. }
                 | Self::DriverPanicked { .. }

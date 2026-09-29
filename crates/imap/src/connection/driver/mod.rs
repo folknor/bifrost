@@ -1016,16 +1016,15 @@ fn utf8_mode(state: &super::state::ProtocolState) -> bool {
 ///
 /// RFC 7888 Section4 (LITERAL+), Section5 (LITERAL-), RFC 3501 Section4.3 (synchronizing).
 fn literal_mode(state: &super::state::ProtocolState) -> LiteralMode {
-    if state.capabilities().contains(&Capability::LiteralPlus) {
+    let usable = |capability: &Capability| {
+        crate::types::profile::supports(state.capabilities(), state.enabled(), capability)
+    };
+    // Both arms ask the authority. Its rev2 baseline folds in LITERAL- and
+    // not LITERAL+ (RFC 9051 Appendix E), so pure rev2 lands on the
+    // 4096-octet LITERAL- behaviour and unbounded LITERAL+ needs the token.
+    if usable(&Capability::LiteralPlus) {
         LiteralMode::LiteralPlus
-    } else if crate::types::profile::supports(
-        state.capabilities(),
-        state.enabled(),
-        &Capability::LiteralMinus,
-    ) {
-        // The LITERAL+ arm above deliberately stays an advertised-only check:
-        // rev2 negotiates the 4096-octet LITERAL- behaviour, never unbounded
-        // LITERAL+, even though the authority lists LITERAL+ as usable there.
+    } else if usable(&Capability::LiteralMinus) {
         LiteralMode::LiteralMinus
     } else {
         LiteralMode::Synchronizing

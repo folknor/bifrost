@@ -542,6 +542,42 @@ fn a_client_side_failure_is_internal_not_a_provider_fault() {
     }
 }
 
+/// An omission by the server is `Protocol(MissingField)`, a wrong response is
+/// `Protocol(ContractViolation)`, and the two share their recovery class,
+/// their cause shape and their connection fatality: the refinement is for
+/// diagnostics only.
+#[test]
+fn a_missing_mandatory_response_is_missing_field_with_the_same_recovery() {
+    let missing = into_account_error(
+        Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()),
+        ImapErrorContext::operation(AccountOperation::SyncChanges),
+    );
+    let wrong = into_account_error(
+        Error::Protocol("unexpected tag".into()),
+        ImapErrorContext::operation(AccountOperation::SyncChanges),
+    );
+    assert_eq!(
+        missing.kind(),
+        &AccountErrorKind::Protocol(ProtocolErrorKind::MissingField)
+    );
+    assert_eq!(
+        wrong.kind(),
+        &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+    );
+    assert_eq!(
+        missing.recovery(),
+        &RecoveryClass::ProviderContractViolation
+    );
+    assert_eq!(missing.recovery(), wrong.recovery());
+    assert!(
+        missing
+            .chain()
+            .iter()
+            .any(|cause| matches!(cause, Cause::Wire(WireCause::MalformedResponse { .. })))
+    );
+    assert!(Error::ProtocolMissing("x".into()).is_connection_fatal());
+}
+
 /// A mid-exchange invariant failure retires the connection; the ordinary
 /// internal failure, raised with the framing intact, does not.
 #[test]

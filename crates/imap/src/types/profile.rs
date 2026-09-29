@@ -178,6 +178,13 @@ impl ServerProfile {
 /// rule and the QRESYNC special case. Extensions the server may advertise but
 /// which rev2 did not fold in (CONDSTORE, QRESYNC, SORT, THREAD, WITHIN,
 /// PREVIEW, NOTIFY, MULTIAPPEND, ...) are deliberately absent.
+///
+/// LITERAL+ is among the absent ones. RFC 9051 Appendix E folds in LITERAL-
+/// only: a rev2 server accepts non-synchronizing literals up to 4096 octets
+/// (RFC 9051 Section 4.3), and unbounded ones only when it ALSO advertises
+/// LITERAL+ (RFC 7888 Section 4). Listing LITERAL+ here would tell every
+/// `supports` caller that a pure rev2 server takes a `{N+}` literal of any
+/// size, which such a server is entitled to reject.
 fn rev2_baseline_includes(capability: &Capability) -> bool {
     matches!(
         capability,
@@ -188,7 +195,6 @@ fn rev2_baseline_includes(capability: &Capability) -> bool {
             | Capability::ListExtended
             | Capability::ListStatus
             | Capability::LiteralMinus
-            | Capability::LiteralPlus
             | Capability::Move
             | Capability::Namespace
             | Capability::ObjectId
@@ -346,7 +352,6 @@ pub(crate) mod capability_matrix {
             | Capability::ListExtended
             | Capability::ListStatus
             | Capability::LiteralMinus
-            | Capability::LiteralPlus
             | Capability::Move
             | Capability::Namespace
             | Capability::ObjectId
@@ -358,7 +363,9 @@ pub(crate) mod capability_matrix {
             | Capability::StatusSize
             | Capability::UidPlus
             | Capability::Unselect => true,
-            Capability::Imap4Rev1
+            // RFC 9051 Appendix E folds in LITERAL-, not LITERAL+.
+            Capability::LiteralPlus
+            | Capability::Imap4Rev1
             | Capability::Imap4Rev2
             | Capability::Acl
             | Capability::AppendLimit(_)

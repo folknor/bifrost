@@ -510,6 +510,15 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 detail: Some(DiagnosticText::support_only(msg.clone())),
             }),
         ),
+        // Same recovery class as `Protocol` (`ProviderContractViolation`);
+        // the kind only records that the server omitted something mandatory.
+        Error::ProtocolMissing(msg) => Translation::new(
+            AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Imap,
+                detail: Some(DiagnosticText::support_only(msg.clone())),
+            }),
+        ),
         Error::Parse(msg) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {

@@ -141,7 +141,7 @@ pub(super) async fn run_fetch(
     let uidvalidity = selected
         .mailbox
         .uid_validity
-        .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
+        .ok_or_else(|| crate::Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()))?;
     if uidvalidity != expected_uidvalidity {
         return Err(BlobError::Account(
             AccountErrorBuilder::new(

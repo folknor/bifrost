@@ -264,7 +264,7 @@ impl ImapAccount {
     ) -> Result<FolderCursor, Error> {
         let uidvalidity = selected
             .uid_validity
-            .ok_or_else(|| Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
+            .ok_or_else(|| Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()))?;
         let known_uids = known_uids.unwrap_or_default();
         if self.qresync_enabled()
             && let Some(modseq) = selected.highest_mod_seq

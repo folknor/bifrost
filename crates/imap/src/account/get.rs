@@ -271,7 +271,7 @@ async fn run_folder_get(
     let uidvalidity = selected
         .mailbox
         .uid_validity
-        .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
+        .ok_or_else(|| crate::Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()))?;
     // `pending` is drained only now: a checkout or SELECT failure above
     // must leave every id in the caller's unresolved set.
     let (valid, stale): (Vec<_>, Vec<_>) = pending
