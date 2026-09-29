@@ -133,21 +133,6 @@ tracks it.
   address resolution is unbounded too. Recorded so the STARTTLS bound is not
   mistaken for "every TLS handshake is bounded".
 
-- **brokkr: an install-boundary sweep for every published crate.** Proposal,
-  2026-09-29, from exploring brokkr's config. `feature_unification =
-  "package"` resolves each crate the way `cargo install` does, and is the only
-  mode that catches a crate compiling in the workspace solely because a sibling
-  donates a feature - the shape of the blocking-SMTP-without-`tokio` break. It
-  is applied today only to `bifrost-jmap`'s zero-feature leg. A default-feature
-  `package`-unified sweep over every published crate would close the class;
-  its cost is one isolated target dir and one cargo invocation per package.
-  BUNDLED 2026-09-29: the owner put this with the rest of the brokkr work
-  rather than ruling on it alone. The plan presented: add an `install-shape`
-  sweep (`packages` = every published crate, `feature_unification =
-  "package"`), time one cold and one warm `brokkr check`, and decide on the
-  numbers - keep it on every check if the warm cost is small, otherwise move
-  it to an on-demand brokkr profile.
-
 - **sync: a worker aborted on an already-spent deadline is never named.**
   Found 2026-09-29 while splitting `WorkerRole`. In `await_worker_until`
   (`engine/ack.rs`), when the worker phase's shared deadline has already

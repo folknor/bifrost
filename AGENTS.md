@@ -69,6 +69,13 @@ restatement, including this one.
   `cargo install` resolves, so no sibling member can donate a feature back.
   Every default feature of this crate is optional, so the zero-feature build is
   a promise to consumers.
+- `install-shape` - every published crate at its default features, pinned to
+  `feature_unification = "package"`, so each builds and passes its tests the
+  way a downstream dependent resolves it. Its `packages` list must be kept in
+  step with the workspace's published members. It runs on every check: its
+  warm cost was measured small enough to keep in the gate, and it roughly
+  doubles the test count because each crate's suite runs again under its own
+  resolution.
 
 Declaring `[[check]]` entries replaced brokkr's implicit single `--all-features`
 sweep, so these sweeps are the coverage, not an addition to it. A new optional
@@ -76,7 +83,7 @@ feature that no workspace member enables is unchecked until a sweep names it.
 `feature_unification = "package"` is the tool for the other blind spot: a
 crate that compiles in the workspace only because a sibling donates a feature
 (the blocking SMTP transport once failed to build without `tokio` for exactly
-that reason). `brokkr man config check` documents every sweep key.
+that reason); `install-shape` applies it to every published crate. `brokkr man config check` documents every sweep key.
 
 Validate a `brokkr.toml` key by running brokkr before writing it into any
 document: a config-load failure is raised before any phase runs, so it costs

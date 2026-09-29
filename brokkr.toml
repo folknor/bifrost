@@ -55,3 +55,28 @@ name = "jmap-no-default"
 packages = ["bifrost-jmap"]
 no_default_features = true
 feature_unification = "package"
+
+# Every published crate at its DEFAULT features, resolved per package the way
+# `cargo install` and a downstream dependent resolve it. The `workspace` sweep
+# unifies features across members, so a crate that compiles only because a
+# sibling donates a feature it forgot to enable itself passes there and breaks
+# for its consumers - the shape of the blocking SMTP transport that once failed
+# to build without `tokio`. `package` resolution is the only mode that catches
+# it. Keep this list in step with the workspace's published members.
+[[check]]
+name = "install-shape"
+packages = [
+    "bifrost-types",
+    "bifrost-net",
+    "bifrost-sasl",
+    "bifrost-smtp",
+    "bifrost-imap",
+    "bifrost-jmap",
+    "bifrost-google",
+    "bifrost-graph",
+    "bifrost-dav-core",
+    "bifrost-carddav",
+    "bifrost-caldav",
+    "bifrost-sync",
+]
+feature_unification = "package"
