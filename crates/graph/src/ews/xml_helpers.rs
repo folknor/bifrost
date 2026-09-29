@@ -66,7 +66,7 @@ pub(crate) fn per_answer_request_ids(body_xml: &str) -> usize {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 if collection_depth.is_some_and(|start| depth == start + 1) {
                     ids += 1;
                 } else if collection_depth.is_none() && is_per_answer_id_collection(&name) {
@@ -151,8 +151,8 @@ pub(crate) fn is_distinguished_folder_id(id: &str) -> bool {
 /// string when absent.
 pub(crate) fn extract_attribute(e: &quick_xml::events::BytesStart<'_>, attr_name: &str) -> String {
     for attr in e.attributes().flatten() {
-        if String::from_utf8_lossy(attr.key.as_ref()) == attr_name {
-            return String::from_utf8_lossy(&attr.value).to_string();
+        if attr.key.as_ref() == attr_name {
+            return attr.value.into_owned();
         }
     }
     String::new()
@@ -176,7 +176,7 @@ pub(crate) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 if local == "Fault" {
                     in_fault = true;
@@ -190,15 +190,13 @@ pub(crate) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
                 buf.clear();
             }
             Ok(Event::Text(ref e)) => {
-                if let Ok(raw) = std::str::from_utf8(e.as_ref())
-                    && let Ok(text) = unescape(raw)
-                {
+                if let Ok(text) = unescape(e.as_ref()) {
                     buf.push_str(&text);
                 }
             }
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 if in_faultstring && local == "faultstring" {
                     fault_message = buf.trim().to_string();
@@ -294,7 +292,7 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 if extract_attribute(e, "ResponseClass") == "Error" {
                     in_error_message = true;
@@ -309,15 +307,13 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
                 buf.clear();
             }
             Ok(Event::Text(ref e)) => {
-                if let Ok(raw) = std::str::from_utf8(e.as_ref())
-                    && let Ok(text) = unescape(raw)
-                {
+                if let Ok(text) = unescape(e.as_ref()) {
                     buf.push_str(&text);
                 }
             }
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 if in_response_code && local == "ResponseCode" {
                     response_code = buf.trim().to_string();
@@ -417,9 +413,7 @@ fn unclassifiable_detail(element: &str, response_code: &str) -> String {
 // every parser that accumulates body text needs to fold these back in or
 // `&lt;` and friends silently vanish.
 pub(crate) fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
-    let Ok(name) = std::str::from_utf8(e.as_ref()) else {
-        return;
-    };
+    let name: &str = e.as_ref();
     if let Some(rest) = name.strip_prefix('#') {
         let codepoint = if let Some(hex) = rest.strip_prefix(['x', 'X']) {
             u32::from_str_radix(hex, 16).ok()

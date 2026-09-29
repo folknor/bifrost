@@ -325,9 +325,7 @@ pub(crate) fn parse_streaming_notifications(
                 }
             }
             Ok(Event::Text(ref event)) => {
-                if let Ok(raw) = std::str::from_utf8(event.as_ref())
-                    && let Ok(text) = unescape(raw)
-                {
+                if let Ok(text) = unescape(event.as_ref()) {
                     buf.push_str(&text);
                 }
             }
@@ -382,9 +380,7 @@ pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<String>, String>
                 buf.clear();
             }
             Ok(Event::Text(ref event)) => {
-                if let Ok(raw) = std::str::from_utf8(event.as_ref())
-                    && let Ok(text) = unescape(raw)
-                {
+                if let Ok(text) = unescape(event.as_ref()) {
                     buf.push_str(&text);
                 }
             }
@@ -928,14 +924,13 @@ fn event_type_for(local: &str) -> Option<EwsStreamingEventType> {
 }
 
 fn attr(event: &BytesStart<'_>, name: &str) -> Option<String> {
-    event.attributes().flatten().find_map(|attr| {
-        (local_name(attr.key.as_ref()) == name)
-            .then(|| String::from_utf8_lossy(&attr.value).to_string())
-    })
+    event
+        .attributes()
+        .flatten()
+        .find_map(|attr| (local_name(attr.key.as_ref()) == name).then(|| attr.value.into_owned()))
 }
 
-fn local_name(name: &[u8]) -> &str {
-    let raw = std::str::from_utf8(name).unwrap_or_default();
+fn local_name(raw: &str) -> &str {
     raw.rsplit_once(':').map_or(raw, |(_, local)| local)
 }
 
@@ -1445,9 +1440,9 @@ mod tests {
 
     #[test]
     fn local_name_strips_any_namespace_prefix() {
-        assert_eq!(local_name(b"t:ItemId"), "ItemId");
-        assert_eq!(local_name(b"ItemId"), "ItemId");
-        assert_eq!(local_name(b""), "");
+        assert_eq!(local_name("t:ItemId"), "ItemId");
+        assert_eq!(local_name("ItemId"), "ItemId");
+        assert_eq!(local_name(""), "");
     }
 
     // ----- worker-loop tests over the scripted EWS transport -----

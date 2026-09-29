@@ -464,10 +464,7 @@ pub fn parse_multistatus<S: MultiStatusSink>(xml: &str, sink: &mut S) -> Result<
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
+            Ok(Event::CData(value)) => text.push_str(&value),
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 let parent = stack.iter().rev().nth(1).map(String::as_str);
@@ -541,10 +538,7 @@ pub fn extract_href_properties(xml: &str, property_name: &str) -> Result<Vec<Str
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
+            Ok(Event::CData(value)) => text.push_str(&value),
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 if name == "href"
@@ -634,10 +628,7 @@ pub fn parse_collection_property(xml: &str, property_name: &str) -> Result<Optio
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
-            Ok(Event::CData(value)) => {
-                let value = value.decode().map_err(|error| error.to_string())?;
-                text.push_str(&value);
-            }
+            Ok(Event::CData(value)) => text.push_str(&value),
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 let parent = stack.iter().rev().nth(1).map(String::as_str);

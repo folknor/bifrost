@@ -16,8 +16,7 @@ use reqwest::Url;
 
 /// The local part of a namespaced XML name (`D:href` -> `href`).
 #[must_use]
-pub fn local_name(raw: &[u8]) -> String {
-    let full = String::from_utf8_lossy(raw);
+pub fn local_name(full: &str) -> String {
     match full.rfind(':') {
         Some(index) => full[index + 1..].to_string(),
         None => full.to_string(),
@@ -63,9 +62,7 @@ pub fn resolve_href(request_url: &str, href: &str) -> String {
 
 /// Append unescaped XML text to an accumulator, so a value split across text
 /// and CDATA events arrives whole.
-pub fn push_text(target: &mut String, raw: &[u8]) -> Result<(), String> {
-    let raw =
-        std::str::from_utf8(raw).map_err(|error| format!("XML text is not UTF-8: {error}"))?;
+pub fn push_text(target: &mut String, raw: &str) -> Result<(), String> {
     let text = unescape(raw).map_err(|error| format!("XML text escape error: {error}"))?;
     target.push_str(&text);
     Ok(())
@@ -174,9 +171,9 @@ mod tests {
 
     #[test]
     fn local_name_drops_any_namespace_prefix() {
-        assert_eq!(local_name(b"D:href"), "href");
-        assert_eq!(local_name(b"href"), "href");
-        assert_eq!(local_name(b"C:calendar-data"), "calendar-data");
+        assert_eq!(local_name("D:href"), "href");
+        assert_eq!(local_name("href"), "href");
+        assert_eq!(local_name("C:calendar-data"), "calendar-data");
     }
 
     #[test]

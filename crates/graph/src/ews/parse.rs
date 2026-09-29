@@ -182,7 +182,7 @@ pub(crate) fn parse_find_folder_response(xml: &str) -> Result<Vec<EwsFolder>, Ew
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
 
                 if is_folder_tag(local) {
@@ -206,7 +206,7 @@ pub(crate) fn parse_find_folder_response(xml: &str) -> Result<Vec<EwsFolder>, Ew
                 }
             }
             Ok(Event::Empty(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 if in_folder && local == "FolderId" {
                     folder_id = extract_attribute(e, "Id");
@@ -215,7 +215,7 @@ pub(crate) fn parse_find_folder_response(xml: &str) -> Result<Vec<EwsFolder>, Ew
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 let trimmed = buf.trim();
 
@@ -289,7 +289,7 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
 
                 if is_folder_tag(local) {
@@ -313,7 +313,7 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
                 }
             }
             Ok(Event::Empty(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 if in_folder && local == "FolderId" {
                     folder_id = extract_attribute(e, "Id");
@@ -325,7 +325,7 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 let trimmed = buf.trim();
 
@@ -433,7 +433,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 depth += 1;
 
@@ -497,7 +497,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                 }
             }
             Ok(Event::Empty(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 // An Empty `ItemId` is a direct child of the currently-open
                 // element (at `depth`); accept it only when that element is
@@ -517,7 +517,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 let trimmed = buf.trim();
 
@@ -645,7 +645,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 depth += 1;
 
@@ -699,7 +699,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                 }
             }
             Ok(Event::Empty(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 // An Empty `AttachmentId` is a child of the currently-open
                 // element, so it counts when that element IS the attachment.
@@ -719,7 +719,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 let trimmed = buf.trim();
 
@@ -860,7 +860,7 @@ pub(crate) fn parse_get_attachment_response(xml: &str) -> Result<EwsAttachmentCo
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name_bytes = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name_bytes = e.name().as_ref().to_owned();
                 let local = strip_ns(&name_bytes);
                 if is_item_tag(local) {
                     in_nested_item = true;
@@ -872,7 +872,7 @@ pub(crate) fn parse_get_attachment_response(xml: &str) -> Result<EwsAttachmentCo
                 buf.clear();
             }
             Ok(Event::Empty(ref e)) => {
-                let name_bytes = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name_bytes = e.name().as_ref().to_owned();
                 if strip_ns(&name_bytes) == "AttachmentId" {
                     attachment_id = extract_attribute(e, "Id");
                 }
@@ -880,7 +880,7 @@ pub(crate) fn parse_get_attachment_response(xml: &str) -> Result<EwsAttachmentCo
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name_bytes = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name_bytes = e.name().as_ref().to_owned();
                 let local = strip_ns(&name_bytes);
                 let trimmed = buf.trim();
                 if !in_nested_item {
@@ -982,9 +982,7 @@ fn default_item_class(item_class: &str) -> String {
 }
 
 fn push_text(e: &quick_xml::events::BytesText<'_>, buf: &mut String) {
-    if let Ok(raw) = std::str::from_utf8(e.as_ref())
-        && let Ok(text) = unescape(raw)
-    {
+    if let Ok(text) = unescape(e.as_ref()) {
         buf.push_str(&text);
     }
 }

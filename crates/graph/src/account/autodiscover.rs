@@ -331,7 +331,7 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().local_name().as_ref()).to_string();
+                let name = e.name().local_name().as_ref().to_owned();
                 if name == "UserSetting" {
                     in_user_setting = true;
                     current_name.clear();
@@ -343,7 +343,7 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().local_name().as_ref()).to_string();
+                let name = e.name().local_name().as_ref().to_owned();
                 let trimmed = buf.trim();
                 if in_user_setting {
                     match current_tag.as_str() {
@@ -433,7 +433,7 @@ fn parse_alternative_mailboxes(xml: &str) -> Vec<SharedMailbox> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().local_name().as_ref()).to_string();
+                let name = e.name().local_name().as_ref().to_owned();
                 if name == "AlternativeMailbox" {
                     in_alternative_mailbox = true;
                     current_type.clear();
@@ -446,7 +446,7 @@ fn parse_alternative_mailboxes(xml: &str) -> Vec<SharedMailbox> {
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().local_name().as_ref()).to_string();
+                let name = e.name().local_name().as_ref().to_owned();
                 if in_alternative_mailbox {
                     let trimmed = buf.trim();
                     match current_tag.as_str() {
@@ -482,9 +482,7 @@ fn parse_alternative_mailboxes(xml: &str) -> Vec<SharedMailbox> {
 }
 
 fn push_text(e: &quick_xml::events::BytesText<'_>, buf: &mut String) {
-    if let Ok(raw) = std::str::from_utf8(e.as_ref())
-        && let Ok(text) = unescape(raw)
-    {
+    if let Ok(text) = unescape(e.as_ref()) {
         buf.push_str(&text);
     }
 }
