@@ -320,8 +320,31 @@ pub(crate) struct WorkerTask {
     pub abort: AbortHandle,
 }
 
+/// Which spawned slot worker a [`WorkerTask`] is.
+///
+/// One variant per spawn site in `engine/attach.rs`, so the `role` field on the
+/// detach worker phase's warn lines (rendered with `Debug`, which prints the
+/// variant name) names the worker that wedged or panicked. Only `AckWriter` has
+/// behavior attached (it is torn down in its own phase, last); every other
+/// variant is a stream-phase worker and exists purely for attribution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkerRole {
+    /// Durably persists cursors as they are acked; drained in its own phase.
     AckWriter,
-    Stream,
+    /// Forwards priority and bandwidth-cap changes to the open handle.
+    ControlApplier,
+    /// Push reconciler: turns watch events into driven scopes.
+    PushReconciler,
+    /// Drains `Account::push_stream` into the per-account watch queue.
+    PushForwarder,
+    /// The per-scope poll multiplexer.
+    Multiplexer,
+    /// Walks registered scopes and runs their backfill partitions.
+    BackfillOrchestrator,
+    /// Establishes cold-start inventory once the slot has a subscriber.
+    DeferredInventory,
+    /// Serves reopen and scope-deleted requests.
+    ReopenListener,
+    /// Polls the bandwidth meter into the control's observed-bps atomic.
+    BandwidthFeed,
 }

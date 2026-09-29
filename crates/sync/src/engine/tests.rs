@@ -32,7 +32,7 @@ async fn the_ack_writer_is_taken_by_role_from_any_position() {
                 idle_worker(if index == writer_position {
                     WorkerRole::AckWriter
                 } else {
-                    WorkerRole::Stream
+                    WorkerRole::Multiplexer
                 })
             })
             .collect();
@@ -40,7 +40,7 @@ async fn the_ack_writer_is_taken_by_role_from_any_position() {
         assert_eq!(taken.role, WorkerRole::AckWriter);
         assert_eq!(workers.len(), 2, "only the writer is removed");
         assert!(
-            workers.iter().all(|w| w.role == WorkerRole::Stream),
+            workers.iter().all(|w| w.role == WorkerRole::Multiplexer),
             "the writer must not be left behind (position {writer_position})"
         );
     }
@@ -52,7 +52,7 @@ async fn the_ack_writer_is_taken_by_role_from_any_position() {
 async fn taking_the_ack_writer_from_a_writerless_list_yields_none() {
     let mut empty: Vec<WorkerTask> = Vec::new();
     assert!(take_ack_writer(&mut empty).is_none());
-    let mut streams = vec![idle_worker(WorkerRole::Stream)];
+    let mut streams = vec![idle_worker(WorkerRole::Multiplexer)];
     assert!(take_ack_writer(&mut streams).is_none());
     assert_eq!(streams.len(), 1, "a non-writer list is left intact");
 }

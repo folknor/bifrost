@@ -274,7 +274,7 @@ impl SyncEngine {
             let mut priority_view = priority_rx.clone();
             let mut bandwidth_view = bandwidth_cap_rx.clone();
             spawn(
-                crate::types::WorkerRole::Stream,
+                crate::types::WorkerRole::ControlApplier,
                 tokio::spawn(async move {
                     {
                         let account = control_account.load_full();
@@ -334,7 +334,7 @@ impl SyncEngine {
             scope_tokens: Arc::clone(&scope_tokens),
         };
         spawn(
-            crate::types::WorkerRole::Stream,
+            crate::types::WorkerRole::PushReconciler,
             tokio::spawn(reconciler.run(watch_rx)),
         );
 
@@ -349,7 +349,7 @@ impl SyncEngine {
             let sd = shutdown.clone();
             let mut generation = account_generation_rx.clone();
             spawn(
-                crate::types::WorkerRole::Stream,
+                crate::types::WorkerRole::PushForwarder,
                 tokio::spawn(async move {
                     let mut reconnect_delay = Duration::from_millis(50);
                     loop {
@@ -467,7 +467,10 @@ impl SyncEngine {
             throttles: Arc::clone(&throttles),
             scheduler: self.scheduler.clone(),
         };
-        spawn(crate::types::WorkerRole::Stream, tokio::spawn(mux.run()));
+        spawn(
+            crate::types::WorkerRole::Multiplexer,
+            tokio::spawn(mux.run()),
+        );
 
         // Spawn the backfill orchestrator. It walks the registered
         // scopes and runs one `BackfillRunner::run_partition` per
@@ -519,7 +522,7 @@ impl SyncEngine {
         };
         let backfill_ctx = ctx.clone();
         spawn(
-            crate::types::WorkerRole::Stream,
+            crate::types::WorkerRole::BackfillOrchestrator,
             tokio::spawn(async move {
                 run_backfill_orchestrator(backfill_ctx, backfill_wiring).await;
             }),
@@ -532,7 +535,7 @@ impl SyncEngine {
         if !deferred_inventory_scopes.is_empty() {
             let inventory_ctx = ctx.clone();
             spawn(
-                crate::types::WorkerRole::Stream,
+                crate::types::WorkerRole::DeferredInventory,
                 tokio::spawn(async move {
                     run_deferred_inventory_establishment(inventory_ctx, deferred_inventory_scopes)
                         .await;
@@ -543,7 +546,7 @@ impl SyncEngine {
         // Spawn the reopen listener.
         let reopen_ctx = ctx.clone();
         spawn(
-            crate::types::WorkerRole::Stream,
+            crate::types::WorkerRole::ReopenListener,
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -592,7 +595,7 @@ impl SyncEngine {
             let bw_control = control.clone();
             let bw_shutdown = shutdown.clone();
             spawn(
-                crate::types::WorkerRole::Stream,
+                crate::types::WorkerRole::BandwidthFeed,
                 tokio::spawn(async move {
                     let view = meter_handle.account(bw_aid);
                     loop {
