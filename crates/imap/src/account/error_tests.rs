@@ -499,6 +499,62 @@ fn missing_capability_with_push_subscribe_maps_to_unsupported() {
     ));
 }
 
+/// A local refusal made before any byte is never a provider fault. These pin
+/// the recovery each local variant derives to at the account boundary, which
+/// is what a consumer acts on: none may be `ProviderContractViolation`.
+#[test]
+fn a_wrong_session_state_is_a_client_bug() {
+    let account = into_account_error(
+        Error::InvalidState("command not valid in Authenticated state".into()),
+        ImapErrorContext::operation(AccountOperation::SyncChanges),
+    );
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Request(RequestErrorKind::Malformed)
+    ));
+    assert!(matches!(
+        account.recovery(),
+        bifrost_types::RecoveryClass::ClientBug
+    ));
+}
+
+#[test]
+fn state_moved_under_a_queued_command_is_a_retry_after_refresh() {
+    let account = into_account_error(
+        Error::StateChangedBeforeSend("session moved to NotAuthenticated".into()),
+        ImapErrorContext::operation(AccountOperation::Send),
+    );
+    assert_eq!(*account.kind(), AccountErrorKind::ConcurrencyConflict);
+    let bifrost_types::RecoveryClass::Retry(advice) = account.recovery() else {
+        panic!("expected a retry, got {:?}", account.recovery());
+    };
+    assert_eq!(
+        advice.disposition,
+        bifrost_types::RetryDisposition::AfterStateRefresh
+    );
+    let attempt = account.chain().iter().find_map(|c| match c {
+        Cause::Attempt(a) => Some(a.transmission_state),
+        _ => None,
+    });
+    assert_eq!(
+        attempt,
+        Some(TransmissionState::Unsent),
+        "nothing was written, even for a non-idempotent operation"
+    );
+}
+
+#[test]
+fn an_operation_this_crate_does_not_implement_is_unsupported() {
+    let account = into_account_error(
+        Error::UnsupportedOperation("flag operation not implemented".into()),
+        ImapErrorContext::operation(AccountOperation::UpdateFlags),
+    );
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
+    ));
+}
+
 #[test]
 fn response_code_modified_maps_to_concurrency_conflict() {
     let err = Error::no_with_code("modified".into(), Some(ResponseCode::Modified(Vec::new())));

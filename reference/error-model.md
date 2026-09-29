@@ -251,6 +251,42 @@ operation is treated idempotent). The rules at altitude (read
   if idempotent else `Reconcile(PartialCompletionSignal, [CheckTarget,
   DedupeByClientId])`; `Unknown` -> `UnknownPermanent`.
 
+### Local refusals
+
+**A request a protocol crate refuses LOCALLY, before any byte of it is sent,
+is never a provider fault.** `Protocol(_)` means the provider sent something
+malformed, out of sequence, or incomplete; it derives
+`ProviderContractViolation` - terminal, remediation "contact provider
+support" - and filing a local refusal there tells the operator to blame the
+provider for the client's own decision. Every producer maps a local refusal by
+what the refusal is about:
+
+- **The caller's input cannot be expressed** (malformed or out-of-range
+  arguments, an empty list the grammar forbids, a command the caller issued in
+  a state that does not permit it) -> `Request(Malformed)`, so `ClientBug`. A
+  state refresh does not make such a request valid, so it must not be
+  retryable.
+- **The server lacks a capability the request needs** (an extension it does
+  not advertise, a command its protocol revision removed), or the client does
+  not implement a variant of a published `#[non_exhaustive]` request type ->
+  `Unsupported(operation)`.
+- **Local state moved under a queued command** (the session left the states
+  the command needs while it waited behind another) -> transient:
+  `ConcurrencyConflict`, so `Retry(AfterStateRefresh)`, with an `Unsent`
+  `Attempt` cause. The one exception is state that moved because the
+  connection is gone (a completed LOGOUT or BYE): that is a transport condition,
+  `Transport(Network)` with `Unsent`.
+
+A missing `Attempt` cause reads as `Unsent` in `derive`, so a refusal with no
+transmission evidence is already classified as unsent; stamping `Unsent`
+explicitly is still right wherever the producer knows it.
+
+The rule is about the refusal, not about where it is raised: a validation made
+AFTER bytes of the same exchange are on the wire (a SASL step mid-exchange, a
+post-OK stream upgrade) is not a local refusal of an unsent request, and its
+classification and connection handling are the producer's to argue
+separately.
+
 ## Cause chain
 
 `cause.rs`. `CauseChain` is a non-empty ordered `Vec<Cause>`:

@@ -290,7 +290,7 @@ impl ImapConnection {
         // RFC 7162 Section 3.2.5.2 ABNF: seq-match-data is only valid after
         // known-uids. Reject invalid combinations instead of fabricating data.
         if params.seq_match_data.is_some() && params.known_uids.is_none() {
-            return Err(Error::Protocol(
+            return Err(Error::InvalidInput(
                 "QRESYNC seq-match-data requires known-uids \
                  (RFC 7162 Section 3.2.5.2)"
                     .into(),
@@ -376,7 +376,7 @@ impl ImapConnection {
         // non-use-attr values." Reject base LIST attributes like \Noselect,
         // \HasChildren, etc. before sending the command.
         if let Some(bad) = special_use.iter().find(|a| !a.is_special_use()) {
-            return Err(Error::Protocol(format!(
+            return Err(Error::InvalidInput(format!(
                 "CREATE USE parameter contains non-special-use attribute {} \
                  (RFC 6154 Section 3: USE MUST only contain use-attr values)",
                 bad.as_imap_str()
@@ -486,7 +486,7 @@ impl ImapConnection {
         // RFC 9051 Appendix F item 19: LSUB was deprecated in IMAP4rev2.
         // Use LIST with \Subscribed return option instead.
         if self.is_rev2() {
-            return Err(Error::Protocol(
+            return Err(Error::MissingCapability(
                 "LSUB was deprecated in IMAP4rev2 (RFC 9051 Appendix F); \
                  use list() with \\Subscribed attribute instead"
                     .into(),

@@ -505,7 +505,7 @@ impl SearchCriteria {
     pub fn uid(mut self, set: &str) -> Result<Self, crate::Error> {
         // RFC 3501 Section 9: validate sequence-set ABNF.
         if !is_valid_sequence_set(set) {
-            return Err(crate::Error::Protocol(format!(
+            return Err(crate::Error::InvalidInput(format!(
                 "invalid sequence-set for UID search per RFC 3501 Section 9: {set:?}"
             )));
         }
@@ -527,7 +527,7 @@ impl SearchCriteria {
     pub fn sequence(mut self, set: &str) -> Result<Self, crate::Error> {
         // RFC 3501 Section 9: validate sequence-set ABNF.
         if !is_valid_sequence_set(set) {
-            return Err(crate::Error::Protocol(format!(
+            return Err(crate::Error::InvalidInput(format!(
                 "invalid sequence-set per RFC 3501 Section 9: {set:?}"
             )));
         }

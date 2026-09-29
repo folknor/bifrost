@@ -2607,9 +2607,10 @@ fn audit_finding6_append_header_uses_literal8_for_binary_append() {
     );
 }
 
-/// RFC 3516 Section 4.4: a NUL-bearing body without BINARY is refused, as
-/// `Error::Protocol` (the variant the account layer already maps), before any
-/// bytes exist.
+/// RFC 3516 Section 4.4: a NUL-bearing body without BINARY is refused before
+/// any bytes exist, as `MissingCapability`: the body is expressible, the
+/// server lacks the capability that carries it, and a local refusal is never
+/// a provider protocol fault.
 #[test]
 fn append_nul_body_without_binary_is_refused() {
     let msgs = [append_nul_msg(3)];
@@ -2622,7 +2623,7 @@ fn append_nul_body_without_binary_is_refused() {
     )
     .expect_err("literal8 needs BINARY");
     assert!(
-        matches!(err, crate::Error::Protocol(ref m) if m.contains("requires BINARY literal8 support")),
+        matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
         "got {err:?}"
     );
 }
@@ -3845,11 +3846,11 @@ fn append_shape_and_capability_validation() {
     assert!(encode_append("A", "INBOX", &one, false, &without_cap).is_ok());
     assert!(matches!(
         encode_append("A", "INBOX", &[], true, &with_cap),
-        Err(crate::Error::Protocol(_))
+        Err(crate::Error::InvalidInput(_))
     ));
     assert!(matches!(
         encode_append("A", "INBOX", &two, false, &with_cap),
-        Err(crate::Error::Protocol(_))
+        Err(crate::Error::InvalidInput(_))
     ));
 }
 
@@ -6098,10 +6099,37 @@ fn search_rejects_non_synchronizing_literal_without_extension() {
     };
     let mut buf = BytesMut::new();
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    assert!(
-        result.is_err(),
+    let err = crate::Error::from(result.expect_err(
         "SEARCH must reject non-synchronizing literals without negotiated \
-         LITERAL+/LITERAL- support (RFC 7888 Section 3)"
+         LITERAL+/LITERAL- support (RFC 7888 Section 3)",
+    ));
+    // Through the `EncodeError` bridge the live driver path uses: the refusal
+    // must arrive as a capability gap, not be flattened into malformed input.
+    assert!(
+        matches!(err, crate::Error::MissingCapability(_)),
+        "got {err:?}"
+    );
+}
+
+/// The `EncodeError` bridge keeps a validation refusal `InvalidInput` and
+/// keeps its message as the encoder wrote it, not prefixed with another
+/// variant's display text.
+#[test]
+fn an_encoder_validation_refusal_arrives_as_invalid_input() {
+    let cmd = Command::Search {
+        criteria: String::new(),
+    };
+    let mut buf = BytesMut::new();
+    let err = crate::Error::from(
+        encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts())
+            .expect_err("empty SEARCH criteria are refused"),
+    );
+    let crate::Error::InvalidInput(message) = err else {
+        panic!("expected InvalidInput, got {err:?}");
+    };
+    assert!(
+        message.contains("at least one search criterion"),
+        "got {message:?}"
     );
 }
 
@@ -6258,10 +6286,13 @@ fn thread_rejects_oversized_non_synchronizing_literal_in_literal_minus_mode() {
         &cmd,
         &opts(LiteralMode::LiteralMinus, false),
     );
-    assert!(
-        result.is_err(),
+    let err = crate::Error::from(result.expect_err(
         "THREAD must reject non-synchronizing literals larger than 4096 octets \
-         in LITERAL- mode (RFC 7888 Section 5 / RFC 9051 Section 4.3)"
+         in LITERAL- mode (RFC 7888 Section 5 / RFC 9051 Section 4.3)",
+    ));
+    assert!(
+        matches!(err, crate::Error::MissingCapability(_)),
+        "LITERAL- without LITERAL+ is a capability gap; got {err:?}"
     );
 }
 

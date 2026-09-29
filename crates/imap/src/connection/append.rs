@@ -126,7 +126,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
 
         if messages.is_empty() {
-            return Err(Error::Protocol(
+            return Err(Error::InvalidInput(
                 "MULTIAPPEND requires at least one message".into(),
             ));
         }

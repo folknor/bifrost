@@ -456,12 +456,11 @@ impl Consumer for StatusConsumer {
             ..
         } = last_resp
         else {
+            // A local invariant, checked after the tagged OK completed the
+            // exchange, so the framing is intact and `Internal` (not
+            // connection-fatal) is safe.
             return Finalized::failure(
-                Error::Protocol(
-                    "internal: matching predicate returned non-MailboxStatus \
-                     variant"
-                        .into(),
-                ),
+                Error::Internal("matching predicate returned non-MailboxStatus variant".into()),
                 self.buffered,
             );
         };

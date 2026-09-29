@@ -110,6 +110,13 @@ pub(crate) enum EncodeError {
         /// The wire name of the missing capability.
         cap: String,
     },
+    /// A capability refusal raised by a per-command encoder that reports it
+    /// as free text (a caller's non-synchronizing literal without LITERAL+, a
+    /// NUL body without BINARY) rather than as a command/capability pair.
+    /// Converts back to `crate::Error::MissingCapability`, so it stays
+    /// `Unsupported` at the account boundary.
+    #[error("encode capability error: {0}")]
+    CapabilityText(String),
     /// A protocol-level validation failure detected during encoding
     /// (e.g., CRLF in a parameter, invalid atom, etc.).
     #[error("encode validation error: {0}")]
@@ -117,13 +124,19 @@ pub(crate) enum EncodeError {
 }
 
 impl From<crate::Error> for EncodeError {
-    /// Convert legacy `crate::Error::Protocol` validation errors into
-    /// `EncodeError::Validation`. This bridge exists so existing per-command
-    /// encoders that return `Result<(), crate::Error>` can be composed with
-    /// the new `EncodeError` return path without rewriting every encoder at
-    /// once.
+    /// Bridge per-command encoders that return `crate::Error` into the
+    /// `EncodeError` return path, PRESERVING the classification: a
+    /// capability refusal stays a capability refusal. Collapsing every
+    /// variant into `Validation` used to turn a missing LITERAL+ into a
+    /// malformed-request client bug on the live driver path while the
+    /// encoder's own tests, which call the inner encoders directly, still saw
+    /// `MissingCapability`.
     fn from(e: crate::Error) -> Self {
-        Self::Validation(e.to_string())
+        match e {
+            crate::Error::MissingCapability(msg) => Self::CapabilityText(msg),
+            crate::Error::InvalidInput(msg) => Self::Validation(msg),
+            other => Self::Validation(other.to_string()),
+        }
     }
 }
 

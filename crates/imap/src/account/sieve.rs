@@ -586,10 +586,12 @@ fn io_error(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error
 
 fn validate_tls_server_name(host: &str) -> Result<(), Error> {
     if host.is_empty() {
-        return Err(Error::Protocol("TLS server name must not be empty".into()));
+        return Err(Error::InvalidInput(
+            "TLS server name must not be empty".into(),
+        ));
     }
     if host.bytes().any(|b| b == 0 || b.is_ascii_whitespace()) {
-        return Err(Error::Protocol(format!(
+        return Err(Error::InvalidInput(format!(
             "invalid TLS server name: {host:?}"
         )));
     }

@@ -38,7 +38,7 @@ enum LiteralForm {
 ///   message list must be non-empty (and a single APPEND carries exactly one);
 ///   flags and dates are validated; a body containing NUL requires BINARY.
 ///   Failures are returned as [`crate::Error`] variants
-///   (`MissingCapability`, `Protocol`, `InvalidAppendDate`, ...) rather than
+///   (`MissingCapability`, `InvalidInput`, `InvalidAppendDate`, ...) rather than
 ///   `EncodeError`, because the account layer maps the variants.
 /// - **Mailbox.** INBOX-normalized and modified UTF-7 unless `opts.utf8_mode`
 ///   (`UTF8=ACCEPT` or active `IMAP4rev2`), where the raw UTF-8 name is used
@@ -69,12 +69,12 @@ pub(crate) fn encode_append(
         return Err(crate::Error::MissingCapability("MULTIAPPEND".into()));
     }
     if messages.is_empty() {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "MULTIAPPEND requires at least one message".into(),
         ));
     }
     if !multi && messages.len() != 1 {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "APPEND carries exactly one message; use MULTIAPPEND for several".into(),
         ));
     }
@@ -189,7 +189,9 @@ fn literal_form(
     if opts.has_capability(&Capability::Binary) {
         Ok(LiteralForm::Literal8)
     } else {
-        Err(crate::Error::Protocol(
+        // The body is expressible; the server lacks the capability that
+        // would carry it, so this is `Unsupported`, not a malformed request.
+        Err(crate::Error::MissingCapability(
             "APPEND data containing NUL requires BINARY literal8 support \
              (RFC 3516 Section 4.4)"
                 .into(),

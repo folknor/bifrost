@@ -49,33 +49,50 @@ item is what stops that.
   what submits raw `Command`s at all.
 
 - **errors: local refusals are never a provider fault.** RULED 2026-09-29
-  (second pass), all three parts, in this order.
-  The finding: IMAP's crate-internal `Error::Protocol` maps at the account
-  boundary to `Protocol(ContractViolation)` with a `MalformedResponse` cause,
-  which `derive` turns into `ProviderContractViolation` - terminal, with the
-  remediation "contact provider support". But `Error::Protocol` has become a
-  grab-bag: about 170 construction sites, a large share of them LOCAL
-  refusals made before any byte is sent (over 50 in the encoder alone, plus
-  the APPEND refusals: a NUL body without BINARY, a session that left
-  Authenticated/Selected while the command was queued). Pre-existing, not
-  introduced by the 2026-09-29 APPEND work. The earlier worry that these
-  refusals lose `Unsent` evidence is moot: pre-driver sites always left the
-  attempt `None` by design, and `derive` reads a missing `Attempt` cause as
-  `Unsent`.
-  (a) Add the rule to `reference/error-model.md`, the cross-crate contract,
-  which has none today: a local refusal made before any byte is sent is
-  never a provider fault - `Request(Malformed)` (so `ClientBug`) when the
-  caller's input cannot be expressed, `Unsupported(operation)` when the
-  server lacks a capability the request needs, transient when local state
-  moved under a queued command.
-  (b) Split IMAP's grab-bag: `Error::Protocol` keeps genuine server
-  violations; each local-refusal site moves to `InvalidInput`,
-  `MissingCapability`, or a new internal variant for state that moved while
-  queued. `Error` is crate-private (`pub(crate)`, private `error` module),
-  so no published surface is involved. The per-site classification is the
-  judgment call and gets reported for review.
-  (c) Audit the other protocol crates against the rule; fix what the ruling
-  covers, file the rest.
+  (second pass), three parts. (a), the rule in `reference/error-model.md`
+  ("Local refusals"), and (b), IMAP's `Error::Protocol` split, have landed.
+  Remaining:
+  - **SASL**, the last IMAP-reaching piece of (b). `bifrost_sasl::SaslError::
+    Protocol` mixes SASLprep refusals of the CALLER's credentials with genuine
+    server-message violations, and both IMAP and SMTP map it straight into
+    their protocol lane. The username is SASLprep'd before AUTHENTICATE is
+    submitted, but the PASSWORD is SASLprep'd inside `scram_client_final`,
+    after the server-first message - mid-exchange - so merely reclassifying it
+    as non-fatal would leave the connection reusable while the server still
+    waits for a SASL continuation. The agreed shape: SASLprep both before the
+    first byte, add a local-input `SaslError` variant, map it to
+    `InvalidInput` in IMAP and SMTP together, and update `reference/sasl.md`.
+    Until then `SaslError::Protocol` stays connection-fatal, so no framing
+    hole is open.
+  - **(c)**: audit the other protocol crates against the rule; fix what the
+    ruling covers, file the rest.
+
+- **errors: local implementation failures derive as provider faults.** Filed
+  2026-09-29 from the (b) work, NOT covered by that ruling. IMAP's
+  `Error::Internal` (poisoned locks, driver result downcasts, a missing
+  pipeline result slot) and `Error::DriverPanicked` both map to
+  `Protocol(ContractViolation)`, so `ProviderContractViolation` - "contact
+  provider support" for a bug in this library (the SCRAM nonce RNG failure and
+  the STATUS consumer's predicate invariant were moved onto `Internal` by the
+  (b) work, so they share this mapping). Local invariant failures raised
+  after bytes of the exchange are on the wire stay `Error::Protocol` so the
+  connection is retired: "SCRAM server signature missing from client state"
+  (`dispatch/auth.rs`) and the four `driver/upgrade.rs` refusals after a
+  tagged OK to STARTTLS/COMPRESS (a non-plain stream, COMPRESS already
+  active, the poison sentinel, the test memory stream). `Request(Malformed)` is the
+  least-bad EXISTING target but its remediation ("fix the client request") is
+  also wrong; the honest fix is a new public `AccountErrorKind` for an
+  implementation or invariant failure, which is a `bifrost-types` taxonomy
+  decision. Whatever it becomes must not imply the connection is reusable:
+  some of these fire mid-exchange. Wants a ruling.
+
+- **imap: `Protocol` subkinds are coarser than the evidence.** Filed
+  2026-09-29. Sites where the server omitted a mandatory response or field
+  (SELECT without UIDVALIDITY, OK without the untagged STATUS / QUOTA / ACL /
+  SEARCH response) all map to `Protocol(ContractViolation)` where
+  `Protocol(MissingField)` is the more precise kind. Same recovery class
+  (`ProviderContractViolation` either way), so a diagnostics refinement, not a
+  defect.
 
 ## Blocked on an unvalidated consumer contract
 

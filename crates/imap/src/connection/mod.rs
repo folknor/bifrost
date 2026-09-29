@@ -296,7 +296,8 @@ pub(crate) struct SearchResult {
 /// RFC 3501 Section 3 defines four session states: Not Authenticated,
 /// Authenticated, Selected, and Logout. Each command method validates that
 /// the connection is in an allowed state before sending, returning
-/// [`Error::Protocol`] if not. For example, [`uid_fetch()`](Self::uid_fetch)
+/// [`Error::InvalidState`] if not ([`Error::Closed`] once the session is in
+/// Logout). For example, [`uid_fetch()`](Self::uid_fetch)
 /// requires the Selected state and will fail if called before
 /// [`select()`](Self::select).
 pub(crate) struct ImapConnection {
@@ -482,10 +483,12 @@ fn build_default_tls_connector() -> Result<native_tls::TlsConnector, Error> {
 
 fn validate_tls_server_name(host: &str) -> Result<(), Error> {
     if host.is_empty() {
-        return Err(Error::Protocol("TLS server name must not be empty".into()));
+        return Err(Error::InvalidInput(
+            "TLS server name must not be empty".into(),
+        ));
     }
     if host.bytes().any(|b| b == 0 || b.is_ascii_whitespace()) {
-        return Err(Error::Protocol(format!(
+        return Err(Error::InvalidInput(format!(
             "invalid TLS server name: {host:?}"
         )));
     }

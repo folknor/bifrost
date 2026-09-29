@@ -58,7 +58,7 @@ fn qresync_seq_match_data_requires_known_uids() {
     };
     assert!(matches!(
         conn.validate_qresync_params(&bad),
-        Err(Error::Protocol(_))
+        Err(Error::InvalidInput(_))
     ));
 
     let good = QresyncParams {
@@ -90,15 +90,32 @@ async fn select_rejects_not_authenticated() {
     let conn = detached(SessionState::NotAuthenticated, vec![], &[]);
     assert!(matches!(
         conn.select("INBOX", T).await,
-        Err(Error::Protocol(_))
+        Err(Error::InvalidState(_))
     ));
+}
+
+/// A session already in Logout is a connection that is gone, not a caller
+/// sequencing mistake: the refusal is `Closed` with `Unsent` evidence, a
+/// transport condition a reconnect answers.
+#[tokio::test]
+async fn a_command_on_a_logged_out_session_is_closed_not_invalid_state() {
+    let conn = detached(SessionState::Logout, vec![], &[]);
+    let err = conn.select("INBOX", T).await.expect_err("session is over");
+    assert!(matches!(err, Error::Closed { .. }), "got {err:?}");
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent)
+    );
 }
 
 #[tokio::test]
 async fn close_and_unselect_require_a_selected_mailbox() {
     let conn = authed(vec![Capability::Unselect]);
-    assert!(matches!(conn.close(T).await, Err(Error::Protocol(_))));
-    assert!(matches!(conn.unselect(T).await, Err(Error::Protocol(_))));
+    assert!(matches!(conn.close(T).await, Err(Error::InvalidState(_))));
+    assert!(matches!(
+        conn.unselect(T).await,
+        Err(Error::InvalidState(_))
+    ));
 }
 
 #[tokio::test]
@@ -122,7 +139,7 @@ async fn lsub_is_rejected_on_rev2() {
     let rev2 = authed(vec![Capability::Imap4Rev2]);
     assert!(matches!(
         rev2.lsub("", "*", T).await,
-        Err(Error::Protocol(_))
+        Err(Error::MissingCapability(_))
     ));
 }
 
@@ -141,7 +158,7 @@ async fn create_special_use_requires_the_capability_and_valid_attributes() {
     assert!(matches!(
         with.create_special_use("Archive", &[MailboxAttribute::NoSelect], T)
             .await,
-        Err(Error::Protocol(_))
+        Err(Error::InvalidInput(_))
     ));
 }
 
@@ -165,11 +182,11 @@ async fn status_validates_items_before_dispatch() {
     // RECENT was removed in IMAP4rev2.
     assert!(matches!(
         conn.status("INBOX", "RECENT", T).await,
-        Err(Error::Protocol(_))
+        Err(Error::MissingCapability(_))
     ));
     assert!(matches!(
         conn.status("INBOX", "()", T).await,
-        Err(Error::Protocol(_))
+        Err(Error::InvalidInput(_))
     ));
 }
 

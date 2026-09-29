@@ -802,10 +802,10 @@ async fn dispatch_response_loop(
 /// [`prepare_append`] refuses BEFORE a byte is written, and its refusals leave
 /// the connection's framing intact whatever their error variant; only a
 /// failure from here on can have desynchronized the stream. The loop applies
-/// `is_connection_fatal` to the second kind alone - applying it to a
-/// validation refusal (a NUL body without BINARY, a malformed flag, a session
-/// that has left the legal states) retired healthy connections, because those
-/// refusals are `Error::Protocol`, which is fatal when it comes off the wire.
+/// `is_connection_fatal` to the second kind alone, so a refusal made before
+/// the first byte never retires the connection whatever its variant. (The
+/// Logout refusal is `Closed`, a fatal variant, but there the session is
+/// already over and the loop exits on Logout regardless.)
 pub(in crate::connection) async fn run_append_command(
     wire_reader: &mut super::wire::WireReader,
     state: &mut super::state::ProtocolState,
@@ -844,9 +844,9 @@ pub(in crate::connection) struct PreparedAppend {
 /// Validate and encode an APPEND from the state this task owns, writing
 /// nothing. Every `Err` here is a refusal before the first byte, so the caller
 /// may safely re-issue against the new state and the connection stays usable.
-/// (`Error::Protocol`, `MissingCapability` and `InvalidInput` carry no
-/// transmission evidence, so there is nothing to stamp: `with_attempt` leaves
-/// those variants unchanged.)
+/// (`MissingCapability` and `InvalidInput` carry no transmission evidence, so
+/// there is nothing to stamp: `with_attempt` leaves those variants unchanged;
+/// `StateChangedBeforeSend` reports `Unsent` by construction.)
 pub(in crate::connection) fn prepare_append(
     state: &super::state::ProtocolState,
     tag_gen: &mut super::tag::TagGenerator,
@@ -860,17 +860,21 @@ pub(in crate::connection) fn prepare_append(
     // Authenticated and Selected. The handle checks this too as a cheap early
     // refusal, but only THIS check is authoritative: a LOGOUT or a BYE
     // completing ahead of a queued APPEND moves the session out from under
-    // any handle-side read. The variant is `Error::Protocol`, unchanged from
-    // the prebuilt path.
-    if !matches!(
-        state.session_state(),
-        super::SessionState::Authenticated | super::SessionState::Selected
-    ) {
-        return Err(Error::Protocol(format!(
-            "session left the Authenticated/Selected states before {cmd_kind:?} \
-             could be sent"
-        ))
-        .with_attempt(TransmissionState::Unsent));
+    // any handle-side read. That is state moving under a queued command,
+    // `StateChangedBeforeSend`, which the caller may re-issue after a state
+    // refresh - except Logout, where the connection itself is gone and the
+    // honest answer is `Closed` with `Unsent` evidence.
+    match state.session_state() {
+        super::SessionState::Authenticated | super::SessionState::Selected => {}
+        super::SessionState::Logout => {
+            return Err(Error::closed().with_attempt(TransmissionState::Unsent));
+        }
+        other => {
+            return Err(Error::StateChangedBeforeSend(format!(
+                "session moved to {other:?}, out of the Authenticated/Selected \
+                 states, before {cmd_kind:?} could be sent"
+            )));
+        }
     }
 
     let tag = tag_gen.next();

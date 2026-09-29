@@ -828,7 +828,11 @@ async fn apply_flag_op(
         FlagOp::Patch { .. } => {
             unreachable!("two-sided patches are handled with per-UID accounting before this call")
         }
-        _ => Err(crate::Error::Protocol("unsupported flag operation".into())),
+        // `FlagOp` is published and `#[non_exhaustive]`: this arm is a variant
+        // added upstream that this crate has not learned, not a server gap.
+        _ => Err(crate::Error::UnsupportedOperation(
+            "flag operation not implemented by bifrost-imap".into(),
+        )),
     }
 }
 

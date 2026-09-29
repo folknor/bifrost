@@ -510,6 +510,32 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 detail: DiagnosticText::support_only(msg.clone()),
             }),
         ),
+        // Local refusals, all made before the first byte. None of them is a
+        // provider fault (`reference/error-model.md`, "Local refusals").
+        Error::InvalidState(msg) => Translation::new(
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(msg.clone()),
+            }),
+        ),
+        Error::StateChangedBeforeSend(msg) => {
+            let mut t = Translation::new(
+                AccountErrorKind::ConcurrencyConflict,
+                Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
+            );
+            t.diagnostic_text = Some(DiagnosticText::support_only(msg.clone()));
+            t.attempt = Some(TransmissionState::Unsent);
+            t
+        }
+        Error::UnsupportedOperation(msg) => {
+            let operation = ctx.operation;
+            let mut t = Translation::new(
+                AccountErrorKind::Unsupported(operation),
+                Cause::Request(RequestCause::Unsupported { operation }),
+            );
+            t.diagnostic_text = Some(DiagnosticText::support_only(msg.clone()));
+            t
+        }
         Error::Internal(msg) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {

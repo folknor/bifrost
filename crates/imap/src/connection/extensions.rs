@@ -59,7 +59,8 @@ impl ImapConnection {
     /// # Errors
     ///
     /// - [`Error::MissingCapability`] if the server does not advertise `NOTIFY`.
-    /// - [`Error::Protocol`] if the command is issued in an invalid state.
+    /// - [`Error::InvalidState`] if the command is issued in an invalid state
+    ///   ([`Error::Closed`] once the session is in Logout).
     /// - [`Error::No`] if the server rejects the request (e.g. `[BADEVENT]`
     ///   for unsupported event types, RFC 5465 Section 5).
     pub async fn notify_set(
@@ -121,7 +122,8 @@ impl ImapConnection {
     /// # Errors
     ///
     /// - [`Error::MissingCapability`] if the server does not advertise `NOTIFY`.
-    /// - [`Error::Protocol`] if the command is issued in an invalid state.
+    /// - [`Error::InvalidState`] if the command is issued in an invalid state
+    ///   ([`Error::Closed`] once the session is in Logout).
     pub async fn notify_none(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 5465 Section 3: NOTIFY is a `command-auth` extension.
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
@@ -172,7 +174,7 @@ impl ImapConnection {
     ///
     /// RFC 5161 Section 2: ENABLE is valid only in the Authenticated state,
     /// before any mailbox is selected. Attempting to ENABLE in the Selected
-    /// state returns [`Error::Protocol`].
+    /// state returns [`Error::InvalidState`].
     ///
     /// # Ordering constraint
     ///

@@ -236,13 +236,10 @@ impl ImapConnection {
             let snap = self.state_rx.borrow();
             // RFC 3501 Section 6.2.3: LOGIN is only valid in
             // NotAuthenticated state.
-            if snap.session_state != SessionState::NotAuthenticated {
-                return Err(Error::Protocol(format!(
-                    "command not valid in {:?} state (expected one of \
-                     [{:?}])",
-                    snap.session_state,
-                    SessionState::NotAuthenticated,
-                )));
+            if let Some(refusal) =
+                super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
+            {
+                return Err(refusal);
             }
             // RFC 3501 Section 6.2.3: "If the server advertises the
             // LOGINDISABLED capability [...] the LOGIN command MUST NOT
@@ -252,7 +249,7 @@ impl ImapConnection {
                 .iter()
                 .any(|c| matches!(c, Capability::LoginDisabled))
             {
-                return Err(Error::Protocol(
+                return Err(Error::MissingCapability(
                     "LOGIN disabled by server (LOGINDISABLED capability \
                      advertised, RFC 3501 Section 6.2.3)"
                         .into(),
@@ -320,13 +317,10 @@ impl ImapConnection {
         // Validate state and build SASL payload from the snapshot.
         let (encoded, has_sasl_ir) = {
             let snap = self.state_rx.borrow();
-            if snap.session_state != SessionState::NotAuthenticated {
-                return Err(Error::Protocol(format!(
-                    "command not valid in {:?} state (expected one of \
-                     [{:?}])",
-                    snap.session_state,
-                    SessionState::NotAuthenticated,
-                )));
+            if let Some(refusal) =
+                super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
+            {
+                return Err(refusal);
             }
             // RFC 3501 Section 6.2.2: verify the server advertises
             // AUTH=PLAIN before sending credentials.
@@ -389,13 +383,10 @@ impl ImapConnection {
         // Validate state and build XOAUTH2 payload from the snapshot.
         let (encoded, has_sasl_ir) = {
             let snap = self.state_rx.borrow();
-            if snap.session_state != SessionState::NotAuthenticated {
-                return Err(Error::Protocol(format!(
-                    "command not valid in {:?} state (expected one of \
-                     [{:?}])",
-                    snap.session_state,
-                    SessionState::NotAuthenticated,
-                )));
+            if let Some(refusal) =
+                super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
+            {
+                return Err(refusal);
             }
             // RFC 3501 Section 6.2.2: verify the server advertises
             // AUTH=XOAUTH2 before sending credentials.
@@ -467,13 +458,10 @@ impl ImapConnection {
         // Validate state and build the OAUTHBEARER payload from the snapshot.
         let (encoded, has_sasl_ir) = {
             let snap = self.state_rx.borrow();
-            if snap.session_state != SessionState::NotAuthenticated {
-                return Err(Error::Protocol(format!(
-                    "command not valid in {:?} state (expected one of \
-                     [{:?}])",
-                    snap.session_state,
-                    SessionState::NotAuthenticated,
-                )));
+            if let Some(refusal) =
+                super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
+            {
+                return Err(refusal);
             }
             // RFC 3501 Section 6.2.2: verify the server advertises
             // AUTH=OAUTHBEARER before sending credentials.
@@ -731,12 +719,10 @@ impl ImapConnection {
 
     fn require_auth_mechanism(&self, mechanism: &str) -> Result<(), Error> {
         let snap = self.state_rx.borrow();
-        if snap.session_state != SessionState::NotAuthenticated {
-            return Err(Error::Protocol(format!(
-                "command not valid in {:?} state (expected one of [{:?}])",
-                snap.session_state,
-                SessionState::NotAuthenticated,
-            )));
+        if let Some(refusal) =
+            super::helpers::state_refusal(snap.session_state, &[SessionState::NotAuthenticated])
+        {
+            return Err(refusal);
         }
         if !snap
             .capabilities
@@ -785,7 +771,7 @@ impl ImapConnection {
     /// # Errors
     ///
     /// - [`Error::MissingCapability`] if `UNAUTHENTICATE` is not advertised.
-    /// - [`Error::Protocol`] if called in Not Authenticated state.
+    /// - [`Error::InvalidState`] if called in Not Authenticated state.
     pub async fn unauthenticate(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 8437 Section2: valid in Authenticated or Selected state.
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
@@ -1236,7 +1222,9 @@ fn generate_scram_nonce() -> Result<String, Error> {
 
     let mut bytes = [0u8; 18];
     getrandom::fill(&mut bytes)
-        .map_err(|e| Error::Protocol(format!("failed to generate SCRAM nonce: {e}")))?;
+        // A local failure before AUTHENTICATE is submitted: nothing is on the
+        // wire, and the server has done nothing wrong.
+        .map_err(|e| Error::Internal(format!("failed to generate SCRAM nonce: {e}")))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 

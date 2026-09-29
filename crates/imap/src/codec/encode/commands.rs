@@ -144,7 +144,7 @@ pub(super) fn encode_search(
     // RFC 6855 Section 3: after ENABLE UTF8=ACCEPT, clients MUST NOT issue a
     // SEARCH command that contains a charset specification.
     if utf8 && search_criteria_starts_with_charset(criteria) {
-        return Err(crate::Error::Protocol(format!(
+        return Err(crate::Error::InvalidInput(format!(
             "{cmd} must not include a CHARSET specification when UTF8=ACCEPT is active \
              (RFC 6855 Section 3)"
         )));
@@ -319,7 +319,7 @@ fn normalize_status_items(items: &str, context: &str) -> Result<String, crate::E
 fn normalize_status_items_body(items: &str, context: &str) -> Result<String, crate::Error> {
     let trimmed = items.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::Protocol(format!(
+        return Err(crate::Error::InvalidInput(format!(
             "{context} must contain at least one status data item \
              (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
         )));
@@ -330,14 +330,14 @@ fn normalize_status_items_body(items: &str, context: &str) -> Result<String, cra
             let inner = without_open
                 .strip_suffix(')')
                 .ok_or_else(|| {
-                    crate::Error::Protocol(format!(
+                    crate::Error::InvalidInput(format!(
                         "{context} must be a single parenthesized status-att-list \
                          (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                     ))
                 })?
                 .trim();
             if inner.is_empty() {
-                return Err(crate::Error::Protocol(format!(
+                return Err(crate::Error::InvalidInput(format!(
                     "{context} must contain at least one status data item \
                      (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                 )));
@@ -345,7 +345,7 @@ fn normalize_status_items_body(items: &str, context: &str) -> Result<String, cra
             inner
         }
         (Some(_), None) | (None, Some(_)) => {
-            return Err(crate::Error::Protocol(format!(
+            return Err(crate::Error::InvalidInput(format!(
                 "{context} must use balanced parentheses for status-att-list \
                  syntax (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
             )));
@@ -354,7 +354,7 @@ fn normalize_status_items_body(items: &str, context: &str) -> Result<String, cra
     };
 
     if body.contains('(') || body.contains(')') {
-        return Err(crate::Error::Protocol(format!(
+        return Err(crate::Error::InvalidInput(format!(
             "{context} must be a flat status-att-list without nested parentheses \
              (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
         )));
@@ -370,7 +370,7 @@ fn normalize_status_items_body(items: &str, context: &str) -> Result<String, cra
 /// for SORT and THREAD.
 fn validate_non_empty_search_criteria(criteria: &str, context: &str) -> Result<(), crate::Error> {
     if criteria.trim().is_empty() {
-        return Err(crate::Error::Protocol(format!(
+        return Err(crate::Error::InvalidInput(format!(
             "{context} must contain at least one search criterion \
              (RFC 3501 Section 6.4.4 / RFC 5256 Section 6)"
         )));
@@ -403,7 +403,7 @@ fn validate_non_empty_search_criteria(criteria: &str, context: &str) -> Result<(
 fn validate_single_fetch_att(attr: &str) -> Result<(), crate::Error> {
     let trimmed = attr.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "NOTIFY MessageNew fetch-att must not be empty \
              (RFC 5465 Section 8)"
                 .into(),
@@ -413,7 +413,7 @@ fn validate_single_fetch_att(attr: &str) -> Result<(), crate::Error> {
     // Individual fetch-atts like BODY[HEADER.FIELDS (From)] contain
     // parentheses only after brackets, not at the top level.
     if trimmed.starts_with('(') {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "NOTIFY MessageNew fetch-att must be a single item, not a \
              parenthesized list  -  use separate vector elements for each \
              fetch-att (RFC 5465 Section 8)"
@@ -427,7 +427,7 @@ fn validate_single_fetch_att(attr: &str) -> Result<(), crate::Error> {
 fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crate::Error> {
     let trimmed = items.trim();
     if trimmed.is_empty() {
-        return Err(crate::Error::Protocol(format!(
+        return Err(crate::Error::InvalidInput(format!(
             "{context} must contain at least one message data item \
              (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
         )));
@@ -435,13 +435,13 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
 
     if let Some(inner) = trimmed.strip_prefix('(') {
         let inner = inner.strip_suffix(')').ok_or_else(|| {
-            crate::Error::Protocol(format!(
+            crate::Error::InvalidInput(format!(
                 "{context} must use balanced parentheses for fetch-att list \
                  syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
             ))
         })?;
         if inner.trim().is_empty() {
-            return Err(crate::Error::Protocol(format!(
+            return Err(crate::Error::InvalidInput(format!(
                 "{context} must contain at least one message data item \
                  (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
             )));
@@ -473,7 +473,7 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
             '[' => bracket_depth += 1,
             ']' => {
                 if bracket_depth == 0 {
-                    return Err(crate::Error::Protocol(format!(
+                    return Err(crate::Error::InvalidInput(format!(
                         "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
                     )));
@@ -483,7 +483,7 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
             '<' if bracket_depth == 0 => angle_depth += 1,
             '>' if bracket_depth == 0 => {
                 if angle_depth == 0 {
-                    return Err(crate::Error::Protocol(format!(
+                    return Err(crate::Error::InvalidInput(format!(
                         "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
                     )));
@@ -493,7 +493,7 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
             '(' if bracket_depth == 0 && angle_depth == 0 => paren_depth += 1,
             ')' if bracket_depth == 0 && angle_depth == 0 => {
                 if paren_depth == 0 {
-                    return Err(crate::Error::Protocol(format!(
+                    return Err(crate::Error::InvalidInput(format!(
                         "{context} must use balanced quotes and delimiters for fetch-att \
                          syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
                     )));
@@ -505,7 +505,7 @@ fn validate_non_empty_fetch_items(items: &str, context: &str) -> Result<(), crat
     }
 
     if in_quote || bracket_depth != 0 || angle_depth != 0 || paren_depth != 0 {
-        return Err(crate::Error::Protocol(format!(
+        return Err(crate::Error::InvalidInput(format!(
             "{context} must use balanced quotes and delimiters for fetch-att \
              syntax (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5)"
         )));
@@ -621,7 +621,7 @@ pub(super) fn encode_select_or_examine(
         // seq-match-data = "(" known-sequence-set SP known-uid-set ")"
         // RFC 3501 Section 9: uidvalidity = nz-number (must be non-zero).
         if params.uid_validity == 0 {
-            return Err(crate::Error::Protocol(
+            return Err(crate::Error::InvalidInput(
                 "QRESYNC uid_validity must be non-zero (nz-number per RFC 3501 Section 9)".into(),
             ));
         }
@@ -646,7 +646,7 @@ pub(super) fn encode_select_or_examine(
             // seq-match-data is semantically meaningless without known-uids
             // (it maps message numbers to UIDs), so we require it.
             if params.known_uids.is_none() {
-                return Err(crate::Error::Protocol(
+                return Err(crate::Error::InvalidInput(
                     "seq-match-data requires known-uids (RFC 7162 Section 3.2.5.2)".into(),
                 ));
             }
@@ -689,7 +689,7 @@ pub(super) fn encode_uid_fetch(
     // RFC 7162 Section 3.2.6: VANISHED requires CHANGEDSINCE in the same
     // fetch modifier list.
     if vanished && changed_since.is_none() {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "VANISHED modifier requires CHANGEDSINCE per RFC 7162 Section 3.2.6".into(),
         ));
     }
@@ -743,7 +743,7 @@ fn encode_store_flags(
                 // Valid per RFC 3501 Section 6.4.6 flag-list ABNF.
             }
             _ => {
-                return Err(crate::Error::Protocol(
+                return Err(crate::Error::InvalidInput(
                     "STORE +FLAGS/-FLAGS requires at least one flag; adding or \
                      removing zero flags is a no-op (RFC 3501 Section 6.4.6)"
                         .into(),

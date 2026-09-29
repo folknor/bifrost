@@ -72,7 +72,9 @@ impl ImapConnection {
             && !super::auth::is_rev2_from_snapshot(&snap);
         drop(snap);
         if needs_utf8 {
-            return Err(Error::Protocol(
+            // A mode the caller has not established, not a missing server
+            // capability: the same request succeeds after the ENABLE.
+            return Err(Error::InvalidState(
                 "server requires ENABLE UTF8=ACCEPT before use \
                  (UTF8=ONLY advertised, RFC 6855 Section 3)"
                     .into(),
@@ -82,17 +84,15 @@ impl ImapConnection {
     }
 
     /// Ensure the session is in one of the allowed states (RFC 3501 Section 6).
+    ///
+    /// Refused before submission, so nothing is sent. A session in Logout is
+    /// a connection that is gone, reported as `Closed` with `Unsent`
+    /// evidence; any other mismatch is caller sequencing, `InvalidState`.
     pub(super) fn require_state(&self, allowed: &[SessionState]) -> Result<(), Error> {
         let snap = self.state_rx.borrow();
         let session_state = snap.session_state;
         drop(snap);
-        if allowed.contains(&session_state) {
-            Ok(())
-        } else {
-            Err(Error::Protocol(format!(
-                "command not valid in {session_state:?} state (expected one of {allowed:?})"
-            )))
-        }
+        state_refusal(session_state, allowed).map_or(Ok(()), Err)
     }
 
     /// Verify that the server supports CONDSTORE (RFC 7162 Section 3.1).
@@ -168,7 +168,7 @@ impl ImapConnection {
         return_options: &[&str],
     ) -> Result<(), Error> {
         if patterns.is_empty() {
-            return Err(Error::Protocol(
+            return Err(Error::InvalidInput(
                 "LIST-EXTENDED requires at least one mailbox pattern \
                  (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
                     .into(),
@@ -199,7 +199,7 @@ impl ImapConnection {
             for option in selection_options {
                 let trimmed = option.trim();
                 if trimmed.is_empty() {
-                    return Err(Error::Protocol(
+                    return Err(Error::InvalidInput(
                         "LIST-EXTENDED selection options must not be empty \
                          (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
                             .into(),
@@ -219,7 +219,7 @@ impl ImapConnection {
         for option in return_options {
             let trimmed = option.trim();
             if trimmed.is_empty() {
-                return Err(Error::Protocol(
+                return Err(Error::InvalidInput(
                     "LIST-EXTENDED return options must not be empty \
                      (RFC 5258 Section 3 / RFC 9051 Section 6.3.9)"
                         .into(),
@@ -256,7 +256,7 @@ impl ImapConnection {
                     && !trimmed.eq_ignore_ascii_case("REMOTE")
             })
         {
-            return Err(Error::Protocol(
+            return Err(Error::InvalidInput(
                 "LIST-EXTENDED selection option RECURSIVEMATCH requires another \
                  non-REMOTE selection option (RFC 5258 Section 3 / \
                  RFC 9051 Section 6.3.9)"
@@ -296,7 +296,7 @@ impl ImapConnection {
             match item.to_ascii_uppercase().as_str() {
                 "RECENT" => {
                     if self.is_rev2() {
-                        return Err(Error::Protocol(
+                        return Err(Error::MissingCapability(
                             "STATUS item RECENT was removed in IMAP4rev2 \
                              (RFC 9051 Section 6.3.11)"
                                 .into(),
@@ -305,7 +305,7 @@ impl ImapConnection {
                 }
                 "DELETED" => {
                     if !self.is_rev2() && !self.has_quota_resource("MESSAGE") {
-                        return Err(Error::Protocol(
+                        return Err(Error::MissingCapability(
                             "STATUS item DELETED requires IMAP4rev2 or \
                              QUOTA=RES-MESSAGE (RFC 9051 Section 6.3.11 / \
                              RFC 9208 Section 4.1.4)"
@@ -421,7 +421,7 @@ impl ImapConnection {
     pub(super) fn status_item_tokens(items: &str) -> Result<Vec<&str>, Error> {
         let trimmed = items.trim();
         if trimmed.is_empty() {
-            return Err(Error::Protocol(
+            return Err(Error::InvalidInput(
                 "STATUS item list must contain at least one data item \
                  (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                     .into(),
@@ -433,7 +433,7 @@ impl ImapConnection {
                 let inner = without_open
                     .strip_suffix(')')
                     .ok_or_else(|| {
-                        Error::Protocol(
+                        Error::InvalidInput(
                             "STATUS item list must use balanced parentheses \
                              (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                                 .into(),
@@ -441,7 +441,7 @@ impl ImapConnection {
                     })?
                     .trim();
                 if inner.is_empty() {
-                    return Err(Error::Protocol(
+                    return Err(Error::InvalidInput(
                         "STATUS item list must contain at least one data item \
                          (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                             .into(),
@@ -450,7 +450,7 @@ impl ImapConnection {
                 inner
             }
             (Some(_), None) | (None, Some(_)) => {
-                return Err(Error::Protocol(
+                return Err(Error::InvalidInput(
                     "STATUS item list must use balanced parentheses \
                      (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                         .into(),
@@ -460,7 +460,7 @@ impl ImapConnection {
         };
 
         if body.contains('(') || body.contains(')') {
-            return Err(Error::Protocol(
+            return Err(Error::InvalidInput(
                 "STATUS item list must be flat and must not contain nested parentheses \
                  (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                     .into(),
@@ -469,7 +469,7 @@ impl ImapConnection {
 
         let tokens: Vec<&str> = body.split_ascii_whitespace().collect();
         if tokens.is_empty() {
-            return Err(Error::Protocol(
+            return Err(Error::InvalidInput(
                 "STATUS item list must contain at least one data item \
                  (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11)"
                     .into(),
@@ -576,7 +576,7 @@ impl ImapConnection {
     ///
     /// **`IMAP4rev1` only.** RFC 9051 removed the CHECK command from
     /// `IMAP4rev2`. On a pure rev2 connection, use [`noop`](Self::noop)
-    /// instead  -  this method returns [`Error::Protocol`].
+    /// instead  -  this method returns [`Error::MissingCapability`].
     pub async fn check(&self, timeout: Duration) -> Result<(), Error> {
         self.require_state(&[SessionState::Selected])?;
         // RFC 9051 removed CHECK; reject when rev2 behavior is active.
@@ -584,7 +584,7 @@ impl ImapConnection {
         // returns true only after `ENABLE IMAP4rev2` (or on pure-rev2
         // servers). Once rev2 is active, CHECK is undefined.
         if self.is_rev2() {
-            return Err(Error::Protocol(
+            return Err(Error::MissingCapability(
                 "CHECK is not defined in IMAP4rev2 (RFC 9051); use NOOP instead".into(),
             ));
         }
@@ -620,6 +620,26 @@ impl ImapConnection {
         .await
         .map_err(|_| Error::timeout_inflight())?
     }
+}
+
+/// The refusal for a command checked against `state` on the handle, or `None`
+/// when `state` is one of `allowed`.
+///
+/// The one classification every handle-side session check shares. Logout is
+/// a connection that is gone - a BYE or LOGOUT completed - so it is `Closed`
+/// with `Unsent` evidence, a transport condition a reconnect answers. Any
+/// other mismatch is the caller issuing a command the session it holds does
+/// not permit, `InvalidState`: a state refresh does not make it valid.
+pub(super) fn state_refusal(state: SessionState, allowed: &[SessionState]) -> Option<Error> {
+    if allowed.contains(&state) {
+        return None;
+    }
+    if state == SessionState::Logout {
+        return Some(Error::closed().with_attempt(bifrost_types::TransmissionState::Unsent));
+    }
+    Some(Error::InvalidState(format!(
+        "command not valid in {state:?} state (expected one of {allowed:?})"
+    )))
 }
 
 #[cfg(test)]

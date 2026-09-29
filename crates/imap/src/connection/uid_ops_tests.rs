@@ -179,16 +179,16 @@ async fn message_commands_require_a_selected_mailbox() {
     );
     assert!(matches!(
         conn.uid_fetch(&set("1:5"), &[FetchAttr::Uid], T).await,
-        Err(Error::Protocol(_))
+        Err(Error::InvalidState(_))
     ));
-    assert!(matches!(conn.expunge(T).await, Err(Error::Protocol(_))));
+    assert!(matches!(conn.expunge(T).await, Err(Error::InvalidState(_))));
     assert!(matches!(
         conn.uid_search("ALL", T).await,
-        Err(Error::Protocol(_))
+        Err(Error::InvalidState(_))
     ));
     assert!(matches!(
         conn.uid_copy(&set("1:5"), "Archive", T).await,
-        Err(Error::Protocol(_))
+        Err(Error::InvalidState(_))
     ));
 }
 

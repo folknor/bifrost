@@ -185,7 +185,7 @@ async fn enable_is_authenticated_state_only() {
         selected
             .enable(&["QRESYNC"], Duration::from_millis(50))
             .await,
-        Err(Error::Protocol(_))
+        Err(Error::InvalidState(_))
     ));
 }
 
@@ -198,6 +198,6 @@ async fn compress_is_rejected_before_authentication() {
     );
     assert!(matches!(
         not_auth.compress(Duration::from_millis(50)).await,
-        Err(Error::Protocol(_))
+        Err(Error::InvalidState(_))
     ));
 }

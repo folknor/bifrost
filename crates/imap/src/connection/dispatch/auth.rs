@@ -507,6 +507,9 @@ impl ContinuationConsumer for AuthenticateScramConsumer {
             }
             ScramState::AwaitServerFinal => {
                 let server_final = decode_continuation(&cont.data)?;
+                // A local invariant, but raised mid-exchange: the server is
+                // waiting for our reply to its server-final, so this must
+                // retire the connection, and `Protocol` is the fatal variant.
                 let expected = self.expected_server_signature.take().ok_or_else(|| {
                     Error::Protocol("SCRAM server signature missing from client state".into())
                 })?;

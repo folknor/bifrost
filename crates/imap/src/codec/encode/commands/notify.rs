@@ -25,7 +25,7 @@ pub(in crate::codec::encode) fn encode_notify_set(
     // RFC 5465 Section 8: event-groups = event-group *(SP event-group)
     // requires at least one event-group.
     if params.event_groups.is_empty() {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "NOTIFY SET requires at least one event group (RFC 5465 Section 8)".into(),
         ));
     }
@@ -43,7 +43,7 @@ pub(in crate::codec::encode) fn encode_notify_set(
         })
         .count();
     if selected_count > 1 {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "NOTIFY SET must not contain more than one event group with a \
              selected or selected-delayed filter (RFC 5465 Section 3)"
                 .into(),
@@ -87,7 +87,7 @@ fn validate_notify_event_group(group: &NotifyEventGroup) -> Result<(), crate::Er
     if is_selected_filter {
         for event in &group.events {
             if !is_message_event(event) {
-                return Err(crate::Error::Protocol(format!(
+                return Err(crate::Error::InvalidInput(format!(
                     "selected/selected-delayed filters only accept message events \
                      (MessageNew, MessageExpunge, FlagChange, AnnotationChange), \
                      got {event:?} (RFC 5465 Section 6.1)"
@@ -104,7 +104,7 @@ fn validate_notify_event_group(group: &NotifyEventGroup) -> Result<(), crate::Er
             if let NotifyEvent::MessageNew { fetch_attrs } = event
                 && !fetch_attrs.is_empty()
             {
-                return Err(crate::Error::Protocol(
+                return Err(crate::Error::InvalidInput(
                     "MessageNew fetch attributes are only valid with \
                      selected/selected-delayed filters (RFC 5465 Section 8)"
                         .into(),
@@ -137,14 +137,14 @@ fn validate_notify_event_group(group: &NotifyEventGroup) -> Result<(), crate::Er
     // RFC 5465 Section 5: "If one of MessageNew or MessageExpunge is
     // specified, then both events MUST be specified."
     if has_new && !has_expunge {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "MessageNew requires MessageExpunge to also be specified \
              (RFC 5465 Section 5)"
                 .into(),
         ));
     }
     if has_expunge && !has_new {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "MessageExpunge requires MessageNew to also be specified \
              (RFC 5465 Section 5)"
                 .into(),
@@ -154,14 +154,14 @@ fn validate_notify_event_group(group: &NotifyEventGroup) -> Result<(), crate::Er
     // are specified, MessageNew and MessageExpunge MUST also be specified
     // by the client."
     if has_flag_change && (!has_new || !has_expunge) {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "FlagChange requires both MessageNew and MessageExpunge to also \
              be specified (RFC 5465 Section 5)"
                 .into(),
         ));
     }
     if has_annotation_change && (!has_new || !has_expunge) {
-        return Err(crate::Error::Protocol(
+        return Err(crate::Error::InvalidInput(
             "AnnotationChange requires both MessageNew and MessageExpunge to \
              also be specified (RFC 5465 Section 5)"
                 .into(),
@@ -219,7 +219,7 @@ fn encode_mailbox_filter(
         MailboxFilter::Subtree(mailboxes) => {
             // RFC 5465 Section 8: one-or-more-mailbox requires at least one.
             if mailboxes.is_empty() {
-                return Err(crate::Error::Protocol(
+                return Err(crate::Error::InvalidInput(
                     "subtree filter requires at least one mailbox (RFC 5465 Section 8)".into(),
                 ));
             }
@@ -229,7 +229,7 @@ fn encode_mailbox_filter(
         MailboxFilter::Mailboxes(mailboxes) => {
             // RFC 5465 Section 8: one-or-more-mailbox requires at least one.
             if mailboxes.is_empty() {
-                return Err(crate::Error::Protocol(
+                return Err(crate::Error::InvalidInput(
                     "mailboxes filter requires at least one mailbox (RFC 5465 Section 8)".into(),
                 ));
             }

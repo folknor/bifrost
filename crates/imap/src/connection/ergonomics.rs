@@ -94,7 +94,7 @@ impl ImapConnection {
         let sequence_set = request.uids.as_sequence_set();
         if request.include_vanished {
             let Some(mod_seq) = request.changed_since else {
-                return Err(Error::Protocol(
+                return Err(Error::InvalidInput(
                     "include_vanished requires changed_since for UID FETCH".into(),
                 ));
             };

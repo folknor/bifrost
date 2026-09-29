@@ -1125,7 +1125,7 @@ async fn multiappend_refuses_bytes_built_before_a_capability_vanished() {
 
     let err = result.expect_err("bytes built against the pre-CAPABILITY state must not be sent");
     assert!(
-        matches!(err, Error::Protocol(ref m) if m.contains("requires BINARY literal8 support")),
+        matches!(err, Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
         "the literal kind must be derived from the state at execution, so a \
          vanished BINARY is caught by the driver; got {err:?}"
     );
@@ -1204,7 +1204,7 @@ async fn a_queued_append_is_validated_against_the_state_at_execution() {
         .expect("append task")
         .expect_err("an APPEND the live state cannot carry must not be sent");
     assert!(
-        matches!(err, Error::Protocol(ref m) if m.contains("requires BINARY literal8 support")),
+        matches!(err, Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
         "the driver must validate the queued APPEND against the state it \
          executes under; got {err:?}"
     );
@@ -1291,8 +1291,9 @@ async fn a_queued_append_is_encoded_for_the_state_at_execution() {
 /// was legal when submitted is refused if a command ahead of it moved the
 /// session out of Authenticated/Selected, nothing is written, and the
 /// connection stays usable: the refusal happens before the first byte, so it
-/// must not retire the connection even though its variant is `Error::Protocol`
-/// (the variant itself is a separate, not-yet-ruled item).
+/// must not retire the connection. The variant is `StateChangedBeforeSend`,
+/// with `Unsent` evidence: local state moved under a queued command, which is
+/// transient, never a provider fault.
 #[tokio::test(start_paused = true)]
 async fn a_queued_append_is_refused_when_the_session_left_the_legal_states() {
     let (conn, mut server) =
@@ -1359,8 +1360,13 @@ async fn a_queued_append_is_refused_when_the_session_left_the_legal_states() {
         .expect("append task")
         .expect_err("the session is no longer legal for APPEND");
     assert!(
-        matches!(err, Error::Protocol(ref m) if m.contains("session left")),
-        "session legality must be refused as Error::Protocol; got {err:?}"
+        matches!(err, Error::StateChangedBeforeSend(_)),
+        "session legality must be refused as StateChangedBeforeSend; got {err:?}"
+    );
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent),
+        "nothing was written, and the error must say so"
     );
     drop(conn);
     script.await.expect("transcript");
@@ -1368,10 +1374,8 @@ async fn a_queued_append_is_refused_when_the_session_left_the_legal_states() {
 
 /// An APPEND the driver refuses during validation leaves the connection
 /// usable. The refusal (here a NUL-bearing body on a server without BINARY) is
-/// an `Error::Protocol`, the variant the driver treats as fatal when it comes
-/// off the wire - but it is made before the first byte, so the framing is
-/// intact and retiring the connection would throw away a healthy one. The
-/// follow-up NOOP is the proof.
+/// made before the first byte, so the framing is intact and retiring the
+/// connection would throw away a healthy one. The follow-up NOOP is the proof.
 #[tokio::test(start_paused = true)]
 async fn a_refused_append_leaves_the_connection_usable() {
     let (conn, mut server) =
@@ -1392,7 +1396,7 @@ async fn a_refused_append_leaves_the_connection_usable() {
         .await
         .expect_err("a NUL body without BINARY must be refused");
     assert!(
-        matches!(err, Error::Protocol(ref m) if m.contains("BINARY")),
+        matches!(err, Error::MissingCapability(ref m) if m.contains("BINARY")),
         "expected the BINARY refusal; got {err:?}"
     );
     conn.noop(Duration::from_secs(5))

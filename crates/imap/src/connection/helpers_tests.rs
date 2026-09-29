@@ -38,7 +38,7 @@ async fn login_rejects_non_ascii_before_submitting_to_the_driver() {
         .login("älice", "password", std::time::Duration::from_secs(1))
         .await
         .expect_err("non-ASCII LOGIN credentials must not reach the driver");
-    assert!(matches!(error, Error::Protocol(message) if message.contains("ASCII-only")));
+    assert!(matches!(error, Error::InvalidInput(message) if message.contains("ASCII-only")));
 }
 
 /// X-GM-LABELS is a Gmail extension attribute like X-GM-MSGID / X-GM-THRID,
@@ -576,7 +576,7 @@ fn list_extended_requires_at_least_one_pattern() {
     let c = conn(vec![Capability::ListExtended]);
     assert!(matches!(
         c.validate_list_extended_request(&[], &[], &[]),
-        Err(Error::Protocol(_))
+        Err(Error::InvalidInput(_))
     ));
 }
 
@@ -617,11 +617,11 @@ fn list_extended_rejects_empty_option_strings() {
     let c = conn(vec![Capability::ListExtended]);
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &["  "], &[]),
-        Err(Error::Protocol(_))
+        Err(Error::InvalidInput(_))
     ));
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &[], &["  "]),
-        Err(Error::Protocol(_))
+        Err(Error::InvalidInput(_))
     ));
 }
 
@@ -670,11 +670,11 @@ fn list_extended_recursivematch_needs_a_partner_option() {
     let c = conn(vec![Capability::ListExtended]);
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &["RECURSIVEMATCH"], &[]),
-        Err(Error::Protocol(_))
+        Err(Error::InvalidInput(_))
     ));
     assert!(matches!(
         c.validate_list_extended_request(&["*"], &["RECURSIVEMATCH", "REMOTE"], &[]),
-        Err(Error::Protocol(_))
+        Err(Error::InvalidInput(_))
     ));
     assert!(
         c.validate_list_extended_request(&["*"], &["RECURSIVEMATCH", "SUBSCRIBED"], &[])

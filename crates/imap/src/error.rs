@@ -115,7 +115,26 @@ pub(crate) enum Error {
         attempt: Option<ImapAttempt>,
     },
 
-    /// IMAP protocol violation by the server.
+    /// IMAP protocol violation by the server: it sent something malformed or
+    /// out of sequence, or omitted something mandatory.
+    ///
+    /// Never a LOCAL refusal. A request refused before any byte is sent is
+    /// never a provider fault (`reference/error-model.md`, "Local refusals"):
+    /// caller input that cannot be expressed is `InvalidInput`, a capability
+    /// the server lacks is `MissingCapability`, an operation this crate does
+    /// not implement is `UnsupportedOperation`, a command the connection's
+    /// local state does not permit is `InvalidState`, and state that moved
+    /// while the command was queued is `StateChangedBeforeSend`. This variant
+    /// maps to a terminal provider contract violation and is connection-fatal,
+    /// so a local refusal filed here both blames the provider and retires a
+    /// healthy connection.
+    ///
+    /// The one deliberate exception: a LOCAL invariant failure raised after
+    /// bytes of the same exchange are on the wire (mid-SASL, or after a tagged
+    /// OK to STARTTLS/COMPRESS once the stream is swapped out) stays here,
+    /// because the connection must be retired and `Internal` is not
+    /// connection-fatal. Its provider attribution is wrong and known; the
+    /// honest fix needs a public error kind for implementation failures.
     #[error("protocol error: {0}")]
     Protocol(String),
 
@@ -128,6 +147,35 @@ pub(crate) enum Error {
     /// which means the *server* violated the wire contract.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// The connection's local protocol state does not permit the command:
+    /// the wrong session state for it (LOGIN once authenticated, CLOSE with
+    /// nothing selected), or a mode the server requires that the caller has
+    /// not established (UTF8=ONLY before `ENABLE UTF8=ACCEPT`). Refused on the
+    /// handle before submission, so nothing was sent and the connection stays
+    /// usable. Caller sequencing, hence a client bug rather than a retry: a
+    /// state refresh does not make LOGIN-while-authenticated valid.
+    ///
+    /// A session already in Logout is `Closed` instead - the connection is
+    /// gone, which is a transport condition, not a sequencing mistake.
+    #[error("command not valid in the current connection state: {0}")]
+    InvalidState(String),
+
+    /// The session state changed while the command waited in the driver's
+    /// queue, so the check made against live state at the head of the queue
+    /// refused it. Nothing was sent and the connection stays usable; the
+    /// caller may re-issue after refreshing state, which is why this maps to a
+    /// transient conflict rather than a client bug.
+    #[error("session state changed before the command was sent: {0}")]
+    StateChangedBeforeSend(String),
+
+    /// The operation is valid but this version of the crate does not
+    /// implement it - a variant of a published `#[non_exhaustive]` request
+    /// type added upstream that this crate has not learned. Distinct from
+    /// `MissingCapability`, which is evidence about the SERVER and which retry
+    /// ladders read as such.
+    #[error("operation not supported by this client: {0}")]
+    UnsupportedOperation(String),
 
     /// Operation exceeded the caller-supplied timeout.
     #[error("operation timed out")]
@@ -215,6 +263,7 @@ impl From<crate::codec::encode::EncodeError> for Error {
             crate::codec::encode::EncodeError::MissingCapability { cmd, cap } => {
                 Self::MissingCapability(format!("{cmd} requires {cap}"))
             }
+            crate::codec::encode::EncodeError::CapabilityText(msg) => Self::MissingCapability(msg),
             crate::codec::encode::EncodeError::Validation(msg) => Self::InvalidInput(msg),
         }
     }
@@ -286,6 +335,9 @@ impl PartialEq for Error {
             (Self::Protocol(a), Self::Protocol(b))
             | (Self::Parse(a), Self::Parse(b))
             | (Self::InvalidInput(a), Self::InvalidInput(b))
+            | (Self::InvalidState(a), Self::InvalidState(b))
+            | (Self::StateChangedBeforeSend(a), Self::StateChangedBeforeSend(b))
+            | (Self::UnsupportedOperation(a), Self::UnsupportedOperation(b))
             | (Self::MissingCapability(a), Self::MissingCapability(b))
             | (Self::InvalidAppendDate(a), Self::InvalidAppendDate(b))
             | (Self::Internal(a), Self::Internal(b)) => a == b,
@@ -445,6 +497,9 @@ impl Error {
             | Self::Bad { attempt, .. }
             | Self::DriverPanicked { attempt, .. }
             | Self::DriverGone { attempt } => attempt.map(|a| a.transmission_state),
+            // Refused at the head of the queue, before the first byte: the
+            // variant IS the evidence, so it needs no field to carry it.
+            Self::StateChangedBeforeSend(_) => Some(TransmissionState::Unsent),
             _ => None,
         }
     }
