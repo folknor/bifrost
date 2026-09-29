@@ -887,7 +887,9 @@ was indistinguishable from a primary folder's.
 `bulk_move` also decodes the destination
 `FolderId` (the `destinationId` body must be the native id) and rejects a
 cross-mailbox move - destination owner != source owner - as `Request(Malformed)`,
-since one endpoint can't express it. The etag cache stays keyed by the encoded
+since one endpoint can't express it. The PIM `move_messages` path (reached from
+`add_to_container` and `delete_thread`) refuses the same condition the same way,
+decided from the ids alone and before its etag GET. The etag cache stays keyed by the encoded
 id; only the URL uses the native id. `push/webhook.rs resource_for_scope` routes a
 foreign subscription via `client_for_scope` + the native folder id, never
 percent-encoding a raw `\u{1f}` id into the URL.
@@ -1733,7 +1735,8 @@ refresh. Shared by `mutate.rs` `bulk_*`, `pim::messages::submit_write_batch`,
 `get_stream`.
 
 Cursor-decode failures (`CursorProtocolMismatch`, `CursorEnvelopeUnknown`,
-`SchemaIncompatible`, malformed payload) build an AccountError with
+`SchemaIncompatible`, and `CursorError::Decode` for cursor or page-marker bytes
+that do not deserialize) build an AccountError with
 `SyncState(SchemaIncompatible)`, routed to `Engine(SchemaIncompatible)`; a
 scope whose shared mailbox left the configuration
 (`cursor::routing_error` -> `CursorError::Configuration`) builds

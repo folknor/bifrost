@@ -232,20 +232,14 @@ fn open_blob_inner_stream(
         let locator = match decode_locator(&handle) {
             Ok(locator) => locator,
             Err(error) => {
-                // Malformed blob handle - this is a protocol contract
-                // violation; the locator was minted by this crate.
-                let account_error = AccountErrorBuilder::new(
-                    AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-                    Cause::Wire(WireCause::MalformedResponse {
-                        protocol: Protocol::Graph,
-                        detail: Some(DiagnosticText::support_only(error)),
-                    }),
-                )
-                .operation(AccountOperation::OpenBlob)
-                .provider(Provider::Microsoft)
-                .protocol(Protocol::Graph)
-                .try_build()
-                .expect("valid account error classification");
+                // A handle this crate did not mint (or one damaged in the
+                // caller's storage). Refused before any request, so it is the
+                // caller's input, never a provider fault - `Request(Malformed)`,
+                // matching Google's `BlobError::InvalidId`.
+                let account_error = crate::account::graph_error::invalid_account_error(
+                    AccountOperation::OpenBlob,
+                    error,
+                );
                 yield SyncEvent::Terminated(account_error);
                 yield SyncEvent::Done(None);
                 return;
@@ -590,6 +584,31 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    /// A handle this crate did not mint is the caller's input, refused before
+    /// any request: `Request(Malformed)`, never a provider contract violation,
+    /// and nothing reaches the transport.
+    #[tokio::test]
+    async fn a_malformed_blob_handle_is_a_client_bug_and_sends_nothing() {
+        let client = GraphClient::new("token");
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let mut handle = file_handle(&ObjectId("AAMkmsg".to_string()), "att1");
+        handle.id = bifrost_types::BlobId("not a locator".to_string());
+
+        let events = drain(open_blob_inner_stream(account, handle, None)).await;
+        let Some(SyncEvent::Terminated(error)) = events.first() else {
+            panic!("expected a terminal error first, got {events:?}");
+        };
+        assert!(
+            matches!(
+                error.kind(),
+                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+            ),
+            "got {:?}",
+            error.kind()
+        );
+        assert!(client.take_download_requests().is_empty());
     }
 
     fn file_handle(message: &ObjectId, attachment: &str) -> BlobHandle {

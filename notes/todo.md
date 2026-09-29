@@ -48,12 +48,69 @@ item is what stops that.
   continuations interleaving with other commands), would treat APPEND, and
   what submits raw `Command`s at all.
 
-- **errors: local refusals are never a provider fault.** RULED 2026-09-29
-  (second pass), three parts. (a), the rule in `reference/error-model.md`
-  ("Local refusals"), and (b), IMAP's `Error::Protocol` split including the
-  SASL credential refusals, have landed. Remaining: **(c)**, audit the other
-  protocol crates against the rule; fix what the ruling covers, file the
-  rest.
+- **SECURITY - graph: a page or delta cursor can send the bearer token to
+  any host.** Found 2026-09-29 by the error-model audit, NOT fixed: outside
+  that ruling, wants its own. `paging::decode_paged_cursor` turns a caller's
+  page cursor into a URL verbatim (the JSON form's `url`, or on a decode
+  failure the raw bytes as a string), and Graph calendar and contacts search
+  fetch it. `client.rs build_url` passes an absolute URL straight through, and
+  bifrost-net attaches the bearer to the first request whatever its host (the
+  trusted-host allowlist and `Authorization` stripping apply only to
+  REDIRECT hops). So a cursor naming `https://elsewhere/...` is fetched with
+  the account's access token. Persisted change cursors resume from a stored
+  `@odata.deltaLink` the same way (`GraphCursorPayload::resume_url`) and
+  want the same check. Exploiting it needs control of the cursor bytes (the
+  consumer's storage, or a caller of the API), but the token is the whole
+  account. Likely fix shape: refuse any cursor URL whose origin is not the
+  client's API base origin, as `Request(Malformed)` for a page cursor and
+  `SyncState(SchemaIncompatible)` for a change cursor, before any request.
+
+- **errors: findings from the local-refusal audit (part c) not covered by
+  the ruling.** Filed 2026-09-29. Parts (a) and (b), and the covered part of
+  (c) - Google Calendar and People caller input, Graph's unknown public
+  folder, cross-mailbox PIM move, malformed blob handle and undecodable
+  cursors, SMTP's missing-extension refusals - have landed. What the audit
+  found beyond the rule's reach, each unverified beyond the audit's read:
+  - JMAP `WebSocketNotConnected` (`sync/push.rs apply_push_set`) derives
+    terminal `Unsupported(PushSubscribe)` for what the code itself calls a
+    transient race. The rule says transient, but flipping it changes how the
+    sync engine's push lane reacts (fallback to polling versus re-subscribe),
+    so it wants that consumer analysis first. Related: a send on a dead sink
+    becomes `Protocol(PartialResponse)` stamped `Acknowledged` though nothing
+    was acknowledged.
+  - SMTP `starttls` on a server without STARTTLS is `Request(Malformed)`,
+    while IMAP's `StartTlsUnavailable` is `Authorization(PolicyBlocked)`: a
+    parity question with a security-policy flavour, left alone.
+  - Server faults or post-send conditions classified as the caller's fault:
+    Google Drive resumable upload (missing `Location`, unparseable or
+    non-advancing 308, exhausted chunks) via `invalid_request`; JMAP session
+    URL templates and the WebSocket capability URL (`InvalidUrl`); CalDAV
+    invalid iCalendar and CardDAV unparseable vCard from the server
+    (`local_error`); dav-core "unresolvable redirect target" / "too many
+    redirects" after bytes were sent, disagreeing with bifrost-net's
+    `RedirectLoop` (`Protocol(ContractViolation)`, `Acknowledged`); Graph
+    calendar's event-search `PageWalk` refusal (`Unsupported`, where every
+    other Graph `walk.enter` site gives `Protocol`).
+  - Configuration errors that derive `Transport(Network)` and so retry
+    forever: JMAP "unsupported HTTP method", invalid default header value,
+    missing credentials, invalid forwarded-for header; Graph "EWS account net
+    not attached" (`get.rs`, `pim/hydrate.rs`, `blob.rs`).
+  - `Unsupported` where the input is really malformed: Graph calendar
+    `local_error` (bad cursor, bad event id, unknown timezone), Google
+    `reject_unexpressible_all_day_patch`.
+  - Transmission evidence: dav-core `status_error` / `parse_error` push no
+    `Acknowledged` attempt on server responses (other crates do); Graph
+    `shutdown_during_upload` stamps `Unsent` though a PUT chunk can be
+    mid-flight; Graph `upload_file_chunked` hitting the client's own
+    `UPLOAD_TOTAL_TIMEOUT` derives `Protocol(ParseFailed)` + `Acknowledged`
+    where `Transport(Timeout)` + `InFlight` is honest.
+  - JMAP `NoPrimaryAccount` (a pre-send missing capability) derives
+    `AuthLost`; and in `crates/jmap/src/sync/error.rs` its rationale comment
+    sits above the `MalformedCapability` arm.
+  - Graph batch `builder.finalize` failures (`reactions.rs`,
+    `push/dispatch.rs`) derive `Protocol(ContractViolation)`; probably the
+    local-invariant class below, not ruled out that server-supplied ids
+    trigger it.
 
 - **errors: local implementation failures derive as provider faults.** Filed
   2026-09-29 from the (b) work, NOT covered by that ruling. IMAP's

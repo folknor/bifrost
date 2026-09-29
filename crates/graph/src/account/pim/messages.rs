@@ -484,20 +484,39 @@ pub(super) async fn move_messages(
     destination: &str,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    let values = message_values_for_ids(account, ids, "id,changeKey").await?;
     // The destination may itself be foreign-encoded (a shared-mailbox
     // folder); the `move` body's `destinationId` must carry the native
     // folder id, never a `\u{1f}`-bearing one. Decode once up front.
     let dest =
         crate::account::foreign::parse_folder(&bifrost_types::FolderId(destination.to_string()));
+    // A cross-mailbox move is not expressible against one endpoint. Decided
+    // from the ids alone, so it is refused BEFORE the etag GET - a local
+    // refusal of the caller's request, `Request(Malformed)`, exactly as the
+    // bulk-move path in `mutate.rs` refuses the same condition.
+    for id in ids {
+        let source_owner = crate::account::foreign::parse_message_id(id)
+            .owner()
+            .map(str::to_string);
+        if dest.foreign().map(|f| f.mailbox.as_str()) != source_owner.as_deref() {
+            return Err(crate::account::graph_error::invalid_item_error(
+                operation,
+                ErrorScope::Message {
+                    id: id.0.clone().into(),
+                },
+                format!(
+                    "Graph move for {} targets a folder in a different mailbox than the message",
+                    id.0
+                ),
+            ));
+        }
+    }
+    let values = message_values_for_ids(account, ids, "id,changeKey").await?;
     let mut requests = Vec::new();
     let mut targets = Vec::new();
     // `ids[i]` is the caller-supplied (possibly foreign-encoded) routing
     // id; `values[i]` is its fetched value (etag). Route the request by
     // the routing id so a shared-mailbox message moves under
-    // `/users/{owner}`, and guard that the destination folder belongs to
-    // the same mailbox - a cross-mailbox move is not expressible against
-    // one endpoint.
+    // `/users/{owner}`.
     for (index, (id, value)) in ids.iter().zip(values.iter()).enumerate() {
         let etag = graph_etag(value).ok_or_else(|| {
             pim_protocol_error(
@@ -508,21 +527,6 @@ pub(super) async fn move_messages(
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
-        let source_owner = crate::account::foreign::parse_message_id(id)
-            .owner()
-            .map(str::to_string);
-        if dest.foreign().map(|f| f.mailbox.as_str()) != source_owner.as_deref() {
-            return Err(pim_protocol_error(
-                operation,
-                Some(ErrorScope::Message {
-                    id: id.0.clone().into(),
-                }),
-                format!(
-                    "Graph move for {} targets a folder in a different mailbox than the message",
-                    id.0
-                ),
-            ));
-        }
         let mut headers = HashMap::new();
         headers.insert("If-Match".to_string(), etag);
         requests.push(BatchRequestItem {
@@ -746,4 +750,50 @@ pub(super) async fn cache_etag_for(account: &GraphAccount, id: &ObjectId, value:
     };
     let mut cache = account.etag_index.write().await;
     cache.insert(id.0.clone(), etag);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::PushMode;
+
+    /// A move whose destination is in a different mailbox than the message
+    /// is refused from the ids alone, before the etag GET, as the caller's
+    /// malformed request - the same classification the bulk-move path gives
+    /// the same condition. It used to be decided after the GET, as a
+    /// provider contract violation.
+    #[tokio::test]
+    async fn a_cross_mailbox_move_is_refused_before_any_request() {
+        let client = GraphClient::new("token");
+        client.script_rest([]);
+        let account = GraphAccount::new_for_tests_with_shared(
+            client.clone(),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        let destination = crate::account::foreign::encode_foreign("shared@contoso.com", "archive");
+
+        let error = move_messages(
+            &account,
+            &[ObjectId("AAMkprimary".to_string())],
+            &destination.0,
+            AccountOperation::AddToContainer,
+        )
+        .await
+        .expect_err("a cross-mailbox move is not expressible");
+        assert!(
+            matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                )
+            ),
+            "got {:?}",
+            error.kind()
+        );
+        assert!(
+            client.take_rest_requests().is_empty(),
+            "the refusal must come before the etag GET"
+        );
+    }
 }

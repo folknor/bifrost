@@ -1080,6 +1080,37 @@ pub(crate) fn invalid_item_error(
     .expect("valid account error classification")
 }
 
+/// Build an `AccountError` for ONE item refused because the account's LOCAL
+/// state no longer matches what minted the id - a public folder with no
+/// routing entry in this process, say, because the map starts empty on every
+/// reopen and discovery can skip a folder after a per-folder failure.
+///
+/// Refused before any request, and neither the caller's fault nor the
+/// provider's: `ConcurrencyConflict` with `Unsent` evidence, so
+/// `Retry(AfterStateRefresh)`, per the local-refusal rule in
+/// `reference/error-model.md`.
+#[must_use]
+pub(crate) fn stale_local_state_error(
+    operation: AccountOperation,
+    scope: ErrorScope,
+    detail: impl Into<String>,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::ConcurrencyConflict,
+        Cause::State(StateCause::ConcurrencyConflict),
+    )
+    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
+        bifrost_types::TransmissionState::Unsent,
+    )))
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .scope(scope)
+    .text(DiagnosticText::support_only(detail.into()))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Build an `AccountError` for ONE id `translateExchangeIds` refused inside
 /// an otherwise successful 200.
 ///
@@ -1142,9 +1173,12 @@ pub(crate) fn id_translation_refused(
 ///
 /// `CursorProtocolMismatch`, `CursorEnvelopeUnknown`, and
 /// `SchemaIncompatible` map to `SyncState(SchemaIncompatible)` so the
-/// engine can restart the scope with a cleared cursor. `Unsupported`
-/// maps to `Unsupported(EstablishCursor)`. `Encode` (serialization
-/// failures) maps to `Protocol(ContractViolation)`.
+/// engine can restart the scope with a cleared cursor, and so does
+/// `Decode`: cursor bytes that do not decode are the caller's durable state,
+/// refused before any request, never a provider fault. `Unsupported`
+/// maps to `Unsupported(EstablishCursor)`. `Encode` (a local serialization
+/// failure) still maps to `Protocol(ContractViolation)` - the filed
+/// local-invariant misattribution, not a local refusal.
 #[must_use]
 pub(crate) fn cursor_error_to_account_error(
     error: crate::account::cursor::CursorError,
@@ -1164,7 +1198,8 @@ pub(crate) fn cursor_error_to_account_error(
     let builder = match error {
         CursorError::ProtocolMismatch
         | CursorError::EnvelopeUnknown
-        | CursorError::SchemaIncompatible => base_builder(
+        | CursorError::SchemaIncompatible
+        | CursorError::Decode(_) => base_builder(
             &ctx,
             AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
             Cause::State(StateCause::SchemaIncompatible),

@@ -491,8 +491,12 @@ mod tests {
         ));
     }
 
+    /// Cursor bytes that do not decode are the caller's durable state, refused
+    /// before any request: never a provider fault. They re-establish like
+    /// every other unreadable cursor. (This used to terminate as
+    /// `Protocol(ContractViolation)`, blaming Graph for bytes it never sent.)
     #[tokio::test]
-    async fn a_garbage_payload_terminates_as_a_contract_violation() {
+    async fn a_garbage_payload_terminates_as_schema_incompatible() {
         let cursor = ChangeCursor {
             scope: email_scope("inbox"),
             server_state: OpaqueChangeState {
@@ -506,7 +510,13 @@ mod tests {
         let error = terminal_kind(cursor).await;
         assert!(matches!(
             error.kind(),
-            AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation)
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Engine(
+                bifrost_types::EngineDirective::SchemaIncompatible
+            )
         ));
     }
 

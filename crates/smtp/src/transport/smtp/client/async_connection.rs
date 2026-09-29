@@ -507,7 +507,7 @@ impl AsyncSmtpConnection {
         options: &SendOptions,
     ) -> Result<Response, Error> {
         if !self.server_info().supports_chunking() {
-            return Err(error::invalid_input(
+            return Err(error::feature_unsupported(
                 "BDAT requires server CHUNKING support",
             ));
         }
@@ -546,7 +546,7 @@ impl AsyncSmtpConnection {
         options: &SendOptions,
     ) -> Result<Vec<Response>, Error> {
         if !self.server_info().supports_chunking() {
-            return Err(error::invalid_input(
+            return Err(error::feature_unsupported(
                 "BDAT requires server CHUNKING support",
             ));
         }
@@ -774,7 +774,7 @@ impl AsyncSmtpConnection {
                 .any(|recipient| !AsRef::<str>::as_ref(&recipient.address).is_ascii());
         if has_non_ascii && !has_smtputf8 {
             if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
-                return Err(error::invalid_input(
+                return Err(error::feature_unsupported(
                     "Envelope contains non-ascii chars but server does not support SMTPUTF8",
                 ));
             }
@@ -783,7 +783,7 @@ impl AsyncSmtpConnection {
 
         if !email.is_ascii() && !has_body_parameter {
             if !self.server_info().supports_feature(Extension::EightBitMime) {
-                return Err(error::invalid_input(
+                return Err(error::feature_unsupported(
                     "Message contains non-ascii chars but server does not support 8BITMIME",
                 ));
             }
@@ -854,7 +854,7 @@ impl AsyncSmtpConnection {
         if envelope.has_non_ascii_addresses() && !has_smtputf8 {
             if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
                 // don't try to send non-ascii addresses (per RFC)
-                return Err(error::invalid_input(
+                return Err(error::feature_unsupported(
                     "Envelope contains non-ascii chars but server does not support SMTPUTF8",
                 ));
             }
@@ -864,7 +864,7 @@ impl AsyncSmtpConnection {
         // Check for non-ascii content in the message
         if !email.is_ascii() && !has_body_parameter {
             if !self.server_info().supports_feature(Extension::EightBitMime) {
-                return Err(error::invalid_input(
+                return Err(error::feature_unsupported(
                     "Message contains non-ascii chars but server does not support 8BITMIME",
                 ));
             }
@@ -953,7 +953,7 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_feature(Extension::EightBitMime) {
                     Ok(())
                 } else {
-                    Err(error::invalid_input(
+                    Err(error::feature_unsupported(
                         "BODY=8BITMIME requires server 8BITMIME support",
                     ))
                 }
@@ -967,7 +967,7 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_binary_mime() {
                     Ok(())
                 } else {
-                    Err(error::invalid_input(
+                    Err(error::feature_unsupported(
                         "BODY=BINARYMIME requires server BINARYMIME support",
                     ))
                 }
@@ -989,14 +989,14 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_feature(Extension::SmtpUtfEight) {
                     Ok(())
                 } else {
-                    Err(error::invalid_input(
+                    Err(error::feature_unsupported(
                         "SMTPUTF8 requires server SMTPUTF8 support",
                     ))
                 }
             }
             MailParameter::RequireTls => {
                 if !self.server_info().supports_require_tls() {
-                    return Err(error::invalid_input(
+                    return Err(error::feature_unsupported(
                         "REQUIRETLS requires server REQUIRETLS support",
                     ));
                 }
@@ -1030,7 +1030,9 @@ impl AsyncSmtpConnection {
             }
             MailParameter::DeliverBy(value) => {
                 if !self.server_info().supports_deliver_by() {
-                    return Err(error::invalid_input("BY requires server DELIVERBY support"));
+                    return Err(error::feature_unsupported(
+                        "BY requires server DELIVERBY support",
+                    ));
                 }
                 if value.mode() == DeliverByMode::Return
                     && value.seconds() > 0
@@ -1049,7 +1051,7 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_mt_priority() {
                     Ok(())
                 } else {
-                    Err(error::invalid_input(
+                    Err(error::feature_unsupported(
                         "MT-PRIORITY requires server MT-PRIORITY support",
                     ))
                 }
@@ -1058,7 +1060,7 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_dsn() {
                     Ok(())
                 } else {
-                    Err(error::invalid_input(
+                    Err(error::feature_unsupported(
                         "DSN MAIL parameters require server DSN support",
                     ))
                 }
@@ -1075,7 +1077,7 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_dsn() {
                     Ok(())
                 } else {
-                    Err(error::invalid_input(
+                    Err(error::feature_unsupported(
                         "DSN RCPT parameters require server DSN support",
                     ))
                 }

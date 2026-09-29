@@ -93,10 +93,9 @@ pub(crate) fn events_in_range(
             .map(String::from_utf8)
             .transpose()
             .map_err(|error| {
-                local_error_with_field(
+                caller_input_error(
                     AccountOperation::EventsInRange,
-                    "eventPageToken",
-                    error.to_string(),
+                    format!("event page cursor is not UTF-8: {error}"),
                 )
             })?;
         let calendar_id = range.calendar_id.0;
@@ -471,7 +470,12 @@ fn decode_page_token(
     page_cursor
         .map(String::from_utf8)
         .transpose()
-        .map_err(|error| local_error_with_field(operation, "eventPageToken", error.to_string()))
+        .map_err(|error| {
+            caller_input_error(
+                operation,
+                format!("event page cursor is not UTF-8: {error}"),
+            )
+        })
 }
 
 fn encode_cross_calendar_cursor(calendar_id: &str, page_token: &[u8]) -> Vec<u8> {
@@ -489,21 +493,36 @@ fn decode_cross_calendar_cursor(
         return Ok((0, None));
     };
     let (calendar_id, page_token) = cursor.split_once('\n').ok_or_else(|| {
-        local_error_with_field(
+        caller_input_error(
             AccountOperation::EventSearch,
-            "eventPageToken",
             "cross-calendar search cursor is missing calendar id".to_string(),
         )
     })?;
+    // A cursor this crate minted can name a calendar the account no longer
+    // lists: it was removed between pages. That is state moving under the
+    // caller's pagination, not a caller bug and not a provider fault, so it is
+    // refused before the search request as a conflict whose refresh is
+    // restarting the search.
     let index = calendar_ids
         .iter()
         .position(|candidate| candidate == calendar_id)
         .ok_or_else(|| {
-            local_error_with_field(
-                AccountOperation::EventSearch,
-                "eventPageToken",
-                "cross-calendar search cursor references an unknown calendar".to_string(),
+            bifrost_types::AccountErrorBuilder::new(
+                bifrost_types::AccountErrorKind::ConcurrencyConflict,
+                bifrost_types::Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
             )
+            .push_cause(bifrost_types::Cause::Attempt(
+                bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Unsent),
+            ))
+            .operation(AccountOperation::EventSearch)
+            .provider(bifrost_types::Provider::Gmail)
+            .protocol(bifrost_types::Protocol::Gmail)
+            .text(bifrost_types::DiagnosticText::support_only(
+                "cross-calendar search cursor references a calendar no longer listed; \
+                 restart the search",
+            ))
+            .try_build()
+            .expect("valid account error classification")
         })?;
     let page_token = (!page_token.is_empty()).then(|| page_token.to_string());
     Ok((index, page_token))
@@ -769,10 +788,9 @@ fn google_range_bound(time: &EventTime, field: &'static str) -> Result<String, A
     {
         return Ok(format!("{}Z", time.value));
     }
-    Err(local_error_with_field(
+    Err(caller_input_error(
         AccountOperation::EventsInRange,
-        field,
-        "Google Calendar range bound requires an RFC 3339 offset".to_string(),
+        format!("Google Calendar range bound `{field}` requires an RFC 3339 offset"),
     ))
 }
 
@@ -966,7 +984,7 @@ fn split_event_id(
         .split_once(EVENT_ID_SEPARATOR)
         .map(|(calendar, event)| (calendar.to_string(), event.to_string()))
         .ok_or_else(|| {
-            local_error(
+            caller_input_error(
                 operation,
                 "Google event id is missing calendar id".to_string(),
             )
@@ -1076,7 +1094,7 @@ fn rsvp_google_attendees_for_self(
     status: RsvpStatus,
 ) -> Result<(), AccountError> {
     let Some(attendees) = attendees.as_mut() else {
-        return Err(local_error(
+        return Err(caller_input_error(
             AccountOperation::EventRsvp,
             "Google Calendar event does not contain the account attendee".to_string(),
         ));
@@ -1087,7 +1105,7 @@ fn rsvp_google_attendees_for_self(
             .as_deref()
             .is_some_and(|email| email.eq_ignore_ascii_case(self_email))
     }) else {
-        return Err(local_error(
+        return Err(caller_input_error(
             AccountOperation::EventRsvp,
             "Google Calendar event does not contain the account attendee".to_string(),
         ));
@@ -1104,8 +1122,23 @@ fn event_error(error: crate::Error, operation: AccountOperation, id: String) -> 
     error::into_account_error(error, GmailErrorContext::calendar_event(operation, id))
 }
 
+/// A response Google sent that is missing something it must carry: a
+/// provider fault (`Protocol(MissingField)`).
 fn local_error(operation: AccountOperation, message: String) -> AccountError {
     local_error_with_field(operation, "calendar", message)
+}
+
+/// The CALLER's input cannot be used - an event id, page cursor or range
+/// bound this crate cannot express, or an RSVP for an account that is not an
+/// attendee. (A cursor that was valid when minted but names a calendar since
+/// removed is state that moved, not this.) Refused before the request it would shape is sent, so never a
+/// provider fault: `Request(Malformed)`, per the local-refusal rule in
+/// `reference/error-model.md`.
+fn caller_input_error(operation: AccountOperation, message: String) -> AccountError {
+    error::into_account_error(
+        crate::error::Error::invalid_request(operation, message),
+        GmailErrorContext::calendar_collection(operation),
+    )
 }
 
 fn calendar_contract_error(operation: AccountOperation, detail: String) -> AccountError {
@@ -1240,6 +1273,60 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::*;
+
+    /// Caller input Google Calendar cannot express is refused before any
+    /// request, as the caller's fault - never `Protocol(MissingField)`, which
+    /// used to blame Google for an id or cursor it never saw.
+    #[test]
+    fn unusable_caller_input_is_a_client_bug_not_a_provider_fault() {
+        let assert_client_bug = |error: AccountError| {
+            assert!(
+                matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::Request(
+                        bifrost_types::RequestErrorKind::Malformed
+                    )
+                ),
+                "got {:?}",
+                error.kind()
+            );
+            assert!(matches!(error.recovery(), RecoveryClass::ClientBug));
+        };
+
+        assert_client_bug(
+            split_event_id("no-separator", AccountOperation::EventGet)
+                .expect_err("an event id without a calendar id is refused"),
+        );
+        assert_client_bug(
+            google_range_bound(
+                &EventTime {
+                    value: "2026-09-29T10:00:00".into(),
+                    timezone: Some("Europe/Oslo".into()),
+                },
+                "timeMin",
+            )
+            .expect_err("a floating bound in a non-UTC zone is refused"),
+        );
+        assert_client_bug(
+            decode_page_token(Some(vec![0xff]), AccountOperation::EventSearch)
+                .expect_err("a non-UTF-8 cursor is refused"),
+        );
+
+        // A cursor this crate minted, naming a calendar removed between pages:
+        // state that moved, so a conflict whose refresh is restarting the
+        // search - neither the caller's fault nor the provider's.
+        let stale = decode_cross_calendar_cursor(Some(b"primary\ntoken".to_vec()), &[])
+            .expect_err("a cursor naming an unlisted calendar is refused");
+        assert_eq!(
+            *stale.kind(),
+            bifrost_types::AccountErrorKind::ConcurrencyConflict
+        );
+        assert!(matches!(
+            stale.recovery(),
+            RecoveryClass::Retry(advice)
+                if advice.disposition == bifrost_types::RetryDisposition::AfterStateRefresh
+        ));
+    }
 
     fn canned_json(status: StatusCode, value: serde_json::Value) -> Canned {
         Canned::Response {

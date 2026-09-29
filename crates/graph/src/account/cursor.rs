@@ -28,8 +28,14 @@ pub(crate) enum CursorError {
     /// A persisted foreign scope refers to a shared mailbox no longer
     /// configured on this account.
     Configuration(String),
-    /// Serialization / deserialization error.
+    /// Serializing a cursor this crate built failed - a local invariant.
     Encode(String),
+    /// The cursor or page-marker bytes the caller handed back do not decode.
+    /// Refused before any request, and the bytes are the caller's durable
+    /// state rather than anything Graph sent, so this is never a provider
+    /// fault: it maps with the other unreadable-cursor arms to
+    /// `SyncState(SchemaIncompatible)`, which clears and re-establishes.
+    Decode(String),
 }
 
 impl std::fmt::Display for CursorError {
@@ -44,7 +50,8 @@ impl std::fmt::Display for CursorError {
                 f.write_str("cursor is a mid-inventory page position, not a changes cursor")
             }
             Self::Configuration(msg) => write!(f, "cursor configuration mismatch: {msg}"),
-            Self::Encode(msg) => write!(f, "cursor encode/decode error: {msg}"),
+            Self::Encode(msg) => write!(f, "cursor encode error: {msg}"),
+            Self::Decode(msg) => write!(f, "cursor decode error: {msg}"),
         }
     }
 }
@@ -390,7 +397,7 @@ pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<GraphCursorPayload,
     }
 
     let mut payload: GraphCursorPayload = serde_json::from_slice(&cursor.server_state.bytes)
-        .map_err(|error| CursorError::Encode(error.to_string()))?;
+        .map_err(|error| CursorError::Decode(error.to_string()))?;
     // The outer `ChangeCursor::advanced_through` is the single source of
     // truth for page progress, in BOTH directions: the engine persists it
     // separately from the opaque payload bytes and may have acked a later
@@ -420,7 +427,7 @@ pub(crate) fn encode_page_marker(
 pub(crate) fn decode_page_marker(
     progress: &OpaqueProgressBytes,
 ) -> Result<GraphPageMarker, CursorError> {
-    serde_json::from_slice(&progress.0).map_err(|error| CursorError::Encode(error.to_string()))
+    serde_json::from_slice(&progress.0).map_err(|error| CursorError::Decode(error.to_string()))
 }
 
 #[cfg(test)]
@@ -528,7 +535,7 @@ mod tests {
 
         assert!(matches!(
             decode_cursor(&cursor),
-            Err(CursorError::Encode(_))
+            Err(CursorError::Decode(_))
         ));
     }
 
@@ -556,7 +563,7 @@ mod tests {
 
         assert!(matches!(
             decode_cursor(&cursor),
-            Err(CursorError::Encode(_))
+            Err(CursorError::Decode(_))
         ));
     }
 

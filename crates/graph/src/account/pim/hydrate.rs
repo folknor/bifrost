@@ -3,11 +3,10 @@
 
 use crate::account::GraphAccount;
 use crate::account::blob::blob_handle_from_graph_attachment;
-use crate::account::graph_error::{GraphErrorContext, protocol_violation};
+use crate::account::graph_error::GraphErrorContext;
 use bifrost_types::{
     AccountError, AccountOperation, Address, AttachmentSource, ContainerId, ErrorScope, FolderId,
-    HydrationProjection, Importance, Message, MessageAttachment, ObjectId, ProtocolErrorKind,
-    ThreadId,
+    HydrationProjection, Importance, Message, MessageAttachment, ObjectId, ThreadId,
 };
 use serde_json::Value;
 use std::collections::HashSet;
@@ -64,13 +63,17 @@ pub(super) async fn public_message_hydrate(
     folder: &FolderId,
     projection: HydrationProjection,
 ) -> Result<Message, AccountError> {
+    // The routing map starts empty on every reopen and is filled by
+    // public-folder discovery, which can skip a folder after a per-folder
+    // failure, so a legitimately minted, persisted id can miss here. Refused
+    // before any EWS request, and neither the caller's fault nor the
+    // provider's: local state that no longer matches the id.
     let Some(routing) = account.public_folder_routing(folder).await else {
-        return Err(protocol_violation(
-            ProtocolErrorKind::MissingField,
+        return Err(crate::account::graph_error::stale_local_state_error(
             AccountOperation::HydrateMessage,
-            Some(ErrorScope::Message {
+            ErrorScope::Message {
                 id: id.0.clone().into(),
-            }),
+            },
             format!("public folder {} has no routing entry", folder.0),
         ));
     };

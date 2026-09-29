@@ -142,16 +142,19 @@ async fn fetch_ews_outcomes(
     for (id, folder) in ids {
         let batch_id = BatchItemId(id.0.clone());
         let Some(routing) = account.public_folder_routing(folder).await else {
-            // Raced with a routing-map eviction; report it per item rather
-            // than poisoning the rest of the chunk.
+            // The routing map starts empty on every reopen and is filled by
+            // public-folder discovery, which can skip a folder after a
+            // per-folder failure, so a legitimately minted id can miss here.
+            // Refused per item, before any EWS request, rather than poisoning
+            // the rest of the chunk - and neither the caller's fault nor the
+            // provider's: local state that no longer matches the id.
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(
                 batch_id,
-                super::graph_error::protocol_violation(
-                    bifrost_types::ProtocolErrorKind::MissingField,
+                super::graph_error::stale_local_state_error(
                     AccountOperation::Hydrate,
-                    Some(ErrorScope::Message {
+                    ErrorScope::Message {
                         id: (id.0.clone()).into(),
-                    }),
+                    },
                     format!("public folder {} has no routing entry", folder.0),
                 ),
             )));

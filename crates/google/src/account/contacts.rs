@@ -134,7 +134,9 @@ pub(crate) fn list(
         let page_token = page_cursor
             .map(String::from_utf8)
             .transpose()
-            .map_err(|error| local_error(AccountOperation::ContactsList, error.to_string()))?;
+            .map_err(|error| {
+                caller_input_error(AccountOperation::ContactsList, error.to_string())
+            })?;
         let mut url = format!(
             "{}/people/me/connections?personFields={}&pageSize=1000",
             client.people_base(),
@@ -169,7 +171,7 @@ async fn list_other_contacts(
     let page_token = page_cursor
         .map(String::from_utf8)
         .transpose()
-        .map_err(|error| local_error(AccountOperation::ContactsList, error.to_string()))?;
+        .map_err(|error| caller_input_error(AccountOperation::ContactsList, error.to_string()))?;
     let mut url = format!(
         "{}/otherContacts?readMask={}&pageSize=1000",
         client.people_base(),
@@ -542,8 +544,9 @@ fn directory_search_url(
         )
     };
     if let Some(cursor) = page_cursor {
-        let token = std::str::from_utf8(cursor)
-            .map_err(|error| local_error(AccountOperation::DirectorySearch, error.to_string()))?;
+        let token = std::str::from_utf8(cursor).map_err(|error| {
+            caller_input_error(AccountOperation::DirectorySearch, error.to_string())
+        })?;
         url.push_str("&pageToken=");
         url.push_str(&bifrost_net::url::encode_query_value(token));
     }
@@ -611,7 +614,7 @@ fn validate_address_book(
     if address_book.is_some_and(|address_book| {
         address_book.0 != CONTACTS_BOOK_ID && !address_book.0.starts_with("contactGroups/")
     }) {
-        return Err(local_error(
+        return Err(caller_input_error(
             operation,
             "Google People supports google:contacts or contactGroups/* address books".to_string(),
         ));
@@ -649,8 +652,9 @@ fn search_url(people_base: &str, request: &ContactSearchRequest) -> Result<Strin
         url.push_str(&limit.min(30).to_string());
     }
     if let Some(cursor) = request.page_cursor.as_ref() {
-        let token = std::str::from_utf8(cursor)
-            .map_err(|error| local_error(AccountOperation::ContactSearch, error.to_string()))?;
+        let token = std::str::from_utf8(cursor).map_err(|error| {
+            caller_input_error(AccountOperation::ContactSearch, error.to_string())
+        })?;
         url.push_str("&pageToken=");
         url.push_str(&bifrost_net::url::encode_query_value(token));
     }
@@ -1060,8 +1064,20 @@ fn contact_error(error: crate::Error, operation: AccountOperation, id: String) -
     error::into_account_error(error, GmailErrorContext::contact(operation, id))
 }
 
+/// A response Google sent that breaks its paging contract: a provider fault.
 fn local_error(operation: AccountOperation, message: String) -> AccountError {
     local_error_with_field(operation, "contactPageToken", message)
+}
+
+/// The CALLER's input cannot be used - a page cursor that is not UTF-8, an
+/// address book this backend does not have. Refused before the request it
+/// would shape is sent, so never a provider fault: `Request(Malformed)`, per
+/// the local-refusal rule in `reference/error-model.md`.
+fn caller_input_error(operation: AccountOperation, message: String) -> AccountError {
+    error::into_account_error(
+        crate::error::Error::invalid_request(operation, message),
+        GmailErrorContext::contact_collection(operation),
+    )
 }
 
 fn local_error_with_field(
