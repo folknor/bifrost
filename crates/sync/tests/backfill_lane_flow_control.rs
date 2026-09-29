@@ -2128,18 +2128,20 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
 /// and drops the receiver while the call is in flight.
 ///
 /// How the window is held open, since detach otherwise runs to completion in one
-/// scheduling pass: a second scope establishes via inventory and its inventory
-/// stream PARKS instead of ending (`inventory_stall`). The deferred-inventory
-/// worker is one of the workers `detach` joins and its fusion stream poll has no
-/// shutdown arm, so `detach` cannot leave its worker await until the test
-/// releases the gate. The departure is therefore inside the window by
-/// construction rather than by timing luck, and the release keeps the teardown
-/// drain's own budget intact - which matters, because the drain is what settles
-/// the discard under the ablation. The `is_finished` assertion below is the
-/// guard on that staging, and it is not decorative: a first version of this test
-/// parked the CHANGES stream instead, which the multiplexer's own per-scope task
-/// owns rather than `detach`, and the detach had already RETURNED by the time
-/// the receiver was dropped. It passed both ablations.
+/// scheduling pass: a second scope establishes via inventory, and the membership
+/// refresh that follows the establishment PARKS instead of ending
+/// (`memberships_stall`). The deferred-inventory worker is one of the workers
+/// `detach` joins and that provider poll has no shutdown arm, so `detach` cannot
+/// leave its worker await until the test releases the gate. The departure is
+/// therefore inside the window by construction rather than by timing luck, and
+/// the release keeps the teardown drain's own budget intact - which matters,
+/// because the drain is what settles the discard under the ablation. The
+/// `is_finished` assertion below is the guard on that staging, and it is not
+/// decorative: a first version of this test parked the CHANGES stream instead,
+/// which the multiplexer's own per-scope task owns rather than `detach`, and the
+/// detach had already RETURNED by the time the receiver was dropped. It passed
+/// both ablations. A parked INVENTORY stream, which a later version used, stopped
+/// holding the window when the fusion walk gained its shutdown arm.
 ///
 /// How the window is ENTERED deterministically: `detach_inner` removes the slot,
 /// calls `begin_teardown`, publishes `Stop` and cancels the token with NO await
@@ -2159,9 +2161,7 @@ async fn a_loss_with_no_walk_running_is_settled_by_detach() {
 ///
 /// The full-length stub needs a lever to hold the walk still while the first
 /// consumer finishes draining, and every such lever in this file is the
-/// scheduler permit - which is unavailable to a test that parks the scope's poll
-/// worker, since the parked worker holds an admission of its own for as long as
-/// it is parked. A SHORT walk removes the need for one: the pages the first
+/// scheduler permit. A SHORT walk removes the need for one: the pages the first
 /// consumer leaves unread never reach `lane_capacity`, so the producer runs to
 /// its marker with no gating at all.
 fn short_open_pages_stub(scope: &CursorScope, windows: u32) -> common::StubAccount {
@@ -2207,19 +2207,20 @@ async fn a_departure_inside_a_live_detach_records_no_loss() {
     let account_id = AccountId("lane-departure-in-detach".to_owned());
     let scope = CursorScope::Account;
     let mut stub = short_open_pages_stub(&scope, 4);
-    // A SECOND scope, established via inventory, whose inventory stream parks.
-    // That is what holds `detach` inside its worker await: the deferred
-    // inventory worker is one of the workers detach joins, and the fusion
-    // stream poll has no shutdown arm. Releasing it right after the departure
-    // keeps the teardown drain's own budget intact - which matters, because the
-    // drain is what settles the discard under the ablation.
+    // A SECOND scope, established via inventory, whose follow-up membership
+    // refresh parks. That is what holds `detach` inside its worker await: the
+    // deferred inventory worker is one of the workers detach joins, and the
+    // refresh's provider poll has no shutdown arm. Releasing it right after the
+    // departure keeps the teardown drain's own budget intact - which matters,
+    // because the drain is what settles the discard under the ablation.
     //
     // A parked CHANGES stream will NOT do, and this was established by
     // measurement, not by reading: the multiplexer owns its per-scope poll
     // tasks and aborts them itself, so they are not among the workers detach
     // waits on, and a first version of this test staged that way found the
     // detach already FINISHED by the time it dropped the receiver - it passed
-    // with `begin_teardown` deleted.
+    // with `begin_teardown` deleted. Nor will a parked inventory stream, which
+    // the fusion walk now polls under the slot's shutdown token.
     let parked_scope = CursorScope::Type(bifrost_types::ObjectType::Contact);
     stub.scopes.push(parked_scope.clone());
     stub.establishment = |scope| match scope {
@@ -2228,8 +2229,7 @@ async fn a_departure_inside_a_live_detach_records_no_loss() {
             bifrost_types::CursorEstablishment::Ready(common::cursor_for(other, b"stub-ready"))
         }
     };
-    let stall = Arc::new(tokio::sync::Notify::new());
-    stub.inventory_stall = Some(Arc::clone(&stall));
+    stub.inventory_hook = Some(common::establishing_inventory());
     let stub = Arc::new(stub);
     let store = Arc::new(InMemoryCheckpointStore::default());
     let engine = Arc::new(
@@ -2244,13 +2244,17 @@ async fn a_departure_inside_a_live_detach_records_no_loss() {
             config(None),
             // The engine default, deliberately. The neighbouring tests run
             // `global: 1` and hold a permit of their own to keep the walk still;
-            // neither is available here, because the parked poll worker holds an
-            // admission for as long as it is parked and would starve the walk
-            // outright under a budget of one. The short stub replaces that lever.
+            // this one needs no such lever, because the short stub replaces it.
             None,
         )
         .await,
     );
+    // Armed after attach, which walks memberships itself, and before A
+    // subscribes, since the deferred worker walks nothing until a real
+    // subscriber exists.
+    let stall = Arc::new(tokio::sync::Notify::new());
+    let (probe, parked, _destroyed) = common::StallProbe::install();
+    *stub.memberships_stall.lock().expect("stall lock") = Some((Arc::clone(&stall), Some(probe)));
 
     // A takes one page and ACKNOWLEDGES NOTHING, here or later - every page it
     // reads is a strandable hole, which is all this test needs of it. Stopping
@@ -2309,17 +2313,10 @@ async fn a_departure_inside_a_live_detach_records_no_loss() {
     );
 
     // The parked worker has to BE parked, or detach has nothing to wait on.
-    tokio::time::timeout(Duration::from_secs(120), async {
-        while stub
-            .inventory_calls
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the deferred inventory worker enters its walk");
+    tokio::time::timeout(Duration::from_secs(120), parked)
+        .await
+        .expect("the deferred inventory worker parks in its membership refresh")
+        .expect("the parked signal is not dropped");
 
     // Detach, and drop A once the call is demonstrably past the slot removal.
     let detaching = tokio::spawn({

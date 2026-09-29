@@ -109,6 +109,25 @@ pub fn cursor_for(scope: &CursorScope, state: &[u8]) -> ChangeCursor {
     }
 }
 
+/// An inventory walk that ESTABLISHES: its `Done` carries a change cursor for
+/// the scope, so fusion reports `Established` and the deferred-inventory worker
+/// goes on to its membership refresh - which is where `memberships_stall` holds
+/// it.
+#[must_use]
+pub fn establishing_inventory() -> InventoryHook {
+    Arc::new(|scope| {
+        vec![InventoryEvent::Done(
+            bifrost_types::InventoryCompletion::complete(
+                bifrost_types::CoverageDomain::full(scope.clone()),
+                Some(Checkpoint::Change(cursor_for(
+                    scope,
+                    b"inventory-established",
+                ))),
+            ),
+        )]
+    })
+}
+
 /// Produces the `InventoryEvent`s one partition pass yields.
 pub type PartitionHook =
     Arc<dyn Fn(&CursorScope, &InventoryPartition) -> Vec<InventoryEvent> + Send + Sync>;
@@ -184,23 +203,35 @@ pub struct StubAccount {
     /// and then PARKS on this `Notify` before ending; `notify_waiters` lets the
     /// stream finish.
     ///
-    /// This parks a worker `detach` actually AWAITS: the deferred-inventory
-    /// establishment worker is a stored `WorkerRole::Stream`, and
-    /// `InventoryFusion::run_stream` polls the provider stream with no shutdown
-    /// arm, so a parked inventory stream holds `detach` inside its worker await
-    /// until the gate is notified - and a gate never notified makes it a
-    /// straggler aborted at `detach_timeout`. Parking a CHANGES stream instead
-    /// does NOT do this, which was established by measurement: the multiplexer
-    /// owns its per-scope poll tasks and retires them itself in its shutdown
-    /// tail (it CANCELS their tokens; the explicit abort there is for the
-    /// lifecycle task), so they are not among the workers `detach` waits on.
+    /// This does NOT make a straggler worker. `InventoryFusion::run_stream`
+    /// polls the provider stream under the walk's shutdown token, so a detach
+    /// drops a parked inventory stream as soon as it cancels the slot. Tests
+    /// that need a worker `detach` must wait on use `memberships_stall`.
     ///
-    /// The worker waits for a real subscriber before walking anything, so a
-    /// test that wants the straggler must subscribe first.
+    /// The deferred-inventory worker waits for a real subscriber before walking
+    /// anything, so a test that wants this stream parked must subscribe first.
     pub inventory_stall: Option<Arc<tokio::sync::Notify>>,
     /// Instrumentation for the stalled stream above, taken by the first stalling
-    /// `inventory_stream` call. See [`InventoryStallProbe`].
-    pub inventory_stall_probe: Option<InventoryStallProbe>,
+    /// `inventory_stream` call. See [`StallProbe`].
+    pub inventory_stall_probe: Option<StallProbe>,
+    /// A stall for the NEXT `discover_memberships` call, armed at runtime and
+    /// taken by the call it stalls. That call yields `memberships` and then
+    /// parks on the `Notify`; the optional probe observes the parked stream.
+    ///
+    /// Armed after attach because attach walks memberships itself. The call it
+    /// is aimed at is the deferred-inventory worker's membership refresh after
+    /// a successful inventory establishment: that walk polls the provider with
+    /// no shutdown arm, so a parked one keeps the worker a STRAGGLER that
+    /// `detach` can only abort at its worker deadline. It needs the inventory
+    /// walk to establish a cursor first - an `inventory_hook` whose `Done`
+    /// carries a change checkpoint for the scope.
+    ///
+    /// Parking a CHANGES stream does NOT make a straggler, which was
+    /// established by measurement: the multiplexer owns its per-scope poll
+    /// tasks and retires them itself in its shutdown tail (it CANCELS their
+    /// tokens; the explicit abort there is for the lifecycle task), so they are
+    /// not among the workers `detach` waits on.
+    pub memberships_stall: Mutex<Option<(Arc<tokio::sync::Notify>, Option<StallProbe>)>>,
     /// `inventory_stream()` call count.
     pub inventory_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// When set, `changes_stream` yields `changes_hook`'s events and then
@@ -216,7 +247,7 @@ pub struct StubAccount {
     pub partition_stall: Option<Arc<tokio::sync::Notify>>,
 }
 
-/// Observes the LIFETIME of the stalled inventory stream, not just its effects.
+/// Observes the LIFETIME of a stalled provider stream, not just its effects.
 ///
 /// Two signals, both one-shot so a test can await either whenever it likes
 /// rather than having to be waiting at the moment it fires:
@@ -231,7 +262,7 @@ pub struct StubAccount {
 ///
 /// The drop stamp is captured by the tail future at construction, so it is
 /// dropped with the stream whether or not the tail was ever polled.
-pub struct InventoryStallProbe {
+pub struct StallProbe {
     parked: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     destroyed: Mutex<Option<tokio::sync::oneshot::Sender<tokio::time::Instant>>>,
 }
@@ -247,7 +278,7 @@ impl Drop for DropStamp {
     }
 }
 
-impl InventoryStallProbe {
+impl StallProbe {
     /// Build a probe plus its two receivers: the parked signal and the
     /// destruction instant.
     #[must_use]
@@ -277,6 +308,32 @@ impl InventoryStallProbe {
     }
 }
 
+/// `items`, then a tail that parks on `gate` and ends without yielding.
+///
+/// The probe's drop stamp is captured at CONSTRUCTION so it lives in the tail
+/// future from the moment the stream exists, and therefore fires when the
+/// stream is destroyed whether or not the tail was ever polled.
+fn stalled<T: Send + 'static>(
+    items: Vec<T>,
+    gate: Arc<tokio::sync::Notify>,
+    probe: Option<&StallProbe>,
+) -> AccountStream<T> {
+    let stamp = probe.map(StallProbe::take_stamp);
+    let parked_tx = probe.and_then(StallProbe::take_parked);
+    let tail = stream::once(async move {
+        let _stamp = stamp;
+        // The park future is created before the signal is sent, so a releaser
+        // reacting to it cannot notify into the gap.
+        let waiter = gate.notified();
+        if let Some(tx) = parked_tx {
+            let _ = tx.send(());
+        }
+        waiter.await;
+    })
+    .filter_map(|()| async move { None::<T> });
+    Box::pin(stream::iter(items).chain(tail))
+}
+
 impl StubAccount {
     #[must_use]
     pub fn new(scopes: Vec<CursorScope>) -> Self {
@@ -299,6 +356,7 @@ impl StubAccount {
             close_fails: false,
             inventory_stall: None,
             inventory_stall_probe: None,
+            memberships_stall: Mutex::new(None),
             inventory_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             changes_stall: None,
             partition_stall: None,
@@ -378,19 +436,34 @@ impl Account for StubAccount {
     }
 
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
-        if self.memberships.is_empty() {
-            return Box::pin(stream::empty());
+        let items: Vec<SyncEvent<MembershipScope>> = if self.memberships.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                SyncEvent::Batch(Batch {
+                    items: self.memberships.clone(),
+                    page_boundary: bifrost_types::PageBoundary::Final,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                }),
+                SyncEvent::Done(None),
+            ]
+        };
+        if let Some((gate, probe)) = self
+            .memberships_stall
+            .lock()
+            .expect("memberships stall lock")
+            .take()
+        {
+            // No `Done` before the park: a `Done` ends the engine's walk, and
+            // the stall is meant to hold it.
+            let items = items
+                .into_iter()
+                .filter(|event| !matches!(event, SyncEvent::Done(_)))
+                .collect();
+            return stalled(items, gate, probe.as_ref());
         }
-        let items: Vec<SyncEvent<MembershipScope>> = vec![
-            SyncEvent::Batch(Batch {
-                items: self.memberships.clone(),
-                page_boundary: bifrost_types::PageBoundary::Final,
-                server_latency: std::time::Duration::ZERO,
-                bytes_in: 0,
-                checkpoint: None,
-            }),
-            SyncEvent::Done(None),
-        ];
         Box::pin(stream::iter(items))
     }
 
@@ -427,30 +500,7 @@ impl Account for StubAccount {
             None => Vec::new(),
         };
         if let Some(gate) = &self.inventory_stall {
-            let gate = Arc::clone(gate);
-            // Captured at CONSTRUCTION so the stamp lives in the tail future
-            // from the moment the stream exists, and therefore fires when the
-            // stream is destroyed whether or not the tail was ever polled.
-            let stamp = self
-                .inventory_stall_probe
-                .as_ref()
-                .map(InventoryStallProbe::take_stamp);
-            let parked_tx = self
-                .inventory_stall_probe
-                .as_ref()
-                .and_then(InventoryStallProbe::take_parked);
-            let tail = stream::once(async move {
-                let _stamp = stamp;
-                // The park future is created before the signal is sent, so a
-                // releaser reacting to it cannot notify into the gap.
-                let waiter = gate.notified();
-                if let Some(tx) = parked_tx {
-                    let _ = tx.send(());
-                }
-                waiter.await;
-            })
-            .filter_map(|()| async move { None::<InventoryEvent> });
-            return Box::pin(stream::iter(items).chain(tail));
+            return stalled(items, Arc::clone(gate), self.inventory_stall_probe.as_ref());
         }
         Box::pin(stream::iter(items))
     }

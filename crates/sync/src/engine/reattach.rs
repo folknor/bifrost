@@ -407,6 +407,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
             Some(ctx.control),
             Arc::clone(ctx.coverage),
             true,
+            ctx.shutdown,
         )
         .await
         {
@@ -422,7 +423,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
                 }
                 return;
             }
-            Err(Error::Paused) => return,
+            Err(Error::Paused | Error::ShuttingDown) => return,
             Err(Error::Account(err) | Error::EstablishCursorTerminated(err)) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
@@ -697,6 +698,7 @@ pub(super) async fn reattach_account(
                 None,
                 Arc::clone(ctx.coverage),
                 false,
+                ctx.shutdown,
             )
             .await
             {
@@ -1136,6 +1138,7 @@ async fn run_establish(
     control: Option<&SyncControl>,
     coverage: Arc<PendingCoverage>,
     persist_ready: bool,
+    shutdown: &CancellationToken,
 ) -> Result<EstablishOrigin, Error> {
     let _activity = match control {
         Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
@@ -1156,6 +1159,7 @@ async fn run_establish(
                     coverage: Some(Arc::clone(&coverage)),
                     writer_tx: Some(writer.sender()),
                     generation: coverage.next_generation(),
+                    shutdown: Some(shutdown.clone()),
                 };
                 return match fusion
                     .run_resume_with_broadcast(account, existing, Some(delivery))
@@ -1213,6 +1217,7 @@ async fn run_establish(
                 coverage: Some(Arc::clone(&coverage)),
                 writer_tx: Some(writer.sender()),
                 generation: coverage.next_generation(),
+                shutdown: Some(shutdown.clone()),
             };
             match fusion
                 .run_with_broadcast(account, scope, Some(delivery))

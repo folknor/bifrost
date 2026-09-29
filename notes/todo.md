@@ -60,24 +60,6 @@ structural landings of the same week, the dav-core `ResponseParts` collapse
 and the smtp sans-I/O core, never received the cold review their rulings
 asked for; that review debt is listed under their crates below.
 
-- **`InventoryFusion::run_stream` still has no shutdown arm.** The other two
-  loops were armed on 2026-09-15 (`drive_changes_stream` selects the account
-  BOUNDARY - `Stop` and `Pause`, never `CheckpointNow`, plus an entry peek for a
-  request the view has already consumed; `BackfillRunner::run_partition` selects
-  the `LaneGate` shutdown token and returns `Error::ShuttingDown`). Fusion was
-  left alone deliberately and still wants its own ruling, for the reasons it
-  always did: its fix moves published surface (a token field on a struct
-  consumers construct by literal), and it forces restaging all three tests that
-  park an inventory stream through fusion to hold a teardown window open. One of
-  them, `a_straggler_worker_does_not_cost_the_ack_writer_its_drain`, names this
-  exact change in its own doc as the ablation that breaks it, and it measures the
-  stalled stream's destruction instant from inside `Drop` precisely because
-  elapsed time cannot discriminate - a restaging that falls back to elapsed time
-  passes against the bug the test exists to pin. The cost being bought out is one
-  `detach_timeout` in the worker phase, already fenced off from the writer and
-  close phases by the per-phase budgets. If it is wanted, the restaged test must
-  keep the `Drop`-instant probe.
-
 - **imap: the driver's two prebuilt-command refusals lose their `Unsent`
   evidence.** Found 2026-09-29 by the test that finally reached the
   `WireAssumptions` guard. `run_prebuilt_command` returns

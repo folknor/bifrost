@@ -899,6 +899,7 @@ pub(super) async fn run_deferred_inventory_establishment(
                 coverage: Some(Arc::clone(&coverage)),
                 writer_tx: Some(writer_tx.clone()),
                 generation: coverage.next_generation(),
+                shutdown: Some(shutdown.clone()),
             };
             let result = match &inventory {
                 DeferredInventory::Start(_) => {
@@ -920,11 +921,19 @@ pub(super) async fn run_deferred_inventory_establishment(
             if matches!(result, Err(Error::Paused)) {
                 continue;
             }
+            if matches!(result, Err(Error::ShuttingDown)) {
+                return;
+            }
             break result;
         };
         match outcome {
             Ok(crate::multiplexer::FusionOutcome::Established) => {
                 let current = account.load_full();
+                // No shutdown arm on this provider poll, unlike the walk above:
+                // a wedged `discover_memberships` keeps this worker alive until
+                // detach aborts it at its worker deadline. The detach teardown
+                // tests rely on exactly that to stage a straggler, so arming it
+                // means restaging them - with the `Drop`-instant probe kept.
                 if let Err(err) =
                     link_discovered_memberships(current.as_ref().as_ref(), &cursors).await
                 {

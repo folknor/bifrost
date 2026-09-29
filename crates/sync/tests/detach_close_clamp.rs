@@ -8,7 +8,11 @@
 //! straggler worker could get aborted with unpersisted acknowledged work, the
 //! exact outcome the two-phase ordering and `take_ack_writer` exist to prevent.
 //!
-//! All four tests run current-thread under `start_paused`, so the elapsed readings
+//! A fifth test pins the other side of the worker phase: a deferred inventory
+//! walk parked on its provider stream is no straggler, because it answers the
+//! slot's cancel.
+//!
+//! Every test runs current-thread under `start_paused`, so the elapsed readings
 //! below are virtual and exact rather than wall-clock guesses; there are no real
 //! sleeps here.
 
@@ -129,19 +133,21 @@ async fn a_close_that_fails_is_absorbed_without_spending_the_budget() {
 /// A straggler worker that burns the whole `detach_timeout` must not take the
 /// close budget with it: a perfectly healthy close needing one round trip would
 /// then be reported as hung and its connection abandoned on a path where nothing
-/// was wrong. The straggler here is the deferred-inventory worker, parked in a
-/// provider inventory stream that never ends - one of the workers `detach`
-/// actually joins, and one whose stream poll has no shutdown arm, so it is
-/// aborted only at the deadline. The close, which answers only after a delay of
-/// its own, still completes.
+/// was wrong. The straggler here is the deferred-inventory worker, parked in the
+/// membership refresh that follows a successful inventory establishment - one of
+/// the workers `detach` actually joins, and a provider poll with no shutdown arm,
+/// so it is aborted only at the deadline. The close, which answers only after a
+/// delay of its own, still completes.
 ///
-/// A parked CHANGES stream does NOT work for this, which was established by
-/// measurement: the multiplexer owns its per-scope poll tasks and retires them
-/// itself in its shutdown tail (it CANCELS their tokens - the explicit abort
+/// Two stagings that do NOT work, both established by measurement. A parked
+/// CHANGES stream: the multiplexer owns its per-scope poll tasks and retires
+/// them itself in its shutdown tail (it CANCELS their tokens - the explicit abort
 /// there is for the lifecycle task), so they are not among the workers `detach`
-/// waits on, and a first
-/// version of this test staged that way detached in 11ms. The elapsed assertion
-/// below is what caught that, and is why it stays.
+/// waits on, and a first version of this test staged that way detached in 11ms.
+/// And a parked INVENTORY stream, which this test used until the fusion walk
+/// gained its shutdown arm: detach now drops that stream as soon as it cancels
+/// the slot. The elapsed assertion below is what catches either, and is why it
+/// stays.
 ///
 /// Ablation: switch the clamp to `timeout_at(deadline, ...)` on the shared
 /// worker deadline and the close is cut off before it answers - `closed` still
@@ -160,30 +166,27 @@ async fn a_slow_close_after_a_straggler_worker_still_completes() {
             bifrost_types::CursorEstablishment::Ready(common::cursor_for(other, b"stub-ready"))
         }
     };
-    // Never notified: the deferred-inventory worker cannot exit, so the worker
-    // deadline is spent in full and the close begins with none of it left.
-    stub.inventory_stall = Some(Arc::new(tokio::sync::Notify::new()));
+    stub.inventory_hook = Some(common::establishing_inventory());
     let gate = Arc::new(tokio::sync::Notify::new());
     stub.close_gate = Some(Arc::clone(&gate));
     let stub = Arc::new(stub);
     let closed = Arc::clone(&stub.closed);
     let engine = attach(&account_id, Arc::clone(&stub)).await;
+    // Armed after attach, which walks memberships itself. Never notified: the
+    // deferred-inventory worker cannot leave its membership refresh, so the
+    // worker deadline is spent in full and the close begins with none of it left.
+    let (probe, parked, _destroyed) = common::StallProbe::install();
+    *stub.memberships_stall.lock().expect("stall lock") =
+        Some((Arc::new(tokio::sync::Notify::new()), Some(probe)));
     // The deferred worker waits for a real subscriber before it walks anything,
     // so the straggler does not exist until somebody subscribes.
     let _subscriber = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    tokio::time::timeout(Duration::from_secs(120), async {
-        while stub
-            .inventory_calls
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the deferred inventory worker enters its walk");
+    tokio::time::timeout(Duration::from_secs(120), parked)
+        .await
+        .expect("the deferred inventory worker reaches its parked membership refresh")
+        .expect("the parked signal is not dropped");
 
     // Release the close a beat after it is entered, so it is genuinely slow and
     // genuinely finite. `notify_waiters` only reaches a waiter already parked,
@@ -384,14 +387,17 @@ impl CheckpointStore for StallingAckStore {
 /// from the other side.
 ///
 /// Staging, in order:
-/// - the deferred-inventory worker parks in a provider inventory stream that
-///   never ends. It is one of the workers `detach` actually joins and its poll
-///   has no shutdown arm, so it is retired only by the worker deadline's abort.
-///   A parked CHANGES stream does NOT work: the multiplexer owns its per-scope
-///   poll tasks and retires them itself in its shutdown tail (cancelling their
-///   tokens; the explicit abort there is for the lifecycle task), so they are not
-///   among the workers `detach` joins and a test staged that way detaches in
-///   milliseconds.
+/// - the deferred-inventory worker establishes its scope through a normal
+///   inventory walk, then parks in the membership refresh that follows it, on a
+///   provider stream that never ends. It is one of the workers `detach` actually
+///   joins and that poll has no shutdown arm, so it is retired only by the
+///   worker deadline's abort. A parked CHANGES stream does NOT work: the
+///   multiplexer owns its per-scope poll tasks and retires them itself in its
+///   shutdown tail (cancelling their tokens; the explicit abort there is for the
+///   lifecycle task), so they are not among the workers `detach` joins and a
+///   test staged that way detaches in milliseconds. Nor, any longer, does a
+///   parked INVENTORY stream: the fusion walk polls it under the slot's shutdown
+///   token.
 /// - a consumer acknowledgement is in flight and the writer is parked INSIDE
 ///   the checkpoint store when `detach` starts, which `entered` establishes.
 /// - the store is released a beat AFTER the worker deadline would have expired,
@@ -400,21 +406,26 @@ impl CheckpointStore for StallingAckStore {
 /// **The straggler's own staging is pinned, not assumed.** Elapsed time alone
 /// does not pin it: the store releases on its own timer at
 /// `detach_timeout + 100ms`, so an `elapsed >= detach_timeout` assertion holds
-/// even if the inventory worker had gained a shutdown arm and left immediately.
+/// even if the parked worker had gained a shutdown arm and left immediately.
 /// What is measured instead is the stalled provider stream's DESTRUCTION, taken
-/// from inside its `Drop` (`InventoryStallProbe`) rather than when this task
-/// receives the signal, since a receive is subject to scheduling delay. The
-/// inventory gate is never released, so the only thing that can destroy that
-/// stream is the worker deadline's abort, and the assertion is that it happened
-/// at least one full worker budget after `detach` began.
+/// from inside its `Drop` (`StallProbe`) rather than when this task receives the
+/// signal, since a receive is subject to scheduling delay. The memberships gate
+/// is never released, so the only thing that can destroy that stream is the
+/// worker deadline's abort, and the assertion is that it happened at least one
+/// full worker budget after `detach` began.
+///
+/// That probe already earned its keep once. This test used to park the
+/// INVENTORY stream, and giving the fusion walk its shutdown arm - exactly the
+/// change the probe was written to detect - is what failed it and forced the
+/// restaging onto the membership refresh.
 ///
 /// Two ablations, two separate claims:
 /// - pass the worker phase's `deadline` to `await_ack_writer_until` instead of
 ///   `writer_deadline` and the writer is aborted while parked in the store -
 ///   `released` stays at 0, the cursor never lands, and the acknowledging caller
 ///   gets "ack writer dropped before persisting".
-/// - give the deferred worker's fusion await a cancellation arm, so the provider
-///   stream is dropped promptly on the slot token: the destruction-time
+/// - give the deferred worker's membership refresh a cancellation arm, so the
+///   provider stream is dropped promptly on the slot token: the destruction-time
 ///   assertion fails even though the store's own timer still holds total elapsed
 ///   above the worker budget.
 #[tokio::test(start_paused = true)]
@@ -430,12 +441,7 @@ async fn a_straggler_worker_does_not_cost_the_ack_writer_its_drain() {
             bifrost_types::CursorEstablishment::Ready(common::cursor_for(other, b"stub-ready"))
         }
     };
-    // Never notified: the deferred-inventory worker cannot exit, so the worker
-    // phase is spent in full and the ONLY thing that can destroy the provider
-    // stream is the worker deadline's abort.
-    stub.inventory_stall = Some(Arc::new(tokio::sync::Notify::new()));
-    let (probe, parked, destroyed) = common::InventoryStallProbe::install();
-    stub.inventory_stall_probe = Some(probe);
+    stub.inventory_hook = Some(common::establishing_inventory());
     let stub = Arc::new(stub);
 
     let store_gate = Arc::new(tokio::sync::Notify::new());
@@ -455,28 +461,25 @@ async fn a_straggler_worker_does_not_cost_the_ack_writer_its_drain() {
         .expect("attach succeeds");
     let engine = Arc::new(engine);
 
+    // Armed after attach, which walks memberships itself. Never notified: the
+    // deferred-inventory worker cannot leave its membership refresh, so the
+    // worker phase is spent in full and the ONLY thing that can destroy the
+    // provider stream is the worker deadline's abort.
+    let (probe, parked, destroyed) = common::StallProbe::install();
+    *stub.memberships_stall.lock().expect("stall lock") =
+        Some((Arc::new(tokio::sync::Notify::new()), Some(probe)));
+
     // The deferred worker waits for a real subscriber before it walks anything,
     // so the straggler does not exist until somebody subscribes.
     let _subscriber = engine
         .account_changes_stream(&account_id)
         .expect("attached account has a change stream");
-    tokio::time::timeout(Duration::from_secs(120), async {
-        while stub
-            .inventory_calls
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("the deferred inventory worker enters its walk");
     // Not "the stream was constructed" but "its tail is actually parked": the
     // straggler must exist before detach starts, or the destruction measurement
     // below is measuring nothing.
     tokio::time::timeout(Duration::from_secs(120), parked)
         .await
-        .expect("the deferred inventory worker reaches its parked tail")
+        .expect("the deferred inventory worker reaches its parked membership refresh")
         .expect("the parked signal is not dropped");
 
     // Acknowledged work, outstanding: the writer takes it and parks in the store.
@@ -537,12 +540,12 @@ async fn a_straggler_worker_does_not_cost_the_ack_writer_its_drain() {
     // release timer alone would carry it past `detach_timeout`.
     let destroyed_at = tokio::time::timeout(Duration::from_secs(1), destroyed)
         .await
-        .expect("the stalled inventory stream is destroyed")
+        .expect("the stalled memberships stream is destroyed")
         .expect("the drop stamp is delivered");
     assert!(
         destroyed_at.duration_since(started) >= EngineConfig::default().detach_timeout,
         "the staging requires a worker that really is a straggler: the parked \
-         inventory stream must survive until the worker deadline aborts it, so the \
+         memberships stream must survive until the worker deadline aborts it, so the \
          writer phase begins with none of that deadline left. it was destroyed \
          {:?} after detach began",
         destroyed_at.duration_since(started)
@@ -571,5 +574,60 @@ async fn a_straggler_worker_does_not_cost_the_ack_writer_its_drain() {
     assert_eq!(
         persisted.server_state.bytes, ACKED_STATE,
         "the durable row is the consumer's acknowledgement, not the establishment cursor"
+    );
+}
+
+/// A deferred inventory walk parked on its provider stream leaves at detach,
+/// not at the worker deadline.
+///
+/// The fusion walk polls the provider stream under the slot's shutdown token,
+/// so the cancel `detach` issues drops the stream at once. Before that arm
+/// existed this worker was the canonical straggler: a stream that neither
+/// yields nor ends held `detach` for its whole `detach_timeout` and was then
+/// aborted.
+///
+/// Measured from inside the stream's `Drop`, as the straggler test above does
+/// and for the same reason: total elapsed would say nothing about which worker
+/// held the phase. Ablation: poll the stream without the shutdown arm in
+/// `InventoryFusion::run_stream` and the stream survives until the worker
+/// deadline aborts it, failing the destruction-time assertion.
+#[tokio::test(start_paused = true)]
+async fn a_parked_inventory_walk_is_dropped_at_detach_not_at_the_deadline() {
+    let account_id = AccountId("detach-inventory-walk-leaves".to_owned());
+    let mut stub = common::StubAccount::new(vec![
+        CursorScope::Account,
+        CursorScope::Type(bifrost_types::ObjectType::Contact),
+    ]);
+    stub.establishment = |scope| match scope {
+        CursorScope::Type(_) => bifrost_types::CursorEstablishment::EstablishViaInventory,
+        other => {
+            bifrost_types::CursorEstablishment::Ready(common::cursor_for(other, b"stub-ready"))
+        }
+    };
+    // Never notified: only the shutdown arm can end this walk early.
+    stub.inventory_stall = Some(Arc::new(tokio::sync::Notify::new()));
+    let (probe, parked, destroyed) = common::StallProbe::install();
+    stub.inventory_stall_probe = Some(probe);
+    let stub = Arc::new(stub);
+    let engine = attach(&account_id, Arc::clone(&stub)).await;
+    let _subscriber = engine
+        .account_changes_stream(&account_id)
+        .expect("attached account has a change stream");
+    tokio::time::timeout(Duration::from_secs(120), parked)
+        .await
+        .expect("the deferred inventory worker parks in its walk")
+        .expect("the parked signal is not dropped");
+
+    let started = tokio::time::Instant::now();
+    engine.detach(&account_id).await.expect("detach succeeds");
+    let destroyed_at = tokio::time::timeout(Duration::from_secs(1), destroyed)
+        .await
+        .expect("the parked inventory stream is destroyed")
+        .expect("the drop stamp is delivered");
+    assert!(
+        destroyed_at.duration_since(started) < EngineConfig::default().detach_timeout,
+        "the walk must leave on the slot's cancel, not be aborted at the worker \
+         deadline: the stream was destroyed {:?} after detach began",
+        destroyed_at.duration_since(started)
     );
 }

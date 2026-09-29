@@ -725,8 +725,8 @@ impl SyncEngine {
         // `detach_timeout` of worker awaits PLUS the trailing phases", and a
         // single shared deadline silently zeroes whichever phase runs last: a
         // provider stream that neither yields nor ends parks a worker until the
-        // deadline (three stream-poll loops in this crate have no shutdown arm),
-        // and the writer then reached `await_worker_until` with `remaining == 0`
+        // deadline wherever its poll has no shutdown arm (the deferred-inventory
+        // worker's membership refresh is one such poll), and the writer then reached `await_worker_until` with `remaining == 0`
         // and was aborted IMMEDIATELY, without draining. That is precisely the
         // "writer aborted with unpersisted work" outcome the two-phase ordering
         // and `take_ack_writer` exist to prevent, reached by a different route.

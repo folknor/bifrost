@@ -60,6 +60,12 @@ pub struct InventoryFusion {
     /// Engine-issued generation for this walk. Orders proof events even when
     /// two walks produce identical cursor bytes.
     pub generation: u64,
+    /// Cancelled when the walk's owner is tearing down. The walk then stops at
+    /// its next provider poll and returns [`Error::ShuttingDown`], dropping the
+    /// provider stream, instead of waiting on a stream that neither yields nor
+    /// ends until the owner's join deadline aborts it. `None` in contexts that
+    /// have no teardown to answer.
+    pub shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl InventoryFusion {
@@ -133,7 +139,28 @@ impl InventoryFusion {
         // be a barrier, this is the position a future walk resumes from - it
         // certifies a prefix ending before the barrier region begins.
         let mut walk = InventoryWalk::default();
-        while let Some(event) = stream.next().await {
+        loop {
+            // The shutdown arm wraps the provider poll and nothing else. Every
+            // other await in this loop - barrier recording, waived-barrier
+            // crossing - runs inside an arm, and a select cannot destroy a
+            // branch mid-poll, so a page's claim registration and its publish,
+            // which are synchronous, cannot be split. What the cut drops is the
+            // provider stream and the activity guard, which is the point.
+            //
+            // An ERROR rather than `NoCursor`, for the same reason the backfill
+            // runner returns one: `NoCursor` is a completed walk that yielded no
+            // cursor, and callers treat it as a finished establishment.
+            let next = match &self.shutdown {
+                Some(shutdown) => {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => return Err(Error::ShuttingDown),
+                        next = stream.next() => next,
+                    }
+                }
+                None => stream.next().await,
+            };
+            let Some(event) = next else { break };
             match event {
                 bifrost_types::InventoryEvent::Done(completion) => {
                     let crossed = if completion.coverage.has_barrier() {
@@ -604,7 +631,62 @@ mod tests {
             coverage: None,
             writer_tx: Some(writer_tx),
             generation: 1,
+            shutdown: None,
         }
+    }
+
+    /// A walk parked on a provider stream that neither yields nor ends leaves
+    /// at shutdown, and drops the stream on the way out.
+    ///
+    /// Without the arm the poll waits on the stream for ever, and in the engine
+    /// only the owner's join deadline gets it back. `NoCursor` would be the
+    /// wrong answer: callers read it as a finished walk.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cuts_a_walk_parked_on_its_provider_stream() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(4);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let fusion = InventoryFusion {
+            shutdown: Some(shutdown.clone()),
+            ..fusion_with_writer(writer_tx)
+        };
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let guard = OnDrop(Some(dropped_tx));
+        let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
+            Box::pin(futures::stream::pending().map(move |event| {
+                let _ = &guard;
+                event
+            }));
+
+        let walk = fusion.run_stream(CursorScope::Account, stream, None);
+        tokio::pin!(walk);
+        // Poll the walk once, so it is genuinely parked in the provider poll
+        // before the cancel lands.
+        tokio::select! {
+            biased;
+            outcome = &mut walk => panic!("a pending stream cannot finish the walk: {outcome:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        shutdown.cancel();
+        // Bounded so a walk that ignores the cancel fails here rather than
+        // hanging; under paused time the bound costs nothing when it holds.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), walk)
+            .await
+            .expect("the cancel must end the walk, not leave it parked");
+        assert!(
+            matches!(outcome, Err(Error::ShuttingDown)),
+            "a cancelled walk reports shutdown, not a finished walk: {outcome:?}"
+        );
+        dropped_rx
+            .await
+            .expect("the provider stream is dropped on the way out");
     }
 
     /// A producer's own inventory warning must reach the consumer.

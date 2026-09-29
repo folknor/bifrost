@@ -150,10 +150,9 @@ coincide. A consumer calling `detach` on the way out of a process is bounding it
 own shutdown by that number.
 
 The per-phase budget is not a nicety. A shared deadline silently zeroes whichever
-phase runs last, so a provider stream that neither yields nor ends - and
-`InventoryFusion::run_stream` still has no shutdown arm, so a wedged provider
-parks that worker until the deadline - burnt the whole budget in the worker
-phase and left the writer to be aborted IMMEDIATELY, with `remaining == 0` and no
+phase runs last, so a provider stream that neither yields nor ends - on any
+worker poll without a shutdown arm, such as the deferred-inventory worker's
+membership refresh - burnt the whole budget in the worker phase and left the writer to be aborted IMMEDIATELY, with `remaining == 0` and no
 drain at all. That is exactly the "writer aborted with unpersisted work" outcome
 the two-phase ordering and `take_ack_writer` exist to prevent, arrived at by a
 different route. Pinned by
@@ -234,7 +233,11 @@ admission waits.
 `BackfillRunner::run_partition` selects the account shutdown token at its
 `inventory_partition_stream` poll (through `LaneGate::shutdown`) and returns
 `Error::ShuttingDown`, which withholds both the partition outcome and the scope
-completion marker. `drive_changes_stream` selects the account BOUNDARY at its
+completion marker. `InventoryFusion::run_stream` does the same with its own
+`shutdown` field at its provider poll - the slot's shutdown token for the
+deferred-inventory worker, the recovery context's for re-establishment - and
+also returns `Error::ShuttingDown` rather than `NoCursor`, which callers would
+read as a finished walk. `drive_changes_stream` selects the account BOUNDARY at its
 `changes_stream` poll - `Stop` and `Pause`, never `CheckpointNow`, which is the
 one request that genuinely needs a checkpoint-bearing item to satisfy - so it
 stops when that account's own `detach` publishes `Stop`, which for a later
@@ -254,10 +257,11 @@ purpose. So the honest guarantee is not "declines to read another event" but
 this: no publication is ever partial, and no cursor advances past an item the
 consumer did not receive, so a discarded item is re-read by the next drive.
 
-**Do not**: `InventoryFusion::run_stream` still does not select on cancellation
-while reading its provider stream, so a wedged fusion stream keeps its worker
-alive until teardown aborts it at the deadline and can delay quiescence while
-its activity guard is held. The push reconciler holds no per-scope token, so a
+**Do not**: the deferred-inventory worker's membership refresh after a
+successful establishment (`link_discovered_memberships`) does not select on
+cancellation while reading `discover_memberships`, so a wedged provider stream
+there keeps the worker alive until teardown aborts it at the deadline. The
+detach teardown tests use exactly that as their straggler. The push reconciler holds no per-scope token, so a
 scope deleted while one of its drives is stalled waits for the boundary rather
 than for the deletion.
 
