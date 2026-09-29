@@ -105,11 +105,26 @@ item is what stops that.
     `local_error` (bad cursor, bad event id, unknown timezone), Google
     `reject_unexpressible_all_day_patch`.
   - Transmission evidence: dav-core `status_error` / `parse_error` push no
-    `Acknowledged` attempt on server responses (other crates do); Graph
-    `shutdown_during_upload` stamps `Unsent` though a PUT chunk can be
-    mid-flight; Graph `upload_file_chunked` hitting the client's own
-    `UPLOAD_TOTAL_TIMEOUT` derives `Protocol(ParseFailed)` + `Acknowledged`
-    where `Transport(Timeout)` + `InFlight` is honest.
+    `Acknowledged` attempt on server responses (other crates do).
+  - Graph OneDrive upload shutdown mid-PUT is conservatively `InFlight`
+    (`cloud.rs upload_chunks`), including when the cancellation lands while
+    bifrost-net is still waiting for rate-limit admission and nothing was
+    dispatched: the dropped future loses its stage. The cost is an unneeded
+    read-back, never a blind replay. Exact classification needs bifrost-net to
+    take a cancellation signal into the request and report the stage it
+    stopped at, a transport feature; sparred and accepted as conservative on
+    2026-09-29, raised again by the cold review.
+  - Graph OneDrive upload 202 handling (`cloud.rs upload_chunks`), rated P1 by
+    two independent cold reviews because it can silently corrupt an uploaded
+    attachment. Found by the spar on the upload-timeout fix and filed rather
+    than built inside it, as outside that item: a malformed body, a missing or empty
+    `nextExpectedRanges`, or an unparseable range silently resumes at the end
+    of the chunk just sent, which skips bytes if the server accepted less -
+    the comment above it says the opposite; the offset check refuses only a
+    non-advancing offset, not one past the submitted range or the total; and
+    the non-advancing 202 and the 202 on the final chunk are semantic contract
+    violations reported through the parse-failure helper
+    (`Protocol(ParseFailed)` where `Protocol(ContractViolation)` is honest).
   - JMAP `NoPrimaryAccount` (a pre-send missing capability) derives
     `AuthLost`; and in `crates/jmap/src/sync/error.rs` its rationale comment
     sits above the `MalformedCapability` arm.

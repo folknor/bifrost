@@ -24,6 +24,7 @@
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, CloudUploadMeta, HostedAttachment, ShareScope,
+    TransmissionState,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -196,8 +197,15 @@ async fn create_upload_session(
 /// so blindly advancing `offset = end` can skip unaccepted bytes and corrupt
 /// the upload). Any other status -> classified error. OneDrive's 202 resume
 /// signal never enters bifrost-net's redirect path, so the Drive-specific 308
-/// passthrough does not apply here. The whole loop is bounded by
+/// passthrough does not apply here. The whole upload is bounded by
 /// `UPLOAD_TOTAL_TIMEOUT` and aborts if the account shutdown token fires.
+///
+/// The budget is enforced INSIDE the transport, not by a timer around the
+/// loop: each chunk PUT carries what is left of it as its bifrost-net total
+/// deadline, so an expiry is classified by the stage it hit - `Unsent` while
+/// waiting to dispatch, `InFlight` awaiting headers, a partial response after
+/// them. A timer around the whole loop threw that stage away, and used to
+/// report the expiry as a provider parse failure the provider never caused.
 async fn upload_file_chunked(
     client: &GraphClient,
     upload_url: &str,
@@ -213,19 +221,8 @@ async fn upload_file_chunked(
         "chunk_size must be a positive multiple of {CHUNK_ALIGNMENT}, got {chunk_size}"
     );
 
-    tokio::select! {
-        () = shutdown.cancelled() => Err(shutdown_during_upload()),
-        result = tokio::time::timeout(
-            UPLOAD_TOTAL_TIMEOUT,
-            upload_chunks(client, upload_url, data, chunk_size, shutdown),
-        ) => match result {
-            Ok(inner) => inner,
-            Err(_elapsed) => Err(malformed_response(format!(
-                "OneDrive upload exceeded the {}s budget without completing",
-                UPLOAD_TOTAL_TIMEOUT.as_secs()
-            ))),
-        },
-    }
+    let deadline = tokio::time::Instant::now() + UPLOAD_TOTAL_TIMEOUT;
+    upload_chunks(client, upload_url, data, chunk_size, shutdown, deadline).await
 }
 
 async fn upload_chunks(
@@ -234,6 +231,7 @@ async fn upload_chunks(
     data: Bytes,
     chunk_size: usize,
     shutdown: &tokio_util::sync::CancellationToken,
+    deadline: tokio::time::Instant,
 ) -> Result<String, GraphError> {
     // Empty payloads are rejected up front in `host_attachment`, so by here the
     // data is non-empty and the loop always runs at least once.
@@ -241,8 +239,18 @@ async fn upload_chunks(
 
     let mut offset = 0usize;
     while offset < total {
+        // Between chunks no PUT is outstanding and every earlier one got a
+        // complete 202, and the file exists only once the final chunk is
+        // accepted: nothing a replay could duplicate has happened, so both
+        // refusals here are `Unsent`.
         if shutdown.is_cancelled() {
-            return Err(shutdown_during_upload());
+            return Err(shutdown_during_upload(TransmissionState::Unsent));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(GraphError::Net(bifrost_net::Error::Timeout {
+                transmission_state: TransmissionState::Unsent,
+            }));
         }
         let end = (offset + chunk_size).min(total);
         let chunk = data.slice(offset..end);
@@ -250,14 +258,29 @@ async fn upload_chunks(
 
         // The session URL is pre-authenticated: sending the Graph bearer to
         // it would leak the token to whatever host OneDrive minted.
-        let response = client
-            .execute_aux(
-                "PUT",
-                crate::client::AuxTarget::Anonymous(upload_url),
-                &[("Content-Range", content_range.as_str())],
-                chunk,
-            )
-            .await?;
+        let headers = [("Content-Range", content_range.as_str())];
+        let put = client.execute_aux(
+            "PUT",
+            crate::client::AuxTarget::Anonymous(upload_url),
+            &headers,
+            chunk,
+            Some(remaining),
+        );
+        // Shutdown is watched HERE, at the one boundary where the stage is
+        // known, rather than by racing the whole upload: a race around the
+        // loop let the same between-chunks shutdown come out either way. Cut
+        // short mid-PUT, the stage is lost and the chunk may be the final one
+        // that creates the file, so it is conservatively `InFlight` (a blind
+        // replay of this non-idempotent upload could make a second file). A
+        // PUT result that is already ready wins over the shutdown, since it
+        // is the known outcome.
+        let response = tokio::select! {
+            biased;
+            response = put => response?,
+            () = shutdown.cancelled() => {
+                return Err(shutdown_during_upload(TransmissionState::InFlight));
+            }
+        };
 
         let status = response.status;
         match status.as_u16() {
@@ -317,13 +340,14 @@ async fn upload_chunks(
     ))
 }
 
-/// The account was shut down (close / reopen) while an upload was in
-/// flight. `Unsent`-state network error so the recovery mapping treats it
-/// as a retryable client-side abort.
-fn shutdown_during_upload() -> GraphError {
+/// The account was shut down (close / reopen) while an upload was under way.
+/// A network-class abort stamped with where it was observed: `Unsent`
+/// between chunks (retryable), `InFlight` when it cut a PUT short (which a
+/// non-idempotent upload reconciles rather than replays).
+fn shutdown_during_upload(transmission_state: TransmissionState) -> GraphError {
     GraphError::Net(bifrost_net::Error::Network {
         message: "OneDrive upload aborted: account shutting down".to_string(),
-        transmission_state: bifrost_types::TransmissionState::Unsent,
+        transmission_state,
         source: None,
     })
 }
@@ -387,6 +411,119 @@ mod tests {
 
     const SESSION_URL: &str = "https://upload.example/session/abc?token=preauth";
 
+    fn fresh_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + UPLOAD_TOTAL_TIMEOUT
+    }
+
+    fn classify(error: GraphError) -> bifrost_types::AccountError {
+        into_account_error(error, ctx())
+    }
+
+    /// The whole-upload budget running out between chunks is this client's
+    /// own timeout, never a provider parse failure (which it used to be):
+    /// `Transport(Timeout)`, `Unsent`, because no PUT is outstanding and no
+    /// file exists yet, so nothing is sent.
+    #[tokio::test]
+    async fn a_spent_budget_between_chunks_is_an_unsent_timeout() {
+        let client = GraphClient::new("token");
+        client.script_aux(std::iter::empty::<ScriptedRestResponse>());
+
+        let error = upload_chunks(
+            &client,
+            SESSION_URL,
+            Bytes::from_static(b"0123456789AB"),
+            5,
+            &CancellationToken::new(),
+            tokio::time::Instant::now(),
+        )
+        .await
+        .expect_err("a spent budget refuses the next chunk");
+        assert!(client.take_aux_requests().is_empty());
+        let error = classify(error);
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Timeout)
+        );
+        assert!(error.recovery().is_retryable(), "{:?}", error.recovery());
+    }
+
+    /// The budget expiring while a chunk PUT is outstanding is classified by
+    /// bifrost-net at the stage it hit. A PUT that may be the final one of a
+    /// non-idempotent upload is read back rather than replayed, since a
+    /// replay could create a second file.
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_expiring_mid_put_reconciles_instead_of_blaming_the_provider() {
+        let client = GraphClient::new("token");
+        client.script_aux_pending(1);
+        // A budget shorter than bifrost-net's per-attempt wait for response
+        // headers, so only the budget can end the PUT this early.
+        let budget = std::time::Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+
+        let error = upload_chunks(
+            &client,
+            SESSION_URL,
+            Bytes::from_static(b"0123456789AB"),
+            CHUNK_ALIGNMENT,
+            &CancellationToken::new(),
+            started + budget,
+        )
+        .await
+        .expect_err("the budget expires");
+        // What is left of the upload budget rode into the transport as the
+        // PUT's own deadline.
+        assert_eq!(started.elapsed(), budget);
+        let error = classify(error);
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Timeout)
+        );
+        assert!(
+            error.recovery().requires_reconciliation(),
+            "{:?}",
+            error.recovery()
+        );
+    }
+
+    /// A shutdown that cuts an outstanding PUT short cannot know whether it
+    /// was the one that created the file, so it is `InFlight`.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_during_a_put_is_in_flight() {
+        let client = GraphClient::new("token");
+        client.script_aux_pending(1);
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            trigger.cancel();
+        });
+
+        let error = upload_file_chunked(
+            &client,
+            SESSION_URL,
+            Bytes::from_static(b"0123456789AB"),
+            CHUNK_ALIGNMENT,
+            &shutdown,
+        )
+        .await
+        .expect_err("the shutdown aborts the upload");
+        assert_eq!(
+            client.take_aux_requests().len(),
+            1,
+            "the PUT was dispatched"
+        );
+        assert!(
+            matches!(
+                &error,
+                GraphError::Net(bifrost_net::Error::Network {
+                    transmission_state: TransmissionState::InFlight,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+    }
+
     /// The resumable chunk PUT, end to end through the aux wire seam.
     ///
     /// Three things this leg cannot get wrong without corrupting an upload
@@ -418,6 +555,7 @@ mod tests {
             Bytes::from_static(b"0123456789AB"),
             5,
             &CancellationToken::new(),
+            fresh_deadline(),
         )
         .await
         .expect("the upload completes");
@@ -473,6 +611,7 @@ mod tests {
             Bytes::from_static(b"0123456789AB"),
             5,
             &CancellationToken::new(),
+            fresh_deadline(),
         )
         .await
         .expect_err("a non-advancing offset fails");
@@ -498,11 +637,13 @@ mod tests {
         let shutdown = CancellationToken::new();
         shutdown.cancel();
 
-        let error = upload_chunks(
+        // Through the public entry point, which used to race the whole upload
+        // against the token and could report this same shutdown as InFlight.
+        let error = upload_file_chunked(
             &client,
             SESSION_URL,
             Bytes::from_static(b"0123456789AB"),
-            5,
+            CHUNK_ALIGNMENT,
             &shutdown,
         )
         .await

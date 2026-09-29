@@ -955,12 +955,19 @@ impl GraphClient {
     /// behavior than the one this path has always had. Keeping it separate
     /// makes the seam an extraction of the existing code rather than a
     /// change to it.
+    ///
+    /// `timeout`, when given, is the request's TOTAL deadline in bifrost-net
+    /// (admission, every attempt, retry backoff, redirects, body drain), so a
+    /// caller spending one budget across several requests passes what is
+    /// left of it and bifrost-net classifies an expiry by the stage it hit.
+    /// `None` keeps the account default.
     pub(crate) async fn execute_aux(
         &self,
         method: &str,
         target: AuxTarget<'_>,
         headers: &[(&str, &str)],
         body: Bytes,
+        timeout: Option<std::time::Duration>,
     ) -> Result<RestResponse, GraphError> {
         let (url, bearer) = match target {
             AuxTarget::Bearer(url) => (url.as_str(), true),
@@ -978,6 +985,9 @@ impl GraphClient {
         };
         if !bearer {
             builder = builder.without_bearer_auth();
+        }
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
         }
         for (name, value) in headers {
             builder = builder.header(name, value);
@@ -1130,6 +1140,17 @@ impl GraphClient {
     pub(crate) fn script_aux(&self, responses: impl IntoIterator<Item = ScriptedRestResponse>) {
         self.script_wire(
             responses.into_iter().map(ScriptedRestResponse::into_canned),
+            RetryPolicy::disabled(),
+        );
+    }
+
+    /// Script aux responses that never arrive: the request is dispatched and
+    /// then waits forever, for a test that needs a deadline or a shutdown to
+    /// land while a request is outstanding.
+    #[cfg(test)]
+    pub(crate) fn script_aux_pending(&self, count: usize) {
+        self.script_wire(
+            std::iter::repeat_with(|| bifrost_net::test_support::Canned::Pending).take(count),
             RetryPolicy::disabled(),
         );
     }
@@ -1505,7 +1526,7 @@ mod tests {
         ));
         assert!(is_internal(
             client
-                .execute_aux("POST", AuxTarget::Bearer(&url), &[], Bytes::new())
+                .execute_aux("POST", AuxTarget::Bearer(&url), &[], Bytes::new(), None)
                 .await
                 .err()
                 .expect("aux")

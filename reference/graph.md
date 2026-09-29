@@ -167,9 +167,17 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   `open_raw_rfc822` (whole message via `/messages/{id}/$value`).
 - `cloud.rs` - `host_attachment`: OneDrive resumable upload + `createLink` in one
   call. Session/link POSTs go through `GraphClient::post` (conflict `rename`); the
-  pre-authed chunk PUT uses the raw `account_net()` builder with
-  `.without_bearer_auth()` and resumes on `202 Accepted`. `ShareScope`: `Anyone ->
-  anonymous`, `Organization -> organization`.
+  pre-authed chunk PUT goes through `execute_aux` with `AuxTarget::Anonymous`
+  (no bearer) and resumes on `202 Accepted`. The whole upload has one budget
+  (`UPLOAD_TOTAL_TIMEOUT`), carried INTO each chunk PUT as the remainder of
+  its bifrost-net total deadline, so an expiry is classified at the stage it
+  hit (`Transport(Timeout)`, `Unsent` before dispatch or between chunks,
+  `InFlight` awaiting headers); a timer around the loop threw that stage away
+  and reported the expiry as a provider parse failure. A shutdown between
+  chunks is `Unsent` (no file exists until the final chunk is accepted), one
+  that cuts a PUT short is conservatively `InFlight`, so this non-idempotent
+  upload reconciles rather than replaying into a second file. `ShareScope`:
+  `Anyone -> anonymous`, `Organization -> organization`.
 - `error.rs` - blob-not-byte-stream warning helper. Classification
   helpers live in `graph_error.rs`.
 
