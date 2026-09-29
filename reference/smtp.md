@@ -41,8 +41,9 @@ banner and EHLO under ONE shared `AsyncDeadline`, so async setup as a whole
 cannot exceed the configured timeout. The blocking half has no such thing, and
 is not merely looser - it is not bounded by that value at all:
 `to_socket_addrs()` resolves synchronously with no timeout, `connect_timeout`
-applies the full value to EACH candidate address in turn, the TLS handshake runs
-before `set_timeout` has armed the socket and so is unbounded, and only the
+applies the full value to EACH candidate address in turn, the implicit-TLS handshake runs
+before `set_timeout` has armed the socket and so is unbounded (an explicit
+`STARTTLS` handshake is bounded on both halves, see "Async setup deadline"), and only the
 banner and EHLO reads are bounded, per reply, by `SO_RCVTIMEO`. A caller reading
 "timeout" as a ceiling on how long a transport may take to produce a usable
 connection is therefore right on the async half and wrong on the blocking one.
@@ -271,6 +272,43 @@ with no transaction open, which is legal SMTP - and is deliberately left alone.
 
 `AsyncDeadline` is a single shared deadline across DNS, connect, TLS handshake, banner read, and initial EHLO. The deadline lives only until `connect_impl` returns; established connections use the per-operation timeout. `starttls(...)` on an established connection uses the per-operation timeout because it is an explicit command, not setup.
 
+**The TLS handshake is never unbounded, whatever the timeout.** `timeout(None)`
+means "do not time out my SMTP conversation", not "let a TLS negotiation hang",
+and `AsyncDeadline::new(None)` yields no slack at all, so on its own it would
+leave a `ClientHello` that is never answered parked forever. The handshake
+therefore goes through `AsyncNetworkStream::upgrade_tls_until`, which replaces
+an unbounded deadline with a fresh `DEFAULT_TLS_HANDSHAKE_TIMEOUT` (30 s,
+`client/mod.rs`) for the handshake alone. That covers explicit `STARTTLS` (via
+`upgrade_tls`) and the implicit-TLS leg of `connect_until`, whose setup deadline
+is the `None` shape under `timeout(None)`. The default is 30 s because it sits
+an order of magnitude above a healthy handshake (two round trips plus platform
+certificate verification, which can include revocation fetches) yet far below
+RFC 5321's five-minute peer command timeouts, so it does not fail a working
+server on a poor link. It substitutes for a MISSING timeout only: a configured
+one is used as given, shorter or longer, so the default is neither a floor nor a
+second timer. That is also what keeps it clear of a timer-inside-timer defect -
+a bounded deadline already IS the timer for the operation and is used as it
+stands, and the substitution happens only where there is no timer to nest in;
+`starttls` is not wrapped in any per-operation timer of its own. Everything
+else under `timeout(None)` stays unbounded except teardown (see "Connection
+lifecycle"). Pinned under paused time against `StalledPeer` by
+`an_unconfigured_tls_handshake_is_bounded_by_the_default`,
+`a_configured_tls_handshake_timeout_is_not_replaced_by_the_default` and
+`an_unbounded_setup_deadline_still_bounds_the_handshake`.
+
+The blocking half applies the same rule to explicit `STARTTLS` only
+(`SmtpConnection::upgrade_tls_bounded`). Its handshake blocks on the socket, so
+its only bound is `SO_RCVTIMEO` / `SO_SNDTIMEO`: with a configured timeout those
+are already armed and govern it, and with none the driver arms the default for
+the handshake and restores the unbounded setting afterwards. This is a per-read
+bound, like every blocking timeout, not a shared deadline. Pinned without a
+socket by reading back the armed timeouts on the transcript stream
+(`an_unconfigured_starttls_handshake_is_bounded_and_then_unbounded_again`,
+`a_configured_starttls_timeout_is_left_alone`); a real stalled handshake needs a
+socket and stays out of scope. The blocking implicit-TLS handshake at connect
+time is NOT covered: it runs before any socket timeout exists, and is unbounded
+even with a configured timeout, as described under "Transport types".
+
 It measures on `tokio::time::Instant`, not `std`'s. Every timeout the deadline
 hands out is a `tokio::time::timeout`, and a deadline that reads a different
 clock from the timers it arms is only accidentally right - it disagrees
@@ -473,7 +511,12 @@ unanswered or accepted recipient is `Unsent`, because `DATA` was never issued
 (`closing_during_envelope`); at `DATA` the accepted recipients fail with it; at
 the end-of-data terminator the lanes resolve `DataFinal` `failed` /
 `Acknowledged` exactly as any other rejection does. Only the connection is
-retired. Parking a connection the peer just said it is closing hands the next
+retired. In a pipelined RCPT window the direct path keeps only the FIRST
+refusal as the reported error, but asks `closing_channel` of EVERY reply in the
+window (`DirectSmtpStage::RcptWindowReply` carries a `closing` flag beside the
+retained failure), so a 550 followed by a 421 reports the 550 and aborts with no
+RSET, as `BatchSmtp` does; pinned by
+`a_421_later_in_an_rcpt_window_aborts_and_reports_the_first_refusal`. Parking a connection the peer just said it is closing hands the next
 checkout a dead socket - and on the batch path, which is the account-level
 `send_smtp_batch`, that dead connection is pooled, so under
 `test_on_checkout(false)` the NEXT send writes `MAIL FROM` into it and fails

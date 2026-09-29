@@ -624,6 +624,15 @@ impl SmtpTransportBuilder {
     }
 
     /// Set the timeout duration
+    ///
+    /// `None` means "do not limit my SMTP conversation": protocol operations
+    /// are then unbounded. It does NOT make an explicit `STARTTLS` handshake
+    /// unbounded: with no timeout set, the socket is armed with a fixed 30
+    /// second default for the handshake alone (a per-read bound, like every
+    /// blocking timeout here) and then returned to unbounded. A configured
+    /// timeout is used as given. The implicit-TLS handshake at connect time
+    /// runs before any socket timeout is armed and stays unbounded on the
+    /// blocking transport, as does address resolution.
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.info.timeout = timeout;
         self
@@ -787,6 +796,15 @@ impl LmtpTransportBuilder {
     }
 
     /// Set the timeout duration
+    ///
+    /// `None` means "do not limit my SMTP conversation": protocol operations
+    /// are then unbounded. It does NOT make an explicit `STARTTLS` handshake
+    /// unbounded: with no timeout set, the socket is armed with a fixed 30
+    /// second default for the handshake alone (a per-read bound, like every
+    /// blocking timeout here) and then returned to unbounded. A configured
+    /// timeout is used as given. The implicit-TLS handshake at connect time
+    /// runs before any socket timeout is armed and stays unbounded on the
+    /// blocking transport, as does address resolution.
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.info.timeout = timeout;
         self

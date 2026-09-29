@@ -14,8 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 use super::escape_crlf;
 use super::metering::WireMetering;
 use super::{
-    ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream,
-    TlsParameters, core,
+    ClientCodec, ConnectionState, DEFAULT_TLS_HANDSHAKE_TIMEOUT, MAX_RESPONSE_BYTES,
+    MAX_RESPONSE_LINE_BYTES, NetworkStream, TlsParameters, core,
     core::{Op, OpOutcome, ProtocolMachine, Step},
     data_terminator, smtp_data_size,
 };
@@ -867,7 +867,7 @@ impl SmtpConnection {
                     "SMTP server sent an unsolicited reply before the STARTTLS upgrade",
                 ));
             }
-            self.stream.get_mut().upgrade_tls(tls_parameters)?;
+            self.upgrade_tls_bounded(tls_parameters)?;
             #[cfg(feature = "tracing")]
             tracing::debug!("connection encrypted");
             // Send EHLO/LHLO again
@@ -879,6 +879,32 @@ impl SmtpConnection {
                 "STARTTLS is not supported on this server",
             ))
         }
+    }
+
+    /// The STARTTLS handshake, never unbounded.
+    ///
+    /// The handshake blocks on the socket, so its only bound is the socket's
+    /// own `SO_RCVTIMEO` / `SO_SNDTIMEO`. With a configured timeout those are
+    /// already armed by `set_timeout`, and the handshake runs under them as it
+    /// stands. With none, they are unset and a peer that never answers the
+    /// `ClientHello` would block the thread forever, so the default is armed for
+    /// the handshake alone and the unbounded setting restored afterwards.
+    /// This is a per-read bound, like every other blocking timeout here, not a
+    /// shared deadline (see "Transport types" in `reference/smtp.md`).
+    fn upgrade_tls_bounded(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
+        if self.read_timeout.is_some() {
+            return self.stream.get_mut().upgrade_tls(tls_parameters);
+        }
+
+        self.set_timeout(Some(DEFAULT_TLS_HANDSHAKE_TIMEOUT))
+            .map_err(error::network)?;
+        let result = self.stream.get_mut().upgrade_tls(tls_parameters);
+        // Restore even after a failure. A failed handshake has usually taken the
+        // socket with it, in which case this fails too and there is nothing to
+        // restore; the connection is broken either way.
+        let restored = self.set_timeout(None);
+        result?;
+        restored.map_err(error::network)
     }
 
     /// Send EHLO or LHLO and update server info
@@ -1469,7 +1495,7 @@ mod transcript_tests {
     };
     use bifrost_types::error::BatchItemId;
 
-    use super::{SendOptions, SmtpConnection};
+    use super::{DEFAULT_TLS_HANDSHAKE_TIMEOUT, SendOptions, SmtpConnection};
 
     const HELLO: &str = "EHLO client.example\r\n";
 
@@ -1919,6 +1945,41 @@ mod transcript_tests {
         let mut connection =
             SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
         connection.send(&envelope, b"body").unwrap();
+        transcript.assert_exhausted();
+    }
+
+    /// A 550 followed by a 421 inside one pipelined RCPT window reports the 550
+    /// (the first refusal) but still retires the connection, and no RSET is
+    /// scripted or written into the channel the peer said it is closing. The
+    /// biting assertion on the exact op stream is
+    /// `a_421_later_in_an_rcpt_window_aborts_and_reports_the_first_refusal`
+    /// in the core tests; this one pins the same exchange through the driver.
+    #[test]
+    fn a_421_after_a_550_in_one_rcpt_window_retires_the_connection() {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let recipients = recipients(2);
+        let mut window = "MAIL FROM:<sender@example.com>\r\n".to_owned();
+        window.push_str(&recipient_commands(&recipients));
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 PIPELINING\r\n")
+            .expect(
+                window,
+                "250 sender ok\r\n550 recipient rejected\r\n421 closing transmission channel\r\n",
+            );
+        let envelope =
+            Envelope::new(Some("sender@example.com".parse().unwrap()), recipients).unwrap();
+
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        let error = connection.send(&envelope, b"body").unwrap_err();
+
+        assert!(
+            error
+                .smtp_response()
+                .is_some_and(|response| response.has_code(550)),
+            "the first refusal is the reported one: {error:?}"
+        );
+        assert!(connection.has_broken());
         transcript.assert_exhausted();
     }
 
@@ -2935,6 +2996,67 @@ mod transcript_tests {
         );
         // The STARTTLS step was consumed, and no post-upgrade EHLO was sent.
         transcript.assert_exhausted();
+    }
+
+    /// Reads back what the blocking driver armed on the socket around the
+    /// handshake. The transcript stream cannot complete a handshake, but the
+    /// timeouts are set before it is attempted and restored after it fails, so
+    /// they are observable without a socket.
+    fn starttls_armed_timeouts(
+        configured: Option<std::time::Duration>,
+    ) -> Vec<Option<std::time::Duration>> {
+        let hello = ClientId::Domain("client.example".to_owned());
+        let transcript = Transcript::new("220 smtp.example\r\n")
+            .expect(HELLO, "250-smtp.example\r\n250 STARTTLS\r\n")
+            .expect("STARTTLS\r\n", "220 ready to start tls\r\n");
+        let mut connection =
+            SmtpConnection::from_transcript(transcript.clone(), &hello, Protocol::Smtp).unwrap();
+        connection.set_timeout(configured).unwrap();
+        transcript.take_read_timeouts();
+
+        let tls = super::TlsParameters::new("smtp.example".to_owned()).unwrap();
+        connection
+            .starttls(&tls, &hello)
+            .expect_err("the in-process transcript stream cannot complete a TLS handshake");
+        transcript.take_read_timeouts()
+    }
+
+    /// With no timeout configured the handshake would block the thread forever
+    /// on a peer that never answers, so the default is armed for the handshake
+    /// and the unbounded setting is put back afterwards.
+    #[test]
+    fn an_unconfigured_starttls_handshake_is_bounded_and_then_unbounded_again() {
+        let armed = starttls_armed_timeouts(None);
+        assert_eq!(
+            armed.first(),
+            Some(&Some(DEFAULT_TLS_HANDSHAKE_TIMEOUT)),
+            "the default must be armed before the handshake: {armed:?}"
+        );
+        assert_eq!(
+            armed.last(),
+            Some(&None),
+            "the unbounded setting must be restored after it: {armed:?}"
+        );
+    }
+
+    /// A configured timeout already governs the handshake through the armed
+    /// socket, so the default must not be layered over it.
+    #[test]
+    fn a_configured_starttls_timeout_is_left_alone() {
+        let configured = std::time::Duration::from_secs(7);
+        let armed = starttls_armed_timeouts(Some(configured));
+        assert!(
+            !armed.contains(&Some(DEFAULT_TLS_HANDSHAKE_TIMEOUT)),
+            "the default replaced a configured timeout: {armed:?}"
+        );
+        // The reply read shrinks the armed value as its per-reply deadline
+        // runs down, so "at most the configured timeout" is the invariant.
+        assert!(
+            armed
+                .iter()
+                .all(|timeout| timeout.is_some_and(|armed| armed <= configured)),
+            "nothing beyond the configured timeout may be armed: {armed:?}"
+        );
     }
 
     /// A server that advertises STARTTLS may still refuse it. The refusal must

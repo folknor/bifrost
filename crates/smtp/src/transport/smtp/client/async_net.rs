@@ -25,6 +25,7 @@ use tokio::net::{TcpSocket, TcpStream, ToSocketAddrs};
 use tokio::time::Sleep;
 use tokio_native_tls::TlsStream as TokioTlsStream;
 
+use super::DEFAULT_TLS_HANDSHAKE_TIMEOUT;
 use super::metering::WireMetering;
 use super::net::resolved_address_filter;
 use super::{ConnectionState, TlsParameters};
@@ -65,6 +66,21 @@ impl AsyncDeadline {
     pub(super) fn postponed_by(self, by: Duration) -> Self {
         Self {
             expires_at: self.expires_at.map(|expires_at| expires_at + by),
+        }
+    }
+
+    /// An unbounded deadline becomes a fresh one of `default`; a bounded one is
+    /// returned untouched.
+    ///
+    /// For the one operation that must never hang whatever the caller asked
+    /// for. Substituting only in the unbounded case is what keeps this from
+    /// nesting a timer inside another: a bounded deadline already IS the timer
+    /// governing the operation and is used as it stands, while an unbounded one
+    /// has no timer to nest in.
+    pub(super) fn or_bounded(self, default: Duration) -> Self {
+        match self.expires_at {
+            Some(_) => self,
+            None => Self::new(Some(default)),
         }
     }
 
@@ -407,6 +423,8 @@ impl AsyncNetworkStream {
         )))
     }
 
+    /// Upgrade to TLS, bounding the handshake by `timeout`, or by
+    /// `DEFAULT_TLS_HANDSHAKE_TIMEOUT` when `timeout` is `None`.
     pub(crate) async fn upgrade_tls(
         &mut self,
         tls_parameters: TlsParameters,
@@ -416,12 +434,17 @@ impl AsyncNetworkStream {
             .await
     }
 
+    /// The handshake is never unbounded: a `deadline` with no expiry (a
+    /// transport built with `timeout(None)`) is replaced by a fresh
+    /// `DEFAULT_TLS_HANDSHAKE_TIMEOUT` for the handshake alone. This covers both
+    /// explicit STARTTLS and the implicit-TLS leg of the connect path.
     pub(super) async fn upgrade_tls_until(
         &mut self,
         tls_parameters: TlsParameters,
         deadline: AsyncDeadline,
     ) -> Result<(), Error> {
         self.state.verify()?;
+        let deadline = deadline.or_bounded(DEFAULT_TLS_HANDSHAKE_TIMEOUT);
 
         match &self.inner {
             InnerAsyncNetworkStream::TokioTcp(_) => {
@@ -854,5 +877,73 @@ mod tokio_test {
 
         let error = result.unwrap_err();
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
+    }
+
+    /// Drive `upgrade_tls` against a peer that swallows the `ClientHello` and
+    /// never answers, and return how long paused time says it took to fail.
+    async fn stalled_handshake_elapsed(timeout: Option<Duration>) -> Duration {
+        let mut stream =
+            AsyncNetworkStream::new(InnerAsyncNetworkStream::TokioTcp(Box::new(StalledPeer)));
+        let tls_parameters = TlsParameters::new("localhost".to_owned()).unwrap();
+
+        let started = Instant::now();
+        // An outer bound far above the default, so an unbounded handshake fails
+        // here instead of hanging: under paused time it costs nothing when the
+        // inner bound holds, and it is the only timer an unbounded one leaves.
+        let error = tokio::time::timeout(
+            DEFAULT_TLS_HANDSHAKE_TIMEOUT * 10,
+            stream.upgrade_tls(tls_parameters, timeout),
+        )
+        .await
+        .expect("the handshake must be bounded, not left to hang")
+        .expect_err("a stalled handshake must not complete");
+        assert!(error.is_timeout(), "expected timeout, got {error:?}");
+        started.elapsed()
+    }
+
+    /// A transport built with `timeout(None)` still ends a wedged handshake,
+    /// and at the documented default rather than at some arbitrary point. Paused
+    /// time makes the elapsed value the finding: an unbounded handshake would
+    /// hang here instead of failing.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn an_unconfigured_tls_handshake_is_bounded_by_the_default() {
+        assert_eq!(
+            stalled_handshake_elapsed(None).await,
+            DEFAULT_TLS_HANDSHAKE_TIMEOUT
+        );
+    }
+
+    /// The default substitutes for a MISSING timeout only. A configured one is
+    /// used as given, shorter than the default here, so the default is not a
+    /// floor or a second timer stacked on the first.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn a_configured_tls_handshake_timeout_is_not_replaced_by_the_default() {
+        let configured = Duration::from_secs(5);
+        assert!(configured < DEFAULT_TLS_HANDSHAKE_TIMEOUT);
+        assert_eq!(
+            stalled_handshake_elapsed(Some(configured)).await,
+            configured
+        );
+    }
+
+    /// The setup-deadline shape: `AsyncDeadline::new(None)` yields no slack, and
+    /// the implicit-TLS leg of `connect_until` hands exactly that to
+    /// `upgrade_tls_until`. It must be bounded there too.
+    #[tokio::test(crate = "tokio", start_paused = true)]
+    async fn an_unbounded_setup_deadline_still_bounds_the_handshake() {
+        let mut stream =
+            AsyncNetworkStream::new(InnerAsyncNetworkStream::TokioTcp(Box::new(StalledPeer)));
+        let tls_parameters = TlsParameters::new("localhost".to_owned()).unwrap();
+
+        let started = Instant::now();
+        let error = tokio::time::timeout(
+            DEFAULT_TLS_HANDSHAKE_TIMEOUT * 10,
+            stream.upgrade_tls_until(tls_parameters, AsyncDeadline::new(None)),
+        )
+        .await
+        .expect("the handshake must be bounded, not left to hang")
+        .expect_err("a stalled handshake must not complete");
+        assert!(error.is_timeout(), "expected timeout, got {error:?}");
+        assert_eq!(started.elapsed(), DEFAULT_TLS_HANDSHAKE_TIMEOUT);
     }
 }

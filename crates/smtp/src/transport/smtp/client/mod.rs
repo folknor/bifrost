@@ -38,6 +38,21 @@ pub(super) const MAX_RESPONSE_BYTES: usize = 100_000;
 /// Single-line byte cap (Postfix `line_length_limit`).
 pub(super) const MAX_RESPONSE_LINE_BYTES: usize = 1000;
 
+/// Bound on a TLS handshake when the caller configured no timeout.
+///
+/// `timeout(None)` means "do not time out my SMTP conversation", not "let a TLS
+/// negotiation hang": a peer that accepts the connection and then never answers
+/// the `ClientHello` would otherwise park the caller forever. The value is
+/// 30 seconds - an order of magnitude above a healthy handshake (two round
+/// trips plus platform certificate verification, which can include revocation
+/// fetches) even on a poor mobile link, and far below the five-minute command
+/// timeouts RFC 5321 section 4.5.3.2 allows for a peer, so it never fails a
+/// working server yet still ends a wedged one within a caller-tolerable time.
+/// It applies ONLY when no timeout is configured; a configured timeout is used
+/// as given, larger or smaller.
+pub(super) const DEFAULT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 /// Maximum number of RCPT commands outstanding in a PIPELINING window.
 ///
 /// RFC 2920 requires clients to respect the peer's TCP window. Draining each

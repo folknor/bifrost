@@ -242,10 +242,14 @@ enum DirectSmtpStage {
         end: usize,
         next: usize,
         failure: Option<Response>,
+        /// Whether ANY reply so far in the window was a 421, kept apart from
+        /// `failure` because only the first negative reply is retained.
+        closing: bool,
     },
     WindowClosing {
         end: usize,
         failure: Option<Response>,
+        closing: bool,
     },
     DataReply,
     BodyWritten,
@@ -427,6 +431,7 @@ impl ProtocolMachine for DirectSmtp {
                             end,
                             next: start,
                             failure: None,
+                            closing: false,
                         };
                     }
                     Step::Run(Op::ReadGrouped)
@@ -442,6 +447,7 @@ impl ProtocolMachine for DirectSmtp {
                         end,
                         next: 0,
                         failure: None,
+                        closing: false,
                     };
                     Step::Run(Op::ReadGrouped)
                 }
@@ -505,7 +511,12 @@ impl ProtocolMachine for DirectSmtp {
                         .map_err(PhasedError::into_error),
                 ),
             },
-            DirectSmtpStage::RcptWindowReply { end, next, failure } => match outcome {
+            DirectSmtpStage::RcptWindowReply {
+                end,
+                next,
+                failure,
+                closing,
+            } => match outcome {
                 OpOutcome::Failed(error) => {
                     let value = phased(SmtpCommandPhase::RcptTo, error);
                     self.begin_epilogue(Epilogue::abort(value))
@@ -525,22 +536,20 @@ impl ProtocolMachine for DirectSmtp {
                     // full per-recipient answer uses the batch machine, which
                     // records every reply into `SendProgress`.
                     //
-                    // Note what the retention rule costs beyond diagnostics: the
-                    // `closing_channel` check runs at `WindowClosing` on the
-                    // RETAINED failure only, so a 550 followed by a 421 in one
-                    // window takes the RSET-and-keep path rather than the abort
-                    // a 421 asks for. `Epilogue::reset` aborts anyway when the
-                    // peer does not positively acknowledge the RSET, so the
-                    // connection still goes; the cost is one wasted command on a
-                    // channel already closing. `BatchSmtpStage::RcptWindowReply`
-                    // tests every reply for it instead, because it has somewhere
-                    // to put the ones it keeps.
+                    // The retention rule does not extend to the 421 question:
+                    // whether the channel is closing is about the CONNECTION,
+                    // not about which refusal is reported, so every reply in
+                    // the window is asked, as `BatchSmtpStage::RcptWindowReply`
+                    // does. A 550 followed by a 421 reports the 550 and still
+                    // aborts, rather than spending an RSET on a channel the
+                    // peer has said it is closing.
                     //
-                    // What would change the answer: giving this path a
-                    // per-recipient output (the batch machine's `SendProgress`,
-                    // or a multi-response error). Until the output shape can
-                    // carry a second refusal, retaining one is the whole of what
-                    // is reportable.
+                    // What would change the retention answer: giving this path
+                    // a per-recipient output (the batch machine's
+                    // `SendProgress`, or a multi-response error). Until the
+                    // output shape can carry a second refusal, retaining one is
+                    // the whole of what is reportable.
+                    let closing = closing || closing_channel(&response);
                     let failure = match failure {
                         Some(failure) => Some(failure),
                         None if !response.is_positive() => Some(response),
@@ -548,22 +557,34 @@ impl ProtocolMachine for DirectSmtp {
                     };
                     let next = next + 1;
                     if next < end {
-                        self.stage = DirectSmtpStage::RcptWindowReply { end, next, failure };
+                        self.stage = DirectSmtpStage::RcptWindowReply {
+                            end,
+                            next,
+                            failure,
+                            closing,
+                        };
                         return Step::Run(Op::ReadGrouped);
                     }
-                    self.stage = DirectSmtpStage::WindowClosing { end, failure };
+                    self.stage = DirectSmtpStage::WindowClosing {
+                        end,
+                        failure,
+                        closing,
+                    };
                     Step::Run(Op::CloseReplyGroup)
                 }
                 OpOutcome::Done => unreachable!("a read op yields a reply or a failure"),
             },
-            DirectSmtpStage::WindowClosing { end, failure } => match outcome {
+            DirectSmtpStage::WindowClosing {
+                end,
+                failure,
+                closing,
+            } => match outcome {
                 OpOutcome::Failed(error) => {
                     let value = phased(SmtpCommandPhase::RcptTo, error);
                     self.begin_epilogue(Epilogue::abort(value))
                 }
                 _ => match failure {
                     Some(response) => {
-                        let closing = closing_channel(&response);
                         let value = phased(SmtpCommandPhase::RcptTo, error::status(response));
                         if closing {
                             return self.begin_epilogue(Epilogue::abort(value));

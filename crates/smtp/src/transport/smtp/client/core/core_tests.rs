@@ -61,6 +61,62 @@ fn closing() -> Response {
         .expect("a valid 421 reply")
 }
 
+/// The direct path keeps only the FIRST refusal in a pipelined RCPT window, but
+/// whether the channel is closing is asked of EVERY reply: a 550 followed by a
+/// 421 reports the 550 and aborts with no RSET, as the batch machine does. A
+/// 421 followed by a 550 (the 421 is the retained refusal) and a lone 550 (the
+/// RSET-and-keep control) pin the neighbours. Ablation: with the `closing` flag
+/// dropped so only the retained failure is asked, the 550-then-421 case writes
+/// `RSET` and ends without a bare `ABORT`.
+#[test]
+fn a_421_later_in_an_rcpt_window_aborts_and_reports_the_first_refusal() {
+    let run = |script: Vec<OpOutcome>| {
+        let mut machine = DirectSmtp::new(mail(), rcpts(2), true, BodyKind::Data);
+        let mut harness = Harness::new(script);
+        let error = harness.run(&mut machine).expect_err("a recipient refused");
+        (error, harness.ops)
+    };
+
+    let (error, ops) = run(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(rejection()),
+        OpOutcome::Reply(closing()),
+    ]);
+    assert_eq!(error.phase(), Some(SmtpCommandPhase::RcptTo));
+    assert_eq!(
+        error.status().map(u16::from),
+        Some(550),
+        "the first refusal stays the reported one"
+    );
+    assert!(
+        !ops.iter().any(|op| op.starts_with("W:RSET")),
+        "no RSET into a closing channel: {ops:?}"
+    );
+    assert_eq!(ops.last().map(String::as_str), Some("ABORT"), "{ops:?}");
+
+    let (error, ops) = run(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(closing()),
+        OpOutcome::Reply(rejection()),
+    ]);
+    assert_eq!(error.status().map(u16::from), Some(421));
+    assert!(!ops.iter().any(|op| op.starts_with("W:RSET")), "{ops:?}");
+    assert_eq!(ops.last().map(String::as_str), Some("ABORT"), "{ops:?}");
+
+    // Control: a plain refusal still resets and keeps the connection.
+    let (error, ops) = run(vec![
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(rejection()),
+        OpOutcome::Reply(ok_reply()),
+        OpOutcome::Reply(ok_reply()),
+    ]);
+    assert_eq!(error.status().map(u16::from), Some(550));
+    assert!(
+        ops.iter().any(|op| op.starts_with("W:RSET")),
+        "a non-421 refusal must still take RSET-and-keep: {ops:?}"
+    );
+}
+
 /// A 421 answering an envelope command aborts the connection at every
 /// boundary, in every machine, instead of parking it (a rejected `MAIL FROM`)
 /// or resetting it (a rejected `RCPT TO` or `DATA`). The reset-or-keep rules

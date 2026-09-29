@@ -777,6 +777,13 @@ impl AsyncSmtpTransportBuilder {
     }
 
     /// Set the timeout duration
+    ///
+    /// `None` means "do not limit my SMTP conversation": protocol operations
+    /// are then unbounded. It does NOT make a TLS handshake unbounded. When no
+    /// timeout is set, the handshake of an implicit-TLS connect or an explicit
+    /// `STARTTLS` upgrade is bounded by a fixed 30 second default, so a peer
+    /// that never answers the `ClientHello` cannot hang the caller. A
+    /// configured timeout is used as given, whatever its size.
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.info.timeout = timeout;
         self
@@ -950,6 +957,13 @@ impl AsyncLmtpTransportBuilder {
     }
 
     /// Set the timeout duration
+    ///
+    /// `None` means "do not limit my SMTP conversation": protocol operations
+    /// are then unbounded. It does NOT make a TLS handshake unbounded. When no
+    /// timeout is set, the handshake of an implicit-TLS connect or an explicit
+    /// `STARTTLS` upgrade is bounded by a fixed 30 second default, so a peer
+    /// that never answers the `ClientHello` cannot hang the caller. A
+    /// configured timeout is used as given, whatever its size.
     pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
         self.info.timeout = timeout;
         self
