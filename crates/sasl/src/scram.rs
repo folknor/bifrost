@@ -130,21 +130,55 @@ pub(crate) fn escape_username(user: &str) -> String {
 /// Apply RFC 4013 SASLprep, then RFC 5802 saslname escaping to a SCRAM username.
 ///
 /// SASLprep failure (a prohibited code point, an unassigned one, or a bidi
-/// violation) is a `Protocol` error rather than a pass-through: sending the raw
-/// bytes would make the client and the server derive `SaltedPassword` over
-/// different inputs, and would let visually equivalent identities reach the
-/// same account.
+/// violation) is an `InvalidCredential` error rather than a pass-through:
+/// sending the raw bytes would make the client and the server derive
+/// `SaltedPassword` over different inputs, and would let visually equivalent
+/// identities reach the same account. It is the caller's input, refused
+/// before the exchange starts, so it is not a protocol fault.
 pub fn prepare_scram_username(user: &str) -> Result<String, SaslError> {
-    let prepared = stringprep::saslprep(user)
-        .map_err(|e| SaslError::Protocol(format!("SCRAM username failed SASLprep: {e}")))?;
+    let prepared = stringprep::saslprep(user).map_err(|e| {
+        SaslError::InvalidCredential(format!("SCRAM username failed SASLprep: {e}"))
+    })?;
     Ok(escape_username(&prepared))
+}
+
+/// A SCRAM password that has already been through RFC 4013 SASLprep.
+///
+/// The only input [`scram_client_final`] accepts, and constructible only
+/// through [`prepare_scram_password`]. That ordering is the point: SASLprep
+/// used to run inside `scram_client_final`, after the server-first message,
+/// so a password the caller supplied that fails SASLprep was discovered
+/// mid-exchange - with AUTHENTICATE already on the wire and the server
+/// waiting for a continuation. Preparing it up front makes that refusal a
+/// local one, made before any byte is sent. Zeroized on drop.
+pub struct ScramPassword(Zeroizing<String>);
+
+impl std::fmt::Debug for ScramPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScramPassword(<redacted>)")
+    }
+}
+
+/// Apply RFC 4013 SASLprep to a SCRAM password, BEFORE the exchange starts.
+///
+/// A password that fails SASLprep is an `InvalidCredential` error, for the
+/// same reasons as [`prepare_scram_username`].
+pub fn prepare_scram_password(password: &str) -> Result<ScramPassword, SaslError> {
+    let prepared = stringprep::saslprep(password).map_err(|e| {
+        SaslError::InvalidCredential(format!("SCRAM password failed SASLprep: {e}"))
+    })?;
+    Ok(ScramPassword(Zeroizing::new(prepared.into_owned())))
 }
 
 /// Build the base64 client-final message and the expected server signature
 /// from the server-first message. Pure; no I/O.
+///
+/// Every error here is about the server-first message, never the caller's
+/// credentials: those were prepared by [`prepare_scram_password`] before the
+/// exchange began.
 pub fn scram_client_final(
     hash: ScramHash,
-    password: &str,
+    password: &ScramPassword,
     client_nonce: &str,
     client_first_bare: &str,
     server_first: &str,
@@ -209,14 +243,9 @@ pub fn scram_client_final(
     let c_value = base64::engine::general_purpose::STANDARD.encode(&cbind);
     let client_final_without_proof = format!("c={c_value},r={server_nonce}");
     let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
-    let password = Zeroizing::new(
-        stringprep::saslprep(password)
-            .map_err(|e| SaslError::Protocol(format!("SCRAM password failed SASLprep: {e}")))?
-            .into_owned(),
-    );
     let (proof, server_signature) = scram_proof_and_server_signature(
         hash,
-        password.as_bytes(),
+        password.0.as_bytes(),
         &salt,
         iterations,
         &auth_message,
@@ -371,6 +400,10 @@ fn xor_bytes(a: &[u8], b: &[u8]) -> Zeroizing<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn pw(password: &str) -> ScramPassword {
+        prepare_scram_password(password).expect("test password prepares")
+    }
+
     #[test]
     fn scram_sha1_client_final_matches_rfc_5802_vector() {
         use base64::Engine;
@@ -380,7 +413,7 @@ mod tests {
         let server_first = "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
         let (client_final, server_signature) = scram_client_final(
             ScramHash::Sha1,
-            "pencil",
+            &pw("pencil"),
             client_nonce,
             client_first_bare,
             server_first,
@@ -412,7 +445,7 @@ mod tests {
         let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
         let (client_final, server_signature) = scram_client_final(
             ScramHash::Sha256,
-            "pencil",
+            &pw("pencil"),
             client_nonce,
             client_first_bare,
             server_first,
@@ -463,7 +496,10 @@ mod tests {
         assert_eq!(prepare_scram_username("\u{2168}").unwrap(), "IX");
         // #6 prohibited character (BELL).
         assert!(
-            matches!(prepare_scram_username("\u{7}"), Err(SaslError::Protocol(_))),
+            matches!(
+                prepare_scram_username("\u{7}"),
+                Err(SaslError::InvalidCredential(_))
+            ),
             "prohibited code point must not pass SASLprep"
         );
         // #7 bidirectional check failure: a RandALCat code point followed by an
@@ -471,7 +507,7 @@ mod tests {
         assert!(
             matches!(
                 prepare_scram_username("\u{627}\u{31}"),
-                Err(SaslError::Protocol(_))
+                Err(SaslError::InvalidCredential(_))
             ),
             "RFC 3454 bidi rule violation must not pass SASLprep"
         );
@@ -485,7 +521,7 @@ mod tests {
         use base64::Engine;
         let (client_final, _) = scram_client_final(
             ScramHash::Sha1,
-            "pen\u{ad}cil",
+            &pw("pen\u{ad}cil"),
             "fyko+d2lbbFgONRv9qkxdawL",
             "n=user,r=fyko+d2lbbFgONRv9qkxdawL",
             "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096",
@@ -501,18 +537,18 @@ mod tests {
         );
     }
 
+    /// A password that fails SASLprep is refused when it is PREPARED, which a
+    /// protocol crate does before the exchange starts - never by
+    /// `scram_client_final`, which runs after the server-first message and so
+    /// mid-exchange. It is the caller's credential, so `InvalidCredential`,
+    /// not a protocol fault.
     #[test]
     fn scram_password_rejects_prohibited_saslprep_input() {
-        let err = scram_client_final(
-            ScramHash::Sha256,
-            "bad\u{7}",
-            "abc",
-            "n=user,r=abc",
-            "r=abcdef,s=QSXCR+Q6sek8bf92,i=4096",
-            &ScramChannelBinding::None,
-        )
-        .unwrap_err();
-        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+        let err = prepare_scram_password("bad\u{7}").unwrap_err();
+        assert!(
+            matches!(err, SaslError::InvalidCredential(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -542,7 +578,7 @@ mod tests {
         ] {
             let err = scram_client_final(
                 ScramHash::Sha256,
-                "pencil",
+                &pw("pencil"),
                 nonce,
                 bare,
                 server_first,
@@ -560,7 +596,7 @@ mod tests {
     fn scram_rejects_duplicate_attributes() {
         let err = scram_client_final(
             ScramHash::Sha256,
-            "pencil",
+            &pw("pencil"),
             "abc",
             "n=user,r=abc",
             "r=abcdef,s=QSXCR+Q6sek8bf92,i=4096,x=one,x=two",
@@ -574,7 +610,7 @@ mod tests {
         // differently-ordered peer honours instead.
         let err = scram_client_final(
             ScramHash::Sha256,
-            "pencil",
+            &pw("pencil"),
             "abc",
             "n=user,r=abc",
             "r=abcdef,s=QSXCR+Q6sek8bf92,s=AAAAAAAAAAAAAAAA,i=4096",
@@ -613,7 +649,7 @@ mod tests {
         // reflection/tamper signal, not merely short entropy.
         let err = scram_client_final(
             ScramHash::Sha256,
-            "pencil",
+            &pw("pencil"),
             "abc",
             "n=user,r=abc",
             "r=xyzdef,s=QSXCR+Q6sek8bf92,i=4096",
@@ -661,7 +697,7 @@ mod tests {
 
         let (plus_final, plus_sig) = scram_client_final(
             ScramHash::Sha256,
-            "pencil",
+            &pw("pencil"),
             client_nonce,
             client_first_bare,
             server_first,
@@ -679,7 +715,7 @@ mod tests {
         // hence a different proof and server signature for the same inputs.
         let (none_final, none_sig) = scram_client_final(
             ScramHash::Sha256,
-            "pencil",
+            &pw("pencil"),
             client_nonce,
             client_first_bare,
             server_first,
@@ -715,7 +751,7 @@ mod tests {
             format!("r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i={i}");
         let err = scram_client_final(
             ScramHash::Sha256,
-            "pencil",
+            &pw("pencil"),
             client_nonce,
             client_first_bare,
             &server_first,
@@ -733,7 +769,7 @@ mod tests {
         let server_first = "r=fyko+d2lbbFgONRv9qkxdawL,s=QSXCR+Q6sek8bf92,i=4096";
         let err = scram_client_final(
             ScramHash::Sha1,
-            "pencil",
+            &pw("pencil"),
             client_nonce,
             client_first_bare,
             server_first,

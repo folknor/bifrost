@@ -50,22 +50,10 @@ item is what stops that.
 
 - **errors: local refusals are never a provider fault.** RULED 2026-09-29
   (second pass), three parts. (a), the rule in `reference/error-model.md`
-  ("Local refusals"), and (b), IMAP's `Error::Protocol` split, have landed.
-  Remaining:
-  - **SASL**, the last IMAP-reaching piece of (b). `bifrost_sasl::SaslError::
-    Protocol` mixes SASLprep refusals of the CALLER's credentials with genuine
-    server-message violations, and both IMAP and SMTP map it straight into
-    their protocol lane. The username is SASLprep'd before AUTHENTICATE is
-    submitted, but the PASSWORD is SASLprep'd inside `scram_client_final`,
-    after the server-first message - mid-exchange - so merely reclassifying it
-    as non-fatal would leave the connection reusable while the server still
-    waits for a SASL continuation. The agreed shape: SASLprep both before the
-    first byte, add a local-input `SaslError` variant, map it to
-    `InvalidInput` in IMAP and SMTP together, and update `reference/sasl.md`.
-    Until then `SaslError::Protocol` stays connection-fatal, so no framing
-    hole is open.
-  - **(c)**: audit the other protocol crates against the rule; fix what the
-    ruling covers, file the rest.
+  ("Local refusals"), and (b), IMAP's `Error::Protocol` split including the
+  SASL credential refusals, have landed. Remaining: **(c)**, audit the other
+  protocol crates against the rule; fix what the ruling covers, file the
+  rest.
 
 - **errors: local implementation failures derive as provider faults.** Filed
   2026-09-29 from the (b) work, NOT covered by that ruling. IMAP's

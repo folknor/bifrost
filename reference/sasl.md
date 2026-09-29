@@ -22,7 +22,9 @@ inside the protocol consumers, never the other way around.
   `From<bifrost_sasl::Secret> for SecretString`, which moves the inner
   allocation so no plaintext copy is left un-zeroized).
 - `SaslError` - `#[non_exhaustive]`. `Protocol(String)` for malformed or
-  unexpected SASL/SCRAM messages; `AuthFailed(String)` for a SCRAM `e=` server
+  unexpected SASL/SCRAM messages and peer-controlled input (the server's
+  certificate); `InvalidCredential(String)` for a caller-supplied username or
+  password that fails SASLprep; `AuthFailed(String)` for a SCRAM `e=` server
   error or a failed exchange.
 - `ScramHash` - `#[non_exhaustive]` `{ Sha1, Sha256 }`. Names the hash, not a
   protocol-layer mechanism. `mechanism_name(ChannelBinding)` returns the wire
@@ -50,10 +52,16 @@ inside the protocol consumers, never the other way around.
   Unrecognized OIDs and EdDSA (Ed25519/Ed448) are a hard `Protocol` error
   rather than a guessed binding hash - a wrong binding value is a silent auth
   failure. Returns raw hash bytes; the caller base64-frames them.
-- `scram_client_final(hash, password, client_nonce, client_first_bare,
-  server_first, binding: &ScramChannelBinding) -> Result<(Secret, Vec<u8>),
-  SaslError>` - parses the server-first message, runs PBKDF2/HMAC, returns the
-  base64 client-final and the expected server signature. The `c=` attribute is
+- `prepare_scram_password(password) -> Result<ScramPassword, SaslError>` -
+  RFC 4013 SASLprep of the password, zeroized on drop. `ScramPassword` is the
+  only password type `scram_client_final` accepts, so the preparation, and
+  its `InvalidCredential` refusal, necessarily happen before the exchange
+  starts rather than after the server-first message.
+- `scram_client_final(hash, password: &ScramPassword, client_nonce,
+  client_first_bare, server_first, binding: &ScramChannelBinding) ->
+  Result<(Secret, Vec<u8>), SaslError>` - parses the server-first message,
+  runs PBKDF2/HMAC, returns the base64 client-final and the expected server
+  signature. Every error it returns is about the server-first message. The `c=` attribute is
   `base64(gs2_header || cbind_data)` derived from `binding`; `None` is
   byte-identical to the old `c=biws`.
 - `verify_server_final(server_final, expected_signature) -> Result<(),
@@ -63,9 +71,9 @@ inside the protocol consumers, never the other way around.
   SASLprep followed by RFC 5802 saslname escaping of `=` / `,`. This is the
   only way a protocol crate builds an `n=` value; the bare escaper is
   crate-private precisely so a caller cannot reach for it and skip SASLprep.
-  `scram_client_final` independently SASLpreps the password before PBKDF2.
-  Prohibited, unassigned, and bidi-violating input is a typed `Protocol` error
-  rather than a misleading authentication failure.
+  Prohibited, unassigned, and bidi-violating input is a typed
+  `InvalidCredential` error rather than a misleading authentication failure
+  or a protocol fault.
 - `decode_continuation(data) -> Result<String, SaslError>` - base64-decode a
   SASL continuation to UTF-8.
 - `cram_md5_response(user, pass, challenge) -> Result<Secret, SaslError>` -
@@ -90,10 +98,18 @@ pre-encoding response are zeroized on drop. Secret and verifier equality use
 `SaslError` is mapped back into each protocol crate's error enum at the single
 call boundary. For IMAP: `Protocol(m)` becomes `Error::Protocol(m)` (identical
 message); `AuthFailed(m)` becomes `Error::auth_with_code(m, None)` (the
-auth-failure lane). This preserves the pre-extraction classification exactly -
-protocol-class messages stay protocol-class, the SCRAM `e=` server error stays
-on the auth-failure lane. A SCRAM signature-verification mismatch is a
-protocol-class failure (`Protocol`), not `AuthFailed`.
+auth-failure lane); `InvalidCredential(m)` becomes `Error::InvalidInput(m)`.
+SMTP's split is the same, into its own kinds (`reference/smtp.md`). A SCRAM
+signature-verification mismatch is a protocol-class failure (`Protocol`), not
+`AuthFailed`.
+
+Both protocol crates prepare the username AND password while building the
+exchange, before the first byte of AUTHENTICATE / AUTH is sent, so an
+`InvalidCredential` is always a local refusal: it follows the cross-crate
+rule in `reference/error-model.md` ("Local refusals") - never a provider
+fault, and never a reason to retire the connection. Everything a protocol
+crate still maps from `Protocol` is either the peer's fault or raised
+mid-exchange, where retiring the connection is required.
 
 ## Correctness pins
 
@@ -131,9 +147,10 @@ correct:
 - RFC 4013 SASLprep examples (`scram.rs`): the complete RFC 4013 Section 3
   example table is pinned on `prepare_scram_username` - mapped-to-nothing, the
   two no-op rows (case is *not* folded), both NFKC rows, the prohibited code
-  point, and the bidi violation. A password containing SOFT HYPHEN maps to the
-  RFC 5802 SHA-1 vector's `pencil` and produces that vector's absolute client
-  proof, which is what proves real SASLprep runs on the PBKDF2 input.
+  point, and the bidi violation. A password containing SOFT HYPHEN, prepared
+  through `prepare_scram_password`, maps to the RFC 5802 SHA-1 vector's
+  `pencil` and produces that vector's absolute client proof, which is what
+  proves real SASLprep runs on the PBKDF2 input.
 - Duplicate attributes (`scram.rs`): repeated server-first and server-final
   keys are rejected rather than selecting the first value, including keys the
   client never reads (an unknown `x=` extension). The server-final pin

@@ -9,9 +9,17 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SaslError {
-    /// A malformed or unexpected SASL/SCRAM protocol message.
+    /// A malformed or unexpected SASL/SCRAM protocol message - the PEER's
+    /// fault, or a peer-controlled input such as its certificate.
     #[error("SASL protocol error: {0}")]
     Protocol(String),
+    /// A credential the CALLER supplied cannot be used: it fails RFC 4013
+    /// SASLprep (a prohibited or unassigned code point, a bidi violation).
+    /// Raised while preparing the exchange, before any byte of it is sent,
+    /// so a protocol crate maps it to its local invalid-input lane - never
+    /// to a provider fault, and never as a reason to retire the connection.
+    #[error("SASL credential rejected: {0}")]
+    InvalidCredential(String),
     /// The server reported an error in its SCRAM server-final message
     /// (the `e=` field), or server-signature verification failed.
     #[error("SCRAM authentication failed: {0}")]

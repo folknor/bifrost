@@ -1,6 +1,6 @@
 use bifrost_sasl::{
-    ScramChannelBinding, ScramHash, cram_md5_response, decode_continuation, prepare_scram_username,
-    scram_client_final, verify_server_final,
+    ScramChannelBinding, ScramHash, ScramPassword, cram_md5_response, decode_continuation,
+    prepare_scram_password, prepare_scram_username, scram_client_final, verify_server_final,
 };
 
 use crate::connection::NotifyFlags;
@@ -15,12 +15,15 @@ use super::{Consumer, ConsumerContext, ContinuationConsumer, ContinuationReply, 
 /// Map a `bifrost-sasl` computation failure back into the IMAP error model.
 ///
 /// Protocol-class messages stay `Error::Protocol`; a SCRAM `e=` server error
-/// (the auth-failure lane) stays `Error::auth_with_code(.., None)`. This
-/// preserves the exact pre-move error classification.
+/// (the auth-failure lane) stays `Error::auth_with_code(.., None)`. A
+/// caller credential that fails SASLprep is `InvalidInput`: it is refused
+/// while the consumer is built, before AUTHENTICATE is submitted, so it is a
+/// local refusal and must neither blame the server nor retire the connection.
 impl From<bifrost_sasl::SaslError> for Error {
     fn from(e: bifrost_sasl::SaslError) -> Self {
         match e {
             bifrost_sasl::SaslError::Protocol(m) => Error::Protocol(m),
+            bifrost_sasl::SaslError::InvalidCredential(m) => Error::InvalidInput(m),
             bifrost_sasl::SaslError::AuthFailed(m) => Error::auth_with_code(m, None),
             // `SaslError` is `#[non_exhaustive]`; any future variant is an
             // unclassified auth failure until it is mapped explicitly.
@@ -352,7 +355,10 @@ enum ScramState {
 /// Consumer for SCRAM-SHA-1 and SCRAM-SHA-256.
 pub(crate) struct AuthenticateScramConsumer {
     mechanism: ScramHash,
-    pass: SecretString,
+    /// SASLprep'd in `new`, before AUTHENTICATE is submitted, so a password
+    /// the caller supplied that cannot be prepared is refused locally rather
+    /// than discovered mid-exchange.
+    pass: ScramPassword,
     client_nonce: String,
     client_first_bare: String,
     /// GS2 channel binding for this exchange. `None` reproduces the old
@@ -375,6 +381,7 @@ impl AuthenticateScramConsumer {
         binding: ScramChannelBinding,
     ) -> Result<Self, Error> {
         let client_first_bare = format!("n={},r={nonce}", prepare_scram_username(&user)?);
+        let pass = prepare_scram_password(pass.as_str())?;
         Ok(Self {
             mechanism,
             pass,
@@ -411,6 +418,9 @@ impl AuthenticateScramConsumer {
         match error {
             bifrost_sasl::SaslError::Protocol(m) => {
                 Error::Protocol(format!("{m} (mechanism {mechanism})"))
+            }
+            bifrost_sasl::SaslError::InvalidCredential(m) => {
+                Error::InvalidInput(format!("{m} (mechanism {mechanism})"))
             }
             bifrost_sasl::SaslError::AuthFailed(m) => {
                 Error::auth_with_mechanism(m, None, mechanism)
@@ -548,6 +558,26 @@ mod tests {
             command_target: None,
             command_tag: "A1",
         }
+    }
+
+    /// A password that fails SASLprep is refused when the consumer is BUILT,
+    /// before AUTHENTICATE is submitted, as `InvalidInput`. It used to be
+    /// discovered in `scram_client_final`, after the server-first message,
+    /// as a connection-fatal `Protocol` error blaming the server.
+    #[test]
+    fn a_password_that_fails_saslprep_is_refused_before_authenticate() {
+        let Err(err) = AuthenticateScramConsumer::new(
+            ScramHash::Sha256,
+            "user".to_owned(),
+            "bad\u{7}".to_owned().into(),
+            "nonce123".to_owned(),
+            true,
+            ScramChannelBinding::None,
+        ) else {
+            panic!("a prohibited password must not build a consumer");
+        };
+        assert!(matches!(err, Error::InvalidInput(_)), "got {err:?}");
+        assert!(!err.is_connection_fatal());
     }
 
     #[test]

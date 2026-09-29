@@ -638,7 +638,7 @@ Plaintext AUTH is refused by default for both passwords and OAuth bearer tokens.
 
 AUTH continuation formatting treats challenge responses as continuation lines even for mechanisms supporting initial response. Required for OAUTHBEARER failed-auth dummy-cancel exchange (`AQ==` on the wire).
 
-`SaslError` maps at the `From<SaslError> for Error` boundary: `Protocol` (malformed SASL, signature mismatch) to `ErrorKind::Parse`; `AuthFailed` (SCRAM `e=` server error) to `ErrorKind::InvalidInput` + `SmtpCommandPhase::Auth` so `account_error.rs` routes it to `Authorization(PolicyBlocked)`.
+`SaslError` maps at the `From<SaslError> for Error` boundary: `Protocol` (malformed SASL, signature mismatch) to `ErrorKind::Parse`; `AuthFailed` (SCRAM `e=` server error) to `ErrorKind::InvalidInput` + `SmtpCommandPhase::Auth` so `account_error.rs` routes it to `Authorization(PolicyBlocked)`; `InvalidCredential` (a username or password that fails SASLprep) to a phase-less `ErrorKind::InvalidInput`, so `Request(Malformed)`. `ScramExchange::new` prepares both credentials, before the AUTH line is sent, so that last refusal is local and never reaches the wire.
 
 Builder helpers: `.password(user, password)` for password auth,
 `.oauth2(identity, access_token)` for a raw OAuth bearer string, and

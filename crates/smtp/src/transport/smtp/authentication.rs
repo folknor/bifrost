@@ -437,6 +437,12 @@ impl From<bifrost_sasl::SaslError> for Error {
     fn from(e: bifrost_sasl::SaslError) -> Self {
         match e {
             bifrost_sasl::SaslError::Protocol(m) => error::parse(m),
+            // A caller credential that fails SASLprep, refused while the
+            // exchange is built, before the AUTH line is sent. Deliberately
+            // NOT Auth-phase tagged: that lane maps to PolicyBlocked, and
+            // this is the caller's input, `Request(Malformed)`, per the
+            // local-refusal rule in `reference/error-model.md`.
+            bifrost_sasl::SaslError::InvalidCredential(m) => error::invalid_input(m),
             bifrost_sasl::SaslError::AuthFailed(m) => {
                 error::invalid_input(m).with_phase(SmtpCommandPhase::Auth { mechanism: None })
             }
@@ -580,6 +586,9 @@ fn named_sasl_error(mechanism: &'static str, error: bifrost_sasl::SaslError) -> 
         bifrost_sasl::SaslError::Protocol(m) => {
             bifrost_sasl::SaslError::Protocol(format!("{m} (mechanism {mechanism})"))
         }
+        bifrost_sasl::SaslError::InvalidCredential(m) => {
+            bifrost_sasl::SaslError::InvalidCredential(format!("{m} (mechanism {mechanism})"))
+        }
         bifrost_sasl::SaslError::AuthFailed(m) => {
             bifrost_sasl::SaslError::AuthFailed(format!("{m} (mechanism {mechanism})"))
         }
@@ -597,7 +606,10 @@ pub(crate) struct ScramExchange {
     /// authority, so a diagnostic can never name a rung other than the one
     /// actually sent.
     mechanism_name: &'static str,
-    password: bifrost_sasl::Secret,
+    /// Prepared (RFC 4013 `SASLprep`) in `new`, before the AUTH line is sent, so a password the
+    /// caller supplied that cannot be prepared is refused locally rather than
+    /// discovered after the server-first message.
+    password: bifrost_sasl::ScramPassword,
     client_nonce: String,
     client_first_bare: String,
     expected_server_signature: Option<Vec<u8>>,
@@ -616,6 +628,7 @@ impl ScramExchange {
             "n={},r={client_nonce}",
             bifrost_sasl::prepare_scram_username(username)?
         );
+        let password = bifrost_sasl::prepare_scram_password(password.as_str())?;
         Ok(ScramExchange {
             mechanism_name: hash.mechanism_name(binding.binding()),
             hash,
@@ -995,6 +1008,28 @@ mod test {
         );
     }
 
+    /// A password that fails `SASLprep` is refused when the exchange is BUILT,
+    /// before the AUTH line is sent, as the caller's invalid input - not a
+    /// parse fault, and not on the Auth-phase lane that maps to
+    /// `PolicyBlocked`. It used to surface from `step`, after the server-first
+    /// message, as a protocol-class parse error.
+    #[test]
+    fn a_password_that_fails_saslprep_is_refused_before_the_exchange() {
+        use super::{ScramChannelBinding, ScramExchange, ScramHash};
+        use crate::transport::smtp::error::ErrorKind;
+
+        let Err(err) = ScramExchange::new(
+            ScramHash::Sha256,
+            ScramChannelBinding::None,
+            "user",
+            "bad\u{7}".into(),
+        ) else {
+            panic!("a prohibited password must not build an exchange");
+        };
+        assert_eq!(err.kind(), &ErrorKind::InvalidInput);
+        assert_eq!(err.phase(), None);
+    }
+
     #[test]
     fn scram_exchange_none_binding_drives_to_complete() {
         use super::{ScramExchange, ScramStep, scram_hash};
@@ -1025,7 +1060,7 @@ mod test {
         // re-deriving the signature through scram_client_final with the exact
         // client-first-bare the exchange used.
         let client_first_bare = format!("n=user,r={nonce}");
-        let password: bifrost_sasl::Secret = "pencil".into();
+        let password = bifrost_sasl::prepare_scram_password("pencil").unwrap();
         let (_cf, sig) = bifrost_sasl::scram_client_final(
             hash,
             &password,
