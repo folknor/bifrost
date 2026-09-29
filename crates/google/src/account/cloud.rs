@@ -76,7 +76,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::error::{GmailErrorContext, into_account_error};
 use crate::client::GmailClient;
-use crate::error::{Error, GmailResponseHeaders, GmailService};
+use crate::error::{Error, GmailResponseHeaders, GmailService, ProviderFault};
 
 /// Minimum alignment for upload chunks (256 KiB per Google Drive API spec).
 const GDRIVE_CHUNK_ALIGN: usize = 256 * 1024;
@@ -202,6 +202,15 @@ async fn upload_and_link(
             SessionDisposition::NotOpen,
         ));
     }
+    // Refused here, before the session POST, so the refusal really is of an
+    // unsent request. Raised inside the chunk loop instead, it came after a
+    // session had been created (and then had to be cancelled).
+    if bytes.is_empty() {
+        return Err((
+            Error::invalid_request(AccountOperation::HostAttachment, "cannot upload empty file"),
+            SessionDisposition::NotOpen,
+        ));
+    }
 
     let upload_url = create_upload_session(client, &meta)
         .await
@@ -309,9 +318,11 @@ async fn create_upload_session(
         .get("location")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
+        // A success status with no session URI is Drive breaking the
+        // resumable protocol, not the caller asking for something wrong.
         .ok_or_else(|| {
-            Error::invalid_request(
-                AccountOperation::HostAttachment,
+            Error::provider_response(
+                ProviderFault::MissingField,
                 "upload session response missing Location header",
             )
         })
@@ -323,31 +334,37 @@ async fn create_upload_session(
 /// 200/201 -> the final chunk was accepted; parse the file metadata. 308 ->
 /// resume, advancing the offset from the parsed `Range: bytes=0-N` header.
 ///
-/// Bug fix vs. the ratatoskr source: on a 308 whose `Range` header is absent or
-/// unparseable, this FAILS rather than falling back to `offset = end`. The old
-/// fallback silently skips a gap whenever the server accepted fewer bytes than
-/// were sent, corrupting the upload. An unparseable resume cursor is
-/// unrecoverable for this attempt.
+/// Bug fix vs. the ratatoskr source: a 308 never advances by `offset = end`. The
+/// old fallback silently skips a gap whenever the server accepted fewer bytes
+/// than were sent, corrupting the upload.
+///
+/// Every refusal below comes after a complete response, and is classified by
+/// what that response did. Drive persisting bytes we never sent, forgetting
+/// bytes it already reported, or reporting every byte without completing is the
+/// provider breaking the resumable protocol (`Protocol(ContractViolation)`); a
+/// `Range` that does not parse is `Protocol(ParseFailed)`. A chunk that made no
+/// progress is legal - Drive documents resending from its reported offset - so
+/// refusing it, like the total attempt budget, is this crate's own limit
+/// (`Internal(LimitExceeded)`). None of it is the caller's fault.
 async fn upload_file_chunked(
     client: &GmailClient,
     upload_url: &str,
     data: Bytes,
     chunk_size: usize,
 ) -> Result<String, Error> {
+    // Both are guaranteed by the callers (the chunk size is a constant, and
+    // `upload_and_link` refuses an empty payload before opening a session), so
+    // reaching either is this crate's bug.
     if chunk_size == 0 || !chunk_size.is_multiple_of(GDRIVE_CHUNK_ALIGN) {
-        return Err(Error::invalid_request(
-            AccountOperation::HostAttachment,
-            format!(
-                "chunk_size must be a positive multiple of {GDRIVE_CHUNK_ALIGN}, got {chunk_size}"
-            ),
-        ));
+        return Err(Error::internal(format!(
+            "chunk_size must be a positive multiple of {GDRIVE_CHUNK_ALIGN}, got {chunk_size}"
+        )));
     }
 
     let total = data.len();
     if total == 0 {
-        return Err(Error::invalid_request(
-            AccountOperation::HostAttachment,
-            "cannot upload empty file",
+        return Err(Error::internal(
+            "empty payload reached the chunk loop; it is refused before the session opens",
         ));
     }
 
@@ -359,10 +376,9 @@ async fn upload_file_chunked(
     while offset < total {
         attempts = attempts.saturating_add(1);
         if attempts > max_attempts {
-            return Err(Error::invalid_request(
-                AccountOperation::HostAttachment,
-                format!("resumable upload exceeded {max_attempts} chunk attempts"),
-            ));
+            return Err(Error::limit_exceeded_after_response(format!(
+                "resumable upload exceeded {max_attempts} chunk attempts"
+            )));
         }
         let end = (offset + chunk_size).min(total);
         let chunk = data.slice(offset..end);
@@ -390,11 +406,32 @@ async fn upload_file_chunked(
             }
             308 => {
                 let resumed = parse_resume_offset(&response.headers)?;
-                if resumed <= offset || resumed > end {
-                    return Err(Error::invalid_request(
-                        AccountOperation::HostAttachment,
+                if resumed > end {
+                    return Err(Error::provider_response(
+                        ProviderFault::ContractViolation,
                         format!(
-                            "resumable 308 made invalid progress from {offset} to {resumed} after sending through {end}"
+                            "resumable 308 reports {resumed} bytes received after only {end} were sent"
+                        ),
+                    ));
+                }
+                if resumed < offset {
+                    return Err(Error::provider_response(
+                        ProviderFault::ContractViolation,
+                        format!(
+                            "resumable 308 reports {resumed} bytes received, fewer than the {offset} it already reported"
+                        ),
+                    ));
+                }
+                if resumed == offset {
+                    return Err(Error::limit_exceeded_after_response(format!(
+                        "resumable 308 made no progress from {offset}; refusing to resend without progress"
+                    )));
+                }
+                if resumed == total {
+                    return Err(Error::provider_response(
+                        ProviderFault::ContractViolation,
+                        format!(
+                            "resumable 308 reports all {total} bytes received but did not complete the upload"
                         ),
                     ));
                 }
@@ -406,26 +443,32 @@ async fn upload_file_chunked(
         }
     }
 
-    Err(Error::invalid_request(
-        AccountOperation::HostAttachment,
-        "upload completed without receiving a file response",
+    // Unreachable: `offset` only ever takes a 308's `resumed`, which the arm
+    // above has already refused when it reaches `total`.
+    Err(Error::internal(
+        "chunk loop ended without a file response or a refusal",
     ))
 }
 
-/// Parse the next byte offset from a 308 `Range: bytes=0-N` header. Returns an
-/// error (never a silent skip) when the header is absent or unparseable.
+/// Parse the number of bytes Drive has persisted from a 308 `Range: bytes=0-N`
+/// header (`N + 1`). An ABSENT header is Drive's documented way of saying no
+/// bytes have been received, so it reads as zero; the caller's progress check
+/// then refuses it, and it can never skip a gap. A present header that does not
+/// parse is an error, never a guess.
 fn parse_resume_offset(headers: &reqwest::header::HeaderMap) -> Result<usize, Error> {
-    headers
-        .get("range")
-        .and_then(|v| v.to_str().ok())
+    let Some(value) = headers.get("range") else {
+        return Ok(0);
+    };
+    value
+        .to_str()
+        .ok()
         .and_then(|range| range.strip_prefix("bytes=0-"))
         .and_then(|end| end.parse::<usize>().ok())
         .and_then(|last_byte| last_byte.checked_add(1))
         .ok_or_else(|| {
-            Error::invalid_request(
-                AccountOperation::HostAttachment,
-                "resumable 308 had an absent or unparseable Range header; \
-                 refusing to skip a gap",
+            Error::provider_response(
+                ProviderFault::ParseFailed,
+                "resumable 308 had an unparseable Range header; refusing to skip a gap",
             )
         })
 }
@@ -635,13 +678,15 @@ mod tests {
 
     #[test]
     fn unparseable_308_range_fails_does_not_skip_gap() {
-        // An absent Range header on a 308 must FAIL, never advance by
-        // `offset = end` (which would silently skip a gap if the server
-        // accepted fewer bytes than were sent).
+        // An absent Range header on a 308 is Drive's documented "no bytes
+        // received": it reads as zero, never as `offset = end` (which would
+        // silently skip a gap if the server accepted fewer bytes than were
+        // sent). The chunk loop then refuses it as no progress; see
+        // `an_absent_range_after_progress_is_refused_without_skipping_a_gap`.
         let empty = reqwest::header::HeaderMap::new();
-        assert!(parse_resume_offset(&empty).is_err());
+        assert_eq!(parse_resume_offset(&empty).unwrap(), 0);
 
-        // A present-but-garbage Range header must also fail.
+        // A present-but-garbage Range header must fail.
         let mut garbage = reqwest::header::HeaderMap::new();
         garbage.insert("range", "bytes=garbage".parse().unwrap());
         assert!(parse_resume_offset(&garbage).is_err());
@@ -878,5 +923,220 @@ mod tests {
             format!("{:?}", b.recovery()),
             "decoration must not change what the engine does next"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Classification: none of the upload refusals below is the caller's
+    // fault. Each was `Request(Malformed)` (`ClientBug`, "fix the client
+    // request") before, with no transmission evidence, so it read `Unsent`
+    // although a complete response had arrived.
+    // -----------------------------------------------------------------
+
+    fn attempt_state(error: &AccountError) -> Option<bifrost_types::TransmissionState> {
+        error.chain().iter().find_map(|cause| match cause {
+            bifrost_types::Cause::Attempt(attempt) => Some(attempt.transmission_state),
+            _ => None,
+        })
+    }
+
+    fn resume_with(range: Option<&str>) -> Canned {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(range) = range {
+            headers.insert("range", range.parse().expect("valid Range"));
+        }
+        Canned::Response {
+            status: reqwest::StatusCode::PERMANENT_REDIRECT,
+            headers,
+            body: Bytes::new(),
+        }
+    }
+
+    fn cancel_accepted() -> Canned {
+        Canned::Response {
+            status: reqwest::StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::new(),
+        }
+    }
+
+    async fn failed_upload(script: &Arc<ScriptedDispatch>) -> AccountError {
+        run(
+            &scripted_client(script),
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+        )
+        .await
+        .expect_err("the upload fails")
+    }
+
+    fn assert_provider_fault(error: &AccountError, kind: bifrost_types::ProtocolErrorKind) {
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(kind),
+            "a broken provider response is the provider's fault"
+        );
+        assert_eq!(
+            attempt_state(error),
+            Some(bifrost_types::TransmissionState::Acknowledged),
+            "a complete response arrived"
+        );
+    }
+
+    fn assert_client_limit(error: &AccountError) {
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::LimitExceeded
+            ),
+            "declining to go further is this crate's own limit"
+        );
+        assert_eq!(
+            attempt_state(error),
+            Some(bifrost_types::TransmissionState::Acknowledged),
+            "every request sent had been answered"
+        );
+    }
+
+    /// A 2xx session response without `Location` leaves nothing to upload
+    /// to: Drive broke the protocol. There is no session URI, so no cancel.
+    #[tokio::test]
+    async fn a_session_response_without_location_is_a_provider_missing_field() {
+        let script = ScriptedDispatch::new([cancel_accepted()]);
+        let error = failed_upload(&script).await;
+
+        assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::MissingField);
+        assert_eq!(script.requests().len(), 1, "only the session POST was sent");
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_308_range_is_a_provider_parse_failure() {
+        let script = ScriptedDispatch::new([
+            session_created(),
+            resume_with(Some("bytes=garbage")),
+            cancel_accepted(),
+        ]);
+        let error = failed_upload(&script).await;
+
+        assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::ParseFailed);
+        assert_eq!(script.remaining(), 0, "the session was still cancelled");
+    }
+
+    /// Seven bytes were sent; Drive claims ten.
+    #[tokio::test]
+    async fn a_308_claiming_bytes_never_sent_is_a_contract_violation() {
+        let script = ScriptedDispatch::new([
+            session_created(),
+            resume_with(Some("bytes=0-9")),
+            cancel_accepted(),
+        ]);
+        let error = failed_upload(&script).await;
+
+        assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::ContractViolation);
+    }
+
+    /// Drive reported three bytes, then answered the next chunk with no
+    /// `Range` (documented as "no bytes received"): it forgot bytes it had
+    /// reported. The loop must neither resume past the gap nor blame the
+    /// caller.
+    #[tokio::test]
+    async fn an_absent_range_after_progress_is_refused_without_skipping_a_gap() {
+        let script = ScriptedDispatch::new([
+            session_created(),
+            resume_with(Some("bytes=0-2")),
+            resume_with(None),
+            cancel_accepted(),
+        ]);
+        let error = failed_upload(&script).await;
+
+        assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::ContractViolation);
+        let requests = script.requests();
+        assert_eq!(requests.len(), 4, "session, two chunk PUTs, cancel");
+        assert_eq!(
+            requests[2]
+                .headers
+                .get("content-range")
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes 3-6/7"),
+            "the second chunk resumed exactly where Drive said it stood"
+        );
+        assert_eq!(requests[3].method, reqwest::Method::DELETE);
+    }
+
+    /// A 308 reporting every byte is a 308 that should have been a 200/201.
+    /// This used to fall out of the loop as "completed without a file
+    /// response" and be blamed on the caller.
+    #[tokio::test]
+    async fn a_308_reporting_every_byte_without_completing_is_a_contract_violation() {
+        let script = ScriptedDispatch::new([
+            session_created(),
+            resume_with(Some("bytes=0-6")),
+            cancel_accepted(),
+        ]);
+        let error = failed_upload(&script).await;
+
+        assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::ContractViolation);
+        assert_eq!(script.remaining(), 0, "the session was cancelled");
+    }
+
+    /// No progress on a chunk is legal (Drive documents resending from its
+    /// offset); refusing to resend is this crate's decision.
+    #[tokio::test]
+    async fn a_chunk_without_progress_is_refused_as_a_client_limit() {
+        let script =
+            ScriptedDispatch::new([session_created(), resume_with(None), cancel_accepted()]);
+        let error = failed_upload(&script).await;
+
+        assert_client_limit(&error);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_chunk_budget_is_a_client_limit() {
+        let responses = (0..9).map(resume_response).collect::<Vec<_>>();
+        let script = ScriptedDispatch::new(responses);
+
+        let error = upload_file_chunked(
+            &scripted_client(&script),
+            "https://upload.test/session",
+            Bytes::from_static(b"a payload longer than nine bytes"),
+            GDRIVE_CHUNK_ALIGN,
+        )
+        .await
+        .expect_err("tiny progress exhausts the budget");
+        let error = into_account_error(error, ctx());
+
+        assert_client_limit(&error);
+        assert_eq!(
+            error.recovery(),
+            &bifrost_types::RecoveryClass::InternalFailure,
+            "a client limit is terminal, not a retry"
+        );
+    }
+
+    /// An empty payload is the caller's input, and it is refused before any
+    /// byte is sent. It used to open a session first, refuse inside the chunk
+    /// loop, and then cancel the session it never needed.
+    #[tokio::test]
+    async fn an_empty_payload_is_refused_before_a_session_opens() {
+        let script = ScriptedDispatch::new(Vec::<Canned>::new());
+        let error = run(
+            &scripted_client(&script),
+            "user@example.com",
+            Bytes::new(),
+            CloudUploadMeta::new(
+                "empty.bin",
+                "application/octet-stream",
+                0,
+                ShareScope::Anyone,
+            ),
+        )
+        .await
+        .expect_err("an empty upload is refused");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+        assert!(script.requests().is_empty(), "nothing was sent");
     }
 }

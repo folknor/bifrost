@@ -51,14 +51,32 @@ Internal modules:
   permission, one call. Session POST uses the raw `account_net()`
   builder (sets `X-Upload-Content-*`, which typed `post` cannot); the
   pre-authed chunk PUT skips auth (`.without_bearer_auth()`) and
-  resumes on 308 via `Range: bytes=0-N` - an absent/unparseable 308
-  `Range`, a non-advancing/backward cursor, or a cursor beyond the bytes just
-  sent is a hard failure, never a silent gap-skip. The loop also bounds total
-  chunk attempts to the expected chunk count plus eight, so malicious tiny
-  progress cannot hold the caller forever. Then a
+  resumes on 308 via `Range: bytes=0-N`. A 308 never advances by the bytes
+  just sent, so it can never silently skip a gap. An ABSENT `Range` on a 308
+  is Google's documented "no bytes received yet" and reads as offset 0; the
+  progress check below then refuses it (no progress from offset 0, or a
+  regression after earlier progress), so it is never resumed past. The
+  loop also bounds total chunk attempts to the expected chunk count plus
+  eight, so malicious tiny progress cannot hold the caller forever. Then a
   `permissions` POST (`type: anyone` / `type: domain` + account domain)
   and a `webViewLink` GET. The 308 reaches the loop only via
   bifrost-net's missing-`Location` passthrough.
+  The upload's local refusals are classified by what happened, and only
+  those raised before any request blame the caller: a mismatched declared
+  size or an empty payload is `Request(Malformed)`, refused before the
+  session POST, so no session exists to cancel. The refusals that follow a
+  complete response carry `AttemptCause(Acknowledged)`: a 2xx session response with no `Location`
+  is `Protocol(MissingField)`; a present 308 `Range` that does not parse
+  is `Protocol(ParseFailed)`; a 308 claiming bytes never sent, fewer bytes
+  than it already reported, or every byte without completing the upload is
+  `Protocol(ContractViolation)`. A chunk that made no progress is legal
+  (Drive documents resending from its reported offset), so refusing it,
+  like the exhausted chunk-attempt budget, is this crate's own limit:
+  `Internal(LimitExceeded)`, terminal `InternalFailure`. A misaligned chunk
+  size or an empty payload reaching the chunk loop, and the loop ending
+  with neither a file response nor a refusal, are unreachable by
+  construction and map to `Internal(InvariantViolated)` with no attempt
+  cause.
   A resumable session is server-side state that Drive holds for about a
   week, so any failure of the upload leg cancels its own session on the
   way out: one un-retried `DELETE` against the session URI, bounded by a
@@ -509,7 +527,11 @@ again - a bare stub carrying an id and `status: "cancelled"` and no `start`,
 `EventTime` on both bounds rather than being refused: a deletion notice is
 not a malformed event, and it is the notice `showDeleted=true` was asked
 for. The tolerance is gated on the cancelled status. A LIVE event the
-provider sends without times is still a projection error.
+provider sends without times is still a projection error
+(`Protocol(MissingField)`), and that includes a live event with a start and
+no end: Google documents that an end is provided even when the event's end
+is unspecified (`endTimeUnspecified: true`), so projecting a missing one as
+zero-length would invent a duration the provider promised to state.
 Projection failures are per item, not per page. `page_from_events` routes a
 refused event onto `Page::failed_ids` under its composite native id and
 serves the rest of the page, matching how bifrost-jmap and bifrost-caldav
@@ -542,7 +564,13 @@ empty `EventRecurrence` sends `[]` (the Google idiom for clearing
 RRULE/RDATE/EXDATE), while an absent recurrence patch omits the key.
 Google carries the timed/all-day distinction in the `start`/`end` shape
 (`date` vs `dateTime`), not a flag, so an `is_all_day` flip is rejected
-as unsupported unless the patch also carries both `start` and `end`.
+as `Unsupported(EventUpdate)` unless the patch also carries both `start` and
+`end` (`reject_unexpressible_all_day_patch`). `Unsupported`, not
+`Request(Malformed)`: the patch is valid shared input that other providers
+apply as it stands (CalDAV re-emits the stored DTSTART/DTEND under the new
+value type, JMAP sets `showWithoutTime`); it is this implementation that
+cannot express it without reading the current bounds, so a `ClientBug`
+classification would be false.
 
 Calendar mutations advertise `MutationConcurrency::None` and write blind:
 `event_update`/`event_delete`/`event_rsvp` send PATCH/DELETE without
@@ -567,13 +595,16 @@ envelope_version: 1, bytes }`. Serialization is an invariant boundary:
 the data-only state must serialize, and an impossible encoder failure
 panics instead of minting an empty poisoned cursor. `decode_gmail_state` rejects
 wrong protocol, wrong envelope version, and wrong schema
-version, mapping each to `AccountError::SchemaIncompatible`.
-JSON deserialization errors map to `AccountError::Other`.
+version, each translating to `SyncState(SchemaIncompatible)`.
+A payload that fails JSON deserialization translates to
+`SyncState(CursorInvalid)`.
 
 `decode_gmail_state_for_profile` layers an identity check on top: the decoded
 `profile_email` must equal the open account's `email_address` under an
 ASCII-case-insensitive comparison. A mismatch
-returns `AccountError::Other` describing both sides, preventing a checkpoint
+returns `GmailLocalError::AccountIdentityMismatch`, translated to
+`SyncState(SchemaIncompatible)` with support-only text naming both sides,
+preventing a checkpoint
 from one Google account being replayed into another (for example after the
 consumer rotates accounts under the same persistence key).
 
@@ -792,12 +823,30 @@ its own repeated-token detection and 10,000-page refusal budget. Where a page
 trips both guards, the repeated-token check is evaluated FIRST and owns the
 diagnostic: it names a provider contract breach, where the budget only reports
 "too many pages", which is also what an honestly huge corpus looks like. Both
-refusals terminate the walk identically as far as the engine is concerned, so
-the order is purely a diagnostic choice - but it is a fixed one in the two Gmail
+refusals end the walk with a terminal recovery class, so the order is purely a
+diagnostic choice - but it is a fixed one in the two Gmail
 sync walks and in `contactGroups.list`, pinned per lane by a test that feeds a
 page tripping both, and `calendars_list` reaches the same order structurally
 (its budget is the `for` loop's own bound, so it can only fire after the token
-check). The production paging sites are:
+check).
+
+Every walk hands its refusal to the error boundary as one crate-level
+`PageRefusal` (`RepeatedToken` or `BudgetExceeded`), converted to the
+matching `GmailLocalError` variant, so every walk classifies the two guards
+the same way. They are classified by who is at fault, not as a missing field:
+
+- A repeated token (`GmailLocalError::PageTokenRepeated`) is the provider
+  cycling, a contract breach no further paging fixes:
+  `Protocol(ContractViolation)` with `AttemptCause(Acknowledged)`, because a
+  complete response carried the token. It derives the terminal
+  `ProviderContractViolation`.
+- An exhausted page budget (`GmailLocalError::PageBudgetExceeded`) is
+  neither a provider fault nor a bug - it is what an honestly huge collection
+  looks like, and the implementation declined to go further:
+  `Internal(LimitExceeded)`, terminal `InternalFailure`, with no attempt
+  cause.
+
+The production paging sites are:
 
 - Gmail `search` and `search_messages` each request one provider page and return
   its `nextPageToken`. They are bounded by one request per call and resume at a
@@ -811,9 +860,9 @@ check). The production paging sites are:
   mid-walk, and only its final batch checkpoints, using the first page's history
   boundary as described above - so a refusal must terminate rather than truncate,
   or the walk would emit a checkpoint for ground it never read. Both guards
-  therefore produce `SyncEvent::Terminated` carrying
-  `Protocol(ContractViolation)`, discarding the page in hand; the next walk
-  restarts from the same unchanged `startHistoryId`.
+  therefore produce `SyncEvent::Terminated`, carrying the classification
+  above, and discard the page in hand; the next walk restarts from the same
+  unchanged `startHistoryId`.
 - People `address_books_list` traverses `contactGroups.list` with repeated-token
   detection and a 10,000-page budget. It returns `Err` on refusal, never the
   accumulated prefix as a complete address-book list.
@@ -1258,11 +1307,39 @@ Mapping highlights:
   originating `ServerCause::{Unavailable, RateLimited, QuotaExhausted}`
   and forwarded to `RetryAdvice::retry_hint`; no separate
   `retry_not_before` side-channel.
-- Local validation failures (`GmailLocalError::*`) ->
-  `Request(Malformed)` or `Request(InvalidArgument)` ->
-  `ClientBug`. The identity-mismatch and cursor-envelope
-  variants produce `SyncState(SchemaIncompatible)` ->
-  `Engine(SchemaIncompatible)` so the engine clears the cursor.
+- Local failures (`GmailLocalError::*`) map by who is at fault, per the
+  three disjoint blame families in `reference/error-model.md`:
+  - `InvalidRequest` (caller input this crate cannot use, refused before
+    the request it would shape is sent) -> `Request(Malformed)` ->
+    `ClientBug`. Google Calendar and People route an event id without a
+    calendar id, a non-UTF-8 page cursor, a range bound with no RFC 3339
+    offset, an RSVP for an account that is not an attendee, and an
+    unsupported address-book id here (`caller_input_error`). A
+    cross-calendar search cursor naming a calendar no longer listed is
+    state that moved rather than caller input: `ConcurrencyConflict` with
+    `AttemptCause(Unsent)`, retried after a state refresh.
+  - `Unsupported` and `BlobRangeUnsupported` -> `Unsupported(op)`.
+  - `MissingField` (a response lacking something it must carry, such as a
+    created event with no id or a live event missing start or end) ->
+    `Protocol(MissingField)`, with no attempt cause.
+  - `ProviderResponse` (a complete, successful-status response that broke
+    its exchange's contract, such as the Drive resumable upload's) ->
+    `Protocol(MissingField | ParseFailed | ContractViolation)` by
+    `ProviderFault`, with `AttemptCause(Acknowledged)`.
+  - `PageTokenRepeated` -> `Protocol(ContractViolation)`, acknowledged;
+    `PageBudgetExceeded` -> `Internal(LimitExceeded)` (see Paging
+    inventory above).
+  - `Internal` (a state this crate believes impossible, such as a change
+    stream with no cursor) -> `Internal(InvariantViolated)`;
+    `LimitExceededAfterResponse` (this crate's own limit stopping a
+    multi-request exchange after every request sent was answered) ->
+    `Internal(LimitExceeded)` with `AttemptCause(Acknowledged)`. Both
+    derive the terminal `InternalFailure`.
+  - The cursor-envelope protocol, envelope-version and schema-version
+    mismatches and the account-identity mismatch produce
+    `SyncState(SchemaIncompatible)` -> `Engine(SchemaIncompatible)` so the
+    engine clears the cursor; a cursor payload that does not deserialize is
+    `SyncState(CursorInvalid)`.
 
 `mutation_error(ids, error, ctx)` is the ordinary per-id fan-out for batched mutations:
 it translates the crate-level error once via `into_account_error` and produces

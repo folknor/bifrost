@@ -281,8 +281,8 @@ pub(crate) fn changes_stream_cancellable(
 /// at all).
 ///
 /// Guard ORDER is deliberate: the repeated-token check runs FIRST. Both
-/// guards terminate the walk identically as far as the engine is
-/// concerned, but for a page that trips both, a repeated token is the
+/// guards terminate the walk with a terminal recovery class, but they
+/// blame different parties, and for a page that trips both, a repeated token is the
 /// sharper diagnosis - it names a provider contract breach, where the
 /// budget only reports "too many pages", which is also what an honestly
 /// huge mailbox looks like.

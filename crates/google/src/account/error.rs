@@ -29,6 +29,7 @@ use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, Tra
 
 use crate::error::{
     Error, GmailCursorFailure, GmailErrorEnvelope, GmailLocalError, GmailResponseError,
+    ProviderFault,
 };
 
 /// Resource hint that drives `NotFound` and `PermissionDenied` payloads.
@@ -1286,10 +1287,46 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
         // Client-side failures (`reference/error-model.md`): terminal
         // `InternalFailure`, remediation `ReportBug`, never the provider.
         GmailLocalError::Internal { detail } => {
-            internal(ctx, InternalErrorKind::InvariantViolated, detail)
+            internal(ctx, InternalErrorKind::InvariantViolated, detail, None)
         }
         GmailLocalError::PageBudgetExceeded { detail } => {
-            internal(ctx, InternalErrorKind::LimitExceeded, detail)
+            internal(ctx, InternalErrorKind::LimitExceeded, detail, None)
+        }
+        GmailLocalError::LimitExceededAfterResponse { detail } => internal(
+            ctx,
+            InternalErrorKind::LimitExceeded,
+            detail,
+            Some(TransmissionState::Acknowledged),
+        ),
+        // A whole response arrived and broke its contract: the provider's
+        // fault, never the caller's (`Request`) or this crate's (`Internal`).
+        GmailLocalError::ProviderResponse { fault, detail } => {
+            let kind = match fault {
+                ProviderFault::MissingField => ProtocolErrorKind::MissingField,
+                ProviderFault::ParseFailed => ProtocolErrorKind::ParseFailed,
+                ProviderFault::ContractViolation => ProtocolErrorKind::ContractViolation,
+            };
+            let detail = DiagnosticText::support_only(detail);
+            let mut builder = AccountErrorBuilder::new(
+                AccountErrorKind::Protocol(kind),
+                Cause::Wire(WireCause::MalformedResponse {
+                    protocol: Protocol::Gmail,
+                    detail: Some(detail.clone()),
+                }),
+            )
+            .push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::Acknowledged,
+            )))
+            .provider(Provider::Gmail)
+            .protocol(Protocol::Gmail)
+            .operation(ctx.operation)
+            .text(detail);
+            if let Some(scope) = ctx.scope.clone() {
+                builder = builder.scope(scope);
+            }
+            builder
+                .try_build()
+                .expect("valid account error classification")
         }
         // The provider handed back a page token it had already served: a
         // complete response carried it, so the evidence is `Acknowledged`.
@@ -1319,7 +1356,12 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
     }
 }
 
-fn internal(ctx: &GmailErrorContext, kind: InternalErrorKind, detail: String) -> AccountError {
+fn internal(
+    ctx: &GmailErrorContext,
+    kind: InternalErrorKind,
+    detail: String,
+    attempt: Option<TransmissionState>,
+) -> AccountError {
     let detail = DiagnosticText::support_only(detail);
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Internal(kind),
@@ -1329,6 +1371,9 @@ fn internal(ctx: &GmailErrorContext, kind: InternalErrorKind, detail: String) ->
     .protocol(Protocol::Gmail)
     .operation(ctx.operation)
     .text(detail);
+    if let Some(state) = attempt {
+        builder = builder.push_cause(Cause::Attempt(AttemptCause::new(state)));
+    }
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
     }

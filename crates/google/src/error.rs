@@ -220,6 +220,34 @@ pub(crate) enum GmailLocalError {
     PageBudgetExceeded {
         detail: String,
     },
+    /// A complete, successful-status provider response broke the contract of
+    /// the exchange it answered: a header it must carry was absent, a value
+    /// it carried did not parse, or the value contradicts the protocol. The
+    /// provider's fault, `Protocol(_)` by [`ProviderFault`], and
+    /// `Acknowledged` because the response arrived whole.
+    ProviderResponse {
+        fault: ProviderFault,
+        detail: String,
+    },
+    /// This crate's own safety limit stopped a multi-request exchange after
+    /// every request sent so far had been answered. `Internal(LimitExceeded)`,
+    /// `Acknowledged`: nothing is left in flight, and the provider did nothing
+    /// the protocol forbids.
+    LimitExceededAfterResponse {
+        detail: String,
+    },
+}
+
+/// Which part of a provider response's contract was broken; selects the
+/// `ProtocolErrorKind` of [`GmailLocalError::ProviderResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderFault {
+    /// A header or field the exchange requires was absent.
+    MissingField,
+    /// A header or field was present and did not parse.
+    ParseFailed,
+    /// The response parsed and contradicts the protocol.
+    ContractViolation,
 }
 
 /// Why a pagination walk stopped following its page token. The two guards
@@ -288,6 +316,15 @@ impl Display for GmailLocalError {
             Self::Internal { detail } => write!(f, "internal gmail error: {detail}"),
             Self::PageTokenRepeated { detail } | Self::PageBudgetExceeded { detail } => {
                 write!(f, "pagination refused: {detail}")
+            }
+            Self::ProviderResponse { fault, detail } => {
+                write!(
+                    f,
+                    "provider response broke its contract ({fault:?}): {detail}"
+                )
+            }
+            Self::LimitExceededAfterResponse { detail } => {
+                write!(f, "client limit exceeded: {detail}")
             }
         }
     }
@@ -370,6 +407,25 @@ impl Error {
     pub(crate) fn invalid_request(operation: AccountOperation, detail: impl Into<String>) -> Self {
         Self::Local(GmailLocalError::InvalidRequest {
             operation,
+            detail: detail.into(),
+        })
+    }
+
+    pub(crate) fn provider_response(fault: ProviderFault, detail: impl Into<String>) -> Self {
+        Self::Local(GmailLocalError::ProviderResponse {
+            fault,
+            detail: detail.into(),
+        })
+    }
+
+    pub(crate) fn limit_exceeded_after_response(detail: impl Into<String>) -> Self {
+        Self::Local(GmailLocalError::LimitExceededAfterResponse {
+            detail: detail.into(),
+        })
+    }
+
+    pub(crate) fn internal(detail: impl Into<String>) -> Self {
+        Self::Local(GmailLocalError::Internal {
             detail: detail.into(),
         })
     }

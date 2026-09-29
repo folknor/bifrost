@@ -584,6 +584,11 @@ fn event_from_google(
     // `EventTime` where it sent none. Refusing them would turn a normal
     // deletion into a projection error. A LIVE event missing its times is
     // still an error - that is a provider contract break, not a deletion.
+    // That includes a live event with a start and no end: Google documents
+    // that an end is sent even when the event's end is unspecified
+    // (`endTimeUnspecified: true`, "an end time is still provided for
+    // compatibility reasons"), so projecting a missing one as zero-length
+    // would invent a duration the provider promised to state.
     let start = match effective_start.map(event_time) {
         Some(start) => start,
         None if is_cancelled => unknown_event_time(),
@@ -963,6 +968,12 @@ fn event_patch_has_non_move_fields(patch: &EventPatch) -> bool {
 // that sets `is_all_day` without both bounds would issue a PATCH that
 // silently never converts the event, so reject it rather than accept a
 // no-op (reject-not-drop).
+//
+// `Unsupported`, not `Request(Malformed)`: the patch is well-formed shared
+// input that other providers apply as it stands (CalDAV re-emits the stored
+// DTSTART/DTEND under the new value type, JMAP sets `showWithoutTime`). It is
+// this implementation that cannot express it without a read of the current
+// bounds, so calling it a caller bug (`ClientBug`) would be false.
 fn reject_unexpressible_all_day_patch(patch: &EventPatch) -> Result<(), AccountError> {
     if patch.is_all_day.is_some() && !(patch.start.is_some() && patch.end.is_some()) {
         return Err(error::into_account_error(

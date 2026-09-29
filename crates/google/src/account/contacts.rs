@@ -99,8 +99,8 @@ pub(crate) fn address_books_list(
 ///
 /// Guard ORDER is deliberate and matches `inventory::inventory_walk_refusal`,
 /// `changes::walk_refusal` and `calendar::calendars_list`: the repeated-token
-/// check runs FIRST. Both guards terminate the walk, so the engine sees the
-/// same outcome either way, but a page that trips both deserves the sharper
+/// check runs FIRST. Both guards terminate the walk with a terminal recovery
+/// class, but they blame different parties, and a page that trips both deserves the sharper
 /// diagnosis. A repeated token names a provider contract breach - the server
 /// is cycling and no amount of further paging makes progress - where the
 /// budget only reports "too many pages", which is also what an honestly huge
