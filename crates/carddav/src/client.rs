@@ -2,7 +2,7 @@ use std::fmt;
 
 use bifrost_dav_core::{
     DavDispatch, DavProtocol, DavRequest, escape_xml, filter_unsupported, normalize_http_etag,
-    prepare_if_match, should_fallback_discovery, worse_recovery,
+    prepare_if_match, worse_recovery,
 };
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery, PutCondition};
 use bifrost_net::{AccountId, AccountNet};
@@ -80,57 +80,15 @@ impl CardDavClient {
         }
     }
 
+    /// The principal walk (well-known probe, fallback predicate, configured
+    /// base) is `bifrost-dav-core`'s, shared with `bifrost-caldav`; only the
+    /// addressbook-home lookup after it is CardDAV's own. This crate's copy of
+    /// the walk is the one that once diverged, parsing the probe body outside
+    /// the lookup so a probe answering `200 text/html` never reached the
+    /// fallback predicate.
     pub(crate) async fn discover_addressbook_home(&self) -> Result<String, AccountError> {
-        // Well-known discovery lives at the ORIGIN root (RFC 6764), so a
-        // configured base carrying a path must not have the well-known
-        // suffix appended to it: the resulting URL is not a discovery
-        // endpoint, and a deployment answering it with 401/403 rather
-        // than 404 would fail the open before the configured base was
-        // ever tried.
-        let well_known_url = bifrost_net::url::well_known_url(self.dav.base_url(), "carddav");
-        let dav_root = match well_known_url {
-            None => self.dav.base_url().to_string(),
-            // The probe's DECODE failure is a probe answer like any other, so it
-            // has to be raised as an `Err` that `should_fallback_discovery` can
-            // read. Parsing inside the `Ok` arm and lifting the failure with `?`
-            // put it outside the predicate entirely: an origin root answering
-            // `200 text/html` failed the open, while the same deployment
-            // answering an empty 207 fell back and worked.
-            Some(well_known_url) => match self.discover_principal(&well_known_url).await {
-                Ok(Some(principal)) => {
-                    return self.addressbook_home_for_principal(principal).await;
-                }
-                Ok(None) => self.dav.base_url().to_string(),
-                Err(error) if should_fallback_discovery(&error, DAV) => {
-                    self.dav.base_url().to_string()
-                }
-                Err(error) => return Err(error),
-            },
-        };
-
-        let principal = self.discover_principal(&dav_root).await?.ok_or_else(|| {
-            parse_error(AccountOperation::Discover, "missing current-user-principal")
-        })?;
+        let principal = self.dav.discover_current_user_principal().await?;
         self.addressbook_home_for_principal(principal).await
-    }
-
-    /// One principal PROPFIND, decode included.
-    ///
-    /// The decode lives here rather than at the call sites so both the
-    /// well-known probe and the configured-base leg produce the same
-    /// `Result<Option<String>, _>` shape, and the probe's fallback predicate
-    /// sees a malformed body as the probe answer it is. `bifrost-caldav`'s
-    /// `discover_principal` is the twin.
-    async fn discover_principal(&self, root: &str) -> Result<Option<String>, AccountError> {
-        let response = self
-            .dav
-            .propfind_raw(root, "0", PROPFIND_PRINCIPAL, AccountOperation::Discover)
-            .await?;
-        Ok(
-            extract_href_property(&response.text, "current-user-principal")
-                .map_err(|error| parse_error(AccountOperation::Discover, error))?
-                .map(|href| resolve_href(&response.url, &href)),
-        )
     }
 
     async fn addressbook_home_for_principal(
@@ -757,13 +715,6 @@ pub(crate) fn not_found_error(operation: AccountOperation, id: impl Into<String>
         .expect("valid account error classification")
 }
 
-const PROPFIND_PRINCIPAL: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-<D:propfind xmlns:D=\"DAV:\">\n\
-  <D:prop>\n\
-    <D:current-user-principal/>\n\
-  </D:prop>\n\
-</D:propfind>";
-
 const PROPFIND_ADDRESSBOOK_HOME: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:carddav\">\n\
   <D:prop>\n\
@@ -1321,6 +1272,76 @@ mod tests {
             requests[0].url, "https://dav.example.test/books/ada/personal/one.vcf",
             "the request addresses the card, never its derived parent collection"
         );
+    }
+
+    /// A card the SERVER sent that will not parse is the provider's malformed
+    /// response, on both single-resource doors that project it. Twin of
+    /// `bifrost-caldav`'s `an_unparseable_event_from_the_server_is_the_providers_fault`.
+    ///
+    /// Against the code before the fix both calls fail the kind assertion:
+    /// `project_error` went through `local_error`, which is `Request(Malformed)`
+    /// -> `ClientBug`. One response is scripted per call, so an update that went
+    /// on to PUT would starve the script and panic.
+    #[tokio::test]
+    async fn an_unparseable_card_from_the_server_is_the_providers_fault() {
+        use bifrost_types::account::Account as _;
+
+        const MALFORMED: &str =
+            "BEGIN:VCARD\r\nFN:Ada\r\nEMAIL;TYPE=\"unterminated:ada@example.test\r\nEND:VCARD\r\n";
+        let url = "https://dav.example.test/books/ada/personal/one.vcf";
+        let malformed = || DavResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: MALFORMED.to_string(),
+            url: String::new(),
+        };
+        let script = dav_script([malformed(), malformed()]);
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account = crate::account::CardDavAccount::for_tests(
+            client,
+            "https://dav.example.test/books/ada/personal/",
+        );
+
+        let got = account
+            .contact_get(bifrost_types::ContactId(url.into()))
+            .await
+            .expect_err("a card that will not parse cannot project");
+        let updated = account
+            .contact_update(
+                bifrost_types::ContactId(url.into()),
+                bifrost_types::ContactPatch::default(),
+            )
+            .await
+            .expect_err("an update cannot patch a card that will not parse");
+
+        for (door, error) in [("contact_get", got), ("contact_update", updated)] {
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
+                ),
+                "{door}: {:?}",
+                error.kind()
+            );
+            assert_eq!(
+                error.recovery(),
+                &RecoveryClass::ProviderContractViolation,
+                "{door}"
+            );
+            assert!(
+                error.chain().iter().any(|cause| matches!(
+                    cause,
+                    bifrost_types::Cause::Attempt(attempt)
+                        if attempt.transmission_state
+                            == bifrost_types::TransmissionState::Acknowledged
+                )),
+                "{door}: the server answered the GET"
+            );
+        }
+        assert_eq!(transcripts(&script).len(), 2, "one GET per door, no PUT");
     }
 
     /// An empty address book home lists NOTHING - no fabricated placeholder.

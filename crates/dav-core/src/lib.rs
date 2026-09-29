@@ -14,10 +14,13 @@
 //! impls are exactly what they were. Consumers see nothing.
 //!
 //! What stays in the protocol crates is what genuinely differs: property
-//! constants, query XML, the iCalendar and vCard projections, and the lanes only
+//! constants, query XML, the iCalendar and vCard projections, the lanes only
 //! one side has (CalDAV's `sync-collection` and scheduling, CardDAV's
-//! `getctag`).
+//! `getctag`), and the discovery steps after the principal. The principal walk
+//! itself - well-known probe, fallback predicate, configured base - is
+//! `DavDispatch::discover_current_user_principal`.
 
+mod discovery;
 mod dispatch;
 mod error;
 mod etag;

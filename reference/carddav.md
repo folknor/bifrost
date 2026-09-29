@@ -25,7 +25,9 @@ the suffix to a configured path - and falls
 back to the configured base URL both when that probe answers that it is not a
 discovery endpoint and when its successful body does not identify a current-user
 principal. The probe-only fallback triggers are 404, 405, a locally-refused
-cross-origin redirect, and a body that will not parse as DAV XML
+cross-origin redirect, a redirect the walk will not follow at all
+(`Protocol(ContractViolation)`: a chain past the hop cap, or a `Location` that
+will not resolve or will not decode), and a body that will not parse as DAV XML
 (`Protocol(ParseFailed)`, motivated by the front end answering the origin-root
 PROPFIND with `200 text/html` and its index page); 401 and 403 still fail the
 open, and `ParseFailed` is deliberately NOT a trigger on the configured-base
@@ -44,19 +46,30 @@ still propagate. The accepted cost is a lost DIAGNOSTIC - an operator is not
 told that the well-known endpoint is serving truncated XML. `reference/caldav.md`
 carries the same reasoning at length, and the twin must not drift from it.
 
-The walk is one shape across both crates: a `discover_principal(root)` helper
-runs the PROPFIND and the `current-user-principal` decode together, returning
+The walk is no longer a twin at all: it is
+`DavDispatch::discover_current_user_principal` in `bifrost-dav-core`
+(`discovery.rs`), shared with `bifrost-caldav`, and this crate's
+`discover_addressbook_home` calls it and keeps only the addressbook-home lookup
+after the principal. `DavProtocol::well_known_service` names the well-known
+suffix. Inside the walk one private `discover_principal(root)` runs the PROPFIND
+and the `current-user-principal` decode together, returning
 `Result<Option<String>, _>`, and both the well-known probe and the
 configured-base leg call it. Keeping the decode at the call site is what let
-this crate diverge - it parsed the probe body inside the `Ok(response)` arm and
-lifted the failure with `?`, so a probe answer that would not parse never
-reached the fallback predicate at all and failed the open, while the same
-deployment answering an empty 207 fell back and worked.
+this crate's former copy diverge - it parsed the probe body inside the
+`Ok(response)` arm and lifted the failure with `?`, so a probe answer that
+would not parse never reached the fallback predicate at all and failed the
+open, while the same deployment answering an empty 207 fell back and worked.
+One walk removes the second copy that could drift. It is pinned once, for both
+dialects, by the dav-core tests `reference/caldav.md` names.
 
-The predicate itself is no longer a twin: `should_fallback_discovery` lives in
-`bifrost-dav-core` (`error.rs`), parameterized by `DavProtocol`, and this crate
-calls it with `DavProtocol::CardDav`. It falls back on the dialect's own
-`NotFound` resource kind, a malformed request, a parse failure and a 405.
+The predicate, `should_fallback_discovery` in `bifrost-dav-core` (`error.rs`),
+is parameterized by `DavProtocol` and has one caller, that shared walk. It
+falls back on the dialect's own `NotFound` resource kind, a malformed request,
+a parse failure, a contract violation and a 405. The contract-violation arm
+covers the redirect failures `send_raw_request` now classifies through
+`bifrost-net`; they were `Request(Malformed)` and fell back through the
+malformed-request arm, so reclassifying them without it would have silently
+narrowed the predicate.
 
 ## Module layout
 
@@ -99,7 +112,13 @@ calls it with `DavProtocol::CardDav`. It falls back on the dialect's own
   the same one) and removed the earlier split where reqwest followed those
   internally, which stripped `Authorization` on any origin change with no
   way to restore it. A 303 is not followed, and the walk is bounded by
-  bifrost-net's `DEFAULT_MAX_HOPS`.
+  bifrost-net's `DEFAULT_MAX_HOPS`. A redirect the walk will not follow (past
+  that cap, or a `Location` that will not resolve or is not valid UTF-8) is
+  classified through `bifrost_net::into_account_error` as the transport
+  classifies its own: `Protocol(ContractViolation)` with
+  `Attempt(Acknowledged)`, not the `Request(Malformed)` it used to be. The
+  refused hop to an unadmitted origin stays a local `Request(Malformed)`;
+  `reference/caldav.md` carries the detail.
 - `parse.rs` - XML response parsers for addressbook discovery,
   contact listing, multiget hydration, depth-0 `getctag`, and nested href
   properties. Addressbook/listing/multiget and href-valued discovery
@@ -150,7 +169,13 @@ calls it with `DavProtocol::CardDav`. It falls back on the dialect's own
   Projection is fallible: a malformed body (unterminated quoted parameter,
   missing value, invalid UTF-8 in a folded run) returns a `VCardParseError`.
   Bulk listing/search route a single bad resource into `Page::failed_ids`;
-  single-resource get/update surface it as a local error.
+  single-resource get/update surface it through `project_error` as
+  `parse_error`: `Protocol(ParseFailed)` with an acknowledged attempt, deriving
+  `ProviderContractViolation`, because the card is the server's answer to a
+  GET. It was `local_error` (`Request(Malformed)` -> `ClientBug`), which blamed
+  the caller for the server's data. Pinned by
+  `an_unparseable_card_from_the_server_is_the_providers_fault`, twin of the
+  CalDAV test of the same shape.
   **Serialize/patch** keeps the hand-rolled verbatim-preserving splice:
   preserved (unmodeled) lines are re-emitted byte for byte on their physical
   line groups - no unfold/refold - and only freshly emitted lines are folded
@@ -561,9 +586,9 @@ drift, and both of which the extraction would otherwise have silently flattened:
 
 The two crates used to hand-mirror roughly 1500 lines of DAV machinery, and
 nothing compared the copies, so divergence was silent: eight separate defects
-were exactly that. The transport, credential gate, error ladder, 207 parser and
-polling cursor have all been collapsed into `bifrost-dav-core` and can no longer
-drift.
+were exactly that. The transport, credential gate, error ladder, 207 parser,
+polling cursor and principal discovery walk have all been collapsed into
+`bifrost-dav-core` and can no longer drift.
 
 Individual divergences are no longer NUMBERED. They used to be ("the eighth
 measured divergence", and so on), and the running tally stopped being true: the
@@ -578,9 +603,9 @@ was found by comparison rather than by a test. So each divergence is still
 recorded where it happened, and still says it is one.
 
 What remains duplicated is smaller but still real: the query bodies and property
-constants, the discovery walk (duplicated but no longer divergent: both crates
-decode inside one `discover_principal(root)` helper and apply the same
-four-answer fallback predicate), the `Unsupported` stubs each crate
+constants, the discovery step after the principal (which genuinely differs: an
+addressbook-home lookup here, a multi-property principal PROPFIND in CalDAV),
+the `Unsupported` stubs each crate
 carries for the other's domain, and the account-level orchestration around the
 shared pieces. **Any fix to shared-shape code here must still be checked against
 `bifrost-caldav`, and vice versa** - and where the fix is to something both

@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use bifrost_net::{
-    AccountNet, AccountSpec, Error as NetError, FollowRedirects, Net, NetErrorContext, TokenSource,
-    into_account_error,
+    AccountNet, AccountSpec, Error as NetError, FollowRedirects, MalformedRedirectKind, Net,
+    NetErrorContext, TokenSource, into_account_error,
 };
 use bifrost_types::{AccountError, AccountId, AccountOperation};
 use bytes::Bytes;
@@ -329,6 +329,34 @@ impl DavDispatch {
         )
     }
 
+    /// Classify a redirect this walk will not follow, through the transport's
+    /// own funnel.
+    ///
+    /// Redirects are disabled in `bifrost-net` and walked here, so the
+    /// transport never sees these failures - but they are the same failures its
+    /// own redirect loop reports, and they must classify the same way:
+    /// `Protocol(ContractViolation)` with an ACKNOWLEDGED attempt. Every one is
+    /// raised after the server answered a hop, and every one is about what the
+    /// server answered (a loop past the hop cap, a `Location` that will not
+    /// resolve or will not decode). They used to be `local_error`, which is
+    /// `Request(Malformed)` - `ClientBug`, blaming the caller for the provider's
+    /// redirect, with no transmission evidence at all.
+    ///
+    /// The refused redirect to an unadmitted origin is deliberately NOT here: it
+    /// is this client's own credential-gate decision, raised by `auth_headers`
+    /// before the next hop goes out.
+    fn redirect_error(&self, error: NetError, operation: AccountOperation) -> AccountError {
+        into_account_error(
+            error,
+            NetErrorContext {
+                provider: None,
+                protocol: self.protocol.protocol(),
+                operation,
+                scope: None,
+            },
+        )
+    }
+
     /// One wire attempt through `bifrost-net`, with its status-bearing failures
     /// turned back into responses.
     ///
@@ -506,11 +534,19 @@ impl DavDispatch {
                     | StatusCode::TEMPORARY_REDIRECT
                     | StatusCode::PERMANENT_REDIRECT
             );
-            let location = response
-                .headers
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok());
-            let Some(location) = location.filter(|_| redirect) else {
+            let location = match response.headers.get(reqwest::header::LOCATION) {
+                Some(value) if redirect => Some(value.to_str().map_err(|error| {
+                    self.redirect_error(
+                        NetError::MalformedRedirect {
+                            kind: MalformedRedirectKind::InvalidLocationEncoding,
+                            message: format!("Location header was not valid UTF-8: {error}"),
+                        },
+                        operation,
+                    )
+                })?),
+                _ => None,
+            };
+            let Some(location) = location else {
                 if !self.is_trusted_url(&response.url) {
                     return Err(local_error(
                         operation,
@@ -526,15 +562,24 @@ impl DavDispatch {
             let next = Url::parse(&response.url)
                 .and_then(|base| base.join(location))
                 .map_err(|error| {
-                    local_error(
+                    self.redirect_error(
+                        NetError::MalformedRedirect {
+                            kind: MalformedRedirectKind::UnresolvableLocation,
+                            message: format!(
+                                "Location {location:?} could not be resolved against base: {error}"
+                            ),
+                        },
                         operation,
-                        format!("unresolvable redirect target: {error}"),
-                        self.protocol,
                     )
                 })?;
             hops += 1;
             if hops > max_hops {
-                return Err(local_error(operation, "too many redirects", self.protocol));
+                return Err(self.redirect_error(
+                    NetError::RedirectLoop {
+                        hops: u16::try_from(hops).unwrap_or(u16::MAX),
+                    },
+                    operation,
+                ));
             }
             // Fresh credentials for the target origin; refused locally when
             // the origin was never admitted by discovery.
@@ -1101,6 +1146,85 @@ mod tests {
                     error.recovery()
                 );
             }
+        }
+    }
+
+    fn acknowledged(error: &AccountError) -> bool {
+        error.chain().iter().any(|cause| {
+            matches!(
+                cause,
+                bifrost_types::Cause::Attempt(attempt)
+                    if attempt.transmission_state == TransmissionState::Acknowledged
+            )
+        })
+    }
+
+    /// A redirect the walk will not follow is the PROVIDER's contract fault,
+    /// classified exactly as `bifrost-net` classifies its own redirect loop:
+    /// `Protocol(ContractViolation)` with an acknowledged attempt.
+    ///
+    /// Against the code before the reclassification every case fails the kind
+    /// assertion: the loop and the unresolvable `Location` were
+    /// `local_error` (`Request(Malformed)` -> `ClientBug`, no attempt), and a
+    /// `Location` that would not decode was not an error at all - the 3xx was
+    /// handed back as a response and classified by the status ladder as a
+    /// server refusal of status 302.
+    #[tokio::test]
+    async fn a_redirect_the_walk_will_not_follow_is_the_providers_contract_fault() {
+        let max_hops = usize::from(bifrost_net::DEFAULT_MAX_HOPS);
+        let looping = (0..=max_hops)
+            .map(|_| dav_redirect(StatusCode::TEMPORARY_REDIRECT, "/next"))
+            .collect::<Vec<_>>();
+        let mut undecodable = HeaderMap::new();
+        undecodable.insert(
+            reqwest::header::LOCATION,
+            HeaderValue::from_bytes(b"/caf\xe9").expect("obs-text is a legal header value"),
+        );
+        for (steps, requests, label) in [
+            (looping, max_hops + 1, "a chain past the hop cap"),
+            (
+                vec![dav_redirect(StatusCode::FOUND, "https://")],
+                1,
+                "a Location with no host will not resolve",
+            ),
+            (
+                vec![Canned::Response {
+                    status: StatusCode::FOUND,
+                    headers: undecodable,
+                    body: Bytes::new(),
+                }],
+                1,
+                "a Location that is not valid UTF-8",
+            ),
+        ] {
+            let script = dav_script(steps);
+            let dispatch = scripted_dispatch(scripted_dav_net(&script));
+
+            let error = dispatch
+                .propfind_raw(
+                    &format!("{BASE}/start"),
+                    "0",
+                    "<propfind/>",
+                    AccountOperation::Discover,
+                )
+                .await
+                .expect_err(label);
+
+            assert_eq!(transcripts(&script).len(), requests, "{label}");
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+                ),
+                "{label}: {:?}",
+                error.kind()
+            );
+            assert!(acknowledged(&error), "{label}: the server answered a hop");
+            assert_eq!(
+                error.recovery(),
+                &RecoveryClass::ProviderContractViolation,
+                "{label}"
+            );
         }
     }
 

@@ -59,6 +59,16 @@ impl DavProtocol {
             Self::CardDav => "carddav",
         }
     }
+
+    /// The RFC 6764 well-known service name discovery probes first
+    /// (`/.well-known/caldav`, `/.well-known/carddav`).
+    #[must_use]
+    pub fn well_known_service(self) -> &'static str {
+        match self {
+            Self::CalDav => "caldav",
+            Self::CardDav => "carddav",
+        }
+    }
 }
 
 #[must_use]
@@ -111,6 +121,14 @@ pub fn local_error(
     .expect("valid account error classification")
 }
 
+/// A server response whose body will not decode into what the request asked
+/// for.
+///
+/// Carries an ACKNOWLEDGED attempt, as [`status_error`] does: there is a body
+/// to fail to parse only because the server answered. Every caller hands this
+/// a body the server sent - a Multi-Status, a discovery property, an iCalendar
+/// or vCard resource - and none uses it for local input, which is what
+/// [`local_error`] is for.
 #[must_use]
 pub fn parse_error(
     operation: AccountOperation,
@@ -124,6 +142,9 @@ pub fn parse_error(
             detail: Some(DiagnosticText::support_only(message)),
         }),
     )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
     .protocol(protocol.protocol())
     .operation(operation)
     .try_build()
@@ -188,6 +209,15 @@ pub fn response_read_error(
     .expect("valid acknowledged response-overflow classification")
 }
 
+/// Classify a non-2xx status the server answered.
+///
+/// Every status here is one the server sent - on the response line, or as the
+/// member status of a 207 whose every response failed - so the error carries an
+/// ACKNOWLEDGED attempt, the transmission evidence `bifrost-net` stamps on the
+/// status-bearing failures it classifies itself. It moves no recovery class
+/// today (`derive` treats an acknowledged attempt like an unsent one on every
+/// kind this ladder mints), but its absence read as `Unsent` in the telemetry
+/// and support exports, which claimed the request never left the process.
 #[must_use]
 pub fn status_error(
     operation: AccountOperation,
@@ -247,6 +277,9 @@ pub fn status_error(
     };
 
     let mut builder = AccountErrorBuilder::new(kind, cause)
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
         .protocol(protocol.protocol())
         .operation(operation)
         .status(Some(status.as_u16()));
@@ -361,15 +394,16 @@ pub fn filter_unsupported(status: StatusCode, body: &str) -> bool {
 ///
 /// Applied to the `/.well-known/<dialect>` attempt ONLY, never to a request
 /// against the configured base URL, so widening it cannot mask a real failure
-/// of the account itself. Both protocol crates feed it the raw `Err` of a
-/// principal lookup whose XML decode is part of the lookup, so a body that will
-/// not parse reaches it as an error like any other probe answer.
+/// of the account itself. Its one caller is the shared principal walk,
+/// `DavDispatch::discover_current_user_principal`, which feeds it the raw `Err`
+/// of a principal lookup whose XML decode is part of the lookup, so a body that
+/// will not parse reaches it as an error like any other probe answer.
 ///
 /// A 401 or 403 still fails the open: those are answers from a discovery
 /// endpoint that exists and refused the credential, and quietly retrying the
 /// base URL would turn a reauthorization signal into a confusing later failure.
 ///
-/// Four answers mean the endpoint simply is not there:
+/// Five answers mean the endpoint simply is not there:
 /// - 404, the spec-correct one (`NotFound` naming the dialect's own resource).
 /// - 405 Method Not Allowed, what a static site or a proxy in front of the DAV
 ///   path answers a PROPFIND on the origin root with. Accepting only 404 failed
@@ -386,9 +420,21 @@ pub fn filter_unsupported(status: StatusCode, body: &str) -> bool {
 ///   than decoding as an empty multistatus. Without this arm that deployment
 ///   fails the open while the identical one answering an empty 207 falls back
 ///   and works.
+/// - A redirect the walk will not follow (`Protocol(ContractViolation)`): a
+///   chain past the hop cap, or a `Location` that will not resolve or decode.
+///   These classify as the transport's own redirect failures do, a provider
+///   contract violation. That is honest about blame, and without this arm it
+///   would silently narrow the predicate: as `Request(Malformed)` they used to
+///   fall back through the refused-redirect arm above.
+///   A well-known that loops is a probe answer nobody can use, the same shape as
+///   one that will not parse, and the fallback's fresh lookup against the
+///   configured base cannot inherit anything from it. On the probe path nothing
+///   else mints this kind: redirects are disabled in the transport, so its own
+///   redirect loop never runs, and the dispatcher maps an oversized body to
+///   `Protocol(PartialResponse)` before the transport's mapping is reached.
 ///
-/// Do NOT narrow that last arm. ANY `Protocol(ParseFailed)` from the well-known
-/// principal lookup triggers the fallback, INCLUDING malformed or truncated DAV
+/// Do NOT narrow the parse-failure arm. ANY `Protocol(ParseFailed)` from the
+/// well-known principal lookup triggers the fallback, INCLUDING malformed or truncated DAV
 /// XML from a genuine discovery endpoint. The predicate cannot distinguish that
 /// from a non-DAV body: both arrive here as an XML parse failure with no headers
 /// available, so the distinction is unobtainable at this seam rather than merely
@@ -410,7 +456,9 @@ pub fn should_fallback_discovery(error: &AccountError, protocol: DavProtocol) ->
     match error.kind() {
         AccountErrorKind::NotFound(resource) => *resource == protocol.resource(),
         AccountErrorKind::Request(RequestErrorKind::Malformed)
-        | AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
+        | AccountErrorKind::Protocol(
+            ProtocolErrorKind::ParseFailed | ProtocolErrorKind::ContractViolation,
+        )
         | AccountErrorKind::Server(ServerErrorKind::Error { status: Some(405) }) => true,
         _ => false,
     }
@@ -470,6 +518,107 @@ mod tests {
                 &parse_error(AccountOperation::Discover, "XML parse error", protocol),
                 protocol
             ));
+            // A redirect the walk will not follow, classified as the transport
+            // classifies its own. It fell back as `Request(Malformed)` before
+            // it was reclassified, and must keep doing so.
+            assert!(should_fallback_discovery(
+                &into_redirect_loop(protocol),
+                protocol
+            ));
+        }
+    }
+
+    fn into_redirect_loop(protocol: DavProtocol) -> AccountError {
+        bifrost_net::into_account_error(
+            bifrost_net::Error::RedirectLoop { hops: 11 },
+            bifrost_net::NetErrorContext {
+                provider: None,
+                protocol: protocol.protocol(),
+                operation: AccountOperation::Discover,
+                scope: None,
+            },
+        )
+    }
+
+    fn acknowledged(error: &AccountError) -> bool {
+        error.chain().iter().any(|cause| {
+            matches!(
+                cause,
+                Cause::Attempt(attempt)
+                    if attempt.transmission_state == TransmissionState::Acknowledged
+            )
+        })
+    }
+
+    /// A status the server answered, and a body it sent that will not parse,
+    /// both carry an ACKNOWLEDGED attempt; a local refusal and a pre-send
+    /// transport failure do not.
+    ///
+    /// Against the code before the attempt was stamped, every `status_error` and
+    /// `parse_error` assertion fails: neither pushed an attempt, so the chain
+    /// read as `Unsent`. The recovery half pins that the evidence moves no
+    /// class: a 503 on a NON-idempotent create still retries (an acknowledged
+    /// answer is a refusal, not a drop), and a 404 is still a refusal.
+    #[test]
+    fn a_server_answer_carries_acknowledged_transmission_evidence() {
+        for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
+            for status in [
+                StatusCode::BAD_REQUEST,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN,
+                StatusCode::NOT_FOUND,
+                StatusCode::CONFLICT,
+                StatusCode::PRECONDITION_FAILED,
+                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::INSUFFICIENT_STORAGE,
+            ] {
+                let error = status_error(
+                    AccountOperation::EventCreate,
+                    status,
+                    String::new(),
+                    protocol,
+                );
+                assert!(
+                    acknowledged(&error),
+                    "{protocol:?} {status} is a server answer: {error:?}"
+                );
+            }
+            assert!(acknowledged(&parse_error(
+                AccountOperation::Discover,
+                "XML parse error",
+                protocol
+            )));
+            assert!(!acknowledged(&local_error(
+                AccountOperation::EventCreate,
+                "refused before the wire",
+                protocol
+            )));
+            assert!(!acknowledged(&transport_error(
+                AccountOperation::EventCreate,
+                "token read failed",
+                protocol
+            )));
+
+            let unavailable = status_error(
+                AccountOperation::EventCreate,
+                StatusCode::SERVICE_UNAVAILABLE,
+                String::new(),
+                protocol,
+            );
+            assert!(
+                matches!(unavailable.recovery(), RecoveryClass::Retry(_)),
+                "{protocol:?}: an answered 503 is retried, never reconciled: {:?}",
+                unavailable.recovery()
+            );
+            let missing = status_error(
+                AccountOperation::EventCreate,
+                StatusCode::NOT_FOUND,
+                String::new(),
+                protocol,
+            );
+            assert_eq!(missing.recovery(), &RecoveryClass::ProviderRefused);
         }
     }
 
@@ -527,6 +676,8 @@ mod tests {
         assert_eq!(DavProtocol::CardDav.resource(), ResourceKind::Contact);
         assert_eq!(DavProtocol::CalDav.field(), "caldav");
         assert_eq!(DavProtocol::CardDav.field(), "carddav");
+        assert_eq!(DavProtocol::CalDav.well_known_service(), "caldav");
+        assert_eq!(DavProtocol::CardDav.well_known_service(), "carddav");
     }
 
     /// Migrated from both crates, which each carried it for one dialect. The

@@ -3,7 +3,7 @@ use std::fmt;
 pub(crate) use bifrost_dav_core::PutCondition;
 use bifrost_dav_core::{
     DavDispatch, DavProtocol, escape_xml, filter_unsupported, prepare_if_match, response_etag,
-    should_fallback_discovery, worse_recovery,
+    worse_recovery,
 };
 pub(crate) use bifrost_dav_core::{FilteredHrefs, HrefQuery};
 use bifrost_net::{AccountId, AccountNet};
@@ -108,35 +108,12 @@ impl CalDavClient {
         }
     }
 
+    /// The principal walk (well-known probe, fallback predicate, configured
+    /// base) is `bifrost-dav-core`'s, shared with `bifrost-carddav`; only the
+    /// multi-property principal PROPFIND after it is CalDAV's own.
     pub(crate) async fn discover_account(&self) -> Result<CalDavDiscovery, AccountError> {
-        // Well-known discovery lives at the ORIGIN root (RFC 6764), so a
-        // configured base carrying a path must not have the well-known
-        // suffix appended to it: the resulting URL is not a discovery
-        // endpoint, and a deployment answering it with 401/403 rather
-        // than 404 would fail the open before the configured base was
-        // ever tried.
-        let from_well_known = match bifrost_net::url::well_known_url(self.dav.base_url(), "caldav")
-        {
-            Some(well_known) => match self.discover_principal(&well_known).await {
-                Ok(principal) => principal,
-                Err(error) if should_fallback_discovery(&error, DAV) => None,
-                Err(error) => return Err(error),
-            },
-            None => None,
-        };
-        let principal = match from_well_known {
-            Some(principal) => principal,
-            None => self.discover_principal_from_base().await?,
-        };
+        let principal = self.dav.discover_current_user_principal().await?;
         self.discover_account_for_principal(&principal).await
-    }
-
-    async fn discover_principal_from_base(&self) -> Result<String, AccountError> {
-        self.discover_principal(self.dav.base_url())
-            .await?
-            .ok_or_else(|| {
-                parse_error(AccountOperation::Discover, "missing current-user-principal")
-            })
     }
 
     async fn discover_account_for_principal(
@@ -164,18 +141,6 @@ impl CalDavClient {
             calendar_user_email,
             schedule_outbox_url,
         })
-    }
-
-    async fn discover_principal(&self, root: &str) -> Result<Option<String>, AccountError> {
-        let response = self
-            .dav
-            .propfind_raw(root, "0", PROPFIND_PRINCIPAL, AccountOperation::Discover)
-            .await?;
-        Ok(
-            extract_href_property(&response.text, "current-user-principal")
-                .map_err(|error| parse_error(AccountOperation::Discover, error))?
-                .map(|href| resolve_href(&response.url, &href)),
-        )
     }
 
     pub(crate) async fn list_calendars(
@@ -940,13 +905,6 @@ pub(crate) fn event_scope(id: impl Into<String>) -> ErrorScope {
     }
 }
 
-const PROPFIND_PRINCIPAL: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-<D:propfind xmlns:D=\"DAV:\">\n\
-  <D:prop>\n\
-    <D:current-user-principal/>\n\
-  </D:prop>\n\
-</D:propfind>";
-
 const PROPFIND_ACCOUNT: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
 <D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
   <D:prop>\n\
@@ -1316,6 +1274,74 @@ mod tests {
             transcripts(&script).is_empty(),
             "a refused instance id must reach no transport at all"
         );
+    }
+
+    /// An event resource the SERVER sent that will not tokenize is the
+    /// provider's malformed response, on both single-resource doors that project
+    /// it.
+    ///
+    /// Against the code before the fix both calls fail the kind assertion: the
+    /// projection failure went through `local_error`, which is
+    /// `Request(Malformed)` -> `ClientBug` - the caller told to fix a request it
+    /// had nothing to do with. One response is scripted per call, so an update
+    /// that went on to PUT would starve the script and panic.
+    #[tokio::test]
+    async fn an_unparseable_event_from_the_server_is_the_providers_fault() {
+        use bifrost_types::account::Account as _;
+
+        const MALFORMED: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=\"unterminated:20260602T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let url = "https://dav.example.test/calendar/one.ics";
+        let malformed = || DavResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: MALFORMED.to_string(),
+            url: String::new(),
+        };
+        let script = dav_script([malformed(), malformed()]);
+        let client = Arc::new(CalDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/");
+
+        let got = account
+            .event_get(bifrost_types::EventId(url.to_string()))
+            .await
+            .expect_err("a body that will not tokenize cannot project");
+        let updated = account
+            .event_update(
+                bifrost_types::EventId(url.to_string()),
+                bifrost_types::EventPatch::default(),
+            )
+            .await
+            .expect_err("an update cannot patch a body that will not tokenize");
+
+        for (door, error) in [("event_get", got), ("event_update", updated)] {
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
+                ),
+                "{door}: {:?}",
+                error.kind()
+            );
+            assert_eq!(
+                error.recovery(),
+                &RecoveryClass::ProviderContractViolation,
+                "{door}"
+            );
+            assert!(
+                error.chain().iter().any(|cause| matches!(
+                    cause,
+                    Cause::Attempt(attempt)
+                        if attempt.transmission_state
+                            == bifrost_types::TransmissionState::Acknowledged
+                )),
+                "{door}: the server answered the GET"
+            );
+        }
+        assert_eq!(transcripts(&script).len(), 2, "one GET per door, no PUT");
     }
 
     /// A discovery that enumerates no calendars leaves the OPENED account with

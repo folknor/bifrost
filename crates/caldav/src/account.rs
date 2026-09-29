@@ -301,11 +301,17 @@ impl CalDavAccount {
             fetched.etag,
             &fetched.data,
         )
+        // The body is the SERVER's answer to a GET, so a body that will not
+        // tokenize is the provider's malformed response - `Protocol(ParseFailed)`
+        // with an acknowledged attempt - never the caller's malformed request.
+        // It was `local_error` (`Request(Malformed)` -> `ClientBug`), which told
+        // the consumer to fix a request it had nothing to do with.
         .map_err(|error| match error {
             EventProjectionError::NoVevent => missing_event_error(operation, event.0),
-            EventProjectionError::Parse(_) => {
-                crate::client::local_error(operation, "CalDAV resource is not valid iCalendar")
-            }
+            EventProjectionError::Parse(parse) => crate::client::parse_error(
+                operation,
+                format!("CalDAV resource is not valid iCalendar: {}", parse.0),
+            ),
         })
     }
 

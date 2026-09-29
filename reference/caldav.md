@@ -28,13 +28,16 @@ Discovery tries `/.well-known/caldav` first - built from the ORIGIN of the
 configured base URL via `bifrost_net::url::well_known_url`, never by appending
 the suffix to a configured path - and falls back to the configured
 base URL only when that initial principal lookup answers that it is not a
-discovery endpoint, or its successful body names no principal. Four probe
+discovery endpoint, or its successful body names no principal. Five probe
 answers mean that: 404, a 405 (a static site or a proxy sitting on the origin
 root in front of the DAV path, common enough that a 404-only rule failed the
 open on deployments whose configured base URL works), a locally-refused
 redirect - RFC 6764's canonical shape is a well-known redirecting to another
 host, which the credential-origin gate cannot admit before discovery has
-authenticated anything, so the walk refuses it as `Request(Malformed)` - and a
+authenticated anything, so the walk refuses it as `Request(Malformed)` - a
+redirect the walk will not follow at all (a chain past the hop cap, or a
+`Location` that will not resolve or will not decode), which classifies as
+`Protocol(ContractViolation)` (see `client.rs` below), and a
 body that will not parse as DAV XML (`Protocol(ParseFailed)`), the motivating
 case being the front end answering the PROPFIND with `200 text/html` and its
 index page: the same deployment shape one status apart from the 405, and an HTML
@@ -59,11 +62,32 @@ signal. The widening applies to the well-known probe only, never to a request
 against the configured base URL, where a parse failure is a real
 contract violation rather than evidence that this was never a discovery
 endpoint. A failure after the principal is identified is
-not a root-discovery fallback trigger. Both legs run through one
-`discover_principal(root)` helper that performs the PROPFIND and the decode
-together, so the probe's parse failure surfaces as an `Err` the fallback
-predicate can read rather than being lifted past it; `bifrost-carddav`'s walk is
-the same shape, method for method.
+not a root-discovery fallback trigger.
+
+The `ContractViolation` arm exists because those redirect failures used to be
+`Request(Malformed)` and fell back through the refused-redirect arm;
+reclassifying them without widening the predicate would have silently narrowed
+it. A well-known that loops is a probe answer nobody can use, the same shape as
+one that will not parse, and the fresh lookup against the configured base
+inherits nothing from it. On the probe path nothing else mints that kind:
+redirects are disabled in the transport, so its own redirect loop never runs,
+and an oversized body is mapped to `Protocol(PartialResponse)` first.
+
+The principal walk is not this crate's. It is
+`DavDispatch::discover_current_user_principal` in `bifrost-dav-core`
+(`discovery.rs`), shared with `bifrost-carddav`, with
+`DavProtocol::well_known_service` naming the dialect's well-known suffix. Both
+legs run through one private `discover_principal(root)` inside it that performs
+the PROPFIND and the decode together, so the probe's parse failure surfaces as
+an `Err` the fallback predicate can read rather than being lifted past it. The
+base leg never consults the predicate, and a base answer naming no principal is
+`Protocol(ParseFailed)`. What stays here is the step after the principal: the
+multi-property principal PROPFIND in `discover_account_for_principal`. The walk
+is pinned once, for both dialects, in dav-core:
+`every_fallback_answer_retries_the_configured_base` (the hop-cap loop
+included), `a_probe_naming_the_principal_ends_the_walk`,
+`a_refused_credential_on_the_probe_fails_the_open` and
+`the_base_leg_fails_on_what_the_probe_would_have_survived`.
 
 ## Module layout
 
@@ -110,6 +134,20 @@ the same shape, method for method.
   internally, which stripped `Authorization` on any origin change with no
   way to restore it. A 303 is not followed, and the walk is bounded by
   bifrost-net's `DEFAULT_MAX_HOPS`.
+  A redirect the walk will not follow - a chain past that cap, a `Location`
+  that will not resolve against the effective URL, or one that is not valid
+  UTF-8 - is classified through `bifrost_net::into_account_error` exactly as
+  the transport classifies its own redirect failures:
+  `Protocol(ContractViolation)` with `Attempt(Acknowledged)`, deriving
+  `ProviderContractViolation`. Each is raised after the server answered a hop
+  and is about what it answered. They were `Request(Malformed)` -> `ClientBug`
+  with no transmission evidence, and an undecodable `Location` was not an error
+  at all: the 3xx came back as a response and the status ladder read it as a
+  server refusal. The refused hop to an unadmitted origin is NOT among them; it
+  is this client's own credential-gate decision, raised by `auth_headers`, and
+  stays a local `Request(Malformed)`. Pinned by
+  `a_redirect_the_walk_will_not_follow_is_the_providers_contract_fault` in
+  dav-core.
 - `parse.rs` - XML response parsers for calendar discovery, event
   listing, multiget hydration, and nested href properties. Calendar
   collection metadata and href-valued discovery properties are staged per
@@ -216,8 +254,16 @@ the same shape, method for method.
   rather than rejected. A genuinely malformed body (unterminated quoted
   parameter, missing name/value, invalid UTF-8) returns an error;
   `event_from_ical` is fallible and the listing/search paths route a
-  single bad resource into `Page::failed_ids`, while
-  `event_get`/`event_update` surface a local error. A TZID-bearing local time
+  single bad resource into `Page::failed_ids`, while the single-resource
+  paths (`event_get`, `event_update` and `event_rsvp`, all through
+  `fetch_event_from_url`) surface `parse_error`: `Protocol(ParseFailed)` with
+  an acknowledged attempt, deriving `ProviderContractViolation`, because the
+  body is the server's answer to a GET. It was `local_error`
+  (`Request(Malformed)` -> `ClientBug`), which told the consumer to fix a
+  request it had nothing to do with. Pinned for get and update by
+  `an_unparseable_event_from_the_server_is_the_providers_fault`, which scripts
+  one response per call so an update that went on to PUT would starve the
+  script. A TZID-bearing local time
   projects as a bare wall-clock value
   (no false `Z`) with the zone in `timezone`; Microsoft/Windows zone names
   (e.g. `W. Europe Standard Time`) are mapped to IANA via caldata's
@@ -798,8 +844,26 @@ impl are exactly what they were, and consumers see no change.
 What moved: `DavRequest` / `DavResponse` / `DavBody`, `settle_body`,
 `url_origin`, `origin_is_secure`, the etag helpers (`response_etag`,
 `normalize_http_etag`, `prepare_if_match`) and `PutCondition`, the whole
-status-to-`AccountError` ladder with its five constructors, and
+status-to-`AccountError` ladder with its constructors, and
 `worse_recovery` / `recovery_rank`.
+
+`status_error` and `parse_error` stamp an `Attempt(Acknowledged)`. Every status
+the ladder classifies is one the server sent - on the response line, or as the
+member status of a 207 whose every response failed - and a body can fail to
+parse only because the server answered one. It is the same transmission
+evidence `bifrost-net` stamps on the status-bearing failures it classifies
+itself. On the status ladder it moves no recovery class (`derive` treats an
+acknowledged attempt like an unsent one on every kind that ladder mints); its
+absence read as `Unsent` in telemetry and support exports, claiming the request
+never left the process. `local_error` carries no attempt and `transport_error`
+an `Unsent` one. Pinned by
+`a_server_answer_carries_acknowledged_transmission_evidence`, which also
+asserts that an answered 503 on a non-idempotent create still retries and a 404
+is still `ProviderRefused`.
+
+Then the `current-user-principal` walk, as
+`DavDispatch::discover_current_user_principal` in `discovery.rs`, described at
+the top of this document. Each crate keeps only the step after the principal.
 
 Then the whole request dispatcher, as `DavDispatch`: the `AccountNet` handle,
 the credential store, the admitted-origin set, the credential gate
@@ -1046,25 +1110,26 @@ for the crate's entire error surface, so
 before that test existed failed exactly one unrelated assertion.
 
 What deliberately did NOT move: `not_found_error` differs between the crates.
-CardDAV's attaches an `ErrorScope` for the contact, CalDAV's
-`missing_event_error` carries the id in the cause instead. That is a real
-behavioural difference, not drift, and flattening it would have changed what
-consumers receive - so both stayed local.
+CardDAV's local `not_found_error` is a 404 `status_error` with an `ErrorScope`
+for the contact attached; CalDAV's `missing_event_error` is a thin wrapper over
+`bifrost_dav_core::not_found_error`, which carries the id in the cause and
+attaches no scope. That is a real behavioural difference, not drift, and
+flattening it would have changed what consumers receive - so each crate keeps
+its own entry point.
 
 ## This crate and bifrost-carddav are near-duplicates, and drift is the defect
 
-The transport, credential gate, error ladder, 207 parser and polling cursor are
-all shared through `bifrost-dav-core` now and can no longer drift - that
-includes the `ResponseParts` propstat state machine, href resolution, multiget
-classification, the cursor codec and the snapshot diff, all of which this
-section used to list as hand-mirrored. What remains duplicated is a much smaller
-remainder: the query bodies and property constants, the per-domain projections
-(`ical.rs` / `vcard.rs`), the discovery walk (duplicated but no longer
-divergent - both crates now probe well-known, decode inside one
-`discover_principal(root)` helper, and apply the same four-answer fallback
-predicate), the account-level
-orchestration around the shared pieces, and the `Unsupported` stubs each crate
-carries for the other's domain.
+The transport, credential gate, error ladder, 207 parser, polling cursor and
+principal discovery walk are all shared through `bifrost-dav-core` now and can
+no longer drift - that includes the `ResponseParts` propstat state machine, href
+resolution, multiget classification, the cursor codec, the snapshot diff and
+the well-known fallback, all of which this section used to list as
+hand-mirrored. What remains duplicated is a much smaller remainder: the query
+bodies and property constants, the per-domain projections (`ical.rs` /
+`vcard.rs`), the discovery step after the principal (which genuinely differs:
+a multi-property principal PROPFIND here, an addressbook-home lookup there), the
+account-level orchestration around the shared pieces, and the `Unsupported`
+stubs each crate carries for the other's domain.
 
 Nothing compares the two copies, so divergence is silent. Five separate defects
 in one hardening arc were exactly that: `escape_xml` quoting, the immediate

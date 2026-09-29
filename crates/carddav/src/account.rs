@@ -1505,8 +1505,16 @@ fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
 
 /// Map a vCard projection failure to an `AccountError` for the single-resource
 /// paths (get/update), where there is no listing to degrade a skip into.
+///
+/// Both callers project a card the SERVER sent, so a card that will not parse
+/// is the provider's malformed response - `Protocol(ParseFailed)` with an
+/// acknowledged attempt - and not a local refusal. It was `local_error`
+/// (`Request(Malformed)` -> `ClientBug`), which blamed the caller for the
+/// server's data. The encode side stays the caller's: a card built from the
+/// caller's `ContactCreate` / `ContactPatch` is this crate's to express, and
+/// nothing about a server's parse failure applies to it.
 fn project_error(operation: AccountOperation, error: &VCardParseError) -> AccountError {
-    local_error(
+    crate::client::parse_error(
         operation,
         format!("CardDAV vCard could not be parsed: {}", error.0),
     )
