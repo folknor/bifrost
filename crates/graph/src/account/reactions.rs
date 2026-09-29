@@ -25,7 +25,7 @@ use std::collections::HashSet;
 
 use bifrost_types::{
     AccountError, AccountOperation, BatchItemId, BatchOutcome, BatchOutcomeBuilder, ErrorScope,
-    MessageReactionState, ObjectId, ProtocolErrorKind,
+    MessageReactionState, ObjectId,
 };
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -33,11 +33,11 @@ use serde_json::Value;
 
 use super::GraphAccount;
 use super::graph_error::{
-    GraphErrorContext, batch_response_missing, into_account_error, protocol_violation,
-    response_to_account_error_pub, unsupported_item_error,
+    GraphErrorContext, batch_response_missing, into_account_error, response_to_account_error_pub,
+    unsupported_item_error,
 };
 use super::pim::{ews_read_folder, message_batch_url};
-use crate::error::GraphResponseError;
+use crate::error::{GraphError, GraphResponseError};
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponseItem};
 
 /// The MAPI named-property GUID Outlook stores reactions under. Identical
@@ -149,12 +149,28 @@ pub(crate) async fn message_reactions(
         }
     }
 
-    builder.finalize(&expected).map_err(|e| {
-        protocol_violation(
-            ProtocolErrorKind::ContractViolation,
-            operation,
-            None,
-            format!("Graph reaction read broke batch accounting: {e}"),
+    finalize_reactions(builder, &expected, operation)
+}
+
+/// Close the ledger, or report that this crate's own accounting broke.
+///
+/// Nothing the server sends can make `finalize` fail here: every lane id is a
+/// deduplicated caller id pushed exactly once, and `classify_chunk` projects
+/// Graph's `$batch` answers onto positions it bounds-checks and deduplicates
+/// before pushing. A missing, duplicate, or unknown id is therefore a bug in
+/// this module - `Internal(InvariantViolated)` - never the provider's
+/// contract breach it used to be filed as.
+fn finalize_reactions(
+    builder: BatchOutcomeBuilder<MessageReactionState>,
+    expected: &[BatchItemId],
+    operation: AccountOperation,
+) -> Result<BatchOutcome<MessageReactionState>, AccountError> {
+    builder.finalize(expected).map_err(|e| {
+        into_account_error(
+            GraphError::Internal {
+                message: format!("Graph reaction read broke batch accounting: {e}"),
+            },
+            GraphErrorContext::graph(operation),
         )
     })
 }
@@ -553,6 +569,34 @@ mod tests {
         assert_eq!(
             error.telemetry_fields().transmission_state,
             Some(bifrost_types::TransmissionState::Acknowledged)
+        );
+    }
+
+    /// A ledger that does not account for an id is this module's own bug.
+    /// It was `Protocol(ContractViolation)`, which told the operator to
+    /// contact Microsoft about an accounting error only bifrost can make.
+    #[test]
+    fn broken_reaction_accounting_is_internal_not_a_provider_fault() {
+        let mut builder = BatchOutcomeBuilder::new();
+        builder.push_succeeded(
+            BatchItemId("m1".to_string()),
+            reaction_state(&oid("m1"), None),
+        );
+        let error = finalize_reactions(
+            builder,
+            &[BatchItemId("m1".to_string()), BatchItemId("m2".to_string())],
+            AccountOperation::MessageReactionsRead,
+        )
+        .expect_err("an unaccounted id must fail finalize");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::InvariantViolated
+            )
+        );
+        assert_eq!(
+            error.recovery(),
+            &bifrost_types::RecoveryClass::InternalFailure
         );
     }
 

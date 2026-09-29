@@ -4,7 +4,7 @@
 
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    ErrorScope, Protocol, Provider, RequestCause, SubscriptionHandle, TransmissionState,
+    ErrorScope, Protocol, Provider, RequestCause, SubscriptionHandle,
 };
 
 use crate::account::graph_error::{GraphErrorContext, into_account_error};
@@ -162,19 +162,31 @@ pub(super) fn announce_push_recovered(account: &crate::account::GraphAccount) {
 }
 
 pub(super) fn new_handle() -> Result<SubscriptionHandle, AccountError> {
+    handle_from_entropy(getrandom::fill)
+}
+
+/// Mint a handle from the given entropy source.
+///
+/// A failing source is `Internal(RuntimeFailure)`: a local facility failed,
+/// which is neither the network's fault nor the provider's. It used to be
+/// minted as a `bifrost_net` `Network` error so it would retry, but a retry
+/// buys nothing here. `getrandom` already absorbs the one transient case
+/// (`EINTR`) internally and BLOCKS, rather than failing, while the kernel pool
+/// initializes, so what reaches this point is a persistent condition of the
+/// host - the syscall denied by a sandbox, no `/dev/urandom`, an unsupported
+/// target - and a `Transport` retry loop against it spins forever while
+/// telling the operator the network is down. The IMAP SCRAM nonce draws from
+/// the same source and classifies the same way. Raised before any
+/// subscription request is built, so there is no transmission to record.
+fn handle_from_entropy<E: std::fmt::Display>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), E>,
+) -> Result<SubscriptionHandle, AccountError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| {
-        // RNG failure is a host-environment problem. Surface it as a
-        // transport "Network" failure with `transmission_state:
-        // Unsent` (no bytes left the process) so the recovery mapping
-        // classifies it as a retryable client-side issue.
-        let net = bifrost_net::Error::Network {
-            message: format!("RNG failed: {error}"),
-            transmission_state: TransmissionState::Unsent,
-            source: None,
-        };
+    fill(&mut bytes).map_err(|error| {
         into_account_error(
-            crate::error::GraphError::Net(net),
+            crate::error::GraphError::RuntimeFailure {
+                message: format!("subscription handle entropy source failed: {error}"),
+            },
             GraphErrorContext::graph(AccountOperation::PushSubscribe),
         )
     })?;
@@ -184,4 +196,34 @@ pub(super) fn new_handle() -> Result<SubscriptionHandle, AccountError> {
         let _ = write!(out, "{byte:02x}");
     }
     Ok(SubscriptionHandle(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_from_entropy;
+    use bifrost_types::{AccountErrorKind, InternalErrorKind, RecoveryClass};
+
+    /// A failed entropy source is the client's runtime failure, terminal. It
+    /// was a `Transport(Network)` error, which derives `Retry(SameRequest)`
+    /// and blames the network for a host that cannot produce randomness.
+    #[test]
+    fn a_failed_entropy_source_is_a_runtime_failure_not_a_network_retry() {
+        let error = handle_from_entropy(|_| Err("entropy source unavailable"))
+            .expect_err("a failed source must not mint a handle");
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::RuntimeFailure)
+        );
+        assert_eq!(error.recovery(), &RecoveryClass::InternalFailure);
+    }
+
+    #[test]
+    fn a_working_entropy_source_mints_a_hex_handle() {
+        let handle = handle_from_entropy(|bytes: &mut [u8]| {
+            bytes.fill(0xab);
+            Ok::<(), &str>(())
+        })
+        .expect("mint");
+        assert_eq!(handle.0, "ab".repeat(16));
+    }
 }

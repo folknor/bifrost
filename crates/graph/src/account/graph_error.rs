@@ -139,21 +139,44 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
             finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
         }
         GraphError::Internal { message } => internal_invariant(message, &ctx),
+        GraphError::LimitExceeded { message } => {
+            internal(InternalErrorKind::LimitExceeded, message, &ctx)
+        }
+        GraphError::RuntimeFailure { message } => {
+            internal(InternalErrorKind::RuntimeFailure, message, &ctx)
+        }
+        // A complete response that breaks the protocol's semantics: the
+        // provider answered, so the evidence is `Acknowledged`.
+        GraphError::ContractViolation { message } => {
+            let detail = DiagnosticText::support_only(message);
+            let builder = base_builder(
+                &ctx,
+                AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                Cause::Wire(WireCause::MalformedResponse {
+                    protocol: ctx.protocol,
+                    detail: Some(detail.clone()),
+                }),
+            )
+            .text(detail);
+            finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
+        }
     }
 }
 
 /// A client-side invariant failure (`reference/error-model.md`): nothing was
 /// sent, and neither the provider nor the network is at fault.
 fn internal_invariant(message: String, ctx: &GraphErrorContext) -> AccountError {
+    internal(InternalErrorKind::InvariantViolated, message, ctx)
+}
+
+/// A client-side failure of the given kind (`reference/error-model.md`).
+fn internal(kind: InternalErrorKind, message: String, ctx: &GraphErrorContext) -> AccountError {
     let detail = DiagnosticText::support_only(message);
     finish(
         base_builder(
             ctx,
-            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-            Cause::Internal(InternalCause::new(
-                InternalErrorKind::InvariantViolated,
-                Some(detail.clone()),
-            )),
+            AccountErrorKind::Internal(kind),
+            Cause::Internal(InternalCause::new(kind, Some(detail.clone()))),
         )
         .text(detail),
         ctx,

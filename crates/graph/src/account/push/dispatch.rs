@@ -1,12 +1,11 @@
 //! The `Account` push doors: per-scope eligibility, mode dispatch, and the
 //! three-lane outcome ledger every subscription request answers with.
 
-use bifrost_types::{
-    AccountError, AccountOperation, CursorScope, ProtocolErrorKind, SubscriptionHandle,
-};
+use bifrost_types::{AccountError, AccountOperation, CursorScope, SubscriptionHandle};
 
-use crate::account::graph_error::{invalid_account_error, protocol_violation};
+use crate::account::graph_error::{GraphErrorContext, into_account_error, invalid_account_error};
 use crate::account::{GraphAccount, PushMode};
+use crate::error::GraphError;
 
 use super::common::{
     no_subscribable_push_scopes, unsupported_push_error, unsupported_push_scope_error,
@@ -79,16 +78,24 @@ pub(super) fn push_item_ids(len: usize) -> Vec<bifrost_types::BatchItemId> {
         .collect()
 }
 
+/// Close the per-scope ledger, or report that this crate's accounting broke.
+///
+/// The lane ids are the positional ids `push_item_ids` mints, and every arm
+/// files each one exactly once while walking its OWN list of scopes; server
+/// answers (`translateExchangeIds`, subscription creates) are looked up by
+/// key, never iterated into the ledger. Nothing server-supplied can therefore
+/// make `finalize` fail, and a failure is `Internal(InvariantViolated)`, not
+/// the provider contract violation it used to be filed as.
 fn finalize_push_outcomes(
     outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
     expected: &[bifrost_types::BatchItemId],
 ) -> Result<bifrost_types::BatchOutcome<CursorScope>, AccountError> {
     outcomes.finalize(expected).map_err(|error| {
-        protocol_violation(
-            ProtocolErrorKind::ContractViolation,
-            AccountOperation::PushSubscribe,
-            None,
-            format!("push scope accounting invariant failed: {error}"),
+        into_account_error(
+            GraphError::Internal {
+                message: format!("push scope accounting invariant failed: {error}"),
+            },
+            GraphErrorContext::graph(AccountOperation::PushSubscribe),
         )
     })
 }
@@ -100,5 +107,30 @@ pub(crate) async fn push_unsubscribe(
     match account.push_mode {
         PushMode::GraphSubscriptions => unsubscribe_graph(account, handle).await,
         PushMode::EwsStreaming => unsubscribe_ews(account, handle).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{finalize_push_outcomes, push_item_ids};
+    use bifrost_types::{
+        AccountErrorKind, BatchOutcomeBuilder, CursorScope, InternalErrorKind, RecoveryClass,
+    };
+
+    /// A scope the ledger never filed is this crate's bug. It was
+    /// `Protocol(ContractViolation)`, telling the operator to contact
+    /// Microsoft about accounting only bifrost can get wrong.
+    #[test]
+    fn broken_push_accounting_is_internal_not_a_provider_fault() {
+        let expected = push_item_ids(2);
+        let mut outcomes = BatchOutcomeBuilder::new();
+        outcomes.push_succeeded(expected[0].clone(), CursorScope::Account);
+        let error = finalize_push_outcomes(outcomes, &expected)
+            .expect_err("an unfiled scope must fail finalize");
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
+        );
+        assert_eq!(error.recovery(), &RecoveryClass::InternalFailure);
     }
 }

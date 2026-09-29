@@ -48,64 +48,36 @@ item is what stops that.
   continuations interleaving with other commands), would treat APPEND, and
   what submits raw `Command`s at all.
 
-- **graph: the OneDrive upload session URL is followed unvalidated.** Found
-  2026-09-29 by the spar on the bearer-origin fix, NOT fixed: it carries no
-  account bearer (`AuxTarget::Anonymous`), so it is outside that fix. The
-  `uploadUrl` a `createUploadSession` answer names receives the attachment
-  bytes and the session's own pre-authenticated credential wherever it
-  points, plain `http://` and userinfo included. Same-origin admission does
-  not fit (real session hosts differ from the Graph host); the likely shape is
-  https-only with no userinfo, perhaps an allowlist of documented upload
-  origins. Wants its own ruling.
-
-- **graph: a malformed Autodiscover answer reads as an empty one.** Found
-  2026-09-29 by the cold review of the bearer-origin fix, NOT fixed (it
-  predates that fix). `parse_user_settings_response` treats a quick-xml parse
-  error like EOF, so a truncated or malformed HTTP 200 reads as an answer with
-  no settings and no error: the public-folder lookups then report a missing
-  setting (`Request(Malformed)`) where the provider sent a malformed response,
-  and `discover_shared_mailboxes` (whose parser does the same) degrades
-  silently.
-
-- **errors: findings from the local-refusal audit (part c) not covered by
-  the ruling.** Filed 2026-09-29. Parts (a) and (b), and the covered part of
-  (c) - Google Calendar and People caller input, Graph's unknown public
-  folder, cross-mailbox PIM move, malformed blob handle and undecodable
-  cursors, SMTP's missing-extension refusals - have landed. What the audit
-  found beyond the rule's reach, each unverified beyond the audit's read:
+- **errors: findings from the local-refusal audit (part c) still open.**
+  Filed 2026-09-29; the rest of the audit's findings landed 2026-09-30.
   - JMAP `WebSocketNotConnected` (`sync/push.rs apply_push_set`) derives
-    terminal `Unsupported(PushSubscribe)` for what the code itself calls a
-    transient race. The rule says transient, but flipping it changes how the
-    sync engine's push lane reacts (fallback to polling versus re-subscribe),
-    so it wants that consumer analysis first. Related: a send on a dead sink
-    becomes `Protocol(PartialResponse)` stamped `Acknowledged` though nothing
-    was acknowledged.
+    terminal `Unsupported(PushSubscribe)` for a transient race. Analysed
+    2026-09-30: the sink is `None` only before the first handshake and is
+    never cleared, so the error means "the reader has not connected yet". The
+    engine does NOT read its kind: `subscribe_push` hands it to the consumer,
+    and during a reopen (`engine/reattach.rs`) any error from the
+    replacement's `push_subscribe` aborts the attempt, so a slow or down
+    WebSocket endpoint during reopen can exhaust `restart_account`'s three
+    attempts and pause the whole account, HTTP sync included. Reclassifying
+    fixes none of that. Recommendation: treat it as deferred success (commit
+    the desired set and return `Ok`; the reader re-applies `enabled` and
+    `push_state` on every connect, and `close()` already treats the error as
+    `Ok`; the lock order was traced and loses no update). Related: a send on a
+    dead sink becomes `Protocol(PartialResponse)` stamped `Acknowledged` though
+    nothing was acknowledged, which for non-idempotent `PushSubscribe` derives
+    a reconcile with no target; honest is `Transport(Network)` (`Unsent` when
+    the library refused before writing, else `InFlight`) with an idempotency
+    override, needing its own sink-send error variant. Knock-on, unverified
+    against `tokio_websockets`: the old account's `push_unsubscribe` on a dead
+    sink fails, its record is marked `teardown_unconfirmed`, and unconfirmed
+    records are never recreated, so a subscription can silently stop being
+    recreated after a reopen that follows a WebSocket drop. Wants a ruling.
   - SMTP `starttls` on a server without STARTTLS is `Request(Malformed)`,
     while IMAP's `StartTlsUnavailable` is `Authorization(PolicyBlocked)`: a
     parity question with a security-policy flavour, left alone.
-  - Server faults or post-send conditions classified as the caller's fault:
-    Google Drive resumable upload (missing `Location`, unparseable or
-    non-advancing 308, exhausted chunks) via `invalid_request`; JMAP session
-    URL templates and the WebSocket capability URL (`InvalidUrl`); CalDAV
-    invalid iCalendar and CardDAV unparseable vCard from the server
-    (`local_error`); dav-core "unresolvable redirect target" / "too many
-    redirects" after bytes were sent, disagreeing with bifrost-net's
-    `RedirectLoop` (`Protocol(ContractViolation)`, `Acknowledged`); Graph
-    calendar's event-search `PageWalk` refusal (`Unsupported`, where every
-    other Graph `walk.enter` site gives `Protocol`).
-  - Local failures still minted as `Transport(Network)` on purpose, found
-    while fixing their configuration-error siblings: Graph `new_handle`'s RNG
-    failure (`push/common.rs`, argued retryable in its comment; the IMAP SCRAM
-    nonce twin is now `Internal(RuntimeFailure)`), public-folder
-    `incomplete_walk_error` (`public_folder.rs`, a page cap or stalled offset
-    retried next poll by design), and JMAP's over-long EventSource response
-    (`event_source/parser.rs too_long_error`, a client safety limit, plausibly
-    `Internal(LimitExceeded)`).
-  - `Unsupported` where the input is really malformed: Graph calendar
-    `local_error` (bad cursor, bad event id, unknown timezone), Google
-    `reject_unexpressible_all_day_patch`.
-  - Transmission evidence: dav-core `status_error` / `parse_error` push no
-    `Acknowledged` attempt on server responses (other crates do).
+  - Graph public-folder `incomplete_walk_error` (`public_folder.rs`) is a
+    `Transport(Network)` retried next poll by design (a page cap or stalled
+    offset); whether the cap arm is `Internal(LimitExceeded)` is unexamined.
   - Graph OneDrive upload shutdown mid-PUT is conservatively `InFlight`
     (`cloud.rs upload_chunks`), including when the cancellation lands while
     bifrost-net is still waiting for rate-limit admission and nothing was
@@ -114,37 +86,81 @@ item is what stops that.
     take a cancellation signal into the request and report the stage it
     stopped at, a transport feature; sparred and accepted as conservative on
     2026-09-29, raised again by the cold review.
-  - Graph OneDrive upload 202 handling (`cloud.rs upload_chunks`), rated P1 by
-    two independent cold reviews because it can silently corrupt an uploaded
-    attachment. Found by the spar on the upload-timeout fix and filed rather
-    than built inside it, as outside that item: a malformed body, a missing or empty
-    `nextExpectedRanges`, or an unparseable range silently resumes at the end
-    of the chunk just sent, which skips bytes if the server accepted less -
-    the comment above it says the opposite; the offset check refuses only a
-    non-advancing offset, not one past the submitted range or the total; and
-    the non-advancing 202 and the 202 on the final chunk are semantic contract
-    violations reported through the parse-failure helper
-    (`Protocol(ParseFailed)` where `Protocol(ContractViolation)` is honest).
-  - JMAP `NoPrimaryAccount` (a pre-send missing capability) derives
-    `AuthLost`; and in `crates/jmap/src/sync/error.rs` its rationale comment
-    sits above the `MalformedCapability` arm.
-  - Graph batch `builder.finalize` failures (`reactions.rs`,
-    `push/dispatch.rs`) derive `Protocol(ContractViolation)`; probably
-    `Internal(InvariantViolated)` now that the kind exists, not ruled out that
-    server-supplied ids trigger it.
-  - Graph `PageWalk` page-budget exhaustion (`paging.rs`) derives
-    `Protocol(ParseFailed)` via `GraphError::Json`, but an honestly huge
-    collection looks the same: it is the shape Google's walks moved to
-    `Internal(LimitExceeded)` (`PageRefusal`), and the repeated-link arm beside
-    it is the genuine provider fault. Split the two the same way.
 
-- **imap: `Protocol` subkinds are coarser than the evidence.** Filed
-  2026-09-29. Sites where the server omitted a mandatory response or field
-  (SELECT without UIDVALIDITY, OK without the untagged STATUS / QUOTA / ACL /
-  SEARCH response) all map to `Protocol(ContractViolation)` where
-  `Protocol(MissingField)` is the more precise kind. Same recovery class
-  (`ProviderContractViolation` either way), so a diagnostics refinement, not a
-  defect.
+## Found 2026-09-30 by the laterals sweep, not fixed
+
+Each was found while fixing a neighbour and is outside what was built; none
+is ruled. Verify against the code before working any of them.
+
+- **graph: `push_subscribe` can leak live subscriptions.**
+  `finalize_push_outcomes` runs after the arm has registered the handle and
+  started the renewal worker; if it fails, the caller gets `Err` with no
+  handle, so the server subscriptions keep being renewed and can never be
+  unsubscribed.
+- **graph: calendar recurrence and patch gaps** (`calendar.rs`). An RRULE Graph
+  cannot express is silently dropped on create and patch, making a one-off
+  event (the test named `graph_event_create_rejects_unsupported_rrule_parts`
+  pins the drop); a patch recurrence with no `start` builds its range start
+  from an empty time; a patch setting attendees to an empty list sends nothing,
+  so attendees cannot be cleared.
+- **graph: OneDrive upload leftovers** (`cloud.rs`). A 307 or 308 on the
+  anonymous chunk PUT goes through bifrost-net's redirect walk, unchecked for
+  where it can lead or an http downgrade; an aborted or refused upload never
+  deletes its upload session; the upload-URL admission duplicates part of
+  `origin::validate`, whose natural home is `origin.rs`.
+- **graph: Autodiscover leftovers** (`autodiscover.rs`). A missing setting, an
+  in-body `ErrorCode` and "exceeded redirect limit" still map to
+  `Request(Malformed)` though they are provider faults;
+  `json_parse_to_account_error` labels every `GraphError::Json` a JSON parse
+  failure, which now includes Autodiscover XML and 202 range failures; the
+  EWS parsers (`ews/parse.rs`, `ews/xml_helpers.rs`) still use the lenient
+  `push_general_ref` and a `push_text` that drops unescape errors, so an
+  unknown entity silently vanishes from an EWS value (Autodiscover now uses
+  the strict `try_push_general_ref`).
+- **google: classification leftovers.** `changes.rs` reports a missing local
+  `start_history_id` as `Protocol(MissingField)` though it is local stream
+  state (`Internal(InvariantViolated)`); `missing_field` never records
+  `Acknowledged` though most callers raise it after a complete response;
+  `cloud.rs account_domain` refuses an account email with no domain as
+  `Request(Malformed)` though it comes from the profile, and only after the
+  upload, leaving an uploaded unshared file; `endTimeUnspecified` is not
+  modelled, so Google's placeholder end is projected as real; a Drive
+  resumable `Location` header that is present but not valid text reads as
+  missing (`MissingField`) where `ParseFailed` is honest.
+- **jmap:** `SessionState::derive` parses `eventSourceUrl` eagerly, so a server
+  whose EventSource template this crate cannot parse cannot be opened at all
+  though sync never uses EventSource; `session_template` checks only template
+  syntax, so a relative `uploadUrl` / `downloadUrl` / `eventSourceUrl` such as
+  `not-a-url/{accountId}` passes and later fails in the transport instead of
+  as `MalformedSessionUrl` (a check must not refuse RFC 6570 templates that
+  are legitimately absolute only after expansion); the `reader_pass` comment in `push.rs`
+  says the re-enable path can produce `WebSocketNotConnected`, which it
+  cannot.
+- **imap:** `account/pim.rs`'s "SELECT missing UIDVALIDITY" sites (four, plus
+  two in search) map to `pim_malformed`, blaming the caller for the server's
+  omission (changes the recovery class, so wants a ruling); a tagged code
+  (typically HIGHESTMODSEQ under QRESYNC) hides COPYUID on MOVE and COPY, which
+  then survives only as an event; a missing mandatory response retires a
+  connection whose framing is intact after the tagged OK; `ImapConnection::
+  literal_mode` in `helpers.rs` is a dead copy of the driver's rule that its
+  test exercises; the rev2 baseline may be too generous (from memory RFC 9051
+  Appendix E folds in neither OBJECTID nor SAVEDATE, and only the FETCH side
+  of BINARY); `Capability::StatusDeleted`'s doc cites RFC 9051 6.3.11 for a
+  token that section does not define; an ESEARCH whose tag names an already
+  finished command still becomes an event, where the surplus-results ruling
+  suggests dropping it; `idle.rs` and `ImapConnection::next_event` mint
+  `Error::driver_gone()` with no phase when the driver dies mid-IDLE, so an
+  in-flight IDLE reads as `Unsent` (low stakes, IDLE mutates nothing).
+- **dav:** a refused redirect to an unadmitted origin (`auth_headers`) is still
+  `local_error` with no attempt stamp though the first hop was sent;
+  `not_found_error` for a GET resource with no VEVENT carries no attempt stamp,
+  while CardDAV's local `not_found_error`, built on `status_error`, now stamps
+  `Acknowledged` as a side effect, so the two crates differ;
+  `patch_to_ical` failures map to `Unsupported`, arguably the provider's fault
+  when the server body has no place to splice the patch; the missing
+  current-user-principal and home-set errors are `ParseFailed` where
+  `MissingField` is more precise; the untrusted-origin check at the end of the
+  redirect walk looks unreachable.
 
 ## Blocked on an unvalidated consumer contract
 
@@ -179,51 +195,11 @@ and the smtp sans-I/O core, never received the cold review their rulings
 asked for. That review debt is still owed, and nothing else in this file
 tracks it.
 
-- **imap: small findings from the 2026-09-29 builds, none a live defect.**
-  `EncodeOptions`'s doc still says it is constructed by
-  `ImapConnection::encode_options()`, which no longer exists.
-  `supports_non_sync_literal` and `supports_non_sync_literal8` in
-  `connection/helpers.rs` have no non-test callers. The rev2 baseline list
-  (`types/profile.rs::rev2_baseline_includes`) contains LITERAL+, so
-  `ServerProfile::supports(LiteralPlus)` is true on pure rev2 although the wire
-  path negotiates LITERAL-, never unbounded LITERAL+. The `STATUS DELETED`
-  gate is `rev2 || QUOTA=RES-MESSAGE` and was deliberately NOT routed through
-  the capability authority, which would also accept an advertised
-  `STATUS=DELETED` on rev1; whether it should is unexamined.
-
 - **smtp: the blocking implicit-TLS handshake at connect time is unbounded
   even with a timeout configured.** Noticed 2026-09-29 while bounding STARTTLS.
   Documented as the blocking transport's structural difference, and its
   address resolution is unbounded too. Recorded so the STARTTLS bound is not
   mistaken for "every TLS handshake is bounded".
-
-- **sync: a worker aborted on an already-spent deadline is never named.**
-  Found 2026-09-29 while splitting `WorkerRole`. In `await_worker_until`
-  (`engine/ack.rs`), when the worker phase's shared deadline has already
-  passed (`remaining.is_zero()`), the worker is aborted with no log line, so
-  only the FIRST straggler of a slow detach gets a `role`-bearing warning and
-  every later one is aborted silently. The per-worker variants cannot help
-  there. A warn line on that branch would close it.
-
-- **imap: `MoveConsumer` narrows an untagged COPYUID OK lossily, like the
-  three the success-path fidelity ruling covered.** Found 2026-09-29 while
-  that ruling was built. It keeps only the code from an untagged `OK
-  [COPYUID ...]` and drops the response on failure - the exact shape the
-  ruling fixed in `CopyConsumer` (same file, `connection/dispatch/search.rs`).
-  The original note listed three consumers and missed this one. Presumably
-  wants the same treatment; not done without a ruling.
-
-- **dav: `discover_principal` is still a caldav/carddav twin.** Noticed
-  2026-09-29 while moving `should_fallback_discovery` into dav-core. The two
-  bodies are identical apart from the crate-local helper wrappers, and the
-  CardDAV copy already once diverged (the probe-body parse that never reached
-  the predicate). A further dav-core candidate; not done without a ruling.
-
-- **imap: a pipelined ESEARCH correlated to a FOREIGN tag.** Split out of the
-  ruled success-path consumer item on 2026-09-29. An ESEARCH whose tag names a
-  different in-flight command is neither surplus to drop nor an event to
-  publish; it probably wants routing to the command its tag names. Not
-  investigated beyond that; wants its own look and ruling.
 
 ## bifrost-sync
 
@@ -511,16 +487,6 @@ drain, and would need the admission mechanism wherever they claim to exercise
 throttling; and TLS handshake, record overhead and shutdown traffic bypass
 plaintext accounting entirely. The honest guarantee is therefore about
 admission of METERED PLAINTEXT writes, not about every byte on the wire.
-
-## Surfaced by the 2026-09-15 fix wave
-
-- **google: `end` falls back to `originalStartTime` but never to `start`.** So a
-  live event carrying a start and no end is refused rather than projected as
-  zero-length. Untouched by the 2026-09-15 tombstone work, which deliberately
-  scoped itself to cancelled events; this is live-event behaviour and a
-  candidate second reading of "malformed". Note that under the per-item
-  isolation that landed with it, such an event now rides `failed_ids` instead of
-  failing its page, so the blast radius is smaller than it was.
 
 ## Notes
 

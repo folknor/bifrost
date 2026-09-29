@@ -168,7 +168,25 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
 - `cloud.rs` - `host_attachment`: OneDrive resumable upload + `createLink` in one
   call. Session/link POSTs go through `GraphClient::post` (conflict `rename`); the
   pre-authed chunk PUT goes through `execute_aux` with `AuxTarget::Anonymous`
-  (no bearer) and resumes on `202 Accepted`. The whole upload has one budget
+  (no bearer) and resumes on `202 Accepted`. The session's `uploadUrl` is
+  admitted at receipt by `admit_upload_url`, before any PUT: an absolute
+  `https` URL on any host without userinfo, or plain `http` only on the
+  configured Graph origin (which already holds the account bearer); anything
+  else is `GraphError::ContractViolation` -> `Protocol(ContractViolation)`,
+  and the refusal never quotes the URL, since the URL is itself the session
+  credential. Same-origin admission cannot apply (session URLs live on
+  SharePoint and OneDrive hosts, never the Graph host) and there is no host
+  allowlist: Microsoft documents `uploadUrl` as opaque, and the hosts vary by
+  tenant, product and national cloud. A 202 must carry a valid resume offset
+  (`admitted_resume_offset`): an unparseable body, a missing
+  `nextExpectedRanges`, or a first entry that is not a byte range is
+  `GraphError::Json` -> `Protocol(ParseFailed)`; an empty range list, an
+  offset that does not advance, one past the end of the bytes just sent, or
+  one that reaches the total (every byte acknowledged without the 200/201
+  drive item) is `Protocol(ContractViolation)`. No offset is ever guessed,
+  because resuming at the chunk end skips bytes the server did not accept. An
+  offset short of the chunk end is legitimate on any chunk, the final one
+  included. The whole upload has one budget
   (`UPLOAD_TOTAL_TIMEOUT`), carried INTO each chunk PUT as the remainder of
   its bifrost-net total deadline, so an expiry is classified at the stage it
   hit (`Transport(Timeout)`, `Unsent` before dispatch or between chunks,
@@ -299,7 +317,16 @@ outlook.timezone="UTC"`. Recurrence maps common daily/weekly/monthly/yearly
 patterns to RRULE and back; unsupported outbound parts reject serialization,
 unsupported inbound shapes are omitted, and `relativeMonthly`/`relativeYearly`
 lacking BYMONTHDAY+BYDAY reject locally. Outbound times map a conservative IANA
--> Windows table (unknown ids reject pre-payload). `responseStatus` maps to
+-> Windows table, refused pre-payload by what the refusal is about: a
+slash-shaped (IANA) id missing from the table may be a real zone this crate
+has no Windows name for, so it is `Unsupported`; a slash-free multi-word
+value passes through as a Windows id, and anything else that is neither
+(`"foo"`, `""`) is `Request(Malformed)` naming its field (`start.timezone` /
+`end.timezone`). An `EventId` without
+the calendar separator was never minted here, so `split_event_id` refuses it
+as `Request(Malformed)` with field `event`. A server-derived organizer, a
+non-`Confirmed` status, and an RSVP value Graph has no action for stay
+`Unsupported`. `responseStatus` maps to
 `self_response`; RSVP uses native `accept`/`decline`/`tentativelyAccept`.
 Calendar/contact update/delete fetch-then-`If-Match` and send sparse PATCH
 (scalar clears as null; contacts emit `null`/`[]` for emptied buckets). Event
@@ -409,7 +436,9 @@ The bearer-carrying send paths accept nothing else: `execute_wire`,
 `download_stream`, `EwsClient` (which holds its admitted endpoint or the
 reason there is none), and `execute_aux`, whose `AuxTarget::Bearer` takes an
 `AdmittedUrl` while `AuxTarget::Anonymous` (the pre-authenticated OneDrive
-chunk PUT) takes a string and never carries the bearer. Server links
+chunk PUT) takes a string and never carries the bearer; its one caller hands
+it only a session URL `admit_upload_url` has already admitted under the
+upload rule (see `cloud.rs` above). Server links
 deserialize as `ProviderLink`, which has no accessor yielding a requestable
 string, so a link cannot be followed, minted into a caller cursor, or
 persisted into a checkpoint without admission. Each provenance is admitted
@@ -858,6 +887,16 @@ adds a second reason: past the 20-id chunk limit earlier chunks have already
 been transmitted, so a top-level `Err` - which means "nothing was
 transmitted" - would be false as well as lossy.
 
+Nothing Graph sends can make the ledger's `finalize` fail here (every lane id
+is a deduplicated caller id, and `classify_chunk` bounds-checks and
+deduplicates response positions before pushing), so a `finalize` failure is
+this module's bug: `GraphError::Internal` -> `Internal(InvariantViolated)`,
+not a provider contract violation. The push door's ledger
+(`push/dispatch.rs finalize_push_outcomes`) classifies the same way for the
+same reason: every arm files each positional id exactly once from its own
+scope list, and server answers are looked up by key, never iterated into the
+ledger.
+
 The `hydrated_from_value` projector maps `FlagsOnly`
 -> canonical flag `HashSet`; `Metadata`/body-bearing -> `metadata_or_flags`.
 Graph JSON is not assembled RFC822, so body-bearing projections degrade to
@@ -993,9 +1032,14 @@ mailboxes" call, so `open` falls back to the EWS-era Autodiscover
 the primary user's SMTP; `merge_shared_mailboxes` combines the result with
 any `with_shared_mailbox` entries additively, empty-dropping and
 exact-string-deduping across the whole merged set (config first, discovered
-appended). Discovery is best-effort and non-fatal: malformed/truncated XML or
-a request failure degrades to the config-supplied mailboxes rather than
-failing `open`, and the skipped pass is recorded on
+appended). An HTTP 200 whose body is malformed or truncated XML, or not an
+`Autodiscover` document at all, is the provider's parse failure
+(`GraphError::Json` -> `Protocol(ParseFailed)`), never an empty or partial
+mailbox list; both Autodiscover parsers (`parse_alternative_mailboxes`,
+`parse_user_settings_response`) require one complete document with the
+expected root. Discovery at `open` stays best-effort and non-fatal: that
+failure, or a request failure, degrades to the config-supplied mailboxes
+rather than failing `open`, and the skipped pass is recorded on
 `OpenedAccount::skipped_scopes` with its classified error so the
 degradation is reportable, not just logged. The EWS twin `ews_shared_scope_error` applies the same
 `ScopeRevoked` -> `DisableScope` isolation to public-folder scopes.
@@ -1017,7 +1061,8 @@ both depend on optional Exchange machinery that a tenant (or a harness) may
 simply not serve, and dropping meant an EMPTY `routing_map`: zero public
 containers, zero pinned scopes, and nothing but a support-only warning:
 
-- No `PublicFolderInformation`: `hierarchy_routing_fallback` anchors the
+- No `PublicFolderInformation` (the setting is absent, or the lookup failed,
+  a malformed answer included): `hierarchy_routing_fallback` anchors the
   browse on the account's own mailbox (a real identity - the anchor becomes
   the owner `MailboxId` on every emitted item, so it must never be empty).
 - No content-mailbox routing for a folder: `content_routing_or_hierarchy`
@@ -1080,11 +1125,11 @@ subscription resource, files any scope with no subscribable resource into the
 failed lane, creates one server
 subscription per resource, and best-effort deletes any already-created
 subscriptions if a later create fails. The `SubscriptionHandle` is minted
-BEFORE the first create: `new_handle` is fallible and classifies its error
-`TransmissionState::Unsent`, which is only honest while nothing has been
-written, so minting it afterwards would let an RNG failure report
-no-bytes-sent over live server-side subscriptions and invite a duplicating
-retry. It stores `(server_id, expires_at)` in a
+BEFORE the first create: `new_handle` is fallible (a failed host entropy
+source is `Internal(RuntimeFailure)`, never retried), and a failure there has
+written nothing. Minted afterwards, the same failure would return an error
+over live server-side subscriptions with no handle any teardown could name
+them by, orphaning them until they expire. It stores `(server_id, expires_at)` in a
 `GraphSubscriptionGroup`, and emits `Reconnected`. `push_unsubscribe`
 deletes each server subscription BEFORE dropping its local state, so a failed
 DELETE leaves that subscription and every not-yet-attempted sibling reachable
@@ -1740,6 +1785,17 @@ than through `invalid_account_error`, which takes an operation and nothing
 else: the rejection is always raised about a specific message, cursor scope,
 or subscription resource, and dropping `ctx.scope` left an operator a bare
 `request.malformed` with nothing to act on.
+A provider body that does not parse is `GraphError::Json` ->
+`Protocol(ParseFailed)`; a complete answer that parsed but is semantically
+impossible (a repeated page link, an impossible upload offset, a refused
+upload URL) is `GraphError::ContractViolation` ->
+`Protocol(ContractViolation)`, both with `Acknowledged` evidence. The
+client-side arms map onto the `Internal` kind and, recording no
+transmission, derive `InternalFailure` (never retried): `GraphError::Internal` -> `Internal(InvariantViolated)`,
+`GraphError::LimitExceeded` (a limit this crate imposes on itself, the page
+budget) -> `Internal(LimitExceeded)`, `GraphError::RuntimeFailure` (a local
+facility failed, the entropy source behind `new_handle`) ->
+`Internal(RuntimeFailure)`.
 `GraphErrorContext::ews(op)`
 is the EWS constructor; `ews_error_to_account_error` routes
 `EwsError::Transport` through `bifrost_net::into_account_error`, `HttpStatus`
@@ -1896,10 +1952,19 @@ tight two-link cycle burn the whole budget on requests. `bifrost-google`'s
 pair. The budget (10,000 pages, so 1,000,000+ objects at Graph's typical `$top`)
 is deliberately generous: it bounds a misbehaving server, not a large account.
 
-A refusal is a provider-contract violation, not a transport failure, so it
-travels as `GraphError::Json` - the crate's carrier for "the response did not
-match the documented contract" - classifying as `Protocol(ParseFailed)` /
-`Wire(MalformedResponse)`.
+The two refusals blame different parties, and neither is a parse failure
+(every page parsed). A repeated link is the provider's breach: an honest
+server never hands back a link it already served, so it is
+`GraphError::ContractViolation` -> `Protocol(ContractViolation)` with
+`Acknowledged` evidence. An exhausted budget is not evidence against the
+provider - an endless series of fresh links and an honestly enormous
+collection look identical from here - so it is `GraphError::LimitExceeded` ->
+`Internal(LimitExceeded)`, this crate's own limit, the same split
+`bifrost-google`'s walks make. The budget is checked first, so a page past it
+is the limit even when its link also repeats. Every walk, the local event
+search included, classifies the `PageWalk` error through
+`into_account_error` (or `graph_shared_scope_error` on the delta walks) rather
+than remapping it.
 
 `list_mail_folders_recursive` needs a SECOND, different guard, and no amount of
 page-link checking substitutes for it. Folder parentage is server-supplied, so a

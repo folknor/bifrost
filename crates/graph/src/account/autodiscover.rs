@@ -1,8 +1,9 @@
 //! Exchange Autodiscover layer: public-folder routing discovery and
 //! delegate (alternative-mailbox) enumeration.
 //!
-//! The two response parsers are copy-direct from ratatoskr's
-//! `autodiscover.rs` (pure quick-xml, fully tested). The HTTP entry
+//! The two response parsers derive from ratatoskr's `autodiscover.rs` (pure
+//! quick-xml), since hardened to refuse a malformed or truncated document
+//! rather than read it as an empty answer. The HTTP entry
 //! points are reshaped onto `AccountNet` (the Bearer is supplied by the
 //! net layer, never a hand-built header) and return `AccountError`
 //! through the existing REST error path - Autodiscover is REST-over-HTTP
@@ -20,7 +21,7 @@ use super::cursor::PublicFolderRouting;
 use super::graph_error::{GraphErrorContext, into_account_error, response_to_account_error_pub};
 use crate::client::AuxTarget;
 use crate::error::GraphResponseError;
-use crate::ews::push_general_ref;
+use crate::ews::try_push_general_ref;
 use crate::origin::AdmittedUrl;
 
 /// The POX (`autodiscover.xml`) Autodiscover path under the Outlook origin.
@@ -79,6 +80,19 @@ fn is_redirect(code: &str) -> bool {
 /// the URL parser (so the scheme's case does not matter).
 fn is_http_url(target: &str) -> bool {
     reqwest::Url::parse(target).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// An Autodiscover HTTP 200 whose body the provider got wrong: the
+/// provider's malformed response (`Protocol(ParseFailed)`, `Acknowledged`).
+/// The body is not attached: Autodiscover answers name mailboxes.
+fn malformed_answer(message: String, ctx: GraphErrorContext) -> AccountError {
+    into_account_error(
+        crate::error::GraphError::Json {
+            message,
+            body: None,
+        },
+        ctx,
+    )
 }
 
 /// A shared/delegate mailbox discovered via Exchange Autodiscover.
@@ -170,13 +184,14 @@ impl GraphAccount {
     /// Consumed by delegate auto-discovery at `open` when the factory's
     /// `with_delegate_discovery()` flag is set.
     ///
-    /// Best-effort by design: `parse_alternative_mailboxes` treats
-    /// malformed or truncated XML as end-of-input rather than an error
-    /// (it is the shared quick-xml walking pattern used across this
-    /// module), so an HTTP-200 response with bad XML yields an empty or
-    /// partial mailbox list here, not an `Err`. That is non-fatal at the
-    /// call site: `open` degrades to the config-supplied mailboxes when
-    /// discovery comes back empty or fails outright.
+    /// An HTTP 200 whose body is malformed, truncated, or not an
+    /// `Autodiscover` document is the provider's malformed response
+    /// (`Protocol(ParseFailed)`), not an answer with no delegates: it used
+    /// to read as an empty list, indistinguishable from a user who has
+    /// none. The best-effort policy lives at the call site, not here: `open`
+    /// degrades to the config-supplied mailboxes on any `Err` and records
+    /// the skipped pass on `skipped_scopes`, so a bad answer is now
+    /// reportable instead of silent.
     pub(crate) async fn discover_shared_mailboxes(
         &self,
         user_email: &str,
@@ -195,9 +210,11 @@ impl GraphAccount {
         let url = self
             .client
             .outlook_url(AUTODISCOVER_XML_PATH)
-            .map_err(|error| into_account_error(error, ctx))?;
+            .map_err(|error| into_account_error(error, ctx.clone()))?;
         let xml = self.autodiscover_post(&url, "text/xml", None, body).await?;
-        Ok(parse_alternative_mailboxes(&xml))
+        parse_alternative_mailboxes(&xml).map_err(|reason| {
+            malformed_answer(format!("Autodiscover alternativeMailboxes: {reason}"), ctx)
+        })
     }
 
     async fn soap_get_user_settings(
@@ -230,7 +247,12 @@ impl GraphAccount {
                     body,
                 )
                 .await?;
-            let parsed = parse_user_settings_response(&xml);
+            let parsed = parse_user_settings_response(&xml).map_err(|reason| {
+                malformed_answer(
+                    format!("Autodiscover GetUserSettings: {reason}"),
+                    ctx.clone(),
+                )
+            })?;
 
             match self.next_step(&parsed, &ctx)? {
                 SoapStep::Settings => return Ok(parsed.settings),
@@ -269,15 +291,7 @@ impl GraphAccount {
         parsed: &UserSettingsResponse,
         ctx: &GraphErrorContext,
     ) -> Result<SoapStep, AccountError> {
-        let malformed = |message: String| {
-            into_account_error(
-                crate::error::GraphError::Json {
-                    message,
-                    body: None,
-                },
-                ctx.clone(),
-            )
-        };
+        let malformed = |message: String| malformed_answer(message, ctx.clone());
         let failure = |code: &str, message: Option<&str>| {
             super::graph_error::invalid_account_error(
                 AccountOperation::Discover,
@@ -417,7 +431,7 @@ fn build_get_user_settings_soap(email: &str, settings: &[&str]) -> String {
     )
 }
 
-// ── Pure parsers (copy-direct from ratatoskr) ───────────────
+// ── Pure parsers ────────────────────────────────────────────
 
 /// The parsed shape of a `GetUserSettings` response. EWS Autodiscover
 /// returns failures and redirects INSIDE an HTTP 200 (the in-body
@@ -454,14 +468,82 @@ pub(crate) struct SoapAnswer {
 /// production path consumes the full response (error/redirect markers).
 #[cfg(test)]
 fn parse_user_settings(xml: &str) -> Vec<(String, String)> {
-    parse_user_settings_response(xml).settings
+    parse_user_settings_response(xml)
+        .expect("well-formed test document")
+        .settings
+}
+
+/// Tracks that an Autodiscover answer is one complete document with the
+/// expected root, so a malformed or truncated HTTP 200 cannot read as a
+/// valid answer that happens to be empty.
+///
+/// quick-xml reports a syntax error as `Err`, but input that simply STOPS
+/// (a truncated body) reaches `Eof` with elements still open and no error,
+/// and a body that is not XML at all (an HTML error page, an empty body)
+/// can produce no element whatever. Both used to end the walk exactly like
+/// a complete answer.
+struct DocumentShape {
+    root: &'static str,
+    seen_root: bool,
+    depth: usize,
+}
+
+impl DocumentShape {
+    fn new(root: &'static str) -> Self {
+        Self {
+            root,
+            seen_root: false,
+            depth: 0,
+        }
+    }
+
+    /// An element opened (`self_closing`: and closed at once).
+    fn open(&mut self, local_name: &str, self_closing: bool) -> Result<(), String> {
+        if self.depth == 0 {
+            if self.seen_root {
+                return Err("a second root element follows the document".to_string());
+            }
+            if local_name != self.root {
+                return Err(format!(
+                    "root element is {local_name}, expected {}",
+                    self.root
+                ));
+            }
+            self.seen_root = true;
+        }
+        if !self_closing {
+            self.depth += 1;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        self.depth = self
+            .depth
+            .checked_sub(1)
+            .ok_or_else(|| "an end tag closes nothing".to_string())?;
+        Ok(())
+    }
+
+    /// The input ended: fine only after one whole root element.
+    fn finish(&self) -> Result<(), String> {
+        if !self.seen_root {
+            return Err(format!("no {} element in the response", self.root));
+        }
+        if self.depth != 0 {
+            return Err("the response ended inside an open element (truncated)".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Parse a `GetUserSettings` response into settings plus the in-body
-/// error / redirect markers.
-fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
+/// error / redirect markers. A document that is malformed, truncated, or not
+/// a SOAP envelope at all is `Err` with the reason, never an empty answer.
+fn parse_user_settings_response(xml: &str) -> Result<UserSettingsResponse, String> {
     let mut reader = Reader::from_str(xml);
     let mut out = UserSettingsResponse::default();
+    let mut shape = DocumentShape::new("Envelope");
 
     let mut in_user_setting = false;
     // Inside the first `<a:UserResponse>`; later ones are ignored, since one
@@ -480,6 +562,7 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 let name = e.name().local_name().as_ref().to_owned();
+                shape.open(&name, false)?;
                 match name.as_str() {
                     "UserSetting" => {
                         in_user_setting = true;
@@ -493,9 +576,13 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
                 current_tag = name;
                 buf.clear();
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf),
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::GeneralRef(ref e)) => try_push_general_ref(e, &mut buf)?,
+            Ok(Event::Empty(ref e)) => {
+                shape.open(e.name().local_name().as_ref(), true)?;
+            }
             Ok(Event::End(ref e)) => {
+                shape.close()?;
                 let name = e.name().local_name().as_ref().to_owned();
                 let trimmed = buf.trim();
                 if in_user_setting {
@@ -551,12 +638,14 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
                 buf.clear();
                 current_tag.clear();
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(format!("malformed XML: {error}")),
             _ => {}
         }
     }
 
-    out
+    shape.finish()?;
+    Ok(out)
 }
 
 /// Merge config-supplied shared-mailbox routing keys with the
@@ -586,10 +675,13 @@ pub(crate) fn merge_shared_mailboxes(
     merged
 }
 
-/// Parse `AlternativeMailbox` elements from an Autodiscover XML response.
-fn parse_alternative_mailboxes(xml: &str) -> Vec<SharedMailbox> {
+/// Parse `AlternativeMailbox` elements from an Autodiscover XML response. A
+/// document that is malformed, truncated, or not an `Autodiscover` answer
+/// at all is `Err` with the reason, never an empty mailbox list.
+fn parse_alternative_mailboxes(xml: &str) -> Result<Vec<SharedMailbox>, String> {
     let mut reader = Reader::from_str(xml);
     let mut mailboxes = Vec::new();
+    let mut shape = DocumentShape::new("Autodiscover");
 
     let mut in_alternative_mailbox = false;
     let mut current_type = String::new();
@@ -602,6 +694,7 @@ fn parse_alternative_mailboxes(xml: &str) -> Vec<SharedMailbox> {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 let name = e.name().local_name().as_ref().to_owned();
+                shape.open(&name, false)?;
                 if name == "AlternativeMailbox" {
                     in_alternative_mailbox = true;
                     current_type.clear();
@@ -611,9 +704,13 @@ fn parse_alternative_mailboxes(xml: &str) -> Vec<SharedMailbox> {
                 current_tag = name;
                 buf.clear();
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf),
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::GeneralRef(ref e)) => try_push_general_ref(e, &mut buf)?,
+            Ok(Event::Empty(ref e)) => {
+                shape.open(e.name().local_name().as_ref(), true)?;
+            }
             Ok(Event::End(ref e)) => {
+                shape.close()?;
                 let name = e.name().local_name().as_ref().to_owned();
                 if in_alternative_mailbox {
                     let trimmed = buf.trim();
@@ -641,18 +738,23 @@ fn parse_alternative_mailboxes(xml: &str) -> Vec<SharedMailbox> {
                 buf.clear();
                 current_tag.clear();
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(error) => return Err(format!("malformed XML: {error}")),
             _ => {}
         }
     }
 
-    mailboxes
+    shape.finish()?;
+    Ok(mailboxes)
 }
 
-fn push_text(e: &quick_xml::events::BytesText<'_>, buf: &mut String) {
-    if let Ok(text) = unescape(e.as_ref()) {
-        buf.push_str(&text);
-    }
+/// A text run that does not unescape is a malformed answer, not an empty
+/// one: dropping it would splice the text on either side into a different
+/// value (an address, say).
+fn push_text(e: &quick_xml::events::BytesText<'_>, buf: &mut String) -> Result<(), String> {
+    let text = unescape(e.as_ref()).map_err(|error| format!("malformed XML text: {error}"))?;
+    buf.push_str(&text);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1012,6 +1114,155 @@ mod tests {
         );
     }
 
+    /// `text` cut just before the first occurrence of `marker`.
+    fn cut_before(text: &str, marker: &str) -> String {
+        text[..text.find(marker).expect("marker present")].to_string()
+    }
+
+    fn assert_parse_failed(error: &bifrost_types::AccountError) {
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Bodies an HTTP 200 can carry that are not a `GetUserSettings` answer.
+    /// The old parser treated a quick-xml error like end of input and never
+    /// checked that the document was complete, so every one of these came
+    /// back as an answer with no settings and no error.
+    #[test]
+    fn a_malformed_user_settings_document_is_an_error_not_an_empty_answer() {
+        let whole = user_settings_xml("AutoDiscoverSMTPAddress", "content@contoso.com");
+        for (label, body) in [
+            ("empty", String::new()),
+            ("plain text", "Bad Gateway".to_string()),
+            ("wrong root", "<html><body>ok</body></html>".to_string()),
+            (
+                "truncated inside a setting",
+                cut_before(&whole, "</a:UserSetting>"),
+            ),
+            (
+                "truncated after the settings",
+                cut_before(&whole, "</a:UserResponse>"),
+            ),
+            (
+                "mismatched end tag",
+                whole.replace("</a:Value>", "</a:Name>"),
+            ),
+            ("two roots", format!("{whole}<s:Envelope/>")),
+            (
+                "unknown entity in a value",
+                whole.replace("content@", "content&bogus;@"),
+            ),
+        ] {
+            assert!(
+                parse_user_settings_response(&body).is_err(),
+                "{label} must not parse as an answer"
+            );
+        }
+    }
+
+    /// The same for the delegate document: a truncated answer used to yield
+    /// the mailboxes before the cut as if they were the whole list, and a
+    /// non-Autodiscover body an empty list.
+    #[test]
+    fn a_malformed_alternative_mailboxes_document_is_an_error_not_a_short_list() {
+        let whole = r#"<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover>
+  <Response>
+    <Account>
+      <AlternativeMailbox><SmtpAddress>sales@contoso.com</SmtpAddress></AlternativeMailbox>
+      <AlternativeMailbox><SmtpAddress>eng@contoso.com</SmtpAddress></AlternativeMailbox>
+    </Account>
+  </Response>
+</Autodiscover>"#;
+        assert_eq!(
+            parse_alternative_mailboxes(whole)
+                .expect("the whole document parses")
+                .len(),
+            2
+        );
+        for (label, body) in [
+            ("empty", String::new()),
+            ("wrong root", "<html><body>ok</body></html>".to_string()),
+            (
+                "truncated after one mailbox",
+                cut_before(whole, "<AlternativeMailbox><SmtpAddress>eng"),
+            ),
+            (
+                "truncated before the root closes",
+                cut_before(whole, "</Autodiscover>"),
+            ),
+            (
+                "mismatched end tag",
+                whole.replace("</Account>", "</Response>"),
+            ),
+            // Dropping the reference would read `sales@contoso.com`, a
+            // different mailbox from the one the server named.
+            ("unknown entity", whole.replace("sales@", "sales&bogus;@")),
+            (
+                "invalid character reference",
+                whole.replace("sales@", "sales&#xD800;@"),
+            ),
+        ] {
+            assert!(
+                parse_alternative_mailboxes(&body).is_err(),
+                "{label} must not parse as a mailbox list"
+            );
+        }
+    }
+
+    /// End to end on both `GetUserSettings` lookups: a truncated HTTP 200 is
+    /// the provider's malformed response. The old code read the truncated
+    /// answer as one with no settings and reported the missing setting as
+    /// `Request(Malformed)`, blaming the caller for the provider's body.
+    #[tokio::test]
+    async fn a_truncated_user_settings_answer_is_the_providers_parse_failure() {
+        let truncated = cut_before(
+            &user_settings_xml("AutoDiscoverSMTPAddress", "content@contoso.com"),
+            "</a:UserSetting>",
+        );
+        let (error, requests) = content_mailbox_error(truncated).await;
+        assert_eq!(requests, 1);
+        assert_parse_failed(&error);
+
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::text(
+            reqwest::StatusCode::OK,
+            &cut_before(
+                &user_settings_xml("PublicFolderInformation", "pf@contoso.com"),
+                "</a:UserSetting>",
+            ),
+        )]);
+        let error = test_account(client.clone())
+            .discover_public_folder_routing("user@contoso.com")
+            .await
+            .expect_err("a truncated answer fails the lookup");
+        assert_parse_failed(&error);
+        assert_eq!(client.take_aux_requests().len(), 1);
+    }
+
+    /// Delegate discovery on a malformed HTTP 200 fails instead of reporting
+    /// "no delegates", so `open`'s best-effort degradation records a skipped
+    /// pass rather than silently opening without them. The old code returned
+    /// `Ok` with an empty list.
+    #[tokio::test]
+    async fn a_malformed_delegate_answer_fails_discovery_instead_of_finding_none() {
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::text(
+            reqwest::StatusCode::OK,
+            "<Autodiscover><Response><Account><AlternativeMailbox>",
+        )]);
+        let error = test_account(client)
+            .discover_shared_mailboxes("user@contoso.com")
+            .await
+            .expect_err("a truncated answer is not an empty one");
+        assert_parse_failed(&error);
+    }
+
     /// A per-setting `ErrorCode` inside `UserSettingErrors` is not the
     /// user's answer: the requested setting that did resolve is returned.
     #[test]
@@ -1032,7 +1283,7 @@ mod tests {
     </a:UserResponse></a:UserResponses>
   </a:Response></a:GetUserSettingsResponseMessage></s:Body>
 </s:Envelope>"#;
-        let parsed = parse_user_settings_response(xml);
+        let parsed = parse_user_settings_response(xml).expect("well-formed");
         assert_eq!(parsed.user.code.as_deref(), Some("NoError"));
         assert_eq!(parsed.response.code.as_deref(), Some("NoError"));
         assert_eq!(
@@ -1077,7 +1328,7 @@ mod tests {
     </Account>
   </Response>
 </Autodiscover>"#;
-        let result = parse_alternative_mailboxes(xml);
+        let result = parse_alternative_mailboxes(xml).expect("well-formed");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].smtp_address, "sales@contoso.com");
         assert_eq!(result[0].display_name.as_deref(), Some("Sales Team"));
@@ -1107,7 +1358,7 @@ mod tests {
     </Account>
   </Response>
 </Autodiscover>"#;
-        let result = parse_alternative_mailboxes(xml);
+        let result = parse_alternative_mailboxes(xml).expect("well-formed");
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].smtp_address, "sales@contoso.com");
         assert_eq!(result[0].mailbox_type, "Delegate");
@@ -1127,7 +1378,11 @@ mod tests {
     </Account>
   </Response>
 </Autodiscover>"#;
-        assert!(parse_alternative_mailboxes(xml).is_empty());
+        assert!(
+            parse_alternative_mailboxes(xml)
+                .expect("well-formed")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1142,7 +1397,11 @@ mod tests {
     </Account>
   </Response>
 </Autodiscover>"#;
-        assert!(parse_alternative_mailboxes(xml).is_empty());
+        assert!(
+            parse_alternative_mailboxes(xml)
+                .expect("well-formed")
+                .is_empty()
+        );
     }
 
     fn shared(smtp: &str, ty: &str) -> SharedMailbox {
@@ -1329,7 +1588,7 @@ mod tests {
     </a:GetUserSettingsResponseMessage>
   </s:Body>
 </s:Envelope>"#;
-        let parsed = parse_user_settings_response(xml);
+        let parsed = parse_user_settings_response(xml).expect("well-formed");
         assert!(parsed.settings.is_empty());
         assert_eq!(parsed.response.code.as_deref(), Some("InvalidUser"));
         assert_eq!(
@@ -1354,7 +1613,7 @@ mod tests {
     </a:GetUserSettingsResponseMessage>
   </s:Body>
 </s:Envelope>"#;
-        let parsed = parse_user_settings_response(xml);
+        let parsed = parse_user_settings_response(xml).expect("well-formed");
         assert_eq!(
             parsed.response.redirect_target.as_deref(),
             Some("user@redirected.contoso.com")
@@ -1384,7 +1643,7 @@ mod tests {
     </a:GetUserSettingsResponseMessage>
   </s:Body>
 </s:Envelope>"#;
-        let parsed = parse_user_settings_response(xml);
+        let parsed = parse_user_settings_response(xml).expect("well-formed");
         assert_eq!(parsed.settings.len(), 1);
         assert_eq!(parsed.settings[0].0, "PresentButEmpty");
         assert_eq!(parsed.settings[0].1, "");

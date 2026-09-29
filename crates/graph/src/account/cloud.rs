@@ -81,21 +81,158 @@ struct DriveItemResponse {
 /// server may accept fewer bytes than were sent (it is allowed to), so the
 /// client must resume from the server's reported offset rather than blindly
 /// advancing to the end of the chunk it just PUT.
-#[derive(Debug, Default, Deserialize)]
+///
+/// The field is REQUIRED: a 202 without it names no offset to resume from,
+/// and guessing one (the end of the chunk just sent) skips every byte the
+/// server did not accept, corrupting the uploaded file without an error.
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadProgress {
-    #[serde(default)]
     next_expected_ranges: Vec<String>,
 }
 
-impl UploadProgress {
-    /// The server's authoritative resume offset: the start of the first
-    /// still-expected range. `None` if the body had no parseable range.
-    fn resume_offset(&self) -> Option<usize> {
-        self.next_expected_ranges
-            .first()
-            .and_then(|range| range.split('-').next())
-            .and_then(|start| start.trim().parse::<usize>().ok())
+/// The start of a `"start-end"` or `"start-"` byte range, or `None` when the
+/// text is not one. Both bounds must be plain decimal digits (no sign, no
+/// whitespace inside), and a closed range must not end before it starts.
+fn range_start(range: &str) -> Option<usize> {
+    fn decimal(text: &str) -> Option<usize> {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    }
+    let (start, end) = range.trim().split_once('-')?;
+    let start = decimal(start)?;
+    if !end.is_empty() && decimal(end)? < start {
+        return None;
+    }
+    Some(start)
+}
+
+/// The resume offset a mid-upload 202 names, admitted against the chunk it
+/// answers (`offset..end` of `total` bytes).
+///
+/// A 202 carries no data of its own beyond this offset, so every way it can
+/// be wrong is refused rather than guessed around:
+///
+/// - a body that does not parse, a missing `nextExpectedRanges`, or a first
+///   range that is not a byte range is the provider's malformed response
+///   (`GraphError::Json`, `Protocol(ParseFailed)`);
+/// - an empty `nextExpectedRanges` (a 202 that wants nothing more), an offset
+///   that does not advance (which would spin the loop), one past the end of
+///   the bytes just sent (which would skip bytes the server never received),
+///   or one that reaches the total (every byte acknowledged, yet no drive
+///   item, the 200/201 the protocol requires) is well-formed but impossible
+///   (`GraphError::ContractViolation`, `Protocol(ContractViolation)`).
+///
+/// An offset short of `end` is legitimate on any chunk, the final one
+/// included: the server accepted part of it and wants the rest again.
+fn admitted_resume_offset(
+    body: &Bytes,
+    offset: usize,
+    end: usize,
+    total: usize,
+) -> Result<usize, GraphError> {
+    let progress: UploadProgress =
+        serde_json::from_slice(body.as_ref()).map_err(|e| GraphError::Json {
+            message: format!("OneDrive 202 body: {e}"),
+            body: (!body.is_empty()).then(|| body.clone()),
+        })?;
+    let Some(first) = progress.next_expected_ranges.first() else {
+        return Err(contract_violation(format!(
+            "OneDrive 202 for bytes {offset}-{} named no nextExpectedRanges",
+            end - 1
+        )));
+    };
+    let next = range_start(first).ok_or_else(|| GraphError::Json {
+        message: "OneDrive 202 nextExpectedRanges entry is not a byte range".to_string(),
+        body: Some(body.clone()),
+    })?;
+    if next <= offset {
+        return Err(contract_violation(format!(
+            "OneDrive 202 resume offset {next} did not advance past {offset}"
+        )));
+    }
+    if next > end {
+        return Err(contract_violation(format!(
+            "OneDrive 202 resume offset {next} is past the end {end} of the bytes sent"
+        )));
+    }
+    if next >= total {
+        return Err(contract_violation(format!(
+            "OneDrive 202 acknowledged all {total} bytes without returning the drive item"
+        )));
+    }
+    Ok(next)
+}
+
+/// An upload session URL admitted for the chunk PUTs. Only
+/// [`admit_upload_url`] builds one, so the PUT loop cannot be handed a URL
+/// that skipped admission.
+struct UploadSessionUrl(reqwest::Url);
+
+impl std::fmt::Debug for UploadSessionUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The session credential rides in the query; a Debug names the
+        // origin and path only.
+        let query = if self.0.query().is_some() { "?.." } else { "" };
+        write!(
+            f,
+            "UploadSessionUrl({}{}{query})",
+            self.0.origin().ascii_serialization(),
+            self.0.path()
+        )
+    }
+}
+
+/// Admit the `uploadUrl` a `createUploadSession` answer named, at receipt and
+/// before any byte is sent to it.
+///
+/// The URL carries no Graph bearer, but it receives the attachment bytes and
+/// is itself a credential (the session's pre-authentication rides in it), so
+/// where it points still matters. Admitted: an absolute `https` URL with a
+/// host and no userinfo, on any host; or an `http` URL on the configured
+/// Graph origin, which the consumer already trusts with the account bearer
+/// itself, so admitting it widens nothing (a local harness serves Graph that
+/// way). Refused: plain `http` anywhere else (the bytes and the credential
+/// would cross the network in the clear), userinfo (an authority that reads
+/// as one host and sends to another), and anything that is not an absolute
+/// http(s) URL.
+///
+/// Same-origin admission, the rule for every bearer-carrying URL, does not
+/// fit: real session URLs live on SharePoint and OneDrive hosts, never on
+/// the Graph host. Nor does an allowlist of upload hosts: Microsoft documents
+/// `uploadUrl` as an opaque URL, not a host set, and the hosts in use vary by
+/// tenant, product and national cloud (`*-my.sharepoint.com`, vanity
+/// SharePoint domains, consumer OneDrive, the sovereign clouds), so a list
+/// would refuse working tenants on a guess. The URL arrives inside a Graph
+/// answer the client fetched over the same TLS channel as its bearer, so a
+/// party able to choose the host could already read that answer; what
+/// admission can and does prevent is the credential leaving over plain http
+/// or behind a misleading authority.
+///
+/// A refusal is the provider's contract violation: Graph answered, and the
+/// answer names a destination this client will not send to.
+fn admit_upload_url(client: &GraphClient, raw: &str) -> Result<UploadSessionUrl, GraphError> {
+    // The reasons never quote the URL: it is a credential.
+    let refuse = |reason: &str| {
+        contract_violation(format!(
+            "OneDrive createUploadSession named an upload URL this client will not send \
+             the attachment to: {reason}"
+        ))
+    };
+    let url = reqwest::Url::parse(raw).map_err(|_| refuse("not an absolute URL"))?;
+    if url.host().is_none() {
+        return Err(refuse("the URL has no host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refuse("the URL carries userinfo"));
+    }
+    match url.scheme() {
+        "https" => Ok(UploadSessionUrl(url)),
+        "http" if client.admit_target(url.as_str()).is_ok() => Ok(UploadSessionUrl(url)),
+        "http" => Err(refuse("plain http off the configured Graph origin")),
+        _ => Err(refuse("the URL is not http or https")),
     }
 }
 
@@ -156,9 +293,10 @@ async fn upload_and_link(
 ) -> Result<HostedAttachment, GraphError> {
     let client = &account.client;
     let session = create_upload_session(client, &meta.file_name).await?;
+    let upload_url = admit_upload_url(client, &session.upload_url)?;
     let item_id = upload_file_chunked(
         client,
-        &session.upload_url,
+        &upload_url,
         bytes,
         DEFAULT_CHUNK_SIZE,
         &account.shutdown,
@@ -195,9 +333,11 @@ async fn create_upload_session(
 /// the server reports the next byte range it expects via `nextExpectedRanges`;
 /// resume from that offset (the server may accept fewer bytes than were sent,
 /// so blindly advancing `offset = end` can skip unaccepted bytes and corrupt
-/// the upload). Any other status -> classified error. OneDrive's 202 resume
-/// signal never enters bifrost-net's redirect path, so the Drive-specific 308
-/// passthrough does not apply here. The whole upload is bounded by
+/// the upload), and refuse a 202 that names no valid offset inside the bytes
+/// just sent rather than guess one (`admitted_resume_offset`). Any other
+/// status -> classified error. OneDrive's 202 resume signal never enters
+/// bifrost-net's redirect path, so the Drive-specific 308 passthrough does
+/// not apply here. The whole upload is bounded by
 /// `UPLOAD_TOTAL_TIMEOUT` and aborts if the account shutdown token fires.
 ///
 /// The budget is enforced INSIDE the transport, not by a timer around the
@@ -208,7 +348,7 @@ async fn create_upload_session(
 /// report the expiry as a provider parse failure the provider never caused.
 async fn upload_file_chunked(
     client: &GraphClient,
-    upload_url: &str,
+    upload_url: &UploadSessionUrl,
     data: Bytes,
     chunk_size: usize,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -227,7 +367,7 @@ async fn upload_file_chunked(
 
 async fn upload_chunks(
     client: &GraphClient,
-    upload_url: &str,
+    upload_url: &UploadSessionUrl,
     data: Bytes,
     chunk_size: usize,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -261,7 +401,7 @@ async fn upload_chunks(
         let headers = [("Content-Range", content_range.as_str())];
         let put = client.execute_aux(
             "PUT",
-            crate::client::AuxTarget::Anonymous(upload_url),
+            crate::client::AuxTarget::Anonymous(upload_url.0.as_str()),
             &headers,
             chunk,
             Some(remaining),
@@ -296,23 +436,11 @@ async fn upload_chunks(
                     })?;
                 return Ok(item.id);
             }
-            // 202 Accepted: read the server's authoritative resume offset
-            // from `nextExpectedRanges`. The server is allowed to accept
-            // fewer bytes than the chunk we PUT, so resuming from `end`
-            // unconditionally would skip the unaccepted tail. Fall back to
-            // `end` only when the body carried no parseable range (and
-            // guard against a non-advancing offset, which would spin).
-            202 => {
-                let progress: UploadProgress =
-                    serde_json::from_slice(response.body.as_ref()).unwrap_or_default();
-                let next = progress.resume_offset().unwrap_or(end);
-                if next <= offset {
-                    return Err(malformed_response(format!(
-                        "OneDrive 202 resume offset {next} did not advance past {offset}"
-                    )));
-                }
-                offset = next;
-            }
+            // 202 Accepted: resume from the server's authoritative offset.
+            // The server is allowed to accept fewer bytes than the chunk we
+            // PUT, so there is no safe default: a 202 without a valid offset
+            // inside `offset..=end` is refused, never resumed at `end`.
+            202 => offset = admitted_resume_offset(&response.body, offset, end, total)?,
             // Everything else. This arm is DELIBERATELY not pinned by a test,
             // and cannot be reached by the failure statuses it reads as though
             // it handled them: bifrost-net resolves 4xx/5xx into an `Err`
@@ -332,12 +460,13 @@ async fn upload_chunks(
         }
     }
 
-    // Reached only if the server 202-acknowledged the final chunk instead of
-    // returning the completed drive item (200/201) - a server protocol
-    // violation, classified as a malformed response.
-    Err(malformed_response(
-        "upload completed without receiving a drive item response".to_string(),
-    ))
+    // Every 202 leaves `offset` short of `total` (`admitted_resume_offset`
+    // refuses one that acknowledges the last byte), so the loop ends only by
+    // returning, unless it never ran: an empty payload, which
+    // `host_attachment` refuses before any request.
+    Err(GraphError::Internal {
+        message: "OneDrive chunked upload was handed an empty payload".to_string(),
+    })
 }
 
 /// The account was shut down (close / reopen) while an upload was under way.
@@ -390,15 +519,12 @@ fn encode_onedrive_path(filename: &str) -> String {
         .replace('?', "%3F")
 }
 
-/// Carry a server-protocol violation (a response that does not match the
-/// resumable-upload contract) through the graph error funnel, where
-/// `GraphError::Json` classifies as `Protocol(ParseFailed)` /
-/// `Wire(MalformedResponse)`.
-fn malformed_response(detail: String) -> GraphError {
-    GraphError::Json {
-        message: detail,
-        body: None,
-    }
+/// A complete OneDrive answer that breaks the resumable-upload contract
+/// (well-formed, but impossible at that point), classified
+/// `Protocol(ContractViolation)` with `Acknowledged` evidence. A body that
+/// does not parse at all is `GraphError::Json` instead.
+fn contract_violation(message: String) -> GraphError {
+    GraphError::ContractViolation { message }
 }
 
 #[cfg(test)]
@@ -410,6 +536,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const SESSION_URL: &str = "https://upload.example/session/abc?token=preauth";
+
+    /// `SESSION_URL`, through the same admission production applies.
+    fn session(client: &GraphClient) -> UploadSessionUrl {
+        admit_upload_url(client, SESSION_URL).expect("an https session URL is admitted")
+    }
 
     fn fresh_deadline() -> tokio::time::Instant {
         tokio::time::Instant::now() + UPLOAD_TOTAL_TIMEOUT
@@ -430,7 +561,7 @@ mod tests {
 
         let error = upload_chunks(
             &client,
-            SESSION_URL,
+            &session(&client),
             Bytes::from_static(b"0123456789AB"),
             5,
             &CancellationToken::new(),
@@ -462,7 +593,7 @@ mod tests {
 
         let error = upload_chunks(
             &client,
-            SESSION_URL,
+            &session(&client),
             Bytes::from_static(b"0123456789AB"),
             CHUNK_ALIGNMENT,
             &CancellationToken::new(),
@@ -500,7 +631,7 @@ mod tests {
 
         let error = upload_file_chunked(
             &client,
-            SESSION_URL,
+            &session(&client),
             Bytes::from_static(b"0123456789AB"),
             CHUNK_ALIGNMENT,
             &shutdown,
@@ -551,7 +682,7 @@ mod tests {
 
         let item = upload_chunks(
             &client,
-            SESSION_URL,
+            &session(&client),
             Bytes::from_static(b"0123456789AB"),
             5,
             &CancellationToken::new(),
@@ -594,34 +725,239 @@ mod tests {
         }
     }
 
-    /// A 202 whose resume offset does not advance would spin the upload
-    /// loop forever against a server that keeps answering the same thing.
-    /// It is treated as a protocol violation instead.
-    #[tokio::test]
-    async fn a_non_advancing_202_offset_is_rejected_instead_of_looping() {
+    /// Upload `data` in 5-byte chunks with exactly ONE scripted answer, and
+    /// return the classified error plus how many PUTs went out. The script
+    /// holds one response, so a loop that resumed after it instead of
+    /// refusing would hit the exhausted seam and panic.
+    async fn refusal_of_first_answer(
+        data: &'static [u8],
+        answer: ScriptedRestResponse,
+    ) -> (bifrost_types::AccountError, usize) {
         let client = GraphClient::new("token");
-        client.script_aux([ScriptedRestResponse::json(
-            reqwest::StatusCode::ACCEPTED,
-            json!({ "nextExpectedRanges": ["0-11"] }),
-        )]);
-
+        client.script_aux([answer]);
         let error = upload_chunks(
             &client,
-            SESSION_URL,
+            &session(&client),
+            Bytes::from_static(data),
+            5,
+            &CancellationToken::new(),
+            fresh_deadline(),
+        )
+        .await
+        .expect_err("the answer must end the upload");
+        (classify(error), client.take_aux_requests().len())
+    }
+
+    fn accepted(body: serde_json::Value) -> ScriptedRestResponse {
+        ScriptedRestResponse::json(reqwest::StatusCode::ACCEPTED, body)
+    }
+
+    /// A 202 is the resume signal and nothing else, so one that names no
+    /// usable offset is the provider's MALFORMED response. The old code read
+    /// each of these as "resume at the end of the chunk just sent" (a body
+    /// that did not parse became an empty progress, and an unparseable range
+    /// fell back to `end`), which skips every byte the server did not
+    /// accept and corrupts the file with no error at all; against it this
+    /// test fails, because the upload goes on to a second PUT the script
+    /// does not hold.
+    #[tokio::test]
+    async fn a_202_without_a_parseable_offset_is_a_malformed_response() {
+        for answer in [
+            ScriptedRestResponse::text(reqwest::StatusCode::ACCEPTED, ""),
+            ScriptedRestResponse::text(reqwest::StatusCode::ACCEPTED, "<html>ok</html>"),
+            accepted(json!({})),
+            accepted(json!({ "nextExpectedRanges": null })),
+            accepted(json!({ "nextExpectedRanges": [5] })),
+            accepted(json!({ "nextExpectedRanges": ["abc-"] })),
+            accepted(json!({ "nextExpectedRanges": ["-"] })),
+            // No dash: the old parser read "5" as offset 5.
+            accepted(json!({ "nextExpectedRanges": ["5"] })),
+            accepted(json!({ "nextExpectedRanges": ["+5-"] })),
+            accepted(json!({ "nextExpectedRanges": ["5-3"] })),
+        ] {
+            let (error, puts) = refusal_of_first_answer(b"0123456789AB", answer).await;
+            assert_eq!(puts, 1);
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ParseFailed
+                )
+            );
+        }
+    }
+
+    /// A 202 that parses but names an impossible offset is the provider's
+    /// CONTRACT VIOLATION, not a parse failure: an empty range list (a 202
+    /// that wants nothing more), an offset that does not advance (which
+    /// would spin the loop), and an offset past the bytes just sent (bytes
+    /// 0-4 went out; resuming at 7 or 20 would skip bytes the server never
+    /// received). Against the old code: the empty list resumed at 5, the
+    /// forward offsets were followed and skipped bytes 5 and 6 (so the
+    /// second PUT hit the exhausted script), and the non-advancing one was
+    /// refused as `ParseFailed` through the parse-failure helper.
+    #[tokio::test]
+    async fn a_202_offset_outside_the_bytes_sent_is_a_contract_violation() {
+        for ranges in [json!([]), json!(["0-11"]), json!(["7-11"]), json!(["20-"])] {
+            let (error, puts) = refusal_of_first_answer(
+                b"0123456789AB",
+                accepted(json!({ "nextExpectedRanges": ranges.clone() })),
+            )
+            .await;
+            assert_eq!(puts, 1, "{ranges}");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation
+                ),
+                "{ranges}"
+            );
+            assert!(!error.recovery().is_retryable(), "{ranges}");
+        }
+    }
+
+    /// A 202 that acknowledges the LAST byte has promised completion without
+    /// the drive item only a 200/201 carries. The old code let the loop run
+    /// out and reported this through the parse-failure helper
+    /// (`Protocol(ParseFailed)`); it is a contract violation.
+    #[tokio::test]
+    async fn a_202_acknowledging_every_byte_is_a_contract_violation() {
+        for ranges in [json!([]), json!(["4-"])] {
+            let (error, puts) = refusal_of_first_answer(
+                b"0123",
+                accepted(json!({ "nextExpectedRanges": ranges.clone() })),
+            )
+            .await;
+            assert_eq!(puts, 1, "{ranges}");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation
+                ),
+                "{ranges}"
+            );
+        }
+    }
+
+    /// The final chunk may be partially accepted like any other: a 202 short
+    /// of the total on the last chunk resumes and re-sends the rest. This
+    /// passes against the old code too; it pins that refusing a full
+    /// acknowledgement did not also refuse a partial one.
+    #[tokio::test]
+    async fn a_partially_accepted_final_chunk_resumes() {
+        let client = GraphClient::new("token");
+        client.script_aux([
+            accepted(json!({ "nextExpectedRanges": ["5-"] })),
+            accepted(json!({ "nextExpectedRanges": ["10-11"] })),
+            // The final chunk (10-11): only byte 10 landed.
+            accepted(json!({ "nextExpectedRanges": ["11-11"] })),
+            ScriptedRestResponse::json(reqwest::StatusCode::CREATED, json!({ "id": "item" })),
+        ]);
+
+        let item = upload_chunks(
+            &client,
+            &session(&client),
             Bytes::from_static(b"0123456789AB"),
             5,
             &CancellationToken::new(),
             fresh_deadline(),
         )
         .await
-        .expect_err("a non-advancing offset fails");
-        let advanced = matches!(
-            &error,
-            GraphError::Json { message, .. } if message.contains("did not advance")
+        .expect("the upload completes");
+        assert_eq!(item, "item");
+        let ranges: Vec<String> = client
+            .take_aux_requests()
+            .iter()
+            .map(|request| request.header("Content-Range").expect("range").to_string())
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                "bytes 0-4/12",
+                "bytes 5-9/12",
+                "bytes 10-11/12",
+                "bytes 11-11/12"
+            ]
         );
-        assert!(advanced, "{error:?}");
-        // Exactly one PUT: the loop did not spin.
-        assert_eq!(client.take_aux_requests().len(), 1);
+    }
+
+    /// A session URL that would send the attachment bytes and the session
+    /// credential in the clear, or behind a misleading authority, is refused
+    /// at receipt as the provider's contract violation: nothing is PUT and
+    /// no sharing link is minted. The old code followed any string: the
+    /// chunk PUT went out to the plain-http URL, consuming the scripted
+    /// response this test deliberately does not provide.
+    #[tokio::test]
+    async fn an_unsafe_upload_url_is_refused_before_any_byte_is_sent() {
+        for upload_url in [
+            "http://upload.example/session/abc?token=preauth",
+            "https://user:secret@upload.example/session/abc",
+            "https://upload.example@attacker.example/session/abc",
+            "ftp://upload.example/session/abc",
+            "/session/abc",
+            "not a url",
+        ] {
+            let client = GraphClient::new("token");
+            client.script_rest([ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({ "uploadUrl": upload_url, "expirationDateTime": "2099-01-01T00:00:00Z" }),
+            )]);
+            let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+            let payload = Bytes::from_static(b"hello");
+
+            let error = host_attachment(
+                account,
+                payload.clone(),
+                CloudUploadMeta::new(
+                    "a.txt",
+                    "text/plain",
+                    payload.len() as u64,
+                    ShareScope::Organization,
+                ),
+            )
+            .await
+            .expect_err("the upload URL is refused");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation
+                ),
+                "{upload_url}"
+            );
+            assert!(client.take_aux_requests().is_empty(), "{upload_url}");
+            assert_eq!(client.take_rest_requests().len(), 1, "{upload_url}");
+            // The refusal names why, never the credential-bearing URL.
+            assert!(
+                !format!("{error:?}").contains("upload.example/session"),
+                "{upload_url}: {error:?}"
+            );
+        }
+    }
+
+    /// What the admission lets through: https on any host (real session
+    /// hosts are SharePoint and OneDrive, never the Graph host), and plain
+    /// http only on the configured Graph origin, which already holds the
+    /// account bearer. The sent URL is the admitted one.
+    #[test]
+    fn upload_url_admission_takes_https_anywhere_and_http_only_on_the_graph_origin() {
+        let client = GraphClient::new("token");
+        for admitted in [
+            "https://contoso-my.sharepoint.com/personal/u/_api/v2.0/uploadSession?tempauth=x",
+            "HTTPS://api.onedrive.com/rup/abc",
+        ] {
+            assert!(admit_upload_url(&client, admitted).is_ok(), "{admitted}");
+        }
+
+        let local = GraphClient::with_api_base("http://127.0.0.1:8181/v1.0", "token");
+        let admitted =
+            admit_upload_url(&local, "http://127.0.0.1:8181/upload/abc").expect("same origin");
+        assert_eq!(admitted.0.as_str(), "http://127.0.0.1:8181/upload/abc");
+        for refused in [
+            "http://127.0.0.1:8182/upload/abc",
+            "http://localhost:8181/upload/abc",
+            "http://user@127.0.0.1:8181/upload/abc",
+        ] {
+            admit_upload_url(&local, refused).expect_err(refused);
+        }
     }
 
     /// A cancelled account shutdown aborts the upload between chunks
@@ -641,7 +977,7 @@ mod tests {
         // against the token and could report this same shutdown as InFlight.
         let error = upload_file_chunked(
             &client,
-            SESSION_URL,
+            &session(&client),
             Bytes::from_static(b"0123456789AB"),
             CHUNK_ALIGNMENT,
             &shutdown,
@@ -783,35 +1119,25 @@ mod tests {
     }
 
     #[test]
-    fn resume_offset_reads_next_expected_range_start() {
+    fn range_start_reads_open_and_closed_ranges() {
         // The server's `nextExpectedRanges` start is the authoritative
         // resume offset, even when it is short of the chunk end the client
         // just PUT (a partially-accepted chunk).
-        let progress = UploadProgress {
-            next_expected_ranges: vec!["1024-".to_string()],
-        };
-        assert_eq!(progress.resume_offset(), Some(1024));
-
-        let bounded = UploadProgress {
-            next_expected_ranges: vec!["524288-1048575".to_string()],
-        };
-        assert_eq!(bounded.resume_offset(), Some(524_288));
+        assert_eq!(range_start("1024-"), Some(1024));
+        assert_eq!(range_start("524288-1048575"), Some(524_288));
+        assert_eq!(range_start(" 7-7 "), Some(7));
+        for junk in ["", "-", "-5", "5", "abc-", "+5-", "5-x", "5-3", "5 -6"] {
+            assert_eq!(range_start(junk), None, "{junk:?}");
+        }
     }
 
     #[test]
-    fn resume_offset_none_without_ranges() {
-        assert_eq!(UploadProgress::default().resume_offset(), None);
-        let junk = UploadProgress {
-            next_expected_ranges: vec!["-".to_string()],
-        };
-        assert_eq!(junk.resume_offset(), None);
-    }
-
-    #[test]
-    fn upload_progress_deserializes_202_body() {
-        let json = r#"{"nextExpectedRanges":["327680-"]}"#;
-        let progress: UploadProgress = serde_json::from_str(json).expect("deserializes");
-        assert_eq!(progress.resume_offset(), Some(327_680));
+    fn a_202_body_resumes_at_its_first_range() {
+        let body = Bytes::from_static(br#"{"nextExpectedRanges":["327680-","700000-"]}"#);
+        assert_eq!(
+            admitted_resume_offset(&body, 0, 327_680, 1_000_000).expect("admitted"),
+            327_680
+        );
     }
 
     #[test]

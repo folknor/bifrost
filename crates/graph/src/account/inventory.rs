@@ -837,10 +837,12 @@ mod tests {
         else {
             panic!("expected termination")
         };
+        // A repeated link is a semantic breach of the paging contract by a
+        // response that parsed fine, not a parse failure.
         assert!(matches!(
             error.kind(),
             bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::ParseFailed
+                bifrost_types::ProtocolErrorKind::ContractViolation
             )
         ));
         assert!(matches!(

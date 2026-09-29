@@ -151,7 +151,7 @@ pub(crate) async fn create(
 
 fn reject_create_organizer(event: &EventCreate) -> Result<(), AccountError> {
     if event.organizer.is_some() {
-        return Err(local_error(
+        return Err(unsupported_error(
             AccountOperation::EventCreate,
             "Graph event organizer is server-derived on event creation".to_string(),
         ));
@@ -172,7 +172,7 @@ fn reject_unwritable_status(
     if matches!(status, EventStatus::Confirmed) {
         return Ok(());
     }
-    Err(local_error(
+    Err(unsupported_error(
         operation,
         "Graph event status is server-derived; only Confirmed can be expressed".to_string(),
     ))
@@ -181,17 +181,30 @@ fn reject_unwritable_status(
 fn validate_event_create_timezones(event: &EventCreate) -> Result<(), AccountError> {
     validate_graph_time_zone(
         event.start.timezone.as_deref(),
+        "start.timezone",
         AccountOperation::EventCreate,
     )?;
-    validate_graph_time_zone(event.end.timezone.as_deref(), AccountOperation::EventCreate)
+    validate_graph_time_zone(
+        event.end.timezone.as_deref(),
+        "end.timezone",
+        AccountOperation::EventCreate,
+    )
 }
 
 fn validate_event_patch_timezones(patch: &EventPatch) -> Result<(), AccountError> {
     if let Some(start) = &patch.start {
-        validate_graph_time_zone(start.timezone.as_deref(), AccountOperation::EventUpdate)?;
+        validate_graph_time_zone(
+            start.timezone.as_deref(),
+            "start.timezone",
+            AccountOperation::EventUpdate,
+        )?;
     }
     if let Some(end) = &patch.end {
-        validate_graph_time_zone(end.timezone.as_deref(), AccountOperation::EventUpdate)?;
+        validate_graph_time_zone(
+            end.timezone.as_deref(),
+            "end.timezone",
+            AccountOperation::EventUpdate,
+        )?;
     }
     Ok(())
 }
@@ -330,8 +343,11 @@ async fn search_locally(
     let mut walk = crate::paging::PageWalk::new("event search");
     let next_cursor;
     loop {
+        // Passed through like every other walk: a repeated link is the
+        // provider's contract breach and an exhausted budget is this crate's
+        // limit, and `PageWalk` already says which.
         walk.enter(&url)
-            .map_err(|error| local_error(AccountOperation::EventSearch, format!("{error:?}")))?;
+            .map_err(|error| into_error(error, operation))?;
         let page: ODataCollection<GraphEvent> =
             get_event_page(&account, &url, AccountOperation::EventSearch).await?;
         // Admitted at receipt, before it can be followed or minted into the
@@ -704,10 +720,14 @@ fn split_event_id(
     value
         .split_once(EVENT_ID_SEPARATOR)
         .map(|(calendar, event)| (calendar.to_string(), event.to_string()))
+        // Every id this crate hands out carries the separator, so one without
+        // it is caller input this crate never minted: `Request(Malformed)`,
+        // not a capability Graph lacks.
         .ok_or_else(|| {
-            local_error(
+            graph_error::invalid_argument_account_error(
                 operation,
-                "Graph event id is missing calendar id".to_string(),
+                "event",
+                "Graph event id is missing calendar id",
             )
         })
 }
@@ -739,17 +759,31 @@ fn graph_time_zone(timezone: Option<&str>) -> String {
     graph_time_zone_name(timezone).unwrap_or("UTC").to_string()
 }
 
+/// Refuse a timezone Graph cannot be sent, by what the refusal is about.
+///
+/// An IANA-shaped id (it has a `/`) missing from the outbound mapping may be a
+/// perfectly real zone this crate simply has no Windows name for: the gap is
+/// the client's, so it is `Unsupported`, not the caller's fault. A value that
+/// is neither IANA-shaped nor a multi-word Windows id (`"foo"`, `""`) is not a
+/// timezone name in any form this operation accepts: `Request(Malformed)`,
+/// naming the field.
 fn validate_graph_time_zone(
     timezone: Option<&str>,
+    field: &'static str,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    if graph_time_zone_name(timezone).is_none() {
-        return Err(local_error(
+    match timezone {
+        _ if graph_time_zone_name(timezone).is_some() => Ok(()),
+        Some(value) if value.contains('/') => Err(unsupported_error(
             operation,
             "Graph event timezone is not in the outbound IANA-to-Windows mapping".to_string(),
-        ));
+        )),
+        _ => Err(graph_error::invalid_argument_account_error(
+            operation,
+            field,
+            "Graph event timezone is neither an IANA nor a Windows timezone id",
+        )),
     }
-    Ok(())
 }
 
 fn graph_time_zone_name(timezone: Option<&str>) -> Option<&str> {
@@ -1239,11 +1273,13 @@ fn rsvp_action(value: RsvpStatus) -> Result<&'static str, AccountError> {
         RsvpStatus::Accepted => Ok("accept"),
         RsvpStatus::Declined => Ok("decline"),
         RsvpStatus::Tentative => Ok("tentativelyAccept"),
-        RsvpStatus::NeedsAction | RsvpStatus::Delegated | RsvpStatus::Unknown => Err(local_error(
-            AccountOperation::EventRsvp,
-            "Graph RSVP only supports accepted, declined, or tentative".to_string(),
-        )),
-        _ => Err(local_error(
+        RsvpStatus::NeedsAction | RsvpStatus::Delegated | RsvpStatus::Unknown => {
+            Err(unsupported_error(
+                AccountOperation::EventRsvp,
+                "Graph RSVP only supports accepted, declined, or tentative".to_string(),
+            ))
+        }
+        _ => Err(unsupported_error(
             AccountOperation::EventRsvp,
             "Graph RSVP status is unsupported".to_string(),
         )),
@@ -1259,7 +1295,11 @@ fn into_error(error: crate::error::GraphError, operation: AccountOperation) -> A
     graph_error::into_account_error(error, GraphErrorContext::graph(operation))
 }
 
-fn local_error(operation: AccountOperation, message: String) -> AccountError {
+/// A request Graph cannot express at all (a server-derived field, a status or
+/// RSVP value with no Graph equivalent, a timezone outside the outbound
+/// mapping): `Unsupported`. Malformed caller input is `Request(Malformed)`
+/// instead, through `graph_error::invalid_argument_account_error`.
+fn unsupported_error(operation: AccountOperation, message: String) -> AccountError {
     graph_error::unsupported_account_error(operation)
         .into_builder()
         .text(bifrost_types::DiagnosticText::support_only(message))
@@ -1740,18 +1780,68 @@ mod tests {
 
     #[test]
     fn graph_time_zone_validation_rejects_unknown_iana_names() {
-        let error =
-            validate_graph_time_zone(Some("America/Unknown"), AccountOperation::EventCreate)
-                .expect_err("unknown IANA timezone should be unsupported");
+        let error = validate_graph_time_zone(
+            Some("America/Unknown"),
+            "start.timezone",
+            AccountOperation::EventCreate,
+        )
+        .expect_err("unknown IANA timezone should be unsupported");
 
         assert!(matches!(
             error.kind(),
             bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
         ));
         assert!(
-            validate_graph_time_zone(Some("Eastern Standard Time"), AccountOperation::EventCreate)
-                .is_ok()
+            validate_graph_time_zone(
+                Some("Eastern Standard Time"),
+                "start.timezone",
+                AccountOperation::EventCreate,
+            )
+            .is_ok()
         );
+    }
+
+    /// A value that is no timezone id in any form is the caller's malformed
+    /// input, not a capability Graph lacks: it was `Unsupported` alongside
+    /// the unmapped-IANA case, which told the operator the provider could
+    /// not do something the caller never validly asked for.
+    #[test]
+    fn a_timezone_that_is_no_timezone_id_is_malformed_input() {
+        for junk in ["foo", ""] {
+            let error =
+                validate_graph_time_zone(Some(junk), "end.timezone", AccountOperation::EventUpdate)
+                    .expect_err("junk timezone must be refused");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                ),
+                "{junk:?}"
+            );
+            assert_eq!(error.recovery(), &bifrost_types::RecoveryClass::ClientBug);
+        }
+    }
+
+    /// An event id this crate never minted (no calendar separator) is
+    /// malformed caller input, `ClientBug`, not `Unsupported`.
+    #[test]
+    fn an_event_id_without_its_calendar_is_malformed_input() {
+        for operation in [
+            AccountOperation::EventGet,
+            AccountOperation::EventUpdate,
+            AccountOperation::EventDelete,
+            AccountOperation::EventRsvp,
+        ] {
+            let error = split_event_id("no-separator", operation)
+                .expect_err("an unminted id must be refused");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                )
+            );
+            assert_eq!(error.recovery(), &bifrost_types::RecoveryClass::ClientBug);
+        }
     }
 
     #[test]
@@ -2239,15 +2329,24 @@ mod tests {
         GraphAccount,
         std::sync::Arc<bifrost_net::test_support::ScriptedDispatch>,
     ) {
+        scripted_search_account_pages(vec![body])
+    }
+
+    fn scripted_search_account_pages(
+        bodies: Vec<serde_json::Value>,
+    ) -> (
+        GraphAccount,
+        std::sync::Arc<bifrost_net::test_support::ScriptedDispatch>,
+    ) {
         use bifrost_net::test_support::{Canned, ScriptedDispatch, scripted_account};
         use bifrost_net::{NetConfig, RetryPolicy, StaticTokenSource, TokenSource};
         use std::sync::Arc;
 
-        let script = ScriptedDispatch::new([Canned::Response {
+        let script = ScriptedDispatch::new(bodies.into_iter().map(|body| Canned::Response {
             status: reqwest::StatusCode::OK,
             headers: reqwest::header::HeaderMap::new(),
             body: bytes::Bytes::from(body.to_string()),
-        }]);
+        }));
         let token_source: Arc<dyn TokenSource> = Arc::new(StaticTokenSource::new("token", None));
         let net = scripted_account(
             &script,
@@ -2317,6 +2416,32 @@ mod tests {
 
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].native_id, "calendar::live");
+    }
+
+    /// The event-search walk refusing a repeated `nextLink` reports the
+    /// provider's contract breach, as every other Graph walk does. It was
+    /// mapped through the calendar's local `Unsupported` helper, telling the
+    /// operator the account cannot search events at all.
+    #[tokio::test]
+    async fn a_repeated_event_search_link_is_a_provider_contract_violation() {
+        let link = "https://graph.contoso.test/v1.0/me/calendars/calendar/events?page=2";
+        let page = json!({"value": [], "@odata.nextLink": link});
+        let (account, _script) = scripted_search_account_pages(vec![page.clone(), page]);
+
+        let error = search(account, local_search_request(false))
+            .await
+            .expect_err("a repeated page link must refuse the walk");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        assert_eq!(
+            error.recovery(),
+            &bifrost_types::RecoveryClass::ProviderContractViolation
+        );
     }
 
     fn search_api_page() -> serde_json::Value {

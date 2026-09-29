@@ -110,11 +110,11 @@ pub(super) async fn subscribe_graph(
     }
 
     // Mint the handle BEFORE the first create. `new_handle` is fallible
-    // (it can fail on host RNG) and classifies its error `Unsent`, which
-    // is only true while nothing has been written. Minting it after the
-    // creates would let an RNG failure return a no-bytes-sent error with
-    // live server-side subscriptions behind it, so a caller acting on
-    // that classification by retrying would duplicate them.
+    // (the host entropy source can fail; that is `Internal(RuntimeFailure)`,
+    // never retried), and a failure here has written nothing. Minting it
+    // after the creates would return an error with live server-side
+    // subscriptions behind it and no handle any teardown could name them
+    // by, orphaning them until they expire.
     let handle = new_handle()?;
 
     let mut subscriptions = Vec::new();

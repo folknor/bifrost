@@ -734,9 +734,11 @@ mod tests {
         let Some(SyncEvent::Terminated(error)) = stream.next().await else {
             panic!("expected SyncEvent::Terminated on the echoed link");
         };
+        // A repeated link is a semantic breach of the paging contract by a
+        // response that parsed fine, not a parse failure.
         assert!(matches!(
             error.kind(),
-            AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ParseFailed)
+            AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation)
         ));
         assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
         assert!(stream.next().await.is_none());

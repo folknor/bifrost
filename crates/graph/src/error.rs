@@ -56,6 +56,22 @@ pub(crate) enum GraphError {
     /// something a retry of the same request can repair
     /// (`Internal(InvariantViolated)`).
     Internal { message: String },
+
+    /// A complete Graph (or OneDrive) response that is well-formed but
+    /// semantically impossible: an offset that does not advance, a completion
+    /// signal the protocol does not allow at that point. The provider's
+    /// contract breach, acknowledged (`Protocol(ContractViolation)`); a body
+    /// that does not parse at all stays `Json`.
+    ContractViolation { message: String },
+
+    /// An implementation-defined safety or resource limit this crate imposes
+    /// on itself was reached (a pagination walk's page budget, say). Not a
+    /// provider fault and not a bug: `Internal(LimitExceeded)`.
+    LimitExceeded { message: String },
+
+    /// A local facility this crate depends on failed at runtime (the system
+    /// entropy source, say): `Internal(RuntimeFailure)`.
+    RuntimeFailure { message: String },
 }
 
 /// Parsed Graph error response.
@@ -148,7 +164,10 @@ impl GraphError {
             | Self::Net(_)
             | Self::Json { .. }
             | Self::ProviderLinkRefused { .. }
-            | Self::Internal { .. } => None,
+            | Self::Internal { .. }
+            | Self::ContractViolation { .. }
+            | Self::LimitExceeded { .. }
+            | Self::RuntimeFailure { .. } => None,
         }
     }
 }

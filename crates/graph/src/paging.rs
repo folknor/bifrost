@@ -14,10 +14,18 @@
 //! two-link cycle burn the whole budget on requests. Only the pair bounds both
 //! shapes.
 //!
-//! A refusal is a provider-contract violation, not a transport failure, so it
-//! travels as `GraphError::Json` - the crate's established carrier for "the
-//! response did not match the documented contract", classifying as
-//! `Protocol(ParseFailed)` / `Wire(MalformedResponse)`.
+//! The two refusals blame different parties, so they travel as different
+//! errors, and neither is a parse failure (every page parsed):
+//!
+//! - A repeated link is the provider's fault and nothing else's: an honest
+//!   server never hands back a link it already served. It is
+//!   `GraphError::ContractViolation` -> `Protocol(ContractViolation)`, with
+//!   `Acknowledged` evidence, since the link arrived in a response.
+//! - An exhausted page budget is NOT evidence against the provider. A server
+//!   issuing fresh links forever and an honestly enormous collection look
+//!   identical from here; what is certain is only that this crate declined to
+//!   go further. It is `GraphError::LimitExceeded` ->
+//!   `Internal(LimitExceeded)`, the same split `bifrost-google`'s walks make.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -31,8 +39,9 @@ use crate::origin::AdmittedUrl;
 /// Deliberately generous: at Graph's typical `$top` of 100-250 this is
 /// 1,000,000+ objects, so no real mailbox, calendar set, or contact folder
 /// tree approaches it. The budget exists to bound a MISBEHAVING server, not to
-/// limit legitimate data, and a walk that hits it has learned something is
-/// wrong rather than that the account is large.
+/// limit legitimate data - but a walk that hits it cannot tell which it met,
+/// which is why the refusal is this crate's own limit and not a provider
+/// fault.
 const MAX_PAGES: usize = 10_000;
 
 /// Guard for a single `nextLink` traversal.
@@ -62,15 +71,13 @@ impl PageWalk {
     pub(crate) fn enter(&mut self, url: &AdmittedUrl) -> Result<(), GraphError> {
         self.pages += 1;
         if self.pages > MAX_PAGES {
-            return Err(GraphError::Json {
+            return Err(GraphError::LimitExceeded {
                 message: format!("Graph {} pagination exceeded {MAX_PAGES} pages", self.what),
-                body: None,
             });
         }
         if !self.seen.insert(url.as_str().to_string()) {
-            return Err(GraphError::Json {
+            return Err(GraphError::ContractViolation {
                 message: format!("Graph {} pagination repeated a page link", self.what),
-                body: None,
             });
         }
         Ok(())
@@ -149,6 +156,7 @@ mod tests {
         MAX_PAGES, PageWalk, decode_link_cursor, decode_paged_cursor, encode_paged_cursor,
     };
     use crate::client::GraphClient;
+    use crate::error::GraphError;
     use crate::origin::{AdmittedUrl, Base};
 
     fn url(link: &str) -> AdmittedUrl {
@@ -230,7 +238,14 @@ mod tests {
         let error = walk
             .enter(&url("https://graph.test/calendars"))
             .expect_err("a link already walked must be refused");
-        assert!(format!("{error:?}").contains("repeated a page link"));
+        // The provider's contract breach: never a parse failure (the page
+        // parsed) and never this crate's own limit.
+        match error {
+            GraphError::ContractViolation { message } => {
+                assert!(message.contains("repeated a page link"), "{message}");
+            }
+            other => panic!("a repeated link must be a contract violation: {other:?}"),
+        }
     }
 
     /// The budget is the half a repeated-link check cannot cover: a server
@@ -247,6 +262,33 @@ mod tests {
         let error = walk
             .enter(&url("https://graph.test/c?page=never-seen-before"))
             .expect_err("an unrepeated but endless walk must still be bounded");
-        assert!(format!("{error:?}").contains("exceeded"));
+        // An honestly huge collection looks the same as an endless one, so the
+        // refusal is this crate's limit, not a charge against the provider.
+        match error {
+            GraphError::LimitExceeded { message } => {
+                assert!(message.contains("exceeded"), "{message}");
+            }
+            other => panic!("an exhausted budget must be LimitExceeded: {other:?}"),
+        }
+    }
+
+    /// Budget exhaustion wins over a repeat on the same call: the page past
+    /// the budget is refused as the limit even when its link also repeats,
+    /// so the classification does not depend on which link the server
+    /// happened to hand out last.
+    #[test]
+    fn the_budget_is_checked_before_the_repeat() {
+        let mut walk = PageWalk::new("c");
+        for page in 0..MAX_PAGES {
+            walk.enter(&url(&format!("https://graph.test/c?page={page}")))
+                .expect("within budget");
+        }
+        let error = walk
+            .enter(&url("https://graph.test/c?page=0"))
+            .expect_err("past the budget");
+        assert!(
+            matches!(error, GraphError::LimitExceeded { .. }),
+            "{error:?}"
+        );
     }
 }

@@ -413,6 +413,12 @@ fn unclassifiable_detail(element: &str, response_code: &str) -> String {
 // every parser that accumulates body text needs to fold these back in or
 // `&lt;` and friends silently vanish.
 pub(crate) fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
+    let _ = try_push_general_ref(e, buf);
+}
+
+/// Strict twin of [`push_general_ref`]: an unknown entity or an invalid
+/// character reference is `Err` with the reference text instead of vanishing.
+pub(crate) fn try_push_general_ref(e: &BytesRef<'_>, buf: &mut String) -> Result<(), String> {
     let name: &str = e.as_ref();
     if let Some(rest) = name.strip_prefix('#') {
         let codepoint = if let Some(hex) = rest.strip_prefix(['x', 'X']) {
@@ -420,10 +426,13 @@ pub(crate) fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
         } else {
             rest.parse::<u32>().ok()
         };
-        if let Some(c) = codepoint.and_then(char::from_u32) {
-            buf.push(c);
-        }
-    } else if let Some(s) = resolve_xml_entity(name) {
+        let c = codepoint
+            .and_then(char::from_u32)
+            .ok_or_else(|| format!("invalid character reference &{name};"))?;
+        buf.push(c);
+    } else {
+        let s = resolve_xml_entity(name).ok_or_else(|| format!("unknown entity &{name};"))?;
         buf.push_str(s);
     }
+    Ok(())
 }
