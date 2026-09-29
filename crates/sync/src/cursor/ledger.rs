@@ -51,16 +51,44 @@ pub enum ProofStatus {
     Discharged { evidence: DischargeEvidence },
 }
 
-/// Bound on parent-link walking, so a cycle from a buggy replacement cannot
-/// hang the single writer every durable mutation funnels through.
+/// The retry budget one lineage shares.
 ///
-/// Multi-level lineages cannot arise in process: `replace_obligation`
-/// re-points every child at `lineage_root(parent)`, so live shapes are always
-/// flat. A chain is reachable only by restoring a durable row through
-/// `decode_ledger` or `from_parts` that another revision, or a hand edit,
-/// wrote. The cap and the ancestor closure are insurance against exactly
-/// those rows, and the tests build chains that way on purpose.
-const LINEAGE_DEPTH_CAP: usize = 64;
+/// A lineage is an obligation plus every child a repair pass split it into.
+/// Its identity is the ROOT key: an entry with `parent: None` is its own
+/// lineage, and a child's `parent` names the root directly, never an
+/// intermediate - `replace_obligation` re-points every child at the parent's
+/// lineage, so the shape is flat by construction and the codec rejects a row
+/// that is not.
+///
+/// The budget lives HERE rather than on any entry. It used to live in the
+/// root entry's `Retrying { attempts }`, and because a replacement always
+/// discharges its parent, that put the one cap on a key-rotating loop onto a
+/// discharged entry - which is what forced compaction to pin discharged roots
+/// and keep process-local parent links for folded keys. Worse, expiry wrote
+/// `OperatorBlocked` onto that discharged root while every open child kept its
+/// own `Retrying` policy, so after the first split the cap was recorded and
+/// never enforced. A row keyed by lineage id, alive exactly while the ledger
+/// retains a member of the lineage, removes both.
+///
+/// `exhausted` is STICKY. The budget is a parameter of each charge rather than
+/// stored state, so a later charge with a larger budget must not reopen a
+/// lineage an earlier charge closed; and a member that joins a spent lineage
+/// later (a reopened sibling, say) has to be born blocked, which it can only
+/// be if the spent state is recorded rather than recomputed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct LineageBudget {
+    /// Completed repair outcomes charged to the lineage.
+    pub(crate) attempts: u32,
+    /// Whether a charge has reached its budget. Never cleared while the row
+    /// lives.
+    pub(crate) exhausted: bool,
+}
+
+/// The lineage an entry belongs to: its parent when it was split out of one,
+/// itself otherwise.
+fn lineage_id(entry: &LedgerEntry) -> &ObligationKey {
+    entry.parent.as_ref().unwrap_or(&entry.key)
+}
 
 /// Entry count at which an ingest folds terminal history into the audit table.
 ///
@@ -231,7 +259,10 @@ pub enum ReplacementProgress {
     Progressed,
     /// Same unresolved extent, same granularity, no proof gained, no better
     /// repair authority. Repeated stalls exhaust the lineage budget rather
-    /// than looping forever.
+    /// than looping forever - which the caller has to charge through
+    /// [`DebtLedger::charge_lineage`] with a lineage it resolved BEFORE the
+    /// swap, since the swap discharges the parent and a discharged key is
+    /// never charged.
     Stalled,
 }
 
@@ -247,6 +278,17 @@ pub enum ReplacementRefusal {
     /// would give one obligation two roots and let a retry budget reset by
     /// picking whichever root is convenient.
     ChildCollidesWithForeignLineage,
+    /// A child reuses the parent's own key or its lineage's root key. The swap
+    /// would mutate the parent in place and then discharge it, leaving no open
+    /// residual, and a child whose key is its lineage id would name itself as
+    /// its parent.
+    ChildReusesLineageKey,
+    /// The parent is no longer `Retrying`: an operator blocked or waived it, or
+    /// its lineage budget ran out, while this automatic result was in flight.
+    /// Accepting the split would move the debt onto fresh `Retrying` children
+    /// and discharge the only entry carrying that decision. The parent stays
+    /// open with its policy intact, and nothing is charged.
+    PolicyNoLongerRetrying,
 }
 
 /// Why an obligation is considered discharged.
@@ -284,9 +326,14 @@ pub enum DischargeEvidence {
 #[non_exhaustive]
 pub enum PolicyStatus {
     /// Eligible for automatic repair. `attempts` counts COMPLETED repair
-    /// outcomes received from the account, never attempts merely started: a
-    /// crash after provider work but before the acknowledgement must cost a
-    /// repeated attempt, not a consumed budget.
+    /// outcomes charged to the obligation's LINEAGE, never attempts merely
+    /// started: a crash after provider work but before the acknowledgement
+    /// must cost a repeated attempt, not a consumed budget.
+    ///
+    /// On a ledger entry this is a VIEW. The count lives in the ledger's
+    /// per-lineage budget, and every mutation rewrites the field on each open
+    /// `Retrying` member from it, so siblings always agree and nothing reads the
+    /// field back to decide anything. On a `BarrierIncident` it is inert.
     Retrying { attempts: u32 },
     /// Automatic work stopped. Still visible, still manually retryable, still
     /// blocking the completion sentinel. NOT abandonment.
@@ -324,9 +371,12 @@ pub struct LedgerEntry {
     /// classifications and messages change between revisions. `None` for an
     /// obligation with no repair path.
     pub target: Option<InventoryRepairTarget>,
-    /// The obligation this one replaced, when a repair pass narrowed a region
-    /// into smaller pieces. Retry budgeting follows the LINEAGE, so an account
-    /// cannot reset a budget by re-minting an equivalent obligation.
+    /// The ROOT of the lineage this obligation was split out of, when a repair
+    /// pass narrowed a region into smaller pieces - always the root itself,
+    /// never an intermediate. Retry budgeting follows the lineage, so an
+    /// account cannot reset a budget by re-minting an equivalent obligation.
+    /// The root need not still be an entry: it is an identity, not a link
+    /// anything dereferences.
     pub parent: Option<ObligationKey>,
     pub first_seen_unix_seconds: i64,
     pub last_error: AccountError,
@@ -399,39 +449,15 @@ pub struct DebtLedger {
     /// order compaction first encounters them, and compaction walks `entries`
     /// in key order.
     compacted: Vec<(CursorScope, DischargeAudit)>,
-    /// Parent links of entries compaction folded away, kept only while the
-    /// chain they start still reaches a retained entry.
+    /// One retry budget per lineage that still has a RETAINED member, keyed by
+    /// lineage id. See [`LineageBudget`].
     ///
-    /// This is the ledger's answer to a dependency it could not previously SEE:
-    /// a repair attempt in flight against key A charges its budget through
-    /// `lineage_root(A)` when the result comes back, and nothing in the ledger
-    /// names A, so no amount of pinning from A's siblings preserves it. Without
-    /// this table, a covering proof that discharges A mid-flight lets compaction
-    /// fold A, after which the deferred result resolves A's root to A itself,
-    /// finds no entry, and charges NOTHING - the attempt vanishes from the
-    /// budget silently, which is the un-capped retry loop budgets exist to
-    /// close.
-    ///
-    /// Chosen over the alternative (retain the entry path of every pending
-    /// attempt until it resolves) because retention needs a dispatch-time
-    /// signal the writer never receives: `run_repair_pass` plans against a
-    /// ledger snapshot and only speaks to the writer again when results are
-    /// already in hand, so a pin would have to be a new cross-module protocol
-    /// with a release on every abnormal exit, and a missed release is a leak of
-    /// exactly the entries compaction exists to reclaim. A parent link costs
-    /// two keys and no coordination.
-    ///
-    /// IN-MEMORY ONLY, deliberately, and that is why nothing in
-    /// `ledger_envelope` carries it. The dependency it protects is an attempt in
-    /// flight in THIS process; a restart loses the executor that would deliver
-    /// the result, so a tombstone restored from disk protects nothing and would
-    /// just be durable state with no reader.
-    ///
-    /// A folded entry with NO parent gets no tombstone. Its budget identity is
-    /// itself, and it is discharged, so the only counter a late result could
-    /// reach sits on a terminal entry that `repairable` already refuses - the
-    /// charge was never load-bearing.
-    folded_lineage: BTreeMap<ObligationKey, ObligationKey>,
+    /// Membership is decided by the lineage id alone, never by proof or
+    /// policy: a lineage whose members are all discharged, waived or blocked
+    /// keeps its row, so a member that rejoins it later inherits the budget
+    /// instead of a fresh one. `settle_lineages` restores every invariant on
+    /// this table after each mutation.
+    lineages: BTreeMap<ObligationKey, LineageBudget>,
 }
 
 impl DebtLedger {
@@ -450,21 +476,77 @@ impl DebtLedger {
     /// preserves "no protocol crate may construct ledger state" - a consumer
     /// restores a ledger by decoding bytes this engine wrote, never by
     /// asserting one.
+    ///
+    /// Takes the parts VERBATIM: nothing is settled or healed here. The codec
+    /// calls [`Self::validate_lineages`] on the result and refuses a row that
+    /// fails it, because repairing contradictory durable state would mean
+    /// choosing which half of the contradiction to believe.
     pub(crate) fn from_parts(
         entries: BTreeMap<ObligationKey, LedgerEntry>,
         barriers: BTreeMap<ObligationKey, BarrierIncident>,
         proved: Vec<(u64, CoverageDomain)>,
         compacted: Vec<(CursorScope, DischargeAudit)>,
+        lineages: BTreeMap<ObligationKey, LineageBudget>,
     ) -> Self {
         Self {
             entries,
             barriers,
             proved,
             compacted,
-            // Empty by construction: see the field's own note on why folded
-            // parent links are process-local and never restored.
-            folded_lineage: BTreeMap::new(),
+            lineages,
         }
+    }
+
+    /// The per-lineage budgets, in their durable order. Crate-private for the
+    /// codec, like `proved` and `compacted`.
+    pub(crate) fn lineages(&self) -> &BTreeMap<ObligationKey, LineageBudget> {
+        &self.lineages
+    }
+
+    /// Check the lineage invariants `settle_lineages` maintains, without
+    /// repairing anything.
+    ///
+    /// Every entry's parent is flat (it names neither itself nor an entry that
+    /// has a parent - which also rules out every chain and cycle); every
+    /// entry's lineage has a row; every row has a retained member; and every
+    /// open `Retrying` member mirrors its unexhausted row. A parent naming an
+    /// ABSENT key is legal: that is a root compaction folded.
+    pub(crate) fn validate_lineages(&self) -> Result<(), String> {
+        let mut live: BTreeSet<&ObligationKey> = BTreeSet::new();
+        for entry in self.entries.values() {
+            if let Some(parent) = &entry.parent {
+                if *parent == entry.key {
+                    return Err("an entry names itself as its lineage root".into());
+                }
+                if self
+                    .entries
+                    .get(parent)
+                    .is_some_and(|root| root.parent.is_some())
+                {
+                    return Err("an entry's lineage root is not a root".into());
+                }
+            }
+            let lineage = lineage_id(entry);
+            live.insert(lineage);
+            let Some(budget) = self.lineages.get(lineage) else {
+                return Err("an entry's lineage has no budget row".into());
+            };
+            if !entry.is_open() {
+                continue;
+            }
+            if let PolicyStatus::Retrying { attempts } = entry.policy {
+                if budget.exhausted {
+                    return Err("a retrying entry sits in an exhausted lineage".into());
+                }
+                if attempts != budget.attempts {
+                    return Err("a retrying entry disagrees with its lineage budget".into());
+                }
+            }
+        }
+        if self.lineages.keys().any(|lineage| !live.contains(lineage)) {
+            return Err("a lineage budget row has no retained member".into());
+        }
+        Ok(())
     }
 
     /// The per-scope audit table, in its durable order.
@@ -602,9 +684,6 @@ impl DebtLedger {
         for obligation in barriers {
             let key = obligation.key().clone();
             if let Some(incident) = self.barriers.remove(&key) {
-                // Same rule as `upsert`: a key becoming an entry again starts a
-                // fresh lineage, so any folded parent link for it goes.
-                self.folded_lineage.remove(&key);
                 self.entries.insert(
                     key.clone(),
                     LedgerEntry {
@@ -631,6 +710,7 @@ impl DebtLedger {
                 entry.last_error = obligation.error().clone();
             }
         }
+        self.settle_lineages();
         true
     }
 
@@ -658,6 +738,7 @@ impl DebtLedger {
             self.record_proof(report.domain.clone(), generation);
         }
         self.compact_if_large();
+        self.settle_lineages();
     }
 
     /// Fold in only the DEBT from a report, never its proof.
@@ -681,6 +762,7 @@ impl DebtLedger {
             self.upsert(obligation, &report.domain, generation, now);
         }
         self.compact_if_large();
+        self.settle_lineages();
     }
 
     /// Fold terminal history into the audit table once the entry map is large.
@@ -689,10 +771,62 @@ impl DebtLedger {
     /// goes through, and never mid-transition. That placement is what makes it
     /// safe against a concurrent transition rather than merely unlikely to race
     /// one: see [`Self::compact_discharged`] for why removing a terminal entry
-    /// cannot change the outcome of anything in flight.
+    /// cannot change the outcome of anything in flight. Leaves settling to its
+    /// caller, which settles once for the whole fold.
     fn compact_if_large(&mut self) {
         if self.entries.len() >= COMPACTION_THRESHOLD {
-            self.compact_discharged();
+            self.fold_discharged();
+        }
+    }
+
+    /// Restore every invariant on the lineage table after a mutation.
+    ///
+    /// The one place lineage state is reconciled, run at the end of every
+    /// public mutator that changed anything, so no individual transition has
+    /// to remember it. One linear pass:
+    ///
+    /// - the live lineages are the ids of every RETAINED entry, open or
+    ///   discharged, whatever its policy. A discharged member still counts
+    ///   because it can be rediscovered, and `upsert` reopens it with its
+    ///   history intact: dropping the row at discharge would hand it a fresh
+    ///   budget, and a provider that alternates a covering walk with a
+    ///   rediscovery would never reach the cap;
+    /// - a row with no retained member is dropped, so the table is bounded by
+    ///   the entry map, which compaction bounds - a folded key raised again is
+    ///   a fresh gap by the compaction contract;
+    /// - a live lineage without a row gets a fresh one;
+    /// - every open `Retrying` member is rewritten from its row: blocked when
+    ///   the row is exhausted, otherwise mirroring the row's count.
+    ///
+    /// Waived and `OperatorBlocked` members are never written, so no operator
+    /// decision is ever overwritten; and discharged entries are never touched
+    /// at all. There is no path from `OperatorBlocked` back to `Retrying`, so a
+    /// member this blocks stays blocked.
+    fn settle_lineages(&mut self) {
+        let live: BTreeSet<ObligationKey> = self
+            .entries
+            .values()
+            .map(|entry| lineage_id(entry).clone())
+            .collect();
+        self.lineages.retain(|lineage, _| live.contains(lineage));
+        for lineage in live {
+            self.lineages.entry(lineage).or_default();
+        }
+        let Self {
+            entries, lineages, ..
+        } = self;
+        for entry in entries.values_mut() {
+            if !entry.is_open() {
+                continue;
+            }
+            let budget = lineages.get(lineage_id(entry)).copied().unwrap_or_default();
+            if let PolicyStatus::Retrying { attempts } = &mut entry.policy {
+                if budget.exhausted {
+                    entry.policy = PolicyStatus::OperatorBlocked;
+                } else {
+                    *attempts = budget.attempts;
+                }
+            }
         }
     }
 
@@ -712,49 +846,26 @@ impl DebtLedger {
     /// collision check only fires on an open entry. So for those, a removed
     /// terminal entry and a present terminal entry produce the same answer.
     ///
-    /// The exception is the LINEAGE, and it is the one thing that made this
-    /// dangerous. `replace_obligation` discharges the parent while leaving its
-    /// policy `Retrying`, and children point at that discharged root; a budget
-    /// charged against a child lands on the root's counter. Compacting a root
-    /// out from under a live child would make `record_attempt` find nothing,
-    /// silently un-cap the retry budget, and reopen the loop budgets exist to
-    /// close. So a discharged entry that any surviving entry names as its
-    /// parent is retained - terminal as proof, still load-bearing as structure.
+    /// That includes the LINEAGE, which used to be the exception. The retry
+    /// budget once lived on the root entry, which a replacement always
+    /// discharges, so compaction had to pin every discharged root a live child
+    /// charged against. The budget now lives in the ledger's own per-lineage
+    /// table, and a child's `parent` is an identity rather than a link anything
+    /// dereferences, so a discharged root folds like any other terminal entry
+    /// and nothing is pinned.
     ///
-    /// # Which guarantee the pin set implements
-    ///
-    /// The STRONGER of the two available, stated here because they are easy to
-    /// confuse and the code must not be ambiguous about which it promises:
-    ///
-    /// **Every entry this ledger retains has its whole parent chain retained
-    /// too.** That is the ancestor CLOSURE - each survivor's ancestors are
-    /// pinned, and each newly pinned ancestor is then walked in turn, with a
-    /// visited set to terminate.
-    ///
-    /// The weaker alternative - one bounded walk from each unresolved entry,
-    /// pinning what it passes - preserves that entry's own `lineage_root`
-    /// lookup and nothing more. It leaves a retained endpoint pointing at a
-    /// removed ancestor, so a `record_attempt` charged against the ENDPOINT
-    /// resolves to a key that is no longer here. The closure has no such edge.
-    ///
-    /// Two details the walk has to get exactly right, both of which reintroduce
-    /// the original hole if fumbled:
-    ///
-    /// - `lineage_root` follows at most `LINEAGE_DEPTH_CAP` edges and returns
-    ///   the key reached AFTER that last edge, even when it has a further
-    ///   parent. So the pin walk must retain distances 1 THROUGH the cap
-    ///   INCLUSIVE. A loop that pins the current node before advancing, and
-    ///   stops after the cap's worth of iterations, misses the endpoint - the
-    ///   one key the resolver actually returns.
-    /// - Both use [`Self::lineage_ancestors`], one primitive, so they cannot
-    ///   disagree about where a chain ends.
+    /// A repair result arriving for a key folded while it was in flight
+    /// charges nothing: `record_attempt` charges only an open entry. That
+    /// cannot let a loop escape the cap - a key with no open entry is never
+    /// planned again, so no provider can collect free attempts against it -
+    /// and the open siblings it leaves behind are charged by their own
+    /// results.
     ///
     /// `DischargeEvidence::ReplacedByChildren` also names entries, and those are
-    /// deliberately NOT pinned. The list is EVIDENCE: nothing in the engine
-    /// dereferences it for a decision (the codec encodes and decodes it, and no
-    /// other reader exists), so a child key in it is a record of what happened,
-    /// not a link something will follow. If a reader ever does resolve those
-    /// keys, they become operational dependencies and belong in the pin set.
+    /// deliberately not retained either. The list is EVIDENCE: nothing in the
+    /// engine dereferences it for a decision (the codec encodes and decodes it,
+    /// and no other reader exists), so a child key in it is a record of what
+    /// happened, not a link something will follow.
     ///
     /// # What a later rediscovery costs
     ///
@@ -765,44 +876,27 @@ impl DebtLedger {
     /// before it was folded, so a re-raise after proof is a fresh gap rather
     /// than a continuing one, and charging it the old budget would be charging
     /// it for failures that provably stopped.
+    ///
+    /// One exception: a compacted lineage ROOT re-raised while members of its
+    /// lineage are still retained rejoins that lineage's budget, because its
+    /// lineage id is its own key and the row is still live. See `upsert`.
     pub fn compact_discharged(&mut self) -> usize {
-        let mut candidates: Vec<ObligationKey> = Vec::new();
-        for entry in self.entries.values() {
-            if !entry.is_open() {
-                candidates.push(entry.key.clone());
-            }
-        }
-        if candidates.is_empty() {
-            return 0;
-        }
-        // The ancestor closure of the entries that will SURVIVE. A discharged
-        // ancestor named only from within the folding set is compactable,
-        // because everything that named it goes too.
-        let candidate_set: BTreeSet<&ObligationKey> = candidates.iter().collect();
-        let mut pinned: BTreeSet<ObligationKey> = BTreeSet::new();
-        let mut frontier: Vec<ObligationKey> = self
+        let removed = self.fold_discharged();
+        self.settle_lineages();
+        removed
+    }
+
+    /// The fold itself, without settling. See [`Self::compact_discharged`].
+    fn fold_discharged(&mut self) -> usize {
+        let candidates: Vec<ObligationKey> = self
             .entries
             .values()
-            .filter(|entry| !candidate_set.contains(&entry.key))
+            .filter(|entry| !entry.is_open())
             .map(|entry| entry.key.clone())
             .collect();
-        while let Some(key) = frontier.pop() {
-            for ancestor in self.lineage_ancestors(&key) {
-                // Already pinned means already walked from, so the rest of this
-                // chain is covered. That is the visited set, and it is also
-                // what makes a cycle terminate.
-                if !pinned.insert(ancestor.clone()) {
-                    break;
-                }
-                frontier.push(ancestor);
-            }
-        }
 
         let mut removed = 0;
         for key in &candidates {
-            if pinned.contains(key) {
-                continue;
-            }
             let Some(entry) = self.entries.remove(key) else {
                 continue;
             };
@@ -815,68 +909,9 @@ impl DebtLedger {
             };
             self.audit_for(&entry.domain.scope)
                 .fold(&entry.key, entry.generation, evidence);
-            if let Some(parent) = entry.parent.clone() {
-                // The budget identity of an attempt still in flight against
-                // this key. See `folded_lineage`.
-                self.folded_lineage.insert(entry.key.clone(), parent);
-            }
             removed += 1;
         }
-        self.prune_folded_lineage();
         removed
-    }
-
-    /// Drop folded parent links whose chain no longer reaches a retained entry.
-    ///
-    /// The bound on the table. A tombstone is only useful while the root it
-    /// leads to is still here to be charged; once the whole lineage has folded
-    /// there is no counter at the end of the walk and the link is dead weight.
-    fn prune_folded_lineage(&mut self) {
-        let folded: Vec<ObligationKey> = self.folded_lineage.keys().cloned().collect();
-        for key in folded {
-            let reaches_a_retained_entry = self
-                .lineage_ancestors(&key)
-                .iter()
-                .any(|ancestor| self.entries.contains_key(ancestor));
-            if !reaches_a_retained_entry {
-                self.folded_lineage.remove(&key);
-            }
-        }
-    }
-
-    /// One step along the parent chain.
-    ///
-    /// The entry first, a folded parent link second. The fallback is what keeps
-    /// a budget resolvable across compaction; it is consulted only when no
-    /// entry exists, so a REDISCOVERED key resolves through its fresh entry
-    /// (parent `None`, budget from zero) exactly as the compaction contract
-    /// says it should, rather than through a stale link to its old lineage.
-    fn parent_of(&self, key: &ObligationKey) -> Option<ObligationKey> {
-        match self.entries.get(key) {
-            Some(entry) => entry.parent.clone(),
-            None => self.folded_lineage.get(key).cloned(),
-        }
-    }
-
-    /// Every ancestor of `key`, nearest first: distances 1 through
-    /// `LINEAGE_DEPTH_CAP` INCLUSIVE.
-    ///
-    /// The one traversal primitive. [`Self::lineage_root`] takes the last
-    /// element of this, and compaction pins every element of it, so the
-    /// resolver and the pin walk cannot disagree about where a chain ends -
-    /// which is the whole reason the endpoint semantics are stated here rather
-    /// than reimplemented at each caller.
-    fn lineage_ancestors(&self, key: &ObligationKey) -> Vec<ObligationKey> {
-        let mut chain = Vec::new();
-        let mut current = key.clone();
-        for _ in 0..LINEAGE_DEPTH_CAP {
-            let Some(parent) = self.parent_of(&current) else {
-                break;
-            };
-            chain.push(parent.clone());
-            current = parent;
-        }
-        chain
     }
 
     fn audit_for(&mut self, scope: &CursorScope) -> &mut DischargeAudit {
@@ -921,12 +956,17 @@ impl DebtLedger {
                 existing.proof = ProofStatus::Unresolved;
             }
             None => {
-                // A rediscovered key is a FRESH gap, with no parent and no
-                // budget - so its old folded parent link must not outlive the
-                // re-raise and quietly hand the new entry a lineage. `parent_of`
-                // already prefers the entry; this keeps the table honest rather
-                // than merely shadowed.
-                self.folded_lineage.remove(&key);
+                // A key with no entry - never seen, or compacted after proof -
+                // is a new entry with no parent, so its lineage id is its own
+                // key. That id usually has no row and the budget starts from
+                // zero; but a compacted lineage ROOT rediscovered while
+                // children of its lineage are still retained finds their row
+                // and rejoins it. That is deliberate: it is the same
+                // obligation re-raised while its lineage is still being
+                // worked, it is what happened when the root could not fold
+                // under a live child, and resetting there would let a
+                // provider evade the cap by getting the root compacted and
+                // re-raised.
                 self.entries.insert(
                     key.clone(),
                     LedgerEntry {
@@ -1014,56 +1054,78 @@ impl DebtLedger {
         })
     }
 
-    /// The lineage root `key` belongs to.
+    /// The lineage root `key` belongs to: its entry's `parent`, or `key` itself
+    /// when it has no parent or no entry.
     ///
-    /// Budgets accrue at the root, not per key, or an account evades every
+    /// Budgets accrue per lineage, not per key, or an account evades every
     /// budget by re-minting an equivalent obligation under a fresh key each
-    /// pass. Walks parent links with a bound, so a cycle introduced by a buggy
-    /// replacement cannot hang the writer.
-    ///
-    /// Bounded by `LINEAGE_DEPTH_CAP` EDGES: at the cap this returns the key
-    /// reached after the last edge even when that key has a further parent.
-    /// Compaction pins the same set this walks, through the same primitive, so
-    /// the key returned here is always one the ledger still holds.
+    /// pass. Lineages are flat, so this is one read, not a walk.
     #[must_use]
     pub fn lineage_root(&self, key: &ObligationKey) -> ObligationKey {
-        self.lineage_ancestors(key)
-            .pop()
-            .unwrap_or_else(|| key.clone())
+        self.entries
+            .get(key)
+            .map_or_else(|| key.clone(), |entry| lineage_id(entry).clone())
     }
 
-    /// Record one COMPLETED repair attempt against `key`'s lineage root.
+    /// The lineage a charge against `key` would land on: `Some` only while
+    /// `key` has an OPEN entry.
+    ///
+    /// A caller about to mutate `key` out of the open set - a replacement
+    /// discharges its parent - resolves this first and charges the result
+    /// through [`Self::charge_lineage`] afterwards.
+    #[must_use]
+    pub fn open_lineage(&self, key: &ObligationKey) -> Option<ObligationKey> {
+        self.entries
+            .get(key)
+            .filter(|entry| entry.is_open())
+            .map(|entry| lineage_id(entry).clone())
+    }
+
+    /// Record one COMPLETED repair attempt against `key`'s lineage.
     ///
     /// Completed, never merely started: a crash after provider work but before
     /// the acknowledgement must cost a repeated attempt, not a consumed budget,
     /// so nothing durable is written before an outcome comes back.
     ///
-    /// Returns whether the budget expired on this attempt. An expired budget
-    /// yields `OperatorBlocked` - automatic work stopped, still visible, still
-    /// blocking, still manually retryable. It NEVER yields `Waived` or
-    /// `Discharged`: a counter running out is evidence that retrying is not
-    /// working, not a decision about what loss is acceptable.
+    /// Charges only while `key` has an OPEN entry, and never treats a bare key
+    /// as a lineage id. A result for an obligation that was discharged (and
+    /// perhaps folded) while it was in flight charges nothing: a key with no
+    /// open entry is never planned again, so skipping it cannot let a loop
+    /// escape the cap. A result for a key that was re-raised as a fresh
+    /// occurrence meanwhile charges the new occurrence, which over-charges by
+    /// at most the results already in flight - the conservative direction.
     ///
-    /// `key` need not still BE an entry. A repair dispatched against an
-    /// obligation that a covering proof discharged mid-flight has had its entry
-    /// folded by the time the result arrives, and the attempt must still be
-    /// charged against the lineage its surviving siblings share - so the root
-    /// resolves through the folded parent link when no entry remains. See
-    /// `folded_lineage`.
+    /// Returns whether the budget expired on this attempt. See
+    /// [`Self::charge_lineage`].
     pub fn record_attempt(&mut self, key: &ObligationKey, budget: u32) -> bool {
-        let root = self.lineage_root(key);
-        let Some(entry) = self.entries.get_mut(&root) else {
-            return false;
-        };
-        let PolicyStatus::Retrying { attempts } = &mut entry.policy else {
-            return false;
-        };
-        *attempts = attempts.saturating_add(1);
-        if *attempts >= budget {
-            entry.policy = PolicyStatus::OperatorBlocked;
-            return true;
+        match self.open_lineage(key) {
+            Some(lineage) => self.charge_lineage(&lineage, budget),
+            None => false,
         }
-        false
+    }
+
+    /// Charge one completed attempt to `lineage` directly.
+    ///
+    /// For a caller that resolved the lineage with [`Self::open_lineage`]
+    /// before a mutation closed the key it came from. A lineage the ledger no
+    /// longer retains any member of has no row and is not charged.
+    ///
+    /// Returns whether THIS charge exhausted the budget. Exhaustion is sticky -
+    /// a later charge with a larger budget does not reopen the lineage - and it
+    /// turns every open `Retrying` member `OperatorBlocked`: automatic work
+    /// stopped, still visible, still blocking. It NEVER yields `Waived` or
+    /// `Discharged`: a counter running out is evidence that retrying is not
+    /// working, not a decision about what loss is acceptable. Members an
+    /// operator already waived or blocked keep that decision.
+    pub fn charge_lineage(&mut self, lineage: &ObligationKey, budget: u32) -> bool {
+        let Some(row) = self.lineages.get_mut(lineage) else {
+            return false;
+        };
+        row.attempts = row.attempts.saturating_add(1);
+        let exhausted_now = !row.exhausted && row.attempts >= budget;
+        row.exhausted |= exhausted_now;
+        self.settle_lineages();
+        exhausted_now
     }
 
     /// Discharge `key` on proof that a repair recovered it and the consumer
@@ -1089,6 +1151,7 @@ impl DebtLedger {
             return false;
         }
         entry.proof = ProofStatus::Discharged { evidence };
+        self.settle_lineages();
         true
     }
 
@@ -1105,9 +1168,12 @@ impl DebtLedger {
     /// assertion is recorded rather than the engine pretending it verified one.
     ///
     /// Children inherit the lineage root, so the retry budget follows the
-    /// unresolved lineage rather than resetting per generated key.
+    /// unresolved lineage rather than resetting per generated key. The swap
+    /// discharges the parent, so a caller that wants to charge a `Stalled`
+    /// result resolves [`Self::open_lineage`] BEFORE calling this.
     ///
-    /// Returns `Err` with a reason when the replacement is refused.
+    /// Returns `Err` with a reason when the replacement is refused. A refusal
+    /// changes nothing.
     pub fn replace_obligation(
         &mut self,
         key: &ObligationKey,
@@ -1122,15 +1188,36 @@ impl DebtLedger {
         if parent.generation > generation || !parent.is_open() {
             return Err(ReplacementRefusal::StaleGeneration);
         }
+        // A split moves the debt onto fresh children and discharges the parent,
+        // so accepting one against a parent an operator blocked or waived - or
+        // whose lineage ran out - while this result was in flight would erase
+        // that decision from the live debt.
+        if !matches!(parent.policy, PolicyStatus::Retrying { .. }) {
+            return Err(ReplacementRefusal::PolicyNoLongerRetrying);
+        }
+        let root = lineage_id(&parent).clone();
+        if children
+            .iter()
+            .any(|child| child.key() == key || *child.key() == root)
+        {
+            return Err(ReplacementRefusal::ChildReusesLineageKey);
+        }
         // A child colliding with an obligation from another lineage would give
         // one key two roots and let a budget reset by choosing the convenient
         // one. Refused as a contract violation rather than resolved silently.
-        let root = self.lineage_root(key);
+        // That holds for a DISCHARGED retained entry too: `upsert` reopens an
+        // existing entry with its policy and history intact, so adopting one
+        // would move another lineage's waiver or block onto this residual
+        // without any operator deciding it. The same goes for a child whose
+        // key is ANOTHER live lineage's id, entry or not: adopting it would
+        // give that lineage's members a parent that itself has a parent, which
+        // is the chain shape the flat lineage model rules out.
         for child in children {
-            if let Some(existing) = self.entries.get(child.key())
-                && self.lineage_root(child.key()) != root
-                && existing.is_open()
-            {
+            let retained_elsewhere = self
+                .entries
+                .get(child.key())
+                .is_some_and(|existing| *lineage_id(existing) != root);
+            if retained_elsewhere || self.lineages.contains_key(child.key()) {
                 return Err(ReplacementRefusal::ChildCollidesWithForeignLineage);
             }
         }
@@ -1156,6 +1243,7 @@ impl DebtLedger {
                 },
             };
         }
+        self.settle_lineages();
         Ok(progress)
     }
 
@@ -1231,6 +1319,7 @@ impl DebtLedger {
             barrier.policy = policy;
             waived = true;
         }
+        self.settle_lineages();
         waived
     }
 
@@ -1245,6 +1334,7 @@ impl DebtLedger {
             barrier.policy = PolicyStatus::OperatorBlocked;
             blocked = true;
         }
+        self.settle_lineages();
         blocked
     }
 }
@@ -1813,6 +1903,9 @@ mod tests {
     /// The budget follows the LINEAGE. An account that answers every pass by
     /// replacing an obligation with an equivalent one under a fresh key would
     /// otherwise never exhaust a budget.
+    ///
+    /// Rewritten when the budget moved off the discharged root into the
+    /// per-lineage table: the rule is unchanged, only where the count lives.
     #[test]
     fn attempts_accrue_at_the_lineage_root() {
         let mut ledger = DebtLedger::new();
@@ -1826,13 +1919,243 @@ mod tests {
         let child = ObligationKey(b"child".to_vec());
         assert_eq!(ledger.lineage_root(&child), parent);
 
-        // An attempt charged against the child lands on the root's counter.
+        // An attempt charged against the child lands on the lineage's budget.
         ledger.record_attempt(&child, 10);
-        let PolicyStatus::Retrying { attempts } = ledger.entry(&parent).expect("root entry").policy
-        else {
-            panic!("root should still be retrying");
-        };
-        assert_eq!(attempts, 2, "both attempts must accrue to the one root");
+        assert_eq!(
+            ledger.lineages().get(&parent).map(|row| row.attempts),
+            Some(2),
+            "both attempts must accrue to the one lineage"
+        );
+        assert_eq!(
+            ledger.entry(&child).expect("child").policy,
+            PolicyStatus::Retrying { attempts: 2 },
+            "the open member shows the lineage's count"
+        );
+    }
+
+    /// The defect the per-lineage budget closed: expiry used to block only the
+    /// discharged root while the open child kept its own `Retrying` policy, so
+    /// `repairable` went on planning it and the cap never bound after the
+    /// first split.
+    #[test]
+    fn an_expired_lineage_stops_repairing_its_open_members() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent"), 1);
+        let parent = ObligationKey(b"parent".to_vec());
+        ledger
+            .replace_obligation(&parent, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .expect("replacement accepted");
+        let a = ObligationKey(b"a".to_vec());
+        let b = ObligationKey(b"b".to_vec());
+
+        assert!(!ledger.record_attempt(&a, 2));
+        assert!(ledger.record_attempt(&b, 2), "the second charge spends it");
+
+        assert_eq!(
+            ledger.repairable().count(),
+            0,
+            "no member of a spent lineage may be planned again"
+        );
+        for key in [&a, &b] {
+            let entry = ledger.entry(key).expect("member");
+            assert_eq!(entry.policy, PolicyStatus::OperatorBlocked);
+            assert!(entry.is_open(), "a spent budget proves nothing");
+        }
+    }
+
+    /// Exhaustion is sticky: a sibling that was closed when the budget ran out
+    /// and is later rediscovered rejoins the SPENT lineage, blocked, rather
+    /// than coming back `Retrying`.
+    #[test]
+    fn a_member_reopened_into_a_spent_lineage_comes_back_blocked() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent"), 1);
+        let parent = ObligationKey(b"parent".to_vec());
+        ledger
+            .replace_obligation(&parent, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .expect("replacement accepted");
+        let a = ObligationKey(b"a".to_vec());
+        let b = ObligationKey(b"b".to_vec());
+        assert!(ledger.discharge_repaired(
+            &b,
+            1,
+            DischargeEvidence::ProvedIrrelevant {
+                detail: "covered".into(),
+            },
+        ));
+        assert!(ledger.record_attempt(&a, 1));
+
+        ingest_one(&mut ledger, replayable("b"), 2);
+        assert_eq!(
+            ledger.entry(&b).expect("reopened").policy,
+            PolicyStatus::OperatorBlocked
+        );
+        assert!(
+            !ledger.record_attempt(&a, 100),
+            "a larger budget on a later charge does not reopen a spent lineage"
+        );
+        assert_eq!(ledger.repairable().count(), 0);
+    }
+
+    /// Expiry never overwrites an operator decision on a member.
+    #[test]
+    fn expiry_leaves_a_waived_member_waived() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent"), 1);
+        let parent = ObligationKey(b"parent".to_vec());
+        ledger
+            .replace_obligation(&parent, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .expect("replacement accepted");
+        let a = ObligationKey(b"a".to_vec());
+        let b = ObligationKey(b"b".to_vec());
+        assert!(ledger.waive(&a, "op".into(), 500));
+        assert!(ledger.record_attempt(&b, 1));
+
+        assert!(ledger.entry(&a).expect("a").policy.is_waived());
+        assert_eq!(
+            ledger.entry(&b).expect("b").policy,
+            PolicyStatus::OperatorBlocked
+        );
+    }
+
+    /// A split that arrives after the operator blocked the parent must not
+    /// move the debt onto fresh `Retrying` children and discharge the only
+    /// entry carrying the block.
+    #[test]
+    fn a_replacement_against_an_operator_decision_is_refused() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("parent"), 1);
+        let parent = ObligationKey(b"parent".to_vec());
+        assert!(ledger.block(&parent));
+
+        assert_eq!(
+            ledger.replace_obligation(&parent, &[], &[replayable("child")], 1, 200),
+            Err(ReplacementRefusal::PolicyNoLongerRetrying)
+        );
+        let entry = ledger.entry(&parent).expect("parent");
+        assert!(entry.is_open());
+        assert_eq!(entry.policy, PolicyStatus::OperatorBlocked);
+        assert!(ledger.entry(&ObligationKey(b"child".to_vec())).is_none());
+    }
+
+    /// A child named after its own parent or lineage root would mutate the
+    /// parent in place and then discharge it, or name itself as its root.
+    #[test]
+    fn a_child_reusing_a_lineage_key_is_refused() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("root"), 1);
+        let root = ObligationKey(b"root".to_vec());
+        assert_eq!(
+            ledger.replace_obligation(&root, &[], &[replayable("root")], 1, 200),
+            Err(ReplacementRefusal::ChildReusesLineageKey)
+        );
+
+        ledger
+            .replace_obligation(&root, &[], &[replayable("a")], 1, 200)
+            .expect("replacement accepted");
+        let a = ObligationKey(b"a".to_vec());
+        assert_eq!(
+            ledger.replace_obligation(&a, &[], &[replayable("a")], 1, 200),
+            Err(ReplacementRefusal::ChildReusesLineageKey)
+        );
+        assert_eq!(
+            ledger.replace_obligation(&a, &[], &[replayable("root")], 1, 200),
+            Err(ReplacementRefusal::ChildReusesLineageKey)
+        );
+        assert!(ledger.entry(&a).expect("a").is_open());
+    }
+
+    /// A child whose key is another live lineage's id - here a discharged
+    /// root whose own child is still open - would give that child a parent
+    /// that itself has a parent.
+    #[test]
+    fn a_child_naming_another_live_lineage_is_refused() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("x"), 1);
+        ingest_one(&mut ledger, replayable("r"), 1);
+        ledger
+            .replace_obligation(
+                &ObligationKey(b"x".to_vec()),
+                &[],
+                &[replayable("y")],
+                1,
+                200,
+            )
+            .expect("replacement accepted");
+
+        assert_eq!(
+            ledger.replace_obligation(
+                &ObligationKey(b"r".to_vec()),
+                &[],
+                &[replayable("x")],
+                1,
+                200,
+            ),
+            Err(ReplacementRefusal::ChildCollidesWithForeignLineage)
+        );
+        ledger.validate_lineages().expect("still flat");
+    }
+
+    /// A compacted lineage ROOT re-raised while its lineage still has a
+    /// retained member rejoins that lineage's budget rather than starting
+    /// fresh - the conservative direction, and the pre-compaction behaviour.
+    #[test]
+    fn a_compacted_root_re_raised_under_a_live_lineage_rejoins_it() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("root"), 1);
+        let root = ObligationKey(b"root".to_vec());
+        ledger
+            .replace_obligation(&root, &[], &[replayable("child")], 1, 200)
+            .expect("replacement accepted");
+        assert!(ledger.record_attempt(&ObligationKey(b"child".to_vec()), 1));
+        assert_eq!(ledger.compact_discharged(), 1, "the root folds");
+
+        ingest_one(&mut ledger, replayable("root"), 2);
+        assert_eq!(
+            ledger.entry(&root).expect("re-raised").policy,
+            PolicyStatus::OperatorBlocked,
+            "the spent lineage is not reset by folding and re-raising its root"
+        );
+    }
+
+    /// A discharged entry of another lineage is refused as a child too:
+    /// reopening it would carry that lineage's operator decision onto this
+    /// residual without anyone deciding it.
+    #[test]
+    fn a_child_naming_a_discharged_foreign_entry_is_refused() {
+        let mut ledger = DebtLedger::new();
+        ingest_one(&mut ledger, replayable("x"), 1);
+        ingest_one(&mut ledger, replayable("r"), 1);
+        ledger
+            .replace_obligation(
+                &ObligationKey(b"x".to_vec()),
+                &[],
+                &[replayable("w")],
+                1,
+                200,
+            )
+            .expect("replacement accepted");
+        let w = ObligationKey(b"w".to_vec());
+        assert!(ledger.waive(&w, "op".into(), 500));
+        assert!(ledger.discharge_repaired(
+            &w,
+            1,
+            DischargeEvidence::ProvedIrrelevant {
+                detail: "covered".into(),
+            },
+        ));
+
+        assert_eq!(
+            ledger.replace_obligation(
+                &ObligationKey(b"r".to_vec()),
+                &[],
+                &[replayable("w")],
+                1,
+                200,
+            ),
+            Err(ReplacementRefusal::ChildCollidesWithForeignLineage)
+        );
+        assert!(!ledger.entry(&w).expect("w").is_open());
     }
 
     /// Replacement is a SWAP. Leaving the parent open alongside its children
@@ -2022,36 +2345,35 @@ mod tests {
         ));
     }
 
-    /// PRESERVATION CHECK for the ONE-LEVEL case. `replace_obligation`
-    /// discharges the parent but leaves its policy `Retrying`, and children
-    /// charge their attempts against it, so folding that root away would
-    /// silently un-cap the retry budget. Stub compaction out and this still
-    /// passes - it fixes the shallowest arrangement rather than exercising the
-    /// pin walk. `a_multi_level_lineage_survives_compaction_whole` and
-    /// `the_lineage_endpoint_at_the_depth_cap_is_pinned_too` are the ones that
-    /// fail against a pin set built from immediate parents.
+    /// A discharged lineage root is no longer load-bearing: the budget lives in
+    /// the lineage table, so compaction folds the root while its child is
+    /// still open and the child's charges still reach the cap.
+    ///
+    /// Rewritten from the pin-era test, which asserted the root SURVIVED
+    /// compaction and carried the counter; the rule it pinned (the cap binds
+    /// through a live child) is unchanged.
     #[test]
-    fn a_discharged_lineage_root_survives_while_a_child_is_open() {
+    fn a_discharged_lineage_root_folds_while_its_child_keeps_the_budget() {
         let mut ledger = DebtLedger::new();
         ingest_one(&mut ledger, replayable("parent"), 1);
         let parent = ObligationKey(b"parent".to_vec());
+        let child = ObligationKey(b"child".to_vec());
+        ledger.record_attempt(&parent, 2);
         ledger
             .replace_obligation(&parent, &[], &[replayable("child")], 1, 200)
             .expect("replacement accepted");
 
-        assert_eq!(
-            ledger.compact_discharged(),
-            0,
-            "the root is terminal as proof and load-bearing as structure"
-        );
-        assert!(ledger.entry(&parent).is_some());
+        assert_eq!(ledger.compact_discharged(), 1, "the root folds");
+        assert!(ledger.entry(&parent).is_none());
+        assert_eq!(ledger.lineage_root(&child), parent);
 
-        let child = ObligationKey(b"child".to_vec());
-        assert!(ledger.record_attempt(&child, 1));
+        assert!(
+            ledger.record_attempt(&child, 2),
+            "the root's earlier charge still counts toward the cap"
+        );
         assert_eq!(
-            ledger.entry(&parent).expect("root").policy,
-            PolicyStatus::OperatorBlocked,
-            "the budget must still reach its cap through the retained root"
+            ledger.entry(&child).expect("child").policy,
+            PolicyStatus::OperatorBlocked
         );
     }
 
@@ -2182,191 +2504,214 @@ mod tests {
         }
     }
 
-    fn ledger_of(entries: Vec<super::LedgerEntry>) -> DebtLedger {
+    fn ledger_of(entries: Vec<super::LedgerEntry>, lineages: &[(&str, u32, bool)]) -> DebtLedger {
         let mut map = std::collections::BTreeMap::new();
         for entry in entries {
             map.insert(entry.key.clone(), entry);
         }
+        let lineages = lineages
+            .iter()
+            .map(|(key, attempts, exhausted)| {
+                (
+                    ObligationKey(key.as_bytes().to_vec()),
+                    super::LineageBudget {
+                        attempts: *attempts,
+                        exhausted: *exhausted,
+                    },
+                )
+            })
+            .collect();
         DebtLedger::from_parts(
             map,
             std::collections::BTreeMap::new(),
             Vec::new(),
             Vec::new(),
+            lineages,
         )
     }
 
-    /// The pin set must be the ancestor CLOSURE, not the immediate parents of
-    /// the survivors. Here `root` is the grandparent of the only open entry, so
-    /// a shallow pin folds it, `lineage_root` then answers with a key that is
-    /// no longer in the map, and the budget stops being reachable.
-    ///
-    /// Built through `from_parts` because that is how a multi-level chain
-    /// actually arrives: `replace_obligation` re-points every child at the
-    /// lineage root, so the shapes it mints in one process are flat, while a
-    /// durable row decoded here carries whatever parent links were written into
-    /// it.
+    /// Lineages are flat by construction, and restored state must be too: a
+    /// chain (or a cycle, which is a chain that closes) is refused rather than
+    /// resolved by guessing which ancestor is the root.
     #[test]
-    fn a_multi_level_lineage_survives_compaction_whole() {
-        let mut ledger = ledger_of(vec![
-            lineage_entry("root", None, true),
-            lineage_entry("middle", Some("root"), true),
-            lineage_entry("leaf", Some("middle"), false),
-        ]);
-
-        assert_eq!(
-            ledger.compact_discharged(),
-            0,
-            "every discharged entry on the open leaf's chain is load-bearing"
+    fn a_restored_chain_or_self_parent_fails_validation() {
+        let chain = ledger_of(
+            vec![
+                lineage_entry("root", None, true),
+                lineage_entry("middle", Some("root"), true),
+                lineage_entry("leaf", Some("middle"), false),
+            ],
+            &[("middle", 0, false)],
         );
-        assert!(ledger.entry(&ObligationKey(b"middle".to_vec())).is_some());
+        assert!(chain.validate_lineages().is_err());
+
+        let cycle = ledger_of(
+            vec![
+                lineage_entry("a", Some("b"), false),
+                lineage_entry("b", Some("a"), false),
+            ],
+            &[("a", 0, false), ("b", 0, false)],
+        );
+        assert!(cycle.validate_lineages().is_err());
+
+        let own = ledger_of(
+            vec![lineage_entry("a", Some("a"), false)],
+            &[("a", 0, false)],
+        );
+        assert!(own.validate_lineages().is_err());
+    }
+
+    /// Every other lineage invariant, each broken once. A parent naming an
+    /// absent key is the one shape that looks odd and is legal: its root was
+    /// compacted.
+    #[test]
+    fn restored_lineage_rows_must_match_the_open_entries() {
+        let open_child = || vec![lineage_entry("leaf", Some("gone"), false)];
+
         assert!(
-            ledger.entry(&ObligationKey(b"root".to_vec())).is_some(),
-            "the grandparent is what a shallow pin set drops"
+            ledger_of(open_child(), &[("gone", 0, false)])
+                .validate_lineages()
+                .is_ok(),
+            "a folded root is a legal lineage id"
         );
-
-        assert!(ledger.record_attempt(&ObligationKey(b"leaf".to_vec()), 1));
-        assert_eq!(
-            ledger
-                .entry(&ObligationKey(b"root".to_vec()))
-                .expect("root")
-                .policy,
-            PolicyStatus::OperatorBlocked,
-            "the budget must still reach the true root"
+        assert!(
+            ledger_of(open_child(), &[]).validate_lineages().is_err(),
+            "an open member needs its budget row"
+        );
+        assert!(
+            ledger_of(open_child(), &[("gone", 0, false), ("orphan", 0, false)])
+                .validate_lineages()
+                .is_err(),
+            "a row with no retained member is stranded"
+        );
+        assert!(
+            ledger_of(open_child(), &[("gone", 3, false)])
+                .validate_lineages()
+                .is_err(),
+            "a retrying member must mirror its row"
+        );
+        assert!(
+            ledger_of(open_child(), &[("gone", 0, true)])
+                .validate_lineages()
+                .is_err(),
+            "no member of an exhausted lineage may still be retrying"
         );
     }
 
-    /// The endpoint case, which is where an off-by-one recreates the identical
-    /// hole. `lineage_root` follows at most `LINEAGE_DEPTH_CAP` edges and
-    /// returns the key reached AFTER the last one, even though that key has a
-    /// further parent - so the pin walk has to retain distances 1 through the
-    /// cap INCLUSIVE. A walk that pins the current node before advancing and
-    /// stops after the cap's iterations drops exactly the key the resolver
-    /// returns.
-    #[test]
-    fn the_lineage_endpoint_at_the_depth_cap_is_pinned_too() {
-        let depth = super::LINEAGE_DEPTH_CAP;
-        let name = |index: usize| format!("n{index}");
-        let mut entries = vec![lineage_entry(&name(0), None, true)];
-        for index in 1..=depth + 1 {
-            entries.push(lineage_entry(
-                &name(index),
-                Some(&name(index - 1)),
-                // Everything but the leaf is discharged, so everything but the
-                // leaf is a fold candidate and only the pin set saves it.
-                index != depth + 1,
-            ));
-        }
-        // n{depth+1} is the only open entry; its ancestors run n{depth}..n1,
-        // and n0 is reachable only by continuing the walk from n1 - which is
-        // the closure, not a single bounded walk from the survivor.
-        let mut ledger = ledger_of(entries);
-        let leaf = ObligationKey(name(depth + 1).into_bytes());
-        let endpoint = ledger.lineage_root(&leaf);
-        assert_eq!(
-            endpoint,
-            ObligationKey(name(1).into_bytes()),
-            "the cap stops the walk one short of the true root"
-        );
-
-        assert_eq!(
-            ledger.compact_discharged(),
-            0,
-            "the ancestor closure retains the whole chain, including the node \
-             past the resolver's cap"
-        );
-        assert!(
-            ledger.entry(&endpoint).is_some(),
-            "the key the resolver returns must survive the fold that follows it"
-        );
-        assert!(
-            ledger.entry(&ObligationKey(name(0).into_bytes())).is_some(),
-            "and so must ITS parent - the guarantee is the closure, not one walk"
-        );
-        assert!(ledger.record_attempt(&leaf, 1));
-        assert_eq!(
-            ledger.entry(&endpoint).expect("endpoint").policy,
-            PolicyStatus::OperatorBlocked
-        );
-    }
-
-    /// The dependency the ledger could not SEE: a repair attempt in flight
-    /// against `a`, a covering proof discharging `a` while it is out, and
-    /// compaction folding `a` because nothing in the ledger names it. When the
-    /// deferred result lands, the attempt still has to be charged against the
-    /// lineage its sibling shares, or it is silently lost against the budget and
-    /// the retry loop stops being capped.
+    /// A repair result for a key that a covering proof discharged while the
+    /// attempt was in flight charges NOTHING, whether or not the entry has
+    /// been folded since. Only an open entry is charged: a key with no open
+    /// entry is never planned again, so no provider can collect free attempts
+    /// against it, and its surviving sibling is charged by its own results.
     ///
-    /// `record_attempt` on a key with no entry is exactly what
-    /// `apply_repair_resolutions` does for `RepairResolution::Deferred`.
+    /// Inverted from the pin-era test, which required this charge to reach
+    /// the lineage through a folded parent link. The owner's ruling that
+    /// moved the budget off discharged entries also made `record_attempt` skip
+    /// non-open ones, and this is that rule observed at its sharpest.
     #[test]
-    fn a_deferred_repair_result_still_charges_a_budget_after_its_entry_folds() {
+    fn a_result_for_a_key_discharged_in_flight_charges_nothing() {
         let mut ledger = DebtLedger::new();
         ingest_one(&mut ledger, replayable("root"), 1);
         let root = ObligationKey(b"root".to_vec());
         ledger
             .replace_obligation(&root, &[], &[replayable("a"), replayable("b")], 1, 200)
             .expect("replacement accepted");
-        // `a` is discharged by a covering proof while its repair is in flight.
+        let a = ObligationKey(b"a".to_vec());
         assert!(ledger.discharge_repaired(
-            &ObligationKey(b"a".to_vec()),
+            &a,
             1,
             DischargeEvidence::ProvedIrrelevant {
                 detail: "covered".into(),
             },
         ));
 
-        assert_eq!(ledger.compact_discharged(), 1, "only `a` folds");
-        assert!(ledger.entry(&ObligationKey(b"a".to_vec())).is_none());
-        assert!(
-            ledger.entry(&root).is_some(),
-            "`b` still names the root, so it is pinned"
-        );
-
-        // The deferred result for the folded `a` arrives now.
-        assert!(
-            ledger.record_attempt(&ObligationKey(b"a".to_vec()), 1),
-            "the attempt must reach a budget, not evaporate"
-        );
+        assert!(!ledger.record_attempt(&a, 1), "discharged, not yet folded");
+        assert_eq!(ledger.compact_discharged(), 2, "root and `a` fold");
+        assert!(!ledger.record_attempt(&a, 1), "folded");
         assert_eq!(
-            ledger.entry(&root).expect("root").policy,
-            PolicyStatus::OperatorBlocked,
-            "the charge lands on the lineage the surviving sibling shares"
+            ledger
+                .entry(&ObligationKey(b"b".to_vec()))
+                .expect("b")
+                .policy,
+            PolicyStatus::Retrying { attempts: 0 },
+            "the sibling's lineage was not charged"
         );
     }
 
-    /// The folded parent links are BOUNDED: they live only while the chain they
-    /// start still reaches a retained entry. Once the whole lineage folds there
-    /// is no counter at the end of the walk, so keeping the link would be
-    /// exactly the unbounded growth compaction exists to remove.
+    /// A lineage's budget row lives exactly while the ledger retains a member
+    /// of it. Discharging every member keeps the row - a retained member can
+    /// be rediscovered - and compaction folding the last one drops it, so the
+    /// table stays bounded by the entry map.
     #[test]
-    fn folded_parent_links_do_not_outlive_their_lineage() {
+    fn a_lineage_budget_lives_while_a_member_is_retained() {
         let mut ledger = DebtLedger::new();
         ingest_one(&mut ledger, replayable("root"), 1);
         let root = ObligationKey(b"root".to_vec());
         ledger
             .replace_obligation(&root, &[], &[replayable("a"), replayable("b")], 1, 200)
             .expect("replacement accepted");
+        ledger.record_attempt(&ObligationKey(b"a".to_vec()), 10);
         let irrelevant = || DischargeEvidence::ProvedIrrelevant {
             detail: "covered".into(),
         };
         assert!(ledger.discharge_repaired(&ObligationKey(b"a".to_vec()), 1, irrelevant()));
-        assert_eq!(ledger.compact_discharged(), 1);
-        assert_eq!(ledger.folded_lineage.len(), 1);
+        assert!(
+            ledger.lineages().contains_key(&root),
+            "`b` is still open, so the budget stays"
+        );
 
         assert!(ledger.discharge_repaired(&ObligationKey(b"b".to_vec()), 1, irrelevant()));
-        assert_eq!(ledger.compact_discharged(), 2, "root and `b` fold together");
-        assert_eq!(ledger.entries().count(), 0);
         assert!(
-            ledger.folded_lineage.is_empty(),
-            "nothing retained is left for a link to lead to"
+            ledger.lineages().contains_key(&root),
+            "every member is discharged but retained, so the budget stays"
+        );
+        ledger.validate_lineages().expect("settled state is valid");
+
+        assert_eq!(ledger.compact_discharged(), 3);
+        assert!(ledger.lineages().is_empty());
+        ledger.validate_lineages().expect("settled state is valid");
+    }
+
+    /// Rediscovery keeps history, budget included. A provider alternating a
+    /// covering walk with a rediscovery of the same retained obligation must
+    /// not get a fresh budget each time, or no budget is ever reachable.
+    #[test]
+    fn a_discharged_obligation_rediscovered_keeps_its_budget() {
+        let mut ledger = DebtLedger::new();
+        ledger.ingest(
+            &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("a")]),
+            4,
+            100,
+        );
+        let a = ObligationKey(b"a".to_vec());
+        assert!(!ledger.record_attempt(&a, 3));
+        assert!(!ledger.record_attempt(&a, 3));
+
+        ledger.ingest(
+            &InventoryCoverageReport::complete(time_domain(0, 180)),
+            5,
+            200,
+        );
+        assert!(!ledger.entry(&a).expect("retained").is_open());
+
+        ledger.ingest(
+            &InventoryCoverageReport::degraded(time_domain(30, 90), vec![object("a")]),
+            6,
+            300,
+        );
+        assert_eq!(
+            ledger.entry(&a).expect("reopened").policy,
+            PolicyStatus::Retrying { attempts: 2 }
+        );
+        assert!(
+            ledger.record_attempt(&a, 3),
+            "the third charge exhausts it, across the discharge"
         );
     }
 
-    /// A rediscovered key is a FRESH gap: no parent, budget from zero. This
-    /// pins the RESOLUTION ORDER that keeps that true now that a folded parent
-    /// link exists at all - the entry wins over the link, so a re-raise does
-    /// not inherit the lineage it was folded out of and charge an old root for
-    /// a new gap.
+    /// A rediscovered CHILD key is a FRESH gap: no parent, budget from zero. A
+    /// re-raise must not inherit the lineage it was folded out of and charge
+    /// an old root for a new gap.
     #[test]
     fn a_rediscovered_key_does_not_inherit_its_folded_lineage() {
         let mut ledger = DebtLedger::new();
@@ -2382,7 +2727,7 @@ mod tests {
                 detail: "covered".into(),
             },
         ));
-        assert_eq!(ledger.compact_discharged(), 1);
+        assert_eq!(ledger.compact_discharged(), 2, "root and `a` fold");
 
         ingest_one(&mut ledger, replayable("a"), 9);
         let raised = ObligationKey(b"a".to_vec());
@@ -2393,9 +2738,13 @@ mod tests {
         );
         assert!(!ledger.record_attempt(&raised, 3), "and its own budget");
         assert_eq!(
-            ledger.entry(&root).expect("root").policy,
-            PolicyStatus::Retrying { attempts: 0 },
-            "the old root must not be charged for a fresh gap"
+            ledger.lineages().get(&root).map(|row| row.attempts),
+            Some(0),
+            "the old lineage must not be charged for a fresh gap"
+        );
+        assert_eq!(
+            ledger.lineages().get(&raised).map(|row| row.attempts),
+            Some(1)
         );
     }
 

@@ -27,13 +27,22 @@
 //!   4 bytes   proof count       -> N (generation, CoverageDomain) pairs
 //! ```
 //!
-//! Version 2 appends one further section AFTER the proofs, in the payload
-//! rather than in the header: a `u32` count followed by that many
-//! `(CursorScope, DischargeAudit)` pairs, the compacted terminal history.
-//! Appending in the payload rather than widening the header is deliberate - a
-//! fourth header count would move `HEADER_LEN`, and then this decoder would
-//! need two header shapes to read a version-1 row. A version-1 row simply has
-//! no trailing section, so the same reader handles both by asking the version.
+//! Two further sections follow the proofs, in the payload rather than in the
+//! header, each a `u32` count and that many rows:
+//!
+//! - `(CursorScope, DischargeAudit)` pairs, the compacted terminal history
+//!   (since version 2);
+//! - `(lineage key, attempts u32, exhausted u8)` rows, the per-lineage retry
+//!   budgets (since version 3).
+//!
+//! The payload must be consumed exactly; trailing bytes are refused.
+//!
+//! Version 3 moved the retry budget off the discharged lineage-root entry and
+//! into its own table. The repository owner ruled that no consumer had
+//! persisted a ledger when it did, so it raised `MIN_MIGRATABLE_LEDGER` to
+//! itself rather than synthesizing budgets
+//! from the old per-entry counters - which, for a split lineage, disagreed
+//! with each other (the root held the count, every child held zero).
 //!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
@@ -59,7 +68,8 @@
 //! That loss is affordable because nothing decides anything on these fields.
 //! Every ledger predicate - `blocks_completion`, `completion_permitted`,
 //! `repairable`, `lineage_root`, `record_attempt`, discharge - reads proof,
-//! policy, domain, generation and target, never the error; `LedgerEntry::target`
+//! policy, domain, generation, target, parent and the lineage budgets, never
+//! the error; `LedgerEntry::target`
 //! exists precisely so a repair descriptor is never taken from the error, whose
 //! classifications and messages change between revisions. The error is operator
 //! evidence, and operator evidence is what a digest preserves.
@@ -87,14 +97,14 @@ use super::envelope::{
     write_bytes, write_string,
 };
 use super::ledger::{
-    BarrierIncident, DebtLedger, DischargeAudit, DischargeEvidence, LedgerEntry, PolicyStatus,
-    ProofStatus,
+    BarrierIncident, DebtLedger, DischargeAudit, DischargeEvidence, LedgerEntry, LineageBudget,
+    PolicyStatus, ProofStatus,
 };
 use crate::error::Error;
 
 /// Current ledger envelope version. Bumped whenever the layout below changes
 /// in a way an older decoder would misread.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 2;
+pub const LEDGER_ENVELOPE_VERSION: u32 = 3;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -104,13 +114,10 @@ pub const LEDGER_ENVELOPE_VERSION: u32 = 2;
 /// revision cannot read, and that is the only classification a consumer's
 /// healing path can key on. An `Error::Other` would instead read as a store
 /// failure and leave the unreadable row in place for every subsequent load.
-pub const MIN_MIGRATABLE_LEDGER: u32 = 1;
+pub const MIN_MIGRATABLE_LEDGER: u32 = 3;
 
 const MAGIC: u8 = 0xB6;
 const HEADER_LEN: usize = 20;
-
-/// First version that carries the compacted discharge audit table.
-const LEDGER_VERSION_WITH_AUDIT: u32 = 2;
 
 /// Serialize a whole `DebtLedger`.
 ///
@@ -162,6 +169,14 @@ pub fn encode_ledger(ledger: &DebtLedger) -> Vec<u8> {
         out.extend_from_slice(&audit.root);
         out.extend_from_slice(&audit.latest_generation.to_le_bytes());
     }
+
+    let lineages = ledger.lineages();
+    write_count(&mut out, lineages.len(), "lineage budgets");
+    for (lineage, budget) in lineages {
+        write_bytes(&mut out, &lineage.0);
+        out.extend_from_slice(&budget.attempts.to_le_bytes());
+        out.push(u8::from(budget.exhausted));
+    }
     out
 }
 
@@ -177,16 +192,12 @@ pub fn encode_ledger(ledger: &DebtLedger) -> Vec<u8> {
 /// returns is current-shaped ledger state, exactly as `decode_envelope` returns
 /// a `ChangeCursor` its own consumers will accept.
 ///
-/// Version 1 is still readable, and reads as a ledger that has never compacted:
-/// its entry map already holds every discharged entry verbatim, so an empty
-/// audit table describes it exactly and nothing is lost or invented. The first
-/// ingest that carries it over `COMPACTION_THRESHOLD` folds that history the
-/// same way it would fold history this revision produced. The reverse
-/// direction is not readable and is not meant to be: a version-2 row handed to
-/// an older engine is outside its window and decodes to
-/// `Error::SchemaIncompatible`, the classification that authorizes a consumer
-/// to clear the row and re-establish rather than to treat it as a store
-/// failure.
+/// Decoded state is VALIDATED, never healed. A duplicated key, a lineage that
+/// is not flat, an entry whose lineage has no budget row, a row with no
+/// retained member, or a retrying entry disagreeing with its row is
+/// `Error::Other`: repairing
+/// it would mean choosing which half of a contradiction to believe, and a
+/// guessed retry budget is exactly the silent reset budgets exist to stop.
 pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
     if bytes.len() < HEADER_LEN {
         return Err(Error::Other("ledger envelope: truncated header".into()));
@@ -212,12 +223,16 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
     let mut entries = BTreeMap::new();
     for _ in 0..entry_count {
         let entry = decode_entry(&mut reader)?;
-        entries.insert(entry.key.clone(), entry);
+        if entries.insert(entry.key.clone(), entry).is_some() {
+            return Err(duplicate("entry"));
+        }
     }
     let mut barriers = BTreeMap::new();
     for _ in 0..barrier_count {
         let barrier = decode_barrier(&mut reader)?;
-        barriers.insert(barrier.key.clone(), barrier);
+        if barriers.insert(barrier.key.clone(), barrier).is_some() {
+            return Err(duplicate("barrier"));
+        }
     }
     let mut proved = Vec::with_capacity(proof_count.min(1024));
     for _ in 0..proof_count {
@@ -225,50 +240,68 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
         proved.push((generation, decode_domain(&mut reader)?));
     }
 
-    // A version-1 row stops after the proofs. Reading nothing is exactly right
-    // for it: version 1 never compacted, so every entry it ever discharged is
-    // still an entry in the map above, and an empty audit table is a true
-    // statement about it rather than a lossy default.
-    let mut compacted = Vec::new();
-    if version >= LEDGER_VERSION_WITH_AUDIT {
-        let audit_count = reader.u32()? as usize;
-        compacted.reserve(audit_count.min(1024));
-        for _ in 0..audit_count {
-            let scope = decode_scope(&reader.bytes()?)?;
-            compacted.push((
-                scope,
-                DischargeAudit {
-                    count: reader.u64()?,
-                    root: reader.digest32()?,
-                    latest_generation: reader.u64()?,
-                },
-            ));
+    let audit_count = reader.u32()? as usize;
+    let mut compacted = Vec::with_capacity(audit_count.min(1024));
+    for _ in 0..audit_count {
+        let scope = decode_scope(&reader.bytes()?)?;
+        compacted.push((
+            scope,
+            DischargeAudit {
+                count: reader.u64()?,
+                root: reader.digest32()?,
+                latest_generation: reader.u64()?,
+            },
+        ));
+    }
+
+    let lineage_count = reader.u32()? as usize;
+    let mut lineages = BTreeMap::new();
+    for _ in 0..lineage_count {
+        let lineage = ObligationKey(reader.bytes()?);
+        let attempts = reader.u32()?;
+        let exhausted = match reader.u8()? {
+            0 => false,
+            1 => true,
+            other => return Err(unknown_tag("lineage exhausted flag", other)),
+        };
+        let budget = LineageBudget {
+            attempts,
+            exhausted,
+        };
+        if lineages.insert(lineage, budget).is_some() {
+            return Err(duplicate("lineage budget"));
         }
     }
 
-    Ok(migrate_ledger(
+    if reader.at != reader.bytes.len() {
+        return Err(Error::Other("ledger envelope: trailing bytes".into()));
+    }
+
+    let ledger = migrate_ledger(
         version,
-        DebtLedger::from_parts(entries, barriers, proved, compacted),
-    ))
+        DebtLedger::from_parts(entries, barriers, proved, compacted, lineages),
+    );
+    ledger
+        .validate_lineages()
+        .map_err(|reason| Error::Other(format!("ledger envelope: {reason}")))?;
+    Ok(ledger)
 }
 
 /// Bring a ledger decoded from an accepted historical layout up to the current
 /// one.
 ///
-/// Still a no-op for the 1 -> 2 step, and that is a conclusion rather than an
-/// omission: version 2 only ADDS the audit table, and a version-1 ledger has a
-/// truthfully empty one. There is no field to reinterpret and no state to
-/// synthesize, so a fixup here would be inventing a discharged history the row
-/// never claimed.
-///
-/// It exists as the named boundary anyway, for the same reason
-/// `migrate_change_cursor` does: the codec is the only place in the workspace
-/// that may hold ledger state in an older shape, so a fixup written anywhere
-/// else spreads knowledge of a dead layout into consumers that have no code to
-/// interpret it.
+/// A no-op while the readable window is a single version. It exists as the
+/// named boundary anyway, for the same reason `migrate_change_cursor` does:
+/// the codec is the only place in the workspace that may hold ledger state in
+/// an older shape, so a fixup written anywhere else spreads knowledge of a dead
+/// layout into consumers that have no code to interpret it.
 fn migrate_ledger(from_version: u32, ledger: DebtLedger) -> DebtLedger {
     let _ = from_version;
     ledger
+}
+
+fn duplicate(what: &str) -> Error {
+    Error::Other(format!("ledger envelope: duplicate {what} key"))
 }
 
 // ---------- entries and barriers ----------
@@ -1490,36 +1523,105 @@ mod tests {
         assert!(decode_ledger(&bytes).is_err());
     }
 
-    /// A version-1 row has no audit section at all. It must still load, and
-    /// load as "never compacted" rather than as a decode failure - an older
-    /// writer's ledger is the single most likely thing this decoder will ever
-    /// be handed after a version bump.
+    /// Version 2 carried the retry budget on the discharged root entry and has
+    /// no lineage table. The owner ruled no consumer had persisted one, so it
+    /// is outside the window rather than migrated from counters that disagreed
+    /// with each other.
     #[test]
-    fn a_version_one_row_without_an_audit_section_still_loads() {
+    fn a_version_two_row_is_schema_incompatible() {
         let mut bytes = encode_ledger(&DebtLedger::new());
-        // The version-1 layout is exactly this one minus the trailing audit
-        // count, which is the last four bytes of an otherwise empty ledger.
-        let audit_count = bytes.split_off(bytes.len() - 4);
-        assert_eq!(audit_count, 0u32.to_le_bytes(), "empty ledger, empty table");
-        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
-
-        let restored = decode_ledger(&bytes).expect("a version-1 ledger still decodes");
-        assert!(restored.is_empty());
-        assert_eq!(
-            restored.discharge_audit(&CursorScope::Account),
-            None,
-            "version 1 never compacted, so it has no folded history to claim"
-        );
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            decode_ledger(&bytes),
+            Err(Error::SchemaIncompatible)
+        ));
     }
 
-    /// The same bytes at the CURRENT version are truncated, and must be
-    /// refused. This is what proves the audit section is genuinely read rather
-    /// than optional at every version - without it, the test above would pass
-    /// against a decoder that ignored the section entirely.
+    /// Both trailing sections are genuinely read: dropping the lineage count
+    /// truncates the row, and bytes past it are refused rather than ignored.
     #[test]
-    fn a_current_version_row_missing_its_audit_section_is_refused() {
-        let mut bytes = encode_ledger(&DebtLedger::new());
-        bytes.truncate(bytes.len() - 4);
+    fn the_payload_must_be_consumed_exactly() {
+        let mut short = encode_ledger(&DebtLedger::new());
+        short.truncate(short.len() - 4);
+        assert!(matches!(decode_ledger(&short), Err(Error::Other(_))));
+
+        let mut long = encode_ledger(&DebtLedger::new());
+        long.push(0);
+        assert!(matches!(decode_ledger(&long), Err(Error::Other(_))));
+    }
+
+    fn replayable(key: &str) -> bifrost_types::InventoryObligation {
+        bifrost_types::InventoryObligation::Region {
+            key: bifrost_types::ObligationKey(key.as_bytes().to_vec()),
+            failure_label: "truncated".into(),
+            error: bifrost_types::AccountErrorBuilder::new(
+                bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed,
+                ),
+                bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+                    detail: bifrost_types::DiagnosticText::support_only("unrepresentable"),
+                }),
+            )
+            .try_build()
+            .expect("valid account error classification"),
+            recovery: bifrost_types::RegionRecovery::DurableReplay {
+                token: b"tok".to_vec(),
+            },
+        }
+    }
+
+    /// A split lineage with a spent budget crosses the durable boundary with
+    /// its budget intact - the table, the flat parent links and the blocked
+    /// members all come back, and the restored ledger still refuses to plan
+    /// them.
+    #[test]
+    fn a_split_lineage_round_trips_with_its_budget() {
+        let mut ledger = DebtLedger::new();
+        ledger.ingest(
+            &bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(CursorScope::Account),
+                vec![replayable("root")],
+            ),
+            1,
+            100,
+        );
+        let root = bifrost_types::ObligationKey(b"root".to_vec());
+        let a = bifrost_types::ObligationKey(b"a".to_vec());
+        ledger
+            .replace_obligation(&root, &[], &[replayable("a"), replayable("b")], 1, 200)
+            .expect("replacement accepted");
+        assert!(!ledger.record_attempt(&a, 2));
+
+        let restored = decode_ledger(&encode_ledger(&ledger)).expect("decodes");
+        assert_eq!(restored.lineages(), ledger.lineages());
+        assert_eq!(restored.lineage_root(&a), root);
+
+        let mut restored = restored;
+        assert!(
+            restored.record_attempt(&a, 2),
+            "the charge made before the round trip still counts"
+        );
+        assert_eq!(restored.repairable().count(), 0);
+    }
+
+    /// Decode validates rather than heals: an open member whose budget row
+    /// was dropped from the bytes is refused, not given a fresh budget.
+    #[test]
+    fn a_row_missing_its_lineage_budget_is_refused() {
+        let mut ledger = DebtLedger::new();
+        ledger.ingest(
+            &bifrost_types::InventoryCoverageReport::degraded(
+                bifrost_types::CoverageDomain::full(CursorScope::Account),
+                vec![replayable("root")],
+            ),
+            1,
+            100,
+        );
+        let mut bytes = encode_ledger(&ledger);
+        // The lineage section is the tail: one row of a 4-byte key length, the
+        // 4-byte key, 4 bytes of attempts and the flag byte, after its count.
+        bytes.truncate(bytes.len() - (4 + 4 + 4 + 4 + 1));
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         assert!(matches!(decode_ledger(&bytes), Err(Error::Other(_))));
     }
 
@@ -1541,6 +1643,7 @@ mod tests {
             BTreeMap::new(),
             Vec::new(),
             vec![(CursorScope::Account, audit)],
+            BTreeMap::new(),
         );
 
         let restored = decode_ledger(&encode_ledger(&ledger)).expect("decodes");

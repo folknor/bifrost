@@ -2511,13 +2511,57 @@ token named), `CoveredBy` (checked with `CoverageDomain::covers`), or
 `Partitioned` (the account asserts the split where the extent is opaque and the
 lattice cannot do set algebra over it).
 
-Retry budgets accrue at the LINEAGE ROOT, counting completed outcomes only. A
-crash after provider work but before acknowledgement must cost a repeated
-attempt, not a consumed budget. Per-key budgets would be evaded by re-minting an
-equivalent obligation each pass, so `replace_obligation` is an atomic
-parent-to-children swap - appending would double-count the extent and replay the
-parent forever - and children inherit the root. A child already open under a
-different root is refused outright rather than silently given two lineages.
+Retry budgets accrue per LINEAGE, counting completed outcomes only. A crash
+after provider work but before acknowledgement must cost a repeated attempt, not
+a consumed budget. Per-key budgets would be evaded by re-minting an equivalent
+obligation each pass, so `replace_obligation` is an atomic parent-to-children
+swap - appending would double-count the extent and replay the parent forever -
+and children inherit the lineage. A child already open under a different
+lineage, or whose key is another live lineage's id, is refused outright
+(`ChildCollidesWithForeignLineage`) rather than silently given two lineages; a
+child reusing its parent's or its lineage's own key is refused
+(`ChildReusesLineageKey`); and a split arriving for a parent that is no longer
+`Retrying` - an operator blocked or waived it, or its budget ran out, while the
+result was in flight - is refused (`PolicyNoLongerRetrying`) and charges
+nothing, because accepting it would discharge the only entry carrying that
+decision and hand the debt to fresh `Retrying` children.
+
+**Where the budget lives.** A lineage's identity is its root key: an entry with
+`parent: None` is its own lineage, and a child's `parent` names the root
+directly - lineages are flat by construction, and the codec refuses a row that
+is not. The count lives in the ledger's own `lineages` table (a
+`LineageBudget { attempts, exhausted }` per lineage id), NOT on any entry. It
+used to live on the root entry's `Retrying { attempts }`, and because a
+replacement always discharges its parent that put the one cap on a key-rotating
+loop onto a discharged entry: compaction had to pin discharged roots, and
+expiry wrote `OperatorBlocked` onto the discharged root while every open child
+kept its own `Retrying` policy, so `repairable` went on planning the children and
+the cap never bound after the first split.
+
+One private `settle_lineages` pass runs at the end of every public mutator. It
+keeps a row exactly while the ledger RETAINS a member of its lineage, open or
+discharged, whatever that member's policy. A discharged member counts because
+`upsert` reopens a rediscovered entry with its history intact, so dropping the
+row at discharge would let a provider alternating a covering walk with a
+rediscovery reset the budget every cycle; the row goes when compaction folds
+the last member, which keeps the table bounded by the entry map. It rewrites
+every open `Retrying` member from its row: blocked when
+the row is exhausted, otherwise mirroring the row's count. `Retrying { attempts }`
+on an entry is therefore a view, never read back to decide anything; waived and
+`OperatorBlocked` members are never written, and discharged entries are never
+touched. Exhaustion is sticky - a later charge with a larger budget does not
+reopen a lineage - so a member that joins a spent lineage later (a closed
+sibling rediscovered, say) comes back blocked.
+
+Charging: `record_attempt(key)` charges `key`'s lineage only while `key` has an
+OPEN entry. A result for an obligation discharged while its attempt was in
+flight charges nothing, folded or not; that cannot let a loop escape the cap,
+because a key with no open entry is never planned again. A result for a key
+re-raised as a fresh occurrence meanwhile charges the new occurrence - an
+over-charge bounded by the results in flight, which is the conservative
+direction. A `Stalled` replacement is charged through `charge_lineage` with a
+lineage `ack.rs` resolved via `open_lineage` BEFORE the swap, since the swap
+discharges the key it came from.
 Progress is judged across extent, granularity, proof gained and repair
 authority, not extent equality: turning one opaque region into three addressable
 objects is progress at identical extent, while repartitioning into equally
@@ -2592,52 +2636,23 @@ itself is inert by construction: `discharge_repaired` and `replace_obligation`
 already bail on `!is_open()`, and the foreign-lineage check only fires on an
 open entry, so a removed terminal entry and a present one give the same answer.
 
-**The one exception is the lineage, and it is why this needed care.**
-`replace_obligation` discharges the parent while leaving its policy `Retrying`,
-and children charge attempts against that discharged root. Folding a root out
-from under a live child would make `record_attempt` find nothing and silently
-un-cap the retry budget. So a discharged entry on a surviving entry's parent
-chain is retained: terminal as proof, still load-bearing as structure. It folds
-once its lineage closes too.
-
-The pin set is the ancestor CLOSURE, and the guarantee is stated deliberately:
-**every entry the ledger retains has its whole parent chain retained too.** Each
-survivor's ancestors are pinned, each newly pinned ancestor is walked in turn,
-and a visited set terminates it (and any cycle). The weaker alternative - one
-bounded walk from each unresolved entry - preserves that entry's own
-`lineage_root` lookup and leaves a retained endpoint pointing at a removed
-ancestor. Two details carry the whole thing: `lineage_root` follows at most
-`LINEAGE_DEPTH_CAP` (64) EDGES and returns the key reached after the last one
-even when it has a further parent, so the pin walk retains distances 1 through
-the cap INCLUSIVE; and both go through the single `lineage_ancestors` primitive
-so the resolver and the pin walk cannot disagree about where a chain ends.
-`DischargeEvidence::ReplacedByChildren` also names entries and those are
-deliberately not pinned - no reader dereferences that list for a decision, so it
-is evidence, not a link. If one ever does, they become operational dependencies
-and belong in the pin set.
-
-**Pending repair results are the dependency that lives outside the ledger.** A
-pass plans against a snapshot and only speaks to the writer again with results
-in hand, so between dispatch and result a covering proof can discharge the
-obligation and compaction can fold it - and nothing in the ledger names it, so
-no amount of pinning from its siblings preserves it. The deferred result then
-resolves its own root to itself, finds no entry, and charges nothing: the
-attempt vanishes against the budget. The ledger therefore keeps a small
-`folded_lineage` table of folded entries' parent links, consulted by
-`lineage_root` only when no entry exists, so a budget identity stays resolvable
-across compaction. It is bounded (a link is dropped once its chain no longer
-reaches a retained entry) and IN-MEMORY only - the attempt it protects is in
-flight in this process, and a restart loses the executor that would deliver the
-result, so nothing in `ledger_envelope` carries it. Chosen over retaining the
-entry path of every pending attempt, which would need a dispatch-time pin
-protocol between `run_repair_pass` and the writer plus a release on every
-abnormal exit, and a missed release leaks exactly what compaction reclaims. A
-folded entry with no parent gets no link: its budget identity is itself, it is
-discharged, and `repairable` already refuses it.
+That includes the lineage, which used to be the exception. While the retry
+budget lived on the discharged root entry, compaction had to retain every
+discharged ancestor a live child charged against, and keep process-local parent
+links for folded keys so a late repair result could still find its root. The
+budget now lives in the ledger's `lineages` table and a child's `parent` is an
+identity rather than a link anything dereferences, so every discharged entry
+folds and nothing is pinned. `DischargeEvidence::ReplacedByChildren` also names
+entries, and no reader dereferences that list for a decision either - it is
+evidence, not a link.
 
 Accepted cost: a compacted key rediscovered later is raised as a NEW entry, with
-`first_seen_unix_seconds` at now and the budget at zero, where an uncompacted
-discharged entry would have kept both. The entry was proved covered before it
+`first_seen_unix_seconds` at now and - unless its key is still a live lineage
+id - the budget at zero, where an uncompacted discharged entry would have kept
+both. The exception is a compacted lineage ROOT re-raised while members of its
+lineage are still retained: its lineage id is its own key, it finds that row,
+and it rejoins the lineage's budget. That is the conservative direction, and it
+is what happened before the root could fold at all. The entry was proved covered before it
 was folded, so a re-raise after proof is a fresh gap rather than a continuing
 one. `DebtLedger::is_empty` counts the audit table for the same reason: a caller
 that skips writing an "empty" ledger must not erase the only surviving record
@@ -2744,30 +2759,33 @@ primitives, same `Error::SchemaIncompatible` for a version outside
 rule that a panic belongs to encode and never to decode. `decode_ledger` is
 likewise the single migration boundary: a version inside the window is migrated
 through `migrate_ledger`, not merely accepted, so what comes out is
-current-shaped ledger state. `LEDGER_ENVELOPE_VERSION` is `2` and
-`MIN_MIGRATABLE_LEDGER` is `1`.
+current-shaped ledger state.
 
-Version 2 added the compacted discharge audit table, and appended it to the
-PAYLOAD rather than widening the header: a fourth header count would move
-`HEADER_LEN` and force this decoder to know two header shapes. A version-1 row
-simply has no trailing section, so one reader handles both by asking the
-version. Such a row still loads, and loads as "never compacted" - version 1
-never compacted, so its entry map already holds every discharged entry verbatim
-and an empty audit table describes it exactly. `migrate_ledger` is therefore
-still a no-op for 1 -> 2, which is a conclusion rather than an omission: there
-is no field to reinterpret, and a fixup would be inventing a discharged history
-the row never claimed. The reverse direction is not readable and is not meant to
-be - a version-2 row handed to an older engine decodes to
-`Error::SchemaIncompatible`, the classification that authorizes clearing the row
-and re-establishing rather than reading as a store failure.
+The discharge audit table and the lineage budget table are appended to the
+PAYLOAD rather than widening the header, so the header keeps one shape. The
+lineage table's version moved the retry budget off the discharged root entry;
+the repository owner ruled that no consumer had persisted a ledger when it
+landed, so it raised
+`MIN_MIGRATABLE_LEDGER` to itself instead of synthesizing budgets from the old
+per-entry counters, which for a split lineage disagreed with each other. An
+older row therefore decodes to `Error::SchemaIncompatible`, the classification
+that authorizes clearing the row and re-establishing rather than reading as a
+store failure.
+
+Decode VALIDATES, never heals: a duplicated entry, barrier or lineage key,
+trailing bytes, a lineage that is not flat (a parent naming itself or an entry
+that has a parent, which covers every chain and cycle), an entry whose lineage
+has no budget row, a row with no retained member, or an open `Retrying` entry
+disagreeing with its row is `Error::Other`. Repairing any of these would mean choosing which half
+of a contradiction to believe, and a guessed budget is the silent reset budgets
+exist to stop. A parent naming an ABSENT key is legal - its root was compacted.
 
 The encoded form covers everything a restart must not forget: the entry map, the
-barrier map, the retained proof set, and the per-scope discharge audit (scope,
-`count`, a fixed 32-byte `root`, `latest_generation`) - dropping the last would
+barrier map, the retained proof set, the per-scope discharge audit (scope,
+`count`, a fixed 32-byte `root`, `latest_generation`) - dropping which would
 silently reset an account's discharged count to zero and make its root
-uncheckable forever after. The folded parent links compaction keeps are
-deliberately NOT encoded: they exist for a repair attempt in flight in this
-process, which no restart survives. Proof retention is easy to mistake for
+uncheckable forever after - and the lineage budgets, without which a restart
+would reset every retry budget. Proof retention is easy to mistake for
 a cache - it is not. Coverage discharges by UNION, so a proof dropped on restart
 turns debt that two later windows jointly cover into debt neither covers alone.
 A `BarrierIncident::resume_from` nests a whole cursor envelope through
@@ -2786,8 +2804,8 @@ cause payloads, `idempotency_override` and `throttle_scope` do not survive.
 
 That is affordable because no ledger predicate reads these fields.
 `blocks_completion`, `completion_permitted`, `repairable`, `lineage_root`,
-`record_attempt` and every discharge path read proof, policy, domain, generation
-and target; `LedgerEntry::target` exists precisely so a repair descriptor is
+`record_attempt` and every discharge path read proof, policy, domain, generation,
+target, parent and the lineage budgets; `LedgerEntry::target` exists precisely so a repair descriptor is
 never taken from an error whose classifications change between revisions. The
 error is operator evidence, and a digest preserves operator evidence. Anything
 that starts DECIDING on a restored error has to promote the field first.

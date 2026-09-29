@@ -78,8 +78,8 @@ use crate::multiplexer::{ChangeDelivery, MultiplexerEvent, WriterRequest};
 /// How many completed attempts a lineage gets before it stops being retried
 /// automatically.
 ///
-/// Expiry yields `OperatorBlocked`, never abandonment. Attempts accrue at the
-/// lineage root so re-minting an equivalent obligation cannot reset it.
+/// Expiry yields `OperatorBlocked`, never abandonment. Attempts accrue per
+/// lineage so re-minting an equivalent obligation cannot reset it.
 pub const DEFAULT_REPAIR_BUDGET: u32 = 5;
 
 /// One resolved repair, ready for the writer.

@@ -29,40 +29,53 @@ has not made, and ruled work that has not landed. Nothing else.
 
 ## Ruled 2026-09-29, not yet built
 
-The owner ruled on twelve items in one serial pass on 2026-09-29, and every one
-was built the same day except the entry below. Several had been ruled in
-earlier sessions without the ruling reaching this file, so they were presented
-again as open; recording the ruling at the item is what stops that.
+Twelve items were ruled in one serial pass on 2026-09-29 and all but one were
+built the same day; a second pass the same day ruled the follow-ups below.
+Several items had been ruled in earlier sessions without the ruling reaching
+this file, so they were presented again as open; recording the ruling at the
+item is what stops that.
 
-- **sync ledger: `record_attempt` charges only open entries.** RULED: make it a
-  no-op on an entry that is not `is_open()`, then establish whether the
-  lineage-root pin is still needed. NOT BUILT: the ruling rests on a premise
-  the implementing agent showed to be false, verified against the code.
-  `replace_obligation` ALWAYS discharges the parent, so every lineage with
-  children has a discharged root, and that discharged root's
-  `Retrying { attempts }` IS the lineage's retry budget - it has no other home
-  (`record_attempt` charges `lineage_root(key)`;
-  `attempts_accrue_at_the_lineage_root` pins exactly that). Charging a
-  discharged entry is the design, not an accident the pin compensates for.
-  Gating on `is_open()` would stop every lineage budget accruing after its
-  first replacement, removing the only cap on an account that loops forever
-  by rotating keys over the same extent; the narrower reading (gate only the
-  key's own entry) opens the same hole through the `Stalled` and
-  `StaleGeneration` callers in `engine/ack.rs`. The pin stays necessary for
-  as long as the counter lives on a discharged entry. WANTS A FRESH RULING:
-  either withdraw this, or move the lineage counter off discharged entries
-  (onto an open entry or a per-lineage map, with a decision for the durable
-  envelope and `from_parts`), which is a redesign rather than a gate.
+- **imap: whether APPEND should also be a `Command`.** DEFERRED 2026-09-29:
+  the owner judged the implications underpresented. The driver-built APPEND
+  lives on the driver's `DriverCommandPayload::Append` (executed by
+  `prepare_append` then `run_append_command`) rather than on `Command`, which
+  the original ruling named. Behaviourally that ruling holds. Two facts to
+  carry into any re-raise: `Command` is NOT published - `types` is a private
+  module, and so is `AppendMessage`, contrary to how this item was first
+  framed - so this is an internal-design question, not a published-surface
+  one; and a re-raise must bring the full analysis first: how every
+  `Command`-accepting path, the pipeline in particular (literal
+  continuations interleaving with other commands), would treat APPEND, and
+  what submits raw `Command`s at all.
 
-- **imap: the driver-built APPEND lives on `DriverCommandPayload`, not on
-  `Command`.** The ruling said "give `Command` an `Append` variant". The build
-  put it on the driver's own payload enum instead
-  (`DriverCommandPayload::Append { mailbox, messages, multi }`, executed by
-  `run_append_command`), because `types/command.rs` was outside the building
-  agent's files. Behaviourally the ruling holds - the driver encodes from live
-  state and validates at execution, and the prebuilt path and
-  `WireAssumptions` are gone - but `Command` is published surface, so whether
-  APPEND should ALSO be expressible as a public `Command` is the owner's call.
+- **errors: local refusals are never a provider fault.** RULED 2026-09-29
+  (second pass), all three parts, in this order.
+  The finding: IMAP's crate-internal `Error::Protocol` maps at the account
+  boundary to `Protocol(ContractViolation)` with a `MalformedResponse` cause,
+  which `derive` turns into `ProviderContractViolation` - terminal, with the
+  remediation "contact provider support". But `Error::Protocol` has become a
+  grab-bag: about 170 construction sites, a large share of them LOCAL
+  refusals made before any byte is sent (over 50 in the encoder alone, plus
+  the APPEND refusals: a NUL body without BINARY, a session that left
+  Authenticated/Selected while the command was queued). Pre-existing, not
+  introduced by the 2026-09-29 APPEND work. The earlier worry that these
+  refusals lose `Unsent` evidence is moot: pre-driver sites always left the
+  attempt `None` by design, and `derive` reads a missing `Attempt` cause as
+  `Unsent`.
+  (a) Add the rule to `reference/error-model.md`, the cross-crate contract,
+  which has none today: a local refusal made before any byte is sent is
+  never a provider fault - `Request(Malformed)` (so `ClientBug`) when the
+  caller's input cannot be expressed, `Unsupported(operation)` when the
+  server lacks a capability the request needs, transient when local state
+  moved under a queued command.
+  (b) Split IMAP's grab-bag: `Error::Protocol` keeps genuine server
+  violations; each local-refusal site moves to `InvalidInput`,
+  `MissingCapability`, or a new internal variant for state that moved while
+  queued. `Error` is crate-private (`pub(crate)`, private `error` module),
+  so no published surface is involved. The per-site classification is the
+  judgment call and gets reported for review.
+  (c) Audit the other protocol crates against the rule; fix what the ruling
+  covers, file the rest.
 
 ## Blocked on an unvalidated consumer contract
 
@@ -97,22 +110,6 @@ and the smtp sans-I/O core, never received the cold review their rulings
 asked for. That review debt is still owed, and nothing else in this file
 tracks it.
 
-- **imap: the driver's APPEND refusals lose their `Unsent` evidence.** Found
-  2026-09-29. `prepare_append` (driver) refuses an APPEND before the first
-  byte - a session that left Authenticated/Selected while it was queued, a
-  NUL body without BINARY, a malformed flag - with `Error::Protocol`,
-  `MissingCapability` or `InvalidInput`, none of which has an attempt field
-  (`with_attempt` is a documented no-op on them). So a non-idempotent APPEND
-  that provably wrote nothing reports `attempt() == None` and takes the
-  conservative reconcile path rather than a clean retry. `Protocol` is also
-  the wrong kind for a local refusal: its doc says "protocol violation by the
-  server". The CONNECTION half is fixed: the driver loop no longer applies
-  `is_connection_fatal` to a refusal made before the first byte, pinned by
-  `a_refused_append_leaves_the_connection_usable`. What remains wants a
-  variant that carries an attempt, either a reshaped `Protocol` or a new
-  local-refusal variant; `Error` is PUBLISHED SURFACE, hence the owner's call.
-  NOT yet ruled.
-
 - **imap: small findings from the 2026-09-29 builds, none a live defect.**
   `EncodeOptions`'s doc still says it is constructed by
   `ImapConnection::encode_options()`, which no longer exists.
@@ -139,7 +136,12 @@ tracks it.
   is applied today only to `bifrost-jmap`'s zero-feature leg. A default-feature
   `package`-unified sweep over every published crate would close the class;
   its cost is one isolated target dir and one cargo invocation per package.
-  Wants a ruling on whether that cost is worth it.
+  BUNDLED 2026-09-29: the owner put this with the rest of the brokkr work
+  rather than ruling on it alone. The plan presented: add an `install-shape`
+  sweep (`packages` = every published crate, `feature_unification =
+  "package"`), time one cold and one warm `brokkr check`, and decide on the
+  numbers - keep it on every check if the warm cost is small, otherwise move
+  it to an on-demand brokkr profile.
 
 - **sync: a worker aborted on an already-spent deadline is never named.**
   Found 2026-09-29 while splitting `WorkerRole`. In `await_worker_until`

@@ -2357,6 +2357,61 @@ async fn repeated_deferrals_block_rather_than_abandon() {
     writer.await.expect("writer exits");
 }
 
+/// A provider that answers every pass by re-splitting the obligation into a
+/// fresh key over the same extent is capped by the LINEAGE budget, and the cap
+/// binds on the open child, not only on the discharged root.
+///
+/// Two ways this used to or could fail: expiry once blocked only the
+/// discharged root while the open child stayed `Retrying` and repairable; and
+/// charging the stall through `record_attempt(key)` after the swap would find
+/// the parent discharged and charge nothing. The writer resolves the lineage
+/// before the swap for exactly that reason.
+#[tokio::test]
+async fn repeated_stalled_splits_exhaust_the_lineage() {
+    let (account, store, coverage, tx, writer) = writer_harness();
+    seed_debt(&tx, &coverage, "stuck").await;
+
+    let mut current = bifrost_types::ObligationKey(b"stuck".to_vec());
+    for slice in 0..crate::repair::DEFAULT_REPAIR_BUDGET {
+        let child = format!("slice-{slice}");
+        apply_repair(
+            &tx,
+            vec![crate::repair::RepairResolution::Replaced {
+                key: current.clone(),
+                proof: Box::new(bifrost_types::RegionRepairProof::Partitioned {
+                    proved: Vec::new(),
+                    residual: vec![bifrost_types::InventoryObligation::Region {
+                        key: bifrost_types::ObligationKey(child.clone().into_bytes()),
+                        failure_label: "truncated".into(),
+                        error: unrepresentable("unused").error().clone(),
+                        recovery: bifrost_types::RegionRecovery::DurableReplay {
+                            token: child.clone().into_bytes(),
+                        },
+                    }],
+                    authority: "test".into(),
+                }),
+                generation: 1,
+            }],
+            None,
+        )
+        .await;
+        current = bifrost_types::ObligationKey(child.into_bytes());
+    }
+
+    let ledger = store.get_ledger(&account).await.expect("ledger");
+    let entry = ledger.entry(&current).expect("latest slice");
+    assert!(entry.is_open(), "a spent budget proves nothing");
+    assert_eq!(entry.policy, crate::cursor::PolicyStatus::OperatorBlocked);
+    assert_eq!(
+        ledger.repairable().count(),
+        0,
+        "no slice of a spent lineage may be planned again"
+    );
+
+    drop(tx);
+    writer.await.expect("writer exits");
+}
+
 /// An aborted reattach deletes only rows NO acknowledgement has claimed.
 ///
 /// Reattach used to write and delete cursors directly against the

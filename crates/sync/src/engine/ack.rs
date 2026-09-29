@@ -895,15 +895,12 @@ async fn apply_repair_resolutions(
                 apply_replacement(ledger, &key, &proof, generation, now);
             }
             crate::repair::RepairResolution::Deferred { key } => {
-                // Charged even when `key` no longer HAS an entry, which is
-                // ordinary rather than exotic: a repair pass plans against a
-                // ledger snapshot, and a covering proof acknowledged while the
-                // pass is out can discharge the obligation and let compaction
-                // fold it before this result gets back. The ledger keeps the
-                // folded entry's parent link precisely so the charge still
-                // lands on the lineage root its surviving siblings share -
-                // otherwise the attempt evaporates and the retry budget stops
-                // being a cap. See `DebtLedger::record_attempt`.
+                // Charges `key`'s lineage only while `key` is still open. A
+                // pass plans against a ledger snapshot, so a covering proof
+                // acknowledged while it is out can discharge the obligation
+                // first; that result then charges nothing, which cannot uncap
+                // anything because a closed key is never planned again. See
+                // `DebtLedger::record_attempt`.
                 ledger.record_attempt(&key, crate::repair::DEFAULT_REPAIR_BUDGET);
             }
         }
@@ -952,20 +949,39 @@ fn apply_replacement(
         bifrost_types::RegionRepairProof::Partitioned {
             proved, residual, ..
         } => {
+            // Resolved BEFORE the swap: an accepted replacement discharges
+            // `key`, and a discharged key is never charged, so resolving after
+            // would silently drop the one charge that caps a key-rotating loop.
+            let lineage = ledger.open_lineage(key);
             match ledger.replace_obligation(key, proved, residual, generation, now) {
                 Ok(crate::cursor::ReplacementProgress::Stalled) => {
                     // Reshaped without improving anything. Charged against the
                     // lineage so an account cannot loop forever by rotating
                     // keys and tokens over the same unresolved extent.
-                    ledger.record_attempt(key, crate::repair::DEFAULT_REPAIR_BUDGET);
+                    if let Some(lineage) = lineage {
+                        ledger.charge_lineage(&lineage, crate::repair::DEFAULT_REPAIR_BUDGET);
+                    }
                 }
                 Ok(crate::cursor::ReplacementProgress::Progressed) => {}
+                // An operator decision (or a spent budget) landed while this
+                // result was in flight. The refusal preserved it, and charging
+                // would bill the lineage for work nobody asked to continue.
+                Err(crate::cursor::ReplacementRefusal::PolicyNoLongerRetrying) => {
+                    tracing::debug!(
+                        target: "bifrost.sync.repair",
+                        "region replacement refused: the obligation is no longer retrying"
+                    );
+                }
                 Err(refusal) => {
                     tracing::warn!(
                         target: "bifrost.sync.repair",
                         refusal = ?refusal,
                         "refusing a region replacement"
                     );
+                    // A refusal changes nothing, so `key` is exactly as open as
+                    // it was: a malformed or colliding split against an open
+                    // obligation charges its lineage (repeating it is a loop),
+                    // and one against a closed or unknown key charges nothing.
                     ledger.record_attempt(key, crate::repair::DEFAULT_REPAIR_BUDGET);
                 }
             }
