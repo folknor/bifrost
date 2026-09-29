@@ -323,8 +323,22 @@ pub(crate) enum Error {
     IdNotFound(String),
     /// Not parsable as the expected format.
     NotParsable(String),
-    /// URL template parsing failure.
+    /// A URL this crate's own caller supplied is unusable (a custom-transport
+    /// client built without a session URL). The caller's fault. A URL the
+    /// SERVER supplied is [`Error::MalformedSessionUrl`] instead.
     InvalidUrl(String),
+    /// A URL or URL template the server published in its session object
+    /// (`uploadUrl`, `downloadUrl`, `eventSourceUrl`, the WebSocket
+    /// capability's `url`) is not usable: an unbalanced or unknown template
+    /// variable, an unparseable URI, a non-websocket scheme. The provider
+    /// described itself wrongly, so this is its malformed response, never a
+    /// fault in the caller's request.
+    MalformedSessionUrl {
+        /// The session property that carried the URL.
+        property: &'static str,
+        /// What was wrong with it, including the offending value.
+        detail: String,
+    },
     /// The session advertises the named capability but its object does
     /// not parse into the shape the RFC defines for it. Distinct from
     /// "not advertised": the server claimed the capability and then
@@ -472,6 +486,12 @@ impl Display for Error {
             Error::IdNotFound(id) => write!(f, "Id {id} not found"),
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
+            Error::MalformedSessionUrl { property, detail } => {
+                write!(
+                    f,
+                    "Session property {property} is not a usable URL: {detail}"
+                )
+            }
             Error::MalformedCapability { capability } => write!(
                 f,
                 "Session advertises capability {capability} with an unparseable object"

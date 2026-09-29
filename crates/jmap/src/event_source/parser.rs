@@ -22,9 +22,10 @@
 /// Both admit `MAX` and refuse `MAX + 1`. Aligning the operators literally
 /// would move the bound on one path by one byte, so do not "fix" either.
 ///
-/// Made visible to the sibling `stream.rs` so its oversized-block fixtures are
-/// derived from the bound rather than restating its current value.
-pub(super) const MAX_EVENT_SIZE: usize = 1024 * 1024;
+/// Crate-visible so oversized-block fixtures elsewhere (`stream.rs`, the
+/// sync error boundary's classification test) are derived from the bound
+/// rather than restating its current value.
+pub(crate) const MAX_EVENT_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -198,8 +199,12 @@ impl EventParser {
         self.discard_at_line_start = at_line_start;
     }
 
+    /// [`MAX_EVENT_SIZE`] is this crate's bound, not the protocol's, so
+    /// tripping it is marked as a local limit: unmarked, the no-evidence
+    /// fallback classified it `Transport(Network)`, and a reconnect replaying
+    /// the same oversized block from `lastEventId` would trip it again.
     fn too_long_error() -> crate::Error {
-        crate::Error::Transport(crate::core::transport::TransportError::new(
+        crate::Error::Transport(crate::core::transport::TransportError::limit_exceeded(
             "EventSource response is too long.",
         ))
     }
@@ -783,6 +788,42 @@ mod tests {
             .expect("a recovered event")
             .expect("no parse error");
         assert_eq!(String::from_utf8(recovered.data).unwrap(), "recovered");
+    }
+
+    // Every cap site reports a LOCAL limit, not a bare transport error: the
+    // cap is this crate's, so an unmarked error fell through to the
+    // no-evidence `Transport(Network)` fallback and read as a retryable
+    // network fault. One input per guard: the comment counter, the mid-line
+    // field and field-plus-value guards, and the whole-line data commit.
+    #[test]
+    fn every_cap_site_reports_a_local_limit_not_a_network_fault() {
+        let max = super::MAX_EVENT_SIZE;
+        let mut comment = Vec::from(":");
+        comment.extend_from_slice(&vec![b'z'; max + 1]);
+        let field = vec![b'x'; max + 1];
+        let mut value = Vec::from("data:");
+        value.extend_from_slice(&vec![b'v'; max]);
+        let data = two_data_lines_totalling(max + 1);
+
+        for (site, input) in [
+            ("comment", comment),
+            ("field", field),
+            ("field+value", value),
+            ("data commit", data),
+        ] {
+            let mut parser = super::EventParser::default();
+            parser.push_bytes(input);
+            let error = parser.next().expect("an item").expect_err("the cap trips");
+            let transport = match error {
+                crate::Error::Transport(transport) => transport,
+                other => panic!("{site}: expected a transport error, got {other:?}"),
+            };
+            assert_eq!(
+                transport.local,
+                Some(crate::core::transport::LocalFailure::LimitExceeded),
+                "{site}"
+            );
+        }
     }
 
     // `discard` documents that it drops every partial buffer EXCEPT the

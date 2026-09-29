@@ -720,7 +720,15 @@ pub(crate) enum URLPart<T: URLParser> {
 }
 
 impl<T: URLParser> URLPart<T> {
-    pub(crate) fn parse(url: &str) -> crate::Result<Vec<URLPart<T>>> {
+    /// Split a URI template into literals and known parameters.
+    ///
+    /// The error is a bare description, not a `crate::Error`: this parser
+    /// cannot know who wrote the template, and that decides the blame. Every
+    /// production template comes from the server's session object, so the
+    /// caller maps it to [`crate::Error::MalformedSessionUrl`] naming the
+    /// property; filing it as the caller's `InvalidUrl` blamed the client's
+    /// request for the provider's malformed session.
+    pub(crate) fn parse(url: &str) -> Result<Vec<URLPart<T>>, String> {
         let mut parts = Vec::new();
         let mut buf = String::with_capacity(url.len());
         let mut in_parameter = false;
@@ -729,7 +737,7 @@ impl<T: URLParser> URLPart<T> {
             match ch {
                 '{' => {
                     if in_parameter {
-                        return Err(crate::Error::InvalidUrl(url.to_string()));
+                        return Err(format!("nested '{{' in URL template: {url}"));
                     }
                     if !buf.is_empty() {
                         parts.push(URLPart::Value(std::mem::take(&mut buf)));
@@ -739,13 +747,11 @@ impl<T: URLParser> URLPart<T> {
                 '}' => {
                     if in_parameter && !buf.is_empty() {
                         parts.push(URLPart::Parameter(T::parse(&buf).ok_or_else(|| {
-                            crate::Error::InvalidUrl(format!(
-                                "Invalid parameter '{buf}' in URL: {url}"
-                            ))
+                            format!("unknown parameter '{buf}' in URL template: {url}")
                         })?));
                         buf.clear();
                     } else {
-                        return Err(crate::Error::InvalidUrl(url.to_string()));
+                        return Err(format!("unmatched or empty '}}' in URL template: {url}"));
                     }
                     in_parameter = false;
                 }
@@ -756,7 +762,7 @@ impl<T: URLParser> URLPart<T> {
         }
 
         if in_parameter {
-            return Err(crate::Error::InvalidUrl(url.to_string()));
+            return Err(format!("unterminated parameter in URL template: {url}"));
         }
 
         if !buf.is_empty() {

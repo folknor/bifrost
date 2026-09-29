@@ -100,6 +100,16 @@ pub(crate) struct SessionState {
     default_account_id: crate::core::id::AccountId,
 }
 
+/// Parse one of the session's URI templates. Every template a session
+/// carries is the server's, so one that does not parse is the provider's
+/// malformed session, named by the property that carried it.
+fn session_template<P: crate::core::session::URLParser>(
+    property: &'static str,
+    url: &str,
+) -> crate::Result<Vec<URLPart<P>>> {
+    URLPart::parse(url).map_err(|detail| crate::Error::MalformedSessionUrl { property, detail })
+}
+
 impl SessionState {
     fn derive(session: Session) -> crate::Result<Self> {
         let default_account_id = session
@@ -109,9 +119,9 @@ impl SessionState {
 
         Ok(Self {
             api_url: session.api_url().to_string(),
-            upload_url: URLPart::parse(session.upload_url())?,
-            download_url: URLPart::parse(session.download_url())?,
-            event_source_url: URLPart::parse(session.event_source_url())?,
+            upload_url: session_template("uploadUrl", session.upload_url())?,
+            download_url: session_template("downloadUrl", session.download_url())?,
+            event_source_url: session_template("eventSourceUrl", session.event_source_url())?,
             default_account_id,
             session: Arc::new(session),
         })
@@ -489,6 +499,47 @@ mod session_state_tests {
             !body.contains("\"accountId\":\"\""),
             "empty account id must not be serialized: {body}"
         );
+    }
+
+    /// The upload / download / EventSource templates come from the server's
+    /// session object, so one that does not parse is the provider's malformed
+    /// session, reported under the property that carried it. It used to
+    /// surface as the caller's `InvalidUrl`, which the account boundary maps
+    /// to `Request(Malformed)` - "fix your request" for a request nobody made.
+    #[test]
+    fn a_malformed_session_template_names_the_servers_property() {
+        for (property, bad) in [
+            ("uploadUrl", "https://example.test/upload/{accountId"),
+            ("downloadUrl", "https://example.test/dl/{notAVariable}"),
+            ("eventSourceUrl", "https://example.test/es?types={types"),
+        ] {
+            let mut session =
+                serde_json::from_str::<serde_json::Value>(&session_json("bad", "A1", "session-1"))
+                    .expect("fixture is json");
+            // The session property IS the JSON key the template came from.
+            session[property] = json!(bad);
+            let session: Session = serde_json::from_value(session).expect("session parses");
+
+            let error = Client::with_transport(
+                RefreshingTransport {
+                    api_urls: Arc::new(Mutex::new(Vec::new())),
+                },
+                session,
+                "https://example.test/.well-known/jmap",
+            )
+            .err()
+            .expect("a malformed template must not build a client");
+            match error {
+                crate::Error::MalformedSessionUrl {
+                    property: reported,
+                    detail,
+                } => {
+                    assert_eq!(reported, property);
+                    assert!(detail.contains(bad), "{property}: {detail}");
+                }
+                other => panic!("{property}: expected MalformedSessionUrl, got {other:?}"),
+            }
+        }
     }
 
     fn leading_value<P: crate::core::session::URLParser>(parts: &[super::URLPart<P>]) -> &str {

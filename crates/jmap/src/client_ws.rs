@@ -389,10 +389,17 @@ impl Client {
             }
         };
 
+        // The URL is the server's, from its own capability object, so an
+        // unusable one is the provider's malformed session, not the caller's.
+        const URL_PROPERTY: &str = "urn:ietf:params:jmap:websocket url";
         let url = capabilities.url().to_string();
-        let uri: Uri = url
-            .parse()
-            .map_err(|e: http::uri::InvalidUri| crate::Error::InvalidUrl(e.to_string()))?;
+        let uri: Uri =
+            url.parse().map_err(
+                |e: http::uri::InvalidUri| crate::Error::MalformedSessionUrl {
+                    property: URL_PROPERTY,
+                    detail: format!("{e}: {url}"),
+                },
+            )?;
 
         let authorization = self.authorization().await?;
         let auth_value =
@@ -414,9 +421,10 @@ impl Client {
             }
             Some("ws") => None,
             _ => {
-                return Err(crate::Error::InvalidUrl(format!(
-                    "websocket capability URL has non-websocket scheme: {url}"
-                )));
+                return Err(crate::Error::MalformedSessionUrl {
+                    property: URL_PROPERTY,
+                    detail: format!("non-websocket scheme: {url}"),
+                });
             }
         };
 
@@ -1532,6 +1540,64 @@ mod tests {
                     .expect("call is added");
             }
             request
+        }
+    }
+
+    /// A client whose session advertises the WebSocket capability at `url`.
+    /// Built on the real reqwest transport, which opens no connection until
+    /// asked to.
+    fn client_with_websocket_url(url: &str) -> Client {
+        let session: crate::core::session::Session = serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "urn:ietf:params:jmap:websocket": {"url": url, "supportsPush": true}
+            },
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://jmap.invalid/api",
+            "downloadUrl": "https://jmap.invalid/dl/{accountId}/{blobId}/{name}/{type}",
+            "uploadUrl": "https://jmap.invalid/upload/{accountId}",
+            "eventSourceUrl": "https://jmap.invalid/es",
+            "state": "session-1"
+        }))
+        .expect("session fixture parses");
+        let transport = crate::transport_reqwest::ReqwestTransport::new(
+            reqwest::header::HeaderMap::new(),
+            crate::client::Authorization::Basic(String::new()),
+            bifrost_net::AccountId("jmap-ws-url".to_string()),
+            std::time::Duration::from_secs(5),
+            false,
+            Arc::new(std::collections::HashSet::new()),
+        )
+        .expect("transport builds");
+        Client::with_transport(transport, session, "https://jmap.invalid/session")
+            .expect("client builds")
+    }
+
+    /// The WebSocket URL comes from the server's own capability object, so
+    /// an unparseable one or one with a non-websocket scheme is the
+    /// provider's malformed session. Both used to surface as the caller's
+    /// `InvalidUrl` (`Request(Malformed)`, "fix your request"). A scheme with
+    /// no host (`wss:/push`) never reaches the connector: `http::Uri` refuses
+    /// a scheme without an authority, so it is the unparseable case. All are
+    /// refused before any connection is attempted, so this is hermetic.
+    #[tokio::test]
+    async fn an_unusable_websocket_capability_url_is_the_servers_malformed_session() {
+        for (url, shape) in [
+            ("https://jmap.invalid/ws", "non-websocket scheme"),
+            ("wss://bad host/ws", "unparseable URI"),
+            ("wss:/push", "scheme with no host"),
+        ] {
+            let error = client_with_websocket_url(url)
+                .connect_ws()
+                .await
+                .err()
+                .expect("the URL is refused before any connection");
+            let crate::Error::MalformedSessionUrl { property, detail } = error else {
+                panic!("{shape}: expected MalformedSessionUrl, got {error:?}");
+            };
+            assert!(property.contains("websocket"), "{shape}: {property}");
+            assert!(detail.contains(url), "{shape}: {detail}");
         }
     }
 

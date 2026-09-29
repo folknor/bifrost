@@ -198,13 +198,23 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         )
         .try_build()
         .expect("valid account error classification"),
-        // The session lists no primary account for the capability we
-        // need. Per `reference/jmap.md` this is an authentication-level
-        // signal: the credential no longer resolves to a usable primary
-        // account, so it maps to `Authentication(ReauthorizationRequired)
-        // -> AuthLost` (terminal, operator must re-authorize) rather than
-        // a `CapabilityChanged -> RestartAccount` reopen loop that would
-        // spin re-running discovery against the same empty session.
+        // The server's own session object published a URL that cannot be
+        // used. The same lane as `MalformedCapability` below: the provider
+        // described itself wrongly, and a reopen re-reads the same session,
+        // so it is a terminal contract violation naming the property - not
+        // the caller's `Request(Malformed)` it was once filed under.
+        crate::Error::MalformedSessionUrl { property, detail } => build(
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "session property {property} is not a usable URL: {detail}"
+                ))),
+            }),
+            &ctx,
+        )
+        .try_build()
+        .expect("valid account error classification"),
         // The server advertised the capability and then sent an object
         // that is not one. Nothing about this session changes on a reopen,
         // so it takes the contract-violation lane rather than the
@@ -222,9 +232,19 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         )
         .try_build()
         .expect("valid account error classification"),
+        // The session names no primary account for the capability the
+        // request needs, so nothing was sent: a local refusal because the
+        // server offers no account for that capability, which is
+        // `Unsupported(operation)` - terminal, like the `AuthLost` this
+        // used to borrow, but without telling the operator to
+        // re-authorize, which cannot add an account to the session. Not
+        // `CapabilityChanged -> RestartAccount` either: that reopen loop
+        // would re-run discovery against the same session forever.
         crate::Error::NoPrimaryAccount { capability } => build(
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-            Cause::Auth(AuthCause::ReauthorizationRequired),
+            AccountErrorKind::Unsupported(ctx.operation),
+            Cause::Request(RequestCause::Unsupported {
+                operation: ctx.operation,
+            }),
             &ctx,
         )
         .text(DiagnosticText::support_only(format!(
@@ -1023,14 +1043,17 @@ fn convert_transport(
     // A local failure is authoritative: checked before the net evidence and
     // the no-evidence fallback, either of which would call it a network
     // fault and retry it forever.
-    if let Some(crate::core::transport::LocalFailure::InvariantViolated) = transport.local {
+    if let Some(local) = transport.local {
+        let kind = match local {
+            crate::core::transport::LocalFailure::InvariantViolated => {
+                InternalErrorKind::InvariantViolated
+            }
+            crate::core::transport::LocalFailure::LimitExceeded => InternalErrorKind::LimitExceeded,
+        };
         let detail = DiagnosticText::support_only(transport.message.clone());
         return build(
-            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
-            Cause::Internal(InternalCause::new(
-                InternalErrorKind::InvariantViolated,
-                Some(detail.clone()),
-            )),
+            AccountErrorKind::Internal(kind),
+            Cause::Internal(InternalCause::new(kind, Some(detail.clone()))),
             &ctx,
         )
         .text(detail)
@@ -1709,6 +1732,39 @@ mod tests {
         );
     }
 
+    /// The EventSource block cap is this crate's bound on a stream the
+    /// protocol leaves unbounded, so tripping it is the client's limit, not
+    /// the provider's fault and not a network drop. Driven through the real
+    /// parser: the error it yields used to carry no local mark and fell to
+    /// the no-evidence `Transport(Network)` fallback, a retryable class for a
+    /// block a reconnect replays unchanged.
+    #[test]
+    fn an_oversized_event_source_block_is_an_internal_limit_not_a_network_retry() {
+        use crate::event_source::parser::{EventParser, MAX_EVENT_SIZE};
+        let mut parser = EventParser::default();
+        let mut frame = Vec::from(":");
+        frame.extend_from_slice(&vec![b'z'; MAX_EVENT_SIZE + 1]);
+        parser.push_bytes(frame);
+        let parse_error = parser.next().expect("an item").expect_err("the cap trips");
+
+        let err = into_account_error(
+            parse_error,
+            JmapErrorContext::new(AccountOperation::PushStream),
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::LimitExceeded)
+        );
+        assert_eq!(err.recovery(), &RecoveryClass::InternalFailure);
+        assert!(
+            err.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Internal(internal) if internal.kind == InternalErrorKind::LimitExceeded
+            )),
+            "the primary cause must name the same internal kind"
+        );
+    }
+
     /// A JMAP `limit` problem is not retried by bifrost-net when the
     /// server states it as a terminal 4xx, so it arrives as
     /// `Error::Status` and its only retry hint is the `Retry-After`
@@ -2004,22 +2060,79 @@ mod tests {
         }
     }
 
+    /// A session naming no primary account for the capability a request
+    /// needs is refused before a byte is sent, and what is missing is the
+    /// server's offer, not the credential: `Unsupported` of the caller's own
+    /// operation. It used to derive `AuthLost`, whose remediation
+    /// (re-authorize) cannot add an account to the session. Both call sites
+    /// are covered: the open-time `primary_account::<Mail>()` lookup
+    /// (`Discover`) and `Request::call` on an empty default account id.
     #[test]
-    fn no_primary_account_maps_auth_lost() {
-        // `reference/jmap.md` documents NoPrimaryAccount as
-        // `Authentication(ReauthorizationRequired) -> AuthLost`, not a
-        // `CapabilityChanged -> RestartAccount` reopen loop.
+    fn no_primary_account_is_unsupported_not_auth_lost() {
+        for operation in [AccountOperation::Discover, AccountOperation::SyncInventory] {
+            let err = into_account_error(
+                crate::Error::NoPrimaryAccount {
+                    capability: "urn:ietf:params:jmap:mail",
+                },
+                JmapErrorContext::new(operation).with_scope(ErrorScope::Account),
+            );
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Unsupported(operation),
+                "{operation:?}"
+            );
+            assert_eq!(
+                err.recovery(),
+                &RecoveryClass::Unsupported(operation),
+                "{operation:?}"
+            );
+            assert!(
+                !matches!(
+                    err.suggested_remediation(),
+                    Some(bifrost_types::RemediationAction::Reauthorize)
+                ),
+                "{operation:?}: re-authorizing cannot add a primary account"
+            );
+        }
+    }
+
+    /// A URL the server published in its session is the provider's
+    /// malformed response: `Protocol(ContractViolation)`, the lane
+    /// `MalformedCapability` takes, with the property in the diagnostic. The
+    /// caller's own unusable URL (`InvalidUrl`) stays `Request(Malformed)`;
+    /// before the split, server URLs were filed there too and told the
+    /// operator to fix a request the client never made.
+    #[test]
+    fn a_malformed_session_url_is_the_providers_fault_not_the_callers() {
         let err = into_account_error(
-            crate::Error::NoPrimaryAccount {
-                capability: "urn:ietf:params:jmap:mail",
+            crate::Error::MalformedSessionUrl {
+                property: "uploadUrl",
+                detail: "unterminated parameter in URL template: https://x/{accountId".to_string(),
             },
-            JmapErrorContext::new(AccountOperation::SyncInventory),
+            JmapErrorContext::new(AccountOperation::Discover).with_scope(ErrorScope::Account),
         );
         assert_eq!(
             err.kind(),
-            &AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
         );
-        assert!(matches!(err.recovery(), RecoveryClass::AuthLost));
+        assert_eq!(err.recovery(), &RecoveryClass::ProviderContractViolation);
+        assert!(
+            err.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Wire(WireCause::MalformedResponse { detail: Some(detail), .. })
+                    if detail.value.contains("uploadUrl")
+            )),
+            "the diagnostic must name the session property"
+        );
+
+        let caller = into_account_error(
+            crate::Error::InvalidUrl("a custom transport client needs a session URL".to_string()),
+            JmapErrorContext::new(AccountOperation::Discover),
+        );
+        assert_eq!(
+            caller.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
     }
 
     #[test]

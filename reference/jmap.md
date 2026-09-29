@@ -110,7 +110,12 @@ returns `Error::Method` for JMAP method-level errors. RFC 8620 s3.2 lets one cal
   deliberately preserves `last_event_id`. It ends because of what the discard
   destroys. The block may already have accumulated `data`, and delivering the
   next block's checkpoint would let a consumer resume past a state change it
-  never saw. Every failure is yielded either way.
+  never saw. Every failure is yielded either way. The cap error is a
+  `TransportError::limit_exceeded` (`LocalFailure::LimitExceeded`), which the
+  error boundary classifies `Internal(LimitExceeded)`: the cap is this crate's,
+  not the protocol's, so the server broke no rule, and a reconnect replaying
+  the same block from `lastEventId` trips it again, so it is not a network
+  fault to retry either.
 
   Flattening a push block emits the token-free notifications (`CalendarAlert`,
   `EmailPush`) first, in wire order, and the merged `StateChange` last, because
@@ -138,7 +143,7 @@ returns `Error::Method` for JMAP method-level errors. RFC 8620 s3.2 lets one cal
   over-1 MiB comment line is worth, and nothing suggests such comments are a
   normal interoperability requirement.
 - `ReqwestTransport` - default implementation with a pooled reqwest::Client.
-- `Client::with_transport(transport, session, session_url)` - crate-internal custom transport injection. The session URL is required and rejected when empty: a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
+- `Client::with_transport(transport, session, session_url)` - crate-internal custom transport injection. The session URL is required and rejected when empty (`Error::InvalidUrl`, the caller's fault): a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
 - WebSocket remains reqwest-specific (documented).
 
 The session and everything derived from it (`apiUrl`, the upload / download /
@@ -147,6 +152,12 @@ together in one `Arc<SessionState>` behind a single lock. RFC 8620 §2 lets any
 Session property change, so `refresh_session` republishes the whole derived set
 atomically; readers take one `session_state()` snapshot and build a whole URL
 from it, so a concurrent refresh cannot splice two sessions into one request.
+Every template comes from the server's session object, so one that does not
+parse (an unbalanced or unknown template variable) is
+`Error::MalformedSessionUrl` naming the session property (`uploadUrl`,
+`downloadUrl`, `eventSourceUrl`), not the caller's `InvalidUrl`. `URLPart::parse`
+itself returns a bare description because it cannot know who wrote the
+template; `SessionState::derive` attaches the property.
 At the sync boundary, a method response whose `sessionState` differs marks the
 client stale and advances a watch generation. The always-driven scope lifecycle
 stream selects on that generation and terminates promptly with
@@ -248,7 +259,7 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 - `Id<T>` - phantom-typed string ID: `AccountId`, `BlobId`, `State`. Available for incremental adoption.
 - `Account<Tr>` - internal account-scoped view of `Client`. Use `account.build()` for scoped requests inside the crate.
 - `Capability` trait - typed URIs with associated `Config` type.
-- `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. A local failure is marked explicitly (`TransportError::invariant`, the private `LocalFailure`) and classifies as `Internal(InvariantViolated)` before the net evidence or the no-evidence `Transport(Network)` fallback is consulted; an unmarked error with no net evidence (a passed-through 3xx, an in-crate test stub) keeps the fallback. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever.
+- `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. A local failure is marked explicitly (the private `LocalFailure`, set only by the dedicated constructors) and classifies as `Internal(_)` before the net evidence or the no-evidence `Transport(Network)` fallback is consulted; an unmarked error with no net evidence (a passed-through 3xx, an in-crate test stub) keeps the fallback. Two marks exist. `LocalFailure::InvariantViolated` (`TransportError::invariant` / `invariant_with_source`) is a state impossible by construction, raised before anything was sent, and classifies `Internal(InvariantViolated)`. `LocalFailure::LimitExceeded` (`TransportError::limit_exceeded`) is a bound this crate imposes on a response the protocol leaves unbounded - today only the EventSource over-long block cap - and classifies `Internal(LimitExceeded)`. The central mapping never retries an `Internal` kind. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever, and a tripped EventSource cap classified as a retryable network fault too.
 
 ## Capabilities
 
@@ -317,7 +328,10 @@ whether the account DEPENDS on the block:
   while `Malformed` raises `Error::MalformedCapability { capability }`, mapped
   by `sync::error` to `Protocol(ContractViolation)` naming the URI. Filing a
   server contradicting its own advertisement under "feature not offered" hides
-  it.
+  it. A block that parses but whose `url` is unusable (not a valid URI, or a
+  scheme other than `ws` / `wss`) is the same kind of fault one level down:
+  `Error::MalformedSessionUrl` naming the websocket capability's `url`, also
+  `Protocol(ContractViolation)`, raised before any connection is attempted.
 
 ### `maxConcurrentUpload` is parsed and deliberately unread
 
@@ -367,10 +381,18 @@ RSVP resolves authenticated email aliases from Basic credentials and RFC 9670 Pr
 The crate-internal JMAP error type uses structured variants. No
 `Error::Internal(String)`:
 
-- `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`, `MalformedCapability`, `WebSocketClosed`, `WebSocketNotConnected`.
-- `Transport(TransportError)` - wraps transport errors, auto-parses ProblemDetails from body.
-- `Method(MethodError)` - JMAP method-level errors.
-- No `From<reqwest::Error>` - reqwest errors converted to TransportError at point of use.
+- `Transport(TransportError)` - wraps transport errors. `From<TransportError>` parses a carried body as ProblemDetails and, when it parses, produces `Problem { details, transport }` instead, keeping the transport error for its status and retry evidence.
+- `Problem { .. }` - an RFC 7807 problem-details response.
+- `Method(MethodError)` - JMAP method-level errors. `Set(SetError)` - per-object set errors.
+- Local request refusals: `RequestEncode`, `RequestCallLimit { max }`, `RequestSizeLimit { max, size }`, `NoPrimaryAccount { capability }`.
+- Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `NotParsable`.
+- `InvalidUrl` - a URL the crate's own caller supplied is unusable. Its one remaining source is `Client::with_transport` given an empty session URL.
+- `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
+- `MalformedCapability { capability }` - an advertised capability whose object does not parse.
+- Behind the `websockets` feature: `WebSocketHandshake`, `WebSocketRuntime`, `WebSocketClosed`, `WebSocketSetup(WebSocketSetupError)`, `WebSocketNotConnected`.
+- No `From<reqwest::Error>` - reqwest errors converted to TransportError at point of use. No `From<tokio_websockets::Error>` either - see "Error translation".
+
+Every variant's classification is listed under "Error translation" below.
 
 ## PatchObject null semantics
 
@@ -523,7 +545,7 @@ Every await in the reader's lifecycle is cancellation-covered, so `close()` is p
 
 `push_stream` is a thin broadcast subscriber. A `Lagged` slot emits a coalesced `Invalidated { source: Coalesced, payload: Unknown }` so the engine full-repolls rather than losing notifications.
 
-`subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. Registry and enabled-union state commit only after the frame send succeeds. Subscribe outcomes account for every submitted position, including repeated scopes; unmapped scopes occupy the failed lane. When NO requested scope maps, the whole call errors (nothing was subscribed) as `Request(Malformed)`, not `Unsupported(PushSubscribe)`: the account advertised `PushCapability::InProcess`, so the fault is these arguments, and `Unsupported` would invite a consumer keying off the kind to downgrade push for the account wholesale. `WebSocketNotConnected` maps to `Error::Unsupported` to signal the engine that push is unavailable.
+`subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. Registry and enabled-union state commit only after the frame send succeeds. Subscribe outcomes account for every submitted position, including repeated scopes; unmapped scopes occupy the failed lane. When NO requested scope maps, the whole call errors (nothing was subscribed) as `Request(Malformed)`, not `Unsupported(PushSubscribe)`: the account advertised `PushCapability::InProcess`, so the fault is these arguments, and `Unsupported` would invite a consumer keying off the kind to downgrade push for the account wholesale. A frame that cannot be sent because no WebSocket is connected (`WebSocketNotConnected`) is reported as `Unsupported(PushSubscribe)` for both `subscribe` and `unsubscribe` (`apply_push_set`). That is a classification for the consumer, not an engine signal: `bifrost-sync` does not read the kind to change push behaviour. `close()` absorbs `WebSocketNotConnected` from its best-effort unsubscribe as success.
 
 `scope_lifecycle_stream` polls `Mailbox/changes` against the primary mailbox state, hydrating changed names before advancing its state cache, then emits `ScopeLifecycle::Created`/`Renamed`/`Deleted`. A transient name-hydration failure leaves the state unchanged for replay; terminal/engine classes emit `Terminated`. Renames emit only when the stored and hydrated names differ and carry both names even when the stable scope id is unchanged.
 
@@ -798,14 +820,34 @@ Typed `ServerFilterCreate::Rule` / `ServerFilterPatch::Rule` return `Unsupported
 
 Mapping highlights for the JMAP signals the central table reads:
 
-- `Method(stateMismatch)` -> `ConcurrencyConflict` +
+Every method error carries `Attempt(Acknowledged)` (the method response
+arrived) and, unless its primary cause already is one, the typed
+`WireCause::Jmap(JmapMethod::*)` as a forensic layer.
+
+- `Method(stateMismatch | alreadyExists)` -> `ConcurrencyConflict` +
   `State(ConcurrencyConflict)` -> `Retry::AfterStateRefresh`.
-- `Method(cannotCalculateChanges)` -> `SyncState(CursorInvalid)` ->
-  `Engine(RestartScope)` when scope known, else `Engine(RestartAccount)`.
-- `Method(serverUnavailable | serverFail | serverPartialFail)` ->
-  `Server(Unavailable)` -> `Retry::SameRequest`;
-  `Method(requestTooLarge | tooManyChanges)` -> `SyncState(CursorInvalid)`
-  or `Request(Malformed)` by context.
+- `Method(cannotCalculateChanges | anchorNotFound | tooManyChanges)` ->
+  `SyncState(CursorInvalid)` -> `Engine(RestartScope)` when the caller
+  threaded an `ErrorScope::Cursor` through the context. Without one the
+  builder refuses `CursorInvalid` (`CursorInvalidWithoutScope`), and the
+  server has answered a non-cursored request with a cursor error, so the
+  scope-less case is `Protocol(ContractViolation)` ->
+  `ProviderContractViolation`, never `RestartAccount`.
+- `Method(serverUnavailable | serverFail)` -> `Server(Unavailable)` ->
+  `Retry::SameRequest`. `Method(serverPartialFail)` is different: some calls
+  may have committed, so it is `Protocol(PartialResponse)` (the wire cause is
+  the primary) -> `Retry::SameRequest` for an idempotent operation,
+  `Reconcile` for a non-idempotent one.
+- `Method(invalidArguments | invalidResultReference | requestTooLarge)` ->
+  `Request(Malformed)` -> `ClientBug`.
+- `Method(unknownMethod | unsupportedSort | unsupportedFilter)` ->
+  `Unsupported(operation)`.
+- `Method(accountNotFound | fromAccountNotFound | accountNotSupportedByMethod
+  | fromAccountNotSupportedByMethod)` -> `SyncState(CapabilityChanged)` ->
+  `Engine(RestartAccount)`. `Method(accountReadOnly)` ->
+  `Authorization(PermissionDenied)`. An unrecognized method error type ->
+  `Protocol(Unknown)` carrying `JmapMethod::Unknown { code }` ->
+  `UnknownPermanent`.
 - `Method(forbidden)` -> `Authorization(PermissionDenied)` ->
   `NoPermission`. For a foreign (shared) `Folder` scope,
   `shared_scope_error` intercepts this into `jmap_scope_revoked` ->
@@ -814,8 +856,16 @@ Mapping highlights for the JMAP signals the central table reads:
 - `Problem(limit)` -> `Server(RateLimited)` w/ `throttle_scope`;
   `Problem(unknownCapability)` -> `SyncState(CapabilityChanged)` ->
   `Engine(RestartAccount)`; `Problem(notJSON | notRequest)` ->
-  `Protocol(ContractViolation)`. Bare-`Problem` HTTP fallbacks
-  (401/403/429/5xx) map per the central rules.
+  `Protocol(ContractViolation)`. A problem document of any other type is
+  classified by its HTTP status (the document's own `status`, else the
+  carrying net error's): 400/422 `Request(Malformed)`, 401
+  `Authentication(ReauthorizationRequired)`, 403
+  `Authorization(PermissionDenied)`, 404 `NotFound(resource)` when the scope
+  names one and `Server(Error { 404 })` otherwise, 409
+  `ConcurrencyConflict`, 410 `SyncState(CursorInvalid)` only under a cursor
+  scope, 429 `Server(RateLimited)` with an account throttle scope, 5xx
+  `Server(Unavailable)`, any other status `Server(Error { status })`, and no
+  status at all `Protocol(Unknown)`.
 - Which net error shape carried the problem document decides where its
   evidence lives, and the crate reads all of them. `Error::Status` is the
   *only* variant bifrost-net produces for a terminal HTTP status, and a
@@ -826,16 +876,45 @@ Mapping highlights for the JMAP signals the central table reads:
   parsed field, the recorded history, *and* the response's own
   `Retry-After` header. `AuthLost` is the deliberate exception: its 401
   classification and transmission evidence stay bifrost-net's.
-- `Transport(_)` -> `Transport(Network)` with `AttemptCause::transmission_state` from where the wire failed; central mapping picks `Retry::SameRequest` for idempotent ops, `Reconcile` for non-idempotent ops caught mid-flight.
+- `Transport(_)` is decided in three steps, in order. A `LocalFailure`
+  mark wins: `InvariantViolated` -> `Internal(InvariantViolated)`,
+  `LimitExceeded` -> `Internal(LimitExceeded)`, never retried. Otherwise
+  bifrost-net evidence delegates to `bifrost_net::into_account_error`,
+  which carries `AttemptCause::transmission_state` from where the wire
+  failed, so the central mapping picks `Retry::SameRequest` for idempotent
+  ops and `Reconcile` for non-idempotent ops caught mid-flight. With
+  neither, the fallback is `Transport(Network)` with no attempt cause.
 - WebSocket errors split by handshake position: `WebSocketHandshake`
   (pre-handshake) -> `Transport(Network)` + `Attempt(Unsent)`;
-  `WebSocketRuntime` (post-handshake) -> `Protocol(PartialResponse)` +
-  `Attempt(Acknowledged)`. No blanket `From<tokio_websockets::Error>`;
-  call sites map explicitly.
-- `NoPrimaryAccount` -> `Authentication(ReauthorizationRequired)` ->
-  `AuthLost`. Local shape errors (`Parse`, `Set`, `CallNotFound`,
-  `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`) ->
-  `Request(Malformed)` -> `ClientBug`.
+  `WebSocketRuntime` (post-handshake) and `WebSocketClosed` ->
+  `Protocol(PartialResponse)` + `Attempt(Acknowledged)`. No blanket
+  `From<tokio_websockets::Error>`; call sites map explicitly.
+  `WebSocketSetup` splits by cause: `Tls` -> `Transport(Tls)` +
+  `Attempt(Unsent)`, `InvalidHeader` -> `Request(Malformed)`,
+  `Subprotocol` -> `SyncState(CapabilityChanged)`.
+  `WebSocketNotConnected` -> `Unsupported(operation)`.
+- `NoPrimaryAccount` -> `Unsupported(operation)`, with the capability in the
+  diagnostic: nothing was sent, and the server offers no account for that
+  capability. Not `AuthLost` (re-authorizing cannot add an account to the
+  session) and not `CapabilityChanged` (the reopen would re-read the same
+  session forever).
+- The server's own session describing itself wrongly is terminal
+  `Protocol(ContractViolation)` -> `ProviderContractViolation`, naming what
+  was wrong: `MalformedSessionUrl` (the session property) and
+  `MalformedCapability` (the capability URI). `UnexpectedMethodResponse` takes
+  the same kind.
+- Response-shape errors are the provider's, not the caller's:
+  `ResponseDecode` and `NotParsable` -> `Protocol(ParseFailed)`,
+  `CallNotFound` -> `Protocol(MissingField)`, all
+  `ProviderContractViolation`. `IdNotFound` -> `NotFound(resource)`
+  (`ProviderRefused`) when the scope names a resource, else
+  `Protocol(MissingField)`.
+- Caller faults -> `Request(Malformed)` -> `ClientBug`: `RequestEncode`,
+  `RequestCallLimit`, `RequestSizeLimit`, and `InvalidUrl` (field `url`;
+  its one source is an empty session URL handed to
+  `Client::with_transport`).
+- `Set` routes through the same per-item `set_error_to_account_error` as
+  the `Email/set` lanes below.
 
 Cursor-decode failures from `cursor::envelope` (protocol mismatch, unknown envelope, malformed payload) build their own AccountError with `SyncState(SchemaIncompatible)`, routed to `Engine(SchemaIncompatible)`.
 
