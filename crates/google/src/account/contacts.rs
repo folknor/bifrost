@@ -78,10 +78,15 @@ pub(crate) fn address_books_list(
             let Some(next) = response.next_page_token else {
                 break;
             };
-            if let Some(detail) =
+            if let Some(refusal) =
                 address_book_walk_refusal(&mut seen_page_tokens, pages_walked, &next)
             {
-                return Err(local_error(AccountOperation::AddressBooksList, detail));
+                // Neither guard is a missing field: a repeated token is the
+                // provider's contract breach, the budget this crate's limit.
+                return Err(error::into_account_error(
+                    crate::error::Error::from(refusal),
+                    GmailErrorContext::contact_collection(AccountOperation::AddressBooksList),
+                ));
             }
             page_token = Some(next);
         }
@@ -104,14 +109,16 @@ fn address_book_walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
     next_page_token: &str,
-) -> Option<String> {
+) -> Option<crate::error::PageRefusal> {
     if !seen_page_tokens.insert(next_page_token.to_string()) {
-        return Some(format!(
+        return Some(crate::error::PageRefusal::RepeatedToken(format!(
             "google contactGroups.list repeated page token {next_page_token:?}"
-        ));
+        )));
     }
     (pages_walked >= MAX_ADDRESS_BOOK_PAGES).then(|| {
-        format!("google contactGroups.list exceeded {MAX_ADDRESS_BOOK_PAGES} pages in one walk")
+        crate::error::PageRefusal::BudgetExceeded(format!(
+            "google contactGroups.list exceeded {MAX_ADDRESS_BOOK_PAGES} pages in one walk"
+        ))
     })
 }
 
@@ -1064,11 +1071,6 @@ fn contact_error(error: crate::Error, operation: AccountOperation, id: String) -
     error::into_account_error(error, GmailErrorContext::contact(operation, id))
 }
 
-/// A response Google sent that breaks its paging contract: a provider fault.
-fn local_error(operation: AccountOperation, message: String) -> AccountError {
-    local_error_with_field(operation, "contactPageToken", message)
-}
-
 /// The CALLER's input cannot be used - a page cursor that is not UTF-8, an
 /// address book this backend does not have. Refused before the request it
 /// would shape is sent, so never a provider fault: `Request(Malformed)`, per
@@ -1285,12 +1287,36 @@ mod tests {
         assert!(address_book_walk_refusal(&mut seen, 1, "next").is_none());
         let repeated =
             address_book_walk_refusal(&mut seen, 2, "next").expect("repeated token must refuse");
-        assert!(repeated.contains("repeated page token"));
+        assert!(repeated.detail().contains("repeated page token"));
 
         let mut fresh = HashSet::new();
         let exhausted = address_book_walk_refusal(&mut fresh, MAX_ADDRESS_BOOK_PAGES, "fresh")
             .expect("budget must refuse");
-        assert!(exhausted.contains("exceeded"));
+        assert!(exhausted.detail().contains("exceeded"));
+
+        // Each guard carries its own blame: the provider for a cycling token,
+        // this crate's own limit for the budget. Neither is a missing field,
+        // which is what both used to report.
+        let classify = |refusal| {
+            error::into_account_error(
+                crate::error::Error::from(refusal),
+                GmailErrorContext::contact_collection(AccountOperation::AddressBooksList),
+            )
+            .kind()
+            .clone()
+        };
+        assert_eq!(
+            classify(repeated),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        assert_eq!(
+            classify(exhausted),
+            bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::LimitExceeded
+            )
+        );
     }
 
     /// A page that trips BOTH guards is diagnosed as the repeated token,
@@ -1301,8 +1327,9 @@ mod tests {
     fn a_page_tripping_both_guards_is_diagnosed_as_the_repeated_token() {
         let mut seen = HashSet::new();
         seen.insert("cycling".to_string());
-        let detail = address_book_walk_refusal(&mut seen, MAX_ADDRESS_BOOK_PAGES, "cycling")
+        let refusal = address_book_walk_refusal(&mut seen, MAX_ADDRESS_BOOK_PAGES, "cycling")
             .expect("a page tripping both guards must refuse");
+        let detail = refusal.detail();
         assert!(
             detail.contains("repeated page token"),
             "repeated-token detection must win over the budget: {detail}",

@@ -109,6 +109,28 @@ top-level taxonomy with per-family subkind enums:
 - `Unsupported(AccountOperation)`.
 - `Protocol(ProtocolErrorKind)` - parse-failed, missing-field,
   contract-violation, partial-response, unknown.
+- `Internal(InternalErrorKind)` - a failure on the CLIENT side of the
+  wire: this library, or any `Account` implementation (bifrost's own or a
+  consumer's), never the provider and never the caller's request.
+  `InvariantViolated` (a state the implementation believes impossible: a
+  poisoned lock, a type-erased result of the wrong type, a cursor this code
+  built that will not serialize), `RuntimeFailure` (a local facility failed:
+  the entropy source for a SCRAM nonce), `Panicked` (a contained panic; the
+  resource it ran on is dead), `AccountContract` (the sync engine caught an
+  `Account` implementation breaking its batch contract), `LimitExceeded`
+  (an implementation-defined safety or resource limit, such as a pagination
+  walk's page budget: the operation is supported, the implementation
+  declined to go further). Its cause is `Cause::Internal(InternalCause {
+  kind, detail })`; keys `internal.invariant-violated`,
+  `internal.runtime-failure`, `internal.panicked`,
+  `internal.account-contract`, `internal.limit-exceeded`.
+
+The three blame families are deliberately disjoint: `Request(_)` is the
+caller asking for something inexpressible, `Protocol(_)` is the provider
+sending something wrong, `Internal(_)` is the code in between. Before
+`Internal` existed, client-side failures borrowed
+`Protocol(ContractViolation)` and told operators to contact the provider
+about a bifrost bug.
 
 `message_key::derive(&kind) -> &'static str` is the stable telemetry
 namespace: dotted, family-prefixed, hyphenated leaf
@@ -136,7 +158,7 @@ it (proven by `recovery_helpers_are_mutually_exclusive_and_exhaustive`):
 - `is_terminal()` - an explicit match over the terminal variants (`AuthLost`,
   `NeedsAdminConsent`, `NeedsPolicyChange`, `NoPermission`,
   `Unsupported`, `ClientBug`, `ProviderContractViolation`,
-  `ProviderRefused`, `UnknownPermanent`).
+  `ProviderRefused`, `UnknownPermanent`, `InternalFailure`).
 
 `EngineDirective`: `RestartScope(CursorScope)`, `RestartAccount`,
 `DowngradeStrategy(StrategyDowngrade)`,
@@ -161,7 +183,7 @@ QuotaExhausted, ConcurrencyConflict, RefreshTransient}`.
 
 `ReconcileAdvice { reason, guidance, retry_hint, throttle_scope }`:
 `ReconcileReason::{TransportDropAfterSend, PartialCompletionSignal,
-ThrottledMidFlight}`
+ThrottledMidFlight, InternalFailureAfterSend}`
 plus `guidance.actions: Vec<ReconcileAction>` where `ReconcileAction`
 is `CheckTarget` / `DedupeByClientId`.
 Both advice structs are explicitly `#[non_exhaustive]`.
@@ -187,7 +209,10 @@ queue is the consumer's to build off the broadcast
 `RefreshToken`, `Reauthorize`, `RequestAdminConsent { needed }`,
 `UpdateTenantPolicy`, `CheckMailboxLicense`,
 `RetryLater { retry_hint }`, `FixClientRequest`,
-`ContactProviderSupport`.
+`ContactProviderSupport`, `ReportBug` (report to whoever ships the
+implementation that failed: this library, or the consumer's own `Account`
+implementation; derived for every `Internal(_)` kind, on either of its
+recovery arms).
 
 ### Central derivation
 
@@ -250,6 +275,18 @@ operation is treated idempotent). The rules at altitude (read
   `ProviderContractViolation`; `PartialResponse` -> `Retry(SameRequest)`
   if idempotent else `Reconcile(PartialCompletionSignal, [CheckTarget,
   DedupeByClientId])`; `Unknown` -> `UnknownPermanent`.
+- **Internal** -> never retried: an implementation failure is deterministic
+  or has left its resource dead, and retrying one in a loop is worse than
+  stopping visibly. `InternalFailure` (terminal), except `InFlight` on a
+  non-idempotent operation -> `Reconcile(InternalFailureAfterSend,
+  [CheckTarget])`: the failure struck after the request may have reached the
+  server, so whether it landed is read back rather than declared. `InFlight`
+  on an idempotent operation stays terminal - replay being safe does not
+  justify re-running broken code. The reconcile arm is only as good as the
+  producer's attempt evidence, since a missing `Attempt` reads as `Unsent`:
+  every producer that fails mid-exchange must stamp its transmission state
+  (IMAP's driver death stamps the caller's phase - `Unsent` when the driver
+  never received the command, `InFlight` when it owned it).
 
 ### Local refusals
 
@@ -285,7 +322,9 @@ The rule is about the refusal, not about where it is raised: a validation made
 AFTER bytes of the same exchange are on the wire (a SASL step mid-exchange, a
 post-OK stream upgrade) is not a local refusal of an unsent request, and its
 classification and connection handling are the producer's to argue
-separately.
+separately. A local INVARIANT failing there is still the client's fault
+(`Internal(InvariantViolated)`, with the exchange's transmission state);
+whether the connection survives is the producer's call, and IMAP retires it.
 
 ## Cause chain
 
@@ -297,7 +336,9 @@ separately.
 - `Attempt(AttemptCause { transmission_state })`,
 - `Auth(AuthCause)`, `Access(AccessCause)`, `Server(ServerCause)`,
   `State(StateCause)`, `Request(RequestCause)`,
-- `Wire(WireCause)`.
+- `Wire(WireCause)`,
+- `Internal(InternalCause { kind, detail })` - the cause an
+  `Internal(kind)` error must carry, `kind` matching.
 
 `AttemptCause` / `TransmissionState::{Unsent, InFlight, Acknowledged}`
 is the **transmission-evidence** carrier: it is what `derive` reads to

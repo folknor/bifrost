@@ -127,14 +127,8 @@ pub(crate) enum Error {
     /// while the command was queued is `StateChangedBeforeSend`. This variant
     /// maps to a terminal provider contract violation and is connection-fatal,
     /// so a local refusal filed here both blames the provider and retires a
-    /// healthy connection.
-    ///
-    /// The one deliberate exception: a LOCAL invariant failure raised after
-    /// bytes of the same exchange are on the wire (mid-SASL, or after a tagged
-    /// OK to STARTTLS/COMPRESS once the stream is swapped out) stays here,
-    /// because the connection must be retired and `Internal` is not
-    /// connection-fatal. Its provider attribution is wrong and known; the
-    /// honest fix needs a public error kind for implementation failures.
+    /// healthy connection. A LOCAL invariant failure that must retire the
+    /// connection is `InternalMidExchange`, not this.
     #[error("protocol error: {0}")]
     Protocol(String),
 
@@ -226,9 +220,30 @@ pub(crate) enum Error {
     #[error("invalid APPEND date-time: {0}")]
     InvalidAppendDate(String),
 
-    /// Internal driver invariant violation.
+    /// Internal driver invariant violation, raised where the command framing
+    /// is intact (before the first byte, or after the tagged completion), so
+    /// the connection stays reusable. Maps to `Internal(InvariantViolated)`.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A local invariant failure raised after bytes of the same exchange are
+    /// on the wire: mid-SASL, mid-literal, or after a tagged OK to
+    /// STARTTLS/COMPRESS once the stream has been swapped out. The client's
+    /// fault, not the server's (`Internal(InvariantViolated)`), but the
+    /// driver's view of the exchange can no longer be trusted, so it is
+    /// connection-fatal. The attempt state is REQUIRED: by construction some
+    /// of the exchange was sent, and a missing state would read as `Unsent`.
+    #[error("internal error mid-exchange: {message}")]
+    InternalMidExchange {
+        message: String,
+        attempt: ImapAttempt,
+    },
+
+    /// A local facility the client depends on failed at runtime (the system
+    /// entropy source for a SCRAM nonce, say): not a logic error, and neither
+    /// the server's fault nor the caller's. Maps to `Internal(RuntimeFailure)`.
+    #[error("local runtime failure: {0}")]
+    LocalRuntime(String),
 
     /// The driver task panicked.
     #[error("driver task panicked: {message}")]
@@ -340,7 +355,18 @@ impl PartialEq for Error {
             | (Self::UnsupportedOperation(a), Self::UnsupportedOperation(b))
             | (Self::MissingCapability(a), Self::MissingCapability(b))
             | (Self::InvalidAppendDate(a), Self::InvalidAppendDate(b))
-            | (Self::Internal(a), Self::Internal(b)) => a == b,
+            | (Self::Internal(a), Self::Internal(b))
+            | (Self::LocalRuntime(a), Self::LocalRuntime(b)) => a == b,
+            (
+                Self::InternalMidExchange {
+                    message: m1,
+                    attempt: a1,
+                },
+                Self::InternalMidExchange {
+                    message: m2,
+                    attempt: a2,
+                },
+            ) => m1 == m2 && a1 == a2,
             (Self::AuthPolicy(a), Self::AuthPolicy(b)) => a == b,
             (Self::Timeout { attempt: a }, Self::Timeout { attempt: b })
             | (Self::Closed { attempt: a }, Self::Closed { attempt: b })
@@ -413,7 +439,20 @@ impl Error {
                 | Self::Closed { .. }
                 | Self::DriverPanicked { .. }
                 | Self::DriverGone { .. }
+                | Self::InternalMidExchange { .. }
         )
+    }
+
+    /// A local invariant failure after bytes of the exchange are on the
+    /// wire. See [`Error::InternalMidExchange`].
+    pub(crate) fn internal_mid_exchange(
+        message: impl Into<String>,
+        transmission_state: TransmissionState,
+    ) -> Self {
+        Self::InternalMidExchange {
+            message: message.into(),
+            attempt: ImapAttempt::new(transmission_state),
+        }
     }
 
     /// Construct a transport-flavored I/O error with no attempt-state evidence.
@@ -450,6 +489,15 @@ impl Error {
         Self::DriverGone { attempt: None }
     }
 
+    /// Construct a `DriverGone` stamped with how far the caller's command
+    /// got: `Unsent` when the driver never received it, `InFlight` when the
+    /// driver owned it and died before answering.
+    pub(crate) const fn driver_gone_at(transmission_state: TransmissionState) -> Self {
+        Self::DriverGone {
+            attempt: Some(ImapAttempt::new(transmission_state)),
+        }
+    }
+
     /// Attach (or override) the attempt evidence on a transport-shaped or
     /// server-acknowledged error.
     ///
@@ -482,6 +530,10 @@ impl Error {
             },
             Self::DriverGone { .. } => Self::DriverGone { attempt },
             Self::DriverPanicked { message, .. } => Self::DriverPanicked { message, attempt },
+            Self::InternalMidExchange { message, .. } => Self::InternalMidExchange {
+                message,
+                attempt: ImapAttempt::new(state),
+            },
             other => other,
         }
     }
@@ -497,6 +549,7 @@ impl Error {
             | Self::Bad { attempt, .. }
             | Self::DriverPanicked { attempt, .. }
             | Self::DriverGone { attempt } => attempt.map(|a| a.transmission_state),
+            Self::InternalMidExchange { attempt, .. } => Some(attempt.transmission_state),
             // Refused at the head of the queue, before the first byte: the
             // variant IS the evidence, so it needs no field to carry it.
             Self::StateChangedBeforeSend(_) => Some(TransmissionState::Unsent),

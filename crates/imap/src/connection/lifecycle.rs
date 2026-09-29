@@ -251,11 +251,11 @@ impl ImapConnection {
             result_tx,
         };
         if self.cmd_tx.send(dcmd).await.is_err() {
-            return Err(self.observe_driver_panic().await);
+            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
         match result_rx.await {
             Ok(result) => result,
-            Err(_) => Err(self.observe_driver_panic().await),
+            Err(_) => Err(self.observe_driver_panic(TransmissionState::InFlight).await),
         }
     }
 
@@ -278,12 +278,22 @@ impl ImapConnection {
 
     /// If the driver task has terminated, return an error describing
     /// why (panic message if panicked, or `DriverGone` if exited
-    /// cleanly). Called from `submit` when `cmd_tx.send` fails so the
-    /// caller sees the real reason instead of a generic `Disconnected`.
-    pub(super) async fn observe_driver_panic(&self) -> Error {
+    /// cleanly), so the caller sees the real reason instead of a generic
+    /// `Disconnected`.
+    ///
+    /// `phase` is how far the caller's command got, and only the CALLER
+    /// knows it: `Unsent` when `cmd_tx.send` failed (the driver never
+    /// received the command), `InFlight` when the send succeeded and the
+    /// reply channel dropped (the driver owned the command when it died, so
+    /// it may have been written - "possibly transmitted", the convention
+    /// `timeout_inflight` uses). A non-idempotent command in the second
+    /// phase must be read back, not declared failed, so the phase is stamped
+    /// on every outcome here - including when another caller already took
+    /// the join handle, since the evidence cannot depend on being first.
+    pub(super) async fn observe_driver_panic(&self, phase: TransmissionState) -> Error {
         let mut guard = self.driver_handle.lock().await;
         let Some(handle) = guard.take() else {
-            return Error::driver_gone();
+            return Error::driver_gone_at(phase);
         };
         // `handle.is_finished()` avoids blocking if still running.
         if !handle.is_finished() {
@@ -291,7 +301,7 @@ impl ImapConnection {
             // a TOCTOU race with the driver exiting.
             *guard = Some(handle);
             drop(guard);
-            return Error::driver_gone();
+            return Error::driver_gone_at(phase);
         }
         match handle.await {
             Err(join_err) if join_err.is_panic() => {
@@ -303,10 +313,10 @@ impl ImapConnection {
                     .unwrap_or_else(|_| "driver panicked (payload not a String)".to_string());
                 Error::DriverPanicked {
                     message: panic_msg,
-                    attempt: None,
+                    attempt: Some(crate::error::ImapAttempt::new(phase)),
                 }
             }
-            Ok(()) | Err(_) => Error::driver_gone(),
+            Ok(()) | Err(_) => Error::driver_gone_at(phase),
         }
     }
 

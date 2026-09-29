@@ -89,21 +89,34 @@ pub(super) async fn send_with_literal_sync(
     buf: &[u8],
     mut routing: Option<&mut PipelineRouting<'_>>,
 ) -> Result<SendOutcome, Error> {
+    // A buffer-shape invariant failure is the client's fault. Before the
+    // first byte the framing is intact and the connection reusable; once an
+    // earlier literal went out (after a server `+`) the command is half-sent,
+    // so the connection must retire and the command may have been seen.
+    let invariant = |pos: usize, message: &str| {
+        if pos == 0 {
+            Error::Internal(message.into())
+        } else {
+            Error::internal_mid_exchange(message, TransmissionState::InFlight)
+        }
+    };
     let mut pos = 0;
     while pos < buf.len() {
         if let Some((marker_end, literal_size)) = super::super::find_literal_boundary(&buf[pos..]) {
             // marker_end is the offset past `\r\n` within buf[pos..]
             let Some(send_end) = pos.checked_add(marker_end) else {
-                return Err(Error::Internal(
-                    "synchronizing literal marker offset overflowed command buffer".into(),
+                return Err(invariant(
+                    pos,
+                    "synchronizing literal marker offset overflowed command buffer",
                 ));
             };
             let Some(body_end) = send_end
                 .checked_add(literal_size)
                 .filter(|&end| end <= buf.len())
             else {
-                return Err(Error::Internal(
-                    "synchronizing literal marker exceeds command buffer".into(),
+                return Err(invariant(
+                    pos,
+                    "synchronizing literal marker exceeds command buffer",
                 ));
             };
             wire_reader
@@ -229,8 +242,11 @@ pub(super) async fn send_chunked_segments(
             && wait_for_continuation(wire_reader, state, event_sink, None).await?
                 == ContinuationOutcome::Rejected
         {
-            return Err(Error::Internal(
-                "literal continuation refused outside a pipeline".into(),
+            // A state this path believes unreachable, raised after the
+            // server answered part of the command: the connection retires.
+            return Err(Error::internal_mid_exchange(
+                "literal continuation refused outside a pipeline",
+                TransmissionState::Acknowledged,
             ));
         }
     }

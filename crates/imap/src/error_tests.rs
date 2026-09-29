@@ -376,6 +376,8 @@ fn all_variants_are_distinguishable() {
         },
         Error::InvalidAppendDate("bad date".into()),
         Error::Internal("internal err".into()),
+        Error::internal_mid_exchange("mid", TransmissionState::InFlight),
+        Error::LocalRuntime("rng".into()),
         Error::DriverPanicked {
             message: "p".into(),
             attempt: None,
@@ -407,6 +409,8 @@ fn all_variants_are_distinguishable() {
             Error::SearchResultTruncated { .. } => "searchresulttruncated",
             Error::InvalidAppendDate(_) => "invalidappenddate",
             Error::Internal(_) => "internal",
+            Error::InternalMidExchange { .. } => "internalmidexchange",
+            Error::LocalRuntime(_) => "localruntime",
             Error::DriverPanicked { .. } => "driverpanicked",
             Error::DriverGone { .. } => "drivergone",
         };
@@ -448,6 +452,8 @@ fn other_variants_have_no_source() {
         },
         Error::InvalidAppendDate("bad".into()),
         Error::Internal("test".into()),
+        Error::internal_mid_exchange("mid", TransmissionState::Acknowledged),
+        Error::LocalRuntime("rng".into()),
         Error::DriverPanicked {
             message: "panic".into(),
             attempt: None,

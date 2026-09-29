@@ -292,7 +292,8 @@ pub fn recovery_rank(class: &RecoveryClass) -> u8 {
         | RecoveryClass::ClientBug
         | RecoveryClass::ProviderContractViolation
         | RecoveryClass::ProviderRefused
-        | RecoveryClass::UnknownPermanent => 2,
+        | RecoveryClass::UnknownPermanent
+        | RecoveryClass::InternalFailure => 2,
         // RecoveryClass is non-exhaustive. An unknown future class must win
         // rather than being silently ranked below a known terminal failure.
         _ => u8::MAX,
@@ -630,6 +631,9 @@ mod tests {
             RecoveryClass::ProviderContractViolation,
             RecoveryClass::ProviderRefused,
             RecoveryClass::UnknownPermanent,
+            // Named, so it ranks with the permanent failures rather than
+            // falling to the unknown-class sentinel that outranks AuthLost.
+            RecoveryClass::InternalFailure,
         ];
         let consent = [
             RecoveryClass::NeedsAdminConsent { needed: "scope" },

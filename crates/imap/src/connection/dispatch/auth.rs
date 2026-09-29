@@ -517,11 +517,15 @@ impl ContinuationConsumer for AuthenticateScramConsumer {
             }
             ScramState::AwaitServerFinal => {
                 let server_final = decode_continuation(&cont.data)?;
-                // A local invariant, but raised mid-exchange: the server is
+                // A local invariant, raised mid-exchange: the server is
                 // waiting for our reply to its server-final, so this must
-                // retire the connection, and `Protocol` is the fatal variant.
+                // retire the connection. The exchange has no tagged
+                // completion yet, hence `InFlight`.
                 let expected = self.expected_server_signature.take().ok_or_else(|| {
-                    Error::Protocol("SCRAM server signature missing from client state".into())
+                    Error::internal_mid_exchange(
+                        "SCRAM server signature missing from client state",
+                        bifrost_types::TransmissionState::InFlight,
+                    )
                 })?;
                 verify_server_final(&server_final, &expected)
                     .map_err(|e| self.named_sasl_error(e))?;

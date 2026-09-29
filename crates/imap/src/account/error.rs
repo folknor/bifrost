@@ -29,9 +29,10 @@
 use bifrost_types::{
     AccessCause, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
     AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText, ErrorScope,
-    ImapResponseCode, Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind,
-    ResourceKind, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade, SyncStateErrorKind,
-    ThrottleScope, TransmissionState, TransportCause, TransportErrorKind, TransportKind, WireCause,
+    ImapResponseCode, InternalCause, InternalErrorKind, Protocol, ProtocolErrorKind, Provider,
+    RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause,
+    StrategyDowngrade, SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause,
+    TransportErrorKind, TransportKind, WireCause,
 };
 
 use crate::Error;
@@ -421,6 +422,18 @@ impl Translation {
     }
 }
 
+/// A client-side failure: `Internal(kind)`, never a provider fault. The
+/// attempt state is whatever the error carries (`Error::attempt()`).
+fn internal(kind: InternalErrorKind, detail: String) -> Translation {
+    Translation::new(
+        AccountErrorKind::Internal(kind),
+        Cause::Internal(InternalCause::new(
+            kind,
+            Some(DiagnosticText::support_only(detail)),
+        )),
+    )
+}
+
 fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
     match error {
         Error::Io { source, .. } => Translation::new(
@@ -448,14 +461,14 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 Some(DiagnosticText::support_only("IMAP driver task gone")),
             )),
         ),
-        Error::DriverPanicked { message, .. } => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Imap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "IMAP driver panicked: {message}"
-                ))),
-            }),
+        // Client-side failures (`reference/error-model.md`): the driver
+        // panicked, never the server's fault. Its attempt state is the
+        // caller's phase (`observe_driver_panic`), so a non-idempotent
+        // command the driver owned when it died reconciles rather than
+        // terminating.
+        Error::DriverPanicked { message, .. } => internal(
+            InternalErrorKind::Panicked,
+            format!("IMAP driver panicked: {message}"),
         ),
         Error::Auth {
             text,
@@ -536,13 +549,10 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             t.diagnostic_text = Some(DiagnosticText::support_only(msg.clone()));
             t
         }
-        Error::Internal(msg) => Translation::new(
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Imap,
-                detail: Some(DiagnosticText::support_only(msg.clone())),
-            }),
-        ),
+        Error::Internal(msg) | Error::InternalMidExchange { message: msg, .. } => {
+            internal(InternalErrorKind::InvariantViolated, msg.clone())
+        }
+        Error::LocalRuntime(msg) => internal(InternalErrorKind::RuntimeFailure, msg.clone()),
         Error::MissingCapability(cap) => {
             let operation = ctx.operation;
             let mut t = Translation::new(

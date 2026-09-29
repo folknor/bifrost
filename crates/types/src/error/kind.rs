@@ -14,6 +14,41 @@ pub enum AccountErrorKind {
     NotFound(ResourceKind),
     Unsupported(AccountOperation),
     Protocol(ProtocolErrorKind),
+    /// A failure on the CLIENT side of the wire: this library, or any
+    /// `Account` implementation (bifrost's own or a consumer's), never the
+    /// provider and never the caller's request. `Protocol(_)` means the
+    /// provider sent something wrong and `Request(_)` means the caller asked
+    /// for something inexpressible; this is the third party, the code in
+    /// between. It derives `RecoveryClass::InternalFailure` (or a
+    /// read-back reconcile when a non-idempotent operation may already have
+    /// reached the server) and remediation `ReportBug`.
+    Internal(InternalErrorKind),
+}
+
+/// What failed on the client side. See [`AccountErrorKind::Internal`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum InternalErrorKind {
+    /// A state the implementation believes impossible was reached: a
+    /// poisoned lock, a type-erased result of the wrong type, a missing
+    /// slot, a cursor this code built that will not serialize.
+    InvariantViolated,
+    /// A local facility the implementation depends on failed at runtime
+    /// (the system entropy source, for example) - not a logic error, but
+    /// not the provider's or the caller's either.
+    RuntimeFailure,
+    /// Code panicked and the panic was contained (an IMAP driver task, for
+    /// example). The resource it ran on is dead.
+    Panicked,
+    /// An `Account` implementation broke the contract the sync engine relies
+    /// on (a partial batch carrying a checkpoint, say). Raised by the engine
+    /// about the implementation it drives, which may be a consumer's.
+    AccountContract,
+    /// An implementation-defined safety or resource limit was reached (a
+    /// pagination walk's page budget, for example). The operation is
+    /// supported; the implementation declined to go further, and only
+    /// whoever ships it can raise or remove the limit.
+    LimitExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

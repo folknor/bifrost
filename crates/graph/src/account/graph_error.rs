@@ -13,9 +13,9 @@ use bifrost_net::{NetErrorContext, parse_retry_after};
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
-    ErrorScope, GraphSignal, MailboxId, MailboxUnavailableKind, Protocol, ProtocolErrorKind,
-    Provider, RequestCause, ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause,
-    SyncStateErrorKind, ThrottleScope, TransmissionState, WireCause,
+    ErrorScope, GraphSignal, InternalCause, InternalErrorKind, MailboxId, MailboxUnavailableKind,
+    Protocol, ProtocolErrorKind, Provider, RequestCause, ResourceKind, RetryHint, ServerCause,
+    ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState, WireCause,
 };
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderName, RETRY_AFTER};
@@ -1206,8 +1206,7 @@ pub(crate) fn id_translation_refused(
 /// `Decode`: cursor bytes that do not decode are the caller's durable state,
 /// refused before any request, never a provider fault. `Unsupported`
 /// maps to `Unsupported(EstablishCursor)`. `Encode` (a local serialization
-/// failure) still maps to `Protocol(ContractViolation)` - the filed
-/// local-invariant misattribution, not a local refusal.
+/// failure) is the client's own invariant: `Internal(InvariantViolated)`.
 #[must_use]
 pub(crate) fn cursor_error_to_account_error(
     error: crate::account::cursor::CursorError,
@@ -1253,14 +1252,20 @@ pub(crate) fn cursor_error_to_account_error(
             Cause::State(StateCause::ScopeRevoked),
         )
         .text(DiagnosticText::support_only(msg)),
-        CursorError::Encode(msg) => base_builder(
-            &ctx,
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: ctx.protocol,
-                detail: Some(DiagnosticText::support_only(msg)),
-            }),
-        ),
+        // A cursor this crate built would not serialize: the client's own
+        // invariant, never the provider's fault.
+        CursorError::Encode(msg) => {
+            let detail = DiagnosticText::support_only(msg);
+            base_builder(
+                &ctx,
+                AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+                Cause::Internal(InternalCause::new(
+                    InternalErrorKind::InvariantViolated,
+                    Some(detail.clone()),
+                )),
+            )
+            .text(detail)
+        }
     };
     finish(builder, &ctx)
 }
@@ -1499,6 +1504,24 @@ mod tests {
             AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
         ));
         assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
+    }
+
+    /// A cursor this crate built that will not serialize is the client's
+    /// own invariant, not a provider contract violation.
+    #[test]
+    fn a_cursor_encode_failure_is_internal_not_a_provider_fault() {
+        let error = cursor_error_to_account_error(
+            crate::account::cursor::CursorError::Encode("serializer refused".to_string()),
+            graph_ctx(AccountOperation::SyncChanges),
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
+        );
+        assert_eq!(
+            error.recovery(),
+            &bifrost_types::RecoveryClass::InternalFailure
+        );
     }
 
     /// The scope is genuinely optional - the call sites that have no id to

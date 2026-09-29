@@ -18,17 +18,18 @@ pub use batch::{
 pub use builder::{AccountErrorBuildError, AccountErrorBuilder};
 pub use cause::{
     AccessCause, AttemptCause, AuthCause, BatchInputInvalidItem, BatchInputInvalidReason, Cause,
-    CauseChain, EnhancedStatusCode, GmailSignal, GraphSignal, ImapResponseCode, JmapMethod,
-    RequestCause, ServerCause, StateCause, TransmissionState, TransportCause, TransportKind,
-    WireCause,
+    CauseChain, EnhancedStatusCode, GmailSignal, GraphSignal, ImapResponseCode, InternalCause,
+    JmapMethod, RequestCause, ServerCause, StateCause, TransmissionState, TransportCause,
+    TransportKind, WireCause,
 };
 pub use diagnostic::{
     DetailVisibility, DiagnosticInfo, DiagnosticText, SupportExportConsented,
     SupportExportInternal, SupportExportMinimal, TelemetryToken, TelemetryView,
 };
 pub use kind::{
-    AccessErrorKind, AccountErrorKind, AuthErrorKind, MailboxUnavailableKind, ProtocolErrorKind,
-    RequestErrorKind, ResourceKind, ServerErrorKind, SyncStateErrorKind, TransportErrorKind,
+    AccessErrorKind, AccountErrorKind, AuthErrorKind, InternalErrorKind, MailboxUnavailableKind,
+    ProtocolErrorKind, RequestErrorKind, ResourceKind, ServerErrorKind, SyncStateErrorKind,
+    TransportErrorKind,
 };
 pub use recovery::{
     EngineDirective, Fatal, ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason,

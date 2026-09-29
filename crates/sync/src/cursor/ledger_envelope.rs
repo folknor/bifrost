@@ -44,6 +44,11 @@
 //! from the old per-entry counters - which, for a split lineage, disagreed
 //! with each other (the root held the count, every child held zero).
 //!
+//! Version 4 added the `Internal` account error kind (tag 10) to the error
+//! digest's vocabulary and changed nothing else, so a version-3 row is read as
+//! is; a version-3 row carrying tag 10 is corrupt, because no version-3 writer
+//! produced one.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -85,11 +90,11 @@ use std::collections::BTreeMap;
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CoverageCoordinate,
-    CoverageDomain, CursorScope, DetailVisibility, DiagnosticText, ErrorScope,
-    MailboxUnavailableKind, ObjectId, ObligationKey, Protocol, ProtocolErrorKind, Provider,
-    RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, SnapshotIdentity,
-    StateCause, StrategyDowngrade, SyncStateErrorKind, TransportCause, TransportErrorKind,
-    TransportKind,
+    CoverageDomain, CursorScope, DetailVisibility, DiagnosticText, ErrorScope, InternalCause,
+    InternalErrorKind, MailboxUnavailableKind, ObjectId, ObligationKey, Protocol,
+    ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind, ServerCause,
+    ServerErrorKind, SnapshotIdentity, StateCause, StrategyDowngrade, SyncStateErrorKind,
+    TransportCause, TransportErrorKind, TransportKind,
 };
 
 use super::envelope::{
@@ -103,8 +108,9 @@ use super::ledger::{
 use crate::error::Error;
 
 /// Current ledger envelope version. Bumped whenever the layout below changes
-/// in a way an older decoder would misread.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 3;
+/// in a way an older decoder would misread, including a new tag in a
+/// vocabulary an older decoder would refuse.
+pub const LEDGER_ENVELOPE_VERSION: u32 = 4;
 
 /// Lowest ledger envelope version still readable by this engine.
 ///
@@ -215,7 +221,7 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
         return Err(Error::SchemaIncompatible);
     }
 
-    let mut reader = Reader::new(&bytes[HEADER_LEN..]);
+    let mut reader = Reader::new(&bytes[HEADER_LEN..], version);
     let entry_count = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
     let barrier_count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
     let proof_count = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
@@ -290,7 +296,8 @@ pub fn decode_ledger(bytes: &[u8]) -> Result<DebtLedger, Error> {
 /// Bring a ledger decoded from an accepted historical layout up to the current
 /// one.
 ///
-/// A no-op while the readable window is a single version. It exists as the
+/// A no-op while every version in the readable window shares one layout
+/// (version 4 only widened the error-kind vocabulary). It exists as the
 /// named boundary anyway, for the same reason `migrate_change_cursor` does:
 /// the codec is the only place in the workspace that may hold ledger state in
 /// an older shape, so a fixup written anywhere else spreads knowledge of a dead
@@ -863,6 +870,7 @@ fn canonical_cause(kind: &AccountErrorKind) -> Cause {
             protocol: Protocol::Unknown,
             detail: None,
         }),
+        AccountErrorKind::Internal(kind) => Cause::Internal(InternalCause::new(*kind, None)),
         // `AccountErrorKind` is `#[non_exhaustive]`; unreachable, because
         // `decode_error_kind` only produces tags this codec wrote. Kept so the
         // match is total without pretending a future kind is a request error.
@@ -966,6 +974,17 @@ fn encode_error_kind(out: &mut Vec<u8>, kind: &AccountErrorKind) {
                 _ => panic!("ledger envelope: unknown protocol error kind"),
             });
         }
+        AccountErrorKind::Internal(kind) => {
+            out.push(10);
+            out.push(match kind {
+                InternalErrorKind::InvariantViolated => 0,
+                InternalErrorKind::RuntimeFailure => 1,
+                InternalErrorKind::Panicked => 2,
+                InternalErrorKind::AccountContract => 3,
+                InternalErrorKind::LimitExceeded => 4,
+                _ => panic!("ledger envelope: unknown internal error kind"),
+            });
+        }
         // `AccountErrorKind` is `#[non_exhaustive]`; same rule as
         // `encode_obj_type` in the cursor envelope - the codec learns the
         // variant before a ledger carrying it may be stored.
@@ -1039,6 +1058,15 @@ fn decode_error_kind(reader: &mut Reader<'_>) -> Result<AccountErrorKind, Error>
             3 => ProtocolErrorKind::PartialResponse,
             4 => ProtocolErrorKind::Unknown,
             other => return Err(unknown_tag("protocol error kind", other)),
+        }),
+        // Introduced in version 4; a version-3 writer never produced it.
+        10 if reader.version >= 4 => AccountErrorKind::Internal(match reader.u8()? {
+            0 => InternalErrorKind::InvariantViolated,
+            1 => InternalErrorKind::RuntimeFailure,
+            2 => InternalErrorKind::Panicked,
+            3 => InternalErrorKind::AccountContract,
+            4 => InternalErrorKind::LimitExceeded,
+            other => return Err(unknown_tag("internal error kind", other)),
         }),
         other => return Err(unknown_tag("account error kind", other)),
     };
@@ -1384,11 +1412,18 @@ fn read_opt_string(reader: &mut Reader<'_>) -> Result<Option<String>, Error> {
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// The row's envelope version, for tags a version introduced: a tag an
+    /// older writer could not have produced is corruption in an older row.
+    version: u32,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+    fn new(bytes: &'a [u8], version: u32) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            version,
+        }
     }
 
     fn take(&mut self, count: usize) -> Result<&'a [u8], Error> {
@@ -1456,7 +1491,7 @@ impl<'a> Reader<'a> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use bifrost_types::CursorScope;
+    use bifrost_types::{AccountErrorBuilder, AccountErrorKind, CursorScope};
 
     use super::{LEDGER_ENVELOPE_VERSION, decode_ledger, encode_ledger};
     use crate::cursor::ledger::{DebtLedger, DischargeAudit, DischargeEvidence};
@@ -1673,5 +1708,46 @@ mod tests {
         }
         let past_end = u8::try_from(super::OPERATIONS.len()).expect("table fits a u8 tag");
         assert!(super::decode_operation(past_end).is_err());
+    }
+
+    /// Version 4 only widened the error-kind vocabulary, so a version-3 row
+    /// is still read as is.
+    #[test]
+    fn a_version_three_row_still_decodes() {
+        let mut bytes = encode_ledger(&DebtLedger::new());
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        assert!(decode_ledger(&bytes).is_ok());
+    }
+
+    /// Every internal kind round-trips through the error digest in a
+    /// version-4 row, and the same bytes in a version-3 row are corruption:
+    /// no version-3 writer could have produced the tag.
+    #[test]
+    fn the_internal_kind_is_a_version_four_tag() {
+        use bifrost_types::InternalErrorKind;
+        for kind in [
+            InternalErrorKind::InvariantViolated,
+            InternalErrorKind::RuntimeFailure,
+            InternalErrorKind::Panicked,
+            InternalErrorKind::AccountContract,
+            InternalErrorKind::LimitExceeded,
+        ] {
+            let kind = AccountErrorKind::Internal(kind);
+            let mut bytes = Vec::new();
+            super::encode_error_kind(&mut bytes, &kind);
+            assert_eq!(
+                super::decode_error_kind(&mut super::Reader::new(&bytes, 4)).expect("v4 tag"),
+                kind
+            );
+            assert!(super::decode_error_kind(&mut super::Reader::new(&bytes, 3)).is_err());
+            // The restored digest re-derives a valid classification.
+            let restored = AccountErrorBuilder::new(kind.clone(), super::canonical_cause(&kind))
+                .try_build()
+                .expect("canonical cause matches the kind");
+            assert_eq!(
+                restored.recovery(),
+                &bifrost_types::RecoveryClass::InternalFailure
+            );
+        }
     }
 }

@@ -19,7 +19,7 @@ use futures::stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
-use crate::error::{Error, GmailLocalError};
+use crate::error::{Error, GmailLocalError, PageRefusal};
 use crate::types::{GmailHistoryItem, GmailMessage, GmailProfile};
 
 use super::cursor::{cursor_for_history, decode_gmail_state};
@@ -225,7 +225,7 @@ pub(crate) fn changes_stream_cancellable(
                     state.finished = true;
                     state.emitted_done = true;
                     let account_error = account_error::into_account_error(
-                        Error::Local(GmailLocalError::Internal { detail: refusal }),
+                        Error::from(refusal),
                         account_error::GmailErrorContext::changes(),
                     );
                     return Some((SyncEvent::Terminated(account_error), state));
@@ -290,13 +290,18 @@ fn walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
     next_page_token: Option<&str>,
-) -> Option<String> {
+) -> Option<PageRefusal> {
     let token = next_page_token?;
     if !seen_page_tokens.insert(token.to_string()) {
-        return Some("gmail users.history.list repeated a page token".to_string());
+        return Some(PageRefusal::RepeatedToken(
+            "gmail users.history.list repeated a page token".to_string(),
+        ));
     }
-    (pages_walked >= MAX_HISTORY_PAGES)
-        .then(|| format!("gmail users.history.list exceeded {MAX_HISTORY_PAGES} pages in one walk"))
+    (pages_walked >= MAX_HISTORY_PAGES).then(|| {
+        PageRefusal::BudgetExceeded(format!(
+            "gmail users.history.list exceeded {MAX_HISTORY_PAGES} pages in one walk"
+        ))
+    })
 }
 
 /// Only the final page of a history walk may advance the durable cursor.
@@ -569,10 +574,24 @@ mod tests {
             walk_refusal(&mut seen, MAX_HISTORY_PAGES - 1, Some("more")).is_none(),
             "the last page inside the budget still follows its token",
         );
-        assert!(walk_refusal(&mut seen, MAX_HISTORY_PAGES, Some("another")).is_some());
+        let refusal = walk_refusal(&mut seen, MAX_HISTORY_PAGES, Some("another"))
+            .expect("the budget refuses");
+        assert!(matches!(refusal, PageRefusal::BudgetExceeded(_)));
         assert!(
             walk_refusal(&mut seen, MAX_HISTORY_PAGES, None).is_none(),
             "a walk that ends on the budget page ends normally",
+        );
+        // An honestly huge mailbox looks exactly like this, so it is the
+        // implementation's own limit, never a provider fault.
+        let error = account_error::into_account_error(
+            Error::from(refusal),
+            account_error::GmailErrorContext::changes(),
+        );
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::LimitExceeded
+            )
         );
     }
 
@@ -583,8 +602,10 @@ mod tests {
     fn a_page_tripping_both_guards_is_diagnosed_as_the_repeated_token() {
         let mut seen = HashSet::new();
         seen.insert("cycling".to_string());
-        let detail = walk_refusal(&mut seen, MAX_HISTORY_PAGES, Some("cycling"))
+        let refusal = walk_refusal(&mut seen, MAX_HISTORY_PAGES, Some("cycling"))
             .expect("a page tripping both guards must refuse");
+        assert!(matches!(refusal, PageRefusal::RepeatedToken(_)));
+        let detail = refusal.detail();
         assert!(
             detail.contains("repeated a page token"),
             "repeated-token detection must win over the budget: {detail}",

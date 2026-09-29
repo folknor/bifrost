@@ -23,14 +23,23 @@ pub enum RecoveryClass {
     Reconcile(ReconcileAdvice),
     Engine(EngineDirective),
     AuthLost,
-    NeedsAdminConsent { needed: &'static str },
+    NeedsAdminConsent {
+        needed: &'static str,
+    },
     NeedsPolicyChange,
-    NoPermission { resource: Option<ResourceKind> },
+    NoPermission {
+        resource: Option<ResourceKind>,
+    },
     Unsupported(AccountOperation),
     ClientBug,
     ProviderContractViolation,
     ProviderRefused,
     UnknownPermanent,
+    /// The client side failed (`AccountErrorKind::Internal`): this library
+    /// or the `Account` implementation, not the caller and not the provider.
+    /// Terminal: an implementation failure does not heal by being asked
+    /// again, and retrying one in a loop is worse than stopping visibly.
+    InternalFailure,
 }
 
 impl RecoveryClass {
@@ -61,7 +70,8 @@ impl RecoveryClass {
             | Self::ClientBug
             | Self::ProviderContractViolation
             | Self::ProviderRefused
-            | Self::UnknownPermanent => true,
+            | Self::UnknownPermanent
+            | Self::InternalFailure => true,
         }
     }
 }
@@ -184,6 +194,10 @@ pub enum ReconcileReason {
     TransportDropAfterSend,
     PartialCompletionSignal,
     ThrottledMidFlight,
+    /// A client-side failure (`AccountErrorKind::Internal`) struck after a
+    /// non-idempotent request may have reached the server. The failure is
+    /// not retried, but whether the operation landed must be read back.
+    InternalFailureAfterSend,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,12 +264,19 @@ pub enum ThrottleKey {
 pub enum RemediationAction {
     RefreshToken,
     Reauthorize,
-    RequestAdminConsent { needed: &'static str },
+    RequestAdminConsent {
+        needed: &'static str,
+    },
     UpdateTenantPolicy,
     CheckMailboxLicense,
-    RetryLater { retry_hint: Option<RetryHint> },
+    RetryLater {
+        retry_hint: Option<RetryHint>,
+    },
     FixClientRequest,
     ContactProviderSupport,
+    /// Report the failure to whoever ships the implementation that failed:
+    /// this library, or the consumer's own `Account` implementation.
+    ReportBug,
 }
 
 /// Newtype carrying a terminal-class [`AccountError`]. Constructed only
@@ -376,6 +397,29 @@ pub(crate) fn derive(
         AccountErrorKind::NotFound(_) => RecoveryClass::ProviderRefused,
         AccountErrorKind::Unsupported(op) => RecoveryClass::Unsupported(*op),
         AccountErrorKind::Protocol(kind) => derive_protocol(*kind, idempotent),
+        AccountErrorKind::Internal(_) => derive_internal(tx_state, idempotent),
+    }
+}
+
+/// A client-side failure is never retried: it is deterministic or it has
+/// left its resource dead. The one exception to plain terminal is a
+/// NON-idempotent operation that may already have reached the server
+/// (`InFlight`): whether it landed is unknown, so the target is read back
+/// rather than the outcome declared. An idempotent one in flight stays
+/// terminal - retrying broken code is not justified merely because replay
+/// would be safe - and `Acknowledged` means the server's answer was read.
+fn derive_internal(tx_state: TransmissionState, idempotent: bool) -> RecoveryClass {
+    if tx_state == TransmissionState::InFlight && !idempotent {
+        RecoveryClass::Reconcile(ReconcileAdvice {
+            reason: ReconcileReason::InternalFailureAfterSend,
+            guidance: ReconcileGuidance {
+                actions: vec![ReconcileAction::CheckTarget],
+            },
+            retry_hint: None,
+            throttle_scope: None,
+        })
+    } else {
+        RecoveryClass::InternalFailure
     }
 }
 
@@ -444,6 +488,7 @@ pub(crate) fn suggest(
         | AccountErrorKind::ConcurrencyConflict
         | AccountErrorKind::Unsupported(_)
         | AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse) => None,
+        AccountErrorKind::Internal(_) => Some(RemediationAction::ReportBug),
     }
 }
 
@@ -463,6 +508,7 @@ pub(crate) fn kind_matches_cause(kind: &AccountErrorKind, cause: &Cause) -> bool
             sync_kind_matches_cause(*kind, cause)
         }
         (AccountErrorKind::Protocol(_), Cause::Wire(_)) => true,
+        (AccountErrorKind::Internal(kind), Cause::Internal(cause)) => *kind == cause.kind,
         (AccountErrorKind::ConcurrencyConflict, Cause::State(StateCause::ConcurrencyConflict)) => {
             true
         }
@@ -890,7 +936,9 @@ fn retry_later(recovery: &RecoveryClass) -> Option<RemediationAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{AttemptCause, TransportCause, TransportKind};
+    use crate::error::{
+        AttemptCause, InternalCause, InternalErrorKind, TransportCause, TransportKind,
+    };
 
     fn chain(cause: Cause) -> CauseChain {
         CauseChain::new(vec![cause])
@@ -1361,7 +1409,20 @@ mod tests {
             None,
         );
 
-        for recovery in [&transport_drop, &partial] {
+        // Arm 3: a client-side failure after a non-idempotent send.
+        let internal = derive(
+            &AccountErrorKind::Internal(InternalErrorKind::Panicked),
+            None,
+            Some(AccountOperation::Send),
+            &CauseChain::new(vec![
+                Cause::Internal(InternalCause::new(InternalErrorKind::Panicked, None)),
+                Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)),
+            ]),
+            None,
+            None,
+        );
+
+        for recovery in [&transport_drop, &partial, &internal] {
             let RecoveryClass::Reconcile(advice) = recovery else {
                 panic!("expected Reconcile, got {recovery:?}");
             };
@@ -1387,6 +1448,81 @@ mod tests {
                 .contains(&ReconcileAction::DedupeByClientId),
             "the partial-response arm is what makes DedupeByClientId reachable"
         );
+    }
+
+    /// A client-side failure is never retried, and never the provider's
+    /// fault. It is terminal `InternalFailure` everywhere except the one
+    /// shape where a side effect may have landed unseen: a non-idempotent
+    /// operation in flight, which reads the target back instead.
+    #[test]
+    fn an_internal_failure_is_terminal_unless_a_non_idempotent_send_is_in_flight() {
+        let derive_at = |state: Option<TransmissionState>, operation: AccountOperation| {
+            let mut causes = vec![Cause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                None,
+            ))];
+            if let Some(state) = state {
+                causes.push(Cause::Attempt(AttemptCause::new(state)));
+            }
+            derive(
+                &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+                None,
+                Some(operation),
+                &CauseChain::new(causes),
+                None,
+                None,
+            )
+        };
+        let reconcile = RecoveryClass::Reconcile(ReconcileAdvice {
+            reason: ReconcileReason::InternalFailureAfterSend,
+            guidance: ReconcileGuidance {
+                actions: vec![ReconcileAction::CheckTarget],
+            },
+            retry_hint: None,
+            throttle_scope: None,
+        });
+        for operation in [AccountOperation::Send, AccountOperation::SyncChanges] {
+            for state in [
+                None,
+                Some(TransmissionState::Unsent),
+                Some(TransmissionState::Acknowledged),
+            ] {
+                assert_eq!(
+                    derive_at(state, operation),
+                    RecoveryClass::InternalFailure,
+                    "{operation:?} {state:?}"
+                );
+            }
+        }
+        assert_eq!(
+            derive_at(Some(TransmissionState::InFlight), AccountOperation::Send),
+            reconcile
+        );
+        assert!(AccountOperation::SyncChanges.is_idempotent());
+        assert_eq!(
+            derive_at(
+                Some(TransmissionState::InFlight),
+                AccountOperation::SyncChanges
+            ),
+            RecoveryClass::InternalFailure,
+            "an idempotent operation in flight is not replayed or read back"
+        );
+        // Remediation follows the kind on both recovery arms.
+        let chain = CauseChain::new(vec![Cause::Internal(InternalCause::new(
+            InternalErrorKind::InvariantViolated,
+            None,
+        ))]);
+        for recovery in [RecoveryClass::InternalFailure, reconcile] {
+            assert_eq!(
+                suggest(
+                    &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+                    &recovery,
+                    None,
+                    &chain,
+                ),
+                Some(RemediationAction::ReportBug)
+            );
+        }
     }
 
     #[test]
@@ -1487,6 +1623,7 @@ mod tests {
             RecoveryClass::ProviderContractViolation,
             RecoveryClass::ProviderRefused,
             RecoveryClass::UnknownPermanent,
+            RecoveryClass::InternalFailure,
         ]
     }
 
@@ -1592,6 +1729,16 @@ mod tests {
                     AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
                     Cause::Wire(crate::error::WireCause::Jmap(
                         crate::error::JmapMethod::Unknown { code: "x".into() },
+                    )),
+                ),
+            ),
+            (
+                "InternalFailure",
+                build(
+                    AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+                    Cause::Internal(InternalCause::new(
+                        InternalErrorKind::InvariantViolated,
+                        None,
                     )),
                 ),
             ),

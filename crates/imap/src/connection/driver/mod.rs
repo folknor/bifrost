@@ -930,8 +930,12 @@ fn short_circuit_on_bye(
 
     let UntaggedResponse::Status { status, text, code } = response else {
         debug_assert!(false, "only an untagged BYE may set the BYE digest");
-        return Err(Error::Internal(
-            "BYE digest without a status response".into(),
+        // Raised mid-read, with the state machine already marked for BYE:
+        // the connection retires. An untagged BYE does not complete the
+        // active command, whose outcome is unknown, hence `InFlight`.
+        return Err(Error::internal_mid_exchange(
+            "BYE digest without a status response",
+            bifrost_types::TransmissionState::InFlight,
         ));
     };
     debug_assert!(matches!(status, UntaggedStatus::Bye));

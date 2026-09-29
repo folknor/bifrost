@@ -27,6 +27,7 @@ use super::typed_event::TypedEvent;
 use super::{IdleEvent, ImapConnection};
 use crate::error::Error;
 use crate::types::response::{UntaggedResponse, UntaggedStatus};
+use bifrost_types::TransmissionState;
 
 impl ImapConnection {
     /// Enter IDLE mode and wait for the first server event (RFC 2177).
@@ -83,7 +84,7 @@ impl ImapConnection {
         let (result_tx, result_rx) = oneshot::channel();
         let dcmd = DriverCommand::Idle { done_rx, result_tx };
         if self.cmd_tx.send(dcmd).await.is_err() {
-            return Err(self.observe_driver_panic().await);
+            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
 
         // The driver is now in IDLE mode: it has sent "tag IDLE\r\n",
@@ -146,7 +147,7 @@ impl ImapConnection {
                             Ok(IdleEvent::ServerTerminated)
                         }
                         Ok(Err(e)) => Err(e),
-                        Err(_) => Err(self.observe_driver_panic().await),
+                        Err(_) => Err(self.observe_driver_panic(TransmissionState::InFlight).await),
                     };
                 }
             }
@@ -166,7 +167,9 @@ impl ImapConnection {
         match tokio::time::timeout(done_timeout, result_rx).await {
             Ok(Ok(Ok(_))) => {}
             Ok(Ok(Err(e))) => return Err(e),
-            Ok(Err(_)) => return Err(self.observe_driver_panic().await),
+            Ok(Err(_)) => {
+                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
+            }
             Err(_) => return Err(Error::timeout_inflight()),
         }
 

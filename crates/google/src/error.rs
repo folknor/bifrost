@@ -201,9 +201,53 @@ pub(crate) enum GmailLocalError {
     BlobRangeUnsupported {
         blob_id: String,
     },
+    /// A state this crate believes impossible was reached (a change stream
+    /// with no cursor, say). The client's fault: `Internal(InvariantViolated)`.
     Internal {
         detail: String,
     },
+    /// A pagination walk was handed a page token it had already followed:
+    /// the provider is cycling, a contract breach no further paging fixes.
+    /// `Protocol(ContractViolation)`, acknowledged (a complete response
+    /// carried the token).
+    PageTokenRepeated {
+        detail: String,
+    },
+    /// A pagination walk reached this crate's own page budget. That is also
+    /// what an honestly huge collection looks like, so it is neither a
+    /// provider fault nor a bug: the implementation declined to go further
+    /// (`Internal(LimitExceeded)`).
+    PageBudgetExceeded {
+        detail: String,
+    },
+}
+
+/// Why a pagination walk stopped following its page token. The two guards
+/// every Google walk runs; kept as one type so each walk classifies them the
+/// same way (see [`GmailLocalError::PageTokenRepeated`] and
+/// [`GmailLocalError::PageBudgetExceeded`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PageRefusal {
+    RepeatedToken(String),
+    BudgetExceeded(String),
+}
+
+impl PageRefusal {
+    #[cfg(test)]
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            Self::RepeatedToken(detail) | Self::BudgetExceeded(detail) => detail,
+        }
+    }
+}
+
+impl From<PageRefusal> for Error {
+    fn from(refusal: PageRefusal) -> Self {
+        Self::Local(match refusal {
+            PageRefusal::RepeatedToken(detail) => GmailLocalError::PageTokenRepeated { detail },
+            PageRefusal::BudgetExceeded(detail) => GmailLocalError::PageBudgetExceeded { detail },
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,6 +286,9 @@ impl Display for GmailLocalError {
                 write!(f, "blob {blob_id} does not support range reads")
             }
             Self::Internal { detail } => write!(f, "internal gmail error: {detail}"),
+            Self::PageTokenRepeated { detail } | Self::PageBudgetExceeded { detail } => {
+                write!(f, "pagination refused: {detail}")
+            }
         }
     }
 }

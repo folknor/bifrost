@@ -7,7 +7,7 @@ use crate::capabilities::CapabilityDelta;
 
 use super::batch::BatchItemId;
 use super::diagnostic::DiagnosticText;
-use super::kind::{MailboxUnavailableKind, ResourceKind, TransportErrorKind};
+use super::kind::{InternalErrorKind, MailboxUnavailableKind, ResourceKind, TransportErrorKind};
 use super::recovery::{RetryHint, StrategyDowngrade};
 use super::scope::{AccountOperation, Protocol};
 
@@ -62,6 +62,8 @@ pub enum Cause {
     State(StateCause),
     Request(RequestCause),
     Wire(WireCause),
+    /// A client-side failure; the cause behind `AccountErrorKind::Internal`.
+    Internal(InternalCause),
 }
 
 impl Cause {
@@ -174,6 +176,11 @@ impl Cause {
                 native_code: cause.native_code(),
                 ..CauseSummary::empty("wire")
             },
+            Self::Internal(cause) => CauseSummary {
+                kind: "internal",
+                detail: cause.detail.as_ref().map(DiagnosticText::as_str),
+                ..CauseSummary::empty("internal")
+            },
         }
     }
 }
@@ -189,11 +196,39 @@ impl fmt::Display for Cause {
             Self::State(cause) => write!(f, "{cause}"),
             Self::Request(cause) => write!(f, "{cause}"),
             Self::Wire(cause) => write!(f, "{cause}"),
+            Self::Internal(cause) => write!(f, "{cause}"),
         }
     }
 }
 
 impl StdError for Cause {}
+
+/// The cause behind an `AccountErrorKind::Internal`: which client-side
+/// failure it was, and support-only detail naming the site.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct InternalCause {
+    pub kind: InternalErrorKind,
+    pub detail: Option<DiagnosticText>,
+}
+
+impl InternalCause {
+    #[must_use]
+    pub fn new(kind: InternalErrorKind, detail: Option<DiagnosticText>) -> Self {
+        Self { kind, detail }
+    }
+}
+
+impl fmt::Display for InternalCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.detail {
+            Some(detail) => write!(f, "internal {:?}: {}", self.kind, detail.as_str()),
+            None => write!(f, "internal {:?}", self.kind),
+        }
+    }
+}
+
+impl StdError for InternalCause {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]

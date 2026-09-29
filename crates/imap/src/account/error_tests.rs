@@ -499,6 +499,91 @@ fn missing_capability_with_push_subscribe_maps_to_unsupported() {
     ));
 }
 
+/// A client-side failure is never the server's fault: every internal
+/// variant classifies `Internal(_)`, points at the implementation
+/// (`ReportBug`), and none derives `ProviderContractViolation`.
+#[test]
+fn a_client_side_failure_is_internal_not_a_provider_fault() {
+    use bifrost_types::{InternalErrorKind, RemediationAction};
+    for (error, kind) in [
+        (
+            Error::Internal("missing pipeline result".into()),
+            InternalErrorKind::InvariantViolated,
+        ),
+        (
+            Error::internal_mid_exchange(
+                "SCRAM server signature missing from client state",
+                TransmissionState::Acknowledged,
+            ),
+            InternalErrorKind::InvariantViolated,
+        ),
+        (
+            Error::LocalRuntime("failed to generate SCRAM nonce".into()),
+            InternalErrorKind::RuntimeFailure,
+        ),
+        (
+            Error::DriverPanicked {
+                message: "boom".into(),
+                attempt: Some(crate::error::ImapAttempt::new(TransmissionState::Unsent)),
+            },
+            InternalErrorKind::Panicked,
+        ),
+    ] {
+        let account = into_account_error(
+            error,
+            ImapErrorContext::operation(AccountOperation::SyncChanges),
+        );
+        assert_eq!(account.kind(), &AccountErrorKind::Internal(kind));
+        assert_eq!(account.recovery(), &RecoveryClass::InternalFailure);
+        assert_eq!(
+            account.suggested_remediation(),
+            Some(&RemediationAction::ReportBug)
+        );
+    }
+}
+
+/// A mid-exchange invariant failure retires the connection; the ordinary
+/// internal failure, raised with the framing intact, does not.
+#[test]
+fn only_the_mid_exchange_internal_failure_is_connection_fatal() {
+    assert!(Error::internal_mid_exchange("x", TransmissionState::InFlight).is_connection_fatal());
+    assert!(!Error::Internal("x".into()).is_connection_fatal());
+    assert!(!Error::LocalRuntime("x".into()).is_connection_fatal());
+}
+
+/// The central safety property of the driver-death phase: a non-idempotent
+/// command the driver OWNED when it died may have been written, so it reads
+/// the target back (`Reconcile`); one that never reached the driver is
+/// plainly terminal. The same holds for a clean driver exit (`DriverGone`),
+/// which used to lose the phase and so skipped reconciliation too.
+#[test]
+fn only_a_command_the_driver_owned_reconciles_after_driver_death() {
+    let panicked = |phase| Error::DriverPanicked {
+        message: "boom".into(),
+        attempt: Some(crate::error::ImapAttempt::new(phase)),
+    };
+    let classify = |error| {
+        into_account_error(error, ImapErrorContext::operation(AccountOperation::Send))
+            .recovery()
+            .clone()
+    };
+
+    assert_eq!(
+        classify(panicked(TransmissionState::Unsent)),
+        RecoveryClass::InternalFailure
+    );
+    let RecoveryClass::Reconcile(advice) = classify(panicked(TransmissionState::InFlight)) else {
+        panic!("a panic with the command in flight must read the target back");
+    };
+    assert_eq!(
+        advice.reason,
+        bifrost_types::ReconcileReason::InternalFailureAfterSend
+    );
+
+    assert!(classify(Error::driver_gone_at(TransmissionState::Unsent)).is_retryable());
+    assert!(classify(Error::driver_gone_at(TransmissionState::InFlight)).requires_reconciliation());
+}
+
 /// A local refusal made before any byte is never a provider fault. These pin
 /// the recovery each local variant derives to at the account boundary, which
 /// is what a consumer acts on: none may be `ProviderContractViolation`.

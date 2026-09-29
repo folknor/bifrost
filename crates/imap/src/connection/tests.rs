@@ -195,10 +195,20 @@ async fn invariant_driver_panic_surfaces_as_error() {
     let _server = server_task.await.unwrap();
 
     match result {
-        Err(Error::DriverPanicked { message: msg, .. }) => {
+        Err(error @ Error::DriverPanicked { .. }) => {
+            let Error::DriverPanicked { message: msg, .. } = &error else {
+                unreachable!()
+            };
             assert!(
                 msg.contains("intentional panic for test"),
                 "panic message not propagated: {msg}"
+            );
+            // The driver owned this command when it died, so it may have
+            // been written: `InFlight`, which a non-idempotent operation
+            // reads back rather than declaring failed.
+            assert_eq!(
+                error.attempt(),
+                Some(bifrost_types::TransmissionState::InFlight)
             );
         }
         other => panic!("expected DriverPanicked, got: {other:?}"),
@@ -250,6 +260,12 @@ async fn invariant_driver_panic_subsequent_commands_fail() {
             Err(Error::DriverPanicked { .. } | Error::DriverGone { .. })
         ),
         "post-panic command should be DriverPanicked or DriverGone, got: {inner:?}"
+    );
+    // This command never reached the dead driver: `Unsent`, whichever of the
+    // two the caller observed and whether or not it was first to observe.
+    assert_eq!(
+        inner.expect_err("post-panic command fails").attempt(),
+        Some(bifrost_types::TransmissionState::Unsent)
     );
 }
 

@@ -110,28 +110,14 @@ item is what stops that.
     `AuthLost`; and in `crates/jmap/src/sync/error.rs` its rationale comment
     sits above the `MalformedCapability` arm.
   - Graph batch `builder.finalize` failures (`reactions.rs`,
-    `push/dispatch.rs`) derive `Protocol(ContractViolation)`; probably the
-    local-invariant class below, not ruled out that server-supplied ids
-    trigger it.
-
-- **errors: local implementation failures derive as provider faults.** Filed
-  2026-09-29 from the (b) work, NOT covered by that ruling. IMAP's
-  `Error::Internal` (poisoned locks, driver result downcasts, a missing
-  pipeline result slot) and `Error::DriverPanicked` both map to
-  `Protocol(ContractViolation)`, so `ProviderContractViolation` - "contact
-  provider support" for a bug in this library (the SCRAM nonce RNG failure and
-  the STATUS consumer's predicate invariant were moved onto `Internal` by the
-  (b) work, so they share this mapping). Local invariant failures raised
-  after bytes of the exchange are on the wire stay `Error::Protocol` so the
-  connection is retired: "SCRAM server signature missing from client state"
-  (`dispatch/auth.rs`) and the four `driver/upgrade.rs` refusals after a
-  tagged OK to STARTTLS/COMPRESS (a non-plain stream, COMPRESS already
-  active, the poison sentinel, the test memory stream). `Request(Malformed)` is the
-  least-bad EXISTING target but its remediation ("fix the client request") is
-  also wrong; the honest fix is a new public `AccountErrorKind` for an
-  implementation or invariant failure, which is a `bifrost-types` taxonomy
-  decision. Whatever it becomes must not imply the connection is reusable:
-  some of these fire mid-exchange. Wants a ruling.
+    `push/dispatch.rs`) derive `Protocol(ContractViolation)`; probably
+    `Internal(InvariantViolated)` now that the kind exists, not ruled out that
+    server-supplied ids trigger it.
+  - Graph `PageWalk` page-budget exhaustion (`paging.rs`) derives
+    `Protocol(ParseFailed)` via `GraphError::Json`, but an honestly huge
+    collection looks the same: it is the shape Google's walks moved to
+    `Internal(LimitExceeded)` (`PageRefusal`), and the repeated-link arm beside
+    it is the genuine provider fault. Split the two the same way.
 
 - **imap: `Protocol` subkinds are coarser than the evidence.** Filed
   2026-09-29. Sites where the server omitted a mandatory response or field

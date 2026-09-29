@@ -14,10 +14,10 @@
 use bifrost_types::error::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText,
-    EnhancedStatusCode as TypesEnhancedStatusCode, MailboxUnavailableKind, Protocol,
-    ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind, ServerCause,
-    ServerErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
-    TransportKind, WireCause,
+    EnhancedStatusCode as TypesEnhancedStatusCode, InternalCause, InternalErrorKind,
+    MailboxUnavailableKind, Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind,
+    ResourceKind, ServerCause, ServerErrorKind, ThrottleScope, TransmissionState, TransportCause,
+    TransportErrorKind, TransportKind, WireCause,
 };
 
 use crate::error::Error as MessageError;
@@ -150,13 +150,17 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             diagnostic.as_deref(),
             None,
         ),
+        // A client-side invariant (a poisoned pool lock, a command that will
+        // not serialize, a reply routed to the error helper, the LMTP status
+        // bookkeeping disagreeing with itself): the implementation's fault,
+        // never the relay's (`reference/error-model.md`).
         ErrorKind::Internal => build_basic(
             &ctx,
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-            Cause::Wire(WireCause::MalformedResponse {
-                protocol: ctx.protocol,
-                detail: diagnostic.clone().map(DiagnosticText::support_only),
-            }),
+            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+            Cause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                diagnostic.clone().map(DiagnosticText::support_only),
+            )),
             attempt_state,
             diagnostic.as_deref(),
             None,
@@ -908,6 +912,39 @@ mod tests {
         assert!(matches!(
             account.recovery(),
             RecoveryClass::Retry(advice) if matches!(advice.reason, RetryReason::Transport)
+        ));
+    }
+
+    /// A client-side invariant is the implementation's fault, never the
+    /// relay's: `Internal(InvariantViolated)`, reported as a bug. Before the
+    /// send it is terminal; after a send that may have reached the relay it
+    /// reads the target back, because the message may already be queued.
+    #[test]
+    fn an_internal_error_is_internal_not_a_relay_fault() {
+        let unsent = into_account_error(
+            smtp_error::internal("connection pool lock poisoned")
+                .with_attempt(SmtpTransmissionState::Unsent),
+            ctx_smtp_send(),
+        );
+        assert_eq!(
+            unsent.kind(),
+            &AccountErrorKind::Internal(bifrost_types::InternalErrorKind::InvariantViolated)
+        );
+        assert_eq!(unsent.recovery(), &RecoveryClass::InternalFailure);
+        assert_eq!(
+            unsent.suggested_remediation(),
+            Some(&bifrost_types::RemediationAction::ReportBug)
+        );
+
+        let in_flight = into_account_error(
+            smtp_error::internal("server returned fewer LMTP statuses than accepted recipients")
+                .with_attempt(SmtpTransmissionState::InFlight),
+            ctx_smtp_send(),
+        );
+        assert!(matches!(
+            in_flight.recovery(),
+            RecoveryClass::Reconcile(advice)
+                if advice.reason == ReconcileReason::InternalFailureAfterSend
         ));
     }
 

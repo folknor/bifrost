@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
 use crate::encoding::decode_base64url_nopad;
+use crate::error::PageRefusal;
 use crate::headers::find_header_value_case_insensitive;
 #[cfg(test)]
 use crate::types::GmailLabel;
@@ -297,9 +298,7 @@ pub(crate) fn inventory_stream_cancellable(
                 // retry starts from the pre-walk history id and no partial
                 // enumeration can be mistaken for complete coverage.
                 let account_error = error::into_account_error(
-                    crate::error::Error::Local(crate::error::GmailLocalError::Internal {
-                        detail: refusal,
-                    }),
+                    crate::error::Error::from(refusal),
                     error::GmailErrorContext::inventory(),
                 );
                 yield bifrost_types::InventoryEvent::Terminated(account_error);
@@ -661,15 +660,17 @@ fn inventory_walk_refusal(
     seen_page_tokens: &mut HashSet<String>,
     pages_walked: usize,
     next_page_token: Option<&str>,
-) -> Option<String> {
+) -> Option<PageRefusal> {
     let token = next_page_token?;
     if !seen_page_tokens.insert(token.to_string()) {
-        return Some(format!(
+        return Some(PageRefusal::RepeatedToken(format!(
             "gmail users.messages.list repeated page token {token:?}"
-        ));
+        )));
     }
     (pages_walked >= MAX_INVENTORY_PAGES).then(|| {
-        format!("gmail users.messages.list exceeded {MAX_INVENTORY_PAGES} pages in one walk")
+        PageRefusal::BudgetExceeded(format!(
+            "gmail users.messages.list exceeded {MAX_INVENTORY_PAGES} pages in one walk"
+        ))
     })
 }
 
@@ -1115,17 +1116,15 @@ mod tests {
     fn inventory_page_guard_refuses_repetition_and_budget_exhaustion() {
         let mut seen = HashSet::new();
         assert!(inventory_walk_refusal(&mut seen, 1, Some("next")).is_none());
-        assert!(
-            inventory_walk_refusal(&mut seen, 2, Some("next"))
-                .expect("repeated token must refuse")
-                .contains("repeated page token")
-        );
+        let repeated =
+            inventory_walk_refusal(&mut seen, 2, Some("next")).expect("repeated token must refuse");
+        assert!(matches!(repeated, PageRefusal::RepeatedToken(_)));
+        assert!(repeated.detail().contains("repeated page token"));
         let mut fresh = HashSet::new();
-        assert!(
-            inventory_walk_refusal(&mut fresh, MAX_INVENTORY_PAGES, Some("fresh"))
-                .expect("budget must refuse")
-                .contains("exceeded")
-        );
+        let budget = inventory_walk_refusal(&mut fresh, MAX_INVENTORY_PAGES, Some("fresh"))
+            .expect("budget must refuse");
+        assert!(matches!(budget, PageRefusal::BudgetExceeded(_)));
+        assert!(budget.detail().contains("exceeded"));
         assert!(inventory_walk_refusal(&mut fresh, MAX_INVENTORY_PAGES, None).is_none());
     }
 
@@ -1136,8 +1135,10 @@ mod tests {
     fn a_page_tripping_both_guards_is_diagnosed_as_the_repeated_token() {
         let mut seen = HashSet::new();
         seen.insert("cycling".to_string());
-        let detail = inventory_walk_refusal(&mut seen, MAX_INVENTORY_PAGES, Some("cycling"))
+        let refusal = inventory_walk_refusal(&mut seen, MAX_INVENTORY_PAGES, Some("cycling"))
             .expect("a page tripping both guards must refuse");
+        assert!(matches!(refusal, PageRefusal::RepeatedToken(_)));
+        let detail = refusal.detail();
         assert!(
             detail.contains("repeated page token"),
             "repeated-token detection must win over the budget: {detail}",

@@ -109,8 +109,11 @@ pub(in crate::connection) async fn run_starttls_upgrade(
         // type before submitting the upgrade. Defensive: leave the
         // connection dead (Poisoned is already installed).
         state.apply_infrastructure_failure();
-        return Err(Error::Protocol(
-            "STARTTLS requires a plain TCP stream (already TLS or compressed)".into(),
+        // Local invariant after the server's tagged OK: the client's fault,
+        // and the stream is already swapped out, so the connection retires.
+        return Err(Error::internal_mid_exchange(
+            "STARTTLS requires a plain TCP stream (already TLS or compressed)",
+            bifrost_types::TransmissionState::Acknowledged,
         ));
     };
 
@@ -149,9 +152,15 @@ pub(in crate::connection) async fn run_starttls_upgrade(
         cap_consumer,
     )
     .await?;
-    let caps = result
-        .downcast::<Vec<Capability>>()
-        .map_err(|_| Error::Internal("CapabilityConsumer output downcast failed".into()))?;
+    let caps = result.downcast::<Vec<Capability>>().map_err(|_| {
+        // After the TLS swap and a completed post-TLS CAPABILITY: the
+        // driver's view of this connection cannot be trusted, so it
+        // retires rather than returning to the pool.
+        Error::internal_mid_exchange(
+            "CapabilityConsumer output downcast failed after STARTTLS",
+            bifrost_types::TransmissionState::Acknowledged,
+        )
+    })?;
     state.apply_capability_fetch(*caps);
 
     debug!("STARTTLS upgrade complete (RFC 3501 Section 6.2.1)");
@@ -206,23 +215,29 @@ async fn run_compress_upgrade(
     let inner = match old_stream {
         ImapStream::Plain(tcp) => InnerStream::Plain(tcp),
         ImapStream::Tls(tls) => InnerStream::Tls(tls),
+        // Local invariants after the server's tagged OK to COMPRESS, with the
+        // stream already swapped for the poison sentinel: the client's
+        // fault, and the connection retires.
         ImapStream::Compressed(_) => {
             state.apply_infrastructure_failure();
-            return Err(Error::Protocol(
-                "COMPRESS=DEFLATE already active on this connection".into(),
+            return Err(Error::internal_mid_exchange(
+                "COMPRESS=DEFLATE already active on this connection",
+                bifrost_types::TransmissionState::Acknowledged,
             ));
         }
         ImapStream::Poisoned => {
             state.apply_infrastructure_failure();
-            return Err(Error::Protocol(
-                "stream poisoned; connection is dead".into(),
+            return Err(Error::internal_mid_exchange(
+                "stream poisoned; connection is dead",
+                bifrost_types::TransmissionState::Acknowledged,
             ));
         }
         #[cfg(test)]
         ImapStream::Memory(_) => {
             state.apply_infrastructure_failure();
-            return Err(Error::Protocol(
-                "COMPRESS=DEFLATE not supported on in-memory test streams".into(),
+            return Err(Error::internal_mid_exchange(
+                "COMPRESS=DEFLATE not supported on in-memory test streams",
+                bifrost_types::TransmissionState::Acknowledged,
             ));
         }
     };

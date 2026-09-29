@@ -20,9 +20,10 @@
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
-    ErrorScope, GmailSignal, ItemOutcome, MutationSuccess, ObjectId, Protocol, ProtocolErrorKind,
-    Provider, RequestCause, RequestErrorKind, ResourceKind, RetryHint, ServerCause,
-    ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState, WireCause,
+    ErrorScope, GmailSignal, InternalCause, InternalErrorKind, ItemOutcome, MutationSuccess,
+    ObjectId, Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind,
+    RetryHint, ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope,
+    TransmissionState, WireCause,
 };
 use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, TransportErrorKind};
 
@@ -577,7 +578,8 @@ fn terminates_mutation_stream(err: &AccountError) -> bool {
         | RecoveryClass::ClientBug
         | RecoveryClass::ProviderContractViolation
         | RecoveryClass::ProviderRefused
-        | RecoveryClass::UnknownPermanent => {
+        | RecoveryClass::UnknownPermanent
+        | RecoveryClass::InternalFailure => {
             // Permanent terminal: both `NotFound` and `Server(Error{..})`
             // fan out per-id (the batch was transmitted, every id gets
             // a `Failed` lane carrying the same `AccountError`). Other
@@ -1281,20 +1283,32 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
                 .try_build()
                 .expect("valid account error classification")
         }
+        // Client-side failures (`reference/error-model.md`): terminal
+        // `InternalFailure`, remediation `ReportBug`, never the provider.
         GmailLocalError::Internal { detail } => {
-            // Internal failures classify as protocol contract violations
-            // so the engine routes them to telemetry rather than retry.
+            internal(ctx, InternalErrorKind::InvariantViolated, detail)
+        }
+        GmailLocalError::PageBudgetExceeded { detail } => {
+            internal(ctx, InternalErrorKind::LimitExceeded, detail)
+        }
+        // The provider handed back a page token it had already served: a
+        // complete response carried it, so the evidence is `Acknowledged`.
+        GmailLocalError::PageTokenRepeated { detail } => {
+            let detail = DiagnosticText::support_only(detail);
             let mut builder = AccountErrorBuilder::new(
                 AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
                 Cause::Wire(WireCause::MalformedResponse {
                     protocol: Protocol::Gmail,
-                    detail: Some(DiagnosticText::support_only(detail.clone())),
+                    detail: Some(detail.clone()),
                 }),
             )
+            .push_cause(Cause::Attempt(AttemptCause::new(
+                TransmissionState::Acknowledged,
+            )))
             .provider(Provider::Gmail)
             .protocol(Protocol::Gmail)
             .operation(ctx.operation)
-            .text(DiagnosticText::support_only(detail));
+            .text(detail);
             if let Some(scope) = ctx.scope.clone() {
                 builder = builder.scope(scope);
             }
@@ -1303,6 +1317,24 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
                 .expect("valid account error classification")
         }
     }
+}
+
+fn internal(ctx: &GmailErrorContext, kind: InternalErrorKind, detail: String) -> AccountError {
+    let detail = DiagnosticText::support_only(detail);
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::Internal(kind),
+        Cause::Internal(InternalCause::new(kind, Some(detail.clone()))),
+    )
+    .provider(Provider::Gmail)
+    .protocol(Protocol::Gmail)
+    .operation(ctx.operation)
+    .text(detail);
+    if let Some(scope) = ctx.scope.clone() {
+        builder = builder.scope(scope);
+    }
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn map_reason_to_signal(reason: &str) -> GmailSignal {

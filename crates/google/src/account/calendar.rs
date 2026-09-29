@@ -69,16 +69,20 @@ pub(crate) fn calendars_list(
                 return Ok(calendars);
             };
             if !seen_tokens.insert(next_token.clone()) {
-                return Err(calendar_contract_error(
+                return Err(page_refusal(
                     AccountOperation::CalendarsList,
-                    "Google Calendar calendarList repeated a page token".to_string(),
+                    crate::error::PageRefusal::RepeatedToken(
+                        "Google Calendar calendarList repeated a page token".to_string(),
+                    ),
                 ));
             }
             page_token = Some(next_token);
         }
-        Err(calendar_contract_error(
+        Err(page_refusal(
             AccountOperation::CalendarsList,
-            format!("Google Calendar calendarList exceeded {MAX_CALENDAR_LIST_PAGES} pages"),
+            crate::error::PageRefusal::BudgetExceeded(format!(
+                "Google Calendar calendarList exceeded {MAX_CALENDAR_LIST_PAGES} pages"
+            )),
         ))
     })
 }
@@ -1141,9 +1145,11 @@ fn caller_input_error(operation: AccountOperation, message: String) -> AccountEr
     )
 }
 
-fn calendar_contract_error(operation: AccountOperation, detail: String) -> AccountError {
+/// A pagination walk refused to follow its next token: a repeated token is
+/// the provider's contract breach, the page budget is this crate's own limit.
+fn page_refusal(operation: AccountOperation, refusal: crate::error::PageRefusal) -> AccountError {
     error::into_account_error(
-        crate::error::Error::Local(crate::error::GmailLocalError::Internal { detail }),
+        crate::error::Error::from(refusal),
         GmailErrorContext::calendar_collection(operation),
     )
 }
@@ -1877,10 +1883,13 @@ mod tests {
             .await
             .expect_err("the page budget must terminate the walk");
 
-        assert!(matches!(
+        // The budget is this crate's own limit (an honestly huge calendar
+        // list looks the same), so it is `Internal(LimitExceeded)`, not the
+        // provider contract violation the repeated-token arm above is.
+        assert_eq!(
             error.kind(),
-            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
-        ));
+            &AccountErrorKind::Internal(bifrost_types::InternalErrorKind::LimitExceeded)
+        );
         assert_eq!(script.requests().len(), MAX_CALENDAR_LIST_PAGES);
     }
 

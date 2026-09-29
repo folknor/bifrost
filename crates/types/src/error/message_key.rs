@@ -1,6 +1,6 @@
 use super::kind::{
-    AccessErrorKind, AccountErrorKind, AuthErrorKind, ProtocolErrorKind, RequestErrorKind,
-    ResourceKind, ServerErrorKind, SyncStateErrorKind, TransportErrorKind,
+    AccessErrorKind, AccountErrorKind, AuthErrorKind, InternalErrorKind, ProtocolErrorKind,
+    RequestErrorKind, ResourceKind, ServerErrorKind, SyncStateErrorKind, TransportErrorKind,
 };
 
 #[must_use]
@@ -88,6 +88,15 @@ pub(crate) fn derive(kind: &AccountErrorKind) -> &'static str {
             "protocol.partial-response"
         }
         AccountErrorKind::Protocol(ProtocolErrorKind::Unknown) => "protocol.unknown",
+        AccountErrorKind::Internal(InternalErrorKind::InvariantViolated) => {
+            "internal.invariant-violated"
+        }
+        AccountErrorKind::Internal(InternalErrorKind::RuntimeFailure) => "internal.runtime-failure",
+        AccountErrorKind::Internal(InternalErrorKind::Panicked) => "internal.panicked",
+        AccountErrorKind::Internal(InternalErrorKind::AccountContract) => {
+            "internal.account-contract"
+        }
+        AccountErrorKind::Internal(InternalErrorKind::LimitExceeded) => "internal.limit-exceeded",
     }
 }
 
@@ -286,6 +295,26 @@ mod tests {
             (
                 AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
                 "protocol.unknown",
+            ),
+            (
+                AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+                "internal.invariant-violated",
+            ),
+            (
+                AccountErrorKind::Internal(InternalErrorKind::RuntimeFailure),
+                "internal.runtime-failure",
+            ),
+            (
+                AccountErrorKind::Internal(InternalErrorKind::Panicked),
+                "internal.panicked",
+            ),
+            (
+                AccountErrorKind::Internal(InternalErrorKind::AccountContract),
+                "internal.account-contract",
+            ),
+            (
+                AccountErrorKind::Internal(InternalErrorKind::LimitExceeded),
+                "internal.limit-exceeded",
             ),
         ];
 

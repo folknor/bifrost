@@ -701,14 +701,22 @@ impl<T> Pipeline<'_, T> {
         let guard = self.conn.in_flight();
         if self.conn.cmd_tx.send(dcmd).await.is_err() {
             guard.completed();
-            return Err(PipelineError::Disconnected);
+            return Err(PipelineError::Disconnected(
+                self.conn
+                    .observe_driver_panic(bifrost_types::TransmissionState::Unsent)
+                    .await,
+            ));
         }
         let received = result_rx.await;
         guard.completed();
         match received {
             Ok(Ok(results)) => Ok(results),
             Ok(Err(e)) => Err(PipelineError::Driver(e)),
-            Err(_) => Err(PipelineError::Disconnected),
+            Err(_) => Err(PipelineError::Disconnected(
+                self.conn
+                    .observe_driver_panic(bifrost_types::TransmissionState::InFlight)
+                    .await,
+            )),
         }
     }
 }

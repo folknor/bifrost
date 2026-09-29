@@ -295,7 +295,8 @@ fn recovery_fields(recovery: &RecoveryClass) -> RecoveryFields<'_> {
         | RecoveryClass::ClientBug
         | RecoveryClass::ProviderContractViolation
         | RecoveryClass::ProviderRefused
-        | RecoveryClass::UnknownPermanent => (None, None, None, None, None),
+        | RecoveryClass::UnknownPermanent
+        | RecoveryClass::InternalFailure => (None, None, None, None, None),
     }
 }
 
@@ -313,6 +314,7 @@ fn recovery_discriminant(recovery: &RecoveryClass) -> &'static str {
         RecoveryClass::ProviderContractViolation => "provider_contract_violation",
         RecoveryClass::ProviderRefused => "provider_refused",
         RecoveryClass::UnknownPermanent => "unknown_permanent",
+        RecoveryClass::InternalFailure => "internal_failure",
     }
 }
 

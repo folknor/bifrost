@@ -138,5 +138,6 @@ pub(crate) fn account_kind_discriminant(kind: &AccountErrorKind) -> &'static str
         AccountErrorKind::NotFound(_) => "not_found",
         AccountErrorKind::Unsupported(_) => "unsupported",
         AccountErrorKind::Protocol(_) => "protocol",
+        AccountErrorKind::Internal(_) => "internal",
     }
 }

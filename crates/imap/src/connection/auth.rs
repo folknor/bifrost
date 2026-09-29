@@ -1,6 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
 use crate::types::SecretString;
+use bifrost_types::TransmissionState;
 
 impl ImapConnection {
     // -----------------------------------------------------------------------
@@ -862,13 +863,15 @@ impl ImapConnection {
         let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
             guard.completed();
-            return Err(self.observe_driver_panic().await);
+            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
         let received = result_rx.await;
         guard.completed();
         let result = match received {
             Ok(inner) => inner?,
-            Err(_) => return Err(self.observe_driver_panic().await),
+            Err(_) => {
+                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
+            }
         };
         let output = *result
             .downcast::<C::Output>()
@@ -897,13 +900,15 @@ impl ImapConnection {
         let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
             guard.completed();
-            return Err(self.observe_driver_panic().await);
+            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
         let received = result_rx.await;
         guard.completed();
         let result = match received {
             Ok(inner) => inner?,
-            Err(_) => return Err(self.observe_driver_panic().await),
+            Err(_) => {
+                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
+            }
         };
         let output = *result
             .downcast::<C::Output>()
@@ -937,13 +942,15 @@ impl ImapConnection {
         let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
             guard.completed();
-            return Err(self.observe_driver_panic().await);
+            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
         let received = result_rx.await;
         guard.completed();
         let result = match received {
             Ok(inner) => inner?,
-            Err(_) => return Err(self.observe_driver_panic().await),
+            Err(_) => {
+                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
+            }
         };
         let output = *result
             .downcast::<C::Output>()
@@ -983,13 +990,15 @@ impl ImapConnection {
         let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
             guard.completed();
-            return Err(self.observe_driver_panic().await);
+            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
         let received = result_rx.await;
         guard.completed();
         let result = match received {
             Ok(inner) => inner?,
-            Err(_) => return Err(self.observe_driver_panic().await),
+            Err(_) => {
+                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
+            }
         };
         let output = *result
             .downcast::<C::Output>()
@@ -1011,7 +1020,7 @@ impl ImapConnection {
         let guard = self.in_flight();
         if self.cmd_tx.send(dcmd).await.is_err() {
             guard.completed();
-            return Err(self.observe_driver_panic().await);
+            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
         let received = result_rx.await;
         guard.completed();
@@ -1020,7 +1029,7 @@ impl ImapConnection {
                 inner?;
                 Ok(())
             }
-            Err(_) => Err(self.observe_driver_panic().await),
+            Err(_) => Err(self.observe_driver_panic(TransmissionState::InFlight).await),
         }
     }
 }
@@ -1224,7 +1233,7 @@ fn generate_scram_nonce() -> Result<String, Error> {
     getrandom::fill(&mut bytes)
         // A local failure before AUTHENTICATE is submitted: nothing is on the
         // wire, and the server has done nothing wrong.
-        .map_err(|e| Error::Internal(format!("failed to generate SCRAM nonce: {e}")))?;
+        .map_err(|e| Error::LocalRuntime(format!("failed to generate SCRAM nonce: {e}")))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 

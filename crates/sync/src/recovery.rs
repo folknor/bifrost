@@ -244,10 +244,15 @@ pub(crate) fn cursor_decode_failure(operation: AccountOperation) -> AccountError
 /// re-poll the same unchanged cursor at the scope's cadence forever: no
 /// backoff past `poll_max`, no recovery dispatch, no `Terminated` event, and
 /// a consumer that sees a scope which has silently stopped making progress
-/// with nothing in the stream to say so. `ProviderContractViolation` is
-/// terminal, so `plan_recovery` stops the scope instead - the honest outcome,
-/// because a provider emitting a nonsense boundary does not heal by being
-/// asked again.
+/// with nothing in the stream to say so.
+///
+/// It is `Internal(AccountContract)`, not a provider fault: the boundary and
+/// the checkpoint are minted by the `Account` implementation, which is client
+/// code - bifrost's or a consumer's - so "contact provider support" would send
+/// the operator to the one party that did nothing wrong. It derives the
+/// terminal `InternalFailure`, so `plan_recovery` stops the scope - the honest
+/// outcome, because an implementation emitting a nonsense boundary does not
+/// heal by being asked again.
 ///
 /// The protocol tag is read off the offending checkpoint. There is no
 /// protocol accessor on `dyn Account`, so where the checkpoint carries no
@@ -292,12 +297,15 @@ fn contract_violation(
     detail: &'static str,
 ) -> AccountError {
     AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation),
-        Cause::Wire(bifrost_types::WireCause::MalformedResponse {
-            protocol: checkpoint_protocol(checkpoint),
-            detail: Some(bifrost_types::DiagnosticText::support_only(detail)),
-        }),
+        AccountErrorKind::Internal(bifrost_types::InternalErrorKind::AccountContract),
+        Cause::Internal(bifrost_types::InternalCause::new(
+            bifrost_types::InternalErrorKind::AccountContract,
+            Some(bifrost_types::DiagnosticText::support_only(detail)),
+        )),
     )
+    // The protocol the offending implementation speaks, for telemetry: it
+    // used to ride inside the wire cause this replaced.
+    .protocol(checkpoint_protocol(checkpoint))
     .operation(operation)
     .scope(ErrorScope::Cursor(scope.clone()))
     .try_build()
@@ -625,6 +633,44 @@ mod tests {
             backfill.contains("backfill checkpoint"),
             "and the message must name what actually happened: {backfill}"
         );
+    }
+
+    /// Both violations are the `Account` implementation's, not the
+    /// provider's: they classify `Internal(AccountContract)`, stop the scope,
+    /// point at the implementation, and keep the protocol the offending
+    /// checkpoint names.
+    #[test]
+    fn a_contract_violation_blames_the_implementation_not_the_provider() {
+        let scope = CursorScope::Account;
+        let checkpoint = bifrost_types::Checkpoint::Change(bifrost_types::ChangeCursor {
+            scope: scope.clone(),
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: Vec::new(),
+            },
+            advanced_through: None,
+            envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
+        });
+        for error in [
+            batch_boundary_violation(Some(&checkpoint), AccountOperation::SyncChanges, &scope),
+            backfill_checkpoint_on_changes(
+                Some(&checkpoint),
+                AccountOperation::SyncChanges,
+                &scope,
+            ),
+        ] {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Internal(bifrost_types::InternalErrorKind::AccountContract)
+            );
+            assert_eq!(error.recovery(), &RecoveryClass::InternalFailure);
+            assert_eq!(
+                error.suggested_remediation(),
+                Some(&bifrost_types::RemediationAction::ReportBug)
+            );
+            assert_eq!(error.protocol(), Some(bifrost_types::Protocol::Imap));
+        }
     }
 
     fn build_retry() -> AccountError {
