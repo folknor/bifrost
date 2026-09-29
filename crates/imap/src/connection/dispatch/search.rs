@@ -41,34 +41,25 @@ impl SearchConsumer {
         }
     }
 
-    /// Everything except the response this command consumed.
+    /// The responses that may reach the event queue once the command has
+    /// succeeded: the generic `Either` buffer, in wire order, and nothing else.
     ///
-    /// The chosen ESEARCH is solicited: it answers this tag, so it belongs to
-    /// the command whether or not the command can turn it into a flat
-    /// [`SearchResult`]. Only genuinely extra or unsolicited responses may
-    /// reach the event queue, and they keep the order they arrived in.
-    fn reclassified_extras(self, chosen: Chosen) -> Vec<UntaggedResponse> {
-        let mut buffered = self.buffered;
-        let skip_tag_correlated = usize::from(matches!(chosen, Chosen::TagCorrelated));
-        for e in self.tag_correlated.into_iter().skip(skip_tag_correlated) {
-            buffered.push(UntaggedResponse::Esearch(e));
-        }
-        let skip_tagless = usize::from(matches!(chosen, Chosen::Tagless));
-        for e in self.tagless_esearch.into_iter().skip(skip_tagless) {
-            buffered.push(UntaggedResponse::Esearch(e));
-        }
-        for (uids, mod_seq) in self.search_responses {
-            buffered.push(UntaggedResponse::Search { uids, mod_seq });
-        }
-        buffered
+    /// Every SEARCH and ESEARCH this consumer accumulated is dropped, the
+    /// chosen one because it is this command's answer and the rest because
+    /// they are surplus solicited data: a second tag-correlated ESEARCH, a
+    /// tagless ESEARCH when a correlated one won, and every legacy SEARCH when
+    /// an ESEARCH won. `classify` makes SEARCH and ESEARCH `OnlySolicited`
+    /// inside a search command and `Impossible` anywhere else, so they are
+    /// never asynchronous mailbox notifications, and publishing a surplus copy
+    /// would emit an event the classifier says cannot exist. This is the same
+    /// answer the failure arm of `finalize` gives.
+    ///
+    /// An ESEARCH correlated to a DIFFERENT in-flight tag is not accumulated
+    /// here; `on_response` buffers it with the `Either` responses, so it is
+    /// still surrendered.
+    fn reclassified_extras(self) -> Vec<UntaggedResponse> {
+        self.buffered
     }
-}
-
-/// Which solicited response this command consumed.
-#[derive(Clone, Copy)]
-enum Chosen {
-    TagCorrelated,
-    Tagless,
 }
 
 impl Consumer for SearchConsumer {
@@ -129,7 +120,7 @@ impl Consumer for SearchConsumer {
             });
             return Finalized {
                 output,
-                reclassified_as_events: (*self).reclassified_extras(Chosen::TagCorrelated),
+                reclassified_as_events: (*self).reclassified_extras(),
             };
         }
 
@@ -141,18 +132,15 @@ impl Consumer for SearchConsumer {
             });
             return Finalized {
                 output,
-                reclassified_as_events: (*self).reclassified_extras(Chosen::Tagless),
+                reclassified_as_events: (*self).reclassified_extras(),
             };
         }
 
         // Pass 3: legacy SEARCH.
-        let mut search_iter = self.search_responses.into_iter();
-        if let Some((uids, mod_seq)) = search_iter.next() {
-            let mut buffered = self.buffered;
-            for (uids, mod_seq) in search_iter {
-                buffered.push(UntaggedResponse::Search { uids, mod_seq });
-            }
-            return Finalized::success(SearchResult { ids: uids, mod_seq }, buffered);
+        // Any further SEARCH is surplus solicited data and is dropped, like
+        // every other surplus SEARCH/ESEARCH (see `reclassified_extras`).
+        if let Some((uids, mod_seq)) = self.search_responses.into_iter().next() {
+            return Finalized::success(SearchResult { ids: uids, mod_seq }, self.buffered);
         }
 
         Finalized::failure(
@@ -302,18 +290,34 @@ pub(crate) struct CopyConsumer {
     /// All responses routed here. COPY has no solicited untagged
     /// responses, so everything is reclassified as events.
     buffered: Vec<UntaggedResponse>,
-    /// COPYUID response code extracted from an untagged `* OK [COPYUID ...]`.
+    /// The whole untagged `* OK [COPYUID ...]` response, with the length of
+    /// `buffered` when it arrived so it can be put back in wire order.
     /// Some servers (e.g. Dovecot) send COPYUID in an untagged OK rather
     /// than in the tagged OK (RFC 4315 Section3).
-    code: Option<ResponseCode>,
+    ///
+    /// The response is kept whole, not narrowed to its `ResponseCode`, so that
+    /// whenever it is not consumed as this command's answer it can be
+    /// surrendered verbatim like any other untagged OK.
+    copyuid: Option<(usize, UntaggedResponse)>,
 }
 
 impl CopyConsumer {
     pub(crate) fn new() -> Self {
         Self {
             buffered: Vec::new(),
-            code: None,
+            copyuid: None,
         }
+    }
+
+    /// `buffered` with the retained untagged COPYUID, if any, put back at the
+    /// position it arrived in.
+    fn surrender_all(self) -> Vec<UntaggedResponse> {
+        let mut events = self.buffered;
+        if let Some((pos, resp)) = self.copyuid {
+            // `buffered` only ever grows, so `pos <= events.len()`.
+            events.insert(pos, resp);
+        }
+        events
     }
 }
 
@@ -330,12 +334,12 @@ impl Consumer for CopyConsumer {
         // Buffer everything for reclassification as events.
         match resp {
             // RFC 4315 Section3: some servers send COPYUID in an untagged OK.
-            UntaggedResponse::Status {
+            resp @ UntaggedResponse::Status {
                 status: UntaggedStatus::Ok,
-                code: code_opt @ Some(ResponseCode::CopyUid { .. }),
+                code: Some(ResponseCode::CopyUid { .. }),
                 ..
-            } if self.code.is_none() => {
-                self.code = code_opt;
+            } if self.copyuid.is_none() => {
+                self.copyuid = Some((self.buffered.len(), resp));
             }
             other => self.buffered.push(other),
         }
@@ -348,19 +352,29 @@ impl Consumer for CopyConsumer {
     ) -> Finalized<CopyResult> {
         // RFC 4315 Section3: server SHOULD return COPYUID response code.
         match tagged.require_ok() {
-            Ok(tagged) => Finalized::success(
-                CopyResult {
-                    code: tagged.code.or(self.code),
-                },
-                self.buffered,
-            ),
-            // The `Either` buffer is surrendered: COPY solicits no untagged
-            // response, so everything in it is an asynchronous notification
-            // and survives the failure. The captured untagged
-            // `OK [COPYUID ...]` is not re-emitted: it is this command's own
-            // answer, and only its response code was retained anyway, so
-            // there is nothing faithful left to publish.
-            Err(e) => Finalized::failure(e, self.buffered),
+            Ok(tagged) => {
+                // The tagged code wins. If it is present, the retained
+                // untagged OK was not used as this command's answer, so it is
+                // surrendered like any other untagged OK. If it is absent,
+                // the untagged OK supplies the code and is consumed.
+                if tagged.code.is_some() {
+                    return Finalized::success(
+                        CopyResult { code: tagged.code },
+                        (*self).surrender_all(),
+                    );
+                }
+                let code = match self.copyuid {
+                    Some((_, UntaggedResponse::Status { code, .. })) => code,
+                    _ => None,
+                };
+                Finalized::success(CopyResult { code }, self.buffered)
+            }
+            // COPY solicits no untagged response, so everything routed here
+            // is an asynchronous notification and survives the failure,
+            // including the untagged `OK [COPYUID ...]`, re-emitted verbatim.
+            // A COPYUID naming a copy the server then failed is not this
+            // command's answer, and it is not this consumer's to drop.
+            Err(e) => Finalized::failure(e, (*self).surrender_all()),
         }
     }
 }
@@ -574,5 +588,188 @@ impl Consumer for ExpungeConsumer {
                 Finalized::failure(e, reclassified)
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::types::response::StatusKind;
+
+    fn ctx() -> ConsumerContext<'static> {
+        ConsumerContext {
+            capabilities: &[],
+            enabled: &[],
+            command_target: None,
+            command_tag: "A001",
+        }
+    }
+
+    fn tagged(status: StatusKind, code: Option<ResponseCode>) -> TaggedResponse {
+        TaggedResponse {
+            tag: "A001".into(),
+            status,
+            code,
+            text: "done".into(),
+        }
+    }
+
+    fn esearch(tag: Option<&str>, uid: u32) -> UntaggedResponse {
+        UntaggedResponse::Esearch(EsearchResponse {
+            tag: tag.map(ToOwned::to_owned),
+            uid: true,
+            all: vec![UidRange::single(uid)],
+            ..EsearchResponse::default()
+        })
+    }
+
+    fn feed(consumer: &mut impl Consumer, resp: UntaggedResponse) {
+        consumer.on_response(resp, NotifyFlags::default(), &ctx());
+    }
+
+    fn copyuid(dest: u32) -> ResponseCode {
+        ResponseCode::CopyUid {
+            uid_validity: 7,
+            source_uids: vec![UidRange::single(1)],
+            dest_uids: vec![UidRange::single(dest)],
+        }
+    }
+
+    fn untagged_ok(code: Option<ResponseCode>, text: &str) -> UntaggedResponse {
+        UntaggedResponse::Status {
+            status: UntaggedStatus::Ok,
+            code,
+            text: text.into(),
+        }
+    }
+
+    /// Surplus solicited SEARCH/ESEARCH is dropped on success: a second
+    /// correlated ESEARCH, a tagless ESEARCH beside a correlated winner, and
+    /// legacy SEARCH beside an ESEARCH winner. Only the `Either` responses
+    /// survive, in wire order.
+    #[test]
+    fn search_success_drops_surplus_search_and_esearch() {
+        let mut consumer = SearchConsumer::new();
+        feed(&mut consumer, UntaggedResponse::Exists(1));
+        feed(&mut consumer, esearch(Some("A001"), 4));
+        feed(&mut consumer, esearch(Some("A001"), 9));
+        feed(&mut consumer, esearch(None, 11));
+        feed(
+            &mut consumer,
+            UntaggedResponse::Search {
+                uids: vec![5],
+                mod_seq: None,
+            },
+        );
+        feed(&mut consumer, UntaggedResponse::Expunge(2));
+
+        let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
+        assert_eq!(result.output.unwrap().ids, vec![4]);
+        assert_eq!(
+            result.reclassified_as_events,
+            vec![UntaggedResponse::Exists(1), UntaggedResponse::Expunge(2)]
+        );
+    }
+
+    /// Tagless winner: surplus tagless ESEARCH and legacy SEARCH are dropped.
+    #[test]
+    fn search_success_drops_surplus_when_tagless_esearch_wins() {
+        let mut consumer = SearchConsumer::new();
+        feed(&mut consumer, esearch(None, 4));
+        feed(&mut consumer, esearch(None, 9));
+        feed(
+            &mut consumer,
+            UntaggedResponse::Search {
+                uids: vec![5],
+                mod_seq: None,
+            },
+        );
+
+        let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
+        assert_eq!(result.output.unwrap().ids, vec![4]);
+        assert!(result.reclassified_as_events.is_empty());
+    }
+
+    /// Legacy SEARCH winner: the second SEARCH is dropped.
+    #[test]
+    fn search_success_drops_surplus_legacy_search() {
+        let mut consumer = SearchConsumer::new();
+        feed(
+            &mut consumer,
+            UntaggedResponse::Search {
+                uids: vec![3],
+                mod_seq: None,
+            },
+        );
+        feed(
+            &mut consumer,
+            UntaggedResponse::Search {
+                uids: vec![8],
+                mod_seq: None,
+            },
+        );
+
+        let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
+        assert_eq!(result.output.unwrap().ids, vec![3]);
+        assert!(result.reclassified_as_events.is_empty());
+    }
+
+    /// An untagged COPYUID OK that supplies the result is consumed, and the
+    /// surrounding `Either` responses survive.
+    #[test]
+    fn copy_consumes_untagged_copyuid_when_tagged_ok_has_no_code() {
+        let mut consumer = CopyConsumer::new();
+        feed(&mut consumer, UntaggedResponse::Exists(3));
+        feed(&mut consumer, untagged_ok(Some(copyuid(20)), "copied"));
+
+        let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
+        assert_eq!(result.output.unwrap().code, Some(copyuid(20)));
+        assert_eq!(
+            result.reclassified_as_events,
+            vec![UntaggedResponse::Exists(3)]
+        );
+    }
+
+    /// The tagged code wins, so the untagged COPYUID OK was not used and is
+    /// surrendered whole, in wire order.
+    #[test]
+    fn copy_surrenders_untagged_copyuid_shadowed_by_tagged_code() {
+        let mut consumer = CopyConsumer::new();
+        feed(&mut consumer, UntaggedResponse::Exists(3));
+        feed(&mut consumer, untagged_ok(Some(copyuid(20)), "copied"));
+        feed(&mut consumer, UntaggedResponse::Expunge(1));
+
+        let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, Some(copyuid(30))), &ctx());
+        assert_eq!(result.output.unwrap().code, Some(copyuid(30)));
+        assert_eq!(
+            result.reclassified_as_events,
+            vec![
+                UntaggedResponse::Exists(3),
+                untagged_ok(Some(copyuid(20)), "copied"),
+                UntaggedResponse::Expunge(1),
+            ]
+        );
+    }
+
+    /// On a tagged NO the retained untagged OK survives verbatim, text
+    /// included, at its wire position.
+    #[test]
+    fn copy_failure_surrenders_untagged_copyuid_verbatim() {
+        let mut consumer = CopyConsumer::new();
+        feed(&mut consumer, UntaggedResponse::Exists(3));
+        feed(&mut consumer, untagged_ok(Some(copyuid(20)), "copied"));
+        feed(&mut consumer, UntaggedResponse::Expunge(1));
+
+        let result = Box::new(consumer).finalize(tagged(StatusKind::No, None), &ctx());
+        assert!(result.output.is_err());
+        assert_eq!(
+            result.reclassified_as_events,
+            vec![
+                UntaggedResponse::Exists(3),
+                untagged_ok(Some(copyuid(20)), "copied"),
+                UntaggedResponse::Expunge(1),
+            ]
+        );
     }
 }

@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 
 use crate::types::response::Capability;
 
@@ -48,18 +48,42 @@ pub(crate) struct EncodeOptions {
 }
 
 impl EncodeOptions {
-    /// Check whether the server advertises a specific capability.
+    /// Check whether the capability is usable on this connection, through the
+    /// single authority `crate::types::profile::supports` (advertised, implied
+    /// by QRESYNC for CONDSTORE, or folded into active IMAP4rev2).
     pub(super) fn has_capability(&self, cap: &Capability) -> bool {
-        self.capabilities.contains(cap) || self.rev2_implies(cap)
+        crate::types::profile::supports(&self.capabilities, &self.enabled, cap)
     }
 
     /// Check whether CONDSTORE is available (explicitly or via QRESYNC).
     ///
     /// RFC 7162 Section 3.2.3: a server that advertises QRESYNC implicitly
-    /// supports CONDSTORE. The encoder checks this whenever a CONDSTORE
-    /// modifier (CHANGEDSINCE, UNCHANGEDSINCE, VANISHED) is present.
+    /// supports CONDSTORE; the authority carries that rule. The encoder checks
+    /// this whenever a CONDSTORE modifier (CHANGEDSINCE, UNCHANGEDSINCE,
+    /// VANISHED) is present.
     pub(super) fn has_condstore(&self) -> bool {
-        self.has_capability(&Capability::Condstore) || self.has_capability(&Capability::QResync)
+        self.has_capability(&Capability::Condstore)
+    }
+
+    /// Whether `UTF8=ACCEPT` (RFC 6855) has been enabled on this connection.
+    ///
+    /// Narrower than [`utf8_mode`](Self::utf8_mode), which is also true under
+    /// active `IMAP4rev2`: only `UTF8=ACCEPT` obliges APPEND to wrap message
+    /// data in the RFC 6855 Section 4 `UTF8 (...)` data extension.
+    pub(super) fn utf8_accept_enabled(&self) -> bool {
+        self.enabled
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"))
+    }
+
+    /// Whether `literal8` may carry the non-synchronizing `+` modifier.
+    ///
+    /// RFC 7888 Section 6: on `IMAP4rev1` only when BOTH BINARY and a literal
+    /// extension apply (the literal-extension half is the caller's
+    /// [`LiteralMode`]). RFC 9051 Section 9 redefines `literal8` for pure
+    /// `IMAP4rev2` with no `+` modifier, so it is never eligible there.
+    pub(super) fn literal8_non_sync_allowed(&self) -> bool {
+        self.capabilities.contains(&Capability::Binary) && !self.imap4rev2_active()
     }
 
     /// RFC 9051 Section6.3.1, via the single authority in
@@ -67,32 +91,6 @@ impl EncodeOptions {
     /// coherent `(capabilities, enabled)` pair and hands it over.
     fn imap4rev2_active(&self) -> bool {
         crate::types::profile::imap4rev2_active(&self.capabilities, &self.enabled)
-    }
-
-    fn rev2_implies(&self, capability: &Capability) -> bool {
-        self.imap4rev2_active()
-            && matches!(
-                capability,
-                Capability::Binary
-                    | Capability::Enable
-                    | Capability::Esearch
-                    | Capability::Idle
-                    | Capability::ListExtended
-                    | Capability::ListStatus
-                    | Capability::LiteralMinus
-                    | Capability::LiteralPlus
-                    | Capability::Move
-                    | Capability::Namespace
-                    | Capability::ObjectId
-                    | Capability::SaslIr
-                    | Capability::SaveDate
-                    | Capability::SearchRes
-                    | Capability::SpecialUse
-                    | Capability::StatusDeleted
-                    | Capability::StatusSize
-                    | Capability::UidPlus
-                    | Capability::Unselect
-            )
     }
 }
 
@@ -162,6 +160,11 @@ impl EncodedCommand {
     /// must wait for a `+` continuation response (RFC 3501 Section 4.3).
     pub(crate) fn segments(&self) -> &[BytesMut] {
         &self.segments
+    }
+
+    /// Consume the command and hand over its segments without copying.
+    pub(super) fn into_segments(self) -> Vec<BytesMut> {
+        self.segments
     }
 
     /// Concatenate all segments into a single buffer.
@@ -251,6 +254,42 @@ impl EncodedCommand {
         // If no synchronizing literals were found, the whole buffer is one
         // segment (already pushed above when seg_start == 0).
         Self { segments }
+    }
+}
+
+/// An encoded command whose literal bodies are held by reference, not copied.
+///
+/// [`EncodedCommand`] is one flat buffer per segment, which is the right shape
+/// for commands whose literals are short strings. APPEND carries whole
+/// messages, so building it that way would copy each body into the command
+/// buffer and then again when splitting at literal boundaries. This type keeps
+/// each body as the caller's own [`Bytes`] (a reference-count bump) and only
+/// allocates for the small command syntax around it.
+///
+/// The segmentation contract is [`EncodedCommand`]'s: the caller writes every
+/// chunk of `segments()[0]` in order, waits for a server `+` continuation,
+/// writes `segments()[1]`, and so on, with no wait after the last segment.
+/// Segments are never empty; a synchronizing literal ends its segment on the
+/// marker and the next segment begins with the body. A segment may hold several
+/// chunks (marker text, a non-synchronizing body, the next message's syntax).
+#[derive(Debug, Clone)]
+pub(crate) struct ChunkedCommand {
+    segments: Vec<Vec<Bytes>>,
+}
+
+impl ChunkedCommand {
+    pub(super) fn new(segments: Vec<Vec<Bytes>>) -> Self {
+        debug_assert!(
+            segments.iter().all(|segment| !segment.is_empty()),
+            "ChunkedCommand segments must not be empty"
+        );
+        Self { segments }
+    }
+
+    /// The wire segments. Between consecutive segments the connection must
+    /// wait for a `+` continuation response (RFC 3501 Section 4.3).
+    pub(crate) fn segments(&self) -> &[Vec<Bytes>] {
+        &self.segments
     }
 }
 

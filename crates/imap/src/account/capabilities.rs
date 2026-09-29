@@ -34,7 +34,7 @@ pub(crate) fn build_capabilities(
             || super::folder_registry::leaf_name(folder.name.as_str(), folder.delimiter)
                 .eq_ignore_ascii_case("drafts")
     });
-    let can_expunge_by_uid = profile.supports(Capability::UidPlus) || profile.imap4rev2;
+    let can_expunge_by_uid = profile.supports(Capability::UidPlus);
     let has_thread_references = profile.capabilities.iter().any(
         |cap| matches!(cap, Capability::Thread(alg) if alg.eq_ignore_ascii_case("REFERENCES")),
     );

@@ -1,6 +1,4 @@
 #![allow(clippy::wildcard_imports)]
-use bytes::BytesMut;
-
 use super::*;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -33,10 +31,16 @@ impl ImapConnection {
 
     /// APPEND a message to a mailbox (RFC 3501 Section 6.3.11).
     ///
-    /// Handles literal synchronization: sends header with `{count}\r\n`,
-    /// waits for `+` continuation, then sends literal data.
-    /// Uses LITERAL+ (RFC 7888 Section 4) `{count+}` when the
-    /// server advertises it.
+    /// The handle only carries the request to the driver; the driver encodes
+    /// it from live protocol state when it executes (literal synchronization,
+    /// LITERAL+/LITERAL- markers, `literal8` for NUL bodies, the RFC 6855
+    /// `UTF8 (` wrapper, mailbox encoding). See
+    /// [`encode_append`](crate::codec::encode::encode_append).
+    ///
+    /// `message` is borrowed, so it is copied once into a shared buffer to
+    /// cross the driver channel. A caller that already holds the body as
+    /// [`bytes::Bytes`] should use [`append_message`](Self::append_message),
+    /// which sends that allocation to the socket without copying it.
     ///
     /// Returns `Some((uid_validity, uid))` when the server supports UIDPLUS
     /// (RFC 4315) and includes an `[APPENDUID]` response code, otherwise `None`.
@@ -48,113 +52,42 @@ impl ImapConnection {
         message: &[u8],
         timeout: Duration,
     ) -> Result<Option<(u32, u32)>, Error> {
+        let mut msg = AppendMessage::new(bytes::Bytes::copy_from_slice(message));
+        msg.flags = flags.to_vec();
+        msg.date = date.map(str::to_owned);
+        self.append_message(mailbox, msg, timeout).await
+    }
+
+    /// APPEND one owned message (RFC 3501 Section 6.3.11), without copying its
+    /// body: the `Bytes` allocation is written to the socket as it is.
+    ///
+    /// Otherwise identical to [`append`](Self::append), including the
+    /// APPENDLIMIT (RFC 7889) preflight and its `Unsent` transmission evidence.
+    pub async fn append_message(
+        &self,
+        mailbox: &str,
+        message: AppendMessage,
+        timeout: Duration,
+    ) -> Result<Option<(u32, u32)>, Error> {
         use super::dispatch::AppendConsumer;
 
         self.check_utf8_only_enforced()?;
-        // RFC 3501 Section 6.3.11: APPEND is valid in Authenticated and Selected states.
+        // RFC 3501 Section 6.3.11: APPEND is valid in Authenticated and Selected
+        // states. Only an early refusal - the driver re-checks against live
+        // state when it executes the command.
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         if let Some(limit) = self.append_limit_for_mailbox(mailbox, timeout).await? {
-            self.check_append_limit(message.len(), limit)?;
+            self.check_append_limit(message.data.len(), limit)?;
         }
 
-        // ONE snapshot read for every decision these bytes bake in. Taken
-        // separately, `utf8_enabled` and the literal kind could disagree - a
-        // publish landing between them opened `UTF8 (~{` and closed with a bare
-        // CRLF, a malformed APPEND whose literal body then desynchronized the
-        // server's parse.
-        let policy = self.append_wire_policy();
-        let utf8_enabled = policy.utf8_enabled;
-        let literal_kind = policy.literal_kind(message)?;
-        let effective_non_sync = policy.literal_is_non_sync(literal_kind, message.len());
-        // RFC 7888 Sections 4-5: determine the literal mode for the encoder.
-        let mode = policy.mode;
-
-        // Build the complete wire bytes as a single buffer.
-        // The driver will send them with literal synchronization handling.
-        let tag = self.next_prebuilt_tag();
-        // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: encode mailbox name
-        // with INBOX normalization and MUTF-7 when not in UTF-8 mode.
-        let wire_mailbox = crate::codec::encode::encode_mailbox_str(mailbox, utf8_enabled);
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(tag.as_bytes());
-        buf.extend_from_slice(b" APPEND ");
-        // RFC 6855 Section 3: when UTF8=ACCEPT is active, the server MUST accept
-        // UTF-8 in quoted strings, so non-ASCII mailbox names can use quoted form
-        // instead of falling back to a synchronizing literal.
-        // RFC 7888 Sections 4-5: use non-synchronizing literal when available.
-        encode_quoted_or_literal_utf8(&mut buf, wire_mailbox.as_bytes(), utf8_enabled, mode);
-
-        // RFC 3501 Section 6.3.11 / RFC 9051 Section 6.3.12: \Recent is
-        // server-only and \* is not valid in APPEND flag lists. Filter them
-        // out just like encode_multi_append_header does.
-        let filtered_flags: Vec<&Flag> = flags
-            .iter()
-            .filter(|f| !matches!(f, Flag::Recent | Flag::Wildcard))
-            .collect();
-        // Validate custom flag keywords contain only ATOM-CHARs (RFC 3501 Section 9).
-        for flag in &filtered_flags {
-            if let Flag::Custom(s) = flag {
-                crate::codec::encode::validate_flag_keyword(s)?;
-            }
-        }
-        if !filtered_flags.is_empty() {
-            buf.extend_from_slice(b" (");
-            for (i, flag) in filtered_flags.iter().enumerate() {
-                if i > 0 {
-                    buf.extend_from_slice(b" ");
-                }
-                buf.extend_from_slice(flag.as_imap_str().as_bytes());
-            }
-            buf.extend_from_slice(b")");
-        }
-
-        if let Some(d) = date {
-            // Validate against the date-time production (RFC 3501 Section 9).
-            crate::codec::encode::validate_append_datetime(d)?;
-            // Date-time is a quoted string (RFC 3501 Section 9).
-            buf.extend_from_slice(b" ");
-            // RFC 7888 Sections 4-5: use non-synchronizing literal when available.
-            encode_quoted_or_literal(&mut buf, d.as_bytes(), mode);
-        }
-
-        // Literal header.
-        // RFC 6855 Section 4: when UTF8=ACCEPT is enabled, use the UTF8
-        // APPEND data extension: `UTF8 (~{size}\r\n<message>)`.
-        // RFC 3516 Section 4.4: APPEND data containing NUL octets must use
-        // the `literal8` prefix `~`, not classic `literal` syntax.
-        // RFC 7888 Section 6: non-synchronizing literal8 (`~{N+}\r\n`) is
-        // only valid when BOTH BINARY and LITERAL+/LITERAL- permit it.
-        match literal_kind {
-            AppendLiteralKind::Utf8Literal8 => buf.extend_from_slice(b" UTF8 (~{"),
-            AppendLiteralKind::Literal8 => buf.extend_from_slice(b" ~{"),
-            AppendLiteralKind::Literal => buf.extend_from_slice(b" {"),
-        }
-        buf.extend_from_slice(message.len().to_string().as_bytes());
-        if effective_non_sync {
-            buf.extend_from_slice(b"+");
-        }
-        buf.extend_from_slice(b"}\r\n");
-
-        // Literal data + closing delimiter.
-        buf.extend_from_slice(message);
-        if utf8_enabled {
-            // RFC 6855 Section 4: close the UTF8 data extension group.
-            buf.extend_from_slice(b")\r\n");
-        } else {
-            buf.extend_from_slice(b"\r\n");
-        }
-
-        // Submit the pre-built bytes to the driver task.
         tokio::time::timeout(
             remaining_timeout(deadline)?,
-            self.submit_prebuilt(
-                buf,
-                tag,
-                crate::types::CommandKind::Append,
-                None,
-                policy.wire_assumptions(),
+            self.submit_append(
+                mailbox.to_owned(),
+                vec![message],
+                false,
                 AppendConsumer::default(),
             ),
         )
@@ -169,13 +102,15 @@ impl ImapConnection {
     /// The first message includes the mailbox name; subsequent messages
     /// follow immediately with their own flag/date/literal (RFC 3502 Section 3).
     ///
-    /// Checks APPENDLIMIT (RFC 7889) per message and uses LITERAL+
-    /// (RFC 7888 Section 4) when the server advertises it.
+    /// Checks APPENDLIMIT (RFC 7889) per message. Everything else - the
+    /// MULTIAPPEND capability, LITERAL+ markers (RFC 7888), BINARY for
+    /// NUL-bearing bodies - is validated and encoded by the driver against
+    /// live state when it executes the command. The bodies are shared
+    /// `Bytes`, so this clones reference counts, not message data.
     ///
     /// Returns a `Vec<(uid_validity, uid)>` extracted from `[APPENDUID]` response
     /// codes (RFC 4315 UIDPLUS). The vec may be empty if the server does not
     /// support UIDPLUS.
-    #[allow(clippy::too_many_lines)]
     pub async fn multi_append(
         &self,
         mailbox: &str,
@@ -185,29 +120,24 @@ impl ImapConnection {
         use super::dispatch::MultiAppendConsumer;
 
         self.check_utf8_only_enforced()?;
-        // RFC 3502 Section 3: MULTIAPPEND is valid in Authenticated and Selected states.
+        // RFC 3502 Section 3: MULTIAPPEND is valid in Authenticated and Selected
+        // states. Only an early refusal - the driver re-checks against live
+        // state when it executes the command.
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
-
-        // Require MULTIAPPEND capability (RFC 3502 Section 3).
-        // Also snapshot APPENDLIMIT and BINARY behavior before any STATUS
-        // lookup for a mailbox-specific limit.
-        let (has_multiappend, advertised_limits) = {
-            let snap = self.state_rx.borrow();
-            let has_multiappend = snap.capabilities.contains(&Capability::MultiAppend);
-            let advertised_limits = AdvertisedAppendLimits::from_capabilities(&snap.capabilities);
-            drop(snap);
-            (has_multiappend, advertised_limits)
-        };
-
-        if !has_multiappend {
-            return Err(Error::MissingCapability("MULTIAPPEND".into()));
-        }
 
         if messages.is_empty() {
             return Err(Error::Protocol(
                 "MULTIAPPEND requires at least one message".into(),
             ));
         }
+
+        // Snapshot the advertised APPENDLIMIT before any STATUS lookup for a
+        // mailbox-specific limit. This is the only handle-side read of
+        // capabilities: it feeds the client-side size check, not wire bytes.
+        let advertised_limits = {
+            let snap = self.state_rx.borrow();
+            AdvertisedAppendLimits::from_capabilities(&snap.capabilities)
+        };
 
         let deadline = tokio::time::Instant::now() + timeout;
         if let Some(limit) = self
@@ -219,94 +149,12 @@ impl ImapConnection {
             }
         }
 
-        // ONE snapshot read, taken AFTER the APPENDLIMIT `STATUS` await above.
-        // `allow_literal8` was previously snapshotted BEFORE that await and then
-        // used to patch the literal markers, so an unsolicited `* CAPABILITY`
-        // dropping BINARY while the STATUS was in flight still emitted `~{n+}`.
-        // A server that does not take non-synchronizing literal8 then reads the
-        // message body as command lines. That needed no second handle: one task
-        // and a scripted server reach it.
-        let policy = self.append_wire_policy();
-        let allow_literal8 = policy.binary && !policy.rev2;
-        let literal_kinds: Vec<AppendLiteralKind> = messages
-            .iter()
-            .map(|msg| policy.literal_kind(&msg.data))
-            .collect::<Result<_, _>>()?;
-
-        let utf8_enabled = policy.utf8_enabled;
-        let tag = self.next_prebuilt_tag();
-        // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: encode mailbox name
-        // with INBOX normalization and MUTF-7 when not in UTF-8 mode.
-        let wire_mailbox = crate::codec::encode::encode_mailbox_str(mailbox, utf8_enabled);
-
-        // RFC 7888 Sections 4-5: determine the literal mode for the encoder.
-        let mode = policy.mode;
-
-        // Build the complete wire bytes for all messages.
-        let mut buf = BytesMut::new();
-
-        for (i, (msg, literal_kind)) in messages.iter().zip(literal_kinds.iter()).enumerate() {
-            // Build the header for this message (RFC 3502 Section 3).
-            let header_start = buf.len();
-            encode_multi_append_header_with_literal8(
-                &mut buf,
-                &tag,
-                &wire_mailbox,
-                &msg.flags,
-                msg.date.as_deref(),
-                msg.data.len(),
-                i == 0,
-                mode,
-                matches!(literal_kind, AppendLiteralKind::Utf8Literal8),
-                matches!(
-                    literal_kind,
-                    AppendLiteralKind::Literal8 | AppendLiteralKind::Utf8Literal8
-                ),
-            )?;
-
-            // RFC 7888 Section 6: when both BINARY and a literal extension are
-            // active, literal8 may use the non-synchronizing `+` modifier. The
-            // encoder conservatively emits synchronizing literal8, so patch the
-            // header before appending the literal data.
-            let header_bytes = buf.split_off(header_start);
-            let patched_header = match mode {
-                LiteralMode::LiteralPlus => {
-                    patch_literals_to_plus_with_binary(&header_bytes, allow_literal8)
-                }
-                LiteralMode::LiteralMinus => {
-                    patch_small_literals_to_plus_with_binary(&header_bytes, allow_literal8)
-                }
-                LiteralMode::Synchronizing => header_bytes,
-            };
-            buf.extend_from_slice(&patched_header);
-
-            // If the literal is synchronizing, the driver's
-            // send_with_literal_sync will detect the {N}\r\n boundary
-            // and wait for the server's `+` continuation before sending
-            // the literal data. Non-sync markers ({N+}\r\n) are sent
-            // without waiting.
-
-            // Literal data.
-            buf.extend_from_slice(&msg.data);
-            if utf8_enabled {
-                // RFC 6855 Section 4: close the UTF8 data extension group.
-                buf.extend_from_slice(b")");
-            }
-            if i == messages.len() - 1 {
-                // Final message  -  terminate the command with CRLF.
-                buf.extend_from_slice(b"\r\n");
-            }
-        }
-
-        // Submit the pre-built bytes to the driver task.
         tokio::time::timeout(
             remaining_timeout(deadline)?,
-            self.submit_prebuilt(
-                buf,
-                tag,
-                crate::types::CommandKind::Append,
-                None,
-                policy.wire_assumptions(),
+            self.submit_append(
+                mailbox.to_owned(),
+                messages.to_vec(),
+                true,
                 MultiAppendConsumer::default(),
             ),
         )
@@ -416,7 +264,7 @@ fn unsent_preflight(error: Error) -> Error {
 
 /// Time left before the caller's deadline.
 ///
-/// Expiry here is still before `submit_prebuilt`, so it is `Unsent`: no APPEND
+/// Expiry here is still before `submit_append`, so it is `Unsent`: no APPEND
 /// octet has reached the driver.
 fn remaining_timeout(deadline: tokio::time::Instant) -> Result<Duration, Error> {
     deadline

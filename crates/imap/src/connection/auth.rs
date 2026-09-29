@@ -349,8 +349,7 @@ impl ImapConnection {
                 .encode(payload.as_slice())
                 .into();
 
-            let has_sasl_ir =
-                snap.capabilities.contains(&Capability::SaslIr) || is_rev2_from_snapshot(&snap);
+            let has_sasl_ir = snapshot_supports(&snap, &Capability::SaslIr);
             drop(snap);
             (encoded, has_sasl_ir)
         };
@@ -414,8 +413,7 @@ impl ImapConnection {
                 .encode(bifrost_sasl::xoauth2_payload(user, token).as_bytes())
                 .into();
 
-            let has_sasl_ir =
-                snap.capabilities.contains(&Capability::SaslIr) || is_rev2_from_snapshot(&snap);
+            let has_sasl_ir = snapshot_supports(&snap, &Capability::SaslIr);
             drop(snap);
             (encoded, has_sasl_ir)
         };
@@ -494,8 +492,7 @@ impl ImapConnection {
                 .encode(bifrost_sasl::oauthbearer_payload(identity, token).as_bytes())
                 .into();
 
-            let has_sasl_ir =
-                snap.capabilities.contains(&Capability::SaslIr) || is_rev2_from_snapshot(&snap);
+            let has_sasl_ir = snapshot_supports(&snap, &Capability::SaslIr);
             drop(snap);
             (encoded, has_sasl_ir)
         };
@@ -651,7 +648,7 @@ impl ImapConnection {
 
         let has_sasl_ir = {
             let snap = self.state_rx.borrow();
-            snap.capabilities.contains(&Capability::SaslIr) || is_rev2_from_snapshot(&snap)
+            snapshot_supports(&snap, &Capability::SaslIr)
         };
 
         let nonce = generate_scram_nonce()?;
@@ -796,7 +793,7 @@ impl ImapConnection {
         // Connection-level capability check.
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Unauthenticate) {
+            if !snapshot_supports(&snap, &Capability::Unauthenticate) {
                 return Err(Error::MissingCapability("UNAUTHENTICATE".into()));
             }
         }
@@ -968,19 +965,18 @@ impl ImapConnection {
         Ok(output)
     }
 
-    /// Submit a pre-built command (APPEND/MULTIAPPEND) to the driver task.
+    /// Submit APPEND (`multi == false`) or MULTIAPPEND (`multi == true`) to
+    /// the driver task.
     ///
-    /// The handle builds the complete wire bytes (including tag) and
-    /// provides them along with the classification metadata. The driver
-    /// sends the bytes with literal synchronization and runs the response
-    /// classification loop.
-    pub(super) async fn submit_prebuilt<C: super::dispatch::Consumer + 'static>(
+    /// The handle sends the mailbox and the messages and nothing else: the
+    /// driver validates and encodes them from live protocol state when the
+    /// command is executed, so no wire decision is made (and none can go
+    /// stale) while the command waits in the queue.
+    pub(super) async fn submit_append<C: super::dispatch::Consumer + 'static>(
         &self,
-        wire_bytes: bytes::BytesMut,
-        tag: String,
-        cmd_kind: crate::types::CommandKind,
-        cmd_target: Option<crate::types::validated::MailboxName>,
-        assumptions: driver::WireAssumptions,
+        mailbox: String,
+        messages: Vec<AppendMessage>,
+        multi: bool,
         consumer: C,
     ) -> Result<C::Output, Error>
     where
@@ -988,12 +984,10 @@ impl ImapConnection {
     {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let dcmd = driver::DriverCommand::Run {
-            payload: driver::DriverCommandPayload::PreBuilt {
-                wire_bytes,
-                tag,
-                cmd_kind,
-                cmd_target,
-                assumptions,
+            payload: driver::DriverCommandPayload::Append {
+                mailbox,
+                messages,
+                multi,
             },
             consumer: driver::DriverConsumer::Regular(
                 Box::new(consumer) as Box<dyn driver::ConsumerErased>
@@ -1171,11 +1165,29 @@ fn offered_authentication(
 /// completes, so under concurrent handles it can be older than the live
 /// protocol state. Safe for the gates on this side, which only ever refuse an
 /// operation the driver would now accept or pick a legacy path that stays valid
-/// under either revision. It is NOT safe for a caller that encodes bytes from
-/// the snapshot and hands them over prebuilt, because the driver sends those
-/// without re-encoding against live state.
+/// under either revision. It is NOT safe for encoding wire bytes on this side
+/// of the driver channel: every command's bytes (APPEND and MULTIAPPEND
+/// included) are encoded by the driver from live state at send time, and a
+/// handle-side encoding decision would go stale while the command is queued.
 pub(super) fn is_rev2_from_snapshot(snap: &driver::ConnectionStateSnapshot) -> bool {
     crate::types::profile::imap4rev2_active(&snap.capabilities, &snap.enabled)
+}
+
+/// Whether `capability` is usable on the connection a
+/// [`ConnectionStateSnapshot`](driver::ConnectionStateSnapshot) describes: the
+/// snapshot-side view of the single capability authority
+/// `crate::types::profile::supports` (advertised, QRESYNC implying CONDSTORE,
+/// or folded into active IMAP4rev2).
+///
+/// EVERY handle gate of the shape "capability X, or rev2 folds it in" goes
+/// through here rather than spelling `contains(&X) || is_rev2_from_snapshot`,
+/// so a capability added to the rev2 baseline reaches every gate at once. The
+/// same snapshot-staleness caveat as [`is_rev2_from_snapshot`] applies.
+pub(super) fn snapshot_supports(
+    snap: &driver::ConnectionStateSnapshot,
+    capability: &Capability,
+) -> bool {
+    crate::types::profile::supports(&snap.capabilities, &snap.enabled, capability)
 }
 
 /// Channel-binding policy for a peer certificate, split out from the live

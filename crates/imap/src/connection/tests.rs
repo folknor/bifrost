@@ -75,7 +75,6 @@ async fn make_driver_test_pair() -> (ImapConnection, tokio::io::DuplexStream) {
         state_rx,
         events_rx: tokio::sync::Mutex::new(events_rx),
         driver_handle: tokio::sync::Mutex::new(Some(handle)),
-        prebuilt_tag_counter: std::sync::atomic::AtomicU32::new(0),
         tls_active: std::sync::atomic::AtomicBool::new(false),
         abandoned: std::sync::atomic::AtomicBool::new(false),
         host: "test".into(),
@@ -605,19 +604,6 @@ fn selection_mismatch_with_no_options_is_never_a_mismatch() {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// Pre-built command tags (RFC 3501 Section 2.2.1)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn prebuilt_tags_are_prefixed_and_monotonic() {
-    let conn =
-        crate::connection::test_support::detached(SessionState::Authenticated, Vec::new(), &[]);
-    assert_eq!(conn.next_prebuilt_tag(), "P001");
-    assert_eq!(conn.next_prebuilt_tag(), "P002");
-    assert_eq!(conn.next_prebuilt_tag(), "P003");
-}
-
 #[tokio::test]
 async fn driver_channel_liveness_is_independent_of_session_state() {
     let detached =
@@ -936,11 +922,12 @@ async fn append_waits_for_the_continuation_before_sending_the_literal() {
             header.trim_end().ends_with("{5}"),
             "expected a synchronizing literal marker, got: {header}"
         );
-        assert!(
-            header.starts_with('P'),
-            "pre-built commands use the P tag prefix, got: {header}"
-        );
         let tag = tag_of(&header).to_owned();
+        // The driver tags APPEND from its own generator, like every command.
+        assert!(
+            tag.len() == 16 && tag.bytes().all(|b| b.is_ascii_hexdigit()),
+            "APPEND must carry a driver-generated tag, got: {header}"
+        );
 
         // Nothing more may arrive until we grant the continuation.
         respond(&mut server, "+ Ready for literal data\r\n").await;
@@ -1098,14 +1085,11 @@ async fn append_checks_the_mailbox_specific_appendlimit_before_writing() {
 /// not accept non-synchronizing literal8 then reads the MESSAGE BODY as command
 /// lines - a desynchronized parse, not a clean rejection.
 ///
-/// WHAT THIS TEST DOES AND DOES NOT PIN, because the distinction cost a
-/// wrong assertion on the way in. It pins that the policy is read ONCE and
-/// AFTER the await: the literal kind is therefore derived from the same state
-/// as everything else, so the vanished BINARY is caught locally and the command
-/// is refused before a byte is written. It does NOT reach the `WireAssumptions`
-/// guard in the driver - that one fires only when the state moves after the
-/// policy is read, i.e. while the command sits QUEUED behind another. The test
-/// after this one stages exactly that.
+/// The driver now encodes and validates from its own live state when it
+/// executes the command, which is necessarily after the `STATUS` completed. So
+/// the vanished BINARY is seen there and the command is refused before a byte
+/// is written. The test after this one stages the harder variant, where the
+/// state moves while the command sits QUEUED behind another.
 #[tokio::test]
 async fn multiappend_refuses_bytes_built_before_a_capability_vanished() {
     use crate::types::AppendMessage;
@@ -1142,28 +1126,29 @@ async fn multiappend_refuses_bytes_built_before_a_capability_vanished() {
     let err = result.expect_err("bytes built against the pre-CAPABILITY state must not be sent");
     assert!(
         matches!(err, Error::Protocol(ref m) if m.contains("requires BINARY literal8 support")),
-        "the literal kind must be derived from the SAME state as the rest of \
-         the policy, so a vanished BINARY is caught here; got {err:?}"
+        "the literal kind must be derived from the state at execution, so a \
+         vanished BINARY is caught by the driver; got {err:?}"
     );
 }
 
-/// Prebuilt APPEND bytes queued behind another command must not be written
-/// once that command's completion has changed what they were encoded for.
+/// A queued APPEND is validated against the state at EXECUTION, not the state
+/// when it was submitted.
 ///
-/// Handle A's NOOP is in flight with its reply withheld. Handle B's APPEND
-/// reads its policy while BINARY is still advertised, builds a
-/// non-synchronizing `~{n+}` literal8, and queues behind A. A's reply then
-/// carries a CAPABILITY that drops BINARY, so by the time the driver reaches
-/// B, the bytes promise a literal form the server no longer accepts. Only the
-/// driver's `WireAssumptions` comparison can catch this: the handle-side policy
-/// read was correct when it happened.
+/// Handle A's NOOP is in flight with its reply withheld. Handle B's APPEND of
+/// a NUL-bearing body is submitted while BINARY is still advertised and queues
+/// behind A. A's reply then carries a CAPABILITY that drops BINARY. The driver
+/// encodes B only when it reaches it, so it sees BINARY gone and refuses
+/// before writing a byte; a handle-side encoding would have promised a
+/// `~{n+}` literal8 the server no longer accepts. (This test used to pin the
+/// driver's `WireAssumptions` comparison, which existed only because the bytes
+/// were built handle-side and could go stale in the queue.)
 ///
 /// Paused time is what makes the staging deterministic. A 1 ms sleep can only
 /// complete by auto-advance, which the runtime performs only once every task
 /// is idle - so when it returns, B has necessarily reached its wait on the
 /// driver's reply, i.e. it is queued.
 #[tokio::test(start_paused = true)]
-async fn a_queued_append_is_refused_when_the_state_it_was_built_for_moved() {
+async fn a_queued_append_is_validated_against_the_state_at_execution() {
     let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
         "IMAP4rev1 BINARY LITERAL+",
     ))
@@ -1217,15 +1202,289 @@ async fn a_queued_append_is_refused_when_the_state_it_was_built_for_moved() {
     let err = append
         .await
         .expect("append task")
-        .expect_err("bytes built for the pre-CAPABILITY state must not be sent");
+        .expect_err("an APPEND the live state cannot carry must not be sent");
     assert!(
-        matches!(err, Error::Protocol(ref m) if m.contains("connection state changed")),
-        "the driver's WireAssumptions guard must refuse the queued APPEND; got {err:?}"
+        matches!(err, Error::Protocol(ref m) if m.contains("requires BINARY literal8 support")),
+        "the driver must validate the queued APPEND against the state it \
+         executes under; got {err:?}"
     );
     // Dropping the last handle closes the client half, which ends the
     // server's read.
     drop(conn);
     script.await.expect("NOOP transcript");
+}
+
+/// The same staging, for an APPEND the live state CAN still carry: it must be
+/// encoded for the state at execution, not the state at submission.
+///
+/// LITERAL+ is advertised when the APPEND is submitted, so a handle-side
+/// encoding would emit `{5+}` and stream the body without waiting. A's reply
+/// drops LITERAL+, and the driver, encoding when it reaches the APPEND, must
+/// instead emit the synchronizing `{5}` and wait for `+` (RFC 3501 Section 4.3).
+/// Writing the `+` form to a server without LITERAL+ would make it read the body
+/// as command lines.
+#[tokio::test(start_paused = true)]
+async fn a_queued_append_is_encoded_for_the_state_at_execution() {
+    let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
+        "IMAP4rev1 LITERAL+ UIDPLUS",
+    ))
+    .await;
+    let conn = std::sync::Arc::new(conn);
+    let (noop_seen_tx, noop_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let script = tokio::spawn(async move {
+        let noop = read_line(&mut server).await;
+        assert!(noop.ends_with(" NOOP\r\n"), "expected NOOP, got {noop:?}");
+        let tag = tag_of(&noop).to_owned();
+        noop_seen_tx.send(()).expect("test is waiting");
+        release_rx.await.expect("test releases the reply");
+        respond(
+            &mut server,
+            &format!("* CAPABILITY IMAP4rev1 UIDPLUS\r\n{tag} OK NOOP completed\r\n"),
+        )
+        .await;
+
+        let header = read_line(&mut server).await;
+        assert!(
+            header.ends_with(" APPEND \"INBOX\" {5}\r\n"),
+            "LITERAL+ is gone by execution time, so the marker must be \
+             synchronizing; got {header:?}"
+        );
+        let tag = tag_of(&header).to_owned();
+        respond(&mut server, "+ Ready for literal data\r\n").await;
+        let body = crate::connection::test_support::read_exact(&mut server, 5).await;
+        assert_eq!(&body[..], b"HELLO");
+        assert_eq!(read_line(&mut server).await, "\r\n");
+        respond(
+            &mut server,
+            &format!("{tag} OK [APPENDUID 7 3] APPEND completed\r\n"),
+        )
+        .await;
+        server
+    });
+
+    let first = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        async move { conn.noop(Duration::from_secs(5)).await }
+    });
+    noop_seen_rx.await.expect("server saw the NOOP");
+    let append = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        async move {
+            conn.append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    release_tx.send(()).expect("server is waiting");
+
+    first.await.expect("noop task").expect("NOOP completes");
+    let uid = append
+        .await
+        .expect("append task")
+        .expect("the APPEND is encoded for the live state and succeeds");
+    assert_eq!(uid, Some((7, 3)));
+    let _server = script.await.expect("transcript");
+}
+
+/// Session legality is re-checked by the driver at execution. An APPEND that
+/// was legal when submitted is refused if a command ahead of it moved the
+/// session out of Authenticated/Selected, nothing is written, and the
+/// connection stays usable: the refusal happens before the first byte, so it
+/// must not retire the connection even though its variant is `Error::Protocol`
+/// (the variant itself is a separate, not-yet-ruled item).
+#[tokio::test(start_paused = true)]
+async fn a_queued_append_is_refused_when_the_session_left_the_legal_states() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 UNAUTHENTICATE"))
+            .await;
+    let conn = std::sync::Arc::new(conn);
+    let (unauth_seen_tx, unauth_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let script = tokio::spawn(async move {
+        let unauth = read_line(&mut server).await;
+        assert!(
+            unauth.ends_with(" UNAUTHENTICATE\r\n"),
+            "expected UNAUTHENTICATE, got {unauth:?}"
+        );
+        let tag = tag_of(&unauth).to_owned();
+        unauth_seen_tx.send(()).expect("test is waiting");
+        release_rx.await.expect("test releases the reply");
+        respond(&mut server, &format!("{tag} OK Unauthenticated\r\n")).await;
+
+        // The very next thing on the wire is the capability refresh that
+        // `unauthenticate` issues. The queued APPEND sat ahead of it in the
+        // driver's queue, so if it had been written it would be here instead,
+        // and if its refusal had retired the connection nothing would be.
+        let next = read_line(&mut server).await;
+        assert!(
+            next.ends_with(" CAPABILITY\r\n"),
+            "the queued APPEND must not have been written; got {next:?}"
+        );
+        let tag = tag_of(&next).to_owned();
+        respond(
+            &mut server,
+            &format!("* CAPABILITY IMAP4rev1\r\n{tag} OK CAPABILITY completed\r\n"),
+        )
+        .await;
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut server, &mut rest)
+            .await
+            .expect("duplex read");
+        let rest = String::from_utf8_lossy(&rest);
+        assert!(!rest.contains("APPEND"), "APPEND was written: {rest:?}");
+    });
+
+    let first = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        async move { conn.unauthenticate(Duration::from_secs(5)).await }
+    });
+    unauth_seen_rx.await.expect("server saw UNAUTHENTICATE");
+    let append = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        async move {
+            conn.append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    release_tx.send(()).expect("server is waiting");
+
+    first
+        .await
+        .expect("unauthenticate task")
+        .expect("UNAUTHENTICATE and its CAPABILITY refresh complete");
+    let err = append
+        .await
+        .expect("append task")
+        .expect_err("the session is no longer legal for APPEND");
+    assert!(
+        matches!(err, Error::Protocol(ref m) if m.contains("session left")),
+        "session legality must be refused as Error::Protocol; got {err:?}"
+    );
+    drop(conn);
+    script.await.expect("transcript");
+}
+
+/// An APPEND the driver refuses during validation leaves the connection
+/// usable. The refusal (here a NUL-bearing body on a server without BINARY) is
+/// an `Error::Protocol`, the variant the driver treats as fatal when it comes
+/// off the wire - but it is made before the first byte, so the framing is
+/// intact and retiring the connection would throw away a healthy one. The
+/// follow-up NOOP is the proof.
+#[tokio::test(start_paused = true)]
+async fn a_refused_append_leaves_the_connection_usable() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let script = tokio::spawn(async move {
+        let next = read_line(&mut server).await;
+        assert!(
+            next.ends_with(" NOOP\r\n"),
+            "the refused APPEND must not reach the wire; got {next:?}"
+        );
+        let tag = tag_of(&next).to_owned();
+        respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+        server
+    });
+
+    let err = conn
+        .append("INBOX", &[], None, b"a\0b", Duration::from_secs(5))
+        .await
+        .expect_err("a NUL body without BINARY must be refused");
+    assert!(
+        matches!(err, Error::Protocol(ref m) if m.contains("BINARY")),
+        "expected the BINARY refusal; got {err:?}"
+    );
+    conn.noop(Duration::from_secs(5))
+        .await
+        .expect("the connection survives a refusal made before the first byte");
+    let _server = script.await.expect("NOOP transcript");
+}
+
+/// MULTIAPPEND validates the MULTIAPPEND capability in the driver, at
+/// execution, and writes no APPEND when it is missing.
+///
+/// Paused time because dropping the last handle makes the driver attempt a
+/// best-effort LOGOUT against a server that never answers, bounded by a
+/// five-second drain timeout that would otherwise run in real time.
+#[tokio::test(start_paused = true)]
+async fn multiappend_without_the_capability_is_refused_before_the_wire() {
+    use crate::types::AppendMessage;
+
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 LITERAL+")).await;
+    let messages = vec![
+        AppendMessage::new(&b"one"[..]),
+        AppendMessage::new(&b"two"[..]),
+    ];
+    let err = conn
+        .multi_append("INBOX", &messages, Duration::from_secs(5))
+        .await
+        .expect_err("MULTIAPPEND is not advertised");
+    assert!(
+        matches!(err, Error::MissingCapability(ref m) if m.contains("MULTIAPPEND")),
+        "got {err:?}"
+    );
+    drop(conn);
+    let mut rest = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut server, &mut rest)
+        .await
+        .expect("duplex read");
+    let rest = String::from_utf8_lossy(&rest);
+    assert!(
+        !rest.contains("APPEND"),
+        "no APPEND may be written, got {rest:?}"
+    );
+}
+
+/// MULTIAPPEND over the wire with synchronizing literals: one continuation per
+/// message body, the second message's syntax follows the first body directly,
+/// and the command ends with a single CRLF (RFC 3502 Section 3).
+#[tokio::test]
+async fn multiappend_waits_for_a_continuation_before_each_body() {
+    use crate::types::AppendMessage;
+
+    let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
+        "IMAP4rev1 MULTIAPPEND UIDPLUS",
+    ))
+    .await;
+    let script = tokio::spawn(async move {
+        let first = read_line(&mut server).await;
+        assert!(
+            first.ends_with(" APPEND \"INBOX\" (\\Seen) {5}\r\n"),
+            "{first:?}"
+        );
+        let tag = tag_of(&first).to_owned();
+        respond(&mut server, "+ go\r\n").await;
+        assert_eq!(
+            &crate::connection::test_support::read_exact(&mut server, 5).await[..],
+            b"HELLO"
+        );
+        let second = read_line(&mut server).await;
+        assert_eq!(second, " {3}\r\n", "second message follows the first body");
+        respond(&mut server, "+ go\r\n").await;
+        assert_eq!(
+            &crate::connection::test_support::read_exact(&mut server, 3).await[..],
+            b"BYE"
+        );
+        assert_eq!(read_line(&mut server).await, "\r\n");
+        respond(
+            &mut server,
+            &format!("{tag} OK [APPENDUID 9 10:11] APPEND completed\r\n"),
+        )
+        .await;
+        server
+    });
+
+    let mut first = AppendMessage::new(&b"HELLO"[..]);
+    first.flags = vec![crate::types::Flag::Seen];
+    let messages = vec![first, AppendMessage::new(&b"BYE"[..])];
+    let uids = conn
+        .multi_append("INBOX", &messages, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let _server = script.await.unwrap();
+    assert_eq!(uids, vec![(9, 10), (9, 11)]);
 }
 
 /// The APPENDLIMIT STATUS is a preflight. Its own transmission evidence is

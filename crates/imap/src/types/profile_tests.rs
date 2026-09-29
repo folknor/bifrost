@@ -72,6 +72,97 @@ fn the_dual_mode_rule_truth_table() {
     }
 }
 
+/// Capability-by-capability, state-by-state matrix for the single authority,
+/// against the first-principles oracle. Covers every `Capability` variant in
+/// every rev2-ACTIVE state, both unadvertised and advertised, and checks that
+/// `ServerProfile::supports` (a view over the authority) gives the same answer.
+#[test]
+fn supports_matrix_over_every_capability_and_state() {
+    use capability_matrix::{connection_states, every_capability, expected_usable};
+
+    for (state_caps, enabled) in connection_states() {
+        for capability in every_capability() {
+            let expected = expected_usable(&state_caps, &enabled, &capability);
+            assert_eq!(
+                supports(&state_caps, &enabled, &capability),
+                expected,
+                "unadvertised {capability:?} with capabilities={state_caps:?}, \
+                 enabled={enabled:?}"
+            );
+            assert_eq!(
+                ServerProfile::new(state_caps.clone(), enabled.clone())
+                    .supports(capability.clone()),
+                expected,
+                "ServerProfile::supports({capability:?}) disagrees with the authority \
+                 (capabilities={state_caps:?}, enabled={enabled:?})"
+            );
+
+            let mut advertised = state_caps.clone();
+            advertised.push(capability.clone());
+            assert!(
+                supports(&advertised, &enabled, &capability),
+                "an advertised {capability:?} is always usable (capabilities={advertised:?})"
+            );
+        }
+    }
+}
+
+/// The negative half of the contract, stated directly: extensions a server may
+/// advertise but which RFC 9051 did not fold into the base protocol get NO rev2
+/// clause, so a pure rev2 connection must not treat them as usable.
+#[test]
+fn rev2_does_not_imply_extensions_outside_the_baseline() {
+    let rev2 = vec![Capability::Imap4Rev2];
+    for capability in [
+        Capability::Condstore,
+        Capability::QResync,
+        Capability::Sort,
+        Capability::Within,
+        Capability::Preview,
+        Capability::Notify,
+        Capability::MultiAppend,
+        Capability::CreateSpecialUse,
+        Capability::Acl,
+        Capability::Quota,
+        Capability::QuotaSet,
+        Capability::Metadata,
+        Capability::MetadataServer,
+        Capability::CompressDeflate,
+        Capability::Id,
+        Capability::Unauthenticate,
+        Capability::XGmExt1,
+    ] {
+        assert!(
+            !supports(&rev2, &[], &capability),
+            "{capability:?} must not be implied by rev2"
+        );
+    }
+}
+
+/// RFC 7162 Section 3.2.3: QRESYNC implies CONDSTORE, and not the reverse.
+#[test]
+fn qresync_implies_condstore_but_not_the_reverse() {
+    assert!(supports(
+        &[Capability::QResync],
+        &[],
+        &Capability::Condstore
+    ));
+    assert!(!supports(
+        &[Capability::Condstore],
+        &[],
+        &Capability::QResync
+    ));
+
+    let profile = ServerProfile::new(vec![Capability::QResync], vec![]);
+    assert!(profile.supports(Capability::Condstore));
+    assert!(profile.supports_condstore());
+    assert!(profile.supports_qresync());
+
+    let profile = ServerProfile::new(vec![Capability::Condstore], vec![]);
+    assert!(profile.supports_condstore());
+    assert!(!profile.supports_qresync());
+}
+
 #[test]
 fn dual_rev_server_requires_enable_for_rev2_profile() {
     let profile = ServerProfile::new(vec![Capability::Imap4Rev1, Capability::Imap4Rev2], vec![]);

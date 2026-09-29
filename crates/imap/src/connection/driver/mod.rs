@@ -7,7 +7,6 @@
 //! primitives (`WireReader`, `ProtocolState`, tag generator,
 //! `DriverEventSink`).
 
-use bytes::BytesMut;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::trace;
 
@@ -40,7 +39,7 @@ use idle::run_idle;
 use pipeline::group_into_sub_batches;
 use pipeline::run_pipeline;
 use upgrade::{logout_best_effort, run_upgrade};
-use wire_send::{send_command_on_wire, send_with_literal_sync};
+use wire_send::{send_chunked_segments, send_command_on_wire};
 
 pub(in crate::connection) use upgrade::run_starttls_upgrade;
 
@@ -118,76 +117,35 @@ pub(super) enum IdleTermination {
 /// Payload for a [`DriverCommand::Run`].
 ///
 /// Standard commands are encoded by the driver via [`encode_command`].
-/// Pre-built commands (APPEND/MULTIAPPEND) carry wire bytes built by
-/// the handle side, which the driver sends with literal synchronization.
+/// APPEND and MULTIAPPEND carry whole messages, so they have their own payload
+/// and their own encoder, but the same rule holds: the DRIVER encodes and
+/// validates them, at execution, from the state it owns.
 pub(super) enum DriverCommandPayload {
     /// Standard IMAP command  -  encoded and sent by the driver.
     Standard(Command),
-    /// Pre-built wire bytes (APPEND / MULTIAPPEND).
+    /// APPEND (`multi == false`, one message) or MULTIAPPEND (`multi == true`,
+    /// RFC 3502).
     ///
-    /// The handle builds the complete wire bytes (including the tag) and
-    /// provides the tag separately so the driver can match the tagged
-    /// response. The driver sends the bytes with literal synchronization
-    /// and runs the response classification loop.
-    PreBuilt {
-        /// Complete wire bytes to send, including the tag prefix.
-        wire_bytes: BytesMut,
-        /// The tag embedded in `wire_bytes`, used for response matching.
-        tag: String,
-        /// Command kind for response classification.
-        cmd_kind: crate::types::CommandKind,
-        /// Optional mailbox target for classification context.
-        cmd_target: Option<MailboxName>,
-        /// The protocol state these bytes were encoded against.
-        ///
-        /// Checked against LIVE state before a single byte goes out. A
-        /// `Standard` command is re-encoded by the driver immediately before
-        /// sending, so it cannot be stale; prebuilt bytes are frozen at build
-        /// time and the snapshot they were built from is only republished when
-        /// a command COMPLETES, so anything queued behind another command can
-        /// be written under a protocol revision it was not encoded for.
-        assumptions: WireAssumptions,
+    /// Nothing about the wire form is decided handle-side. The driver runs
+    /// [`encode_append`](crate::codec::encode::encode_append) against LIVE
+    /// state when the command reaches the head of the queue, so the mailbox
+    /// encoding, the RFC 6855 `UTF8 (` wrapper, RFC 7888 `+` markers, literal8
+    /// eligibility, session legality, the MULTIAPPEND capability and the
+    /// BINARY requirement for NUL-bearing bodies all reflect the connection
+    /// as it is at send time. Bytes prebuilt handle-side froze those decisions
+    /// while the command sat queued behind another, which is how a queued
+    /// APPEND could be written under a protocol revision it was not encoded
+    /// for.
+    ///
+    /// The bodies are [`bytes::Bytes`] and travel to the socket by reference.
+    Append {
+        /// Destination mailbox, as the caller named it (decoded form).
+        mailbox: String,
+        /// The messages to append; exactly one unless `multi`.
+        messages: Vec<crate::types::AppendMessage>,
+        /// Whether this is MULTIAPPEND (requires the capability).
+        multi: bool,
     },
-}
-
-/// What a set of prebuilt wire bytes assumed about the connection.
-///
-/// Deliberately the DECISIONS rather than a generation counter. A counter needs
-/// a bump rule that fires on capability, `enabled` and session changes but not
-/// on every `EXISTS`, and gets that rule wrong in one direction or the other; a
-/// decision record cannot over-fire, because an unsolicited response that does
-/// not change any of these leaves them all equal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct WireAssumptions {
-    /// `UTF8=ACCEPT` was enabled. Governs mailbox encoding (modified UTF-7
-    /// versus raw UTF-8) AND the RFC 6855 `UTF8 (` wrapper.
-    pub(super) utf8_enabled: bool,
-    /// BINARY was advertised: literal8 was eligible for the `+` marker.
-    pub(super) binary: bool,
-    /// The connection was in pure `IMAP4rev2` mode, where literal8 is always
-    /// synchronizing (RFC 9051 Section 9).
-    pub(super) rev2: bool,
-    /// The literal mode the markers were emitted for.
-    pub(super) literal_mode: crate::codec::encode::LiteralMode,
-}
-
-impl WireAssumptions {
-    /// Re-derive the same decisions from live protocol state.
-    fn from_live(state: &super::state::ProtocolState) -> Self {
-        let rev2 = is_rev2(state);
-        let capabilities = state.capabilities();
-        let binary = capabilities.contains(&Capability::Binary);
-        let literal_mode = build_encode_options(state).literal_mode;
-        Self {
-            utf8_enabled: state
-                .enabled()
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT")),
-            binary,
-            rev2,
-            literal_mode,
-        }
-    }
 }
 
 /// Payload for a [`DriverCommand::Upgrade`].
@@ -462,6 +420,11 @@ pub(super) async fn driver_task(
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
                     DriverCommand::Run { payload, consumer, result_tx } => {
+                        // Whether a failure can have touched the wire. A
+                        // refusal made before the first byte leaves the
+                        // framing intact, so it must not retire the
+                        // connection whatever its error variant.
+                        let mut refused_before_send = false;
                         let result = match payload {
                             DriverCommandPayload::Standard(command) => {
                                 run_one_command(
@@ -473,23 +436,33 @@ pub(super) async fn driver_task(
                                     consumer,
                                 ).await
                             }
-                            DriverCommandPayload::PreBuilt {
-                                wire_bytes, tag, cmd_kind, cmd_target, assumptions,
-                            } => {
-                                run_prebuilt_command(
-                                    &mut wire_reader,
-                                    &mut state,
-                                    &mut event_sink,
-                                    wire_bytes,
-                                    &tag,
-                                    cmd_kind,
-                                    cmd_target,
-                                    assumptions,
-                                    consumer,
-                                ).await
+                            DriverCommandPayload::Append { mailbox, messages, multi } => {
+                                match prepare_append(
+                                    &state,
+                                    &mut tag_gen,
+                                    &mailbox,
+                                    &messages,
+                                    multi,
+                                ) {
+                                    Ok(prepared) => {
+                                        run_append_command(
+                                            &mut wire_reader,
+                                            &mut state,
+                                            &mut event_sink,
+                                            prepared,
+                                            consumer,
+                                        ).await
+                                    }
+                                    Err(refusal) => {
+                                        refused_before_send = true;
+                                        Err(refusal)
+                                    }
+                                }
                             }
                         };
-                        if result.as_ref().is_err_and(Error::is_connection_fatal) {
+                        if !refused_before_send
+                            && result.as_ref().is_err_and(Error::is_connection_fatal)
+                        {
                             state.apply_infrastructure_failure();
                             cmd_rx.close();
                         }
@@ -812,63 +785,83 @@ async fn dispatch_response_loop(
 }
 
 // ---------------------------------------------------------------------------
-// Pre-built command execution (APPEND / MULTIAPPEND)
+// APPEND / MULTIAPPEND execution
 // ---------------------------------------------------------------------------
 
-/// Execute a pre-built command whose wire bytes were constructed by the
-/// handle side.
-///
-/// Sends the pre-built bytes using [`send_with_literal_sync`] (which
-/// handles synchronizing literal boundaries per RFC 3501 Section4.3), then
-/// runs the same classification-based response loop as
+/// Execute APPEND or MULTIAPPEND: validate, encode and send against LIVE state,
+/// then run the same classification-based response loop as
 /// [`run_one_command`].
 ///
-/// APPEND and MULTIAPPEND use this path because their literal encoding
-/// is handled by the handle side rather than by [`encode_command`].
-#[allow(clippy::too_many_arguments)]
-pub(in crate::connection) async fn run_prebuilt_command(
+/// Every decision the wire bytes depend on is made here, from the state this
+/// task owns, at the moment the command reaches the head of the queue. That is
+/// the property the prebuilt path lacked: it froze those decisions on the
+/// handle while the command waited behind another, and the snapshot they were
+/// read from is only republished when a command COMPLETES.
+///
+/// Split in two so the driver loop can tell the two kinds of failure apart:
+/// [`prepare_append`] refuses BEFORE a byte is written, and its refusals leave
+/// the connection's framing intact whatever their error variant; only a
+/// failure from here on can have desynchronized the stream. The loop applies
+/// `is_connection_fatal` to the second kind alone - applying it to a
+/// validation refusal (a NUL body without BINARY, a malformed flag, a session
+/// that has left the legal states) retired healthy connections, because those
+/// refusals are `Error::Protocol`, which is fatal when it comes off the wire.
+pub(in crate::connection) async fn run_append_command(
     wire_reader: &mut super::wire::WireReader,
     state: &mut super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
-    wire_bytes: BytesMut,
-    tag: &str,
-    cmd_kind: crate::types::CommandKind,
-    cmd_target: Option<MailboxName>,
-    assumptions: WireAssumptions,
+    prepared: PreparedAppend,
     consumer: DriverConsumer,
 ) -> Result<Box<dyn std::any::Any + Send>, Error> {
-    trace!(tag, ?cmd_kind, "driver: sending pre-built command");
+    let PreparedAppend { tag, encoded } = prepared;
+    let cmd_kind = crate::types::CommandKind::Append;
 
-    // REFUSE BYTES ENCODED FOR A DIFFERENT CONNECTION STATE.
-    //
-    // A `Standard` command is re-encoded here from live state, so a stale
-    // handle-side gate can only refuse something the driver would now accept.
-    // Prebuilt bytes are frozen at build time and the snapshot they came from
-    // is republished only when a command completes, so anything queued behind
-    // another command can be written under a revision it was not encoded for.
-    // That is not a loud failure: modified UTF-7 stays syntactically valid
-    // ASCII under rev2, so the APPEND lands in a DIFFERENT mailbox; and a
-    // `UTF8 (` wrapper or a non-synchronizing literal8 emitted to a server that
-    // no longer has them desynchronizes the parse, because the message body is
-    // then read as command lines.
-    //
-    // Refusing here is `Unsent`: nothing has been written, and APPEND is
-    // non-idempotent, so the safe direction is to make the caller re-issue
-    // against the new state rather than to guess.
-    let live = WireAssumptions::from_live(state);
-    if live != assumptions {
-        return Err(Error::Protocol(format!(
-            "connection state changed between building and sending {cmd_kind:?} \
-             (built for {assumptions:?}, now {live:?}); re-issue the command"
-        ))
-        .with_attempt(TransmissionState::Unsent));
-    }
-    // Session legality is checked SEPARATELY rather than folded into the
-    // equality above, because it is not an encoding decision. Both prebuilt
-    // commands are legal in Authenticated AND Selected (RFC 3501 Section 6.3.11,
-    // RFC 3502 Section 3), so a SELECT completing between build and send is a
-    // legal transition that must not refuse the command - an equality check on
-    // the session would have over-fired on exactly that.
+    // No routing: an APPEND is dispatched alone, so its own tagged response is
+    // the only one that can arrive during the send. Errors before a tagged
+    // response are Unsent or InFlight depending on where in the send they
+    // occur; the sender stamps them. After the send, responses are InFlight.
+    send_chunked_segments(wire_reader, state, event_sink, encoded.segments()).await?;
+
+    dispatch_response_loop(
+        wire_reader,
+        state,
+        event_sink,
+        &tag,
+        cmd_kind,
+        None,
+        consumer,
+        ContinuationPolicy::RejectAfterSend,
+    )
+    .await
+}
+
+/// An APPEND encoded against live state and ready for the wire.
+pub(in crate::connection) struct PreparedAppend {
+    tag: String,
+    encoded: crate::codec::encode::ChunkedCommand,
+}
+
+/// Validate and encode an APPEND from the state this task owns, writing
+/// nothing. Every `Err` here is a refusal before the first byte, so the caller
+/// may safely re-issue against the new state and the connection stays usable.
+/// (`Error::Protocol`, `MissingCapability` and `InvalidInput` carry no
+/// transmission evidence, so there is nothing to stamp: `with_attempt` leaves
+/// those variants unchanged.)
+pub(in crate::connection) fn prepare_append(
+    state: &super::state::ProtocolState,
+    tag_gen: &mut super::tag::TagGenerator,
+    mailbox: &str,
+    messages: &[crate::types::AppendMessage],
+    multi: bool,
+) -> Result<PreparedAppend, Error> {
+    let cmd_kind = crate::types::CommandKind::Append;
+
+    // Session legality (RFC 3501 Section 6.3.11, RFC 3502 Section 3): valid in
+    // Authenticated and Selected. The handle checks this too as a cheap early
+    // refusal, but only THIS check is authoritative: a LOGOUT or a BYE
+    // completing ahead of a queued APPEND moves the session out from under
+    // any handle-side read. The variant is `Error::Protocol`, unchanged from
+    // the prebuilt path.
     if !matches!(
         state.session_state(),
         super::SessionState::Authenticated | super::SessionState::Selected
@@ -880,25 +873,19 @@ pub(in crate::connection) async fn run_prebuilt_command(
         .with_attempt(TransmissionState::Unsent));
     }
 
-    // Send pre-built bytes with literal synchronization.
-    // Errors before a tagged response are Unsent or InFlight depending
-    // on where in the send they occur; send_with_literal_sync propagates
-    // them without decoration. After send, responses are InFlight.
-    // No routing: a prebuilt command is dispatched alone, so its own tagged
-    // response is the only one that can arrive during the send.
-    send_with_literal_sync(wire_reader, state, event_sink, &wire_bytes, None).await?;
-
-    dispatch_response_loop(
-        wire_reader,
-        state,
-        event_sink,
+    let tag = tag_gen.next();
+    trace!(
         tag,
-        cmd_kind,
-        cmd_target,
-        consumer,
-        ContinuationPolicy::RejectAfterSend,
-    )
-    .await
+        ?cmd_kind,
+        multi,
+        "driver: encoding APPEND from live state"
+    );
+    // Capability, BINARY, flag and date validation live in the encoder, so
+    // they see the same live options the markers are chosen from.
+    let opts = build_encode_options(state);
+    let encoded = crate::codec::encode::encode_append(&tag, mailbox, messages, multi, &opts)
+        .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
+    Ok(PreparedAppend { tag, encoded })
 }
 
 /// Publish the state snapshot before waking the command caller.
@@ -1023,7 +1010,14 @@ fn utf8_mode(state: &super::state::ProtocolState) -> bool {
 fn literal_mode(state: &super::state::ProtocolState) -> LiteralMode {
     if state.capabilities().contains(&Capability::LiteralPlus) {
         LiteralMode::LiteralPlus
-    } else if state.capabilities().contains(&Capability::LiteralMinus) || is_rev2(state) {
+    } else if crate::types::profile::supports(
+        state.capabilities(),
+        state.enabled(),
+        &Capability::LiteralMinus,
+    ) {
+        // The LITERAL+ arm above deliberately stays an advertised-only check:
+        // rev2 negotiates the 4096-octet LITERAL- behaviour, never unbounded
+        // LITERAL+, even though the authority lists LITERAL+ as usable there.
         LiteralMode::LiteralMinus
     } else {
         LiteralMode::Synchronizing

@@ -441,9 +441,7 @@ impl ImapConnection {
         {
             let snap = self.state_rx.borrow();
             // ESEARCH is a base feature in IMAP4rev2 (RFC 9051 Section 6.4.4).
-            if !snap.capabilities.contains(&Capability::Esearch)
-                && !super::auth::is_rev2_from_snapshot(&snap)
-            {
+            if !super::auth::snapshot_supports(&snap, &Capability::Esearch) {
                 return Err(Error::MissingCapability("ESEARCH".into()));
             }
         }
@@ -547,17 +545,16 @@ impl ImapConnection {
         }
 
         // Read capabilities from snapshot to decide which path to take.
-        let (has_move, has_uidplus, is_rev2) = {
+        let (has_move, has_uidplus) = {
             let snap = self.state_rx.borrow();
             (
-                snap.capabilities.contains(&Capability::Move),
-                snap.capabilities.contains(&Capability::UidPlus),
-                super::auth::is_rev2_from_snapshot(&snap),
+                super::auth::snapshot_supports(&snap, &Capability::Move),
+                super::auth::snapshot_supports(&snap, &Capability::UidPlus),
             )
         };
 
         // MOVE is a base feature in IMAP4rev2 (RFC 9051 Appendix E item 2).
-        if has_move || is_rev2 {
+        if has_move {
             let mbox = MailboxName::new(mailbox)?;
             self.move_native_impl(
                 Command::UidMove {
@@ -678,9 +675,7 @@ impl ImapConnection {
             // RFC 4315 Section 2: UID EXPUNGE requires the UIDPLUS extension.
             // RFC 9051 Appendix E item 3: IMAP4rev2 incorporates UIDPLUS into
             // the base command set, so rev2 servers implicitly support it.
-            if !snap.capabilities.contains(&Capability::UidPlus)
-                && !super::auth::is_rev2_from_snapshot(&snap)
-            {
+            if !super::auth::snapshot_supports(&snap, &Capability::UidPlus) {
                 return Err(Error::MissingCapability("UIDPLUS".into()));
             }
         }

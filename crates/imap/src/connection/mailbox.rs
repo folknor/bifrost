@@ -122,13 +122,11 @@ impl ImapConnection {
         // RFC 9051 Section 6.3.9 folds LIST-STATUS into the IMAP4rev2 base.
         {
             let snap = self.state_rx.borrow();
-            if !auth::is_rev2_from_snapshot(&snap) {
-                if !snap.capabilities.contains(&Capability::ListStatus) {
-                    return Err(Error::MissingCapability("LIST-STATUS".into()));
-                }
-                if !snap.capabilities.contains(&Capability::ListExtended) {
-                    return Err(Error::MissingCapability("LIST-EXTENDED".into()));
-                }
+            if !auth::snapshot_supports(&snap, &Capability::ListStatus) {
+                return Err(Error::MissingCapability("LIST-STATUS".into()));
+            }
+            if !auth::snapshot_supports(&snap, &Capability::ListExtended) {
+                return Err(Error::MissingCapability("LIST-EXTENDED".into()));
             }
         }
         self.validate_requested_status_items(status_items)?;
@@ -370,7 +368,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::CreateSpecialUse) {
+            if !super::auth::snapshot_supports(&snap, &Capability::CreateSpecialUse) {
                 return Err(Error::MissingCapability("CREATE-SPECIAL-USE".into()));
             }
         }
@@ -546,9 +544,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Unselect)
-                && !super::auth::is_rev2_from_snapshot(&snap)
-            {
+            if !super::auth::snapshot_supports(&snap, &Capability::Unselect) {
                 return Err(Error::MissingCapability("UNSELECT".into()));
             }
         }

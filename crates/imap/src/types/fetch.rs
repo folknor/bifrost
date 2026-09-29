@@ -368,14 +368,19 @@ pub struct AppendMessage {
     /// Optional INTERNALDATE in IMAP date-time format (RFC 3501 Section 6.3.11).
     pub date: Option<String>,
     /// Raw RFC 5322 message data.
-    pub data: Vec<u8>,
+    ///
+    /// Held as [`bytes::Bytes`] so the driver can put the body on the wire
+    /// by reference: the same allocation travels from the caller through the
+    /// driver channel to the socket writes without being copied.
+    pub data: bytes::Bytes,
 }
 
 impl AppendMessage {
     /// Create an append message with only the raw data (RFC 3501 Section 6.3.11).
     ///
-    /// Flags default to empty and date defaults to `None`.
-    pub fn new(data: impl Into<Vec<u8>>) -> Self {
+    /// Flags default to empty and date defaults to `None`. A `Vec<u8>` or
+    /// `String` is taken over without copying; a `Bytes` is shared.
+    pub fn new(data: impl Into<bytes::Bytes>) -> Self {
         Self {
             flags: Vec::new(),
             date: None,

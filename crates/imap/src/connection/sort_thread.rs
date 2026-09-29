@@ -29,7 +29,7 @@ impl ImapConnection {
         self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Sort) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Sort) {
                 return Err(Error::MissingCapability("SORT".into()));
             }
         }
@@ -65,7 +65,7 @@ impl ImapConnection {
         self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Sort) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Sort) {
                 return Err(Error::MissingCapability("SORT".into()));
             }
         }

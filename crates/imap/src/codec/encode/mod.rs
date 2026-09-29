@@ -24,18 +24,17 @@ use crate::types::Command;
 use crate::types::QresyncParams;
 
 // Re-export sub-module items that are part of this module's public API.
-#[cfg(test)]
-pub(crate) use commands::encode_multi_append_header;
-pub(crate) use commands::encode_multi_append_header_with_literal8;
+pub(crate) use commands::encode_append;
 pub(crate) use dispatch::encode_command;
 pub(crate) use string_helpers::{encode_quoted_or_literal, encode_quoted_or_literal_utf8};
 
 // Make sub-module items available within this module for dispatch.
-pub(crate) use commands::encode_mailbox_str;
 pub(crate) use commands::list_status_return_option_items;
 #[cfg(test)]
 use commands::{encode_getmetadata, encode_login, encode_select_or_examine, encode_simple};
-pub(crate) use core::{EncodeError, EncodeOptions, EncodedCommand, LITERAL_MINUS_MAX, LiteralMode};
+pub(crate) use core::{
+    ChunkedCommand, EncodeError, EncodeOptions, EncodedCommand, LITERAL_MINUS_MAX, LiteralMode,
+};
 #[cfg(test)]
 use dispatch::encode_command_to_buf;
 #[cfg(test)]

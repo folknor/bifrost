@@ -147,14 +147,3 @@ fn literal_minus_skips_markers_inside_payload() {
     let out = patch_small_literals_to_plus_with_binary(b"A1 X {7}\r\n{9}\r\nab\r\n", false);
     assert_eq!(&out[..], b"A1 X {7+}\r\n{9}\r\nab\r\n");
 }
-
-// ---------------------------------------------------------------------------
-// AppendLiteralKind
-// ---------------------------------------------------------------------------
-
-#[test]
-fn append_literal_kinds_are_distinct() {
-    assert_ne!(AppendLiteralKind::Literal, AppendLiteralKind::Literal8);
-    assert_ne!(AppendLiteralKind::Literal8, AppendLiteralKind::Utf8Literal8);
-    assert_eq!(AppendLiteralKind::Literal, AppendLiteralKind::Literal);
-}

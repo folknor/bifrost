@@ -43,6 +43,92 @@ fn default_opts() -> EncodeOptions {
     opts(LiteralMode::Synchronizing, false)
 }
 
+// --- APPEND / MULTIAPPEND helpers ---
+//
+// These drive the PRODUCTION entry point, `encode_append`, the same function
+// the driver calls at send time. Bodies are `x` filler (or NULs where a test
+// needs literal8); assertions render a body chunk as `<len>` so the expected
+// wire text stays readable while the framing around it is exact.
+
+/// Options for APPEND tests: `opts` plus MULTIAPPEND. UTF-8 mode implies the
+/// RFC 6855 `UTF8=ACCEPT` enable, which is what selects the `UTF8 (` wrapper.
+fn append_opts(literal_mode: LiteralMode, utf8: bool) -> EncodeOptions {
+    let mut o = opts(literal_mode, utf8);
+    o.capabilities.push(Capability::MultiAppend);
+    if utf8 {
+        o.enabled.push("UTF8=ACCEPT".to_owned());
+    }
+    o
+}
+
+/// A message with `len` bytes of `x` filler.
+fn append_msg(
+    flags: &[crate::types::Flag],
+    date: Option<&str>,
+    len: usize,
+) -> crate::types::AppendMessage {
+    let mut msg = crate::types::AppendMessage::new(vec![b'x'; len]);
+    msg.flags = flags.to_vec();
+    msg.date = date.map(str::to_owned);
+    msg
+}
+
+/// A message whose body is `len` NUL octets (forces `literal8`).
+fn append_nul_msg(len: usize) -> crate::types::AppendMessage {
+    crate::types::AppendMessage::new(vec![0u8; len])
+}
+
+/// Whether `chunk` is exactly the allocation of one of `messages`' bodies.
+fn is_body_chunk(chunk: &bytes::Bytes, messages: &[crate::types::AppendMessage]) -> bool {
+    messages
+        .iter()
+        .any(|m| chunk.as_ptr() == m.data.as_ptr() && chunk.len() == m.data.len())
+}
+
+/// Render each segment as text, with a body chunk shown as `<len>`.
+fn append_segments(cmd: &ChunkedCommand, messages: &[crate::types::AppendMessage]) -> Vec<String> {
+    cmd.segments()
+        .iter()
+        .map(|segment| {
+            segment
+                .iter()
+                .map(|chunk| {
+                    if is_body_chunk(chunk, messages) {
+                        format!("<{}>", chunk.len())
+                    } else {
+                        String::from_utf8_lossy(chunk).into_owned()
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// Encode a plain APPEND carrying `date`, for the date-validation tests.
+fn append_with_date(date: &str) -> Result<ChunkedCommand, crate::Error> {
+    let msgs = [append_msg(&[], Some(date), 100)];
+    encode_append(
+        "A001",
+        "INBOX",
+        &msgs,
+        false,
+        &append_opts(LiteralMode::Synchronizing, false),
+    )
+}
+
+/// Encode APPEND (`multi == false`) or MULTIAPPEND and render the whole wire
+/// text, with bodies shown as `<len>`.
+fn append_wire(
+    tag: &str,
+    mailbox: &str,
+    messages: &[crate::types::AppendMessage],
+    multi: bool,
+    opts: &EncodeOptions,
+) -> String {
+    let cmd = encode_append(tag, mailbox, messages, multi, opts).unwrap();
+    append_segments(&cmd, messages).concat()
+}
+
 #[test]
 fn encode_enable_uses_imap4rev2_base_capability() {
     let opts = EncodeOptions {
@@ -68,6 +154,44 @@ fn encode_options_treats_list_status_as_imap4rev2_base_capability() {
     };
 
     assert!(opts.has_capability(&Capability::ListStatus));
+}
+
+/// The encoder's command admission is a view over the single capability
+/// authority: for every capability in every rev2-ACTIVE state it must answer
+/// exactly what the oracle does, including QRESYNC implying CONDSTORE.
+#[test]
+fn encode_options_capability_answers_match_the_authority() {
+    use crate::types::profile::capability_matrix::{
+        connection_states, every_capability, expected_usable,
+    };
+
+    for (capabilities, enabled) in connection_states() {
+        let opts = EncodeOptions {
+            utf8_mode: false,
+            literal_mode: LiteralMode::Synchronizing,
+            capabilities: capabilities.clone(),
+            enabled: enabled.clone(),
+        };
+        for capability in every_capability() {
+            assert_eq!(
+                opts.has_capability(&capability),
+                expected_usable(&capabilities, &enabled, &capability),
+                "{capability:?} with capabilities={capabilities:?}, enabled={enabled:?}"
+            );
+        }
+        assert_eq!(
+            opts.has_condstore(),
+            expected_usable(&capabilities, &enabled, &Capability::Condstore)
+        );
+    }
+
+    let qresync_only = EncodeOptions {
+        utf8_mode: false,
+        literal_mode: LiteralMode::Synchronizing,
+        capabilities: vec![Capability::QResync],
+        enabled: Vec::new(),
+    };
+    assert!(qresync_only.has_condstore());
 }
 
 #[test]
@@ -1598,276 +1722,306 @@ fn encode_compress() {
 #[test]
 fn encode_multi_append_first_message_no_flags() {
     // First message with no flags and no date (RFC 3502 Section 3).
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        None,
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
-    assert_eq!(&buf[..], b"A001 APPEND \"INBOX\" {100}\r\n");
+    let msgs = [append_msg(&[], None, 100)];
+    assert_eq!(
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            false,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"INBOX\" {100}\r\n<100>\r\n"
+    );
 }
 
 #[test]
 fn encode_multi_append_first_message_with_flags() {
     // First message with flags (RFC 3502 Section 3 / RFC 3501 Section 6.3.11).
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
+    let msgs = [append_msg(
         &[crate::types::Flag::Seen, crate::types::Flag::Flagged],
         None,
         200,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
+    )];
     assert_eq!(
-        &buf[..],
-        b"A001 APPEND \"INBOX\" (\\Seen \\Flagged) {200}\r\n"
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            false,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"INBOX\" (\\Seen \\Flagged) {200}\r\n<200>\r\n"
     );
 }
 
 #[test]
 fn encode_multi_append_first_message_with_date() {
     // First message with internal date (RFC 3502 Section 3 / RFC 3501 Section 6.3.11).
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        Some("17-Jul-1996 02:44:25 -0700"),
-        50,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
+    let msgs = [append_msg(&[], Some("17-Jul-1996 02:44:25 -0700"), 50)];
     assert_eq!(
-        &buf[..],
-        b"A001 APPEND \"INBOX\" \"17-Jul-1996 02:44:25 -0700\" {50}\r\n"
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            false,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"INBOX\" \"17-Jul-1996 02:44:25 -0700\" {50}\r\n<50>\r\n"
     );
 }
 
 #[test]
 fn encode_multi_append_first_message_with_flags_and_date() {
     // First message with both flags and date (RFC 3502 Section 3).
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
+    let msgs = [append_msg(
         &[crate::types::Flag::Seen],
         Some(" 1-Jan-2024 00:00:00 +0000"),
         300,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
+    )];
     assert_eq!(
-        &buf[..],
-        b"A001 APPEND \"INBOX\" (\\Seen) \" 1-Jan-2024 00:00:00 +0000\" {300}\r\n"
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            false,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"INBOX\" (\\Seen) \" 1-Jan-2024 00:00:00 +0000\" {300}\r\n<300>\r\n"
     );
 }
 
 #[test]
 fn encode_multi_append_subsequent_message() {
-    // Subsequent message  -  no tag/APPEND/mailbox prefix (RFC 3502 Section 3).
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[crate::types::Flag::Draft],
-        None,
-        75,
-        false,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
-    assert_eq!(&buf[..], b" (\\Draft) {75}\r\n");
+    // Subsequent message  -  no tag/APPEND/mailbox prefix, and it follows the
+    // previous body directly (RFC 3502 Section 3).
+    let msgs = [
+        append_msg(&[], None, 10),
+        append_msg(&[crate::types::Flag::Draft], None, 75),
+    ];
+    assert_eq!(
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            true,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"INBOX\" {10}\r\n<10> (\\Draft) {75}\r\n<75>\r\n"
+    );
 }
 
 #[test]
 fn encode_multi_append_with_literal_plus() {
     // LITERAL+ (RFC 7888)  -  non-synchronizing literal.
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        None,
-        42,
-        true,
-        LiteralMode::LiteralPlus,
-        false,
-    )
-    .unwrap();
-    assert_eq!(&buf[..], b"A001 APPEND \"INBOX\" {42+}\r\n");
+    let msgs = [append_msg(&[], None, 42)];
+    assert_eq!(
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            false,
+            &append_opts(LiteralMode::LiteralPlus, false)
+        ),
+        "A001 APPEND \"INBOX\" {42+}\r\n<42>\r\n"
+    );
 }
 
 #[test]
 fn encode_multi_append_subsequent_with_literal_plus() {
     // Subsequent message with LITERAL+ (RFC 7888 / RFC 3502 Section 3).
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        None,
-        99,
-        false,
-        LiteralMode::LiteralPlus,
-        false,
-    )
-    .unwrap();
-    assert_eq!(&buf[..], b" {99+}\r\n");
+    let msgs = [append_msg(&[], None, 1), append_msg(&[], None, 99)];
+    assert_eq!(
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            true,
+            &append_opts(LiteralMode::LiteralPlus, false)
+        ),
+        "A001 APPEND \"INBOX\" {1+}\r\n<1> {99+}\r\n<99>\r\n"
+    );
 }
 
 #[test]
 fn encode_multi_append_two_messages_mixed_flags() {
-    // Simulate a 2-message MULTIAPPEND: first with flags, second without (RFC 3502).
-    let mut buf = BytesMut::new();
-
-    // First message: with flags and date
-    encode_multi_append_header(
-        &mut buf,
+    // 2-message MULTIAPPEND: first with flags and date, second with neither
+    // (RFC 3502). Synchronizing, so each body is preceded by a boundary.
+    let msgs = [
+        append_msg(
+            &[crate::types::Flag::Seen, crate::types::Flag::Answered],
+            Some("15-Mar-2026 10:00:00 +0000"),
+            50,
+        ),
+        append_msg(&[], None, 30),
+    ];
+    let cmd = encode_append(
         "A010",
         "INBOX",
-        &[crate::types::Flag::Seen, crate::types::Flag::Answered],
-        Some("15-Mar-2026 10:00:00 +0000"),
-        50,
+        &msgs,
         true,
-        LiteralMode::Synchronizing,
-        false,
+        &append_opts(LiteralMode::Synchronizing, false),
     )
     .unwrap();
     assert_eq!(
-        &buf[..],
-        b"A010 APPEND \"INBOX\" (\\Seen \\Answered) \"15-Mar-2026 10:00:00 +0000\" {50}\r\n"
+        append_segments(&cmd, &msgs),
+        vec![
+            "A010 APPEND \"INBOX\" (\\Seen \\Answered) \"15-Mar-2026 10:00:00 +0000\" {50}\r\n"
+                .to_owned(),
+            "<50> {30}\r\n".to_owned(),
+            "<30>\r\n".to_owned(),
+        ],
+        "N synchronizing literals must yield N+1 segments"
     );
-
-    // Simulate literal data would be sent here, then the second header:
-    buf.clear();
-    encode_multi_append_header(
-        &mut buf,
-        "A010",
-        "INBOX",
-        &[],
-        None,
-        30,
-        false,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
-    // Subsequent message: no flags, no date  -  just the literal header.
-    assert_eq!(&buf[..], b" {30}\r\n");
 }
 
 #[test]
 fn encode_multi_append_three_messages_literal_plus() {
     // 3-message MULTIAPPEND with LITERAL+ (RFC 3502 / RFC 7888 Section 4).
-    let mut buf = BytesMut::new();
-
-    // Message 1
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [
+        append_msg(&[crate::types::Flag::Seen], None, 100),
+        append_msg(&[], Some(" 1-Jan-2025 00:00:00 +0000"), 200),
+        append_msg(&[crate::types::Flag::Flagged], None, 300),
+    ];
+    let cmd = encode_append(
         "A020",
         "Archive",
-        &[crate::types::Flag::Seen],
-        None,
-        100,
+        &msgs,
         true,
-        LiteralMode::LiteralPlus,
-        false,
+        &append_opts(LiteralMode::LiteralPlus, false),
     )
     .unwrap();
-    let expected1 = b"A020 APPEND \"Archive\" (\\Seen) {100+}\r\n";
-    assert_eq!(&buf[..], &expected1[..]);
-
-    // Message 2 (no flags, with date)
-    buf.clear();
-    encode_multi_append_header(
-        &mut buf,
-        "A020",
-        "Archive",
-        &[],
-        Some(" 1-Jan-2025 00:00:00 +0000"),
-        200,
-        false,
-        LiteralMode::LiteralPlus,
-        false,
-    )
-    .unwrap();
-    assert_eq!(&buf[..], b" \" 1-Jan-2025 00:00:00 +0000\" {200+}\r\n");
-
-    // Message 3 (flags only, no date)
-    buf.clear();
-    encode_multi_append_header(
-        &mut buf,
-        "A020",
-        "Archive",
-        &[crate::types::Flag::Flagged],
-        None,
-        300,
-        false,
-        LiteralMode::LiteralPlus,
-        false,
-    )
-    .unwrap();
-    assert_eq!(&buf[..], b" (\\Flagged) {300+}\r\n");
+    assert_eq!(
+        append_segments(&cmd, &msgs),
+        vec![
+            "A020 APPEND \"Archive\" (\\Seen) {100+}\r\n<100> \" 1-Jan-2025 00:00:00 +0000\" \
+             {200+}\r\n<200> (\\Flagged) {300+}\r\n<300>\r\n"
+                .to_owned()
+        ],
+        "with LITERAL+ nothing waits, so the whole command is one segment"
+    );
 }
 
 #[test]
 fn encode_multi_append_subsequent_no_flags_with_date() {
     // Subsequent message with date but no flags (RFC 3502 Section 3).
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        Some("25-Dec-2025 12:00:00 +0000"),
-        500,
-        false,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
-    assert_eq!(&buf[..], b" \"25-Dec-2025 12:00:00 +0000\" {500}\r\n");
+    let msgs = [
+        append_msg(&[], None, 10),
+        append_msg(&[], Some("25-Dec-2025 12:00:00 +0000"), 500),
+    ];
+    assert_eq!(
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            true,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"INBOX\" {10}\r\n<10> \"25-Dec-2025 12:00:00 +0000\" {500}\r\n<500>\r\n"
+    );
 }
 
 #[test]
 fn encode_multi_append_special_mailbox() {
     // Mailbox name with special characters uses quoting (RFC 3501 Section 9).
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 10)];
+    assert_eq!(
+        append_wire(
+            "A001",
+            r#"folder"name"#,
+            &msgs,
+            false,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"folder\\\"name\" {10}\r\n<10>\r\n"
+    );
+}
+
+/// The encoder must not copy a body: the chunk it emits is the caller's own
+/// allocation, and both a synchronizing and a non-synchronizing literal keep
+/// that property.
+#[test]
+fn encode_append_bodies_are_carried_by_reference() {
+    let msgs = [append_msg(&[], None, 8192), append_msg(&[], None, 4)];
+    for mode in [LiteralMode::Synchronizing, LiteralMode::LiteralPlus] {
+        let cmd = encode_append("A001", "INBOX", &msgs, true, &append_opts(mode, false)).unwrap();
+        let carried: Vec<&bytes::Bytes> = cmd
+            .segments()
+            .iter()
+            .flatten()
+            .filter(|chunk| is_body_chunk(chunk, &msgs))
+            .collect();
+        assert_eq!(
+            carried.len(),
+            2,
+            "both bodies present, once each ({mode:?})"
+        );
+        for (chunk, msg) in carried.iter().zip(&msgs) {
+            assert_eq!(chunk.as_ptr(), msg.data.as_ptr(), "no copy ({mode:?})");
+        }
+    }
+}
+
+/// A mailbox that cannot be a quoted string (here, one carrying CRLF) becomes a
+/// literal of its own. Under synchronizing literals that is a boundary in the
+/// middle of the header, so the message body is the THIRD segment.
+///
+/// Only in UTF-8 mode: outside it the mailbox is modified UTF-7, which encodes
+/// CR and LF into ASCII, so no mailbox name ever needs a literal there. The
+/// second half pins that too.
+#[test]
+fn encode_append_splits_at_a_synchronizing_mailbox_literal() {
+    let msgs = [append_msg(&[], None, 6)];
+    let cmd = encode_append(
         "A001",
-        r#"folder"name"#,
-        &[],
-        None,
-        10,
-        true,
-        LiteralMode::Synchronizing,
+        "a\r\nb",
+        &msgs,
         false,
+        &append_opts(LiteralMode::Synchronizing, true),
     )
     .unwrap();
-    assert_eq!(&buf[..], b"A001 APPEND \"folder\\\"name\" {10}\r\n");
+    assert_eq!(
+        append_segments(&cmd, &msgs),
+        vec![
+            "A001 APPEND {4}\r\n".to_owned(),
+            "a\r\nb UTF8 (~{6}\r\n".to_owned(),
+            "<6>)\r\n".to_owned(),
+        ]
+    );
+
+    let cmd = encode_append(
+        "A001",
+        "a\r\nb",
+        &msgs,
+        false,
+        &append_opts(LiteralMode::Synchronizing, false),
+    )
+    .unwrap();
+    assert_eq!(
+        append_segments(&cmd, &msgs),
+        vec![
+            "A001 APPEND \"a&AA0ACg-b\" {6}\r\n".to_owned(),
+            "<6>\r\n".to_owned(),
+        ],
+        "modified UTF-7 turns CRLF into ASCII, so the mailbox stays quoted"
+    );
+}
+
+/// Non-empty segments: an empty message body is a legal zero-length literal and
+/// still gets its own continuation under synchronizing literals.
+#[test]
+fn encode_append_zero_length_body_is_still_a_segment() {
+    let msgs = [crate::types::AppendMessage::new(bytes::Bytes::new())];
+    let cmd = encode_append(
+        "A001",
+        "INBOX",
+        &msgs,
+        false,
+        &append_opts(LiteralMode::Synchronizing, false),
+    )
+    .unwrap();
+    assert_eq!(cmd.segments().len(), 2);
+    assert!(cmd.segments().iter().all(|segment| !segment.is_empty()));
 }
 
 // ===== Negative / edge-case encoding tests =====
@@ -2389,68 +2543,177 @@ fn spec_audit_l14_invalid_sequence_set() {
 /// `APPEND <mailbox> UTF8 (~{size[+]}\r\n<message>)`.
 #[test]
 fn audit_finding1_append_header_with_utf8_extension() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 100)];
+    // UTF8=ACCEPT enabled, no literal extension.
+    let output = append_wire(
         "A001",
         "INBOX",
-        &[],
-        None,
-        100,
-        true,                       // first message
-        LiteralMode::Synchronizing, // no literal extension
-        true,                       // utf8 mode
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
+        &msgs,
+        false,
+        &append_opts(LiteralMode::Synchronizing, true),
+    );
     assert_eq!(
-        output, "A001 APPEND \"INBOX\" UTF8 (~{100}\r\n",
-        "RFC 6855 Section 4: UTF8 APPEND data extension"
+        output, "A001 APPEND \"INBOX\" UTF8 (~{100}\r\n<100>)\r\n",
+        "RFC 6855 Section 4: UTF8 APPEND data extension, closed after the body"
     );
 }
 
 /// Without UTF8 mode, the classic form is used.
 #[test]
 fn audit_finding1_append_header_classic_without_utf8() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 100)];
+    let output = append_wire(
         "A001",
         "INBOX",
-        &[],
-        None,
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false, // no utf8
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
-    assert_eq!(output, "A001 APPEND \"INBOX\" {100}\r\n");
+        &msgs,
+        false,
+        &append_opts(LiteralMode::Synchronizing, false),
+    );
+    assert_eq!(output, "A001 APPEND \"INBOX\" {100}\r\n<100>\r\n");
     assert!(!output.contains("UTF8"));
+}
+
+/// RFC 6855 Section 4 in MULTIAPPEND: each message is its own `UTF8 (...)`
+/// group, closed before the next message's syntax, with one final CRLF.
+#[test]
+fn append_utf8_extension_wraps_every_message_of_a_multiappend() {
+    let msgs = [
+        append_msg(&[crate::types::Flag::Seen], None, 5),
+        append_msg(&[], None, 7),
+    ];
+    assert_eq!(
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            true,
+            &append_opts(LiteralMode::Synchronizing, true)
+        ),
+        "A001 APPEND \"INBOX\" (\\Seen) UTF8 (~{5}\r\n<5>) UTF8 (~{7}\r\n<7>)\r\n"
+    );
 }
 
 /// RFC 3516 Section 4.4 / RFC 9051 Section 9: APPEND data containing NUL
 /// octets must use the `literal8` marker `~{size}\r\n`, not classic
-/// `literal` syntax.
+/// `literal` syntax. It needs BINARY; here no literal extension is in play.
 #[test]
 fn audit_finding6_append_header_uses_literal8_for_binary_append() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header_with_literal8(
-        &mut buf,
+    let msgs = [append_nul_msg(12)];
+    let mut o = append_opts(LiteralMode::Synchronizing, false);
+    o.capabilities.push(Capability::Binary);
+    assert_eq!(
+        append_wire("A001", "INBOX", &msgs, false, &o),
+        "A001 APPEND \"INBOX\" ~{12}\r\n<12>\r\n"
+    );
+}
+
+/// RFC 3516 Section 4.4: a NUL-bearing body without BINARY is refused, as
+/// `Error::Protocol` (the variant the account layer already maps), before any
+/// bytes exist.
+#[test]
+fn append_nul_body_without_binary_is_refused() {
+    let msgs = [append_nul_msg(3)];
+    let err = encode_append(
         "A001",
         "INBOX",
-        &[],
-        None,
-        12,
-        true,
-        LiteralMode::LiteralPlus,
+        &msgs,
         false,
-        true,
+        &append_opts(LiteralMode::LiteralPlus, false),
     )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
-    assert_eq!(output, "A001 APPEND \"INBOX\" ~{12}\r\n");
+    .expect_err("literal8 needs BINARY");
+    assert!(
+        matches!(err, crate::Error::Protocol(ref m) if m.contains("requires BINARY literal8 support")),
+        "got {err:?}"
+    );
+}
+
+/// The refusal is per message: a clean first message does not excuse a NUL in
+/// the second.
+#[test]
+fn multiappend_nul_body_without_binary_is_refused_in_any_position() {
+    let msgs = [append_msg(&[], None, 3), append_nul_msg(3)];
+    assert!(
+        encode_append(
+            "A001",
+            "INBOX",
+            &msgs,
+            true,
+            &append_opts(LiteralMode::Synchronizing, false),
+        )
+        .is_err()
+    );
+}
+
+/// RFC 7888 Section 6 matrix for literal8: the `+` marker needs BINARY AND a
+/// literal extension, with the LITERAL- size cap, and is never used on pure
+/// `IMAP4rev2` (RFC 9051 Section 9).
+#[test]
+fn append_literal8_plus_marker_matrix() {
+    let binary = |mode: LiteralMode| {
+        let mut o = append_opts(mode, false);
+        o.capabilities.push(Capability::Binary);
+        o
+    };
+    let small = [append_nul_msg(100)];
+    let large = [append_nul_msg(5000)];
+
+    assert_eq!(
+        append_wire(
+            "A",
+            "INBOX",
+            &small,
+            false,
+            &binary(LiteralMode::LiteralPlus)
+        ),
+        "A APPEND \"INBOX\" ~{100+}\r\n<100>\r\n",
+        "BINARY + LITERAL+: non-synchronizing literal8"
+    );
+    assert_eq!(
+        append_wire(
+            "A",
+            "INBOX",
+            &small,
+            false,
+            &binary(LiteralMode::LiteralMinus)
+        ),
+        "A APPEND \"INBOX\" ~{100+}\r\n<100>\r\n",
+        "BINARY + LITERAL- within 4096 octets"
+    );
+    assert_eq!(
+        append_wire(
+            "A",
+            "INBOX",
+            &large,
+            false,
+            &binary(LiteralMode::LiteralMinus)
+        ),
+        "A APPEND \"INBOX\" ~{5000}\r\n<5000>\r\n",
+        "BINARY + LITERAL- over 4096 octets stays synchronizing"
+    );
+    assert_eq!(
+        append_wire(
+            "A",
+            "INBOX",
+            &small,
+            false,
+            &binary(LiteralMode::Synchronizing)
+        ),
+        "A APPEND \"INBOX\" ~{100}\r\n<100>\r\n",
+        "BINARY without a literal extension"
+    );
+
+    // Pure rev2: BINARY is implied and literal8 is always synchronizing.
+    let rev2 = EncodeOptions {
+        utf8_mode: true,
+        literal_mode: LiteralMode::LiteralMinus,
+        capabilities: vec![Capability::Imap4Rev2, Capability::MultiAppend],
+        enabled: Vec::new(),
+    };
+    assert_eq!(
+        append_wire("A", "INBOX", &small, false, &rev2),
+        "A APPEND \"INBOX\" ~{100}\r\n<100>\r\n",
+        "rev2 literal8 has no `+` modifier, and NUL is allowed because BINARY is implied"
+    );
 }
 
 // ===== Audit finding #3: QRESYNC encoder fabricates known_uids =====
@@ -2750,20 +3013,14 @@ fn audit_h3_single_append_filters_recent_and_wildcard() {
         crate::types::Flag::Wildcard,
         crate::types::Flag::Flagged,
     ];
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&flags, None, 10)];
+    let output = append_wire(
         "A001",
         "INBOX",
-        &flags,
-        None,
-        10,
-        true,
-        LiteralMode::Synchronizing,
+        &msgs,
         false,
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
+        &append_opts(LiteralMode::Synchronizing, false),
+    );
     assert!(
         !output.contains("\\Recent"),
         "must filter \\Recent: {output}"
@@ -3328,7 +3585,7 @@ fn store_all_flags_filtered_returns_error_recent_only() {
 
 // --- Flag validation and filtering tests (STORE / APPEND) ---
 // These lock down the behavior of the shared flag-filter + validate logic
-// in encode_store_flags and encode_multi_append_header before refactoring.
+// in encode_store_flags and encode_append before refactoring.
 
 /// RFC 3501 Section 9: `\*` (Wildcard) is not valid in the `flag`
 /// production used by STORE; it must be silently filtered.
@@ -3510,11 +3767,7 @@ fn imap_003_store_remove_empty_flags_returns_error() {
 /// RFC 3501 Section 9: APPEND must filter `\Recent` and `\*` from flags.
 #[test]
 fn append_filters_recent_and_wildcard_flags() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
+    let msgs = [append_msg(
         &[
             crate::types::Flag::Seen,
             crate::types::Flag::Recent,
@@ -3523,14 +3776,16 @@ fn append_filters_recent_and_wildcard_flags() {
         ],
         None,
         42,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
+    )];
     assert_eq!(
-        &buf[..],
-        b"A001 APPEND \"INBOX\" (\\Seen \\Flagged) {42}\r\n",
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            false,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"INBOX\" (\\Seen \\Flagged) {42}\r\n<42>\r\n",
         "Recent and Wildcard must be filtered from APPEND flags"
     );
 }
@@ -3538,38 +3793,93 @@ fn append_filters_recent_and_wildcard_flags() {
 /// APPEND accepts valid custom flag keywords (RFC 3501 Section 9).
 #[test]
 fn append_accepts_valid_custom_flag() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
+    let msgs = [append_msg(
         &[crate::types::Flag::Custom("$MailFlagBit0".into())],
         None,
         10,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    )
-    .unwrap();
-    assert_eq!(&buf[..], b"A001 APPEND \"INBOX\" ($MailFlagBit0) {10}\r\n");
+    )];
+    assert_eq!(
+        append_wire(
+            "A001",
+            "INBOX",
+            &msgs,
+            false,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A001 APPEND \"INBOX\" ($MailFlagBit0) {10}\r\n<10>\r\n"
+    );
 }
 
 /// APPEND rejects custom flags containing invalid characters (RFC 3501 Section 9).
 #[test]
 fn append_rejects_invalid_custom_flag() {
-    let mut buf = BytesMut::new();
-    let result = encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
+    let msgs = [append_msg(
         &[crate::types::Flag::Custom("bad{flag}".into())],
         None,
         10,
-        true,
-        LiteralMode::Synchronizing,
+    )];
+    let result = encode_append(
+        "A001",
+        "INBOX",
+        &msgs,
         false,
+        &append_opts(LiteralMode::Synchronizing, false),
     );
     assert!(result.is_err(), "custom flag with braces must be rejected");
+}
+
+/// MULTIAPPEND needs the capability (RFC 3502 Section 3) and at least one
+/// message; a single APPEND carries exactly one.
+#[test]
+fn append_shape_and_capability_validation() {
+    let one = [append_msg(&[], None, 1)];
+    let two = [append_msg(&[], None, 1), append_msg(&[], None, 1)];
+    let with_cap = append_opts(LiteralMode::Synchronizing, false);
+    let without_cap = opts(LiteralMode::Synchronizing, false);
+
+    assert!(matches!(
+        encode_append("A", "INBOX", &one, true, &without_cap),
+        Err(crate::Error::MissingCapability(ref m)) if m == "MULTIAPPEND"
+    ));
+    // A plain APPEND never needs it.
+    assert!(encode_append("A", "INBOX", &one, false, &without_cap).is_ok());
+    assert!(matches!(
+        encode_append("A", "INBOX", &[], true, &with_cap),
+        Err(crate::Error::Protocol(_))
+    ));
+    assert!(matches!(
+        encode_append("A", "INBOX", &two, false, &with_cap),
+        Err(crate::Error::Protocol(_))
+    ));
+}
+
+/// Under active `IMAP4rev2` the mailbox goes out as raw UTF-8 like every other
+/// command's mailbox argument, not as modified UTF-7 (RFC 9051 Section 5.1);
+/// `UTF8=ACCEPT` is what selects the `UTF8 (` wrapper, and rev2 alone does not.
+#[test]
+fn append_rev2_uses_utf8_mailbox_without_the_utf8_wrapper() {
+    let rev2 = EncodeOptions {
+        utf8_mode: true,
+        literal_mode: LiteralMode::Synchronizing,
+        capabilities: vec![Capability::Imap4Rev2],
+        enabled: Vec::new(),
+    };
+    let msgs = [append_msg(&[], None, 3)];
+    assert_eq!(
+        append_wire("A", "café", &msgs, false, &rev2),
+        "A APPEND \"café\" {3}\r\n<3>\r\n"
+    );
+    // The same mailbox on rev1 without UTF8=ACCEPT is modified UTF-7.
+    assert_eq!(
+        append_wire(
+            "A",
+            "café",
+            &msgs,
+            false,
+            &append_opts(LiteralMode::Synchronizing, false)
+        ),
+        "A APPEND \"caf&AOk-\" {3}\r\n<3>\r\n"
+    );
 }
 
 // --- CHANGEDSINCE modifier boundary tests ---
@@ -3776,18 +4086,7 @@ fn encode_utf8_mode_escapes_backslash_and_dquote() {
 /// correct (day 7 of the month). The validator must accept them.
 #[test]
 fn test_append_accepts_zero_padded_day() {
-    let mut buf = BytesMut::new();
-    let result = encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        Some("07-Jul-1996 02:44:25 -0700"),
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    );
+    let result = append_with_date("07-Jul-1996 02:44:25 -0700");
     assert!(
         result.is_ok(),
         "zero-padded day '07' is valid per RFC 3501 Section 9 \
@@ -3823,42 +4122,22 @@ fn test_append_rejects_day_zero() {
 /// invalid month name must be rejected (RFC 3501 Section 9).
 #[test]
 fn test_append_rejects_invalid_month() {
-    let mut buf = BytesMut::new();
-    let result = encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        Some("31-Foo-2024 12:00:00 +0000"),
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    );
+    let result = append_with_date("31-Foo-2024 12:00:00 +0000");
     assert!(
         result.is_err(),
         "invalid month name should be rejected per RFC 3501 Section 9 date-month"
     );
 }
 
-/// completely malformed date string must be rejected.
+/// completely malformed date string must be rejected, with the
+/// `InvalidAppendDate` variant the account layer maps (the encoder returns
+/// `crate::Error`, not `EncodeError`, precisely so it survives).
 #[test]
 fn test_append_rejects_garbage_date() {
-    let mut buf = BytesMut::new();
-    let result = encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        Some("not-a-date"),
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    );
+    let result = append_with_date("not-a-date");
     assert!(
-        result.is_err(),
-        "garbage date string should be rejected per RFC 3501 Section 9"
+        matches!(result, Err(crate::Error::InvalidAppendDate(_))),
+        "garbage date string should be rejected per RFC 3501 Section 9: {result:?}"
     );
 }
 
@@ -3869,54 +4148,21 @@ fn test_append_rejects_garbage_date() {
 #[test]
 fn test_append_accepts_case_insensitive_month() {
     // Uppercase month
-    let mut buf = BytesMut::new();
-    let result = encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        Some(" 7-JAN-2024 12:00:00 +0000"),
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    );
+    let result = append_with_date(" 7-JAN-2024 12:00:00 +0000");
     assert!(
         result.is_ok(),
         "uppercase month must be accepted per RFC 3501 Section 9 paragraph (1): {result:?}"
     );
 
     // Lowercase month
-    let mut buf2 = BytesMut::new();
-    let result2 = encode_multi_append_header(
-        &mut buf2,
-        "A001",
-        "INBOX",
-        &[],
-        Some("15-jul-2024 12:00:00 +0000"),
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    );
+    let result2 = append_with_date("15-jul-2024 12:00:00 +0000");
     assert!(
         result2.is_ok(),
         "lowercase month must be accepted per RFC 3501 Section 9 paragraph (1): {result2:?}"
     );
 
     // Mixed case month
-    let mut buf3 = BytesMut::new();
-    let result3 = encode_multi_append_header(
-        &mut buf3,
-        "A001",
-        "INBOX",
-        &[],
-        Some("20-sEp-2024 12:00:00 +0000"),
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    );
+    let result3 = append_with_date("20-sEp-2024 12:00:00 +0000");
     assert!(
         result3.is_ok(),
         "mixed-case month must be accepted per RFC 3501 Section 9 paragraph (1): {result3:?}"
@@ -3927,36 +4173,14 @@ fn test_append_accepts_case_insensitive_month() {
 #[test]
 fn test_append_accepts_valid_datetime() {
     // Space-padded single-digit day.
-    let mut buf = BytesMut::new();
-    let result = encode_multi_append_header(
-        &mut buf,
-        "A001",
-        "INBOX",
-        &[],
-        Some(" 7-Jul-1996 02:44:25 -0700"),
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    );
+    let result = append_with_date(" 7-Jul-1996 02:44:25 -0700");
     assert!(
         result.is_ok(),
         "valid space-padded day should be accepted: {result:?}"
     );
 
     // Two-digit day.
-    let mut buf2 = BytesMut::new();
-    let result2 = encode_multi_append_header(
-        &mut buf2,
-        "A001",
-        "INBOX",
-        &[],
-        Some("17-Jul-1996 02:44:25 -0700"),
-        100,
-        true,
-        LiteralMode::Synchronizing,
-        false,
-    );
+    let result2 = append_with_date("17-Jul-1996 02:44:25 -0700");
     assert!(
         result2.is_ok(),
         "valid two-digit day should be accepted: {result2:?}"
@@ -4074,24 +4298,19 @@ fn spec_audit_day_month_cross_check() {
     );
 }
 
-/// RFC 6855 Section 3: verify `encode_multi_append_header` uses quoted form
-/// for a UTF-8 mailbox name when `utf8` is true.
+/// RFC 6855 Section 3: verify `encode_append` uses quoted form
+/// for a UTF-8 mailbox name when UTF-8 mode is on.
 #[test]
 fn spec_audit_multi_append_utf8_mailbox_quoted() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 42)];
+    let output = append_wire(
         "A001",
         "日本語",
-        &[],
-        None,
-        42,
-        true,
-        LiteralMode::Synchronizing,
-        true, // utf8 = true
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf[..]).unwrap_or("");
+        &msgs,
+        false,
+        &append_opts(LiteralMode::Synchronizing, true),
+    );
+    let output = output.as_str();
     // The mailbox should be quoted, not a literal.
     assert!(
         output.contains("APPEND \""),
@@ -4638,25 +4857,21 @@ fn encode_get_quota_root_non_ascii() {
 // ── RFC 9051 Section 9: literal8 must not use non-synchronizing `+` suffix ──
 
 /// RFC 9051 Section 9: `literal8 = "~{" number64 "}" CRLF *OCTET`  -  no `["+"]`.
-/// When UTF8=ACCEPT is active, the encoder must produce `~{N}\r\n`,
-/// never `~{N+}\r\n`. The decoder at decode.rs:377-383 already rejects
+/// When UTF8=ACCEPT is active on a server with LITERAL+ but WITHOUT BINARY,
+/// the encoder must produce `~{N}\r\n`, never `~{N+}\r\n` (RFC 7888 Section 6
+/// makes the `+` form conditional on BINARY). The decoder already rejects
 /// `~{N+}`  -  the encoder must match.
 #[test]
 fn literal8_must_not_use_non_sync_plus() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 100)];
+    let output = append_wire(
         "A001",
         "INBOX",
-        &[],                      // no flags
-        None,                     // no date
-        100,                      // message length
-        true,                     // first_message
-        LiteralMode::LiteralPlus, // LITERAL+ is negotiated (RFC 7888 Section 4)
-        true,                     // utf8 = true (UTF8=ACCEPT is active)
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
+        &msgs,
+        false,
+        &append_opts(LiteralMode::LiteralPlus, true), // UTF8=ACCEPT, LITERAL+, no BINARY
+    );
+    let output = output.as_str();
     // Must NOT contain `+}`  -  literal8 doesn't allow non-synchronizing form.
     assert!(
         !output.contains("+}"),
@@ -4669,24 +4884,33 @@ fn literal8_must_not_use_non_sync_plus() {
     );
 }
 
+/// RFC 7888 Section 6: BINARY together with LITERAL+ makes the `UTF8 (~{N+}`
+/// form legal on `IMAP4rev1`, and the encoder uses it (the pre-refactor
+/// handle-side path did too, by patching the header afterwards).
+#[test]
+fn utf8_wrapped_literal8_gets_plus_only_with_binary() {
+    let msgs = [append_msg(&[], None, 100)];
+    let mut o = append_opts(LiteralMode::LiteralPlus, true);
+    o.capabilities.push(Capability::Binary);
+    assert_eq!(
+        append_wire("A001", "INBOX", &msgs, false, &o),
+        "A001 APPEND \"INBOX\" UTF8 (~{100+}\r\n<100>)\r\n"
+    );
+}
+
 /// RFC 9051 Section 9: when UTF8=ACCEPT is NOT active, LITERAL+ `{N+}` is fine.
 /// This test ensures we don't regress the normal LITERAL+ path.
 #[test]
 fn regular_literal_plus_still_works_without_utf8() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 200)];
+    let output = append_wire(
         "A001",
         "INBOX",
-        &[],                      // no flags
-        None,                     // no date
-        200,                      // message length
-        true,                     // first_message
-        LiteralMode::LiteralPlus, // LITERAL+ is negotiated (RFC 7888 Section 4)
-        false,                    // utf8 = false (no UTF8=ACCEPT)
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
+        &msgs,
+        false,
+        &append_opts(LiteralMode::LiteralPlus, false),
+    );
+    let output = output.as_str();
     // Regular literal with LITERAL+ must contain `{200+}\r\n`.
     assert!(
         output.contains("{200+}\r\n"),
@@ -4697,20 +4921,15 @@ fn regular_literal_plus_still_works_without_utf8() {
 /// RFC 9051 Section 9: when neither LITERAL+ nor UTF8=ACCEPT, produce `{N}\r\n`.
 #[test]
 fn synchronizing_literal_without_utf8() {
-    let mut buf = BytesMut::new();
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 300)];
+    let output = append_wire(
         "A001",
         "INBOX",
-        &[],                        // no flags
-        None,                       // no date
-        300,                        // message length
-        true,                       // first_message
-        LiteralMode::Synchronizing, // no literal extension
-        false,                      // utf8 = false
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
+        &msgs,
+        false,
+        &append_opts(LiteralMode::Synchronizing, false), // no literal extension
+    );
+    let output = output.as_str();
     // Must contain synchronizing literal `{300}\r\n`, no `+` or `~`.
     assert!(
         output.contains("{300}\r\n"),
@@ -5621,25 +5840,20 @@ fn literal_minus_small_literal_produces_single_segment() {
     );
 }
 
-/// RFC 7888 Section 5: `encode_multi_append_header` must respect the
+/// RFC 7888 Section 5: `encode_append` must respect the
 /// LITERAL- size limit for the message literal.
 #[test]
 fn literal_minus_multi_append_large_message_synchronizing() {
-    let mut buf = BytesMut::new();
     // Message size 5000 > 4096, must use synchronizing form in LITERAL- mode.
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 5000)];
+    let output = append_wire(
         "A001",
         "INBOX",
-        &[],
-        None,
-        5000,
+        &msgs,
         true,
-        LiteralMode::LiteralMinus,
-        false,
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
+        &append_opts(LiteralMode::LiteralMinus, false),
+    );
+    let output = output.as_str();
     assert!(
         output.contains("{5000}\r\n"),
         "LITERAL- with message > 4096 bytes must use synchronizing literal \
@@ -5652,25 +5866,20 @@ fn literal_minus_multi_append_large_message_synchronizing() {
     );
 }
 
-/// RFC 7888 Section 5: `encode_multi_append_header` uses non-synchronizing
+/// RFC 7888 Section 5: `encode_append` uses non-synchronizing
 /// form for small messages in LITERAL- mode.
 #[test]
 fn literal_minus_multi_append_small_message_non_synchronizing() {
-    let mut buf = BytesMut::new();
     // Message size 100 <= 4096, must use non-synchronizing form.
-    encode_multi_append_header(
-        &mut buf,
+    let msgs = [append_msg(&[], None, 100)];
+    let output = append_wire(
         "A001",
         "INBOX",
-        &[],
-        None,
-        100,
+        &msgs,
         true,
-        LiteralMode::LiteralMinus,
-        false,
-    )
-    .unwrap();
-    let output = std::str::from_utf8(&buf).unwrap();
+        &append_opts(LiteralMode::LiteralMinus, false),
+    );
+    let output = output.as_str();
     assert!(
         output.contains("{100+}\r\n"),
         "LITERAL- with message <= 4096 bytes must use non-synchronizing \

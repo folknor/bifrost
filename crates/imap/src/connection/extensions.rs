@@ -29,7 +29,7 @@ impl ImapConnection {
         // Check COMPRESS=DEFLATE capability from the snapshot.
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::CompressDeflate) {
+            if !super::auth::snapshot_supports(&snap, &Capability::CompressDeflate) {
                 return Err(Error::MissingCapability("COMPRESS=DEFLATE".into()));
             }
         }
@@ -200,9 +200,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Enable)
-                && !super::auth::is_rev2_from_snapshot(&snap)
-            {
+            if !super::auth::snapshot_supports(&snap, &Capability::Enable) {
                 return Err(Error::MissingCapability("ENABLE".into()));
             }
         }
@@ -231,9 +229,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Namespace)
-                && !super::auth::is_rev2_from_snapshot(&snap)
-            {
+            if !super::auth::snapshot_supports(&snap, &Capability::Namespace) {
                 return Err(Error::MissingCapability("NAMESPACE".into()));
             }
         }
@@ -267,7 +263,7 @@ impl ImapConnection {
     ) -> Result<Vec<(String, Option<String>)>, Error> {
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Id) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Id) {
                 return Err(Error::MissingCapability("ID".into()));
             }
         }
@@ -314,8 +310,8 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Metadata)
-                && !snap.capabilities.contains(&Capability::MetadataServer)
+            if !super::auth::snapshot_supports(&snap, &Capability::Metadata)
+                && !super::auth::snapshot_supports(&snap, &Capability::MetadataServer)
             {
                 return Err(Error::MissingCapability("METADATA".into()));
             }
@@ -351,8 +347,8 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Metadata)
-                && !snap.capabilities.contains(&Capability::MetadataServer)
+            if !super::auth::snapshot_supports(&snap, &Capability::Metadata)
+                && !super::auth::snapshot_supports(&snap, &Capability::MetadataServer)
             {
                 return Err(Error::MissingCapability("METADATA".into()));
             }
@@ -391,7 +387,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Quota) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Quota) {
                 return Err(Error::MissingCapability("QUOTA".into()));
             }
         }
@@ -420,7 +416,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Quota) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Quota) {
                 return Err(Error::MissingCapability("QUOTA".into()));
             }
         }
@@ -450,7 +446,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::QuotaSet) {
+            if !super::auth::snapshot_supports(&snap, &Capability::QuotaSet) {
                 return Err(Error::MissingCapability("QUOTASET".into()));
             }
         }
@@ -490,7 +486,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Acl) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
@@ -524,7 +520,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Acl) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
@@ -552,7 +548,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Acl) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
@@ -583,7 +579,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Acl) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }
@@ -612,7 +608,7 @@ impl ImapConnection {
         self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Acl) {
+            if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
                 return Err(Error::MissingCapability("ACL".into()));
             }
         }

@@ -262,9 +262,10 @@ fn search_consumer_keeps_the_solicited_reply_when_uid_expansion_is_incomplete() 
 }
 
 /// The same partitioning on the success path: the chosen ESEARCH is consumed,
-/// a second one is an extra and is reclassified.
+/// and a second one is surplus and DROPPED, as on the failure path. An ESEARCH
+/// is never an asynchronous notification, so it must not become an event.
 #[test]
-fn search_consumer_reclassifies_only_the_extra_esearch() {
+fn search_consumer_drops_the_surplus_esearch_on_success() {
     let mut consumer = SearchConsumer::new();
     let ctx = default_ctx();
     consumer.on_response(UntaggedResponse::Exists(1), NotifyFlags::default(), &ctx);
@@ -283,10 +284,8 @@ fn search_consumer_reclassifies_only_the_extra_esearch() {
     assert_eq!(result.output.unwrap().ids, vec![4]);
     assert_eq!(
         result.reclassified_as_events,
-        vec![
-            UntaggedResponse::Exists(1),
-            esearch_all(Some("A001"), vec![UidRange::single(9)]),
-        ]
+        vec![UntaggedResponse::Exists(1)],
+        "only the unsolicited EXISTS may become an event"
     );
 }
 
@@ -398,6 +397,114 @@ fn id_consumer_solicited_response_not_leaked() {
         result.reclassified_as_events.is_empty(),
         "solicited ID response must not be reclassified as event"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AppendConsumer / MultiAppendConsumer  -  the untagged OK is kept whole
+// ---------------------------------------------------------------------------
+
+fn untagged_appenduid_ok(uid_validity: u32, uids: Vec<UidRange>) -> UntaggedResponse {
+    UntaggedResponse::Status {
+        status: UntaggedStatus::Ok,
+        code: Some(ResponseCode::AppendUid { uid_validity, uids }),
+        text: "APPEND completed".into(),
+    }
+}
+
+fn tagged_ok_with(code: ResponseCode) -> TaggedResponse {
+    TaggedResponse {
+        code: Some(code),
+        ..tagged_ok()
+    }
+}
+
+/// An untagged `OK [APPENDUID]` is the answer when the tagged OK carries no
+/// code, and being the answer it is consumed, not also published as an event.
+#[test]
+fn append_consumer_uses_an_untagged_appenduid_as_the_answer() {
+    let mut consumer = AppendConsumer::default();
+    let ctx = default_ctx();
+    let notify = NotifyFlags::default();
+    consumer.on_response(UntaggedResponse::Exists(3), notify, &ctx);
+    consumer.on_response(
+        untagged_appenduid_ok(4242, vec![UidRange::single(12)]),
+        notify,
+        &ctx,
+    );
+
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
+    assert_eq!(result.output.expect("tagged OK"), Some((4242, 12)));
+    assert_eq!(
+        result.reclassified_as_events,
+        vec![UntaggedResponse::Exists(3)],
+        "the consumed APPENDUID OK must not be republished; the EXISTS must be"
+    );
+}
+
+/// The tagged code wins, and the unused untagged OK is surrendered whole
+/// rather than silently dropped.
+#[test]
+fn append_consumer_surrenders_an_untagged_appenduid_the_tagged_code_outranks() {
+    let mut consumer = AppendConsumer::default();
+    let ctx = default_ctx();
+    let untagged = untagged_appenduid_ok(1, vec![UidRange::single(1)]);
+    consumer.on_response(untagged.clone(), NotifyFlags::default(), &ctx);
+
+    let result = Box::new(consumer).finalize(
+        tagged_ok_with(ResponseCode::AppendUid {
+            uid_validity: 9,
+            uids: vec![UidRange::single(7)],
+        }),
+        &ctx,
+    );
+    assert_eq!(result.output.expect("tagged OK"), Some((9, 7)));
+    assert_eq!(result.reclassified_as_events, vec![untagged]);
+}
+
+/// A failed APPEND must hand back the untagged OK it saw, whole: it can no
+/// longer be an answer, and narrowing it to its code at `on_response` time is
+/// what used to make it unrecoverable.
+#[test]
+fn append_consumer_surrenders_the_whole_untagged_ok_on_failure() {
+    let mut consumer = AppendConsumer::default();
+    let ctx = default_ctx();
+    let notify = NotifyFlags::default();
+    let untagged = untagged_appenduid_ok(4242, vec![UidRange::single(12)]);
+    consumer.on_response(UntaggedResponse::Exists(3), notify, &ctx);
+    consumer.on_response(untagged.clone(), notify, &ctx);
+
+    let result = Box::new(consumer).finalize(tagged_no(), &ctx);
+    assert!(result.output.is_err());
+    assert_eq!(
+        result.reclassified_as_events,
+        vec![UntaggedResponse::Exists(3), untagged],
+        "arrival order is preserved and the OK keeps its text"
+    );
+}
+
+#[test]
+fn multi_append_consumer_expands_an_untagged_appenduid_and_surrenders_on_failure() {
+    let ctx = default_ctx();
+    let notify = NotifyFlags::default();
+    let untagged = untagged_appenduid_ok(5, vec![UidRange::range(10, 12), UidRange::single(20)]);
+
+    let mut consumer = MultiAppendConsumer::default();
+    consumer.on_response(untagged.clone(), notify, &ctx);
+    let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
+    assert_eq!(
+        result.output.expect("tagged OK"),
+        vec![(5, 10), (5, 11), (5, 12), (5, 20)]
+    );
+    assert!(
+        result.reclassified_as_events.is_empty(),
+        "the consumed untagged OK is the answer, not an event"
+    );
+
+    let mut consumer = MultiAppendConsumer::default();
+    consumer.on_response(untagged.clone(), notify, &ctx);
+    let result = Box::new(consumer).finalize(tagged_bad(), &ctx);
+    assert!(result.output.is_err());
+    assert_eq!(result.reclassified_as_events, vec![untagged]);
 }
 
 // ---------------------------------------------------------------------------

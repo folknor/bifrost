@@ -1,24 +1,5 @@
 use bytes::BytesMut;
 
-/// Wire literal syntax for APPEND message data.
-///
-/// RFC 3501 Section 4.3 / RFC 9051 Section 4.3 define classic `literal`
-/// syntax for `CHAR8` data (no NUL octets). RFC 3516 Section 4.4 extends
-/// APPEND with `literal8` for binary data, and RFC 6855 Section 4 wraps
-/// `literal8` in `UTF8 (...)` when UTF8=ACCEPT is enabled for UTF-8 headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AppendLiteralKind {
-    /// Classic `{N}` / `{N+}` APPEND literal for `CHAR8` data.
-    /// RFC 3501 Section 4.3 / RFC 9051 Section 4.3.
-    Literal,
-    /// Binary `~{N}` APPEND literal for data containing NUL octets.
-    /// RFC 3516 Section 4.4.
-    Literal8,
-    /// UTF8 APPEND wrapper using `UTF8 (~{N})`.
-    /// RFC 6855 Section 4.
-    Utf8Literal8,
-}
-
 /// RFC 9051 Section 9 ceiling for `number64`: an unsigned 63-bit integer, so
 /// the largest legal literal count is `i64::MAX`.
 pub(crate) const NUMBER64_MAX: u64 = i64::MAX as u64;

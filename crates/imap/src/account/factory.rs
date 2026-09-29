@@ -629,7 +629,7 @@ pub(crate) async fn discover_shared_folders(
     cfg: &ImapAccountConfig,
     profile: &ServerProfile,
 ) -> SharedDiscovery {
-    if !profile.supports(Capability::Namespace) && !profile.imap4rev2 {
+    if !profile.supports(Capability::Namespace) {
         return SharedDiscovery {
             entries: Vec::new(),
             foreign_namespaces_advertised: false,
@@ -745,7 +745,7 @@ pub(crate) async fn list_folders(
     cfg: &ImapAccountConfig,
     profile: &ServerProfile,
 ) -> Result<Vec<MailboxInfo>, crate::Error> {
-    if profile.supports(Capability::ListExtended) || profile.imap4rev2 {
+    if profile.supports(Capability::ListExtended) {
         match conn
             .list_extended("", &["*"], &[], &["SPECIAL-USE"], cfg.imap.command_timeout)
             .await

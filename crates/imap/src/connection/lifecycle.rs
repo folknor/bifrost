@@ -225,7 +225,6 @@ impl ImapConnection {
             state_rx,
             events_rx: tokio::sync::Mutex::new(events_rx),
             driver_handle: tokio::sync::Mutex::new(Some(handle)),
-            prebuilt_tag_counter: std::sync::atomic::AtomicU32::new(0),
             host: host.to_owned(),
             tls_active: std::sync::atomic::AtomicBool::new(
                 tls_mode.uses_implicit_tls() || tls_mode.uses_starttls(),

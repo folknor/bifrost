@@ -23,9 +23,7 @@ mod notify;
 mod quota_acl;
 mod thread_sort;
 
-#[cfg(test)]
-pub(crate) use self::append::encode_multi_append_header;
-pub(crate) use self::append::encode_multi_append_header_with_literal8;
+pub(crate) use self::append::encode_append;
 pub(super) use self::id::encode_id;
 pub(crate) use self::list::list_status_return_option_items;
 pub(super) use self::list::{encode_create_special_use, encode_list_extended, encode_list_status};

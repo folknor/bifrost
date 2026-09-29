@@ -422,7 +422,7 @@ fn append_message_basic() {
     let msg = AppendMessage {
         flags: vec![Flag::Seen],
         date: Some("01-Jan-2024 00:00:00 +0000".into()),
-        data: b"From: test@example.com\r\nSubject: Hi\r\n\r\nBody".to_vec(),
+        data: bytes::Bytes::from_static(b"From: test@example.com\r\nSubject: Hi\r\n\r\nBody"),
     };
     assert_eq!(msg.flags.len(), 1);
     assert_eq!(msg.flags[0], Flag::Seen);
@@ -435,10 +435,31 @@ fn append_message_no_flags_no_date() {
     let msg = AppendMessage {
         flags: vec![],
         date: None,
-        data: b"minimal message".to_vec(),
+        data: bytes::Bytes::from_static(b"minimal message"),
     };
     assert!(msg.flags.is_empty());
     assert!(msg.date.is_none());
+}
+
+/// `AppendMessage::new` must take an owned buffer over without copying it:
+/// the whole point of the `Bytes` field is that the caller's allocation is the
+/// one that reaches the socket.
+#[test]
+fn append_message_new_does_not_copy_an_owned_buffer() {
+    let body = b"From: a@example.com\r\n\r\nbody".to_vec();
+    let ptr = body.as_ptr();
+    let msg = AppendMessage::new(body);
+    assert_eq!(
+        msg.data.as_ptr(),
+        ptr,
+        "Vec<u8> must be adopted, not copied"
+    );
+    assert!(msg.flags.is_empty());
+    assert!(msg.date.is_none());
+
+    let shared = bytes::Bytes::from_static(b"shared");
+    let msg = AppendMessage::new(shared.clone());
+    assert_eq!(msg.data.as_ptr(), shared.as_ptr());
 }
 
 // --- Clone / Eq ---

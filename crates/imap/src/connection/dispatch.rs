@@ -459,19 +459,62 @@ impl Consumer for CreateConsumer {
 // Consumers  -  APPEND / MULTIAPPEND
 // ---------------------------------------------------------------------------
 
+/// Whether `resp` is an untagged `* OK [APPENDUID ...]`.
+///
+/// RFC 4315 Section 3: some servers send APPENDUID in an untagged OK rather
+/// than in the tagged OK.
+fn is_untagged_appenduid_ok(resp: &UntaggedResponse) -> bool {
+    matches!(
+        resp,
+        UntaggedResponse::Status {
+            status: UntaggedStatus::Ok,
+            code: Some(ResponseCode::AppendUid { .. }),
+            ..
+        }
+    )
+}
+
+/// Decide which APPENDUID code answers an APPEND, on the success path.
+///
+/// The tagged response's code wins when it has one. Otherwise the first
+/// untagged `OK [APPENDUID]` the consumer saw (`appenduid_at`, an index into
+/// `buffered`) is CONSUMED as the answer: it is removed from `buffered`, so it
+/// is not also published as an event. When the tagged code wins, the untagged
+/// OK stays in `buffered` and is surrendered to the dispatcher like any other
+/// unused response.
+fn resolve_appenduid(
+    tagged_code: Option<ResponseCode>,
+    appenduid_at: Option<usize>,
+    buffered: &mut Vec<UntaggedResponse>,
+) -> Option<ResponseCode> {
+    if tagged_code.is_some() {
+        return tagged_code;
+    }
+    let index = appenduid_at.filter(|&i| i < buffered.len())?;
+    match buffered.remove(index) {
+        UntaggedResponse::Status { code, .. } => code,
+        _ => None,
+    }
+}
+
 /// Consumer for APPEND (RFC 3501 Section6.3.11).
 ///
 /// APPEND has no solicited untagged responses of its own  -  all
 /// untagged data during APPEND is async state changes (EXISTS,
 /// EXPUNGE, FETCH, etc.). The result is extracted from the tagged
 /// OK response code: `[APPENDUID uidvalidity uid]` (RFC 4315 Section3).
+///
+/// An untagged `* OK [APPENDUID ...]` is retained WHOLE, in arrival order in
+/// `buffered`, with only its index remembered. Narrowing it to its
+/// `ResponseCode` at `on_response` time is what used to make it
+/// unrecoverable: by the time a failure was known, the response text was gone
+/// and nothing faithful could be handed back to the dispatcher. Now every arm
+/// says what becomes of it - consumed as the answer, or surrendered.
 #[derive(Default)]
 pub(crate) struct AppendConsumer {
     buffered: Vec<UntaggedResponse>,
-    /// APPENDUID response code extracted from an untagged `* OK [APPENDUID ...]`.
-    /// Some servers send APPENDUID in an untagged OK rather than in the
-    /// tagged OK (RFC 4315 Section3).
-    code: Option<ResponseCode>,
+    /// Index in `buffered` of the first untagged `OK [APPENDUID ...]`.
+    appenduid_at: Option<usize>,
 }
 
 impl Consumer for AppendConsumer {
@@ -484,18 +527,12 @@ impl Consumer for AppendConsumer {
         _ctx: &ConsumerContext,
     ) {
         // APPEND produces no untagged responses of its own
-        // (RFC 3501 Section6.3.11). Buffer everything for reclassification.
-        match resp {
-            // RFC 4315 Section3: some servers send APPENDUID in an untagged OK.
-            UntaggedResponse::Status {
-                status: UntaggedStatus::Ok,
-                code: code_opt @ Some(ResponseCode::AppendUid { .. }),
-                ..
-            } if self.code.is_none() => {
-                self.code = code_opt;
-            }
-            other => self.buffered.push(other),
+        // (RFC 3501 Section6.3.11). Buffer everything; remember where the
+        // first untagged APPENDUID OK sits.
+        if self.appenduid_at.is_none() && is_untagged_appenduid_ok(&resp) {
+            self.appenduid_at = Some(self.buffered.len());
         }
+        self.buffered.push(resp);
     }
 
     fn finalize(
@@ -503,19 +540,20 @@ impl Consumer for AppendConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<Option<(u32, u32)>> {
-        // `buffered` is all `Either` data and is surrendered on both arms.
-        // `self.code` is DROPPED on failure, deliberately: it is a solicited
-        // accumulator, an APPENDUID naming a message the server has just told
-        // us it did not append is not a state change anyone should act on, and
-        // `on_response` kept only the code - the untagged OK's text is already
-        // gone, so no faithful `UntaggedResponse` can be rebuilt from it.
+        // On failure everything is surrendered, the untagged APPENDUID OK
+        // included: it is whole, so it is a faithful event, and it was
+        // classified `Either` so it may equally be an asynchronous notice.
+        let Self {
+            mut buffered,
+            appenduid_at,
+        } = *self;
         let tagged = match tagged.require_ok() {
             Ok(t) => t,
-            Err(e) => return Finalized::failure(e, self.buffered),
+            Err(e) => return Finalized::failure(e, buffered),
         };
-        // RFC 4315 Section3: extract APPENDUID from the tagged OK response code.
-        // Servers without UIDPLUS may omit it.
-        let code = tagged.code.or(self.code);
+        // RFC 4315 Section3: extract APPENDUID from the tagged OK response code,
+        // or failing that from an untagged OK. Servers without UIDPLUS may omit it.
+        let code = resolve_appenduid(tagged.code, appenduid_at, &mut buffered);
         let append_uid = match code {
             Some(ResponseCode::AppendUid { uid_validity, uids }) => {
                 // Single APPEND  -  extract the first UID from the set.
@@ -523,7 +561,7 @@ impl Consumer for AppendConsumer {
             }
             _ => None,
         };
-        Finalized::success(append_uid, self.buffered)
+        Finalized::success(append_uid, buffered)
     }
 }
 
@@ -531,14 +569,13 @@ impl Consumer for AppendConsumer {
 ///
 /// Same as [`AppendConsumer`] but extracts multiple UIDs from the
 /// `[APPENDUID]` response code. Each UID range is expanded into
-/// individual `(uid_validity, uid)` pairs.
+/// individual `(uid_validity, uid)` pairs. Retains an untagged
+/// `* OK [APPENDUID ...]` whole, exactly as [`AppendConsumer`] does.
 #[derive(Default)]
 pub(crate) struct MultiAppendConsumer {
     buffered: Vec<UntaggedResponse>,
-    /// APPENDUID response code extracted from an untagged `* OK [APPENDUID ...]`.
-    /// Some servers send APPENDUID in an untagged OK rather than in the
-    /// tagged OK (RFC 4315 Section3).
-    code: Option<ResponseCode>,
+    /// Index in `buffered` of the first untagged `OK [APPENDUID ...]`.
+    appenduid_at: Option<usize>,
 }
 
 impl Consumer for MultiAppendConsumer {
@@ -551,18 +588,12 @@ impl Consumer for MultiAppendConsumer {
         _ctx: &ConsumerContext,
     ) {
         // MULTIAPPEND produces no untagged responses of its own
-        // (RFC 3502 Section3). Buffer everything for reclassification.
-        match resp {
-            // RFC 4315 Section3: some servers send APPENDUID in an untagged OK.
-            UntaggedResponse::Status {
-                status: UntaggedStatus::Ok,
-                code: code_opt @ Some(ResponseCode::AppendUid { .. }),
-                ..
-            } if self.code.is_none() => {
-                self.code = code_opt;
-            }
-            other => self.buffered.push(other),
+        // (RFC 3502 Section3). Buffer everything; remember where the first
+        // untagged APPENDUID OK sits.
+        if self.appenduid_at.is_none() && is_untagged_appenduid_ok(&resp) {
+            self.appenduid_at = Some(self.buffered.len());
         }
+        self.buffered.push(resp);
     }
 
     fn finalize(
@@ -570,17 +601,19 @@ impl Consumer for MultiAppendConsumer {
         tagged: TaggedResponse,
         _ctx: &ConsumerContext,
     ) -> Finalized<Vec<(u32, u32)>> {
-        // Same disposition as `AppendConsumer`: `buffered` is surrendered,
-        // `self.code` is dropped on failure (solicited, unusable after a NO,
-        // and no longer reconstructible as an `UntaggedResponse`).
+        // Same disposition as `AppendConsumer`.
+        let Self {
+            mut buffered,
+            appenduid_at,
+        } = *self;
         let tagged = match tagged.require_ok() {
             Ok(t) => t,
-            Err(e) => return Finalized::failure(e, self.buffered),
+            Err(e) => return Finalized::failure(e, buffered),
         };
         // RFC 4315 Section3: for MULTIAPPEND, the uid-set contains one
         // UID per appended message, possibly as ranges.
         let mut results = Vec::new();
-        let code = tagged.code.or(self.code);
+        let code = resolve_appenduid(tagged.code, appenduid_at, &mut buffered);
         if let Some(ResponseCode::AppendUid { uid_validity, uids }) = code {
             for range in &uids {
                 if let Some(end) = range.end {
@@ -593,7 +626,7 @@ impl Consumer for MultiAppendConsumer {
                 }
             }
         }
-        Finalized::success(results, self.buffered)
+        Finalized::success(results, buffered)
     }
 }
 

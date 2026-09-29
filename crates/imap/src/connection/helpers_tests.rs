@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::codec::encode::LiteralMode;
-use crate::connection::literals::AppendLiteralKind;
 use crate::connection::test_support::detached;
 use crate::connection::{ImapConnection, SessionState};
 use crate::error::Error;
@@ -244,6 +243,31 @@ fn require_condstore_accepts_either_capability() {
         conn(vec![]).require_condstore(),
         Err(Error::MissingCapability(_))
     ));
+}
+
+/// The handle-side gate helper is a view over the single capability authority:
+/// for every capability in every rev2-ACTIVE state it answers what the oracle
+/// does, so a capability added to the rev2 baseline reaches every handle gate.
+#[test]
+fn snapshot_supports_matches_the_authority() {
+    use crate::types::profile::capability_matrix::{
+        connection_states, every_capability, expected_usable,
+    };
+
+    for (capabilities, enabled) in connection_states() {
+        let snap = crate::connection::driver::ConnectionStateSnapshot {
+            session_state: SessionState::Authenticated,
+            capabilities: capabilities.clone(),
+            enabled: enabled.clone(),
+        };
+        for capability in every_capability() {
+            assert_eq!(
+                crate::connection::auth::snapshot_supports(&snap, &capability),
+                expected_usable(&capabilities, &enabled, &capability),
+                "{capability:?} with capabilities={capabilities:?}, enabled={enabled:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -541,54 +565,6 @@ fn non_sync_literal8_requires_binary_and_is_off_for_pure_rev2() {
     let minus = conn(vec![Capability::LiteralMinus, Capability::Binary]);
     assert!(minus.supports_non_sync_literal8(4096));
     assert!(!minus.supports_non_sync_literal8(4097));
-}
-
-// ---------------------------------------------------------------------------
-// APPEND literal kind (RFC 3516 Section 4.4 / RFC 6855 Section 4)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn append_literal_kind_plain_for_char8_data() {
-    let c = conn(vec![]);
-    assert_eq!(
-        c.append_literal_kind(b"hello").unwrap(),
-        AppendLiteralKind::Literal
-    );
-}
-
-#[test]
-fn append_literal_kind_requires_binary_for_nul_data() {
-    let without = conn(vec![]);
-    assert!(matches!(
-        without.append_literal_kind(b"a\0b"),
-        Err(Error::Protocol(_))
-    ));
-    let with = conn(vec![Capability::Binary]);
-    assert_eq!(
-        with.append_literal_kind(b"a\0b").unwrap(),
-        AppendLiteralKind::Literal8
-    );
-}
-
-#[test]
-fn append_literal_kind_is_utf8_wrapped_once_enabled() {
-    // RFC 6855 Section 4: after ENABLE UTF8=ACCEPT every APPEND uses the
-    // `UTF8 (~{n})` wrapper, NUL or not.
-    let c = conn_enabled(vec![], &["utf8=accept"]);
-    assert_eq!(
-        c.append_literal_kind(b"plain ascii").unwrap(),
-        AppendLiteralKind::Utf8Literal8
-    );
-}
-
-#[test]
-fn append_literal_non_sync_follows_the_kind() {
-    let c = conn(vec![Capability::LiteralPlus]);
-    // Classic literal follows LITERAL+ ...
-    assert!(c.append_literal_is_non_sync(AppendLiteralKind::Literal, 100_000));
-    // ... but literal8 additionally needs BINARY.
-    assert!(!c.append_literal_is_non_sync(AppendLiteralKind::Literal8, 1));
-    assert!(!c.append_literal_is_non_sync(AppendLiteralKind::Utf8Literal8, 1));
 }
 
 // ---------------------------------------------------------------------------

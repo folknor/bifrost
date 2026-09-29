@@ -37,18 +37,15 @@ impl ImapConnection {
 
         if (Self::search_criteria_contains_atom(criteria, "OLDER")
             || Self::search_criteria_contains_atom(criteria, "YOUNGER"))
-            && !snap.capabilities.contains(&Capability::Within)
+            && !super::auth::snapshot_supports(&snap, &Capability::Within)
         {
             return Err(Error::MissingCapability("WITHIN".into()));
         }
 
-        let is_rev2 = super::auth::is_rev2_from_snapshot(&snap);
-
         if ["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"]
             .into_iter()
             .any(|atom| Self::search_criteria_contains_atom(criteria, atom))
-            && !snap.capabilities.contains(&Capability::SaveDate)
-            && !is_rev2
+            && !super::auth::snapshot_supports(&snap, &Capability::SaveDate)
         {
             return Err(Error::MissingCapability("SAVEDATE".into()));
         }
@@ -56,8 +53,7 @@ impl ImapConnection {
         if ["EMAILID", "THREADID"]
             .into_iter()
             .any(|atom| Self::search_criteria_contains_atom(criteria, atom))
-            && !snap.capabilities.contains(&Capability::ObjectId)
-            && !is_rev2
+            && !super::auth::snapshot_supports(&snap, &Capability::ObjectId)
         {
             return Err(Error::MissingCapability("OBJECTID".into()));
         }

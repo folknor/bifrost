@@ -34,7 +34,10 @@ use super::{EncodeError, EncodeOptions, EncodedCommand, encode_enable, validate_
 /// produced: commands that require capabilities not present in
 /// `opts.capabilities` / `opts.enabled` return `EncodeError::MissingCapability`.
 ///
-/// APPEND is handled separately by `ImapConnection::append()`.
+/// APPEND and MULTIAPPEND are encoded by [`super::encode_append`], which the
+/// driver calls at send time: they carry whole messages, so they produce a
+/// [`super::ChunkedCommand`] that holds each body by reference instead of
+/// copying it into a flat buffer.
 /// Tag-command format per RFC 3501 Section 2.2.1 / RFC 9051 Section 2.2.1.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn encode_command(

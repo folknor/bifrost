@@ -89,9 +89,10 @@ impl ServerProfile {
         }
     }
 
-    /// Return `true` if the capability is advertised or folded into active IMAP4rev2.
+    /// Return `true` if the capability is advertised, implied by an advertised
+    /// QRESYNC (CONDSTORE only), or folded into active IMAP4rev2.
     pub fn supports(&self, capability: Capability) -> bool {
-        self.capabilities.contains(&capability) || self.rev2_implies(&capability)
+        supports(&self.capabilities, &self.enabled, &capability)
     }
 
     /// Return `true` if the server advertises the SASL mechanism.
@@ -142,7 +143,7 @@ impl ServerProfile {
 
     /// Return `true` when CONDSTORE behavior is available.
     pub fn supports_condstore(&self) -> bool {
-        self.supports(Capability::Condstore) || self.supports(Capability::QResync)
+        self.supports(Capability::Condstore)
     }
 
     /// Return `true` when QRESYNC is advertised.
@@ -166,32 +167,70 @@ impl ServerProfile {
     pub fn supports_compress(&self) -> bool {
         self.supports(Capability::CompressDeflate)
     }
+}
 
-    fn rev2_implies(&self, capability: &Capability) -> bool {
-        self.imap4rev2
-            && matches!(
-                capability,
-                Capability::Binary
-                    | Capability::Enable
-                    | Capability::Esearch
-                    | Capability::Idle
-                    | Capability::ListExtended
-                    | Capability::ListStatus
-                    | Capability::LiteralMinus
-                    | Capability::LiteralPlus
-                    | Capability::Move
-                    | Capability::Namespace
-                    | Capability::ObjectId
-                    | Capability::SaslIr
-                    | Capability::SaveDate
-                    | Capability::SearchRes
-                    | Capability::SpecialUse
-                    | Capability::StatusDeleted
-                    | Capability::StatusSize
-                    | Capability::UidPlus
-                    | Capability::Unselect
-            )
+/// Whether the RFC 9051 IMAP4rev2 baseline folds `capability` into the base
+/// protocol, so an active rev2 connection may use it without the server
+/// advertising the token.
+///
+/// This is THE list, and it is private to this module on purpose: every
+/// consumer asks [`supports`] instead, which combines it with the rev2-ACTIVE
+/// rule and the QRESYNC special case. Extensions the server may advertise but
+/// which rev2 did not fold in (CONDSTORE, QRESYNC, SORT, THREAD, WITHIN,
+/// PREVIEW, NOTIFY, MULTIAPPEND, ...) are deliberately absent.
+fn rev2_baseline_includes(capability: &Capability) -> bool {
+    matches!(
+        capability,
+        Capability::Binary
+            | Capability::Enable
+            | Capability::Esearch
+            | Capability::Idle
+            | Capability::ListExtended
+            | Capability::ListStatus
+            | Capability::LiteralMinus
+            | Capability::LiteralPlus
+            | Capability::Move
+            | Capability::Namespace
+            | Capability::ObjectId
+            | Capability::SaslIr
+            | Capability::SaveDate
+            | Capability::SearchRes
+            | Capability::SpecialUse
+            | Capability::StatusDeleted
+            | Capability::StatusSize
+            | Capability::UidPlus
+            | Capability::Unselect
+    )
+}
+
+/// Whether `capability` is usable on a connection with these advertised
+/// capabilities and ENABLEd extensions: the single authority for the question
+/// every encoder command gate, connection-handle gate and
+/// [`ServerProfile::supports`] asks.
+///
+/// Usable means any of:
+/// - the server advertises it;
+/// - it is the CONDSTORE capability and the server advertises QRESYNC (RFC 7162
+///   Section 3.2.3: QRESYNC implies CONDSTORE);
+/// - IMAP4rev2 is active ([`imap4rev2_active`]) and the rev2 baseline folds it
+///   in (RFC 9051 Appendix E). Extensions outside that baseline get no rev2
+///   clause.
+///
+/// The same warning as [`imap4rev2_active`] applies: pass a coherent
+/// `(capabilities, enabled)` pair from one owner, preferably through a typed
+/// wrapper.
+pub(crate) fn supports(
+    capabilities: &[Capability],
+    enabled: &[String],
+    capability: &Capability,
+) -> bool {
+    if capabilities.contains(capability) {
+        return true;
     }
+    if matches!(capability, Capability::Condstore) && capabilities.contains(&Capability::QResync) {
+        return true;
+    }
+    rev2_baseline_includes(capability) && imap4rev2_active(capabilities, enabled)
 }
 
 /// Whether IMAP4rev2 behaviour is active: the single authority for the RFC 9051
@@ -223,6 +262,161 @@ pub(crate) fn imap4rev2_active(capabilities: &[Capability], enabled: &[String]) 
             .any(|extension| extension.eq_ignore_ascii_case("IMAP4rev2"))
     } else {
         has_rev2
+    }
+}
+
+/// Shared oracle for tests of every view over [`supports`] (the profile, the
+/// encoder options and the connection snapshot).
+///
+/// `expected_usable` is written from RFC 9051 Appendix E and RFC 7162 Section
+/// 3.2.3 with an EXHAUSTIVE match over [`Capability`], so adding a variant does
+/// not compile until someone has decided whether the rev2 baseline folds it in.
+/// That is the guard against the failure this authority exists to prevent: a
+/// capability added to one list and silently missing from another.
+#[cfg(test)]
+pub(crate) mod capability_matrix {
+    use super::{Capability, imap4rev2_active};
+
+    /// One sample of every [`Capability`] variant (parameterised variants get a
+    /// representative payload).
+    pub(crate) fn every_capability() -> Vec<Capability> {
+        vec![
+            Capability::Imap4Rev1,
+            Capability::Imap4Rev2,
+            Capability::Acl,
+            Capability::AppendLimit(None),
+            Capability::AppendLimit(Some(1024)),
+            Capability::Binary,
+            Capability::Children,
+            Capability::CompressDeflate,
+            Capability::Condstore,
+            Capability::CreateSpecialUse,
+            Capability::Enable,
+            Capability::Esearch,
+            Capability::Id,
+            Capability::Idle,
+            Capability::ListExtended,
+            Capability::ListStatus,
+            Capability::LiteralPlus,
+            Capability::LoginDisabled,
+            Capability::LiteralMinus,
+            Capability::Metadata,
+            Capability::MetadataServer,
+            Capability::Move,
+            Capability::MultiAppend,
+            Capability::Namespace,
+            Capability::Notify,
+            Capability::ObjectId,
+            Capability::QResync,
+            Capability::Quota,
+            Capability::QuotaResource("STORAGE".to_owned()),
+            Capability::QuotaSet,
+            Capability::Rights("texk".to_owned()),
+            Capability::Preview,
+            Capability::SaslIr,
+            Capability::SaveDate,
+            Capability::SearchRes,
+            Capability::Sort,
+            Capability::SortDisplay("DISPLAY".to_owned()),
+            Capability::StartTls,
+            Capability::SpecialUse,
+            Capability::Thread("REFERENCES".to_owned()),
+            Capability::StatusSize,
+            Capability::StatusDeleted,
+            Capability::UidPlus,
+            Capability::Unauthenticate,
+            Capability::Unselect,
+            Capability::Utf8Accept,
+            Capability::Utf8Only,
+            Capability::Within,
+            Capability::XGmExt1,
+            Capability::Auth("PLAIN".to_owned()),
+            Capability::Other("X-VENDOR".to_owned()),
+        ]
+    }
+
+    /// Whether the RFC 9051 Appendix E baseline folds the capability in. Kept
+    /// as an exhaustive match, deliberately independent of the production list.
+    fn in_rev2_baseline(capability: &Capability) -> bool {
+        match capability {
+            Capability::Binary
+            | Capability::Enable
+            | Capability::Esearch
+            | Capability::Idle
+            | Capability::ListExtended
+            | Capability::ListStatus
+            | Capability::LiteralMinus
+            | Capability::LiteralPlus
+            | Capability::Move
+            | Capability::Namespace
+            | Capability::ObjectId
+            | Capability::SaslIr
+            | Capability::SaveDate
+            | Capability::SearchRes
+            | Capability::SpecialUse
+            | Capability::StatusDeleted
+            | Capability::StatusSize
+            | Capability::UidPlus
+            | Capability::Unselect => true,
+            Capability::Imap4Rev1
+            | Capability::Imap4Rev2
+            | Capability::Acl
+            | Capability::AppendLimit(_)
+            | Capability::Children
+            | Capability::CompressDeflate
+            | Capability::Condstore
+            | Capability::CreateSpecialUse
+            | Capability::Id
+            | Capability::LoginDisabled
+            | Capability::Metadata
+            | Capability::MetadataServer
+            | Capability::MultiAppend
+            | Capability::Notify
+            | Capability::QResync
+            | Capability::Quota
+            | Capability::QuotaResource(_)
+            | Capability::QuotaSet
+            | Capability::Rights(_)
+            | Capability::Preview
+            | Capability::Sort
+            | Capability::SortDisplay(_)
+            | Capability::StartTls
+            | Capability::Thread(_)
+            | Capability::Unauthenticate
+            | Capability::Utf8Accept
+            | Capability::Utf8Only
+            | Capability::Within
+            | Capability::XGmExt1
+            | Capability::Auth(_)
+            | Capability::Other(_) => false,
+        }
+    }
+
+    /// The expected answer for `capability` given the pair, from first
+    /// principles: advertised, or QRESYNC for CONDSTORE, or baseline under
+    /// active rev2.
+    pub(crate) fn expected_usable(
+        capabilities: &[Capability],
+        enabled: &[String],
+        capability: &Capability,
+    ) -> bool {
+        capabilities.contains(capability)
+            || (matches!(capability, Capability::Condstore)
+                && capabilities.contains(&Capability::QResync))
+            || (in_rev2_baseline(capability) && imap4rev2_active(capabilities, enabled))
+    }
+
+    /// Connection states that exercise every branch of the rev2-ACTIVE rule.
+    pub(crate) fn connection_states() -> Vec<(Vec<Capability>, Vec<String>)> {
+        let en = || vec!["IMAP4rev2".to_owned()];
+        vec![
+            (vec![], vec![]),
+            (vec![Capability::Imap4Rev1], vec![]),
+            (vec![Capability::Imap4Rev2], vec![]),
+            (vec![Capability::Imap4Rev1, Capability::Imap4Rev2], vec![]),
+            (vec![Capability::Imap4Rev1, Capability::Imap4Rev2], en()),
+            (vec![Capability::Imap4Rev1], en()),
+        ]
     }
 }
 

@@ -11,10 +11,7 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use crate::codec::encode::{
-    LiteralMode, encode_multi_append_header_with_literal8, encode_quoted_or_literal,
-    encode_quoted_or_literal_utf8,
-};
+use crate::codec::encode::LiteralMode;
 use crate::error::Error;
 use crate::types::{
     AclEntry, AppendMessage, Capability, Command, CopyResult, EsearchResponse, ExpungeResult,
@@ -53,7 +50,7 @@ pub(super) mod wire;
 pub use config::ImapConfig;
 pub(crate) use dispatch::FetchStreamItem;
 use literals::{
-    AppendLiteralKind, find_literal_boundary, patch_literals_to_plus_with_binary,
+    find_literal_boundary, patch_literals_to_plus_with_binary,
     patch_small_literals_to_plus_with_binary,
 };
 use stream::{CompressedStream, ImapStream, InnerStream};
@@ -315,11 +312,6 @@ pub(crate) struct ImapConnection {
     /// Wrapped in `Mutex<Option<...>>` so that `observe_driver_panic`
     /// can take the handle when shutting down, without needing `&mut self`.
     driver_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Tag counter for pre-built commands (APPEND / MULTIAPPEND).
-    ///
-    /// Uses prefix `P` to avoid collision with the driver's hex-format
-    /// tags. `AtomicU32` enables `&self` access without interior mutability.
-    prebuilt_tag_counter: std::sync::atomic::AtomicU32,
     /// Server hostname, retained for STARTTLS upgrade (RFC 3501 Section6.2.1).
     ///
     /// Needed to construct the `ServerName` for TLS SNI and certificate
@@ -419,19 +411,6 @@ impl ImapConnection {
             flag: &self.abandoned,
             completed: false,
         }
-    }
-
-    /// Generate the next tag for a pre-built command (APPEND/MULTIAPPEND).
-    ///
-    /// Uses `P` prefix to avoid collision with the driver's hex-format
-    /// tags (RFC 3501 Section2.2.1). Safe to call from `&self` via atomic
-    /// increment.
-    pub(super) fn next_prebuilt_tag(&self) -> String {
-        let n = self
-            .prebuilt_tag_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .wrapping_add(1);
-        format!("P{n:03}")
     }
 
     /// Drain all pending events from the typed event queue.

@@ -1,5 +1,5 @@
 use bifrost_types::TransmissionState;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tracing::trace;
 
 use crate::codec::encode::{LiteralMode, encode_command};
@@ -180,6 +180,61 @@ pub(super) async fn send_encoded_segments(
         }
     }
     Ok(SendOutcome::Sent)
+}
+
+/// Send the segments of a [`ChunkedCommand`](crate::codec::encode::ChunkedCommand),
+/// waiting for a `+` continuation between each pair of consecutive segments
+/// (RFC 3501 Section 4.3).
+///
+/// This is the send half of the ownership-preserving encoding: a message body
+/// is written straight from the caller's `Bytes`, never gathered into a
+/// command buffer. Each chunk is its own write, which is a flush per chunk, so
+/// the encoder keeps chunks few (command syntax is coalesced; a body is one
+/// chunk).
+///
+/// Transmission evidence follows [`send_encoded_segments`]: a failure in the
+/// first segment is `Unsent`, and any later segment comes after a server `+`
+/// and is `InFlight`. That is deliberately stricter for a non-synchronizing
+/// command than the flat-buffer path, which stamps its trailing write `Unsent`:
+/// APPEND is non-idempotent, and once a body has been offered to the socket,
+/// claiming "the server never saw it" is the unsafe direction.
+///
+/// Only reachable without pipeline routing, so a refused continuation is an
+/// ordinary error from [`wait_for_continuation`] and the `Rejected` outcome
+/// cannot occur; it is still handled rather than assumed.
+pub(super) async fn send_chunked_segments(
+    wire_reader: &mut super::super::wire::WireReader,
+    state: &mut super::super::state::ProtocolState,
+    event_sink: &mut event_sink::DriverEventSink,
+    segments: &[Vec<Bytes>],
+) -> Result<(), Error> {
+    for (i, segment) in segments.iter().enumerate() {
+        let state_for_segment = if i == 0 {
+            TransmissionState::Unsent
+        } else {
+            TransmissionState::InFlight
+        };
+        for chunk in segment {
+            // An empty message body is a legal zero-length literal; there is
+            // nothing to write for it.
+            if chunk.is_empty() {
+                continue;
+            }
+            wire_reader
+                .write_all(chunk)
+                .await
+                .map_err(|e| e.with_attempt(state_for_segment))?;
+        }
+        if i + 1 < segments.len()
+            && wait_for_continuation(wire_reader, state, event_sink, None).await?
+                == ContinuationOutcome::Rejected
+        {
+            return Err(Error::Internal(
+                "literal continuation refused outside a pipeline".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Wait for a server continuation response (`+ ...`) during

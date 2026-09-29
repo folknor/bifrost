@@ -350,9 +350,7 @@ impl ImapConnection {
         // MOVE is a base feature in IMAP4rev2 (RFC 9051 Appendix E item 2).
         {
             let snap = self.state_rx.borrow();
-            if !snap.capabilities.contains(&Capability::Move)
-                && !super::auth::is_rev2_from_snapshot(&snap)
-            {
+            if !super::auth::snapshot_supports(&snap, &Capability::Move) {
                 return Err(Error::MissingCapability("MOVE".into()));
             }
         }
