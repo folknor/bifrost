@@ -49,6 +49,13 @@ pub(crate) enum GraphError {
     /// receipt, so the provider's answer has been read and the refused
     /// follow-up was never sent.
     ProviderLinkRefused { reason: String },
+
+    /// A state this crate believes impossible was reached: a client used
+    /// with no attached `AccountNet`, a closed request semaphore. The
+    /// client's fault, never the provider's or the network's, and not
+    /// something a retry of the same request can repair
+    /// (`Internal(InvariantViolated)`).
+    Internal { message: String },
 }
 
 /// Parsed Graph error response.
@@ -140,7 +147,8 @@ impl GraphError {
             Self::Configuration { .. }
             | Self::Net(_)
             | Self::Json { .. }
-            | Self::ProviderLinkRefused { .. } => None,
+            | Self::ProviderLinkRefused { .. }
+            | Self::Internal { .. } => None,
         }
     }
 }

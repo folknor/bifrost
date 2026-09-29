@@ -693,10 +693,21 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-pub(crate) fn ews_client(account: &GraphAccount) -> Option<EwsClient> {
-    account.client.account_net().map(|net| {
-        EwsClient::new(net, account.client.ews_url()).with_tally(account.client.batch_tally())
-    })
+/// The EWS client over the account's attached transport.
+///
+/// A missing transport is unreachable (the factory attaches before any
+/// `GraphAccount` exists and nothing detaches it), so it is the client's own
+/// invariant failing: `EwsError::Internal`, never a network fault. A retry of
+/// the same request cannot re-attach, so a retryable classification here
+/// could only loop.
+pub(crate) fn ews_client(account: &GraphAccount) -> Result<EwsClient, EwsError> {
+    account
+        .client
+        .account_net()
+        .map(|net| {
+            EwsClient::new(net, account.client.ews_url()).with_tally(account.client.batch_tally())
+        })
+        .ok_or_else(|| EwsError::Internal("EWS client has no attached account transport".into()))
 }
 
 /// The result of walking a folder's `FindItem` pages.
@@ -860,12 +871,18 @@ pub(crate) async fn discover_public_folder_scopes(
         }
     };
 
-    let Some(ews) = ews_client(account) else {
-        warnings.push(Warning::support_only(
-            WarningKind::OperatorAttentionNeeded,
-            "public-folder discovery skipped: EWS account net not attached".to_string(),
-        ));
-        return (scopes, warnings);
+    // Best-effort like every other failure in this leg, which has no error
+    // channel: the warning names the internal invariant, so the missing
+    // containers are not mistaken for an account with no public folders.
+    let ews = match ews_client(account) {
+        Ok(ews) => ews,
+        Err(error) => {
+            warnings.push(Warning::support_only(
+                WarningKind::OperatorAttentionNeeded,
+                format!("public-folder discovery skipped: internal invariant failed: {error}"),
+            ));
+            return (scopes, warnings);
+        }
     };
 
     // Browse the hierarchy from the root using hierarchy headers (the
@@ -1063,24 +1080,16 @@ pub(crate) fn public_folder_inventory_stream(
 
         let (account, tally) = account.metered();
 
-        let Some(ews) = ews_client(&account) else {
-            let ctx = GraphErrorContext::ews(AccountOperation::SyncInventory)
-                .with_scope(ErrorScope::Cursor(scope.clone()));
-            yield bifrost_types::InventoryEvent::Terminated(ews_shared_scope_error(
-                // Not-yet-attached is a transient lifecycle condition
-                // (the engine reopens), not a malformed wire response;
-                // route it as a retryable Transport(Unsent) rather than a
-                // terminal Protocol(ParseFailed) that kills the scope.
-                EwsError::Transport(bifrost_net::Error::Network {
-                    message: "EWS account net not attached".to_string(),
-                    transmission_state: bifrost_types::TransmissionState::Unsent,
-                    source: None,
-                }),
-                &scope,
-                None,
-                ctx,
-            ));
-            return;
+        let ews = match ews_client(&account) {
+            Ok(ews) => ews,
+            Err(error) => {
+                let ctx = GraphErrorContext::ews(AccountOperation::SyncInventory)
+                    .with_scope(ErrorScope::Cursor(scope.clone()));
+                yield bifrost_types::InventoryEvent::Terminated(ews_shared_scope_error(
+                    error, &scope, None, ctx,
+                ));
+                return;
+            }
         };
 
         let walk = match fetch_all_items(&ews, &folder.0, None, &routing).await {
@@ -1446,25 +1455,15 @@ pub(crate) fn public_folder_changes_stream(
 
         let (account, tally) = account.metered();
 
-        let Some(ews) = ews_client(&account) else {
-            let ctx = GraphErrorContext::ews(AccountOperation::SyncChanges)
-                .with_scope(ErrorScope::Cursor(scope.clone()));
-            yield SyncEvent::Terminated(ews_shared_scope_error(
-                // Not-yet-attached is a transient lifecycle condition
-                // (the engine reopens), not a malformed wire response;
-                // route it as a retryable Transport(Unsent) rather than a
-                // terminal Protocol(ParseFailed) that kills the scope.
-                EwsError::Transport(bifrost_net::Error::Network {
-                    message: "EWS account net not attached".to_string(),
-                    transmission_state: bifrost_types::TransmissionState::Unsent,
-                    source: None,
-                }),
-                &scope,
-                None,
-                ctx,
-            ));
-            yield SyncEvent::Done(None);
-            return;
+        let ews = match ews_client(&account) {
+            Ok(ews) => ews,
+            Err(error) => {
+                let ctx = GraphErrorContext::ews(AccountOperation::SyncChanges)
+                    .with_scope(ErrorScope::Cursor(scope.clone()));
+                yield SyncEvent::Terminated(ews_shared_scope_error(error, &scope, None, ctx));
+                yield SyncEvent::Done(None);
+                return;
+            }
         };
 
         // 1. Incremental timestamp poll: items at/after the watermark. An
@@ -1560,6 +1559,33 @@ pub(crate) fn public_folder_changes_stream(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// An account whose client has no attached transport cannot build an
+    /// EWS client, and that is the client's own invariant: `Internal`, where
+    /// every EWS lane used to mint a `Network(Unsent)` error the engine
+    /// retried forever on the mistaken belief that a reopen was coming.
+    #[test]
+    fn an_unattached_account_has_no_ews_client_and_says_why() {
+        use super::super::{GraphAccount, PushMode};
+        use crate::client::GraphClient;
+
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let Err(error) = ews_client(&account) else {
+            panic!("an unattached account must not build an EWS client");
+        };
+        assert!(matches!(error, EwsError::Internal(_)));
+        let account_error = crate::account::graph_error::ews_error_to_account_error(
+            error,
+            GraphErrorContext::ews(AccountOperation::SyncChanges),
+        );
+        assert_eq!(
+            account_error.kind(),
+            &bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::InvariantViolated
+            )
+        );
+    }
 
     #[tokio::test]
     async fn metered_account_enrolls_buffered_ews_responses() {

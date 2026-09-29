@@ -165,9 +165,8 @@ async fn fetch_ews_attachment(
     let Some(routing) = account.public_folder_routing(&folder).await else {
         return Err(EwsAttachmentError::NotPublic);
     };
-    let Some(ews) = super::public_folder::ews_client(account) else {
-        return Err(EwsAttachmentError::NotAttached);
-    };
+    let ews = super::public_folder::ews_client(account)
+        .map_err(|error| EwsAttachmentError::NotAttached(Box::new(error)))?;
     let content = ews
         .get_attachment(&locator.attachment_id, &routing.headers())
         .await
@@ -179,7 +178,9 @@ enum EwsAttachmentError {
     /// The locator does not name a public folder we route (a stale handle,
     /// or discovery has not seeded the folder).
     NotPublic,
-    NotAttached,
+    /// No attached transport: the client's own invariant (see
+    /// `public_folder::ews_client`), scoped to the account.
+    NotAttached(Box<crate::ews::EwsError>),
     Ews(Box<crate::ews::EwsError>),
 }
 
@@ -199,16 +200,11 @@ fn open_ews_blob_stream(
                     &ObjectId(locator.message_id.clone()),
                 ));
             }
-            Err(EwsAttachmentError::NotAttached) => {
+            Err(EwsAttachmentError::NotAttached(error)) => {
                 let ctx = GraphErrorContext::ews(AccountOperation::OpenBlob)
                     .with_scope(ErrorScope::Account);
                 yield SyncEvent::Terminated(super::graph_error::ews_error_to_account_error(
-                    crate::ews::EwsError::Transport(bifrost_net::Error::Network {
-                        message: "EWS account net not attached".to_string(),
-                        transmission_state: bifrost_types::TransmissionState::Unsent,
-                        source: None,
-                    }),
-                    ctx,
+                    *error, ctx,
                 ));
             }
             Err(EwsAttachmentError::Ews(error)) => {
@@ -410,10 +406,7 @@ async fn fetch_raw_stream(
     let url = client
         .api_url(&format!("{prefix}/messages/{enc_message_id}/$value"))
         .map_err(Box::new)?;
-    client
-        .download_stream(&url, None)
-        .await
-        .map_err(|error| Box::new(crate::error::GraphError::Net(error)))
+    client.download_stream(&url, None).await.map_err(Box::new)
 }
 
 async fn fetch_blob_stream(
@@ -449,16 +442,17 @@ enum BlobFetchError {
     Failed(Box<crate::error::GraphError>),
 }
 
-impl From<bifrost_net::Error> for BlobFetchError {
-    fn from(error: bifrost_net::Error) -> Self {
+impl From<crate::error::GraphError> for BlobFetchError {
+    fn from(error: crate::error::GraphError) -> Self {
         match error {
-            bifrost_net::Error::Status { code, .. }
+            crate::error::GraphError::Net(bifrost_net::Error::Status { code, .. })
                 if code == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
             {
                 Self::MethodNotAllowed
             }
-            // All other net errors flow through the typed GraphError boundary.
-            other => Self::Failed(Box::new(crate::error::GraphError::Net(other))),
+            // Everything else, a client-side failure included, flows
+            // through the typed GraphError boundary.
+            other => Self::Failed(Box::new(other)),
         }
     }
 }

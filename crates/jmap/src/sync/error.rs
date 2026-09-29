@@ -26,9 +26,9 @@ use bifrost_net::{NetErrorContext, into_account_error as net_into_account_error}
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure, BatchItemId,
-    BatchSuccess, Cause, CursorScope, DiagnosticText, ErrorScope, ItemOutcome, JmapMethod,
-    MutationSuccess, Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind,
-    ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause, SyncEvent,
+    BatchSuccess, Cause, CursorScope, DiagnosticText, ErrorScope, InternalCause, InternalErrorKind,
+    ItemOutcome, JmapMethod, MutationSuccess, Protocol, ProtocolErrorKind, Provider, RequestCause,
+    RequestErrorKind, ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause, SyncEvent,
     SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
     TransportKind, WireCause,
 };
@@ -1020,6 +1020,23 @@ fn convert_transport(
     transport: crate::core::transport::TransportError,
     ctx: JmapErrorContext,
 ) -> AccountError {
+    // A local failure is authoritative: checked before the net evidence and
+    // the no-evidence fallback, either of which would call it a network
+    // fault and retry it forever.
+    if let Some(crate::core::transport::LocalFailure::InvariantViolated) = transport.local {
+        let detail = DiagnosticText::support_only(transport.message.clone());
+        return build(
+            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+            Cause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                Some(detail.clone()),
+            )),
+            &ctx,
+        )
+        .text(detail)
+        .try_build()
+        .expect("valid account error classification");
+    }
     if let Some(net) = transport.net {
         net_into_account_error(
             net,
@@ -1651,6 +1668,45 @@ mod tests {
     /// exactly what a live response produces.
     fn from_net(error: bifrost_net::Error) -> crate::Error {
         crate::Error::from(crate::core::transport::TransportError::from_net(error))
+    }
+
+    /// A local failure the transport marks is authoritative: it classifies
+    /// as the client's own invariant and stops, where the no-evidence
+    /// fallback called it `Transport(Network)` and the engine retried it as
+    /// a network fault forever. An unmarked error with no wire evidence (a
+    /// test stub's missing reply) keeps the fallback.
+    #[test]
+    fn a_local_transport_failure_is_internal_not_a_network_retry() {
+        use crate::core::transport::TransportError;
+        for local in [
+            TransportError::invariant("unsupported HTTP method: PUT"),
+            TransportError::invariant_with_source(
+                "Invalid forwarded-for header",
+                std::io::Error::other("bad byte"),
+            ),
+        ] {
+            let err = into_account_error(
+                crate::Error::from(local),
+                JmapErrorContext::new(AccountOperation::SyncChanges),
+            );
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
+            );
+            assert_eq!(
+                err.recovery(),
+                &bifrost_types::RecoveryClass::InternalFailure
+            );
+        }
+
+        let unmarked = into_account_error(
+            crate::Error::from(TransportError::new("stub transport has no queued reply")),
+            JmapErrorContext::new(AccountOperation::SyncChanges),
+        );
+        assert_eq!(
+            unmarked.kind(),
+            &AccountErrorKind::Transport(TransportErrorKind::Network)
+        );
     }
 
     /// A JMAP `limit` problem is not retried by bifrost-net when the

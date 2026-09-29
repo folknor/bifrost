@@ -384,6 +384,19 @@ exact origin equality with the base, no userinfo in the parsed fields or in
 the authority as written. The result is an `AdmittedUrl`, sent as its own
 serialization so the admitted URL is the sent one.
 
+Every send path takes its transport from one accessor, `attached_net`, and an
+EWS lane from `public_folder::ews_client`. A client with no attached
+`AccountNet` is unreachable - the factory attaches before any `GraphAccount`
+exists, `with_account_net` fills the slot at construction, derived clients
+copy a filled slot, and nothing empties it - so an empty or poisoned slot, and
+likewise a closed request semaphore, is `GraphError::Internal` /
+`EwsError::Internal` -> `Internal(InvariantViolated)`. It used to be minted as
+`Network(Unsent)`, which the engine retried forever although a retry of the
+same request never attaches anything. The EWS streaming worker reports it as
+`WatchEvent::Terminated` rather than exiting silently; best-effort
+public-folder discovery reports it as an operator warning, like the rest of
+that leg.
+
 The bearer-carrying send paths accept nothing else: `execute_wire`,
 `download_stream`, `EwsClient` (which holds its admitted endpoint or the
 reason there is none), and `execute_aux`, whose `AuxTarget::Bearer` takes an

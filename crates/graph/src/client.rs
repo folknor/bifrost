@@ -5,6 +5,7 @@ use bifrost_net::RetryPolicy;
 use bifrost_net::{
     AccountId, AccountNet, AccountSpec, Net, RateLimit, StaticTokenSource, TokenSource,
 };
+#[cfg(test)]
 use bifrost_types::TransmissionState;
 use bytes::Bytes;
 use serde::Serialize;
@@ -894,20 +895,17 @@ impl GraphClient {
         // below, through the production retry loop.
         #[cfg(test)]
         self.record_wire(method, url, if_match, prefer, body.as_ref());
-        let _permit = self.inner.semaphore.acquire().await.map_err(|_| {
-            GraphError::Net(bifrost_net::Error::Network {
+        // Nothing closes this semaphore, so a closed one is the client's own
+        // invariant failing - not a network fault a retry could clear.
+        let _permit = self
+            .inner
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|_| GraphError::Internal {
                 message: "Graph request semaphore closed".to_string(),
-                transmission_state: TransmissionState::Unsent,
-                source: None,
-            })
-        })?;
-        let account_net = self.wire_net().ok_or_else(|| {
-            GraphError::Net(bifrost_net::Error::Network {
-                message: "Graph client is not attached to an account".to_string(),
-                transmission_state: TransmissionState::Unsent,
-                source: None,
-            })
-        })?;
+            })?;
+        let account_net = self.attached_net()?;
 
         let mut builder = match method {
             "GET" => account_net.get(url),
@@ -970,13 +968,7 @@ impl GraphClient {
         };
         #[cfg(test)]
         self.record_aux(method, url, headers, bearer, &body);
-        let account_net = self.wire_net().ok_or_else(|| {
-            GraphError::Net(bifrost_net::Error::Network {
-                message: "Graph client is not attached to an account".to_string(),
-                transmission_state: TransmissionState::Unsent,
-                source: None,
-            })
-        })?;
+        let account_net = self.attached_net()?;
         let mut builder = match method {
             "POST" => account_net.post(url),
             "PUT" => account_net.put(url),
@@ -1060,27 +1052,41 @@ impl GraphClient {
         &self,
         url: &AdmittedUrl,
         range: Option<bifrost_types::ByteRange>,
-    ) -> Result<bifrost_net::ByteStream, bifrost_net::Error> {
+    ) -> Result<bifrost_net::ByteStream, GraphError> {
         let url = url.as_str();
         #[cfg(test)]
         self.record_download(url, range);
-        let account_net = self.wire_net().ok_or(bifrost_net::Error::Network {
-            message: "Graph client is not attached to an account".to_string(),
-            transmission_state: TransmissionState::Unsent,
-            source: None,
-        })?;
-        account_net.download_stream(url, range).await
+        let account_net = self.attached_net()?;
+        account_net
+            .download_stream(url, range)
+            .await
+            .map_err(GraphError::Net)
     }
 
     /// The transport a wire call should use: the scripted one under test
     /// when a script is installed, otherwise this client's own attached
     /// `AccountNet`. In production this is always the latter.
-    fn wire_net(&self) -> Option<AccountNet> {
+    ///
+    /// An unattached client is unreachable: `GraphAccountFactory::open`
+    /// attaches before any `GraphAccount` exists, `with_account_net` fills
+    /// the slot at construction, derived clients copy a filled slot, and
+    /// nothing empties it. So an empty or poisoned slot is the client's own
+    /// invariant failing (`GraphError::Internal`), and it must not be
+    /// dressed as a network fault: a retry of the same request never
+    /// re-attaches, so a retryable classification could only loop.
+    fn attached_net(&self) -> Result<AccountNet, GraphError> {
         #[cfg(test)]
         if let Some(scripted) = self.scripted_net() {
-            return Some(scripted);
+            return Ok(scripted);
         }
-        self.account_net()
+        match self.inner.account_net.read() {
+            Ok(slot) => slot.clone().ok_or_else(|| GraphError::Internal {
+                message: "Graph client is not attached to an account".to_string(),
+            }),
+            Err(_) => Err(GraphError::Internal {
+                message: "Graph client account_net lock poisoned".to_string(),
+            }),
+        }
     }
 
     #[cfg(test)]
@@ -1479,6 +1485,53 @@ mod tests {
         assert_eq!(client.api_base(), "http://127.0.0.1:8181/graph");
         // The Outlook origin, by contrast, correctly follows the redirect.
         assert_eq!(client.outlook_base(), "http://127.0.0.1:8181");
+    }
+
+    /// A client with no attached transport is the client's own invariant
+    /// failing, on every send path: it used to be minted as a
+    /// `Network(Unsent)` error, which the engine retried as a network fault
+    /// forever, though a retry of the same request never attaches anything.
+    #[tokio::test]
+    async fn an_unattached_client_is_an_internal_failure_on_every_send_path() {
+        let client = GraphClient::new("token");
+        let url = client.api_url("/me").expect("api url");
+        let is_internal = |error: GraphError| matches!(error, GraphError::Internal { .. });
+
+        assert!(is_internal(
+            client
+                .get::<serde_json::Value>(&url)
+                .await
+                .expect_err("rest")
+        ));
+        assert!(is_internal(
+            client
+                .execute_aux("POST", AuxTarget::Bearer(&url), &[], Bytes::new())
+                .await
+                .err()
+                .expect("aux")
+        ));
+        assert!(is_internal(
+            client
+                .download_stream(&url, None)
+                .await
+                .err()
+                .expect("download")
+        ));
+    }
+
+    /// Nothing closes the request semaphore, so a closed one is the client's
+    /// invariant too, not a network fault.
+    #[tokio::test]
+    async fn a_closed_request_semaphore_is_an_internal_failure() {
+        let client = GraphClient::new("token");
+        client.script_rest([]);
+        client.inner.semaphore.close();
+        let url = client.api_url("/me").expect("api url");
+        assert!(matches!(
+            client.get::<serde_json::Value>(&url).await,
+            Err(GraphError::Internal { .. })
+        ));
+        assert_eq!(client.wire_attempts(), 0);
     }
 
     #[test]

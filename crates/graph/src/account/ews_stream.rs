@@ -70,7 +70,21 @@ enum StreamLoopExit {
 
 pub(crate) async fn run_streaming_worker(account: GraphAccount) {
     let Some(account_net) = account.client.account_net() else {
-        tracing::warn!("[Graph EWS] Streaming worker started before account attach");
+        // Unreachable (the factory attaches before any `GraphAccount`
+        // exists), so it is the client's own invariant failing. Report it
+        // on the push channel rather than only logging: a silent exit would
+        // leave the push registration standing with no worker behind it and
+        // no health event to say so.
+        tracing::warn!("[Graph EWS] Streaming worker started with no attached transport");
+        let error = crate::account::graph_error::ews_error_to_account_error(
+            crate::ews::EwsError::Internal(
+                "EWS streaming worker has no attached account transport".into(),
+            ),
+            crate::account::graph_error::GraphErrorContext::ews(
+                bifrost_types::AccountOperation::PushSubscribe,
+            ),
+        );
+        let _ = account.push_tx.send(WatchEvent::Terminated(error));
         return;
     };
     let ews = EwsClient::new(account_net, account.client.ews_url());

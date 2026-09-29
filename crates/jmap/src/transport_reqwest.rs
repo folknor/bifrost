@@ -103,8 +103,12 @@ impl ReqwestTransport {
         let mut request = match method {
             "GET" => self.net.get(url),
             "POST" => self.net.post(url),
+            // Every caller in this file passes GET or POST, and the only
+            // default header is `Forwarded`, formatted from an `IpAddr`: both
+            // failures are impossible by construction, so they are the
+            // client's own invariant, not a network fault to retry.
             _ => {
-                return Err(TransportError::new(format!(
+                return Err(TransportError::invariant(format!(
                     "unsupported HTTP method: {method}"
                 )));
             }
@@ -112,7 +116,10 @@ impl ReqwestTransport {
         request = request.timeout(self.timeout);
         for (name, value) in &self.headers {
             let value = value.to_str().map_err(|e| {
-                TransportError::with_source(format!("Invalid default header value for {name}"), e)
+                TransportError::invariant_with_source(
+                    format!("Invalid default header value for {name}"),
+                    e,
+                )
             })?;
             request = request.header(name.as_str(), value);
         }
@@ -227,7 +234,10 @@ impl SseTransport for ReqwestTransport {
             .without_timeout();
         for (name, value) in &self.headers {
             let value = value.to_str().map_err(|e| {
-                TransportError::with_source(format!("Invalid default header value for {name}"), e)
+                TransportError::invariant_with_source(
+                    format!("Invalid default header value for {name}"),
+                    e,
+                )
             })?;
             request = request.header(name.as_str(), value);
         }

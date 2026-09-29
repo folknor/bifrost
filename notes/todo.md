@@ -93,10 +93,14 @@ item is what stops that.
     `RedirectLoop` (`Protocol(ContractViolation)`, `Acknowledged`); Graph
     calendar's event-search `PageWalk` refusal (`Unsupported`, where every
     other Graph `walk.enter` site gives `Protocol`).
-  - Configuration errors that derive `Transport(Network)` and so retry
-    forever: JMAP "unsupported HTTP method", invalid default header value,
-    missing credentials, invalid forwarded-for header; Graph "EWS account net
-    not attached" (`get.rs`, `pim/hydrate.rs`, `blob.rs`).
+  - Local failures still minted as `Transport(Network)` on purpose, found
+    while fixing their configuration-error siblings: Graph `new_handle`'s RNG
+    failure (`push/common.rs`, argued retryable in its comment; the IMAP SCRAM
+    nonce twin is now `Internal(RuntimeFailure)`), public-folder
+    `incomplete_walk_error` (`public_folder.rs`, a page cap or stalled offset
+    retried next poll by design), and JMAP's over-long EventSource response
+    (`event_source/parser.rs too_long_error`, a client safety limit, plausibly
+    `Internal(LimitExceeded)`).
   - `Unsupported` where the input is really malformed: Graph calendar
     `local_error` (bad cursor, bad event id, unknown timezone), Google
     `reject_unexpressible_all_day_patch`.

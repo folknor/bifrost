@@ -153,6 +153,10 @@ pub(crate) enum EwsError {
     /// The configured Outlook origin is unusable, so no request was sent.
     /// The consumer's configuration, classified `Request(Malformed)`.
     Configuration(String),
+
+    /// A state this crate believes impossible (no attached `AccountNet` to
+    /// send on), so no request was sent. `Internal(InvariantViolated)`.
+    Internal(String),
 }
 
 impl std::fmt::Display for EwsError {
@@ -165,6 +169,7 @@ impl std::fmt::Display for EwsError {
             }
             Self::MalformedXml(detail) => write!(f, "EWS malformed XML: {}", detail.as_str()),
             Self::Configuration(message) => write!(f, "EWS not configured: {message}"),
+            Self::Internal(message) => write!(f, "EWS internal error: {message}"),
         }
     }
 }

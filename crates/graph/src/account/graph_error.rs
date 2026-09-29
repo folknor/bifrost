@@ -138,7 +138,26 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
             .text(detail);
             finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
         }
+        GraphError::Internal { message } => internal_invariant(message, &ctx),
     }
+}
+
+/// A client-side invariant failure (`reference/error-model.md`): nothing was
+/// sent, and neither the provider nor the network is at fault.
+fn internal_invariant(message: String, ctx: &GraphErrorContext) -> AccountError {
+    let detail = DiagnosticText::support_only(message);
+    finish(
+        base_builder(
+            ctx,
+            AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+            Cause::Internal(InternalCause::new(
+                InternalErrorKind::InvariantViolated,
+                Some(detail.clone()),
+            )),
+        )
+        .text(detail),
+        ctx,
+    )
 }
 
 /// Classify a transport-layer failure, re-decoding Graph's own error
@@ -260,6 +279,7 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
             let builder = push_attempt(builder, TransmissionState::Acknowledged);
             finish(builder, &ctx)
         }
+        EwsError::Internal(message) => internal_invariant(message, &ctx),
         // An unusable configured Outlook origin: nothing was sent, and the
         // fix is the consumer's configuration.
         EwsError::Configuration(message) => finish(
@@ -1504,6 +1524,27 @@ mod tests {
             AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
         ));
         assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
+    }
+
+    /// A client-side invariant (an unattached client, a closed semaphore) is
+    /// `Internal`, terminal: never the `Transport(Network)` retry it used to
+    /// be dressed as.
+    #[test]
+    fn a_graph_internal_error_is_internal_not_a_network_retry() {
+        let error = into_account_error(
+            GraphError::Internal {
+                message: "Graph client is not attached to an account".to_string(),
+            },
+            graph_ctx(AccountOperation::SyncChanges),
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
+        );
+        assert_eq!(
+            error.recovery(),
+            &bifrost_types::RecoveryClass::InternalFailure
+        );
     }
 
     /// A cursor this crate built that will not serialize is the client's

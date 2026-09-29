@@ -16,7 +16,23 @@ pub(crate) struct TransportError {
     /// `None`; the conversion boundary falls back to a generic
     /// `Transport(Network)` classification when absent.
     pub(crate) net: Option<bifrost_net::Error>,
+    /// Set only when this crate failed locally, before anything was sent.
+    /// Authoritative over the no-`net` fallback: without it, a local
+    /// failure fell through to `Transport(Network)` and was retried as a
+    /// network fault forever. Only the dedicated constructors set it, so a
+    /// passed-through 3xx (`with_body`) or a test stub's missing reply keeps
+    /// the fallback.
+    pub(crate) local: Option<LocalFailure>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+/// What failed locally in a [`TransportError`]. Semantic rather than a flag,
+/// so each variant maps to its own `Internal` kind and no classification
+/// ever keys on the message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalFailure {
+    /// A state the transport believes impossible by construction.
+    InvariantViolated,
 }
 
 impl std::fmt::Display for TransportError {
@@ -39,6 +55,7 @@ impl TransportError {
             message: message.into(),
             body: None,
             net: None,
+            local: None,
             source: None,
         }
     }
@@ -51,6 +68,7 @@ impl TransportError {
             message: message.into(),
             body: None,
             net: None,
+            local: None,
             source: Some(Box::new(source)),
         }
     }
@@ -60,7 +78,29 @@ impl TransportError {
             message: message.into(),
             body: Some(body.into()),
             net: None,
+            local: None,
             source: None,
+        }
+    }
+
+    /// A local state this crate believes impossible by construction, raised
+    /// before anything was sent: `Internal(InvariantViolated)`, never a
+    /// network fault.
+    pub(crate) fn invariant(message: impl Into<String>) -> Self {
+        Self {
+            local: Some(LocalFailure::InvariantViolated),
+            ..Self::new(message)
+        }
+    }
+
+    /// As [`TransportError::invariant`], keeping the underlying error.
+    pub(crate) fn invariant_with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            local: Some(LocalFailure::InvariantViolated),
+            ..Self::with_source(message, source)
         }
     }
 
@@ -83,12 +123,14 @@ impl TransportError {
                     body,
                     headers,
                 }),
+                local: None,
                 source: None,
             },
             other => Self {
                 message,
                 body: preserved_response_body(&other),
                 net: Some(other),
+                local: None,
                 source: None,
             },
         }

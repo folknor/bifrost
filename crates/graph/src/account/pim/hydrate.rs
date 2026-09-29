@@ -77,20 +77,16 @@ pub(super) async fn public_message_hydrate(
             format!("public folder {} has no routing entry", folder.0),
         ));
     };
-    let Some(ews) = crate::account::public_folder::ews_client(account) else {
-        return Err(crate::account::graph_error::ews_error_to_account_error(
-            crate::ews::EwsError::Transport(bifrost_net::Error::Network {
-                message: "EWS account net not attached".to_string(),
-                transmission_state: bifrost_types::TransmissionState::Unsent,
-                source: None,
-            }),
+    let ews = crate::account::public_folder::ews_client(account).map_err(|error| {
+        crate::account::graph_error::ews_error_to_account_error(
+            error,
             GraphErrorContext::ews(AccountOperation::HydrateMessage).with_scope(
                 ErrorScope::Message {
                     id: id.0.clone().into(),
                 },
             ),
-        ));
-    };
+        )
+    })?;
     let native = crate::account::foreign::parse_message_id(id)
         .native_id()
         .to_string();

@@ -308,8 +308,12 @@ impl ClientBuilder {
     }
 
     pub(crate) async fn connect(self, url: &str) -> crate::Result<Client> {
+        // Both failures are impossible by construction - the only
+        // production caller (the sync factory) always sets credentials, and
+        // the forwarded-for value is formatted from an `IpAddr` - so they are
+        // the client's own invariant, not a network fault to retry.
         let credentials = self.credentials.ok_or_else(|| {
-            crate::core::transport::TransportError::new(
+            crate::core::transport::TransportError::invariant(
                 "Missing credentials - call .credentials() before .connect()",
             )
         })?;
@@ -319,7 +323,7 @@ impl ClientBuilder {
             headers.insert(
                 header::FORWARDED,
                 header::HeaderValue::from_str(&forwarded_for).map_err(|e| {
-                    crate::core::transport::TransportError::with_source(
+                    crate::core::transport::TransportError::invariant_with_source(
                         "Invalid forwarded-for header",
                         e,
                     )
