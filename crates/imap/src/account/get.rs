@@ -16,7 +16,7 @@ use super::inventory::{fetch_to_inventory, flags_set};
 use super::pim::PREVIEW_FETCH_BYTES;
 use super::targets::{TargetBatch, Verdict};
 use super::{
-    BATCH_ITEMS, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
+    BATCH_ITEMS, DecodedObjectId, ImapAccount, batch, decode_object_id, guarded_receiver_stream,
 };
 
 /// Memory ceiling for one body-bearing hydration FETCH.
@@ -35,7 +35,7 @@ pub(crate) fn get_stream(
     projection: Projection,
 ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
         let mut buffered = 0usize;
         while let Some(id) = ids.next().await {
@@ -83,7 +83,7 @@ pub(crate) fn get_stream(
         }
         let _ = tx.send(SyncEvent::Done(None)).await;
     });
-    boxed_receiver_stream(rx)
+    guarded_receiver_stream(rx, task)
 }
 
 async fn flush_get_groups(

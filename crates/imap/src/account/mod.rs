@@ -986,8 +986,8 @@ pub(crate) fn boxed_receiver_stream<T: Send + 'static>(
 /// A receiver stream that aborts the task feeding it when the stream is
 /// dropped.
 ///
-/// `Account::changes_stream` and `inventory_stream` are channel-backed by
-/// a detached `tokio::spawn`. Dropping the returned stream drops only the
+/// `Account::changes_stream`, `inventory_stream` and `get_stream` are
+/// channel-backed by a detached `tokio::spawn`. Dropping the returned stream drops only the
 /// receiver, so without this the task runs on against the account's
 /// connection until its next `tx.send` fails - and the engine now cuts a
 /// pending poll on every PAUSE, not only at teardown, then calls back in

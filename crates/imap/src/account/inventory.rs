@@ -380,44 +380,16 @@ mod tests {
     }
 
     mod qresync_ticket {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicU64;
-
-        use super::super::super::factory::ImapAccountConfig;
-        use super::super::super::{ImapAccount, ImapAccountParts, Pool};
+        use super::super::super::test_support::scripted_account_parts;
+        use super::super::super::{ImapAccount, ImapAccountParts};
         use super::super::QresyncWarningTicket;
         use crate::connection::test_support::{driver_pair, preauth_greeting};
-        use crate::types::{AuthPolicy, Credentials};
 
         async fn account() -> (ImapAccount, tokio::io::DuplexStream) {
             let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
-            let config = Arc::new(ImapAccountConfig::new(
-                crate::ImapConfig::plaintext("test.invalid"),
-                Credentials::password("user", "pass"),
-                AuthPolicy::default(),
-            ));
-            let bandwidth_cap = Arc::new(AtomicU64::new(0));
-            let pool = Arc::new(Pool::new(
-                Arc::clone(&config),
-                conn,
-                1,
-                None,
-                Arc::clone(&bandwidth_cap),
-            ));
             let account = ImapAccount::new(ImapAccountParts {
-                config,
-                capabilities: super::super::super::test_support::stub_capabilities(),
-                pool,
-                folders: Default::default(),
-                qresync_enabled: false,
                 qresync_negotiation_warning: Some("QRESYNC refused by the server".to_string()),
-                supports_notify: false,
-                bandwidth_cap,
-                contacts: None,
-                calendars: None,
-                dav_scopes: Default::default(),
-                submission: None,
-                dav_degraded: Vec::new(),
+                ..scripted_account_parts(conn, 1)
             });
             (account, server)
         }

@@ -180,6 +180,13 @@ fn importance_sets_important_keyword(level: Importance) -> bool {
 /// IMAP/SMTP does not do Graph-style shared-mailbox send routing; a
 /// `send_as` request is rejected `Unsupported(Send)` rather than
 /// silently sent from the authenticated user's own mailbox.
+///
+/// A shared-mailbox send over SMTP already works without `send_as`: the
+/// consumer sets `request.from` to the shared address and the relay's Send-As
+/// policy authorizes it. `Unsupported` is therefore a deliberate answer, not a
+/// gap. Translating `send_as` into a `from` override is the change to consider
+/// if a consumer wants the uniform surface to carry shared-mailbox send for
+/// IMAP-shaped accounts too.
 fn send_as_guard(request: &SendRequest) -> Option<AccountError> {
     request
         .send_as

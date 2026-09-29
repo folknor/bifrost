@@ -1104,9 +1104,8 @@ async fn append_checks_the_mailbox_specific_appendlimit_before_writing() {
 /// as everything else, so the vanished BINARY is caught locally and the command
 /// is refused before a byte is written. It does NOT reach the `WireAssumptions`
 /// guard in the driver - that one fires only when the state moves after the
-/// policy is read, i.e. while the command sits QUEUED behind another, which
-/// needs two handles and a withheld reply to stage. That guard is currently
-/// unpinned; see `notes/todo.md`.
+/// policy is read, i.e. while the command sits QUEUED behind another. The test
+/// after this one stages exactly that.
 #[tokio::test]
 async fn multiappend_refuses_bytes_built_before_a_capability_vanished() {
     use crate::types::AppendMessage;
@@ -1146,6 +1145,87 @@ async fn multiappend_refuses_bytes_built_before_a_capability_vanished() {
         "the literal kind must be derived from the SAME state as the rest of \
          the policy, so a vanished BINARY is caught here; got {err:?}"
     );
+}
+
+/// Prebuilt APPEND bytes queued behind another command must not be written
+/// once that command's completion has changed what they were encoded for.
+///
+/// Handle A's NOOP is in flight with its reply withheld. Handle B's APPEND
+/// reads its policy while BINARY is still advertised, builds a
+/// non-synchronizing `~{n+}` literal8, and queues behind A. A's reply then
+/// carries a CAPABILITY that drops BINARY, so by the time the driver reaches
+/// B, the bytes promise a literal form the server no longer accepts. Only the
+/// driver's `WireAssumptions` comparison can catch this: the handle-side policy
+/// read was correct when it happened.
+///
+/// Paused time is what makes the staging deterministic. A 1 ms sleep can only
+/// complete by auto-advance, which the runtime performs only once every task
+/// is idle - so when it returns, B has necessarily reached its wait on the
+/// driver's reply, i.e. it is queued.
+#[tokio::test(start_paused = true)]
+async fn a_queued_append_is_refused_when_the_state_it_was_built_for_moved() {
+    let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
+        "IMAP4rev1 BINARY LITERAL+",
+    ))
+    .await;
+    let conn = std::sync::Arc::new(conn);
+    let (noop_seen_tx, noop_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let script = tokio::spawn(async move {
+        let noop = read_line(&mut server).await;
+        assert!(noop.ends_with(" NOOP\r\n"), "expected NOOP, got {noop:?}");
+        let tag = tag_of(&noop).to_owned();
+        noop_seen_tx.send(()).expect("test is waiting");
+        release_rx.await.expect("test releases the reply");
+        respond(
+            &mut server,
+            &format!("* CAPABILITY IMAP4rev1 LITERAL+\r\n{tag} OK NOOP completed\r\n"),
+        )
+        .await;
+        // Everything the client writes from here until it hangs up. Any
+        // APPEND in it means the stale bytes reached the wire. Read to EOF
+        // rather than expecting a particular next command, so the assertion
+        // holds however the refusal leaves the connection.
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut server, &mut rest)
+            .await
+            .expect("duplex read");
+        let rest = String::from_utf8_lossy(&rest);
+        assert!(
+            !rest.contains("APPEND"),
+            "the stale APPEND must never be written, got {rest:?}"
+        );
+    });
+
+    let first = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        async move { conn.noop(Duration::from_secs(5)).await }
+    });
+    noop_seen_rx.await.expect("server saw the NOOP");
+    let append = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        // NUL forces literal8, whose `+` eligibility BINARY governs.
+        async move {
+            conn.append("INBOX", &[], None, b"a\0b", Duration::from_secs(5))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    release_tx.send(()).expect("server is waiting");
+
+    first.await.expect("noop task").expect("NOOP completes");
+    let err = append
+        .await
+        .expect("append task")
+        .expect_err("bytes built for the pre-CAPABILITY state must not be sent");
+    assert!(
+        matches!(err, Error::Protocol(ref m) if m.contains("connection state changed")),
+        "the driver's WireAssumptions guard must refuse the queued APPEND; got {err:?}"
+    );
+    // Dropping the last handle closes the client half, which ends the
+    // server's read.
+    drop(conn);
+    script.await.expect("NOOP transcript");
 }
 
 /// The APPENDLIMIT STATUS is a preflight. Its own transmission evidence is

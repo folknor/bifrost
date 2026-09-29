@@ -209,6 +209,14 @@ async fn upload_and_link(
 
     // From here until the upload completes there is server-side state to clean
     // up, so every exit on this leg goes through the cancel.
+    //
+    // Every exit except one: if the caller drops this future mid-upload, no
+    // cancel runs and Drive holds the partial for a week. A `Drop` guard is
+    // deliberately NOT the fix. `Drop` cannot await, and spawning the DELETE
+    // from `drop` trades an expiring server-side session for a detached task
+    // that outlives the account handle. Resuming on reopen is out too: the
+    // session URI is per-call state that no `HostAttachment` request carries
+    // back in, so resumption would need a published surface change.
     let file_id = match upload_file_chunked(client, &upload_url, bytes, GDRIVE_CHUNK_SIZE).await {
         Ok(file_id) => file_id,
         Err(error) => {

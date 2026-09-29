@@ -53,6 +53,13 @@ pub enum ProofStatus {
 
 /// Bound on parent-link walking, so a cycle from a buggy replacement cannot
 /// hang the single writer every durable mutation funnels through.
+///
+/// Multi-level lineages cannot arise in process: `replace_obligation`
+/// re-points every child at `lineage_root(parent)`, so live shapes are always
+/// flat. A chain is reachable only by restoring a durable row through
+/// `decode_ledger` or `from_parts` that another revision, or a hand edit,
+/// wrote. The cap and the ancestor closure are insurance against exactly
+/// those rows, and the tests build chains that way on purpose.
 const LINEAGE_DEPTH_CAP: usize = 64;
 
 /// Entry count at which an ingest folds terminal history into the audit table.

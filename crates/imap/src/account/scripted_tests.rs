@@ -8,17 +8,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use bifrost_types::{ContainerId, ContainerKind};
 
 use crate::connection::test_support::{driver_pair, preauth_greeting, read_line, respond, tag_of};
-use crate::types::{AuthPolicy, Credentials};
 
-use super::factory::ImapAccountConfig;
 use super::folder_registry::FolderRegistry;
-use super::{ImapAccount, ImapAccountParts, Pool};
+use super::test_support::scripted_account_parts;
+use super::{ImapAccount, ImapAccountParts};
 
 /// Build an account whose pool holds exactly `pool_cap` permits and is
 /// primed with the scripted connection. Every checkout therefore reuses
@@ -60,36 +58,12 @@ fn scripted_dav_account(
     folders: FolderRegistry,
     dav_scopes: super::DavScopeIndex,
 ) -> ImapAccount {
-    let config = Arc::new(ImapAccountConfig {
-        pool_cap,
-        ..ImapAccountConfig::new(
-            crate::ImapConfig::plaintext("test.invalid"),
-            Credentials::password("user", "pass"),
-            AuthPolicy::default(),
-        )
-    });
-    let bandwidth_cap = Arc::new(AtomicU64::new(0));
-    let pool = Arc::new(Pool::new(
-        Arc::clone(&config),
-        conn,
-        pool_cap,
-        None,
-        Arc::clone(&bandwidth_cap),
-    ));
     ImapAccount::new(ImapAccountParts {
-        config,
-        capabilities: super::test_support::stub_capabilities(),
-        pool,
         folders: Arc::new(folders),
         qresync_enabled,
         qresync_negotiation_warning,
-        supports_notify: false,
-        bandwidth_cap,
-        contacts: None,
-        calendars: None,
         dav_scopes,
-        submission: None,
-        dav_degraded: Vec::new(),
+        ..scripted_account_parts(conn, pool_cap)
     })
 }
 

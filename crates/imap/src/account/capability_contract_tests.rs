@@ -30,7 +30,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use bifrost_types::{
     Account, AccountError, AccountErrorKind, AccountOperation, CloudUploadMeta, ContactCreate,
@@ -43,11 +42,10 @@ use bifrost_types::{
 use futures::StreamExt as _;
 
 use super::capabilities::build_capabilities;
-use super::factory::ImapAccountConfig;
-use super::folder_registry::FolderRegistry;
-use super::{ImapAccount, ImapAccountParts, Pool};
+use super::test_support::scripted_account_parts;
+use super::{ImapAccount, ImapAccountParts};
 use crate::connection::test_support::{driver_pair, preauth_greeting};
-use crate::types::{AuthPolicy, Credentials, ServerProfile};
+use crate::types::{Credentials, ServerProfile};
 
 /// An account carrying the REAL IMAP capability snapshot for a bare server
 /// (no UIDPLUS, no THREAD, no QUOTA, no IDLE), no ManageSieve, no submission
@@ -60,34 +58,10 @@ async fn account() -> ImapAccount {
     let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     drop(server);
 
-    let config = Arc::new(ImapAccountConfig::new(
-        crate::ImapConfig::plaintext("test.invalid"),
-        Credentials::password("user", "pass"),
-        AuthPolicy::default(),
-    ));
-    let bandwidth_cap = Arc::new(AtomicU64::new(0));
-    let pool = Arc::new(Pool::new(
-        Arc::clone(&config),
-        conn,
-        1,
-        None,
-        Arc::clone(&bandwidth_cap),
-    ));
     let profile = ServerProfile::new(Vec::new(), Vec::new());
     ImapAccount::new(ImapAccountParts {
-        config,
         capabilities: build_capabilities(&profile, &[], false, None, None, false, false),
-        pool,
-        folders: Arc::new(FolderRegistry::default()),
-        qresync_enabled: false,
-        qresync_negotiation_warning: None,
-        supports_notify: false,
-        bandwidth_cap,
-        contacts: None,
-        calendars: None,
-        dav_scopes: Default::default(),
-        submission: None,
-        dav_degraded: Vec::new(),
+        ..scripted_account_parts(conn, 1)
     })
 }
 
@@ -109,19 +83,7 @@ async fn account_with_submission() -> ImapAccount {
     let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
     drop(server);
 
-    let config = Arc::new(ImapAccountConfig::new(
-        crate::ImapConfig::plaintext("test.invalid"),
-        Credentials::password("user", "pass"),
-        AuthPolicy::default(),
-    ));
-    let bandwidth_cap = Arc::new(AtomicU64::new(0));
-    let pool = Arc::new(Pool::new(
-        Arc::clone(&config),
-        conn,
-        1,
-        None,
-        Arc::clone(&bandwidth_cap),
-    ));
+    let parts = scripted_account_parts(conn, 1);
     let submission_config = super::SmtpSubmissionConfig::new(
         "smtp.test.invalid",
         super::SubmissionTls::Plaintext,
@@ -132,25 +94,15 @@ async fn account_with_submission() -> ImapAccount {
             &submission_config,
             &Credentials::password("user", "pass"),
             None,
-            Arc::clone(&bandwidth_cap),
+            Arc::clone(&parts.bandwidth_cap),
         )
         .expect("a plaintext relay transport builds without I/O"),
     );
     let profile = ServerProfile::new(Vec::new(), Vec::new());
     ImapAccount::new(ImapAccountParts {
-        config,
         capabilities: build_capabilities(&profile, &[], false, None, None, true, false),
-        pool,
-        folders: Arc::new(FolderRegistry::default()),
-        qresync_enabled: false,
-        qresync_negotiation_warning: None,
-        supports_notify: false,
-        bandwidth_cap,
-        contacts: None,
-        calendars: None,
-        dav_scopes: Default::default(),
         submission: Some(submission),
-        dav_degraded: Vec::new(),
+        ..parts
     })
 }
 

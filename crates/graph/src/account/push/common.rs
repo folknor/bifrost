@@ -114,6 +114,11 @@ pub(super) fn no_subscribable_push_scopes(failed: &[bifrost_types::BatchFailure]
 /// present for the recovery would lose the reconcile that covers the gap -
 /// a missed reconcile in place of a superfluous one. The latch records the
 /// outage the account had, not the outage somebody was listening for.
+///
+/// If the lost warning ever matters, the sound repair is prime-on-subscribe:
+/// have `push_stream` yield `Disconnected` as its first item while the latch
+/// is up. That adds no reconciles, only the advisory warning. Not built,
+/// because nothing needs it yet.
 pub(super) fn mark_push_disconnected(account: &crate::account::GraphAccount) {
     if !account
         .push_disconnected

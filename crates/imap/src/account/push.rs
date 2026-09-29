@@ -262,6 +262,11 @@ pub(crate) fn push_stream(account: ImapAccount) -> AccountStream<WatchEvent> {
     let mut rx = account.push.tx.subscribe();
     let shutdown = account.shutdown.clone();
     let (tx, out) = tokio::sync::mpsc::channel(128);
+    // Detached rather than `guarded_receiver_stream`, deliberately: this
+    // forwarder holds no pool checkout and issues no IMAP command, only a
+    // broadcast receiver, and it ends on account shutdown or on its next
+    // failed send. The hazard the guard exists for - two drivers sharing one
+    // account's connection - cannot arise from it.
     tokio::spawn(async move {
         loop {
             tokio::select! {

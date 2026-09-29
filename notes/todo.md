@@ -78,74 +78,33 @@ asked for; that review debt is listed under their crates below.
   close phases by the per-phase budgets. If it is wanted, the restaged test must
   keep the `Drop`-instant probe.
 
-- **imap: `get_stream` and `push` use the unguarded detached-spawn shape.**
-  Found 2026-09-15 while guarding the changes and inventory streams. Those two
-  now hold an `AbortOnDrop` guard, so dropping the stream stops the spawned task
-  and returns its pool checkout; `get.rs` and `push.rs` still spawn detached.
-  `get_stream` is short-lived but carries the identical hazard - a dropped
-  receiver leaves it running against the account's connection until its next
-  failed send. `push.rs` is account-lifetime and owns its own shutdown token, so
-  it is probably fine as it stands. Wants a ruling on whether the guard should be
-  the crate-wide default for spawn-backed streams, or whether the two remaining
-  sites are deliberate.
+- **imap: the driver's two prebuilt-command refusals lose their `Unsent`
+  evidence.** Found 2026-09-29 by the test that finally reached the
+  `WireAssumptions` guard. `run_prebuilt_command` returns
+  `Error::Protocol(..).with_attempt(TransmissionState::Unsent)` for both the
+  stale-encoding refusal and the session-legality refusal, but `Protocol(String)`
+  has no attempt field and `with_attempt` is a documented no-op on it, so
+  `attempt()` reads `None`. The caller of a non-idempotent APPEND that provably
+  wrote nothing then falls back to `ImapErrorContext::transmission_state`, and
+  an unknown attempt takes the conservative reconcile path rather than a clean
+  retry. `Protocol` is also the wrong kind: its doc says "protocol violation by
+  the server", and these are local refusals. That has a second, worse
+  consequence: `Error::is_connection_fatal` lists `Protocol(_)`, so the driver
+  closes its command channel after refusing, and a connection whose framing is
+  provably intact - nothing was written - is retired. The guard's stated intent
+  is "make the caller re-issue against the new state"; today the re-issue needs
+  a fresh connection. The fix is a variant that carries an attempt and is not
+  connection-fatal, either a reshaped `Protocol` or a new local-refusal variant,
+  and `Error` is PUBLISHED SURFACE, hence the owner's call. Once it lands, the
+  test `a_queued_append_is_refused_when_the_state_it_was_built_for_moved`
+  should assert `Unsent` and a working follow-up command on the same
+  connection.
 
-- **imap: three copies of a `Pool`-backed `ImapAccount` test builder.** Left by
-  the stream-guard work, because `account/test_support.rs` was outside the
-  editing scope at the time: `scripted_tests.rs` has one and two nested test
-  modules grew their own. Folding a single `scripted_account`-style helper into
-  `test_support.rs` removes all three. Pure test hygiene, no behaviour.
-
-- **graph: a lost `Disconnected` costs a WARNING, and the obvious fix is a
-  trap.** INVESTIGATED 2026-09-15 and deliberately NOT fixed; the mechanism is
-  real but the consequence is nil, and that is recorded here so nobody
-  rediscovers it and "repairs" it.
-  `mark_push_disconnected` flips the `push_disconnected` latch and then does
-  `let _ = push_tx.send(..)` on a broadcast sender, which errs with zero
-  receivers. The latch is `pub(crate)` and reachable through no capability,
-  snapshot or query, so a late subscriber genuinely cannot recover the edge it
-  missed. What makes it harmless is the CONSUMER: bifrost-sync's reconciler
-  holds no connectivity state at all - `Disconnected` emits one advisory
-  `Warning` and nothing else, `Reconnected` triggers an account-wide reconcile -
-  so a surviving lone `Reconnected` yields a SUPERFLUOUS reconcile, never a
-  missed one. The dangerous mirror cannot occur: a live consumer IS a receiver,
-  so `Reconnected` cannot be lost while anyone is listening, and a `Lagged`
-  receiver is turned into the same `Coalesced` invalidation anyway. The latch
-  also never wedges, since a lost edge leaves it in the state that makes the
-  NEXT edge fire.
-  THE TRAP, pinned by an ablation test: gating the `swap(true)` on
-  `push_tx.send(..).is_ok()` - the obvious "only move the latch when delivery
-  succeeds" repair - is WORSE than the defect. An outage that begins with no
-  subscriber would go unrecorded, so `mark_push_reconnected` would find the
-  latch already down, emit nothing, and a consumer that attached mid-outage and
-  was present at recovery would get NO reconcile at all. That converts a
-  redundant reconcile into a missed one.
-  If the missing warning ever matters, the sound repair is prime-on-subscribe:
-  have `push_stream` yield `Disconnected` as its first item when the latch is
-  up. It adds no reconciles, only the advisory warning. Not built, because
-  nothing needs it yet.
-
-- **imap: the prebuilt-APPEND `WireAssumptions` guard is unpinned, and the
-  structured-command refactor behind it is unbuilt.** The DEFECT was fixed
-  2026-09-15 in two parts. First, `append` and `multi_append` read every
-  protocol decision from ONE snapshot borrow (`append_wire_policy`); they used
-  to take four independent borrows, in `multi_append`'s case across the
-  APPENDLIMIT `STATUS` await, so the bytes could contradict themselves - a
-  `UTF8 (~{` opened against one read and closed with a bare CRLF against
-  another, whose literal body then desynchronized the parse. Second, those
-  decisions ride to the driver as `WireAssumptions` and are compared against
-  live state before a byte is written, because prebuilt bytes are frozen at
-  build time while the snapshot they came from is republished only when a
-  command COMPLETES - so a command queued behind another could be written under
-  a revision it was not encoded for, and modified UTF-7 stays valid ASCII under
-  rev2, which lands the APPEND in a DIFFERENT mailbox rather than failing.
-  WHAT IS LEFT. (a) The guard itself has no test. Reaching it needs the state to
-  move AFTER the policy read, i.e. a command sitting QUEUED behind another,
-  which takes two handles on one connection and a withheld reply to stage
-  deterministically - `driver_pair` returns the connection by value so
-  `Arc::new` gives two handles, and `tokio::time::pause()` makes the ordering
-  hermetic, but it was not built. The transcript test that exists pins the
-  single-borrow half only and says so in its own doc.
-  (b) The architectural fix is still the right one and is not done: give
+- **imap: the structured-command APPEND refactor is unbuilt.** The prebuilt
+  path is guarded (one snapshot borrow per APPEND, plus the driver's
+  `WireAssumptions` comparison against live state, both pinned by transcript
+  tests), but the guard patches a class the architecture still has.
+  The architectural fix is still the right one and is not done: give
   `Command` an `Append { mailbox, messages }` variant and let the DRIVER encode
   it from live state, which deletes the whole prebuilt path and with it this
   entire class. It also collapses a real duplication - single-APPEND
@@ -189,49 +148,6 @@ asked for; that review debt is listed under their crates below.
   authority (a shared `supports(capabilities, enabled, capability)`) and a
   capability-by-capability test matrix, not a fold.
 
-- **imap: `UnavailableOnLiveSnapshot` is unreachable by construction.** The
-  rung-fall-through that records it landed 2026-09-15 and is correct and
-  defensive, but it cannot be pinned hermetically today. Reaching it needs the
-  LIVE snapshot to lack a capability the ladder's profile snapshot had, and
-  (a) the profile and the per-site gates are now provably governed by the same
-  comparison, and (b) the snapshot only moves when a command completes, while a
-  rung that completes either succeeds and returns or fails non-`MissingCapability`
-  and aborts the ladder. The only real path is a second handle on the same driver
-  refetching CAPABILITY concurrently, which is nondeterministic to script. Keep
-  the code; do not delete it for want of a test, and do not write a test that
-  fakes the shape - an earlier attempt at exactly that asserted a premise the
-  code contradicts and had never been run.
-
-- **sasl-F5 residual: the stale `offered` snapshot.** The vanishing rung was
-  fixed 2026-09-15 (the `MissingCapability` fallthrough now records an
-  `UnavailableOnLiveSnapshot` rejection before advancing). What survives is
-  that `AuthPolicyFailure::Display` still renders `offered` from a snapshot
-  taken BEFORE the ladder ran, so under skew the reported offer list can name a
-  mechanism the live snapshot no longer advertises. Documented on the type:
-  `rejected` is the authoritative per-rung record, and re-reading the profile at
-  failure time would move the skew window rather than close it.
-
-## bifrost-graph
-
-- **graph-A5b-1.** Public-folder deletion reconcile is side-table-free:
-  the live-id baseline rides in the cursor (`PublicFolderCursor.live_ids`)
-  hard-capped at `PUBLIC_FOLDER_LIVE_IDS_CAP` (10_000). Above the cap a
-  folder degrades to additions-only (no `Destroyed` emission). Restore
-  reconcile for huge folders with a `CheckpointStore`-backed deletion
-  baseline once bifrost owns that side table. (A5b v1 follow-up.)
-  BLOCKED (verified 2026-07-21): the side table does not exist and no
-  account-reachable path to one does. `CheckpointStore` lives in
-  `crates/sync/src/cursor/store.rs`, is held only by the engine, and is
-  never handed to `Account` impls; the graph crate does not depend on
-  `bifrost-sync` and so cannot name it; the trait exposes only change
-  cursors + backfill checkpoints keyed by `(account, scope[, partition])`,
-  no free-form key/value surface. Unblocking is a cross-crate prerequisite
-  epic - extend `CheckpointStore` with a generic side-table put/get and
-  thread a store handle into `Account::open` (touches `bifrost-types`,
-  `bifrost-sync`, and every account crate). Do not schedule A5b-1 until
-  that lands. Nothing is broken today: the degraded additions-only mode is
-  correct and covered by tests; this is a capability upgrade, not a fix.
-
 ## bifrost-sync
 
 - **sync-F6.** (residuals of the closed F4+F5 throttle wiring) What
@@ -255,23 +171,6 @@ asked for; that review debt is listed under their crates below.
   so the FIRST provider-wide deadline is invisible to a sibling that
   has never failed. Attach-time enrollment needs the account's
   provider identity at attach - the same identity-channel shape as (a).
-  (d) CLOSED 2026-09-07. The blocker really was the clock, not the test:
-  `ThrottleBucket` deadlines were `SystemTime` while the poll loop slept
-  them off on tokio time, so under `start_paused` the sleep returned
-  without wall-clock moving and the re-check re-derived the full wait
-  forever. The bucket is engine-owned in-memory state - no serde, never
-  in a `Checkpoint` or the store - so a monotonic deadline is safe, and
-  `tokio::time::Instant` matches what `AsyncDeadline` and `ByteBucket` in
-  bifrost-smtp had to do for the same reason. `tests/throttle_defers_
-  changes.rs` now pins both halves the item asked for. Note this changed
-  five PUBLIC `ThrottleBucket` signatures from `SystemTime` to
-  `tokio::time::Instant`; nothing was removed or renamed.
-
-## bifrost-types
-
-Surfaced while authoring `reference/error-model.md` (a read of
-`crates/types/src/error/`). All pre-existing, none blocking.
-
 
 ## A9 (directory search) follow-ups
 
@@ -297,24 +196,6 @@ Surfaced while authoring `reference/error-model.md` (a read of
 - **a9-3 (graph)** `$search` (with `ConsistencyLevel: eventual`) as a
   richer substring directory match than the current `startswith` prefix
   `$filter`, if needed.
-
-## C-3 (Graph send-as) follow-ups
-
-Scoped out of C-3 (the Graph shared-mailbox send-as / send-on-behalf-of brick)
-to keep its blast radius on the Graph send path. C-3 landed the typed
-`SendRequest::send_as` surface and the Graph backend; the remaining item is a
-provider capability ratatoskr may eventually wire, currently rejected with
-`Unsupported(Send)`.
-
-- **c3-2 (imap/smtp)** Shared-mailbox send over SMTP for IMAP-shaped accounts.
-  C-3 rejects a `Some(send_as)` on IMAP because Graph-style mailbox routing has no
-  SMTP analog. A shared-mailbox send over SMTP is the consumer setting
-  `request.from` to the shared address and letting the relay's Send-As policy
-  authorize it - that path already works and needs no `send_as`. If a consumer
-  later wants `send_as` to map onto an SMTP `From:`/`MAIL FROM` choice (so the
-  uniform surface carries shared-mailbox send for IMAP-shaped accounts too),
-  decide whether IMAP honors `send_as` by translating it to a `from` override or
-  whether it stays a deliberate `Unsupported`. Today: deliberate `Unsupported`.
 
 ## Namespaced-container follow-ups
 
@@ -391,21 +272,6 @@ confirm against the code before working any of them.
   it becomes a scheduled lane it needs the throttle-deadline and pause checks
   the backfill partition runner already does, and it should respect
   `OperatorBlocked` without re-arming it on a timer.
-
-### Open defects
-
-- **google-B2-residual. Drive session cleanup does not survive a dropped
-  future.** [C2] The mid-upload abandonment is fixed (2026-08-29): every exit
-  between `create_upload_session` and a completed upload now cancels the
-  session, and a cancel that itself fails decorates the error as an abandoned
-  session. What remains is the cancellation case - if the caller's future is
-  dropped mid-upload, no cancel runs and Drive holds the partial for a week.
-  A `Drop` guard is deliberately NOT the answer: `Drop` cannot await, and
-  spawning the DELETE from `drop` trades an expiring server-side session for a
-  detached task outliving the account handle. This is the same shape as the
-  documented `close()`-dropped-mid-`users.stop` residual. Resume-on-reopen is
-  also out: the session URI is per-call state that no `HostAttachment` request
-  carries back in, so resumption needs a published surface change.
 
 ### Cross-crate shaping questions
 
@@ -492,44 +358,6 @@ PUBLISHED SURFACE fence apply.
   `AccountOperation` set, so the capability answer and the error answer become
   the same value read twice, and a new trait method defaults to unsupported
   instead of needing a bool nobody sets. That DELETES a published struct.
-
-- **types-B1b. `send_as` gates a request FIELD, not a method, and the crates
-  disagree.** imap and google reject a `send_as` request with
-  `Unsupported(Send)`; jmap's `route_send_as` answers `Request(Malformed)` for
-  an unknown foreign id and `Unsupported(Send)` only for a known-but-not-
-  submission-capable one. Not asserted anywhere and not expressible in the
-  types-B1 test, which drives methods. Decide whether the uniform answer is
-  worth it, or document the split. Related: c3-2.
-
-  AUDITED 2026-09-15, and **the premise above is wrong**: this is not jmap
-  versus everyone. Graph draws exactly the same line and says so in its own
-  rustdoc at `send_as_unknown_mailbox` ("The provider supports send-as; this
-  specific mailbox is just not configured, so it is a caller error"). The split
-  is two coherent groups separated precisely by the capability flag:
-  `pim_methods.send_as == false` means the FEATURE is absent, so
-  `Unsupported(Send)`; `== true` means the feature is present, so an unheld
-  mailbox id is a bad ARGUMENT, hence `Request(Malformed)` with
-  `RequestCause::InvalidArgument { field: Some("send_as.mailbox"), .. }`.
-  imap and google genuinely cannot draw that line - with no routing table there
-  is no known id to fail against - so `Unsupported` is the only honest answer
-  available to them. RULING WANTED: document the split, do not unify it.
-  Unifying has to break one of the two groups, and forcing graph/jmap to
-  `Unsupported` would tell a consumer "this account cannot send-as" about an
-  account that demonstrably can, while discarding the field pointer a UI needs.
-  Both kinds classify terminal (`ClientBug` and `Unsupported`), so no automatic
-  machinery branches on the difference; the distinction is for the consumer's
-  remediation, correct-the-request versus reconfigure-the-feature.
-  LANDED 2026-09-15: the governing statement is now the rustdoc on
-  `SendRequest::send_as`, abbreviated on `PimMethodSupport::send_as`, with
-  one-line branch pointers in `reference/imap.md`, `reference/google.md` and a
-  corrected paragraph in `reference/graph.md`. Graph's unconditional `send_as:
-  true` was fixed in the same pass (derived from the shared-client map, with a
-  refresh at the one post-construction replacement site). One correction banked
-  from that work: the audit claimed Graph already carried
-  `RequestCause::InvalidArgument { field: Some("send_as.mailbox") }`. It did
-  NOT - only JMAP did; Graph built a bare `Malformed { detail }`. Graph was
-  brought up to the documented contract rather than the doc hedged down to
-  Graph. What remains open here is only types-B1d below.
 
 - **send_message and send_as cannot both be honest about a JMAP account with
   foreign submission only.** [found 2026-09-15 by the cold review of the
@@ -715,7 +543,7 @@ Found while resolving the dav-F, smtp-CR and jmap-C2 items and the two cold
 reviews over them. Everything the reviews found at P1 or P2 was fixed in that
 wave; these are what was left. Verify before working any of them.
 
-- **Three owner rulings, none blocking.**
+- **Two owner rulings, none blocking.**
   (a) Move `should_fallback_discovery` into `bifrost-dav-core`, parameterised by
   the existing `DavProtocol` (the only difference between the copies is
   `ResourceKind::Calendar` versus `Contact`, which `DavProtocol` already
@@ -735,71 +563,10 @@ wave; these are what was left. Verify before working any of them.
   `TimeoutBudget::SetupDeadline` yielding `None` slack when built from
   `AsyncDeadline::new(None)`; any future "everything is bounded" claim starts
   there.
-  (c) LANDED 2026-09-15, and it needs one clean verifying run. The gap was real:
-  nothing compiled this workspace with features OFF, so the two tests under
-  `#[cfg(not(feature = "calendars"))]` were never typechecked, and
-  `flatten_push_object`'s `#[allow(unreachable_patterns)] _ => {}` arm existed
-  for a configuration that was never built. `brokkr.toml` now declares three
-  `[[check]]` sweeps, the featureless leg scoped to `bifrost-jmap` under
-  `no_default_features` with `feature_unification = "selected"` so a sibling
-  cannot donate `jmap/sync` back and make it a fourth copy of the default sweep.
-  Doctests were turned on in the same pass; they default OFF, and 24 files carry
-  `///` examples on a published API that had never been compiled.
-
-  TWO THINGS TO RULE ON, both raised by the agent that wired it. Declaring ANY
-  `[[check]]` entry REPLACES brokkr's implicit `--all-features` sweep, so those
-  three entries have to reconstruct that coverage - the claim that they do is
-  reasoning about the feature graph, not a measurement. And none of it is
-  verified by a build: whether `jmap-featureless` compiles at all is unknown,
-  and if it does not, that is the defect the sweep exists to surface rather than
-  a config error.
-
-  KEEP THE PHANTOM-KEY STORY, because it explains a class of error rather than
-  one mistake. This item used to propose `[check] consumer_features` as "one
-  line closes both". Brokkr rejects it: sweeps are the `[[check]]` ARRAY and the
-  legacy table form is refused at parse. `AGENTS.md` asserted the key existed,
-  and it got that from brokkr's OWN long help text, which still repeats it while
-  the man page and the parser both disagree. So a stale upstream help string
-  propagated into a binding project document, then into a filed ruling, then
-  into a recommendation to the repository owner, with nothing in the loop
-  checking it against the tool.
-  VERIFIED 2026-09-15: the phantom key is GONE from the tool's help - neither
-  the check subcommand's long help nor the `feature-unification` man section
-  mentions `consumer_features` any more, so there is nothing left to report
-  upstream and nobody should re-file it. The story is kept anyway, because it
-  explains a class of error rather than one mistake.
-  The reusable lesson: a config-load failure is raised before any phase runs, so
-  brokkr validates a config far more cheaply than a build does. Validate a key
-  that way before writing it into any document.
-- **Three rulings from the ledger-compaction landing (2026-09-07).**
-  (a) After compaction a re-raised key becomes a NEW entry:
-  `first_seen_unix_seconds` resets to now and the retry budget to zero, where an
-  uncompacted discharged entry preserved both, since `upsert` deliberately keeps
-  history on re-raise. Accepted and documented on the argument that the entry was
-  proved covered before folding, so a re-raise after proof is a fresh gap and
-  charging it the old budget charges it for failures that provably stopped. It is
-  still a behaviour change to the "re-raising must not reset history" rule and it
-  is reachable in production; preserving it means retaining keys, which reopens
-  the growth compaction removes.
-  (b) Multi-level lineages cannot arise in process - `replace_obligation`
-  re-points every child at `lineage_root(parent)`, so live shapes are always
-  flat. A chain is reachable only through `decode_ledger` / `from_parts`
-  restoring a durable row written by another revision or by hand. The depth cap
-  and the ancestor closure are therefore either cheap insurance or load-bearing
-  depending on whether such rows are possible; the tests build chains that way
-  deliberately and say so. Somebody should rule on it.
-  (c) `record_attempt` charges an entry regardless of `is_open()`, so a
+- **Ledger: `record_attempt` charges an entry regardless of `is_open()`**, so a
   discharged-but-`Retrying` entry can still take charges. Pre-existing, and it is
   precisely what makes the lineage-root pin necessary. Worth deciding whether
   that is the intended contract or an accident the pin is now compensating for.
-
-- **A capped reply read's postponement is bounded but large.** The read-side
-  refund pushes a reply deadline out by the throttle debt the read itself paid,
-  and the bound on that is `MAX_RESPONSE_BYTES / cap` because a peer can only buy
-  time by SENDING bytes and every byte is charged. `MAX_RESPONSE_BYTES` is 100 kB,
-  so at a 100 B/s cap the worst case is on the order of 1000 s. Bounded, and the
-  consumer chose the cap, so this is not a defect - but if that ever needs a
-  ceiling it is a separate ruling and should not be folded into the refund.
 
 - **imap: SearchConsumer publishes surplus SEARCH/ESEARCH as events on the
   SUCCESS path.** [found 2026-09-15 while landing the infallible-finalize work]
@@ -824,15 +591,6 @@ wave; these are what was left. Verify before working any of them.
   reclassified the way other untagged OKs are. `MultiAppendConsumer` and
   `CopyConsumer` have the same shape. Restructuring them to retain the whole
   response is available and was deliberately not done in the finalize pass.
-
-- **imap: `emit_untagged_response_code_events` and `has_critical_response_code`
-  are complements maintained by hand.** Both handle exactly `Alert` and
-  `NotificationOverflow`, with no compiler link between them, so a third
-  critical code added to one and not the other silently reproduces the
-  dead-guard/double-emit bug the `Bye` exclusion already demonstrates. A
-  shared helper returning `Option<TypedEvent>`, with the predicate defined as
-  `.is_some()`, would make them structurally complementary. Refactor
-  proposal, not a defect, so it wants a ruling rather than a fix.
 
 - **smtp: a 421 masked by an earlier 550 in the same RCPT window.** Found
   2026-09-07 while documenting `DirectSmtpStage::RcptWindowReply`, which keeps
@@ -868,18 +626,6 @@ is the argument for having them.
   crate has never claimed it, no consumer has asked, and "make it compile" means
   either gating five more sites or making optional dependencies mandatory. Rule
   on the promise before anyone writes the `cfg`s.
-
-- **The blocking SMTP transport did not compile without the `tokio` feature.**
-  FIXED 2026-09-15. `error::timeout` carried a `#[cfg(feature = "tokio")]` since
-  the per-reply-deadline commit, while the BLOCKING reader called it for the
-  spent-deadline case (a zero `SO_RCVTIMEO` means block forever, so an expired
-  deadline has to be an error rather than a zero re-arm). Nothing caught it
-  because nothing had ever built `bifrost-smtp` without `tokio`; the in-workspace
-  consumer is async, so unification always donated the feature. Worth keeping as
-  the reference example of why "nothing calls it in this workspace" says nothing
-  about a library crate: the blocking half is published API, it is deliberately
-  independent of tokio, and it was broken in exactly the configuration no
-  in-workspace consumer exercises.
 
 ## Surfaced by the 2026-09-15 fix wave
 
@@ -921,26 +667,6 @@ divergences and the jmap push-arm items. Verify before working any of them.
   no-`limit` behaviour is the owner's call - but if that alignment is ever
   ruled, this is the argument for bounding CalDAV rather than unbounding
   CardDAV.
-
-- **CardDAV's `contact_search` saturates an unrepresentable `limit` to
-  `usize::MAX`**, so an absurd explicit limit becomes unbounded on the crate
-  whose DEFAULT is bounded. Unreachable on 64-bit, and left alone during
-  dav-F7 because naming it `UNBOUNDED_PAGE_SIZE` would imply a constant that
-  crate does not otherwise have. It is now the only bare `usize::MAX` page
-  size across the twins.
-
-- **`reference/smtp.md` states the write-timeout/cap interaction in three
-  places** ("Transport types", "Per-reply read deadline", "Bandwidth
-  metering") across 1062 lines. Not a defect, and the cross-references are
-  deliberate, but it is the restatement shape the standing lessons name: any
-  behaviour change there needs three edits and nothing enforces that.
-
-- **`notes/todo.md` is running behind the code in bifrost-smtp.** Working the
-  smtp items on 2026-09-15 found smtp-CR7(b) already FIXED (with a test
-  pinning it), and smtp-CR7(a), CR12 and CR13 already absorbed into
-  `reference/smtp.md`, in CR7(a)'s case in stronger and more accurate terms
-  than the bullet carried. Check the remaining smtp bullets against the
-  reference before working them.
 
 ## Notes
 

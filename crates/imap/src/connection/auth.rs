@@ -168,6 +168,20 @@ impl ImapConnection {
                     // diagnostic omits the one mechanism that actually went
                     // missing - and `offered`, snapshotted before the ladder
                     // ran, still lists it as available.
+                    //
+                    // This arm has no hermetic test, and cannot have one
+                    // today. Reaching it needs the LIVE snapshot to lack a
+                    // capability the ladder's profile snapshot had, but the
+                    // profile and the per-site gates are governed by the same
+                    // comparison, and the snapshot only moves when a command
+                    // completes - while a rung that completes either succeeds
+                    // and returns or fails non-`MissingCapability` and aborts.
+                    // The one real path is a second handle on the same driver
+                    // refetching CAPABILITY concurrently, which is not
+                    // deterministic to script. Keep the arm; do not delete it
+                    // for want of a test, and do not write a test that fakes
+                    // the shape - an earlier attempt asserted a premise this
+                    // code contradicts and had never been run.
                     match attempt {
                         Ok(()) => {}
                         Err(Error::MissingCapability(cap)) => {

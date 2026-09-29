@@ -71,6 +71,11 @@ Declaring `[[check]]` entries replaced brokkr's implicit single `--all-features`
 sweep, so those three are the coverage, not an addition to it. A new optional
 feature that no workspace member enables is unchecked until a sweep names it.
 
+Validate a `brokkr.toml` key by running brokkr before writing it into any
+document: a config-load failure is raised before any phase runs, so it costs
+nothing. A key once propagated from a stale brokkr help string into this file,
+then into a filed ruling, with nothing in the loop checking it against the tool.
+
 ### brokkr check
 
 - `brokkr check` - the full pipeline, in order: gremlins, header, textlint,

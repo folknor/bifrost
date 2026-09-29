@@ -659,6 +659,53 @@ pub(crate) fn stub_arc(account: StubAccount) -> Arc<dyn Account> {
     Arc::new(account)
 }
 
+/// The parts of a real `ImapAccount` whose pool holds exactly `pool_cap`
+/// permits and is primed with `conn`, usually one half of
+/// `connection::test_support::driver_pair`.
+///
+/// Every field a test might care about is at its quietest default: stub
+/// capabilities, an empty folder registry, no QRESYNC, no submission, no
+/// composed DAV. Override what the test needs, then `ImapAccount::new`.
+/// The duplex transport cannot dial, so once the primed connection is
+/// checked out a second concurrent checkout hangs rather than silently
+/// opening another connection.
+pub(crate) fn scripted_account_parts(
+    conn: crate::ImapConnection,
+    pool_cap: usize,
+) -> super::ImapAccountParts {
+    let config = Arc::new(super::factory::ImapAccountConfig {
+        pool_cap,
+        ..super::factory::ImapAccountConfig::new(
+            crate::ImapConfig::plaintext("test.invalid"),
+            crate::types::Credentials::password("user", "pass"),
+            crate::types::AuthPolicy::default(),
+        )
+    });
+    let bandwidth_cap = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let pool = Arc::new(super::Pool::new(
+        Arc::clone(&config),
+        conn,
+        pool_cap,
+        None,
+        Arc::clone(&bandwidth_cap),
+    ));
+    super::ImapAccountParts {
+        config,
+        capabilities: stub_capabilities(),
+        pool,
+        folders: Arc::new(super::folder_registry::FolderRegistry::default()),
+        qresync_enabled: false,
+        qresync_negotiation_warning: None,
+        supports_notify: false,
+        bandwidth_cap,
+        contacts: None,
+        calendars: None,
+        dav_scopes: Default::default(),
+        submission: None,
+        dav_degraded: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod mdn_tests {
     use super::*;

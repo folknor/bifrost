@@ -142,6 +142,13 @@ impl ReplyBudget {
 
     /// Give back time spent draining throttle debt. A no-op on `Setup`, which
     /// is the one budget that may not be moved.
+    ///
+    /// The total postponement of one reply is bounded but can be large. A peer
+    /// buys time only by SENDING bytes, and every byte is charged, so the ceiling
+    /// is `MAX_RESPONSE_BYTES / cap`: at a 100 B/s cap that is on the order of
+    /// 1000 s. Accepted, because the consumer chose the cap. A ceiling on it
+    /// would be its own ruling, separate from this refund, which exists so the
+    /// budget is only ever spent on the peer's silence.
     fn postpone(&mut self, by: Duration) {
         if let Self::Own(deadline) = self {
             *deadline = deadline.postponed_by(by);
