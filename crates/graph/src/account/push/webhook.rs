@@ -16,7 +16,8 @@ use crate::account::{GraphAccount, PushMode};
 use crate::webhooks::{create_subscription, delete_subscription};
 
 use super::common::{
-    mark_push_reconnected, new_handle, unsupported_push_error, unsupported_push_scope_error,
+    DecodedHandle, account_closed_error, decode_handle, graph_handle, mark_push_reconnected,
+    new_handle_token, unsupported_push_error, unsupported_push_scope_error,
 };
 use super::dispatch::{ArmOutcome, finalize_push_outcomes};
 use super::renewal::run_graph_subscription_worker;
@@ -126,13 +127,15 @@ pub(super) async fn subscribe_graph(
         return Ok((None, finalize_push_outcomes(outcomes, expected)?));
     }
 
-    // Mint the handle BEFORE the first create. `new_handle` is fallible
-    // (the host entropy source can fail; that is `Internal(RuntimeFailure)`,
-    // never retried), and a failure here has written nothing. Minting it
-    // after the creates would return an error with live server-side
-    // subscriptions behind it and no handle any teardown could name them
-    // by, orphaning them until they expire.
-    let handle = new_handle()?;
+    // Mint the handle's random token BEFORE the first create.
+    // `new_handle_token` is fallible (the host entropy source can fail; that
+    // is `Internal(RuntimeFailure)`, never retried), and a failure here has
+    // written nothing. Minting it after the creates would return an error
+    // with live server-side subscriptions behind it and no handle any
+    // teardown could name them by, orphaning them until they expire. The
+    // handle itself is assembled after the creates, because it embeds the
+    // server ids they return (see `common::decode_handle`).
+    let token = new_handle_token()?;
 
     // A closed account must not gain server-side state. `close()` walks the
     // registered groups once; a create that started after that walk could
@@ -172,7 +175,7 @@ pub(super) async fn subscribe_graph(
         SubscribeRequest {
             endpoint,
             grouped,
-            handle,
+            token,
             outcomes,
             expected: expected.to_vec(),
         },
@@ -199,7 +202,8 @@ pub(super) async fn subscribe_graph(
 struct SubscribeRequest {
     endpoint: super::common::PushEndpoint,
     grouped: HashMap<String, Vec<(bifrost_types::BatchItemId, CursorScope)>>,
-    handle: SubscriptionHandle,
+    /// The random part of the handle, minted before any create.
+    token: String,
     outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
     expected: Vec<bifrost_types::BatchItemId>,
 }
@@ -225,14 +229,14 @@ async fn run_subscribe(
     result_tx: tokio::sync::oneshot::Sender<Result<ArmOutcome, AccountError>>,
     ack_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
-    let handle = request.handle.clone();
     let result = create_and_register(&account, request).await;
-    if result.is_err() {
+    // Only a success registered a group, and the success names its handle.
+    let Some(handle) = result.as_ref().ok().and_then(|(handle, _)| handle.clone()) else {
         // Nothing registered, so nothing to retire; a dropped waiter has
         // nobody to tell.
         let _ = result_tx.send(result);
         return;
-    }
+    };
     let received = result_tx.send(result).is_ok() && ack_rx.await.is_ok();
     if received {
         return;
@@ -259,7 +263,7 @@ async fn create_and_register(
     let SubscribeRequest {
         endpoint,
         grouped,
-        handle,
+        token,
         mut outcomes,
         expected,
     } = request;
@@ -329,6 +333,12 @@ async fn create_and_register(
         roll_back_created(account, &subscriptions).await;
         return Err(account_closed_error());
     }
+    // The handle embeds the ids just created, so a reopened instance that
+    // inherits it as an orphan can still DELETE them.
+    let handle = graph_handle(
+        &token,
+        subscriptions.iter().map(|state| state.server_id.as_str()),
+    );
     groups.insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
     drop(groups);
     // Only on the recovery EDGE. `Reconnected` is the engine's account-wide
@@ -342,16 +352,6 @@ async fn create_and_register(
     mark_push_reconnected(account);
     ensure_graph_worker(account.clone()).await;
     Ok((Some(handle), outcomes))
-}
-
-/// `push_subscribe` on (or racing) a closed account.
-fn account_closed_error() -> AccountError {
-    into_account_error(
-        crate::error::GraphError::RuntimeFailure {
-            message: "the account is closed".to_string(),
-        },
-        GraphErrorContext::graph(AccountOperation::PushSubscribe),
-    )
 }
 
 /// Best-effort DELETE of subscriptions this request created but will never
@@ -377,12 +377,70 @@ async fn roll_back_created(account: &GraphAccount, subscriptions: &[GraphSubscri
     }
 }
 
+/// Delete the subscriptions a handle this instance does not know names.
+///
+/// The engine retries a failed teardown against whatever instance is current,
+/// which after a reopen is a newer connection than the one that subscribed.
+/// The handle carries the Graph ids (`common::decode_handle`), so any instance
+/// can finish the job; 404/410 count as already gone (`delete_subscription`).
+///
+/// What this must not do is delete something a live subscription owns:
+/// - it deletes ONLY the ids decoded from this handle, so a newer instance's
+///   own subscriptions (different ids) are untouched by an older instance's
+///   orphan;
+/// - an id that this instance currently has registered under a group is
+///   skipped, so a forged, stale or recycled handle cannot tear down a
+///   subscription this instance still renews. The registered handle is the
+///   only door to those.
+///
+/// Every id is attempted even when an earlier one fails, and the first
+/// failure is returned: the handle is the engine's only record, and a retry
+/// simply re-deletes (idempotent).
+async fn unsubscribe_orphan(
+    account: &GraphAccount,
+    server_ids: Vec<String>,
+) -> Result<(), AccountError> {
+    let owned: std::collections::HashSet<String> = account
+        .graph_subscriptions
+        .read()
+        .await
+        .values()
+        .flat_map(|group| {
+            group
+                .subscriptions
+                .iter()
+                .map(|state| state.server_id.clone())
+        })
+        .collect();
+    let mut first_error = None;
+    for server_id in server_ids {
+        if owned.contains(&server_id) {
+            continue;
+        }
+        if let Err(error) = delete_subscription(&account.client, &server_id).await {
+            first_error.get_or_insert_with(|| {
+                into_account_error(
+                    error,
+                    GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
+                )
+            });
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 pub(super) async fn unsubscribe_graph(
     account: GraphAccount,
     handle: SubscriptionHandle,
 ) -> Result<(), AccountError> {
     let Some(server_ids) = begin_graph_teardown(&account, &handle).await else {
-        return Ok(());
+        // Unknown to this instance: an orphan from an earlier connection (or
+        // a handle already torn down here). The handle itself says what to
+        // delete.
+        return match decode_handle(&handle) {
+            DecodedHandle::Graph(server_ids) => unsubscribe_orphan(&account, server_ids).await,
+            DecodedHandle::Ews | DecodedHandle::Unrecognized => Ok(()),
+        };
     };
     for server_id in server_ids {
         delete_subscription(&account.client, &server_id)

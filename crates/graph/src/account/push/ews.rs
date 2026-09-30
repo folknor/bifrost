@@ -18,7 +18,9 @@ use crate::account::graph_error::{
     GraphErrorContext, id_translation_refused, into_account_error, protocol_violation,
 };
 
-use super::common::{new_handle, unsupported_push_scope_error};
+use super::common::{
+    account_closed_error, ews_handle, new_handle_token, unsupported_push_scope_error,
+};
 use super::dispatch::{ArmOutcome, finalize_push_outcomes};
 
 #[derive(Debug, Clone)]
@@ -152,7 +154,11 @@ pub(super) async fn subscribe_ews(
     if scopes.is_empty() {
         return Ok((None, outcomes));
     }
-    let handle = new_handle()?;
+    // An EWS handle carries no server state: the streaming subscription is
+    // the worker's connection and dies with it, so a handle retried on a
+    // newer instance has nothing left to delete (`unsubscribe_ews` on an
+    // unknown handle is the correct no-op).
+    let handle = ews_handle(&new_handle_token()?);
     let mut registrations = account.ews_subscriptions.write().await;
     // Re-checked under the write lock for a `close()` that began while the
     // translation was in flight. Nothing server-side exists yet, so there is
@@ -179,17 +185,6 @@ pub(super) async fn subscribe_ews(
     crate::account::push_stream::ensure_ews_worker(account).await;
     registration.disarm();
     Ok((Some(handle), outcomes))
-}
-
-/// `push_subscribe` on (or racing) a closed account. Same classification as
-/// the webhook arm's refusal: a runtime failure, never retried.
-fn account_closed_error() -> AccountError {
-    into_account_error(
-        crate::error::GraphError::RuntimeFailure {
-            message: "the account is closed".to_string(),
-        },
-        GraphErrorContext::graph(AccountOperation::PushSubscribe),
-    )
 }
 
 /// Retires a registration whose `subscribe_ews` future was dropped before it

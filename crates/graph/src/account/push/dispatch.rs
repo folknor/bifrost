@@ -8,7 +8,8 @@ use crate::account::{GraphAccount, PushMode};
 use crate::error::GraphError;
 
 use super::common::{
-    no_subscribable_push_scopes, unsupported_push_error, unsupported_push_scope_error,
+    DecodedHandle, decode_handle, no_subscribable_push_scopes, unsupported_push_error,
+    unsupported_push_scope_error,
 };
 use super::ews::subscribe_ews;
 use super::ews::unsubscribe_ews;
@@ -134,9 +135,18 @@ pub(crate) async fn push_unsubscribe(
     account: GraphAccount,
     handle: SubscriptionHandle,
 ) -> Result<(), AccountError> {
-    match account.push_mode {
-        PushMode::GraphSubscriptions => unsubscribe_graph(account, handle).await,
-        PushMode::EwsStreaming => unsubscribe_ews(account, handle).await,
+    // Routed by what the handle says it is, not by this instance's mode: a
+    // reopen can change the push mode, and a webhook handle retried on an EWS
+    // instance would otherwise be dropped with its Graph subscription alive.
+    // A handle of neither shape falls back to the mode.
+    match (decode_handle(&handle), account.push_mode) {
+        (DecodedHandle::Graph(_), _)
+        | (DecodedHandle::Unrecognized, PushMode::GraphSubscriptions) => {
+            unsubscribe_graph(account, handle).await
+        }
+        (DecodedHandle::Ews, _) | (DecodedHandle::Unrecognized, PushMode::EwsStreaming) => {
+            unsubscribe_ews(account, handle).await
+        }
     }
 }
 

@@ -9,7 +9,8 @@ use bifrost_types::{
 };
 
 use crate::account::push::common::PushEndpoint;
-use crate::account::push::dispatch::push_subscribe;
+use crate::account::push::common::{DecodedHandle, decode_handle, ews_handle, graph_handle};
+use crate::account::push::dispatch::{push_subscribe, push_unsubscribe};
 use crate::account::push::webhook::{
     GraphSubscriptionGroup, mark_group_tearing_down, remove_subscription_from_groups,
     resource_for_scope, retire_all_graph_subscriptions, unsubscribe_graph,
@@ -656,4 +657,175 @@ async fn retiring_all_subscriptions_cancels_the_shutdown_token_first() {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
     retire_all_graph_subscriptions(&account).await;
     assert!(account.shutdown.is_cancelled());
+}
+
+// ---- orphan handles: teardown on an instance that never saw the subscribe ----
+
+fn urls(client: &GraphClient) -> Vec<(String, String)> {
+    client
+        .take_rest_requests()
+        .into_iter()
+        .map(|request| (request.method, request.url))
+        .collect()
+}
+
+/// The handle `push_subscribe` returns must name the server ids, or a reopened
+/// instance has nothing to delete by.
+#[tokio::test]
+async fn a_subscribed_handle_embeds_the_created_server_ids() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("sub-a")]);
+    let account = webhook_account(&client);
+    let subscription = push_subscribe(account.clone(), vec![email_scope("inbox")])
+        .await
+        .expect("subscribe");
+    let handle = subscription.handle.expect("a handle");
+    assert_eq!(
+        decode_handle(&handle),
+        DecodedHandle::Graph(vec!["sub-a".to_string()])
+    );
+    assert!(
+        account
+            .graph_subscriptions
+            .read()
+            .await
+            .contains_key(&handle),
+        "the registered key is the returned handle"
+    );
+}
+
+/// The filed defect: the old instance's teardown failed, the account was
+/// reopened, and the engine retries on the NEW instance, whose map is empty.
+#[tokio::test]
+async fn an_orphan_handle_is_torn_down_by_a_fresh_instance() {
+    let client = GraphClient::new("token");
+    client.script_rest([deleted(), deleted()]);
+    let fresh = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    let orphan = graph_handle("ab12", ["old-one", "old-two"]);
+
+    push_unsubscribe(fresh, orphan)
+        .await
+        .expect("orphan teardown succeeds");
+    let requests = urls(&client);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests[0].0, "DELETE");
+    assert!(requests[0].1.ends_with("/subscriptions/old-one"));
+    assert_eq!(requests[1].0, "DELETE");
+    assert!(requests[1].1.ends_with("/subscriptions/old-two"));
+}
+
+/// A row Graph already expired is done, and its siblings are still deleted.
+#[tokio::test]
+async fn an_orphan_teardown_treats_404_and_410_as_done() {
+    let client = GraphClient::new("token");
+    client.script_rest([
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({"error":{"code":"ResourceNotFound","message":"gone"}}),
+        ),
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::GONE,
+            serde_json::json!({"error":{"code":"Gone","message":"gone"}}),
+        ),
+        deleted(),
+    ]);
+    let fresh = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    push_unsubscribe(fresh, graph_handle("ab12", ["a", "b", "c"]))
+        .await
+        .expect("already-gone rows are not failures");
+    assert_eq!(client.take_rest_requests().len(), 3);
+}
+
+/// A failed DELETE is returned (the engine keeps the orphan and retries), but
+/// it does not stop the remaining ids being attempted.
+#[tokio::test]
+async fn an_orphan_teardown_attempts_every_id_and_reports_a_failure() {
+    let client = GraphClient::new("token");
+    client.script_rest([
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error":{"code":"InternalServerError","message":"no"}}),
+        ),
+        deleted(),
+    ]);
+    let fresh = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    push_unsubscribe(fresh, graph_handle("ab12", ["a", "b"]))
+        .await
+        .expect_err("the failed DELETE is reported");
+    assert_eq!(client.take_rest_requests().len(), 2);
+}
+
+/// Two live instances during a reopen: the old instance's orphan, retried on
+/// the new one, deletes the OLD ids only. The new instance's own subscription
+/// survives, and an id this instance still owns is never deleted through a
+/// handle that is not the one it registered.
+#[tokio::test]
+async fn an_orphan_never_deletes_what_this_instance_owns() {
+    let client = GraphClient::new("token");
+    client.script_rest([deleted()]);
+    let new_instance = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    let own = graph_handle("cd34", ["new-sub"]);
+    new_instance.graph_subscriptions.write().await.insert(
+        own.clone(),
+        GraphSubscriptionGroup::live(vec![state("new-sub", "/me/events")]),
+    );
+
+    // A stale or forged handle that names both the old id and the live one.
+    push_unsubscribe(
+        new_instance.clone(),
+        graph_handle("ab12", ["old-sub", "new-sub"]),
+    )
+    .await
+    .expect("orphan teardown");
+
+    let requests = urls(&client);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(requests[0].1.ends_with("/subscriptions/old-sub"));
+    assert!(
+        new_instance
+            .graph_subscriptions
+            .read()
+            .await
+            .contains_key(&own),
+        "the live group is untouched"
+    );
+}
+
+/// A handle that is not a well-formed webhook handle chooses nothing to
+/// delete, whatever it contains.
+#[tokio::test]
+async fn a_forged_handle_issues_no_requests() {
+    let client = GraphClient::new("token");
+    let fresh = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    for raw in [
+        "graph1:ab12:../me/messages",
+        "graph1:ab12:a?x=1",
+        "graph1:nothex:id",
+        "h",
+    ] {
+        push_unsubscribe(fresh.clone(), SubscriptionHandle(raw.to_string()))
+            .await
+            .expect("unrecognized handles are a no-op");
+    }
+    assert!(client.take_rest_requests().is_empty());
+}
+
+/// A reopen can switch the push mode. The handle decides, not the mode: a
+/// webhook orphan on an EWS instance still deletes, and an EWS handle on a
+/// webhook instance touches nothing (EWS state dies with the connection).
+#[tokio::test]
+async fn orphan_routing_follows_the_handle_not_the_instance_mode() {
+    let client = GraphClient::new("token");
+    client.script_rest([deleted()]);
+    let ews = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
+    push_unsubscribe(ews, graph_handle("ab12", ["old"]))
+        .await
+        .expect("teardown");
+    assert_eq!(client.take_rest_requests().len(), 1);
+
+    let webhook = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    push_unsubscribe(webhook, ews_handle("ab12"))
+        .await
+        .expect("no-op");
+    assert!(client.take_rest_requests().is_empty());
 }

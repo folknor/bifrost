@@ -6,7 +6,7 @@ use bifrost_types::{
     ObjectType,
 };
 
-use crate::account::push::common::{PushEndpoint, new_handle};
+use crate::account::push::common::{PushEndpoint, new_handle_token};
 use crate::account::push::dispatch::{push_item_ids, push_subscribe, subscribe_eligible};
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
@@ -176,11 +176,11 @@ async fn an_unsubscribable_ews_scope_does_not_sink_its_valid_siblings() {
 
 #[test]
 fn subscription_handles_are_distinct_hex_tokens() {
-    let first = new_handle().expect("rng");
-    let second = new_handle().expect("rng");
+    let first = new_handle_token().expect("rng");
+    let second = new_handle_token().expect("rng");
     // 16 random bytes, lowercase hex: 32 digits, parseable as a u128.
-    assert_eq!(first.0.len(), 32);
-    assert!(u128::from_str_radix(&first.0, 16).is_ok(), "{}", first.0);
+    assert_eq!(first.len(), 32);
+    assert!(u128::from_str_radix(&first, 16).is_ok(), "{first}");
     assert_ne!(first, second);
 }
 

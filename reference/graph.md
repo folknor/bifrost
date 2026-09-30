@@ -68,7 +68,8 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     closes it itself, before it registers anything.
   - `push/common.rs` - what both arms share: `PushEndpoint`, the two
     `Unsupported(PushSubscribe)` refusals (whole-request and scope-correlated),
-    and `new_handle`.
+    the shared `account_closed_error`, and the handle codec
+    (`graph_handle` / `ews_handle` / `decode_handle`, `new_handle_token`).
   - `push/webhook.rs` - the Graph `/subscriptions` arm: `resource_for_scope`,
     `subscribe_graph` with its create rollback, the per-handle
     `GraphSubscriptionGroup` / `GraphSubscriptionState`, and teardown -
@@ -1256,12 +1257,13 @@ Graph's own expiry, since no group holds the row. The EWS arm closes its ledger
 the same way before it installs scopes, bumps the topology or spawns the
 worker; it creates nothing server-side beforehand, so there is nothing to undo.
 The arm answers with `(Option<handle>, outcomes)` and the dispatcher only turns
-a handle-less answer into the whole-request `Err`. The `SubscriptionHandle` is minted
-BEFORE the first create: `new_handle` is fallible (a failed host entropy
-source is `Internal(RuntimeFailure)`, never retried), and a failure there has
-written nothing. Minted afterwards, the same failure would return an error
-over live server-side subscriptions with no handle any teardown could name
-them by, orphaning them until they expire. It stores `(server_id, expires_at)` in a
+a handle-less answer into the whole-request `Err`. The handle's random token is
+minted BEFORE the first create: `new_handle_token` is fallible (a failed host
+entropy source is `Internal(RuntimeFailure)`, never retried), and a failure
+there has written nothing. Minted afterwards, the same failure would return an
+error over live server-side subscriptions with no handle any teardown could
+name them by, orphaning them until they expire. The handle itself is assembled
+after the creates because it embeds their ids (next paragraph). It stores `(server_id, expires_at)` in a
 `GraphSubscriptionGroup`, and emits `Reconnected`. `push_unsubscribe`
 deletes each server subscription BEFORE dropping its local state, so a failed
 DELETE leaves that subscription and every not-yet-attempted sibling reachable
@@ -1283,7 +1285,35 @@ concurrent `push_subscribe` cannot install its live group until the slot is
 empty, so its `ensure_graph_worker` always spawns a replacement. Without that
 ordering a new subscription could observe a still-unfinished `JoinHandle`,
 decline to spawn, and never be renewed. Lock order is subscriptions-then-worker
-on every path. The webhook receiver is not in this crate: consumers mount an HTTPS
+on every path.
+
+Handles are self-describing so a teardown retried on a newer account instance
+still works. The engine keeps a handle whose teardown failed and retries
+`push_unsubscribe` on whatever instance is current; after a reopen that
+instance's `graph_subscriptions` map has never seen it. A webhook handle is the
+opaque string `graph1:<hex token>:<id>,<id>,...` carrying the Graph
+subscription ids (server-global per tenant; the account's credentials can
+delete them). An EWS handle is `ews1:<hex token>` and carries nothing: the
+streaming subscription is the worker's connection and dies with it, so an
+unknown EWS handle is correctly a no-op. `push_unsubscribe` routes by the
+decoded handle, not the instance's push mode (a reopen may switch modes), and
+falls back to the mode for a handle of neither shape. For a handle this
+instance knows, `unsubscribe_graph` keeps the registered-group path above. For
+one it does not, `unsubscribe_orphan` DELETEs exactly the ids decoded from
+that handle (404/410 count as gone), attempts every id even after a failure,
+and returns the first failure so the engine keeps the orphan. Two safeguards:
+ids this instance currently has registered are skipped (a stale or forged
+handle cannot tear down what this instance still renews), and decoding is
+all-or-nothing with an id allowlist (alphanumerics, `-`, `_`), so a malformed
+handle deletes nothing and cannot inject path or query text into the DELETE
+URL. An old instance's orphan retried on a new one therefore deletes the old
+ids only. Known limits: the handle embeds the ids present at subscribe time,
+so a subscription the renewal worker later recreated under a new id is not
+named by an orphan's handle and lives until Graph expires it; a handle is not
+bound to an account, so a webhook handle from another account in the same
+tenant would delete its ids if given to this one.
+
+The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the
 engine `InvalidationSink`; `push_stream` carries health only.
 
