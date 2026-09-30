@@ -386,6 +386,18 @@ old handle is explicitly unsubscribed before the swap. All old-handle
 push teardowns must succeed before the replacement is installed, so an
 account that retains failed server-side DELETE state (Graph) remains
 live and retryable instead of being closed with an orphaned subscription.
+The abort is kept on purpose: it buys one retry against the still-installed
+old account, which is the only place a provider's retained delete state
+lives. It is made cheap instead. The teardown pass never stops at a
+refusal; it tries every old handle and flags every refusing one
+(`teardown_unconfirmed`), so the retry meets no first-time failure and a
+reopen costs at most one aborted attempt however many subscriptions the
+consumer holds (the account-wide budget is three attempts).
+A handle whose teardown SUCCEEDED before the pass aborted is recorded at
+once as `torn_down` (a wanted record) or removed (a pure orphan). A
+`torn_down` record is still `desired`, so the retry recreates it, but it is
+never handed to `push_unsubscribe` again, and `SubscriptionRegistry::take`
+(consumer `unsubscribe_push`, detach) drops it rather than tearing it down.
 `Account::close()` is called best-effort after the swap. Any failure
 before the swap closes the replacement and leaves the running handle
 installed - and any subscription already created on that replacement is

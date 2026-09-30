@@ -764,6 +764,7 @@ pub(super) async fn reattach_account(
                             scopes: covered,
                             teardown_unconfirmed: false,
                             desired: true,
+                            torn_down: false,
                         });
                     }
                 }
@@ -816,10 +817,32 @@ pub(super) async fn reattach_account(
         // record would lose the only retry path and leak a server subscription.
         let previous = ctx.current.load_full();
         let mut carried_unconfirmed = Vec::new();
+        // The first refusal of a handle not yet known to be unreachable. The
+        // pass does NOT stop at it: every remaining record is still torn down
+        // and every refusal is flagged, so the retry meets no first-time
+        // failure and the whole reopen costs at most one aborted attempt no
+        // matter how many subscriptions the consumer holds. Stopping at the
+        // first refusal made N failing records cost N + 1 attempts, and the
+        // account-wide retry budget is three.
+        let mut first_refusal: Option<AccountError> = None;
         for record in &previous_subscriptions {
+            if record.torn_down {
+                // An earlier attempt already deleted it server-side and then
+                // aborted; the record is only the consumer's desire, which the
+                // recreation loop above has honoured. Deleting it again is
+                // an unknown-handle error on a strict provider.
+                continue;
+            }
             let teardown = previous.push_unsubscribe(record.handle.clone()).await;
             match teardown {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Recorded immediately, with no await between the delete
+                    // returning and the registry write, so an abort later in
+                    // this pass (or this future being dropped) cannot leave a
+                    // deleted handle registered as live for the next attempt.
+                    ctx.subscriptions
+                        .mark_torn_down(ctx.account_id, &record.handle);
+                }
                 Err(error) if record.teardown_unconfirmed => {
                     // Its teardown already failed once. The handle may belong
                     // to a connection that is long gone, so a repeated failure
@@ -842,23 +865,25 @@ pub(super) async fn reattach_account(
                     carried_unconfirmed.push(record.clone().into_orphan());
                 }
                 Err(error) => {
-                    // The replacement's own subscriptions must not be stranded
-                    // by this unwind: `Account::close()` deliberately does not
-                    // delete server-side subscriptions, so any handle whose
-                    // teardown did not succeed stays in the registry - on
-                    // whichever side it was created - and is retried later.
-                    unwind_replacement_subscriptions(
-                        ctx,
-                        next.as_ref(),
-                        &mut replacement_subscriptions,
-                    )
-                    .await;
+                    // Still live and wanted on the old account, which stays
+                    // installed if this pass aborts: flag it so the retry
+                    // carries it instead of aborting on it again.
                     ctx.subscriptions
                         .mark_unconfirmed(ctx.account_id, &record.handle);
-                    rollback_reattach_inserts(ctx).await;
-                    return Err(Error::Account(error));
+                    first_refusal.get_or_insert(error);
                 }
             }
+        }
+        if let Some(error) = first_refusal {
+            // The replacement's own subscriptions must not be stranded by this
+            // unwind: `Account::close()` deliberately does not delete
+            // server-side subscriptions, so any handle whose teardown did not
+            // succeed stays in the registry - on whichever side it was
+            // created - and is retried later.
+            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut replacement_subscriptions)
+                .await;
+            rollback_reattach_inserts(ctx).await;
+            return Err(Error::Account(error));
         }
         replacement_subscriptions.extend(carried_unconfirmed);
 

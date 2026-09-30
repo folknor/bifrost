@@ -291,6 +291,16 @@ pub struct StubAccount {
     /// How many upcoming `push_unsubscribe` calls on THIS account fail with
     /// [`push_teardown_refused`] before it starts succeeding. Default 0.
     pub push_unsubscribe_failures: std::sync::atomic::AtomicUsize,
+    /// Handles whose `push_unsubscribe` on THIS account always fails, however
+    /// many times it is retried. Lets a test make some subscriptions refuse and
+    /// others succeed within one reopen. Default empty.
+    pub push_unsubscribe_refused: Vec<String>,
+    /// A provider that errors on a handle it no longer knows: a successful
+    /// `push_unsubscribe` remembers the handle, and a second call for it fails
+    /// with [`push_teardown_refused`]. Default false.
+    pub push_unsubscribe_strict: bool,
+    /// Handles deleted by a successful `push_unsubscribe` on THIS account.
+    pub push_deleted: Mutex<Vec<String>>,
 }
 
 /// Observes the LIFETIME of a stalled provider stream, not just its effects.
@@ -409,6 +419,9 @@ impl StubAccount {
             push_label: "stub".to_owned(),
             push_log: Arc::new(PushLog::default()),
             push_unsubscribe_failures: std::sync::atomic::AtomicUsize::new(0),
+            push_unsubscribe_refused: Vec::new(),
+            push_unsubscribe_strict: false,
+            push_deleted: Mutex::new(Vec::new()),
         }
     }
 
@@ -615,12 +628,23 @@ impl Account for StubAccount {
         &self,
         scopes: &[CursorScope],
     ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
-        self.push_log
-            .subscribed
-            .lock()
-            .expect("push log lock")
-            .push((self.push_label.clone(), scopes.to_vec()));
-        let handle = SubscriptionHandle(self.push_label.clone());
+        // The first subscription on an account is named by its label, so a
+        // single-subscription test reads `call("old", "old")`. Further ones
+        // get `label-2`, `label-3`, ...: a test holding several subscriptions
+        // on one account needs handles it can tell apart.
+        let handle = {
+            let mut subscribed = self.push_log.subscribed.lock().expect("push log lock");
+            let prior = subscribed
+                .iter()
+                .filter(|(label, _)| label == &self.push_label)
+                .count();
+            subscribed.push((self.push_label.clone(), scopes.to_vec()));
+            if prior == 0 {
+                SubscriptionHandle(self.push_label.clone())
+            } else {
+                SubscriptionHandle(format!("{}-{}", self.push_label, prior + 1))
+            }
+        };
         let scopes = scopes.to_vec();
         Box::pin(async move {
             Ok(bifrost_types::PushSubscription::all_succeeded(
@@ -637,8 +661,8 @@ impl Account for StubAccount {
             .unsubscribed
             .lock()
             .expect("push log lock")
-            .push((self.push_label.clone(), handle));
-        let fail = self
+            .push((self.push_label.clone(), handle.clone()));
+        let counted = self
             .push_unsubscribe_failures
             .try_update(
                 std::sync::atomic::Ordering::SeqCst,
@@ -646,6 +670,14 @@ impl Account for StubAccount {
                 |remaining| remaining.checked_sub(1),
             )
             .is_ok();
+        let refused = self.push_unsubscribe_refused.contains(&handle.0);
+        let mut deleted = self.push_deleted.lock().expect("push deleted lock");
+        let unknown = self.push_unsubscribe_strict && deleted.contains(&handle.0);
+        let fail = counted || refused || unknown;
+        if !fail {
+            deleted.push(handle.0);
+        }
+        drop(deleted);
         Box::pin(async move {
             if fail {
                 Err(push_teardown_refused())

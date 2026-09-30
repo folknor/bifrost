@@ -32,6 +32,14 @@ pub(crate) struct RegisteredSubscription {
     /// recreated. A record is always `desired`, `teardown_unconfirmed`, or
     /// both; `into_orphan` is the only way to clear `desired`.
     pub desired: bool,
+    /// The old-side teardown of this handle already SUCCEEDED in a reopen
+    /// attempt that then aborted, so the server-side subscription is gone and
+    /// the record survives only as the consumer's desire, to be recreated by
+    /// the next attempt. Such a record is never handed to `push_unsubscribe`
+    /// again (a provider that errors on an unknown handle would turn that into
+    /// another abort) and is dropped, not torn down, by `take`. Implies
+    /// `desired` and not `teardown_unconfirmed`.
+    pub torn_down: bool,
 }
 
 impl RegisteredSubscription {
@@ -43,6 +51,7 @@ impl RegisteredSubscription {
         Self {
             teardown_unconfirmed: true,
             desired: false,
+            torn_down: false,
             ..self
         }
     }
@@ -70,16 +79,24 @@ impl SubscriptionRegistry {
                 scopes,
                 teardown_unconfirmed: false,
                 desired: true,
+                torn_down: false,
             });
     }
 
-    /// Take all records registered for an account. Returns an empty
-    /// vec if none. Callers that cannot tear down a handle restore its
-    /// record so the same account-side handle remains retryable.
+    /// Take all records registered for an account that still have a
+    /// server-side handle to tear down. Returns an empty vec if none. Callers
+    /// that cannot tear down a handle restore its record so the same
+    /// account-side handle remains retryable. A `torn_down` record is dropped
+    /// here: its server side is already gone and the caller taking the
+    /// registry (a consumer unsubscribe, a detach) is ending the desire it
+    /// carried.
     #[must_use]
     pub(crate) fn take(&self, account: &AccountId) -> Vec<RegisteredSubscription> {
         match self.inner.remove(account) {
-            Some((_, v)) => v,
+            Some((_, mut v)) => {
+                v.retain(|record| !record.torn_down);
+                v
+            }
             None => Vec::new(),
         }
     }
@@ -106,6 +123,28 @@ impl SubscriptionRegistry {
                     record.teardown_unconfirmed = true;
                 }
             }
+        }
+    }
+
+    /// Record that a still-registered handle's server-side teardown
+    /// SUCCEEDED in a reopen attempt that may yet abort. A wanted record
+    /// stays, flagged `torn_down`, so the next attempt recreates it without
+    /// unsubscribing the dead handle again; a pure orphan has nothing left to
+    /// carry and is removed.
+    pub(crate) fn mark_torn_down(&self, account: &AccountId, handle: &SubscriptionHandle) {
+        if let Some(mut records) = self.inner.get_mut(account) {
+            records.retain_mut(|record| {
+                if &record.handle != handle {
+                    return true;
+                }
+                if record.desired {
+                    record.torn_down = true;
+                    record.teardown_unconfirmed = false;
+                    true
+                } else {
+                    false
+                }
+            });
         }
     }
 

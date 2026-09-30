@@ -282,3 +282,210 @@ async fn a_subscription_the_consumer_tore_down_is_not_resurrected_by_reopen() {
 
     engine.detach(&id).await.expect("detach");
 }
+
+/// An old account that is strict about handles and refuses to delete exactly
+/// the named ones, however often it is asked.
+fn strict_refusing(label: &str, log: &Arc<PushLog>, refused: &[&str]) -> Arc<StubAccount> {
+    let mut caps = common::caps();
+    caps.push = PushCapability::WebhookOrEwsStream;
+    Arc::new(StubAccount {
+        caps,
+        push_label: label.to_owned(),
+        push_log: Arc::clone(log),
+        push_unsubscribe_refused: refused.iter().map(|h| (*h).to_owned()).collect(),
+        push_unsubscribe_strict: true,
+        ..StubAccount::new(inbox())
+    })
+}
+
+/// Attach and register `subscriptions` push subscriptions on the first account.
+async fn attached_with_subscriptions(
+    id: &AccountId,
+    accounts: Vec<Arc<StubAccount>>,
+    subscriptions: usize,
+) -> SyncEngine {
+    let engine = SyncEngine::builder().build().expect("engine");
+    let factory: Arc<dyn AccountFactory> = Arc::new(StubFactory::queue(accounts));
+    engine.attach(id.clone(), factory).await.expect("attach");
+    for _ in 0..subscriptions {
+        engine
+            .subscribe_push(id, &inbox())
+            .await
+            .expect("consumer subscribes");
+    }
+    engine
+}
+
+/// Three subscriptions on a dead old connection. Every reopen attempt used to
+/// flag only the FIRST refusing record and abort, so three records needed four
+/// attempts and the engine's budget is three: the account paused for good.
+/// Flagging every refusal in one pass makes the whole reopen cost two attempts
+/// whatever the count.
+///
+/// Reverting the pass-continues change in `reattach_account` (aborting at the
+/// first refusal again) makes the SECOND `reattach` here return an error, and
+/// the unsubscribe log lose the `old-2` / `old-3` entries of attempt 1.
+#[tokio::test]
+async fn many_failing_old_side_teardowns_cost_one_aborted_attempt() {
+    let id = AccountId("reopen-many-dead-handles".into());
+    let log = Arc::new(PushLog::default());
+    let engine = attached_with_subscriptions(
+        &id,
+        vec![
+            pushing("old", &log, usize::MAX),
+            pushing("aborted", &log, 0),
+            pushing("replacement", &log, 0),
+        ],
+        3,
+    )
+    .await;
+
+    assert!(matches!(engine.reattach(&id).await, Err(Error::Account(_))));
+    engine
+        .reattach(&id)
+        .await
+        .expect("every refusal was flagged by the first attempt, so the second commits");
+
+    assert_eq!(
+        log.unsubscribed(),
+        vec![
+            // Attempt 1 tries every old handle, then unwinds its replacement.
+            call("old", "old"),
+            call("old", "old-2"),
+            call("old", "old-3"),
+            call("aborted", "aborted"),
+            call("aborted", "aborted-2"),
+            call("aborted", "aborted-3"),
+            // Attempt 2 carries all three, none of them aborting.
+            call("old", "old"),
+            call("old", "old-2"),
+            call("old", "old-3"),
+        ],
+    );
+    assert_eq!(
+        log.subscribed()
+            .iter()
+            .filter(|(label, _)| label == "replacement")
+            .count(),
+        3,
+        "all three wanted subscriptions were recreated on the installed account"
+    );
+
+    engine.unsubscribe_push(&id).await.expect("teardown");
+    assert_eq!(
+        log.unsubscribed()[9..],
+        [
+            call("replacement", "replacement"),
+            call("replacement", "replacement-2"),
+            call("replacement", "replacement-3"),
+            call("replacement", "old"),
+            call("replacement", "old-2"),
+            call("replacement", "old-3"),
+        ],
+        "three recreated subscriptions and three carried orphans, no more"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}
+
+/// Two of three handles delete cleanly and one refuses, on a provider that
+/// errors on an unknown handle. The refusal aborts the attempt AFTER the other
+/// two are gone; the retry must not delete them a second time.
+///
+/// Reverting the `torn_down` skip in the teardown pass makes the second
+/// `reattach` fail (the strict provider rejects the repeated `old`), and the
+/// log shows `old` and `old-3` twice.
+#[tokio::test]
+async fn an_old_handle_already_torn_down_is_not_torn_down_again_by_the_retry() {
+    let id = AccountId("reopen-torn-down-then-abort".into());
+    let log = Arc::new(PushLog::default());
+    let engine = attached_with_subscriptions(
+        &id,
+        vec![
+            strict_refusing("old", &log, &["old-2"]),
+            pushing("aborted", &log, 0),
+            pushing("replacement", &log, 0),
+        ],
+        3,
+    )
+    .await;
+
+    assert!(matches!(engine.reattach(&id).await, Err(Error::Account(_))));
+    engine
+        .reattach(&id)
+        .await
+        .expect("the retry only meets the handle that is still unconfirmed");
+
+    assert_eq!(
+        log.unsubscribed(),
+        vec![
+            call("old", "old"),
+            call("old", "old-2"),
+            call("old", "old-3"),
+            call("aborted", "aborted"),
+            call("aborted", "aborted-2"),
+            call("aborted", "aborted-3"),
+            // Attempt 2: ONLY the refused handle; the two deleted ones are
+            // not asked again.
+            call("old", "old-2"),
+        ],
+    );
+    assert_eq!(
+        log.subscribed()
+            .iter()
+            .filter(|(label, _)| label == "replacement")
+            .count(),
+        3,
+        "the torn-down records were still wanted, so all three are recreated"
+    );
+
+    engine.unsubscribe_push(&id).await.expect("teardown");
+    assert_eq!(
+        log.unsubscribed()[7..],
+        [
+            call("replacement", "replacement"),
+            call("replacement", "replacement-2"),
+            call("replacement", "replacement-3"),
+            call("replacement", "old-2"),
+        ],
+        "the deleted handles were dropped, the refused one carried"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}
+
+/// Where the hole could move to: after an aborted reopen the old account is
+/// still installed, and a consumer `unsubscribe_push` lands before the retry.
+/// The already-deleted handles must not be sent to the provider again, or a
+/// strict provider turns them into permanently failing orphans.
+///
+/// Reverting the `torn_down` filter in `SubscriptionRegistry::take` makes the
+/// log show `old` and `old-3` deleted twice.
+#[tokio::test]
+async fn a_consumer_unsubscribe_after_an_aborted_reopen_skips_deleted_handles() {
+    let id = AccountId("reopen-abort-then-unsubscribe".into());
+    let log = Arc::new(PushLog::default());
+    let engine = attached_with_subscriptions(
+        &id,
+        vec![
+            strict_refusing("old", &log, &["old-2"]),
+            pushing("aborted", &log, 0),
+        ],
+        3,
+    )
+    .await;
+
+    assert!(matches!(engine.reattach(&id).await, Err(Error::Account(_))));
+    assert!(
+        matches!(engine.unsubscribe_push(&id).await, Err(Error::Account(_))),
+        "the refused handle still refuses"
+    );
+
+    assert_eq!(
+        log.unsubscribed()[6..],
+        [call("old", "old-2")],
+        "only the handle that was never deleted is asked about again"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}
