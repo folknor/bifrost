@@ -204,10 +204,12 @@ impl GoogleAccount {
             .get_profile()
             .await
             .map_err(|error| error::into_account_error(error, error::GmailErrorContext::open()))?;
+        // Present but not a number: a parse failure in a complete response,
+        // not a missing field.
         let history_id = profile.history_id.parse::<u64>().map_err(|error| {
             error::into_account_error(
-                crate::error::Error::missing_field(
-                    "historyId",
+                crate::error::Error::provider_response(
+                    crate::error::ProviderFault::ParseFailed,
                     format!("gmail profile invalid history id: {error}"),
                 ),
                 error::GmailErrorContext::open(),
@@ -218,16 +220,20 @@ impl GoogleAccount {
             profile.email_address.clone(),
         ));
         let shutdown = CancellationToken::new();
+        // Built before `profile` moves into the struct below; the mailbox is
+        // the key under which account instances coordinate `users.stop`.
+        let pubsub = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            pubsub,
+            shutdown.clone(),
+            &profile.email_address,
+        ));
         Ok(Arc::new(Self {
             client: Arc::clone(&client),
             capabilities: gmail_capabilities(),
             profile,
             seed_state,
-            pubsub: Arc::new(PubSubControl::new(
-                Arc::clone(&client),
-                pubsub,
-                shutdown.clone(),
-            )),
+            pubsub,
             scope_cache: Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
             shutdown,
             closed: AtomicBool::new(false),
@@ -966,6 +972,8 @@ mod tests {
 
     const TEST_HOST: &str = "gmail.test";
 
+    static NEXT_MAILBOX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     /// An account wired to a scripted transport, with one live watch
     /// handle so `close()` actually issues `users.stop`.
     fn scripted_account(script: &Arc<ScriptedDispatch>) -> (Arc<GoogleAccount>, bifrost_net::Net) {
@@ -987,7 +995,17 @@ mod tests {
                 history_id: "1".to_owned(),
             },
             seed_state: encode_gmail_state(&GmailChangeState::new(1, "user@gmail.test".to_owned())),
-            pubsub: Arc::new(PubSubControl::new(client, None, shutdown.clone())),
+            // A mailbox per call: the watch registry is process-wide and
+            // libtest runs these tests in parallel.
+            pubsub: Arc::new(PubSubControl::new(
+                client,
+                None,
+                shutdown.clone(),
+                &format!(
+                    "close-test-{}@gmail.test",
+                    NEXT_MAILBOX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
+            )),
             scope_cache: Arc::new(ScopeCacheState::new(ScopeSnapshot::empty())),
             shutdown,
             closed: AtomicBool::new(false),
@@ -1083,5 +1101,38 @@ mod tests {
         assert!(account.shutdown.is_cancelled());
         assert_eq!(net.governor().cost_default_for(TEST_HOST), None);
         assert!(!account.pubsub.has_handles().await);
+    }
+
+    /// A profile whose `historyId` is present but not a number did not
+    /// parse; it was not missing, and the response arrived whole.
+    #[tokio::test]
+    async fn open_refuses_an_unparseable_profile_history_id_as_a_parse_failure() {
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: reqwest::StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(
+                br#"{"emailAddress":"user@gmail.test","historyId":"not-a-number"}"#,
+            ),
+        }]);
+        let (account, _net) = scripted_account(&script);
+
+        let Err(error) = GoogleAccount::open(Arc::clone(&account.client), None).await else {
+            panic!("an unparseable history id must refuse the open");
+        };
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            )
+        );
+        let attempt = error.chain().iter().find_map(|cause| match cause {
+            bifrost_types::Cause::Attempt(attempt) => Some(attempt.transmission_state),
+            _ => None,
+        });
+        assert_eq!(
+            attempt,
+            Some(bifrost_types::TransmissionState::Acknowledged)
+        );
     }
 }

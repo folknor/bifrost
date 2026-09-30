@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
@@ -28,6 +28,161 @@ const RENEW_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 /// into an unthrottled `users.watch` storm. Deliberately not applied to
 /// the `None` fallback, which is already six days.
 const MIN_RENEW_DELAY: Duration = RENEW_RETRY_AFTER;
+
+/// Process-wide watch coordination for one Gmail mailbox.
+///
+/// A Gmail watch belongs to the MAILBOX, not to the account instance that
+/// created it: `users.watch` on a mailbox that already has one replaces it,
+/// and `users.stop` takes no watch identity and stops whatever watch the
+/// mailbox has. Two live `GoogleAccount` instances for one mailbox therefore
+/// share one remote watch - and the sync engine's reopen creates exactly that
+/// pair, subscribing on the replacement BEFORE it tears down the old
+/// account's handle. Without coordination the old account's teardown
+/// `users.stop` kills the replacement's fresh watch, and push stays silently
+/// dead until the next renewal, up to six days later (the abort path of the
+/// same reopen does the mirror image to the old account).
+///
+/// `holders` counts the actors in this process that currently own a live
+/// watch on the mailbox; a teardown sends `users.stop` only when no OTHER
+/// holder exists. `exchange` serializes every `users.watch` and `users.stop`
+/// for the mailbox across instances, so a stop decided on a zero count
+/// cannot reach Gmail after another instance's watch that the count did not
+/// yet show.
+///
+/// The bias is deliberate: a watch nobody stops is cheap (it expires within
+/// seven days, and a notification with no listener is dropped), a watch
+/// stopped under a live listener is expensive (push is silently dead). Every
+/// ambiguity - a holder released late, a second consumer in the process
+/// using another topic - errs toward skipping the stop. Instances in OTHER
+/// processes are invisible here; `users.stop` gives no way to scope to a
+/// watch, so that residual cannot be closed on this side.
+#[derive(Default)]
+struct MailboxWatch {
+    exchange: tokio::sync::Mutex<()>,
+    holders: Mutex<usize>,
+}
+
+static MAILBOX_WATCHES: LazyLock<Mutex<HashMap<String, Weak<MailboxWatch>>>> =
+    LazyLock::new(Mutex::default);
+
+fn mailbox_watch(mailbox: &str) -> Arc<MailboxWatch> {
+    let key = mailbox.to_ascii_lowercase();
+    let mut watches = MAILBOX_WATCHES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    watches.retain(|_, watch| watch.strong_count() > 0);
+    if let Some(existing) = watches.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let fresh = Arc::new(MailboxWatch::default());
+    watches.insert(key, Arc::downgrade(&fresh));
+    fresh
+}
+
+/// One actor's stake in its mailbox's shared watch. Dropping it (the actor
+/// ending, for any reason) releases the claim, so a dead instance never pins
+/// another instance's stop decision.
+struct WatchOwnership {
+    mailbox: Arc<MailboxWatch>,
+    claimed: bool,
+}
+
+impl WatchOwnership {
+    fn new(mailbox: Arc<MailboxWatch>) -> Self {
+        Self {
+            mailbox,
+            claimed: false,
+        }
+    }
+
+    fn holders(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.mailbox
+            .holders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn claim(&mut self) {
+        if !self.claimed {
+            *self.holders() += 1;
+            self.claimed = true;
+        }
+    }
+
+    fn release(&mut self) {
+        if self.claimed {
+            let mut holders = self.holders();
+            *holders = holders.saturating_sub(1);
+            drop(holders);
+            self.claimed = false;
+        }
+    }
+
+    /// Live watch holders in this process other than this actor.
+    fn others(&self) -> usize {
+        self.holders().saturating_sub(usize::from(self.claimed))
+    }
+}
+
+impl Drop for WatchOwnership {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Whether a teardown reached Gmail or deferred to another live holder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopOutcome {
+    Stopped,
+    SharedWithAnotherInstance,
+}
+
+/// `users.stop`, unless another instance in this process holds a live watch
+/// on the same mailbox - stopping would kill that instance's watch too. The
+/// caller must hold the mailbox's `exchange` guard. Releases this actor's own
+/// claim on every non-error outcome: either the watch is gone, or it now
+/// belongs to the other holder.
+async fn stop_unless_shared(
+    client: &GmailClient,
+    ownership: &mut WatchOwnership,
+) -> crate::Result<StopOutcome> {
+    if ownership.others() > 0 {
+        ownership.release();
+        return Ok(StopOutcome::SharedWithAnotherInstance);
+    }
+    stop_watch(client).await?;
+    ownership.release();
+    Ok(StopOutcome::Stopped)
+}
+
+/// `stop_unless_shared` under the mailbox's `exchange` guard. Every teardown
+/// path goes through here, so no stop decision is taken outside the
+/// serialization that `watch_claimed` also runs under.
+async fn stop_exclusive(
+    client: &GmailClient,
+    ownership: &mut WatchOwnership,
+) -> crate::Result<StopOutcome> {
+    let mailbox = Arc::clone(&ownership.mailbox);
+    let _exchange = mailbox.exchange.lock().await;
+    stop_unless_shared(client, ownership).await
+}
+
+/// `users.watch` under the mailbox's `exchange` guard, taking this actor's
+/// claim before the guard is released. A stop decided by another instance
+/// either ran wholly before this watch (and this watch replaced whatever that
+/// stop left) or sees the claim and defers. Claiming is idempotent, so a
+/// renewal re-enters here harmlessly.
+async fn watch_claimed(
+    client: &GmailClient,
+    config: &PubSubConfig,
+    ownership: &mut WatchOwnership,
+) -> crate::Result<GmailWatchResponse> {
+    let mailbox = Arc::clone(&ownership.mailbox);
+    let _exchange = mailbox.exchange.lock().await;
+    let response = watch_once(client, config).await?;
+    ownership.claim();
+    Ok(response)
+}
 
 /// Gmail Cloud Pub/Sub watch configuration for `GoogleAccountFactory`.
 #[derive(Debug, Clone)]
@@ -104,10 +259,13 @@ enum HandleRemoval {
 }
 
 impl PubSubControl {
+    /// `mailbox` is the account's Gmail address: the identity Gmail scopes a
+    /// watch to, and so the key under which instances coordinate teardown.
     pub(crate) fn new(
         client: Arc<GmailClient>,
         config: Option<PubSubConfig>,
         shutdown: CancellationToken,
+        mailbox: &str,
     ) -> Self {
         let (health_tx, _) = broadcast::channel(32);
         let (commands, receiver) = mpsc::channel(16);
@@ -117,6 +275,7 @@ impl PubSubControl {
             shutdown.clone(),
             health_tx.clone(),
             receiver,
+            WatchOwnership::new(mailbox_watch(mailbox)),
         ));
         Self {
             commands,
@@ -249,6 +408,7 @@ async fn watch_actor(
     shutdown: CancellationToken,
     health_tx: broadcast::Sender<WatchEvent>,
     mut commands: mpsc::Receiver<WatchCommand>,
+    mut ownership: WatchOwnership,
 ) {
     let mut lifecycle = WatchLifecycle::Unwatched;
     let mut handles = HashSet::new();
@@ -260,6 +420,16 @@ async fn watch_actor(
     let mut consecutive_renewal_failures: u32 = 0;
     let mut retry_after = None;
     loop {
+        // A claim is held only while this actor owns a live watch. Claims are
+        // taken eagerly (inside the serialized exchange that created the
+        // watch) and dropped here lazily; a late release only makes another
+        // instance skip a stop, which is the cheap direction.
+        if !matches!(
+            lifecycle,
+            WatchLifecycle::Watched { .. } | WatchLifecycle::Renewing
+        ) {
+            ownership.release();
+        }
         // Computed WITHOUT consuming `retry_after`. This runs on every trip
         // around the loop, including trips that end in a command rather than
         // in the renewal timer, and a `take()` here let any command arriving
@@ -282,7 +452,7 @@ async fn watch_actor(
                     WatchCommand::Subscribe { reply } => {
                         let result = actor_subscribe(
                             &client, config.as_ref(), &shutdown,
-                            &mut lifecycle, &mut handles,
+                            &mut lifecycle, &mut handles, &mut ownership,
                         ).await;
                         if result.is_ok() {
                             // A completed subscribe is a completed request,
@@ -309,12 +479,12 @@ async fn watch_actor(
                     // traffic after shutdown" is deliberate.
                     WatchCommand::Unsubscribe { handle, reply } => {
                         let result = actor_unsubscribe(
-                            &client, handle, &mut lifecycle, &mut handles,
+                            &client, handle, &mut lifecycle, &mut handles, &mut ownership,
                         ).await;
                         let _ = reply.send(result);
                     }
                     WatchCommand::Close { reply } => {
-                        actor_close(&client, &mut lifecycle, &mut handles).await;
+                        actor_close(&client, &mut lifecycle, &mut handles, &mut ownership).await;
                         let _ = reply.send(());
                     }
                     #[cfg(test)]
@@ -353,10 +523,12 @@ async fn watch_actor(
                 // keep its result is made by `commit_watched`, which cannot
                 // lose that race because it reads the token after the
                 // response is already in hand.
-                let result = watch_once(&client, config).await;
+                let result = watch_claimed(&client, config, &mut ownership).await;
                 match result {
                     Ok(response) => {
-                        if !commit_watched(&client, &shutdown, &mut lifecycle, &response).await {
+                        if !commit_watched(
+                            &client, &shutdown, &mut lifecycle, &response, &mut ownership,
+                        ).await {
                             retry_after = None;
                             continue;
                         }
@@ -422,6 +594,7 @@ async fn actor_subscribe(
     shutdown: &CancellationToken,
     lifecycle: &mut WatchLifecycle,
     handles: &mut HashSet<String>,
+    ownership: &mut WatchOwnership,
 ) -> Result<SubscriptionHandle, AccountError> {
     if shutdown.is_cancelled() || matches!(lifecycle, WatchLifecycle::Retired) {
         return Err(closed_error(AccountOperation::PushSubscribe));
@@ -440,9 +613,11 @@ async fn actor_subscribe(
     // `users.watch` be committed by the arm that won, leaving a Gmail-side
     // watch that no renewer refreshes and no `close()` retires. The request
     // runs to completion and `commit_watched` decides afterwards.
-    let response = watch_once(client, config).await.map_err(|error| {
-        error::into_account_error(error, error::GmailErrorContext::push_subscribe())
-    })?;
+    let response = watch_claimed(client, config, ownership)
+        .await
+        .map_err(|error| {
+            error::into_account_error(error, error::GmailErrorContext::push_subscribe())
+        })?;
     // Encode before committing. An encode failure after the commit would
     // leave `Watched` installed with no handle in the set, so `close()`
     // would skip `users.stop` and the renewer would keep the orphan alive.
@@ -459,7 +634,7 @@ async fn actor_subscribe(
             // not stop the watch the earlier handles depend on; the watch
             // stays live and the renewer keeps refreshing it.
             if handles.is_empty() {
-                let _ = stop_watch(client).await;
+                let _ = stop_exclusive(client, ownership).await;
             }
             return Err(error::into_account_error(
                 crate::error::Error::invalid_request(
@@ -470,7 +645,7 @@ async fn actor_subscribe(
             ));
         }
     };
-    if !commit_watched(client, shutdown, lifecycle, &response).await {
+    if !commit_watched(client, shutdown, lifecycle, &response, ownership).await {
         return Err(closed_error(AccountOperation::PushSubscribe));
     }
     handles.insert(handle.0.clone());
@@ -482,6 +657,7 @@ async fn actor_unsubscribe(
     handle: SubscriptionHandle,
     lifecycle: &mut WatchLifecycle,
     handles: &mut HashSet<String>,
+    ownership: &mut WatchOwnership,
 ) -> Result<(), AccountError> {
     let _decoded: GmailSubscriptionHandle = serde_json::from_str(&handle.0).map_err(|error| {
         error::into_account_error(
@@ -508,7 +684,7 @@ async fn actor_unsubscribe(
         HandleRemoval::NotPresent if !handles.is_empty() => return Ok(()),
         HandleRemoval::NotPresent => {}
     }
-    if let Err(error) = stop_watch(client).await {
+    if let Err(error) = stop_exclusive(client, ownership).await {
         if removal == HandleRemoval::Last {
             handles.insert(handle.0);
         }
@@ -525,9 +701,10 @@ async fn actor_close(
     client: &GmailClient,
     lifecycle: &mut WatchLifecycle,
     handles: &mut HashSet<String>,
+    ownership: &mut WatchOwnership,
 ) {
     if !handles.is_empty()
-        && let Err(error) = stop_watch(client).await
+        && let Err(error) = stop_exclusive(client, ownership).await
     {
         let account_error =
             error::into_account_error(error, error::GmailErrorContext::push_unsubscribe());
@@ -575,10 +752,11 @@ async fn commit_watched(
     shutdown: &CancellationToken,
     lifecycle: &mut WatchLifecycle,
     response: &GmailWatchResponse,
+    ownership: &mut WatchOwnership,
 ) -> bool {
     if shutdown.is_cancelled() || matches!(lifecycle, WatchLifecycle::Retired) {
         *lifecycle = WatchLifecycle::Retired;
-        if let Err(error) = stop_watch(client).await {
+        if let Err(error) = stop_exclusive(client, ownership).await {
             let account_error =
                 error::into_account_error(error, error::GmailErrorContext::push_unsubscribe());
             tracing::warn!(
@@ -843,7 +1021,12 @@ mod tests {
     async fn persisted_handle_after_restart_still_stops_the_watch() {
         let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
         let shutdown = CancellationToken::new();
-        let control = Arc::new(PubSubControl::new(Arc::clone(&client), None, shutdown));
+        let control = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            None,
+            shutdown,
+            "persisted-handle@push.test",
+        ));
 
         push_unsubscribe(control, encoded_handle())
             .await
@@ -862,7 +1045,12 @@ mod tests {
             canned(StatusCode::NO_CONTENT),
         ]);
         let shutdown = CancellationToken::new();
-        let control = Arc::new(PubSubControl::new(Arc::clone(&client), None, shutdown));
+        let control = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            None,
+            shutdown,
+            "failed-last-stop@push.test",
+        ));
         let handle = encoded_handle();
         control.insert_handle(&handle).await;
 
@@ -891,7 +1079,12 @@ mod tests {
     async fn close_stops_a_locally_active_watch_before_clearing_state() {
         let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
         let shutdown = CancellationToken::new();
-        let control = Arc::new(PubSubControl::new(Arc::clone(&client), None, shutdown));
+        let control = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            None,
+            shutdown,
+            "close-stops@push.test",
+        ));
         control.insert_handle(&encoded_handle()).await;
 
         close_watch(&control).await;
@@ -938,6 +1131,7 @@ mod tests {
             Arc::clone(&client),
             Some(PubSubConfig::new("projects/p/topics/t")),
             shutdown,
+            "terminal-renewal@push.test",
         ));
         let mut health = pubsub.health_tx.subscribe();
 
@@ -999,6 +1193,7 @@ mod tests {
             Arc::clone(&client),
             Some(PubSubConfig::new("projects/p/topics/t")),
             shutdown.clone(),
+            "damper@push.test",
         ));
 
         push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
@@ -1056,6 +1251,7 @@ mod tests {
             Arc::clone(&client),
             Some(PubSubConfig::new("projects/p/topics/t")),
             shutdown.clone(),
+            "warning-count@push.test",
         ));
         let mut health = pubsub.health_tx.subscribe();
 
@@ -1098,7 +1294,12 @@ mod tests {
     async fn unsubscribe_after_close_is_a_local_no_op() {
         let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
         let shutdown = CancellationToken::new();
-        let control = Arc::new(PubSubControl::new(Arc::clone(&client), None, shutdown));
+        let control = Arc::new(PubSubControl::new(
+            Arc::clone(&client),
+            None,
+            shutdown,
+            "unsubscribe-after-close@push.test",
+        ));
 
         close_watch(&control).await;
         assert!(
@@ -1125,6 +1326,7 @@ mod tests {
             client,
             Some(PubSubConfig::new("projects/p/topics/t")),
             shutdown,
+            "subscribe-after-shutdown@push.test",
         ));
 
         let error = push_subscribe(pubsub, vec![CursorScope::Account])
@@ -1168,7 +1370,18 @@ mod tests {
             expiration: Some("1700000000000".to_owned()),
         };
 
-        assert!(commit_watched(&client, &shutdown, &mut lifecycle, &response).await);
+        let mut ownership = WatchOwnership::new(mailbox_watch("commit-moves@push.test"));
+
+        assert!(
+            commit_watched(
+                &client,
+                &shutdown,
+                &mut lifecycle,
+                &response,
+                &mut ownership
+            )
+            .await
+        );
 
         let WatchLifecycle::Watched {
             history_id,
@@ -1205,8 +1418,17 @@ mod tests {
             expiration: Some("1700000000000".to_owned()),
         };
 
+        let mut ownership = WatchOwnership::new(mailbox_watch("completes-after-close@push.test"));
+
         shutdown.cancel();
-        let committed = commit_watched(&client, &shutdown, &mut lifecycle, &response).await;
+        let committed = commit_watched(
+            &client,
+            &shutdown,
+            &mut lifecycle,
+            &response,
+            &mut ownership,
+        )
+        .await;
 
         assert!(!committed, "a cancelled account must not install Watched");
         assert!(
@@ -1235,7 +1457,18 @@ mod tests {
             expiration: None,
         };
 
-        assert!(!commit_watched(&client, &shutdown, &mut lifecycle, &response).await);
+        let mut ownership = WatchOwnership::new(mailbox_watch("retired-lifecycle@push.test"));
+
+        assert!(
+            !commit_watched(
+                &client,
+                &shutdown,
+                &mut lifecycle,
+                &response,
+                &mut ownership
+            )
+            .await
+        );
         assert!(matches!(lifecycle, WatchLifecycle::Retired));
         assert_eq!(script.requests()[0].url.path(), "/stop");
     }
@@ -1275,6 +1508,7 @@ mod tests {
             Arc::clone(&client),
             Some(PubSubConfig::new("projects/p/topics/t")),
             shutdown.clone(),
+            "cancelled-retires@push.test",
         ));
 
         push_subscribe(Arc::clone(&pubsub), vec![CursorScope::Account])
@@ -1293,6 +1527,161 @@ mod tests {
             1,
             "a renewal due at close must not re-issue users.watch",
         );
+    }
+
+    // ---- shared mailbox watch -------------------------------------------
+
+    fn watch_ok(history_id: &str) -> Canned {
+        Canned::Response {
+            status: StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(format!("{{\"historyId\":\"{history_id}\"}}").into_bytes()),
+        }
+    }
+
+    fn watching_control(client: &Arc<GmailClient>, mailbox: &str) -> Arc<PubSubControl> {
+        Arc::new(PubSubControl::new(
+            Arc::clone(client),
+            Some(PubSubConfig::new("projects/p/topics/t")),
+            CancellationToken::new(),
+            mailbox,
+        ))
+    }
+
+    fn stop_paths(script: &ScriptedDispatch) -> usize {
+        script
+            .requests()
+            .iter()
+            .filter(|request| request.url.path() == "/stop")
+            .count()
+    }
+
+    /// The sync engine's reopen subscribes on the replacement BEFORE tearing
+    /// down the old account's handle. `users.stop` stops the mailbox's watch,
+    /// so the old account's unsubscribe must not send it while the replacement
+    /// holds a live watch; the last holder's unsubscribe must.
+    ///
+    /// Bites on the `others() > 0` early return in `stop_unless_shared`:
+    /// without it the first unsubscribe posts `/stop` (and the exhausted
+    /// script turns that into an error).
+    #[tokio::test]
+    async fn unsubscribe_defers_the_stop_while_another_instance_holds_a_watch() {
+        let mailbox = "shared-unsubscribe@push.test";
+        let (old_client, old_script) = scripted_client([watch_ok("1")]);
+        let (new_client, new_script) =
+            scripted_client([watch_ok("2"), canned(StatusCode::NO_CONTENT)]);
+        let old = watching_control(&old_client, mailbox);
+        let replacement = watching_control(&new_client, mailbox);
+
+        let old_handle = push_subscribe(Arc::clone(&old), vec![CursorScope::Account])
+            .await
+            .expect("old account subscribes");
+        let new_handle = push_subscribe(Arc::clone(&replacement), vec![CursorScope::Account])
+            .await
+            .expect("replacement subscribes");
+
+        push_unsubscribe(Arc::clone(&old), old_handle)
+            .await
+            .expect("old account's teardown succeeds without a wire stop");
+        assert_eq!(
+            stop_paths(&old_script),
+            0,
+            "the old account must not stop the replacement's watch"
+        );
+        assert_eq!(stop_paths(&new_script), 0);
+
+        push_unsubscribe(Arc::clone(&replacement), new_handle)
+            .await
+            .expect("last holder stops the watch");
+        assert_eq!(
+            stop_paths(&new_script),
+            1,
+            "the last holder's teardown must reach users.stop"
+        );
+    }
+
+    /// Same contract on the `close()` path.
+    ///
+    /// Bites on the same `others() > 0` early return: `actor_close` routes
+    /// through `stop_exclusive`, and reverting it makes the first close post
+    /// `/stop`.
+    #[tokio::test]
+    async fn close_defers_the_stop_while_another_instance_holds_a_watch() {
+        let mailbox = "shared-close@push.test";
+        let (old_client, old_script) = scripted_client([watch_ok("1")]);
+        let (new_client, new_script) =
+            scripted_client([watch_ok("2"), canned(StatusCode::NO_CONTENT)]);
+        let old = watching_control(&old_client, mailbox);
+        let replacement = watching_control(&new_client, mailbox);
+        push_subscribe(Arc::clone(&old), vec![CursorScope::Account])
+            .await
+            .expect("old account subscribes");
+        push_subscribe(Arc::clone(&replacement), vec![CursorScope::Account])
+            .await
+            .expect("replacement subscribes");
+
+        close_watch(&old).await;
+        assert_eq!(stop_paths(&old_script), 0, "shared watch must survive");
+        assert!(!old.has_handles().await, "close still clears local handles");
+
+        close_watch(&replacement).await;
+        assert_eq!(stop_paths(&new_script), 1, "last holder's close stops");
+    }
+
+    /// An instance that holds no watch of its own (a handle persisted across
+    /// a restart) still must not stop a live watch another instance in this
+    /// process created on the mailbox.
+    ///
+    /// Bites on the same early return: `others()` counts the live holder
+    /// even though this actor never claimed.
+    #[tokio::test]
+    async fn an_unclaimed_unsubscribe_defers_to_a_live_holder() {
+        let mailbox = "shared-unclaimed@push.test";
+        let (holder_client, _holder_script) = scripted_client([watch_ok("1")]);
+        let (stale_client, stale_script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
+        let holder = watching_control(&holder_client, mailbox);
+        let stale = watching_control(&stale_client, mailbox);
+        push_subscribe(Arc::clone(&holder), vec![CursorScope::Account])
+            .await
+            .expect("holder subscribes");
+
+        push_unsubscribe(Arc::clone(&stale), encoded_handle())
+            .await
+            .expect("stale handle teardown succeeds locally");
+
+        assert_eq!(stop_paths(&stale_script), 0);
+    }
+
+    /// A stop is decided and sent under the mailbox `exchange` guard, so it
+    /// cannot interleave with another instance's `users.watch`.
+    ///
+    /// Bites on the `exchange.lock()` in `stop_exclusive`: without it the
+    /// stop reaches the wire while the test still holds the guard.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_mailbox_exchange() {
+        let mailbox_name = "shared-exchange@push.test";
+        let (client, script) = scripted_client([canned(StatusCode::NO_CONTENT)]);
+        let control = watching_control(&client, mailbox_name);
+        let mailbox = mailbox_watch(mailbox_name);
+        let exchange = mailbox.exchange.lock().await;
+
+        let mut unsubscribe = push_unsubscribe(Arc::clone(&control), encoded_handle());
+        for _ in 0..8 {
+            assert!(
+                futures::future::poll_immediate(&mut unsubscribe)
+                    .await
+                    .is_none(),
+                "the stop must wait for the exchange guard"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(script.requests().is_empty(), "nothing on the wire yet");
+
+        drop(exchange);
+        unsubscribe
+            .await
+            .expect("stop proceeds once the guard drops");
+        assert_eq!(stop_paths(&script), 1);
     }
 
     // ---- config builder -------------------------------------------------

@@ -194,6 +194,12 @@ pub(crate) enum GmailLocalError {
         cursor_email: String,
         profile_email: String,
     },
+    /// A complete provider response lacked a field it must carry (a created
+    /// event with no id, a raw projection with no `raw`). Raised only after
+    /// the response arrived, so it maps to `Protocol(MissingField)` with
+    /// `AttemptCause(Acknowledged)`. Never raise it before a request is sent:
+    /// a missing LOCAL value is `Internal`, and missing caller input is
+    /// `InvalidRequest`.
     MissingField {
         field: &'static str,
         detail: String,
@@ -226,6 +232,16 @@ pub(crate) enum GmailLocalError {
     /// provider's fault, `Protocol(_)` by [`ProviderFault`], and
     /// `Acknowledged` because the response arrived whole.
     ProviderResponse {
+        fault: ProviderFault,
+        detail: String,
+    },
+    /// A value an EARLIER provider response supplied (the profile's email
+    /// address, say) is unusable for the request now being built, and the
+    /// request is refused before any byte of it is sent. The provider's
+    /// fault, `Protocol(_)` by [`ProviderFault`], but `Unsent`: this
+    /// exchange never reached the wire, so it is neither `Acknowledged` nor
+    /// the caller's `Request(Malformed)`.
+    ProviderValueUnusable {
         fault: ProviderFault,
         detail: String,
     },
@@ -323,6 +339,9 @@ impl Display for GmailLocalError {
                     "provider response broke its contract ({fault:?}): {detail}"
                 )
             }
+            Self::ProviderValueUnusable { fault, detail } => {
+                write!(f, "provider-supplied value unusable ({fault:?}): {detail}")
+            }
             Self::LimitExceededAfterResponse { detail } => {
                 write!(f, "client limit exceeded: {detail}")
             }
@@ -418,6 +437,13 @@ impl Error {
         })
     }
 
+    pub(crate) fn provider_value_unusable(fault: ProviderFault, detail: impl Into<String>) -> Self {
+        Self::Local(GmailLocalError::ProviderValueUnusable {
+            fault,
+            detail: detail.into(),
+        })
+    }
+
     pub(crate) fn limit_exceeded_after_response(detail: impl Into<String>) -> Self {
         Self::Local(GmailLocalError::LimitExceededAfterResponse {
             detail: detail.into(),
@@ -430,6 +456,7 @@ impl Error {
         })
     }
 
+    /// See [`GmailLocalError::MissingField`]: only after a complete response.
     pub(crate) fn missing_field(field: &'static str, detail: impl Into<String>) -> Self {
         Self::Local(GmailLocalError::MissingField {
             field,

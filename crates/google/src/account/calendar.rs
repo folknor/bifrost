@@ -156,9 +156,13 @@ pub(crate) fn create(
             .post(&url, &google_event_from_create(&event))
             .await
             .map_err(|error| collection_error(error, AccountOperation::EventCreate))?;
-        let id = created
-            .id
-            .ok_or_else(|| local_error(AccountOperation::EventCreate, "missing event id".into()))?;
+        let id = created.id.ok_or_else(|| {
+            local_error_with_field(
+                AccountOperation::EventCreate,
+                "id",
+                "created Google event has no id".into(),
+            )
+        })?;
         Ok(EventId(join_event_id(&calendar_id, &id)))
     })
 }
@@ -1137,12 +1141,6 @@ fn event_error(error: crate::Error, operation: AccountOperation, id: String) -> 
     error::into_account_error(error, GmailErrorContext::calendar_event(operation, id))
 }
 
-/// A response Google sent that is missing something it must carry: a
-/// provider fault (`Protocol(MissingField)`).
-fn local_error(operation: AccountOperation, message: String) -> AccountError {
-    local_error_with_field(operation, "calendar", message)
-}
-
 /// The CALLER's input cannot be used - an event id, page cursor or range
 /// bound this crate cannot express, or an RSVP for an account that is not an
 /// attendee. (A cursor that was valid when minted but names a calendar since
@@ -1165,6 +1163,10 @@ fn page_refusal(operation: AccountOperation, refusal: crate::error::PageRefusal)
     )
 }
 
+/// A complete response Google sent lacks `field`, which it must carry (a
+/// created event with no id, a live event with no start or end): a provider
+/// fault, `Protocol(MissingField)` with `AttemptCause(Acknowledged)`. Only for
+/// use after the response arrived.
 fn local_error_with_field(
     operation: AccountOperation,
     field: &'static str,
@@ -2176,6 +2178,59 @@ mod tests {
 
         assert_eq!(patch.transparency.as_deref(), Some("transparent"));
         assert_eq!(patch.status.as_deref(), Some("tentative"));
+    }
+
+    /// A created event with no id names the field Google left out, `id`,
+    /// not the unrelated `calendar` the shared helper once hard-coded.
+    #[tokio::test]
+    async fn a_created_event_without_an_id_names_the_missing_id_field() {
+        let (client, _script) = scripted_client(vec![canned_json(StatusCode::OK, json!({}))]);
+        let error = create(
+            client,
+            EventCreate {
+                calendar_id: CalendarId("primary".to_string()),
+                title: None,
+                description: None,
+                location: None,
+                start: EventTime {
+                    value: "2026-06-02T12:00:00Z".to_string(),
+                    timezone: None,
+                },
+                end: EventTime {
+                    value: "2026-06-02T13:00:00Z".to_string(),
+                    timezone: None,
+                },
+                is_all_day: false,
+                status: EventStatus::Confirmed,
+                availability: EventAvailability::Busy,
+                visibility: EventVisibility::Default,
+                organizer: None,
+                attendees: Vec::new(),
+                recurrence: EventRecurrence::default(),
+            },
+        )
+        .await
+        .expect_err("a created event without an id is refused");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::MissingField
+            )
+        );
+        let support_text = error.support_consented().support_text;
+        assert!(
+            support_text
+                .iter()
+                .any(|text| text.contains("missing field `id`")),
+            "the missing field must be named `id`, got {support_text:?}"
+        );
+        assert!(
+            !support_text
+                .iter()
+                .any(|text| text.contains("missing field `calendar`")),
+            "got {support_text:?}"
+        );
     }
 
     #[test]

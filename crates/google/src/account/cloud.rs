@@ -45,11 +45,14 @@
 //! session for a detached task outliving the account handle, which is a worse
 //! leak in a crate whose shutdown story is the caller dropping the future.
 //!
-//! The chunk loop's 308 Resume Incomplete handling depends on bifrost-net's
-//! 308-without-Location passthrough: a resumable 308 carries a `Range` header
-//! and NO `Location`, and without the passthrough the default redirect-follower
-//! converts it to `MalformedRedirect` and every multi-chunk upload fails on the
-//! first incomplete chunk.
+//! The chunk PUTs and the cancel DELETE go to the pre-authenticated session URI
+//! with redirects disabled per request (`FollowRedirects::Disabled`), so every
+//! 3xx comes back to this module as a plain response and nothing is ever sent
+//! to a `Location`. Drive's 308 Resume Incomplete carries a `Range` header and
+//! NO `Location`, so it reaches the chunk loop as progress; a 3xx that DOES
+//! carry a `Location` is a real redirect the resumable protocol never uses, and
+//! is refused as `Protocol(ContractViolation)` without echoing the `Location`.
+//! A redirected cancel is reported as an abandoned session.
 //!
 //! Byte accounting: these are the only Gmail-crate requests that do NOT go
 //! through `GmailClient::send_recorded`, so they are not enrolled in the
@@ -212,6 +215,13 @@ async fn upload_and_link(
         ));
     }
 
+    // The permission body needs the account's domain for domain-scoped
+    // sharing. Deriving it after the upload refused only once the bytes were
+    // on the drive, leaving an uploaded file that nothing shares; derived
+    // here, an unusable account email costs nothing.
+    let permission =
+        permission_body(meta.scope, account_email).map_err(|e| (e, SessionDisposition::NotOpen))?;
+
     let upload_url = create_upload_session(client, &meta)
         .await
         .map_err(|e| (e, SessionDisposition::NotOpen))?;
@@ -237,7 +247,7 @@ async fn upload_and_link(
     // The session closed itself when the final chunk was accepted; a failure
     // from here leaves an uploaded-but-unlinked file, not a partial session,
     // and the DELETE below would not address it.
-    let share_url = create_sharing_permission(client, &file_id, meta.scope, account_email)
+    let share_url = create_sharing_permission(client, &file_id, &permission)
         .await
         .map_err(|e| (e, SessionDisposition::NotOpen))?;
 
@@ -259,16 +269,21 @@ async fn upload_and_link(
 /// the session is already gone, which is the outcome we wanted. Anything else
 /// is reported as abandoned.
 async fn cancel_upload_session(client: &GmailClient, upload_url: &str) -> SessionDisposition {
+    // Not followed, for the same reason as the chunk PUT: the session URI is
+    // pre-authenticated and admitted only as itself.
     let outcome = client
         .account_net()
         .delete(upload_url)
         .without_bearer_auth()
+        .follow_redirects(bifrost_net::FollowRedirects::Disabled)
         .retry(bifrost_net::RetryPolicy::disabled())
         .timeout(GDRIVE_CANCEL_TIMEOUT)
         .send()
         .await;
 
     match outcome {
+        // An unfollowed 3xx is not Drive accepting the cancel.
+        Ok(response) if response.status().is_redirection() => SessionDisposition::Abandoned,
         Ok(_) => SessionDisposition::Cancelled,
         Err(bifrost_net::Error::Status { code, .. })
             if matches!(code.as_u16(), 404 | 410 | 499) =>
@@ -313,19 +328,32 @@ async fn create_upload_session(
         ));
     }
 
-    response
-        .headers
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        // A success status with no session URI is Drive breaking the
-        // resumable protocol, not the caller asking for something wrong.
-        .ok_or_else(|| {
-            Error::provider_response(
-                ProviderFault::MissingField,
-                "upload session response missing Location header",
-            )
-        })
+    // A success status with no usable session URI is Drive breaking the
+    // resumable protocol, not the caller asking for something wrong. An
+    // absent header is missing; a present one that is not visible-ASCII text,
+    // or not an absolute http(s) URL with a host, did not parse. An empty or
+    // relative value accepted here would send every chunk PUT and the cancel
+    // DELETE to a bogus URL and surface as a transport failure instead.
+    let Some(location) = response.headers.get("location") else {
+        return Err(Error::provider_response(
+            ProviderFault::MissingField,
+            "upload session response missing Location header",
+        ));
+    };
+    let unparseable = |why: &str| {
+        Error::provider_response(
+            ProviderFault::ParseFailed,
+            format!("upload session response Location header {why}"),
+        )
+    };
+    let text = location
+        .to_str()
+        .map_err(|_| unparseable("is not valid text"))?;
+    let url = reqwest::Url::parse(text).map_err(|_| unparseable("is not an absolute URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
+        return Err(unparseable("is not an http(s) URL with a host"));
+    }
+    Ok(text.to_owned())
 }
 
 /// Upload the payload in `chunk_size`-aligned chunks against the pre-authenticated
@@ -384,10 +412,15 @@ async fn upload_file_chunked(
         let chunk = data.slice(offset..end);
         let content_range = format!("bytes {offset}-{}/{total}", end - 1);
 
+        // Redirects are never followed: the session URI is pre-authenticated
+        // and admitted only as itself, so a hop would carry the payload
+        // somewhere nobody admitted. Drive's `308 Resume Incomplete` carries
+        // no `Location` and still arrives here as a plain response.
         let response = client
             .account_net()
             .put(upload_url)
             .without_bearer_auth()
+            .follow_redirects(bifrost_net::FollowRedirects::Disabled)
             .header("Content-Range", &content_range)
             .body(chunk)
             .send()
@@ -395,6 +428,9 @@ async fn upload_file_chunked(
             .map_err(Error::Net)?;
 
         let status = response.status().as_u16();
+        if response.status().is_redirection() && response.headers.contains_key("location") {
+            return Err(redirect_refused("chunk upload", status));
+        }
         match status {
             200 | 201 => {
                 let file: GDriveFileResponse = serde_json::from_slice(response.body.as_ref())
@@ -450,6 +486,18 @@ async fn upload_file_chunked(
     ))
 }
 
+/// A 3xx carrying a `Location` against the pre-authenticated session URI: a
+/// real redirect, which the resumable protocol never uses (its 308 carries no
+/// `Location`). The provider broke the protocol, and the complete response
+/// makes it acknowledged. The `Location` is deliberately not echoed: it is
+/// server-chosen and may itself carry credentials.
+fn redirect_refused(leg: &str, status: u16) -> Error {
+    Error::provider_response(
+        ProviderFault::ContractViolation,
+        format!("resumable {leg} answered {status} with a Location; redirects are not followed"),
+    )
+}
+
 /// Parse the number of bytes Drive has persisted from a 308 `Range: bytes=0-N`
 /// header (`N + 1`). An ABSENT header is Drive's documented way of saying no
 /// bytes have been received, so it reads as zero; the caller's progress check
@@ -473,16 +521,9 @@ fn parse_resume_offset(headers: &reqwest::header::HeaderMap) -> Result<usize, Er
         })
 }
 
-/// Create a sharing permission (two round-trips): POST the permission, then GET
-/// the `webViewLink`. These are header-free JSON calls, so the typed
-/// `post`/`get` helpers are correct here.
-async fn create_sharing_permission(
-    client: &GmailClient,
-    file_id: &str,
-    scope: ShareScope,
-    account_email: &str,
-) -> Result<String, Error> {
-    let body = match scope {
+/// The Drive `permissions` body for `scope`, built before anything is sent.
+fn permission_body(scope: ShareScope, account_email: &str) -> Result<serde_json::Value, Error> {
+    Ok(match scope {
         ShareScope::Anyone => serde_json::json!({
             "role": "reader",
             "type": "anyone",
@@ -495,11 +536,20 @@ async fn create_sharing_permission(
             "type": "domain",
             "domain": account_domain(account_email)?,
         }),
-    };
+    })
+}
 
+/// Create a sharing permission (two round-trips): POST the permission, then GET
+/// the `webViewLink`. These are header-free JSON calls, so the typed
+/// `post`/`get` helpers are correct here.
+async fn create_sharing_permission(
+    client: &GmailClient,
+    file_id: &str,
+    body: &serde_json::Value,
+) -> Result<String, Error> {
     let file_id = bifrost_net::url::encode_path_component(file_id);
     let path = format!("https://www.googleapis.com/drive/v3/files/{file_id}/permissions?fields=id");
-    let _perm: serde::de::IgnoredAny = client.post(&path, &body).await?;
+    let _perm: serde::de::IgnoredAny = client.post(&path, body).await?;
 
     let link_path =
         format!("https://www.googleapis.com/drive/v3/files/{file_id}?fields=webViewLink");
@@ -509,15 +559,20 @@ async fn create_sharing_permission(
 
 /// Derive the account's primary domain from its email address, for the
 /// `type: domain` Drive permission.
+///
+/// The address is the one Gmail's `users.getProfile` returned when the account
+/// opened, not caller input, so an address with no domain is the provider's
+/// value failing to parse (`Protocol(ParseFailed)`), refused before this
+/// exchange sends anything (`Unsent`).
 fn account_domain(account_email: &str) -> Result<String, Error> {
     account_email
         .rsplit_once('@')
         .map(|(_, domain)| domain.to_owned())
         .filter(|d| !d.is_empty())
         .ok_or_else(|| {
-            Error::invalid_request(
-                AccountOperation::HostAttachment,
-                "account email has no domain for Organization-scoped sharing",
+            Error::provider_value_unusable(
+                ProviderFault::ParseFailed,
+                "the profile's account email has no domain for Organization-scoped sharing",
             )
         })
 }
@@ -1007,6 +1062,189 @@ mod tests {
 
         assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::MissingField);
         assert_eq!(script.requests().len(), 1, "only the session POST was sent");
+    }
+
+    /// A `Location` that is present but not visible-ASCII text did not
+    /// parse; it was not missing.
+    #[tokio::test]
+    async fn a_session_location_that_is_not_text_is_a_provider_parse_failure() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "location",
+            reqwest::header::HeaderValue::from_bytes(b"https://upload.test/session/\xff")
+                .expect("obs-text is a legal header value"),
+        );
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: reqwest::StatusCode::OK,
+            headers,
+            body: Bytes::new(),
+        }]);
+        let error = failed_upload(&script).await;
+
+        assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::ParseFailed);
+        assert_eq!(script.requests().len(), 1, "only the session POST was sent");
+    }
+
+    /// A `Location` that is text but not an absolute http(s) URL with a host
+    /// did not parse either. Accepted, it sent every chunk PUT to a bogus URL.
+    #[tokio::test]
+    async fn a_session_location_that_is_not_an_absolute_http_url_is_a_provider_parse_failure() {
+        for location in [
+            "",
+            "/upload/session/abc",
+            "ftp://upload.test/session",
+            "file:///session",
+        ] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "location",
+                reqwest::header::HeaderValue::from_str(location).expect("valid header value"),
+            );
+            let script = ScriptedDispatch::new([
+                Canned::Response {
+                    status: reqwest::StatusCode::OK,
+                    headers,
+                    body: Bytes::new(),
+                },
+                cancel_accepted(),
+                cancel_accepted(),
+            ]);
+            let error = failed_upload(&script).await;
+
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ParseFailed
+                ),
+                "Location {location:?} must be refused as unparseable"
+            );
+            assert_eq!(
+                attempt_state(&error),
+                Some(bifrost_types::TransmissionState::Acknowledged),
+                "a complete response arrived for {location:?}"
+            );
+            assert_eq!(
+                script.requests().len(),
+                1,
+                "only the session POST was sent for {location:?}"
+            );
+        }
+    }
+
+    fn redirect_to_elsewhere(status: reqwest::StatusCode) -> Canned {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "location",
+            "https://elsewhere.test/steal?token=secret"
+                .parse()
+                .expect("valid URL"),
+        );
+        Canned::Response {
+            status,
+            headers,
+            body: Bytes::new(),
+        }
+    }
+
+    /// A chunk PUT answered by a real redirect must not carry the payload to
+    /// the `Location`: the session URI is pre-authenticated and admitted only
+    /// as itself. The redirect is Drive breaking the resumable protocol, and
+    /// the error must not echo the server-chosen `Location`.
+    #[tokio::test]
+    async fn a_redirect_on_a_chunk_put_is_not_followed_and_is_a_contract_violation() {
+        for status in [
+            reqwest::StatusCode::TEMPORARY_REDIRECT,
+            reqwest::StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let script = ScriptedDispatch::new([
+                session_created(),
+                redirect_to_elsewhere(status),
+                cancel_accepted(),
+                cancel_accepted(),
+            ]);
+            let error = failed_upload(&script).await;
+
+            let requests = script.requests();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.host_str() != Some("elsewhere.test")),
+                "a {status} Location must never be requested"
+            );
+            assert_provider_fault(&error, bifrost_types::ProtocolErrorKind::ContractViolation);
+            assert_eq!(requests.len(), 3, "session, the redirected PUT, cancel");
+            assert_eq!(requests[2].method, reqwest::Method::DELETE);
+            assert_eq!(requests[2].url.host_str(), Some("upload.test"));
+            let consented = error.support_consented();
+            assert!(
+                !consented
+                    .support_text
+                    .iter()
+                    .any(|text| text.contains("elsewhere.test") || text.contains("secret")),
+                "the Location must not be echoed, got {:?}",
+                consented.support_text
+            );
+        }
+    }
+
+    /// A cancel DELETE answered by a redirect is not followed, and is not
+    /// Drive accepting the cancel: the session is reported abandoned.
+    #[tokio::test]
+    async fn a_redirect_on_the_cancel_is_not_followed_and_abandons_the_session() {
+        let script = ScriptedDispatch::new([
+            session_created(),
+            network_failure(),
+            redirect_to_elsewhere(reqwest::StatusCode::TEMPORARY_REDIRECT),
+            cancel_accepted(),
+        ]);
+        let error = failed_upload(&script).await;
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3, "session, the failing PUT, one cancel");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.host_str() != Some("elsewhere.test")),
+            "the cancel's Location must never be requested"
+        );
+        assert!(
+            error
+                .support_consented()
+                .support_text
+                .contains(&ABANDONED_SESSION_TEXT),
+            "a redirected cancel did not cancel anything"
+        );
+    }
+
+    /// The account email comes from Gmail's profile, not the caller, so an
+    /// address with no domain is the provider's value failing to parse. It
+    /// must be refused before anything is sent: refused after the upload, it
+    /// left an uploaded file that nothing shares.
+    #[tokio::test]
+    async fn an_account_email_without_a_domain_is_refused_before_the_upload() {
+        let script = ScriptedDispatch::new(Vec::<Canned>::new());
+        let error = run(
+            &scripted_client(&script),
+            "no-domain",
+            Bytes::from_static(b"payload"),
+            CloudUploadMeta::new("report.pdf", "application/pdf", 7, ShareScope::Organization),
+        )
+        .await
+        .expect_err("domain sharing needs a domain");
+
+        assert!(script.requests().is_empty(), "nothing was uploaded");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            ),
+            "the profile's value is the provider's, not the caller's input"
+        );
+        assert_eq!(
+            attempt_state(&error),
+            Some(bifrost_types::TransmissionState::Unsent),
+            "this exchange never reached the wire"
+        );
     }
 
     #[tokio::test]

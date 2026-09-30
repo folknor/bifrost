@@ -1168,22 +1168,36 @@ fn malformed_request(ctx: &GmailErrorContext, detail: String) -> AccountError {
         .expect("valid account error classification")
 }
 
-fn missing_field(ctx: &GmailErrorContext, field: &'static str, detail: String) -> AccountError {
+/// A provider response broke its contract: `Protocol(_)` by `fault`, the
+/// provider's fault, never the caller's (`Request`) or this crate's
+/// (`Internal`). `state` is this exchange's transmission evidence:
+/// `Acknowledged` when the offending response answered this exchange,
+/// `Unsent` when the offending value came from an earlier one and this
+/// exchange was refused before it was sent.
+fn provider_fault(
+    ctx: &GmailErrorContext,
+    fault: ProviderFault,
+    detail: String,
+    state: TransmissionState,
+) -> AccountError {
+    let kind = match fault {
+        ProviderFault::MissingField => ProtocolErrorKind::MissingField,
+        ProviderFault::ParseFailed => ProtocolErrorKind::ParseFailed,
+        ProviderFault::ContractViolation => ProtocolErrorKind::ContractViolation,
+    };
+    let detail = DiagnosticText::support_only(detail);
     let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+        AccountErrorKind::Protocol(kind),
         Cause::Wire(WireCause::MalformedResponse {
             protocol: Protocol::Gmail,
-            detail: Some(DiagnosticText::support_only(format!(
-                "missing field `{field}`: {detail}"
-            ))),
+            detail: Some(detail.clone()),
         }),
     )
+    .push_cause(Cause::Attempt(AttemptCause::new(state)))
     .provider(Provider::Gmail)
     .protocol(Protocol::Gmail)
     .operation(ctx.operation)
-    .text(DiagnosticText::support_only(format!(
-        "missing field `{field}`: {detail}"
-    )));
+    .text(detail);
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
     }
@@ -1263,7 +1277,14 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
         )))
         .try_build()
         .expect("valid account error classification"),
-        GmailLocalError::MissingField { field, detail } => missing_field(ctx, field, detail),
+        // Every producer raises this after a complete response lacked the
+        // field, so the evidence is `Acknowledged` (see the variant's doc).
+        GmailLocalError::MissingField { field, detail } => provider_fault(
+            ctx,
+            ProviderFault::MissingField,
+            format!("missing field `{field}`: {detail}"),
+            TransmissionState::Acknowledged,
+        ),
         GmailLocalError::BlobRangeUnsupported { blob_id } => {
             let mut builder = AccountErrorBuilder::new(
                 AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange),
@@ -1301,32 +1322,12 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
         // A whole response arrived and broke its contract: the provider's
         // fault, never the caller's (`Request`) or this crate's (`Internal`).
         GmailLocalError::ProviderResponse { fault, detail } => {
-            let kind = match fault {
-                ProviderFault::MissingField => ProtocolErrorKind::MissingField,
-                ProviderFault::ParseFailed => ProtocolErrorKind::ParseFailed,
-                ProviderFault::ContractViolation => ProtocolErrorKind::ContractViolation,
-            };
-            let detail = DiagnosticText::support_only(detail);
-            let mut builder = AccountErrorBuilder::new(
-                AccountErrorKind::Protocol(kind),
-                Cause::Wire(WireCause::MalformedResponse {
-                    protocol: Protocol::Gmail,
-                    detail: Some(detail.clone()),
-                }),
-            )
-            .push_cause(Cause::Attempt(AttemptCause::new(
-                TransmissionState::Acknowledged,
-            )))
-            .provider(Provider::Gmail)
-            .protocol(Protocol::Gmail)
-            .operation(ctx.operation)
-            .text(detail);
-            if let Some(scope) = ctx.scope.clone() {
-                builder = builder.scope(scope);
-            }
-            builder
-                .try_build()
-                .expect("valid account error classification")
+            provider_fault(ctx, fault, detail, TransmissionState::Acknowledged)
+        }
+        // The provider supplied the value earlier; this exchange was refused
+        // before it was sent.
+        GmailLocalError::ProviderValueUnusable { fault, detail } => {
+            provider_fault(ctx, fault, detail, TransmissionState::Unsent)
         }
         // The provider handed back a page token it had already served: a
         // complete response carried it, so the evidence is `Acknowledged`.
@@ -2019,6 +2020,49 @@ mod tests {
             })
             .expect("decode error carries an Attempt cause");
         assert_eq!(attempt, bifrost_types::TransmissionState::Acknowledged);
+    }
+
+    /// Every `missing_field` producer raises it after a complete response
+    /// lacked the field, so it must carry `Acknowledged` evidence; before,
+    /// it carried none and read as `Unsent`.
+    #[test]
+    fn missing_field_pushes_acknowledged_attempt_cause() {
+        let acc = into_account_error(
+            Error::missing_field("id", "created Gmail filter has no id"),
+            GmailErrorContext::base(AccountOperation::FilterCreate),
+        );
+        assert_eq!(
+            acc.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::MissingField)
+        );
+        let attempt = acc
+            .chain()
+            .iter()
+            .find_map(|cause| match cause {
+                bifrost_types::Cause::Attempt(a) => Some(a.transmission_state),
+                _ => None,
+            })
+            .expect("a missing field carries an Attempt cause");
+        assert_eq!(attempt, bifrost_types::TransmissionState::Acknowledged);
+    }
+
+    /// A value an earlier response supplied, refused before this exchange
+    /// is sent: the provider's fault, but `Unsent`, not `Acknowledged`.
+    #[test]
+    fn provider_value_unusable_is_a_protocol_fault_with_unsent_evidence() {
+        let acc = into_account_error(
+            Error::provider_value_unusable(ProviderFault::ParseFailed, "profile email"),
+            GmailErrorContext::base(AccountOperation::HostAttachment),
+        );
+        assert_eq!(
+            acc.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
+        );
+        let attempt = acc.chain().iter().find_map(|cause| match cause {
+            bifrost_types::Cause::Attempt(a) => Some(a.transmission_state),
+            _ => None,
+        });
+        assert_eq!(attempt, Some(bifrost_types::TransmissionState::Unsent));
     }
 
     /// drafts route to `NotFound(Draft)`, not `Message`.

@@ -11,15 +11,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, Change, Checkpoint, LabelId, MembershipScope,
-    ObjectChange, ObjectChangeKind, ObjectId, PageBoundary, ScopeChange, ScopeChangeKind,
-    SyncEvent,
+    AccountStream, Batch, Change, Checkpoint, LabelId, MembershipScope, ObjectChange,
+    ObjectChangeKind, ObjectId, PageBoundary, ScopeChange, ScopeChangeKind, SyncEvent,
 };
 use futures::stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
-use crate::error::{Error, GmailLocalError, PageRefusal};
+use crate::error::{Error, GmailLocalError, PageRefusal, ProviderFault};
 use crate::types::{GmailHistoryItem, GmailMessage, GmailProfile};
 
 use super::cursor::{cursor_for_history, decode_gmail_state};
@@ -78,7 +77,10 @@ pub(crate) fn changes_stream_cancellable(
         checked_profile: false,
         shutdown,
     };
+    stream_from_state(state)
+}
 
+fn stream_from_state(state: ChangeState) -> AccountStream<SyncEvent<Change>> {
     Box::pin(stream::unfold(state, |mut state| async move {
         if state.shutdown.is_cancelled() {
             return None;
@@ -178,11 +180,17 @@ pub(crate) fn changes_stream_cancellable(
             }
         }
 
+        // Unreachable by construction: the profile check above sets
+        // `start_history_id` in the same arm that sets `checked_profile`.
+        // Reaching it is this crate's bug, never a provider response
+        // lacking a field: `Internal(InvariantViolated)`.
         let Some(start_history_id) = state.start_history_id.as_deref() else {
             state.finished = true;
             state.emitted_done = true;
             let account_error = account_error::into_account_error(
-                Error::missing_field("start_history_id", "gmail change stream"),
+                Error::internal(
+                    "gmail change stream has no start history id after its profile check",
+                ),
                 account_error::GmailErrorContext::changes(),
             );
             return Some((SyncEvent::Terminated(account_error), state));
@@ -197,13 +205,15 @@ pub(crate) fn changes_stream_cancellable(
                 let bytes_in = state.tally.take();
                 let history_id = match response.history_id.parse::<u64>() {
                     Ok(history_id) => history_id,
+                    // Present but not a number: the field did not parse,
+                    // it was not missing.
                     Err(error) => {
                         state.finished = true;
                         state.emitted_done = true;
                         let account_error = account_error::into_account_error(
-                            Error::missing_field(
-                                "historyId",
-                                format!("gmail history response invalid: {error}"),
+                            Error::provider_response(
+                                ProviderFault::ParseFailed,
+                                format!("gmail history response historyId invalid: {error}"),
                             ),
                             account_error::GmailErrorContext::changes(),
                         );
@@ -397,8 +407,6 @@ fn changes_from_history(history: &[GmailHistoryItem]) -> Vec<Change> {
             }
         }
     }
-    // AccountOperation::SyncChanges is implicit in the changes context.
-    let _ = AccountOperation::SyncChanges;
     changes
 }
 
@@ -613,6 +621,95 @@ mod tests {
         assert!(
             !detail.contains("exceeded"),
             "the budget must not claim a page the repeated-token guard owns: {detail}",
+        );
+    }
+
+    /// A walk past its profile check with no start history id is local
+    /// stream state this crate failed to set, not a provider response
+    /// missing a field: it must blame the implementation, and send nothing.
+    #[tokio::test]
+    async fn a_missing_start_history_id_is_an_invariant_violation() {
+        let script = ScriptedDispatch::new(Vec::<Canned>::new());
+        let net = bifrost_net::test_support::scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            Arc::new(StaticTokenSource::new("token", None)),
+            RetryPolicy::disabled(),
+        );
+        let client = GmailClient::with_account_net("https://gmail.test", net);
+        let (client, tally) = client.metered();
+        let state = ChangeState {
+            client: Arc::new(client),
+            tally,
+            profile: GmailProfile {
+                email_address: "person@example.com".to_string(),
+                history_id: "100".to_string(),
+            },
+            cursor: None,
+            page_token: None,
+            start_history_id: None,
+            walk_history_id: None,
+            seen_page_tokens: HashSet::new(),
+            pages_walked: 0,
+            finished: false,
+            emitted_done: false,
+            checked_profile: true,
+            shutdown: CancellationToken::new(),
+        };
+
+        let events = stream_from_state(state).collect::<Vec<_>>().await;
+
+        let [SyncEvent::Terminated(error)] = events.as_slice() else {
+            panic!("the walk must terminate alone, got {} events", events.len());
+        };
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::InvariantViolated
+            )
+        );
+        assert!(script.requests().is_empty(), "nothing was sent");
+    }
+
+    /// A `historyId` that is present but not a number did not parse; it was
+    /// not missing. The response arrived whole, so the evidence is
+    /// `Acknowledged`.
+    #[tokio::test]
+    async fn an_unparseable_history_id_is_a_provider_parse_failure() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "emailAddress": "person@example.com", "historyId": "100" })),
+            ok_json(json!({ "historyId": "not-a-number", "history": [] })),
+        ]);
+        let profile = GmailProfile {
+            email_address: "person@example.com".to_string(),
+            history_id: "100".to_string(),
+        };
+
+        let events = changes_stream(
+            client,
+            profile,
+            cursor_for_history(100, "person@example.com"),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let [SyncEvent::Terminated(error)] = events.as_slice() else {
+            panic!("the walk must terminate alone, got {} events", events.len());
+        };
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            )
+        );
+        let attempt = error.chain().iter().find_map(|cause| match cause {
+            bifrost_types::Cause::Attempt(attempt) => Some(attempt.transmission_state),
+            _ => None,
+        });
+        assert_eq!(
+            attempt,
+            Some(bifrost_types::TransmissionState::Acknowledged)
         );
     }
 
