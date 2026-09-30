@@ -604,7 +604,20 @@ fn event_from_google(
             ));
         }
     };
+    //
+    // `endTimeUnspecified: true` is the one case where that provided end is
+    // NOT a real end: Google fills `end` with a placeholder (typically the
+    // start) only because its API cannot omit the field. `CalendarEvent.end`
+    // is not optional on the shared surface, so absence cannot be expressed.
+    // The most honest value the existing surface allows is the empty
+    // `EventTime` that `unknown_event_time` already defines as "the provider
+    // did not say" (the tombstone convention above). Forwarding the
+    // placeholder would tell the consumer a fabricated end is real, and
+    // substituting the start would invent a zero-length duration. The
+    // placeholder is discarded even when `end` is absent, so an unspecified
+    // end never trips the missing-end refusal below.
     let end = match event.end.or(cancelled_instance_time).map(event_time) {
+        _ if event.end_time_unspecified == Some(true) => unknown_event_time(),
         Some(end) => end,
         None if is_cancelled => start.clone(),
         None => {
@@ -1213,6 +1226,8 @@ struct GoogleEvent {
     location: Option<String>,
     start: Option<GoogleEventTime>,
     end: Option<GoogleEventTime>,
+    /// True when `end` is a placeholder, not a real end time.
+    end_time_unspecified: Option<bool>,
     status: Option<String>,
     visibility: Option<String>,
     organizer: Option<GoogleOrganizer>,
@@ -1542,6 +1557,77 @@ mod tests {
             !event.is_all_day,
             "a stub with no times says nothing about all-day-ness",
         );
+    }
+
+    /// `endTimeUnspecified: true` means Google's `end` is a placeholder.
+    /// The shared `end` is not optional, so it projects as the empty
+    /// "provider did not say" time rather than the fabricated value. Fails
+    /// if the `end_time_unspecified` arm of the `end` match is removed.
+    #[test]
+    fn an_unspecified_end_does_not_project_the_placeholder() {
+        let event = event_from_google(
+            "primary".to_string(),
+            serde_json::from_value(json!({
+                "id": "open-ended",
+                "status": "confirmed",
+                "start": {"dateTime": "2026-06-02T12:00:00Z", "timeZone": "UTC"},
+                "end": {"dateTime": "2026-06-02T12:00:00Z", "timeZone": "UTC"},
+                "endTimeUnspecified": true
+            }))
+            .expect("fixture deserializes"),
+            AccountOperation::EventGet,
+        )
+        .expect("an unspecified end is a valid event");
+
+        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(event.end.value, "");
+        assert_eq!(event.end.timezone, None);
+        assert!(!event.is_all_day);
+    }
+
+    /// The flag also wins over a missing `end`: a live event whose end is
+    /// unspecified is not a contract break, so it must not hit the
+    /// missing-end refusal. Fails if the arm is moved below the
+    /// `None => Err` arm or the flag stops being deserialized.
+    #[test]
+    fn an_unspecified_end_with_no_end_object_is_not_refused() {
+        let event = event_from_google(
+            "primary".to_string(),
+            serde_json::from_value(json!({
+                "id": "open-ended-bare",
+                "status": "confirmed",
+                "start": {"date": "2026-06-02"},
+                "endTimeUnspecified": true
+            }))
+            .expect("fixture deserializes"),
+            AccountOperation::EventGet,
+        )
+        .expect("no end plus endTimeUnspecified is valid");
+
+        assert_eq!(event.end.value, "");
+        assert!(event.is_all_day);
+    }
+
+    /// `endTimeUnspecified: false` (or absent) leaves a real end alone, so
+    /// the fix cannot swallow ordinary ends. Fails if the arm matches on
+    /// anything but `Some(true)`.
+    #[test]
+    fn a_specified_end_is_still_projected() {
+        let event = event_from_google(
+            "primary".to_string(),
+            serde_json::from_value(json!({
+                "id": "closed",
+                "status": "confirmed",
+                "start": {"dateTime": "2026-06-02T12:00:00Z"},
+                "end": {"dateTime": "2026-06-02T13:00:00Z"},
+                "endTimeUnspecified": false
+            }))
+            .expect("fixture deserializes"),
+            AccountOperation::EventGet,
+        )
+        .expect("valid event");
+
+        assert_eq!(event.end.value, "2026-06-02T13:00:00Z");
     }
 
     /// The tolerance is gated on the cancelled status, not on the mere

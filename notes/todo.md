@@ -121,31 +121,39 @@ now; the owner accepts it, or it is reverted as its own change.
 Found while recovering and auditing the laterals work; none is ruled. Verify
 against the code before working any of them.
 
-- **google: `endTimeUnspecified` is not modelled**, so Google's placeholder end
-  is projected as real.
-- **sync: the reopen attempt budget scales with subscription count.** A dead
-  old side marks only the first failing record per aborted attempt, so N
-  desired records whose teardown fails need N+1 attempts; with
-  `REOPEN_RETRY_BUDGET` at three, three such records pause the account, and
-  each aborted attempt creates and unwinds subscriptions on the replacement.
-  Records whose old teardown already succeeded before an abort are torn down
-  again on the next attempt, which a provider that errors on an unknown handle
-  would turn into another abort.
-- **graph: `push_subscribe` is not cancellation-safe.** A future dropped
-  mid-create leaves earlier creates live on the server, one dropped inside
-  `roll_back_created` skips the remaining DELETEs, one dropped between the
-  group insert and the return registers a group whose handle nobody received,
-  and a create that failed after Graph made it is not rolled back.
-- **caldav: a patch always splices into the first VEVENT**, so a body whose
-  first VEVENT is an override, or a target that is itself an override, is
-  patched in the wrong place. Pre-existing. `splice_lines` also pairs
-  caldata's `LineReader` numbers with `str::lines` by index, unverified for a
-  bare CR line break.
-- **imap: pipelined and single-command literal waits disagree.** An early
-  tagged OK before a literal continuation is a non-fatal `ProtocolMissing`
-  outside a pipeline and a fatal `Protocol` inside one; nothing says whether
-  that is intended. No test covers the new own-tag and foreign-tag arms of
-  `wait_for_continuation`.
+- **google: an event with an unspecified end projects an empty `end`.** Landed
+  2026-09-30: `CalendarEvent.end` cannot be absent, so `endTimeUnspecified`
+  projects the empty `EventTime` tombstones already use, rather than Google's
+  placeholder. Consumers that assumed only tombstones carry an empty end now
+  see it on live events; the honest shape is an optional `end` in
+  `bifrost-types`, a published-surface ruling. Related: an empty `end` echoed
+  back in `EventPatch` or `EventCreate` is sent to Google as `dateTime: ""`,
+  with no guard.
+- **sync: `reattach_account` dropped mid-way leaks replacement
+  subscriptions.** A future dropped after replacement subscriptions are created
+  and before the swap or `unwind_replacement_subscriptions` leaves them live
+  and unregistered; there is no drop guard. Pre-existing. After an aborted
+  reopen that tore some old handles down, those subscriptions deliver nothing
+  until the retry recreates them on the replacement.
+- **graph: the renewal worker's `replace_gone_subscription` is the same
+  shape** as the cancellation hole fixed in `push_subscribe`: it creates a
+  subscription inside a task that `close()` aborts and the retire path
+  cancels, so an abort mid-create can strand a server subscription. The EWS
+  push arm's drop behaviour was not audited beyond its creating nothing
+  server-side before registration.
+- **caldav: an override-only resource shows only its first override** to
+  `event_get` and `event_update`, while range and search listings see every
+  override. Also unexamined: caldata's `LineReader` keeps a bare CR inside a
+  value, and this crate's text and parameter handling may not expect one.
+- **imap: an early tagged reply after a LATER literal of the same command.**
+  The early-OK and `NO`/`BAD` paths are safe for a command's first literal,
+  since the only bytes on the wire are its first line. For MULTIAPPEND or any
+  command with several literals, the text between literals is written before
+  the reply is read. A conforming server can only answer at a literal marker,
+  which that text ends in, so the wire stays in sync; a server answering
+  straight after a literal body would desync it while the error reads
+  non-fatal. Low risk; making any reply after a granted literal fatal would
+  close it.
 
 ## Blocked on an unvalidated consumer contract
 
