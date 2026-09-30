@@ -268,10 +268,7 @@ async fn run_folder_get(
         }
         Err(err) => return Err(err.into()),
     };
-    let uidvalidity = selected
-        .mailbox
-        .uid_validity
-        .ok_or_else(|| crate::Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()))?;
+    let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
     // `pending` is drained only now: a checkout or SELECT failure above
     // must leave every id in the caller's unresolved set.
     let (valid, stale): (Vec<_>, Vec<_>) = pending
@@ -482,8 +479,9 @@ fn fetch_to_hydrated(
 /// Fold a later FETCH response for the same UID into the one already held.
 /// Data items only ever fill gaps: a second response may add `FLAGS` or a
 /// section the first lacked, but it must never blank out data the first
-/// response carried.
-fn merge_fetch_response(existing: &mut FetchResponse, later: FetchResponse) {
+/// response carried. Shared with `pim::hydrate_decoded`, which faces the
+/// same split responses.
+pub(super) fn merge_fetch_response(existing: &mut FetchResponse, later: FetchResponse) {
     if later.flags.is_some() {
         existing.flags = later.flags;
     }
@@ -505,6 +503,25 @@ fn merge_fetch_response(existing: &mut FetchResponse, later: FetchResponse) {
     if existing.save_date.is_none() {
         existing.save_date = later.save_date;
     }
+    if existing.preview.is_none() {
+        existing.preview = later.preview;
+    }
+    if existing.email_id.is_none() {
+        existing.email_id = later.email_id;
+    }
+    if existing.thread_id.is_none() {
+        existing.thread_id = later.thread_id;
+    }
+    if existing.gmail_msg_id.is_none() {
+        existing.gmail_msg_id = later.gmail_msg_id;
+    }
+    if existing.gmail_thread_id.is_none() {
+        existing.gmail_thread_id = later.gmail_thread_id;
+    }
+    // Labels are mutable state like FLAGS: the later report is the fresher.
+    if later.gmail_labels.is_some() {
+        existing.gmail_labels = later.gmail_labels;
+    }
     for section in later.body_sections {
         if existing
             .body_sections
@@ -517,6 +534,16 @@ fn merge_fetch_response(existing: &mut FetchResponse, later: FetchResponse) {
             .body_sections
             .retain(|held| !held.section.eq_ignore_ascii_case(&section.section));
         existing.body_sections.push(section);
+    }
+    for (section, size) in later.binary_sizes {
+        if existing
+            .binary_sizes
+            .iter()
+            .any(|(held, _)| *held == section)
+        {
+            continue;
+        }
+        existing.binary_sizes.push((section, size));
     }
     for section in later.binary_sections {
         if existing
@@ -850,6 +877,40 @@ mod tests {
             ),
             other => panic!("expected RawMime, got {other:?}"),
         }
+    }
+
+    // Every data item fills a gap the earlier response left, not only the
+    // body-shaped ones: `pim::fetch_to_message` reads THREADID and the Gmail
+    // thread id, and a split response used to lose them. BINARY.SIZE entries
+    // add per section without replacing one already held; Gmail labels are
+    // mutable state like FLAGS, so the later report wins.
+    #[test]
+    fn merging_fetches_fills_every_optional_item_and_binary_size() {
+        let mut first = FetchResponse {
+            uid: Some(7),
+            binary_sizes: vec![(vec![1], 10)],
+            gmail_labels: Some(vec!["old".to_owned()]),
+            ..Default::default()
+        };
+        merge_fetch_response(
+            &mut first,
+            FetchResponse {
+                uid: Some(7),
+                thread_id: Some("T1".to_owned()),
+                email_id: Some("E1".to_owned()),
+                gmail_thread_id: Some(42),
+                preview: Some("hi".to_owned()),
+                binary_sizes: vec![(vec![1], 99), (vec![2], 20)],
+                gmail_labels: Some(vec!["new".to_owned()]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(first.thread_id.as_deref(), Some("T1"));
+        assert_eq!(first.email_id.as_deref(), Some("E1"));
+        assert_eq!(first.gmail_thread_id, Some(42));
+        assert_eq!(first.preview.as_deref(), Some("hi"));
+        assert_eq!(first.binary_sizes, vec![(vec![1], 10), (vec![2], 20)]);
+        assert_eq!(first.gmail_labels, Some(vec!["new".to_owned()]));
     }
 
     // A trailing partial response may add a section the first lacked, but

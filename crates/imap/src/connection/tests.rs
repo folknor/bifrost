@@ -705,6 +705,76 @@ async fn select_no_response_leaves_the_session_authenticated() {
     assert!(conn.is_alive(), "a tagged NO leaves the wire reusable");
 }
 
+/// RFC 3501 Section 6.3.1: a SELECT that completes with a tagged OK but
+/// without the mandatory FLAGS response is the server's omission, reported as
+/// `ProtocolMissing`. The exchange is over and the framing intact, so the
+/// connection must stay usable: the next command on it round-trips.
+#[tokio::test]
+async fn a_missing_mandatory_response_leaves_the_connection_usable() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT"), "unexpected command: {select}");
+        let tag = tag_of(&select).to_owned();
+        respond(
+            &mut server,
+            &format!(
+                "* 3 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 4242] UIDs valid\r\n\
+                 {tag} OK [READ-WRITE] SELECT completed\r\n"
+            ),
+        )
+        .await;
+        let noop = read_line(&mut server).await;
+        assert!(noop.contains("NOOP"), "unexpected command: {noop}");
+        let tag = tag_of(&noop).to_owned();
+        respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+        server
+    });
+
+    let err = conn
+        .select("INBOX", Duration::from_secs(5))
+        .await
+        .expect_err("a SELECT without FLAGS must fail");
+    assert!(matches!(err, Error::ProtocolMissing(_)), "got {err:?}");
+    assert!(
+        conn.is_alive(),
+        "an omission after the tagged OK leaves the wire synchronized"
+    );
+    conn.noop(Duration::from_secs(5))
+        .await
+        .expect("the connection must still carry the next command");
+    let _server = script.await.unwrap();
+}
+
+/// RFC 3501 Section 6.1.3 owes a BYE only ahead of a tagged OK. A server that
+/// refuses LOGOUT has not started closing, so the caller must see the
+/// refusal itself, not a "missing BYE" protocol error that blames the server
+/// for an omission it never made.
+#[tokio::test]
+async fn a_refused_logout_reports_the_refusal_not_a_missing_bye() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+
+    let script = tokio::spawn(async move {
+        let logout = read_line(&mut server).await;
+        assert!(logout.contains("LOGOUT"), "unexpected command: {logout}");
+        let tag = tag_of(&logout).to_owned();
+        respond(&mut server, &format!("{tag} NO not now\r\n")).await;
+        server
+    });
+
+    let err = conn.logout().await.expect_err("a refused LOGOUT fails");
+    assert!(
+        matches!(err, Error::No { ref text, .. } if text.contains("not now")),
+        "got {err:?}"
+    );
+    let _server = script.await.unwrap();
+}
+
 #[tokio::test]
 async fn uid_fetch_round_trip_with_a_literal_body() {
     let (conn, mut server) =
@@ -857,6 +927,14 @@ async fn bye_mid_command_preserves_the_response_code_without_waiting_for_close()
             }
         ),
         "BYE must preserve its structured response code: {err:?}"
+    );
+    // The NOOP was on the wire and the BYE did not complete it, so its
+    // outcome is unknown: InFlight, not the missing evidence that reads as
+    // Unsent.
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::InFlight),
+        "{err:?}"
     );
     assert!(
         !conn.is_alive(),
@@ -1696,6 +1774,243 @@ async fn idle_surfaces_a_server_terminated_session_without_done() {
         "got {event:?}"
     );
     let _server = script.await.unwrap();
+}
+
+/// The driver owned the IDLE command when it died - it had already written
+/// it - so the error must say `InFlight`. The event channel and the result
+/// channel close together; IDLE's wait reads the event channel first, and that
+/// arm used to mint a phase-less `DriverGone`, which reads as `Unsent`.
+#[tokio::test]
+async fn a_driver_death_mid_idle_is_in_flight() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+
+    let script = tokio::spawn(async move {
+        let idle = read_line(&mut server).await;
+        assert!(idle.ends_with(" IDLE\r\n"), "expected IDLE, got {idle:?}");
+        respond(&mut server, "+ idling\r\n").await;
+        let _ = entered_tx.send(());
+        server
+    });
+
+    let (result, ()) = tokio::join!(
+        conn.idle(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            tokio_util::sync::CancellationToken::new(),
+        ),
+        async {
+            entered_rx.await.unwrap();
+            conn.terminate().await;
+        }
+    );
+    let err = result.expect_err("a dead driver must fail the IDLE");
+    assert!(
+        matches!(err, Error::DriverGone { .. } | Error::DriverPanicked { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::InFlight),
+        "the IDLE command was on the wire: {err:?}"
+    );
+    let _server = script.await.unwrap();
+}
+
+/// Wait until the driver task has fully exited, without polling anything
+/// else of the connection. Once it has, IDLE's event channel and its result
+/// channel are BOTH ready, so the next poll of an `idle()` future takes the
+/// event-channel arm deterministically (it is polled first).
+async fn wait_for_driver_exit(conn: &ImapConnection) {
+    loop {
+        let finished = conn
+            .driver_handle
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished);
+        if finished {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A BYE mid-IDLE ends the driver after it has answered the IDLE command
+/// with the BYE. IDLE's event-channel arm is polled first and used to replace
+/// that answer with a generic `DriverGone`, losing the server's text and code.
+#[tokio::test]
+async fn a_bye_mid_idle_surfaces_as_the_bye_not_as_driver_gone() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+
+    let script = tokio::spawn(async move {
+        let _idle = read_line(&mut server).await;
+        respond(&mut server, "+ idling\r\n* BYE server shutting down\r\n").await;
+        let _ = sent_tx.send(());
+        server
+    });
+
+    let mut idle = std::pin::pin!(conn.idle(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    assert!(
+        futures::FutureExt::now_or_never(&mut idle).is_none(),
+        "IDLE is waiting"
+    );
+    sent_rx.await.unwrap();
+    wait_for_driver_exit(&conn).await;
+
+    let err = idle.await.expect_err("a BYE ends the IDLE");
+    assert!(
+        matches!(err, Error::Bye { ref text, .. } if text.contains("shutting down")),
+        "got {err:?}"
+    );
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::InFlight),
+        "the IDLE was on the wire: {err:?}"
+    );
+    let _server = script.await.unwrap();
+}
+
+/// RFC 2177 Section 3: the server grants IDLE with `+`. A tagged OK for IDLE
+/// with no `+` first is an omission by a server that finished the exchange:
+/// the error must say so in IDLE's terms (it used to be worded as a literal
+/// continuation fault) and, the framing being intact, must not retire the
+/// connection.
+#[tokio::test]
+async fn an_idle_completed_without_its_continuation_is_an_idle_omission() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+
+    let script = tokio::spawn(async move {
+        let idle = read_line(&mut server).await;
+        let tag = tag_of(&idle).to_owned();
+        respond(&mut server, &format!("{tag} OK IDLE done already\r\n")).await;
+        let noop = read_line(&mut server).await;
+        assert!(noop.contains("NOOP"), "unexpected command: {noop}");
+        let tag = tag_of(&noop).to_owned();
+        respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+        server
+    });
+
+    let err = conn
+        .idle(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("IDLE without its continuation is a server omission");
+    assert!(
+        matches!(err, Error::ProtocolMissing(ref m) if m.contains("IDLE") && !m.contains("literal")),
+        "got {err:?}"
+    );
+    assert!(
+        conn.is_alive(),
+        "the exchange completed; the wire is in sync"
+    );
+    conn.noop(Duration::from_secs(5))
+        .await
+        .expect("the connection still carries the next command");
+    let _server = script.await.unwrap();
+}
+
+/// The IDLE command is on the wire once the server grants it, so an EOF in
+/// the IDLE read loop is `InFlight`. It used to carry no phase and read as
+/// `Unsent`.
+#[tokio::test]
+async fn an_eof_mid_idle_is_in_flight() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+
+    let script = tokio::spawn(async move {
+        let _idle = read_line(&mut server).await;
+        respond(&mut server, "+ idling\r\n").await;
+        drop(server);
+        let _ = sent_tx.send(());
+    });
+
+    let mut idle = std::pin::pin!(conn.idle(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    assert!(
+        futures::FutureExt::now_or_never(&mut idle).is_none(),
+        "IDLE is waiting"
+    );
+    sent_rx.await.unwrap();
+    wait_for_driver_exit(&conn).await;
+
+    let err = idle.await.expect_err("an EOF ends the IDLE");
+    assert!(
+        matches!(err, Error::Closed { .. } | Error::Io { .. }),
+        "the driver's own error, not a generic DriverGone: {err:?}"
+    );
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::InFlight),
+        "{err:?}"
+    );
+    script.await.unwrap();
+}
+
+/// An EOF while draining after DONE is `InFlight` too: the IDLE command and
+/// the DONE are both on the wire.
+#[tokio::test]
+async fn an_eof_while_draining_after_done_is_in_flight() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+
+    let script = tokio::spawn(async move {
+        let _idle = read_line(&mut server).await;
+        respond(&mut server, "+ idling\r\n* 3 EXISTS\r\n").await;
+        assert_eq!(read_line(&mut server).await, "DONE\r\n");
+        // No tagged completion: the peer goes away instead.
+        drop(server);
+    });
+
+    let err = conn
+        .idle(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("an EOF during the DONE drain fails the IDLE");
+    assert!(
+        matches!(err, Error::Closed { .. } | Error::Io { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::InFlight),
+        "{err:?}"
+    );
+    script.await.unwrap();
+}
+
+/// `next_event` submits nothing, so a dead driver is `Unsent` from its point
+/// of view - stated, not left to the missing-evidence default.
+#[tokio::test]
+async fn next_event_on_a_dead_driver_carries_a_phase() {
+    let dead = crate::connection::test_support::detached(SessionState::Selected, Vec::new(), &[]);
+    let err = dead
+        .next_event(Duration::from_secs(5))
+        .await
+        .expect_err("a closed event channel is a dead driver");
+    assert!(matches!(err, Error::DriverGone { .. }), "got {err:?}");
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent)
+    );
 }
 
 // A peer whose TCP is alive but which never answers the tagged OK for IDLE

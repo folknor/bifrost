@@ -186,6 +186,9 @@ fn literal_form(
         return Ok(LiteralForm::Classic);
     }
     // RFC 3516 Section 4.4: NUL octets need literal8, which needs BINARY.
+    // Active IMAP4rev2 does not stand in for it: RFC 9051 Appendix B folds
+    // in only the FETCH side of BINARY, not its APPEND extension, and the
+    // capability authority answers BINARY accordingly (advertised only).
     if opts.has_capability(&Capability::Binary) {
         Ok(LiteralForm::Literal8)
     } else {

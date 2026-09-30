@@ -273,3 +273,85 @@ async fn sort_and_thread_inherit_the_search_criteria_gates() {
         Err(Error::MissingCapability(_))
     ));
 }
+
+// ---------------------------------------------------------------------------
+// UID MOVE fallback transcript (RFC 6851 Section 3.3)
+// ---------------------------------------------------------------------------
+
+/// Without MOVE, UID MOVE falls back to UID COPY + UID STORE + UID EXPUNGE.
+/// The final UID EXPUNGE's tagged code (HIGHESTMODSEQ, as a QRESYNC server
+/// sends) is the counterpart of the native MOVE's tagged code and lands in
+/// `MoveResult::code`; the COPY's COPYUID is not lost, it is in `copy_uid`.
+///
+/// Against the old fallback `code` was the COPY's COPYUID and the
+/// EXPUNGE's HIGHESTMODSEQ was discarded.
+#[tokio::test]
+async fn uid_move_fallback_carries_the_expunge_tagged_code_and_the_copyuid() {
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, tag_of,
+    };
+    use crate::types::response::ResponseCode;
+    use crate::types::{ExpungeResult, UidRange};
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT"), "unexpected command: {select}");
+        let tag = tag_of(&select).to_owned();
+        respond(
+            &mut server,
+            &format!(
+                "* 3 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Seen \\Deleted)\r\n\
+                 * OK [UIDVALIDITY 7] ok\r\n{tag} OK [READ-WRITE] done\r\n"
+            ),
+        )
+        .await;
+
+        let copy = read_line(&mut server).await;
+        assert!(copy.contains("UID COPY"), "unexpected command: {copy}");
+        let tag = tag_of(&copy).to_owned();
+        respond(
+            &mut server,
+            &format!("{tag} OK [COPYUID 7 4 20] copied\r\n"),
+        )
+        .await;
+
+        let store = read_line(&mut server).await;
+        assert!(store.contains("UID STORE"), "unexpected command: {store}");
+        let tag = tag_of(&store).to_owned();
+        respond(&mut server, &format!("{tag} OK stored\r\n")).await;
+
+        let expunge = read_line(&mut server).await;
+        assert!(
+            expunge.contains("UID EXPUNGE"),
+            "unexpected command: {expunge}"
+        );
+        let tag = tag_of(&expunge).to_owned();
+        respond(
+            &mut server,
+            &format!("* 1 EXPUNGE\r\n{tag} OK [HIGHESTMODSEQ 99] expunged\r\n"),
+        )
+        .await;
+        server
+    });
+
+    let timeout = Duration::from_secs(5);
+    conn.select("INBOX", timeout).await.unwrap();
+    let result = conn
+        .uid_move_messages(&set("4"), "Archive", timeout)
+        .await
+        .expect("the fallback move succeeds");
+    let _server = script.await.unwrap();
+
+    assert_eq!(result.code, Some(ResponseCode::HighestModSeq(99)));
+    assert_eq!(
+        result.copy_uid,
+        Some(ResponseCode::CopyUid {
+            uid_validity: 7,
+            source_uids: vec![UidRange::single(4)],
+            dest_uids: vec![UidRange::single(20)],
+        })
+    );
+    assert_eq!(result.expunged, ExpungeResult::Expunged(vec![1]));
+}

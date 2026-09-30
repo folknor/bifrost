@@ -543,9 +543,10 @@ fn a_client_side_failure_is_internal_not_a_provider_fault() {
 }
 
 /// An omission by the server is `Protocol(MissingField)`, a wrong response is
-/// `Protocol(ContractViolation)`, and the two share their recovery class,
-/// their cause shape and their connection fatality: the refinement is for
-/// diagnostics only.
+/// `Protocol(ContractViolation)`, and the two share their recovery class and
+/// their cause shape. They differ in connection fatality: an omission is
+/// judged after the tagged OK, with the framing intact, so it does not retire
+/// the connection, while a wrong response may have desynchronised it.
 #[test]
 fn a_missing_mandatory_response_is_missing_field_with_the_same_recovery() {
     let missing = into_account_error(
@@ -575,7 +576,7 @@ fn a_missing_mandatory_response_is_missing_field_with_the_same_recovery() {
             .iter()
             .any(|cause| matches!(cause, Cause::Wire(WireCause::MalformedResponse { .. })))
     );
-    assert!(Error::ProtocolMissing("x".into()).is_connection_fatal());
+    assert!(!Error::ProtocolMissing("x".into()).is_connection_fatal());
 }
 
 /// A mid-exchange invariant failure retires the connection; the ordinary

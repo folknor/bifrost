@@ -185,11 +185,23 @@ impl ServerProfile {
 /// LITERAL+ (RFC 7888 Section 4). Listing LITERAL+ here would tell every
 /// `supports` caller that a pure rev2 server takes a `{N+}` literal of any
 /// size, which such a server is entitled to reject.
+///
+/// OBJECTID (RFC 8474) and SAVEDATE (RFC 8514) are absent too: RFC 9051
+/// defines none of their FETCH items, SEARCH keys, STATUS items or response
+/// codes, so a rev2 server that does not advertise them owes none of it.
+///
+/// So is BINARY, because rev2 folds in only HALF of it. RFC 9051 Appendix B:
+/// IMAP4rev2 includes the BINARY FETCH items (`BINARY`, `BINARY.PEEK`,
+/// `BINARY.SIZE`) but not RFC 3516's extension to APPEND, and a server with
+/// full RFC 3516 support must still advertise BINARY. The capability token
+/// stands for the whole extension, APPEND side included, so answering it from
+/// rev2 would let an APPEND carry a NUL-bearing `literal8` body a rev2 server
+/// is entitled to reject. The FETCH half has its own question,
+/// [`binary_fetch_usable`].
 fn rev2_baseline_includes(capability: &Capability) -> bool {
     matches!(
         capability,
-        Capability::Binary
-            | Capability::Enable
+        Capability::Enable
             | Capability::Esearch
             | Capability::Idle
             | Capability::ListExtended
@@ -197,9 +209,7 @@ fn rev2_baseline_includes(capability: &Capability) -> bool {
             | Capability::LiteralMinus
             | Capability::Move
             | Capability::Namespace
-            | Capability::ObjectId
             | Capability::SaslIr
-            | Capability::SaveDate
             | Capability::SearchRes
             | Capability::SpecialUse
             | Capability::StatusDeleted
@@ -237,6 +247,18 @@ pub(crate) fn supports(
         return true;
     }
     rev2_baseline_includes(capability) && imap4rev2_active(capabilities, enabled)
+}
+
+/// Whether the BINARY FETCH items (`BINARY[...]`, `BINARY.PEEK[...]`,
+/// `BINARY.SIZE[...]`, RFC 3516 Section 4.2) may be requested: the server
+/// advertises BINARY, or IMAP4rev2 is active, whose base protocol carries
+/// those items (RFC 9051 Section 6.4.5, Appendix B).
+///
+/// Deliberately a separate question from `supports(Binary)`, which stays
+/// advertised-only on rev2 because rev2 did not fold in RFC 3516's APPEND
+/// side (see [`rev2_baseline_includes`]).
+pub(crate) fn binary_fetch_usable(capabilities: &[Capability], enabled: &[String]) -> bool {
+    supports(capabilities, enabled, &Capability::Binary) || imap4rev2_active(capabilities, enabled)
 }
 
 /// Whether IMAP4rev2 behaviour is active: the single authority for the RFC 9051
@@ -345,8 +367,7 @@ pub(crate) mod capability_matrix {
     /// as an exhaustive match, deliberately independent of the production list.
     fn in_rev2_baseline(capability: &Capability) -> bool {
         match capability {
-            Capability::Binary
-            | Capability::Enable
+            Capability::Enable
             | Capability::Esearch
             | Capability::Idle
             | Capability::ListExtended
@@ -354,9 +375,7 @@ pub(crate) mod capability_matrix {
             | Capability::LiteralMinus
             | Capability::Move
             | Capability::Namespace
-            | Capability::ObjectId
             | Capability::SaslIr
-            | Capability::SaveDate
             | Capability::SearchRes
             | Capability::SpecialUse
             | Capability::StatusDeleted
@@ -365,6 +384,12 @@ pub(crate) mod capability_matrix {
             | Capability::Unselect => true,
             // RFC 9051 Appendix E folds in LITERAL-, not LITERAL+.
             Capability::LiteralPlus
+            // RFC 9051 Appendix B: only the FETCH side of BINARY is base
+            // rev2, not its APPEND extension, so the token is not implied.
+            | Capability::Binary
+            // Nothing of RFC 8474 or RFC 8514 is in RFC 9051.
+            | Capability::ObjectId
+            | Capability::SaveDate
             | Capability::Imap4Rev1
             | Capability::Imap4Rev2
             | Capability::Acl

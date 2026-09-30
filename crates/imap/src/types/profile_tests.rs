@@ -180,7 +180,6 @@ fn dual_rev_server_requires_enable_for_rev2_profile() {
 fn imap4rev2_profile_implies_base_extensions() {
     let profile = ServerProfile::new(vec![Capability::Imap4Rev2], vec![]);
     let implied = [
-        Capability::Binary,
         Capability::Enable,
         Capability::Esearch,
         Capability::Idle,
@@ -189,9 +188,7 @@ fn imap4rev2_profile_implies_base_extensions() {
         Capability::LiteralMinus,
         Capability::Move,
         Capability::Namespace,
-        Capability::ObjectId,
         Capability::SaslIr,
-        Capability::SaveDate,
         Capability::SearchRes,
         Capability::SpecialUse,
         Capability::StatusDeleted,
@@ -221,6 +218,58 @@ fn imap4rev2_profile_does_not_imply_literal_plus() {
     let advertised =
         ServerProfile::new(vec![Capability::Imap4Rev2, Capability::LiteralPlus], vec![]);
     assert!(advertised.supports(Capability::LiteralPlus));
+}
+
+/// RFC 9051 defines nothing from OBJECTID (RFC 8474) or SAVEDATE (RFC 8514),
+/// and folds in only the FETCH side of BINARY (Appendix B: not RFC 3516's
+/// APPEND extension). A pure rev2 server that does not advertise these tokens
+/// has not promised them; one that does, has.
+///
+/// Against the old baseline list, which contained all three, every
+/// "not implied" assertion fails.
+#[test]
+fn imap4rev2_does_not_imply_objectid_savedate_or_the_binary_token() {
+    let pure_rev2 = ServerProfile::new(vec![Capability::Imap4Rev2], vec![]);
+    for capability in [
+        Capability::ObjectId,
+        Capability::SaveDate,
+        Capability::Binary,
+    ] {
+        assert!(
+            !pure_rev2.supports(capability.clone()),
+            "{capability:?} must not be implied by rev2"
+        );
+        assert!(
+            !supports(&[Capability::Imap4Rev2], &[], &capability),
+            "{capability:?} must not be implied by rev2"
+        );
+        let advertised =
+            ServerProfile::new(vec![Capability::Imap4Rev2, capability.clone()], vec![]);
+        assert!(advertised.supports(capability));
+    }
+}
+
+/// The FETCH half of BINARY is base rev2 (RFC 9051 Section 6.4.5, Appendix
+/// B) even though the token is not implied: the question is asked separately.
+#[test]
+fn binary_fetch_items_are_usable_under_rev2_or_an_advertised_binary() {
+    use capability_matrix::connection_states;
+
+    for (caps, enabled) in connection_states() {
+        assert_eq!(
+            binary_fetch_usable(&caps, &enabled),
+            imap4rev2_active(&caps, &enabled),
+            "unadvertised BINARY: FETCH side follows active rev2 \
+             (capabilities={caps:?}, enabled={enabled:?})"
+        );
+        let mut advertised = caps.clone();
+        advertised.push(Capability::Binary);
+        assert!(
+            binary_fetch_usable(&advertised, &enabled),
+            "an advertised BINARY always admits the FETCH items \
+             (capabilities={advertised:?})"
+        );
+    }
 }
 
 #[test]

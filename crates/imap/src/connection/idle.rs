@@ -126,9 +126,33 @@ impl ImapConnection {
                             }
                         }
                         Ok(None) => break IdleEvent::Timeout,
-                        Err(Error::DriverGone { .. }) => {
+                        Err(
+                            driver_death @ (Error::DriverGone { .. }
+                            | Error::DriverPanicked { .. }),
+                        ) => {
                             // Driver exited  -  don't try to send DONE.
-                            return Err(Error::driver_gone());
+                            //
+                            // The driver answers the IDLE command BEFORE it
+                            // exits whenever it can, so by the time the event
+                            // channel reads closed the real outcome (a BYE,
+                            // an I/O failure) is usually already waiting in
+                            // `result_rx`. This arm is polled first, so
+                            // without this look it replaced that outcome with
+                            // a generic `DriverGone`. `try_recv`, not an
+                            // await: nothing guarantees the answer exists.
+                            return match result_rx.try_recv() {
+                                Ok(Ok(_)) => Ok(IdleEvent::ServerTerminated),
+                                Ok(Err(e)) => Err(e),
+                                // No answer: the driver owned the IDLE
+                                // command when it died (the send above
+                                // succeeded), so it may have been written:
+                                // `InFlight`, as on the P3 arm. `next_event`
+                                // stamps `Unsent` because IT sent nothing;
+                                // that is not this command's phase.
+                                Err(_) => {
+                                    Err(driver_death.with_attempt(TransmissionState::InFlight))
+                                }
+                            };
                         }
                         Err(e) => return Err(e),
                     }

@@ -307,10 +307,7 @@ async fn open_folder_for_mutation(
     let selected = account
         .select_folder(&mut conn, folder, cursor.as_ref(), false)
         .await?;
-    let uidvalidity = selected
-        .mailbox
-        .uid_validity
-        .ok_or_else(|| crate::Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()))?;
+    let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
     for range in selected.mailbox.vanished.clone() {
         let uids = super::folder_registry::expand_range(range);
         account.folders.clear_modseqs(folder, uidvalidity, &uids);

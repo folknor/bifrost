@@ -90,7 +90,11 @@ pub enum Capability {
     Thread(String),
     /// `STATUS=SIZE` (RFC 8438).
     StatusSize,
-    /// `STATUS=DELETED` (RFC 9051 Section 6.3.11).
+    /// `STATUS=DELETED`, a capability token no RFC defines. RFC 9051 Section 6.3.11 defines the STATUS data item
+    /// `DELETED` as part of base IMAP4rev2, not a capability; the only rev1
+    /// route to that item is `QUOTA=RES-MESSAGE` (RFC 9208 Section 4.1.4).
+    /// Parsed so it round-trips rather than landing in `Other`; the STATUS
+    /// `DELETED` gate does not read it.
     StatusDeleted,
     /// `UIDPLUS` (RFC 4315).
     UidPlus,

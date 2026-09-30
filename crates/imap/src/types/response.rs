@@ -548,9 +548,16 @@ impl Default for ExpungeResult {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct MoveResult {
     /// The response code from the tagged OK when it carries one, otherwise
-    /// the code from the first untagged `OK [COPYUID ...]`; typically
-    /// `COPYUID` (RFC 6851 Section 4.3).
+    /// the code from the first untagged `OK [COPYUID ...]`. Under QRESYNC
+    /// the tagged OK typically carries `HIGHESTMODSEQ` (RFC 7162), in which
+    /// case the COPYUID is only in [`copy_uid`](Self::copy_uid).
     pub code: Option<ResponseCode>,
+    /// The `COPYUID` response code (RFC 4315 Section 3, RFC 6851 Section
+    /// 4.3): the tagged OK's code when that is COPYUID, otherwise the first
+    /// untagged `OK [COPYUID ...]`, whatever code the tagged OK carries.
+    /// Always a [`ResponseCode::CopyUid`] when present. `None` when the
+    /// server sent no COPYUID at all.
+    pub copy_uid: Option<ResponseCode>,
     /// The EXPUNGE or VANISHED responses that preceded the tagged OK
     /// (RFC 6851 Section 3 / RFC 7162 Section 3.2.10).
     pub expunged: ExpungeResult,
@@ -560,13 +567,23 @@ pub struct MoveResult {
 ///
 /// RFC 4315 Section 3 specifies that the server SHOULD respond with a
 /// `[COPYUID uid-validity source-uids dest-uids]` response code in the
-/// tagged OK. This struct captures that response code.
+/// tagged OK; some servers send it in an untagged OK instead. This struct
+/// captures the tagged code and the COPYUID separately, because the tagged
+/// OK can carry a different code of its own.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct CopyResult {
-    /// The response code from the tagged OK, typically `COPYUID`
-    /// (RFC 4315 Section 3). `None` when the server omits the response code.
+    /// The response code from the tagged OK when it carries one, otherwise
+    /// the code from the first untagged `OK [COPYUID ...]`. `None` when the
+    /// server sent neither. When the tagged OK carries a code other than
+    /// COPYUID, the COPYUID is only in [`copy_uid`](Self::copy_uid).
     pub code: Option<ResponseCode>,
+    /// The `COPYUID` response code (RFC 4315 Section 3): the tagged OK's
+    /// code when that is COPYUID, otherwise the first untagged
+    /// `OK [COPYUID ...]`, whatever code the tagged OK carries. Always a
+    /// [`ResponseCode::CopyUid`] when present. `None` when the server sent
+    /// no COPYUID at all.
+    pub copy_uid: Option<ResponseCode>,
 }
 
 /// Parameters for QRESYNC-enabled SELECT/EXAMINE (RFC 7162 Section 3.2.5.2).

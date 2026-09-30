@@ -56,10 +56,12 @@ impl SearchConsumer {
     ///
     /// An ESEARCH correlated to a different tag is not accumulated here;
     /// `on_response` buffers it with the `Either` responses, so it is still
-    /// surrendered. In a pipelined batch one correlated to another in-flight
-    /// search never gets here: the pipeline router delivers it to the command
-    /// its tag names. What remains is a tag naming no command that can own it
-    /// (outside the batch, already finalized, or not yet received).
+    /// surrendered. In a pipelined batch one correlated to another search of
+    /// the batch never gets here: the pipeline router delivers it to the
+    /// command its tag names while that command is active, and drops it as
+    /// surplus once that command has finalized. What remains is a tag naming
+    /// no command that can own it (outside the batch, not yet received, or a
+    /// non-search command).
     fn reclassified_extras(self) -> Vec<UntaggedResponse> {
         self.buffered
     }
@@ -285,10 +287,11 @@ impl Consumer for SearchSaveConsumer {
 
 /// Consumer for COPY and UID COPY (RFC 3501 Section6.4.7, RFC 4315 Section3).
 ///
-/// COPY has no solicited untagged responses. The result is extracted
-/// from the tagged OK response code, which SHOULD be `[COPYUID ...]`
-/// per RFC 4315 Section3. Any untagged responses routed here (classified as
-/// `Either`) are reclassified as events.
+/// COPY has no solicited untagged responses. The result carries the tagged
+/// OK's response code and, separately, the COPYUID (RFC 4315 Section3),
+/// taken from the tagged OK or from an untagged `OK [COPYUID ...]` (see
+/// `resolve_copyuid`). Any other untagged responses routed here (classified
+/// as `Either`) are reclassified as events.
 pub(crate) struct CopyConsumer {
     /// All responses routed here. COPY has no solicited untagged
     /// responses, so everything is reclassified as events.
@@ -311,17 +314,21 @@ impl CopyConsumer {
             copyuid: None,
         }
     }
+}
 
-    /// `buffered` with the retained untagged COPYUID, if any, put back at the
-    /// position it arrived in.
-    fn surrender_all(self) -> Vec<UntaggedResponse> {
-        let mut events = self.buffered;
-        if let Some((pos, resp)) = self.copyuid {
-            // `buffered` only ever grows, so `pos <= events.len()`.
-            events.insert(pos, resp);
-        }
-        events
+/// `buffered` with the retained untagged COPYUID OK, if any, put back at the
+/// position it arrived in. Shared by `CopyConsumer` and `MoveConsumer`, which
+/// retain it the same way; for MOVE the mutations are not included.
+fn reinsert_copyuid(
+    buffered: Vec<UntaggedResponse>,
+    retained: Option<(usize, UntaggedResponse)>,
+) -> Vec<UntaggedResponse> {
+    let mut events = buffered;
+    if let Some((pos, resp)) = retained {
+        // `buffered` only ever grows, so `pos <= events.len()`.
+        events.insert(pos, resp);
     }
+    events
 }
 
 impl Consumer for CopyConsumer {
@@ -354,32 +361,59 @@ impl Consumer for CopyConsumer {
         _ctx: &ConsumerContext,
     ) -> Finalized<CopyResult> {
         // RFC 4315 Section3: server SHOULD return COPYUID response code.
+        let this = *self;
         match tagged.require_ok() {
             Ok(tagged) => {
-                // The tagged code wins. If it is present, the retained
-                // untagged OK was not used as this command's answer, so it is
-                // surrendered like any other untagged OK. If it is absent,
-                // the untagged OK supplies the code and is consumed.
-                if tagged.code.is_some() {
-                    return Finalized::success(
-                        CopyResult { code: tagged.code },
-                        (*self).surrender_all(),
-                    );
-                }
-                let code = match self.copyuid {
-                    Some((_, UntaggedResponse::Status { code, .. })) => code,
-                    _ => None,
-                };
-                Finalized::success(CopyResult { code }, self.buffered)
+                let (code, copy_uid, events) =
+                    resolve_copyuid(tagged.code, this.buffered, this.copyuid);
+                Finalized::success(CopyResult { code, copy_uid }, events)
             }
             // COPY solicits no untagged response, so everything routed here
             // is an asynchronous notification and survives the failure,
             // including the untagged `OK [COPYUID ...]`, re-emitted verbatim.
             // A COPYUID naming a copy the server then failed is not this
             // command's answer, and it is not this consumer's to drop.
-            Err(e) => Finalized::failure(e, (*self).surrender_all()),
+            Err(e) => Finalized::failure(e, reinsert_copyuid(this.buffered, this.copyuid)),
         }
     }
+}
+
+/// The success-arm answer shared by `CopyConsumer` and `MoveConsumer`:
+/// `(code, copy_uid, events)`.
+///
+/// `code` is the tagged OK's code when it has one, otherwise the retained
+/// untagged `OK [COPYUID ...]`'s code. `copy_uid` is the COPYUID wherever it
+/// was: the tagged code when that is COPYUID, otherwise the retained untagged
+/// OK. The two are separate because the tagged OK may carry a code of its
+/// own - under QRESYNC typically `HIGHESTMODSEQ` (RFC 7162) - and a single
+/// slot used to let that code hide the COPYUID, which then survived only as
+/// an event.
+///
+/// The retained untagged OK is consumed exactly when it supplies
+/// `copy_uid`, i.e. whenever the tagged code is not itself COPYUID. When it
+/// is, the untagged OK was not used as this command's answer and is
+/// surrendered verbatim at its wire position among `buffered`, like any
+/// other untagged OK.
+fn resolve_copyuid(
+    tagged_code: Option<ResponseCode>,
+    buffered: Vec<UntaggedResponse>,
+    retained: Option<(usize, UntaggedResponse)>,
+) -> (
+    Option<ResponseCode>,
+    Option<ResponseCode>,
+    Vec<UntaggedResponse>,
+) {
+    if matches!(tagged_code, Some(ResponseCode::CopyUid { .. })) {
+        let copy_uid = tagged_code.clone();
+        return (tagged_code, copy_uid, reinsert_copyuid(buffered, retained));
+    }
+    // `on_response` retains only an untagged OK whose code is COPYUID.
+    let untagged_code = match retained {
+        Some((_, UntaggedResponse::Status { code, .. })) => code,
+        _ => None,
+    };
+    let code = tagged_code.or_else(|| untagged_code.clone());
+    (code, untagged_code, buffered)
 }
 
 /// Consumer for MOVE and UID MOVE (RFC 6851 Section3).
@@ -428,20 +462,6 @@ impl MoveConsumer {
             copyuid: None,
         }
     }
-
-    /// `buffered` with the retained untagged COPYUID, if any, put back at the
-    /// position it arrived in. The mutations are not included.
-    fn buffered_with_copyuid(
-        buffered: Vec<UntaggedResponse>,
-        copyuid: Option<(usize, UntaggedResponse)>,
-    ) -> Vec<UntaggedResponse> {
-        let mut events = buffered;
-        if let Some((pos, resp)) = copyuid {
-            // `buffered` only ever grows, so `pos <= events.len()`.
-            events.insert(pos, resp);
-        }
-        events
-    }
 }
 
 impl Consumer for MoveConsumer {
@@ -482,25 +502,16 @@ impl Consumer for MoveConsumer {
         match tagged.require_ok() {
             Ok(tagged) => {
                 let expunged = fold_mutations(this.mutations, qresync_enabled(ctx));
-                // The tagged code wins, as in `CopyConsumer`. If it is
-                // present, the retained untagged OK was not used as this
-                // command's answer, so it is surrendered like any other
-                // untagged OK. If it is absent, the untagged OK supplies the
-                // code and is consumed.
-                if tagged.code.is_some() {
-                    return Finalized::success(
-                        MoveResult {
-                            code: tagged.code,
-                            expunged,
-                        },
-                        Self::buffered_with_copyuid(this.buffered, this.copyuid),
-                    );
-                }
-                let code = match this.copyuid {
-                    Some((_, UntaggedResponse::Status { code, .. })) => code,
-                    _ => None,
-                };
-                Finalized::success(MoveResult { code, expunged }, this.buffered)
+                let (code, copy_uid, events) =
+                    resolve_copyuid(tagged.code, this.buffered, this.copyuid);
+                Finalized::success(
+                    MoveResult {
+                        code,
+                        copy_uid,
+                        expunged,
+                    },
+                    events,
+                )
             }
             Err(e) => {
                 // The sharpest failure arm in the crate. A tagged NO can
@@ -517,7 +528,7 @@ impl Consumer for MoveConsumer {
                 // at its wire position: a COPYUID naming a move the server
                 // then failed is not this command's answer, and it is not
                 // this consumer's to drop.
-                let mut reclassified = Self::buffered_with_copyuid(this.buffered, this.copyuid);
+                let mut reclassified = reinsert_copyuid(this.buffered, this.copyuid);
                 reclassified.extend(this.mutations);
                 Finalized::failure(e, reclassified)
             }
@@ -547,6 +558,47 @@ impl ExpungeConsumer {
         Self {
             mutations: Vec::new(),
             buffered: Vec::new(),
+        }
+    }
+
+    /// An `ExpungeConsumer` that also yields the tagged OK's response code.
+    ///
+    /// For the UID MOVE fallback (COPY + STORE + UID EXPUNGE, RFC 6851
+    /// Section 3.3): the final UID EXPUNGE's tagged OK plays the part of the
+    /// native MOVE's tagged OK, and under QRESYNC it carries the source
+    /// mailbox's new `HIGHESTMODSEQ` (RFC 7162), which the plain consumer
+    /// discards.
+    pub(crate) fn with_tagged_code() -> ExpungeWithCodeConsumer {
+        ExpungeWithCodeConsumer(Self::new())
+    }
+}
+
+/// [`ExpungeConsumer`] plus the tagged OK's response code. Routing and both
+/// finalize arms are the inner consumer's, unchanged.
+pub(crate) struct ExpungeWithCodeConsumer(ExpungeConsumer);
+
+impl Consumer for ExpungeWithCodeConsumer {
+    type Output = (ExpungeResult, Option<ResponseCode>);
+
+    fn on_response(
+        &mut self,
+        resp: UntaggedResponse,
+        notify_snapshot: NotifyFlags,
+        ctx: &ConsumerContext,
+    ) {
+        self.0.on_response(resp, notify_snapshot, ctx);
+    }
+
+    fn finalize(
+        self: Box<Self>,
+        tagged: TaggedResponse,
+        ctx: &ConsumerContext,
+    ) -> Finalized<(ExpungeResult, Option<ResponseCode>)> {
+        let code = tagged.code.clone();
+        let inner = Box::new(self.0).finalize(tagged, ctx);
+        Finalized {
+            output: inner.output.map(|expunged| (expunged, code)),
+            reclassified_as_events: inner.reclassified_as_events,
         }
     }
 }
@@ -782,24 +834,28 @@ mod tests {
         feed(&mut consumer, untagged_ok(Some(copyuid(20)), "copied"));
 
         let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
-        assert_eq!(result.output.unwrap().code, Some(copyuid(20)));
+        let output = result.output.unwrap();
+        assert_eq!(output.code, Some(copyuid(20)));
+        assert_eq!(output.copy_uid, Some(copyuid(20)));
         assert_eq!(
             result.reclassified_as_events,
             vec![UntaggedResponse::Exists(3)]
         );
     }
 
-    /// The tagged code wins, so the untagged COPYUID OK was not used and is
-    /// surrendered whole, in wire order.
+    /// A tagged COPYUID is the answer, so an untagged COPYUID OK beside it
+    /// was not used and is surrendered whole, in wire order.
     #[test]
-    fn copy_surrenders_untagged_copyuid_shadowed_by_tagged_code() {
+    fn copy_surrenders_untagged_copyuid_when_tagged_code_is_copyuid() {
         let mut consumer = CopyConsumer::new();
         feed(&mut consumer, UntaggedResponse::Exists(3));
         feed(&mut consumer, untagged_ok(Some(copyuid(20)), "copied"));
         feed(&mut consumer, UntaggedResponse::Expunge(1));
 
         let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, Some(copyuid(30))), &ctx());
-        assert_eq!(result.output.unwrap().code, Some(copyuid(30)));
+        let output = result.output.unwrap();
+        assert_eq!(output.code, Some(copyuid(30)));
+        assert_eq!(output.copy_uid, Some(copyuid(30)));
         assert_eq!(
             result.reclassified_as_events,
             vec![
@@ -808,6 +864,43 @@ mod tests {
                 UntaggedResponse::Expunge(1),
             ]
         );
+    }
+
+    /// A tagged OK carrying a code of its own (HIGHESTMODSEQ, as a QRESYNC
+    /// server sends) does not hide the untagged COPYUID: the result carries
+    /// both, and the untagged OK is consumed as this command's answer rather
+    /// than surviving only as an event.
+    #[test]
+    fn copy_keeps_untagged_copyuid_beside_a_tagged_non_copyuid_code() {
+        let mut consumer = CopyConsumer::new();
+        feed(&mut consumer, UntaggedResponse::Exists(3));
+        feed(&mut consumer, untagged_ok(Some(copyuid(20)), "copied"));
+        feed(&mut consumer, UntaggedResponse::Expunge(1));
+
+        let result = Box::new(consumer).finalize(
+            tagged(StatusKind::Ok, Some(ResponseCode::HighestModSeq(99))),
+            &ctx(),
+        );
+        let output = result.output.unwrap();
+        assert_eq!(output.code, Some(ResponseCode::HighestModSeq(99)));
+        assert_eq!(output.copy_uid, Some(copyuid(20)));
+        assert_eq!(
+            result.reclassified_as_events,
+            vec![UntaggedResponse::Exists(3), UntaggedResponse::Expunge(1)]
+        );
+    }
+
+    /// No COPYUID anywhere: `copy_uid` is `None` even though the tagged OK
+    /// has a code.
+    #[test]
+    fn copy_without_any_copyuid_has_none() {
+        let result = Box::new(CopyConsumer::new()).finalize(
+            tagged(StatusKind::Ok, Some(ResponseCode::HighestModSeq(99))),
+            &ctx(),
+        );
+        let output = result.output.unwrap();
+        assert_eq!(output.code, Some(ResponseCode::HighestModSeq(99)));
+        assert_eq!(output.copy_uid, None);
     }
 
     /// On a tagged NO the retained untagged OK survives verbatim, text
@@ -843,6 +936,7 @@ mod tests {
         let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx());
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(copyuid(20)));
+        assert_eq!(output.copy_uid, Some(copyuid(20)));
         assert_eq!(output.expunged, ExpungeResult::Expunged(vec![1]));
         assert_eq!(
             result.reclassified_as_events,
@@ -850,11 +944,11 @@ mod tests {
         );
     }
 
-    /// MOVE: the tagged code wins, so the untagged COPYUID OK was not used
-    /// and is surrendered whole, at its wire position among the buffered
-    /// responses.
+    /// MOVE: a tagged COPYUID is the answer, so an untagged COPYUID OK beside
+    /// it was not used and is surrendered whole, at its wire position among
+    /// the buffered responses.
     #[test]
-    fn move_surrenders_untagged_copyuid_shadowed_by_tagged_code() {
+    fn move_surrenders_untagged_copyuid_when_tagged_code_is_copyuid() {
         let mut consumer = MoveConsumer::new();
         feed(&mut consumer, UntaggedResponse::Exists(3));
         feed(&mut consumer, untagged_ok(Some(copyuid(20)), "moved"));
@@ -864,6 +958,7 @@ mod tests {
         let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, Some(copyuid(30))), &ctx());
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(copyuid(30)));
+        assert_eq!(output.copy_uid, Some(copyuid(30)));
         assert_eq!(output.expunged, ExpungeResult::Expunged(vec![1]));
         assert_eq!(
             result.reclassified_as_events,
@@ -872,6 +967,49 @@ mod tests {
                 untagged_ok(Some(copyuid(20)), "moved"),
                 UntaggedResponse::Recent(0),
             ]
+        );
+    }
+
+    /// MOVE under QRESYNC: the RFC 6851 Section 4.3 untagged COPYUID OK, the
+    /// VANISHED, then a tagged OK carrying HIGHESTMODSEQ. The tagged code
+    /// used to shadow the COPYUID, which then survived only as an event; the
+    /// result now carries both and the untagged OK is consumed.
+    #[test]
+    fn move_keeps_untagged_copyuid_beside_a_tagged_highestmodseq() {
+        let qresync = ["QRESYNC".to_owned()];
+        let ctx = ConsumerContext {
+            capabilities: &[],
+            enabled: &qresync,
+            command_target: None,
+            command_tag: "A001",
+        };
+        let mut consumer = MoveConsumer::new();
+        let vanished = UntaggedResponse::Vanished {
+            earlier: false,
+            uids: vec![UidRange::single(1)],
+        };
+        consumer.on_response(
+            untagged_ok(Some(copyuid(20)), "moved"),
+            NotifyFlags::default(),
+            &ctx,
+        );
+        consumer.on_response(vanished, NotifyFlags::default(), &ctx);
+        consumer.on_response(UntaggedResponse::Exists(3), NotifyFlags::default(), &ctx);
+
+        let result = Box::new(consumer).finalize(
+            tagged(StatusKind::Ok, Some(ResponseCode::HighestModSeq(99))),
+            &ctx,
+        );
+        let output = result.output.unwrap();
+        assert_eq!(output.code, Some(ResponseCode::HighestModSeq(99)));
+        assert_eq!(output.copy_uid, Some(copyuid(20)));
+        assert_eq!(
+            output.expunged,
+            ExpungeResult::Vanished(vec![UidRange::single(1)])
+        );
+        assert_eq!(
+            result.reclassified_as_events,
+            vec![UntaggedResponse::Exists(3)]
         );
     }
 

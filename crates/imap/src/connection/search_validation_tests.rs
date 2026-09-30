@@ -192,15 +192,22 @@ fn within_criteria_require_the_within_capability() {
     }
 }
 
+/// RFC 8514 SEARCH keys need the advertised SAVEDATE token on either
+/// revision: RFC 9051 folds in nothing from SAVEDATE.
 #[test]
-fn savedate_criteria_are_implied_by_rev2() {
+fn savedate_criteria_are_not_implied_by_rev2() {
     assert!(matches!(
         conn(vec![Capability::Imap4Rev1])
             .validate_search_criteria_capabilities("SAVEDSINCE 1-Jan-2026"),
         Err(Error::MissingCapability(_))
     ));
-    assert!(
+    assert!(matches!(
         conn(vec![Capability::Imap4Rev2])
+            .validate_search_criteria_capabilities("SAVEDBEFORE 1-Jan-2026"),
+        Err(Error::MissingCapability(_))
+    ));
+    assert!(
+        conn(vec![Capability::Imap4Rev2, Capability::SaveDate])
             .validate_search_criteria_capabilities("SAVEDBEFORE 1-Jan-2026")
             .is_ok()
     );
@@ -211,14 +218,20 @@ fn savedate_criteria_are_implied_by_rev2() {
     );
 }
 
+/// RFC 8474 SEARCH keys need the advertised OBJECTID token on either
+/// revision: RFC 9051 folds in nothing from OBJECTID.
 #[test]
-fn objectid_criteria_are_implied_by_rev2() {
+fn objectid_criteria_are_not_implied_by_rev2() {
     assert!(matches!(
         conn(vec![Capability::Imap4Rev1]).validate_search_criteria_capabilities("EMAILID M1"),
         Err(Error::MissingCapability(_))
     ));
+    assert!(matches!(
+        conn(vec![Capability::Imap4Rev2]).validate_search_criteria_capabilities("THREADID T1"),
+        Err(Error::MissingCapability(_))
+    ));
     assert!(
-        conn(vec![Capability::Imap4Rev2])
+        conn(vec![Capability::Imap4Rev2, Capability::ObjectId])
             .validate_search_criteria_capabilities("THREADID T1")
             .is_ok()
     );

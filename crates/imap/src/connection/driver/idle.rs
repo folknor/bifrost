@@ -1,3 +1,4 @@
+use bifrost_types::TransmissionState;
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
@@ -7,7 +8,7 @@ use crate::types::response::StatusKind;
 
 use super::IdleTermination;
 use super::event_sink;
-use super::wire_send::{send_command_on_wire, wait_for_continuation};
+use super::wire_send::send_command_on_wire;
 
 /// Enter IDLE mode, read and publish events, exit on DONE or server
 /// termination (RFC 2177 Sections 2-4).
@@ -32,9 +33,7 @@ pub(super) async fn run_idle(
     let tag = send_command_on_wire(wire_reader, state, tag_gen, event_sink, &Command::Idle).await?;
 
     // 2. Wait for `+` continuation (RFC 2177 Section 3).
-    // No routing: IDLE has exactly one command outstanding, so every tagged
-    // response is its own and no untagged response has a consumer to reach.
-    wait_for_continuation(wire_reader, state, event_sink, None).await?;
+    wait_for_idle_grant(wire_reader, state, event_sink, &tag).await?;
 
     trace!(tag, "driver: entered IDLE mode");
 
@@ -50,7 +49,11 @@ pub(super) async fn run_idle(
             biased;
             _ = &mut done_rx => true,
             result = wire_reader.read_one(super::utf8_mode(state)) => {
-                let resp = result?;
+                // The IDLE command is on the wire and the server granted it,
+                // so a transport failure here is InFlight, as in
+                // `dispatch_response_loop`. Without the stamp an EOF mid-IDLE
+                // carried no phase and read as Unsent.
+                let resp = result.map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
                 let digest = state.apply_side_effects(&resp);
                 match resp {
                     crate::types::Response::Tagged(t) if t.tag == tag => {
@@ -78,7 +81,7 @@ pub(super) async fn run_idle(
                         super::emit_tagged_response_code_events(&t, event_sink);
                     }
                     crate::types::Response::Untagged(u) => {
-                        super::process_untagged_as_event(digest, u, event_sink)?;
+                        super::process_untagged_as_event(digest, u, event_sink, TransmissionState::InFlight)?;
                     }
                     crate::types::Response::Continuation(_) => {
                         // A second continuation during IDLE is invalid;
@@ -96,10 +99,80 @@ pub(super) async fn run_idle(
         if done_signaled {
             // 4. Client requested exit. Send DONE (untagged, RFC 2177 Section3).
             trace!(tag, "driver: sending DONE");
-            wire_reader.write_all(b"DONE\r\n").await?;
+            wire_reader
+                .write_all(b"DONE\r\n")
+                .await
+                .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
             drain_idle_responses(wire_reader, state, event_sink, &tag).await?;
             trace!(tag, "driver: exited IDLE mode");
             return Ok(IdleTermination::ClientDone);
+        }
+    }
+}
+
+/// Wait for the server's `+` granting IDLE (RFC 2177 Section 3, RFC 9051
+/// Section 6.3.13).
+///
+/// Not the shared literal `wait_for_continuation`: that wait answers every
+/// tagged response as the command's own and words a premature OK as a
+/// literal-continuation fault, and its `ContinuationOutcome` has no meaning
+/// for IDLE (there is no literal to abandon). IDLE's own rules:
+///
+/// * `+` grants IDLE.
+/// * Its own tagged `NO` / `BAD` is the refusal of IDLE.
+/// * Its own tagged `OK` with no `+` first means the server completed IDLE
+///   without the continuation it owes. The exchange is over and the framing
+///   intact, so this is the non-fatal `ProtocolMissing`, not `Protocol`.
+/// * Any other tag cannot exist - IDLE is the only command outstanding - so
+///   it is a desynchronization (`Protocol`, connection-fatal), as in
+///   `dispatch_response_loop`.
+/// * Untagged responses become events through the shared arm, BYE included.
+async fn wait_for_idle_grant(
+    wire_reader: &mut super::super::wire::WireReader,
+    state: &mut super::super::state::ProtocolState,
+    event_sink: &mut event_sink::DriverEventSink,
+    tag: &str,
+) -> Result<(), Error> {
+    loop {
+        // The IDLE command is on the wire: a transport failure is InFlight.
+        let resp = wire_reader
+            .read_one(super::utf8_mode(state))
+            .await
+            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
+        let digest = state.apply_side_effects(&resp);
+        match resp {
+            crate::types::Response::Continuation(_) => return Ok(()),
+            crate::types::Response::Tagged(t) if t.tag == tag => {
+                super::emit_tagged_response_code_events(&t, event_sink);
+                return Err(match t.status {
+                    StatusKind::No => Error::no_with_code(t.text, t.code),
+                    StatusKind::Bad => Error::bad_with_code(t.text, t.code),
+                    StatusKind::Ok => Error::ProtocolMissing(
+                        "IDLE completed with a tagged OK before the server sent the `+` \
+                         continuation it owes (RFC 2177 Section 3, RFC 9051 Section 6.3.13)"
+                            .into(),
+                    ),
+                });
+            }
+            crate::types::Response::Tagged(t) => {
+                return Err(Error::Protocol(format!(
+                    "unexpected tag {:?} while waiting for the IDLE continuation (expected {tag:?})",
+                    t.tag,
+                )));
+            }
+            crate::types::Response::Untagged(u) => {
+                super::process_untagged_as_event(
+                    digest,
+                    u,
+                    event_sink,
+                    TransmissionState::InFlight,
+                )?;
+            }
+            crate::types::Response::Greeting(_) => {
+                return Err(Error::Protocol(
+                    "unexpected greeting while waiting for the IDLE continuation".into(),
+                ));
+            }
         }
     }
 }
@@ -113,7 +186,10 @@ async fn drain_idle_responses(
     tag: &str,
 ) -> Result<(), Error> {
     loop {
-        let resp = wire_reader.read_one(super::utf8_mode(state)).await?;
+        let resp = wire_reader
+            .read_one(super::utf8_mode(state))
+            .await
+            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
         let digest = state.apply_side_effects(&resp);
         match resp {
             crate::types::Response::Tagged(t) if t.tag == tag => {
@@ -130,7 +206,12 @@ async fn drain_idle_responses(
                 super::emit_tagged_response_code_events(&t, event_sink);
             }
             crate::types::Response::Untagged(u) => {
-                super::process_untagged_as_event(digest, u, event_sink)?;
+                super::process_untagged_as_event(
+                    digest,
+                    u,
+                    event_sink,
+                    TransmissionState::InFlight,
+                )?;
             }
             crate::types::Response::Continuation(_) => {
                 // Ignore unexpected continuation while draining DONE.

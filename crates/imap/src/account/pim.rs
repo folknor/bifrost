@@ -42,7 +42,7 @@ use crate::types::{
 use super::targets::UidOperand;
 use super::{
     DecodedObjectId, ImapAccount, account_error_with, decode_object_id, decode_thread_id,
-    encode_object_id, encode_thread_id, factory,
+    encode_object_id, encode_thread_id, factory, selected_uidvalidity,
 };
 use crate::connection::ImapConnection;
 use crate::error::Error;
@@ -53,6 +53,28 @@ use crate::error::Error;
 /// `Reconcile` vs `Retry::SameRequest` on non-idempotent operations.
 fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
     move |e| account_error_with(e, super::error::ImapErrorContext::operation(op))
+}
+
+/// `op_err` for a failure in the PREFLIGHT of a per-folder step - the
+/// checkout, the SELECT/EXAMINE, the UIDVALIDITY read - restamped `Unsent`
+/// relative to the operation, the rule `connection::append`'s
+/// `unsent_preflight` states for APPEND. The preflight command carries its own
+/// transmission evidence (a tagged `NO` to SELECT is `Acknowledged`), but that
+/// is about the SELECT, not about the COPY / STORE / FETCH the operation is
+/// made of, which was never sent. Publishing the SELECT's evidence would make
+/// recovery reconcile a non-idempotent mutation that never reached the server.
+///
+/// Scope: this speaks for the folder being prepared. Earlier folders of the
+/// same multi-folder call may already have been mutated, in which case
+/// `Unsent` understates what the call did; these `Result<(), _>` lanes cannot
+/// express partial success at all, a known gap this does not close.
+fn preflight_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
+    move |e| {
+        account_error_with(
+            e.with_attempt(bifrost_types::TransmissionState::Unsent),
+            super::error::ImapErrorContext::operation(op),
+        )
+    }
 }
 
 /// Memory budget for the one-shot full-message `BODY[]` fetch in
@@ -72,6 +94,9 @@ pub(crate) fn add_to_container(
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if !account.capabilities.pim_methods.add_to_container {
+            return Err(super::error::unsupported(AccountOperation::AddToContainer));
+        }
         let destination = folder_from_container(&container, AccountOperation::AddToContainer)?;
         let ids = decoded_targets(&target, AccountOperation::AddToContainer)?;
         copy_messages(
@@ -832,9 +857,7 @@ pub(crate) fn search(
                 .select_folder(&mut conn, &folder, None, true)
                 .await
                 .map_err(err)?;
-            let uidvalidity = selected.mailbox.uid_validity.ok_or_else(|| {
-                pim_malformed(AccountOperation::Search, "SELECT missing UIDVALIDITY")
-            })?;
+            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
             let roots = conn
                 .connection()
                 .uid_thread(
@@ -874,12 +897,7 @@ pub(crate) fn search_messages(
                 .select_folder(&mut conn, &folder, None, true)
                 .await
                 .map_err(err)?;
-            let uidvalidity = selected.mailbox.uid_validity.ok_or_else(|| {
-                pim_malformed(
-                    AccountOperation::SearchMessages,
-                    "SELECT missing UIDVALIDITY",
-                )
-            })?;
+            let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
             let result = conn
                 .connection()
                 .uid_search(&plan.criteria, account.command_timeout())
@@ -1130,20 +1148,26 @@ pub(crate) fn message_hydrate(
     projection: HydrationProjection,
 ) -> AccountFuture<Result<Message, AccountError>> {
     Box::pin(async move {
+        if !account.capabilities.pim_methods.message_hydrate {
+            return Err(super::error::unsupported(AccountOperation::HydrateMessage));
+        }
         let decoded = decode_object_id(&message, AccountOperation::HydrateMessage)?;
-        let mut messages = hydrate_decoded(
+        // The canonical spelling of the requested id, compared against the
+        // ids `fetch_to_message` mints. `hydrate_decoded` already drops
+        // FETCH responses for UIDs nobody asked about; picking by id rather
+        // than by position keeps the answer right independently of that.
+        let wanted = encode_object_id(&decoded.folder, decoded.uidvalidity, decoded.uid);
+        let messages = hydrate_decoded(
             &account,
             vec![decoded],
             projection,
             AccountOperation::HydrateMessage,
         )
         .await?;
-        messages.pop().ok_or_else(|| {
-            pim_malformed(
-                AccountOperation::HydrateMessage,
-                "message was not returned by IMAP FETCH",
-            )
-        })
+        messages
+            .into_iter()
+            .find(|hydrated| hydrated.id == wanted)
+            .ok_or_else(|| expunged_message(wanted))
     })
 }
 
@@ -1220,16 +1244,17 @@ async fn copy_messages(
     op: AccountOperation,
 ) -> Result<(), AccountError> {
     let err = op_err(op);
+    let preflight = preflight_err(op);
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
+        let mut conn = account
+            .checkout_for_folder(&folder)
+            .await
+            .map_err(preflight)?;
         let selected = account
             .select_folder(&mut conn, &folder, None, false)
             .await
-            .map_err(err)?;
-        let uidvalidity = selected
-            .mailbox
-            .uid_validity
-            .ok_or_else(|| pim_malformed(op, "SELECT missing UIDVALIDITY"))?;
+            .map_err(preflight)?;
+        let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
         let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
         let Some(uid_set) = operand.uid_set() else {
             continue;
@@ -1252,16 +1277,17 @@ async fn delete_messages(
     op: AccountOperation,
 ) -> Result<(), AccountError> {
     let err = op_err(op);
+    let preflight = preflight_err(op);
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
+        let mut conn = account
+            .checkout_for_folder(&folder)
+            .await
+            .map_err(preflight)?;
         let selected = account
             .select_folder(&mut conn, &folder, None, false)
             .await
-            .map_err(err)?;
-        let uidvalidity = selected
-            .mailbox
-            .uid_validity
-            .ok_or_else(|| pim_malformed(op, "SELECT missing UIDVALIDITY"))?;
+            .map_err(preflight)?;
+        let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
         let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
         let Some(uid_set) = operand.uid_set() else {
             continue;
@@ -1299,21 +1325,22 @@ async fn set_flag(
     op: AccountOperation,
 ) -> Result<(), AccountError> {
     let err = op_err(op);
+    let preflight = preflight_err(op);
     let operation = if value {
         StoreOperation::AddSilent
     } else {
         StoreOperation::RemoveSilent
     };
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
+        let mut conn = account
+            .checkout_for_folder(&folder)
+            .await
+            .map_err(preflight)?;
         let selected = account
             .select_folder(&mut conn, &folder, None, false)
             .await
-            .map_err(err)?;
-        let uidvalidity = selected
-            .mailbox
-            .uid_validity
-            .ok_or_else(|| pim_malformed(op, "SELECT missing UIDVALIDITY"))?;
+            .map_err(preflight)?;
+        let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
         let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
         let Some(uid_set) = operand.uid_set() else {
             continue;
@@ -1342,17 +1369,18 @@ async fn hydrate_decoded(
     op: AccountOperation,
 ) -> Result<Vec<Message>, AccountError> {
     let err = op_err(op);
+    let preflight = preflight_err(op);
     let mut messages = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
+        let mut conn = account
+            .checkout_for_folder(&folder)
+            .await
+            .map_err(preflight)?;
         let selected = account
             .select_folder(&mut conn, &folder, None, true)
             .await
-            .map_err(err)?;
-        let uidvalidity = selected
-            .mailbox
-            .uid_validity
-            .ok_or_else(|| pim_malformed(op, "SELECT missing UIDVALIDITY"))?;
+            .map_err(preflight)?;
+        let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;
         let operand = pim_operand(valid_uids(ids, uidvalidity, op)?, op)?;
         let Some(uid_set) = operand.uid_set() else {
             continue;
@@ -1366,14 +1394,52 @@ async fn hydrate_decoded(
             )
             .await
             .map_err(err)?;
-        for fetch in fetches {
-            if let Some(message) = fetch_to_message(&folder, uidvalidity, fetch, projection) {
-                messages.push(message);
-            }
-        }
+        let merged = merge_requested_fetches(fetches, operand.uids());
+        messages.extend(
+            merged
+                .into_values()
+                .filter_map(|fetch| fetch_to_message(&folder, uidvalidity, fetch, projection)),
+        );
     }
     messages.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     Ok(messages)
+}
+
+/// Fold a UID FETCH's collected responses into one response per REQUESTED
+/// UID.
+///
+/// The connection hands back every FETCH seen during the command, and two
+/// kinds are not the answer: an unsolicited FETCH for a UID nobody asked
+/// about (another client's flag change), which would otherwise hydrate as a
+/// message the caller never requested, and a second response for a requested
+/// UID - the server may split data items across responses, or append a
+/// FLAGS-only update - which would otherwise hydrate as a duplicate, possibly
+/// bodiless, copy. Responses without a UID cannot be attributed and are
+/// dropped. The fold is `get`'s `merge_fetch_response`: later data fills gaps
+/// and never blanks what an earlier response carried.
+fn merge_requested_fetches(
+    fetches: Vec<crate::types::FetchResponse>,
+    requested: &[u32],
+) -> HashMap<u32, crate::types::FetchResponse> {
+    let requested: std::collections::HashSet<u32> = requested.iter().copied().collect();
+    let mut by_uid: HashMap<u32, crate::types::FetchResponse> = HashMap::new();
+    for fetch in fetches {
+        let Some(uid) = fetch.uid else {
+            continue;
+        };
+        if !requested.contains(&uid) {
+            continue;
+        }
+        match by_uid.entry(uid) {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                super::get::merge_fetch_response(held.get_mut(), fetch);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(fetch);
+            }
+        }
+    }
+    by_uid
 }
 
 fn decoded_targets(
@@ -2286,6 +2352,33 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
         disposition_notification_to: None,
     };
     Ok(bifrost_types::render_rfc5322(&composed))
+}
+
+/// The message a completed `UID FETCH` did not answer for.
+///
+/// `hydrate_decoded` only reaches the FETCH once `valid_uids` has confirmed the
+/// id's UIDVALIDITY matches the selected mailbox, so the UID is a live name in
+/// the current epoch and the id was well-formed. A tagged OK with no FETCH for
+/// that UID is how RFC 3501 6.4.8 / RFC 9051 6.4.9 report a UID that no longer
+/// exists: the message was expunged between the caller learning the id and
+/// this FETCH. That is `NotFound(Message)`, not the caller's malformed request.
+/// The server answered, so the attempt is `Acknowledged`.
+fn expunged_message(id: ObjectId) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message),
+        Cause::Request(RequestCause::NotFound {
+            what: bifrost_types::ResourceKind::Message,
+            id: Some(id.0.clone()),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::HydrateMessage)
+    .scope(bifrost_types::ErrorScope::Message { id })
+    .push_cause(Cause::Attempt(bifrost_types::AttemptCause::new(
+        bifrost_types::TransmissionState::Acknowledged,
+    )))
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Build a `Request(Malformed)` `AccountError` for local PIM failures

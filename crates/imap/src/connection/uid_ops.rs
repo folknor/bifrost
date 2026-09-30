@@ -526,8 +526,12 @@ impl ImapConnection {
     /// because it can delete unrelated `\Deleted` messages (data-loss risk).
     ///
     /// Returns a [`MoveResult`] containing:
-    /// - `code`: the server's response code, typically `[COPYUID ...]` per
-    ///   RFC 6851 Section 4.3 / RFC 4315 Section 3.
+    /// - `code`: the server's response code (see [`MoveResult::code`]). On
+    ///   the fallback path, the final UID EXPUNGE's tagged code, else the
+    ///   COPY's `code`.
+    /// - `copy_uid`: the `[COPYUID ...]` code per RFC 6851 Section 4.3 /
+    ///   RFC 4315 Section 3, tagged or untagged, even when the tagged OK
+    ///   carries a different code. On the fallback path, the COPY's.
     /// - `expunged`: the EXPUNGE or VANISHED responses (RFC 6851 Section 3).
     ///   When QRESYNC is enabled (RFC 7162 Section 3.2.10), the server sends
     ///   VANISHED instead of EXPUNGE.
@@ -581,9 +585,17 @@ impl ImapConnection {
                 timeout,
             )
             .await?;
-            let expunged = self.uid_expunge(sequence_set, timeout).await?;
+            let (expunged, expunge_code) =
+                self.uid_expunge_with_code(sequence_set, timeout).await?;
+            // `code` mirrors the native path, where it is the MOVE's tagged
+            // code: here the final UID EXPUNGE's tagged OK is that
+            // counterpart (under QRESYNC, the source mailbox's new
+            // HIGHESTMODSEQ). The COPY's code is only the fallback when the
+            // EXPUNGE carried none; its COPYUID is not lost either way,
+            // because `copy_uid` carries it.
             Ok(MoveResult {
-                code: copy_result.code,
+                code: expunge_code.or(copy_result.code),
+                copy_uid: copy_result.copy_uid,
                 expunged,
             })
         } else {
@@ -615,8 +627,10 @@ impl ImapConnection {
 
     /// UID COPY (RFC 3501 Section 6.4.7, RFC 4315 Section 3).
     ///
-    /// On success, returns the server's response code, which SHOULD be
-    /// `[COPYUID uid-validity source-uids dest-uids]` per RFC 4315 Section 3.
+    /// On success, returns a [`CopyResult`] carrying the tagged OK's response
+    /// code and, separately in `copy_uid`, the
+    /// `[COPYUID uid-validity source-uids dest-uids]` code (RFC 4315
+    /// Section 3), whether the server sent it tagged or untagged.
     pub async fn uid_copy(
         &self,
         sequence_set: &SequenceSet,
@@ -641,9 +655,7 @@ impl ImapConnection {
     /// Shared implementation for COPY and UID COPY (RFC 3501 Section 6.4.7,
     /// RFC 4315 Section 3).
     ///
-    /// On success, returns a [`CopyResult`] containing the server's response
-    /// code, which SHOULD be `[COPYUID uid-validity source-uids dest-uids]`
-    /// per RFC 4315 Section 3.
+    /// On success, returns a [`CopyResult`]; see [`uid_copy`](Self::uid_copy).
     pub(super) async fn copy_impl(
         &self,
         cmd: Command,
@@ -665,6 +677,35 @@ impl ImapConnection {
         sequence_set: &SequenceSet,
         timeout: Duration,
     ) -> Result<ExpungeResult, Error> {
+        let cmd = self.uid_expunge_command(sequence_set)?;
+        tokio::time::timeout(
+            timeout,
+            self.submit_regular(cmd, dispatch::ExpungeConsumer::new()),
+        )
+        .await
+        .map_err(|_| Error::timeout_inflight())?
+    }
+
+    /// UID EXPUNGE that also returns the tagged OK's response code, for the
+    /// UID MOVE fallback: under QRESYNC that is the source mailbox's new
+    /// `HIGHESTMODSEQ` (RFC 7162), the counterpart of the native MOVE's
+    /// tagged code.
+    async fn uid_expunge_with_code(
+        &self,
+        sequence_set: &SequenceSet,
+        timeout: Duration,
+    ) -> Result<(ExpungeResult, Option<ResponseCode>), Error> {
+        let cmd = self.uid_expunge_command(sequence_set)?;
+        tokio::time::timeout(
+            timeout,
+            self.submit_regular(cmd, dispatch::ExpungeConsumer::with_tagged_code()),
+        )
+        .await
+        .map_err(|_| Error::timeout_inflight())?
+    }
+
+    /// The local admission checks for UID EXPUNGE, then the command.
+    fn uid_expunge_command(&self, sequence_set: &SequenceSet) -> Result<Command, Error> {
         self.require_state(&[SessionState::Selected])?;
         // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
         if sequence_set.as_str().contains('$') {
@@ -679,15 +720,9 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("UIDPLUS".into()));
             }
         }
-        let cmd = Command::UidExpunge {
+        Ok(Command::UidExpunge {
             sequence_set: sequence_set.clone(),
-        };
-        tokio::time::timeout(
-            timeout,
-            self.submit_regular(cmd, dispatch::ExpungeConsumer::new()),
-        )
-        .await
-        .map_err(|_| Error::timeout_inflight())?
+        })
     }
 
     /// EXPUNGE (RFC 3501 Section 6.4.3 / RFC 7162 Section 3.2.10).

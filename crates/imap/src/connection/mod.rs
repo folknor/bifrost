@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use tracing::{debug, warn};
 
-use crate::codec::encode::LiteralMode;
 use crate::error::Error;
 use crate::types::{
     AclEntry, AppendMessage, Capability, Command, CopyResult, EsearchResponse, ExpungeResult,
@@ -436,8 +435,14 @@ impl ImapConnection {
     /// timeout.
     ///
     /// Returns `Ok(Some(event))` when an event arrives, `Ok(None)` when
-    /// `timeout` elapses without an event, or `Err(Error::DriverGone)`
-    /// when the driver task has exited (channel closed).
+    /// `timeout` elapses without an event, or `Err(Error::DriverGone)` /
+    /// `Err(Error::DriverPanicked)` when the driver task has exited (channel
+    /// closed).
+    ///
+    /// The driver death is stamped `Unsent`: this method submits no command,
+    /// so nothing of ITS OWN can have reached the wire. A caller that owns a
+    /// command the driver was executing (IDLE) knows a later phase and must
+    /// restamp the error with it.
     ///
     /// RFC 3501 Section5.3: servers may send untagged data at any time. This
     /// method surfaces that data as [`TypedEvent`]s, enabling callers to
@@ -446,10 +451,15 @@ impl ImapConnection {
         &self,
         timeout: std::time::Duration,
     ) -> Result<Option<typed_event::TypedEvent>, crate::error::Error> {
-        let mut rx = self.events_rx.lock().await;
-        match tokio::time::timeout(timeout, rx.recv()).await {
+        let received = {
+            let mut rx = self.events_rx.lock().await;
+            tokio::time::timeout(timeout, rx.recv()).await
+        };
+        match received {
             Ok(Some(ev)) => Ok(Some(ev)),
-            Ok(None) => Err(crate::error::Error::driver_gone()),
+            Ok(None) => Err(self
+                .observe_driver_panic(bifrost_types::TransmissionState::Unsent)
+                .await),
             Err(_) => Ok(None), // timeout
         }
     }

@@ -258,9 +258,25 @@ impl PooledConn {
     }
 
     pub(crate) fn set_selected(&mut self, folder: MailboxName) {
+        self.set_selected_affinity(Some(folder));
+    }
+
+    /// Record which mailbox this member's session has selected, or that it
+    /// has none. `deselect_target` trusts this record to decide whether an
+    /// UNSELECT must precede a DELETE or RENAME, so it must follow the
+    /// session through failures too, not only through successful SELECTs.
+    pub(crate) fn set_selected_affinity(&mut self, folder: Option<MailboxName>) {
         if let Some(member) = &mut self.member {
-            member.selected = Some(folder);
+            member.selected = folder;
         }
+    }
+
+    /// The mailbox this member's session is recorded as having selected.
+    #[cfg(test)]
+    pub(crate) fn selected_affinity(&self) -> Option<&MailboxName> {
+        self.member
+            .as_ref()
+            .and_then(|member| member.selected.as_ref())
     }
 
     /// Make a mailbox-management command safe for a target that this pooled

@@ -470,3 +470,12 @@ fn other_variants_have_no_source() {
     // the vec.
     let _ = Arc::new(0_u8);
 }
+
+/// An omission is raised only after the exchange completed, so the framing
+/// is intact: `ProtocolMissing` must not retire the connection, while a
+/// server that sent something WRONG (`Protocol`) still does.
+#[test]
+fn a_missing_mandatory_response_is_not_connection_fatal() {
+    assert!(!Error::ProtocolMissing("x".into()).is_connection_fatal());
+    assert!(Error::Protocol("x".into()).is_connection_fatal());
+}

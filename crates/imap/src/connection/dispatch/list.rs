@@ -438,8 +438,9 @@ impl Consumer for StatusConsumer {
             let target = ctx
                 .command_target()
                 .map_or_else(|| "<unknown>".to_owned(), |t| t.as_str().to_owned());
-            // Stays a real `Error` in `output`: the driver reads it through
-            // `is_connection_fatal` before publishing the result. Nothing
+            // Stays a real `Error` in `output`, which the driver reads through
+            // `is_connection_fatal` before publishing the result; an omission
+            // raised after the tagged OK leaves the connection usable. Nothing
             // solicited exists to drop, so the buffer is surrendered.
             return Finalized::failure(
                 Error::ProtocolMissing(format!(

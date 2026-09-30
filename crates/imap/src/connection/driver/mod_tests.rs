@@ -254,7 +254,12 @@ fn run_prefix(response: UntaggedResponse) -> (Result<bool, crate::error::Error>,
     let mut state = super::super::state::ProtocolState::new();
     let wrapped = crate::types::Response::Untagged(Box::new(response.clone()));
     let digest = state.apply_side_effects(&wrapped);
-    let result = process_untagged_prefix(digest, &response, &mut sink);
+    let result = process_untagged_prefix(
+        digest,
+        &response,
+        &mut sink,
+        bifrost_types::TransmissionState::InFlight,
+    );
     let mut events = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         events.push(ev);
@@ -273,6 +278,13 @@ fn untagged_prologue_emits_the_alert_carried_by_a_fatal_bye() {
     assert!(
         matches!(result, Err(crate::error::Error::Bye { .. })),
         "a BYE must fail the in-flight command, got {result:?}"
+    );
+    // The command was on the wire when the BYE arrived, and the BYE does not
+    // complete it: the outcome is unknown, so the evidence must say InFlight
+    // rather than carry nothing (which reads as Unsent).
+    assert_eq!(
+        result.as_ref().unwrap_err().attempt(),
+        Some(bifrost_types::TransmissionState::InFlight)
     );
     assert!(
         matches!(
@@ -318,8 +330,9 @@ fn untagged_prologue_reports_whether_a_code_event_was_emitted() {
 // Shared consumer-less untagged arm
 // ---------------------------------------------------------------------------
 //
-// The four read loops with nowhere to route a response (IDLE, the post-DONE
-// IDLE drain, the literal continuation wait, and the LOGOUT drain) answer an
+// The read loops with nowhere to route a response (IDLE's grant wait, IDLE,
+// the post-DONE IDLE drain, the literal continuation wait, and the LOGOUT
+// drain) answer an
 // untagged response through `process_untagged_as_event`. These pin the tail
 // the helper owns: forward exactly once, never on top of a code event, and
 // never at all once the BYE guard has fired.
@@ -331,7 +344,12 @@ fn run_as_event(response: UntaggedResponse) -> (Result<(), crate::error::Error>,
     let boxed = Box::new(response);
     let wrapped = crate::types::Response::Untagged(boxed.clone());
     let digest = state.apply_side_effects(&wrapped);
-    let result = process_untagged_as_event(digest, boxed, &mut sink);
+    let result = process_untagged_as_event(
+        digest,
+        boxed,
+        &mut sink,
+        bifrost_types::TransmissionState::InFlight,
+    );
     let mut events = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         events.push(ev);

@@ -302,8 +302,10 @@ impl ImapConnection {
     ///
     /// Prefer [`uid_copy`](Self::uid_copy) for stable message references.
     ///
-    /// On success, returns the server's response code, which SHOULD be
-    /// `[COPYUID uid-validity source-uids dest-uids]` per RFC 4315 Section 3.
+    /// On success, returns a [`CopyResult`] carrying the tagged OK's response
+    /// code and, separately in `copy_uid`, the
+    /// `[COPYUID uid-validity source-uids dest-uids]` code (RFC 4315
+    /// Section 3), whether the server sent it tagged or untagged.
     pub async fn copy(
         &self,
         sequence_set: &SequenceSet,
@@ -330,8 +332,10 @@ impl ImapConnection {
     /// Prefer [`uid_move_messages`](Self::uid_move_messages) for stable message references.
     ///
     /// Returns a [`MoveResult`] containing:
-    /// - `code`: the server's response code, typically `[COPYUID ...]` per
-    ///   RFC 6851 Section 4.3.
+    /// - `code`: the server's response code (see [`MoveResult::code`]).
+    /// - `copy_uid`: the `[COPYUID ...]` code per RFC 6851 Section 4.3 /
+    ///   RFC 4315 Section 3, tagged or untagged, even when the tagged OK
+    ///   carries a different code.
     /// - `expunged`: the EXPUNGE or VANISHED responses sent before the tagged
     ///   OK (RFC 6851 Section 3). When QRESYNC is enabled (RFC 7162
     ///   Section 3.2.10), the server sends VANISHED instead of EXPUNGE.

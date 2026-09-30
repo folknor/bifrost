@@ -161,38 +161,67 @@ fn apply_pipeline_pre_effects(
     }
 }
 
-/// The command a tag-correlated ESEARCH names, when that command can own it.
+/// Where a tag-correlated ESEARCH goes when its correlator names a search
+/// command of this batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CorrelatedEsearch {
+    /// The named search is still active: deliver to its consumer.
+    Deliver(usize),
+    /// The named search has already finalized: this is surplus solicited
+    /// data for a completed command, and it is dropped.
+    DropSurplus,
+}
+
+/// The command a tag-correlated ESEARCH names, when that command is a search
+/// of this batch that can have solicited it.
 ///
-/// `Some` only when every condition holds: the response is an ESEARCH with a
-/// search-correlator, the tag is one of this batch's commands, that command
-/// is below the untagged-ownership bound (the server has received it), it
-/// has not finalized (the tag-completion barrier), and it is a search command
-/// for which `classify` makes ESEARCH solicited. Anything else - a tagless
-/// ESEARCH, a tag from outside the batch, a tag naming a finalized or unsent
-/// command, or a tag naming a non-search command - is `None` and takes the
-/// ordinary head-consumer path unchanged.
+/// `Some` only when the response is an ESEARCH with a search-correlator, the
+/// tag is one of this batch's commands, and it is a search command for which
+/// `classify` makes ESEARCH solicited. Then:
+///
+/// * the command has finalized (the tag-completion barrier) - `DropSurplus`.
+///   Its answer, if it had one, was already taken, so this is surplus
+///   solicited data for a completed command, and it gets the same answer
+///   `SearchConsumer` gives surplus SEARCH/ESEARCH: dropped, not published.
+///   `classify` makes ESEARCH `OnlySolicited` inside a search and
+///   `Impossible` anywhere else, so it has no life as an asynchronous event,
+///   and the correlator says outright whose it is. Before this arm, head
+///   routing handed it to whichever command was still active, which either
+///   buffered it as a foreign-tagged ESEARCH and surrendered it, or had no use
+///   for it and forwarded it as an event - either way, an event the
+///   classifier says cannot exist. A finalized command is always below the
+///   untagged-ownership bound or is the rejected sending command, and the
+///   late data is surplus in both cases, so the bound is not consulted.
+/// * the command is active and below the untagged-ownership bound (the
+///   server has received it) - `Deliver`.
+///
+/// Anything else - a tagless ESEARCH, a tag from outside the batch, a tag
+/// naming an unsent command, or a tag naming a non-search command - is
+/// `None` and takes the ordinary head-consumer path unchanged.
 fn correlated_esearch_owner(
     routing: &PipelineRouting<'_>,
     resp: &crate::types::response::UntaggedResponse,
     bound: usize,
     notify: super::super::NotifyFlags,
-) -> Option<usize> {
+) -> Option<CorrelatedEsearch> {
     let crate::types::response::UntaggedResponse::Esearch(e) = resp else {
         return None;
     };
     let idx = *routing.tag_to_idx.get(e.tag.as_deref()?)?;
-    if idx >= bound || routing.consumers[idx].is_none() {
-        return None;
-    }
     let ctx = ClassificationContext {
         notify,
         command_target: routing.targets[idx].as_ref(),
     };
-    matches!(
+    if !matches!(
         classification::classify(routing.kinds[idx], resp, &ctx),
         SolicitationRule::OnlySolicited
-    )
-    .then_some(idx)
+    ) {
+        return None;
+    }
+    if routing.consumers[idx].is_none() {
+        return Some(CorrelatedEsearch::DropSurplus);
+    }
+    (idx < bound).then_some(CorrelatedEsearch::Deliver(idx))
 }
 
 /// Route one response read in pipeline context: apply its side effects
@@ -303,7 +332,14 @@ pub(super) fn route_pipeline_response(
             // `run_pipeline_batch` returning `(PipelineResults, Option<Error>)`,
             // which ripples into the sub-batch loop and the driver's fatal
             // check; re-raise it only with that whole shape in hand.
-            let code_emitted = super::process_untagged_prefix(digest, &u, event_sink)?;
+            // The router runs only once some of the batch is on the wire, and
+            // a BYE completes none of it: InFlight.
+            let code_emitted = super::process_untagged_prefix(
+                digest,
+                &u,
+                event_sink,
+                bifrost_types::TransmissionState::InFlight,
+            )?;
             let bound = routing.untagged_bound();
 
             // An ESEARCH carrying a search-correlator names its command
@@ -312,18 +348,27 @@ pub(super) fn route_pipeline_response(
             // be the head. Head routing would hand it to an EARLIER search's
             // consumer, which buffers a foreign-tagged ESEARCH and surrenders
             // it as an event, while the command it answers finalizes with no
-            // result: a connection-fatal "OK but no ESEARCH" for a server
-            // that merely interleaved two pipelined searches.
-            if let Some(owner) = correlated_esearch_owner(routing, &u, bound, notify_before) {
-                let ctx = super::build_consumer_context(
-                    state,
-                    routing.targets[owner].as_ref(),
-                    &routing.tags[owner],
-                );
-                if let Some(ref mut consumer) = routing.consumers[owner] {
-                    consumer.on_response(*u, notify_before, &ctx);
+            // result: a spurious "OK but no ESEARCH" protocol error for a
+            // server that merely interleaved two pipelined searches.
+            // One correlated to a search that has already finalized is
+            // surplus data for a completed command and is dropped.
+            match correlated_esearch_owner(routing, &u, bound, notify_before) {
+                Some(CorrelatedEsearch::Deliver(owner)) => {
+                    let ctx = super::build_consumer_context(
+                        state,
+                        routing.targets[owner].as_ref(),
+                        &routing.tags[owner],
+                    );
+                    if let Some(ref mut consumer) = routing.consumers[owner] {
+                        consumer.on_response(*u, notify_before, &ctx);
+                    }
+                    return Ok(Routed::Continue);
                 }
-                return Ok(Routed::Continue);
+                Some(CorrelatedEsearch::DropSurplus) => {
+                    trace!("driver: dropping surplus ESEARCH for a finalized pipelined search");
+                    return Ok(Routed::Continue);
+                }
+                None => {}
             }
 
             // Head consumer: the first still-active command eligible to own
@@ -624,6 +669,7 @@ async fn run_pipeline_batch(
                     state,
                     event_sink,
                     &patched,
+                    &tags[i],
                     Some(&mut routing),
                 )
                 .await?;
@@ -649,6 +695,7 @@ async fn run_pipeline_batch(
                     state,
                     event_sink,
                     encoded.segments(),
+                    &tags[i],
                     Some(&mut routing),
                 )
                 .await?;

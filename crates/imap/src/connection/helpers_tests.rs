@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use crate::codec::encode::LiteralMode;
 use crate::connection::test_support::detached;
 use crate::connection::{ImapConnection, SessionState};
 use crate::error::Error;
@@ -460,20 +459,47 @@ fn fetch_modseq_requires_condstore_and_is_not_implied_by_rev2() {
     );
 }
 
+/// RFC 9051 folds in nothing from OBJECTID (RFC 8474) or SAVEDATE (RFC
+/// 8514): their FETCH items and STATUS item need the advertised token on rev2
+/// exactly as on rev1.
 #[test]
-fn fetch_objectid_items_are_implied_by_rev2() {
+fn objectid_and_savedate_items_are_not_implied_by_rev2() {
+    for item in [FetchAttr::EmailId, FetchAttr::ThreadId, FetchAttr::SaveDate] {
+        for caps in [vec![Capability::Imap4Rev1], vec![Capability::Imap4Rev2]] {
+            assert!(
+                matches!(
+                    conn(caps.clone()).validate_requested_fetch_items(std::slice::from_ref(&item)),
+                    Err(Error::MissingCapability(_))
+                ),
+                "{item:?} must need its capability on {caps:?}"
+            );
+        }
+    }
+    assert!(matches!(
+        conn(vec![Capability::Imap4Rev2]).validate_requested_status_items("MAILBOXID"),
+        Err(Error::MissingCapability(_))
+    ));
+
+    let objectid = conn(vec![Capability::Imap4Rev2, Capability::ObjectId]);
     assert!(
-        conn(vec![Capability::Imap4Rev1])
-            .validate_requested_fetch_items(&[FetchAttr::EmailId])
-            .is_err()
+        objectid
+            .validate_requested_fetch_items(&[FetchAttr::EmailId, FetchAttr::ThreadId])
+            .is_ok()
     );
     assert!(
-        conn(vec![Capability::Imap4Rev2])
-            .validate_requested_fetch_items(&[FetchAttr::ThreadId])
+        objectid
+            .validate_requested_status_items("MAILBOXID")
+            .is_ok()
+    );
+    assert!(
+        conn(vec![Capability::Imap4Rev2, Capability::SaveDate])
+            .validate_requested_fetch_items(&[FetchAttr::SaveDate])
             .is_ok()
     );
 }
 
+/// RFC 9051 Appendix B: the BINARY FETCH items are base rev2 even though the
+/// BINARY token (which also covers RFC 3516's APPEND side) is not implied.
 #[test]
 fn fetch_binary_items_are_implied_by_rev2() {
     let item = FetchAttr::BinarySize { section: vec![1] };
@@ -515,31 +541,6 @@ fn fetch_base_items_need_no_capability() {
             .validate_requested_fetch_items(&[FetchAttr::Uid, FetchAttr::Flags])
             .is_ok()
     );
-}
-
-// ---------------------------------------------------------------------------
-// Literal-mode selection (RFC 7888)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn literal_mode_prefers_literal_plus() {
-    assert!(matches!(
-        conn(vec![Capability::LiteralPlus, Capability::LiteralMinus]).literal_mode(),
-        LiteralMode::LiteralPlus
-    ));
-    assert!(matches!(
-        conn(vec![Capability::LiteralMinus]).literal_mode(),
-        LiteralMode::LiteralMinus
-    ));
-    // RFC 9051 Appendix E item 2: pure rev2 has LITERAL- behavior.
-    assert!(matches!(
-        conn(vec![Capability::Imap4Rev2]).literal_mode(),
-        LiteralMode::LiteralMinus
-    ));
-    assert!(matches!(
-        conn(vec![Capability::Imap4Rev1]).literal_mode(),
-        LiteralMode::Synchronizing
-    ));
 }
 
 // ---------------------------------------------------------------------------

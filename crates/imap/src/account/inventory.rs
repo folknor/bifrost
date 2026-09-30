@@ -208,10 +208,7 @@ async fn run_inventory(
         }
         Err(err) => return Err(err.into()),
     };
-    let uidvalidity = selected
-        .mailbox
-        .uid_validity
-        .ok_or_else(|| crate::Error::ProtocolMissing("SELECT missing UIDVALIDITY".into()))?;
+    let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
     let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
     let attrs = inventory_attrs(include_modseq);
     let all_uids = UidSet::all();

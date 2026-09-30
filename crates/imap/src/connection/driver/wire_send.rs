@@ -58,7 +58,7 @@ pub(super) async fn send_command_on_wire(
             // markers to non-synchronizing and send in one shot.
             let flat = encoded.into_buf();
             let patched = super::super::patch_literals_to_plus_with_binary(&flat, allow_literal8);
-            send_with_literal_sync(wire_reader, state, event_sink, &patched, None).await?;
+            send_with_literal_sync(wire_reader, state, event_sink, &patched, &tag, None).await?;
         }
         LiteralMode::LiteralMinus => {
             // LITERAL- path (RFC 7888 Section5): patch small (<=4096 byte)
@@ -66,12 +66,20 @@ pub(super) async fn send_command_on_wire(
             let flat = encoded.into_buf();
             let patched =
                 super::super::patch_small_literals_to_plus_with_binary(&flat, allow_literal8);
-            send_with_literal_sync(wire_reader, state, event_sink, &patched, None).await?;
+            send_with_literal_sync(wire_reader, state, event_sink, &patched, &tag, None).await?;
         }
         LiteralMode::Synchronizing => {
             // No literal extension: all literals are synchronizing
             // (RFC 3501 Section4.3). Use pre-split segments from the encoder.
-            send_encoded_segments(wire_reader, state, event_sink, encoded.segments(), None).await?;
+            send_encoded_segments(
+                wire_reader,
+                state,
+                event_sink,
+                encoded.segments(),
+                &tag,
+                None,
+            )
+            .await?;
         }
     }
     Ok(tag)
@@ -82,11 +90,14 @@ pub(super) async fn send_command_on_wire(
 ///
 /// The driver owns this send path outright. It was lifted out of the
 /// pre-driver connection layer, which retains no copy of it.
+///
+/// `own_tag` is the tag of the command in `buf`; see [`wait_for_continuation`].
 pub(super) async fn send_with_literal_sync(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
     buf: &[u8],
+    own_tag: &str,
     mut routing: Option<&mut PipelineRouting<'_>>,
 ) -> Result<SendOutcome, Error> {
     // A buffer-shape invariant failure is the client's fault. Before the
@@ -123,7 +134,14 @@ pub(super) async fn send_with_literal_sync(
                 .write_all(&buf[pos..send_end])
                 .await
                 .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
-            if wait_for_continuation(wire_reader, state, event_sink, routing.as_deref_mut()).await?
+            if wait_for_continuation(
+                wire_reader,
+                state,
+                event_sink,
+                own_tag,
+                routing.as_deref_mut(),
+            )
+            .await?
                 == ContinuationOutcome::Rejected
             {
                 // The server refused this literal. Its remaining bytes - the
@@ -165,6 +183,7 @@ pub(super) async fn send_encoded_segments(
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
     segments: &[BytesMut],
+    own_tag: &str,
     mut routing: Option<&mut PipelineRouting<'_>>,
 ) -> Result<SendOutcome, Error> {
     for (i, segment) in segments.iter().enumerate() {
@@ -184,7 +203,14 @@ pub(super) async fn send_encoded_segments(
         // After every segment except the last, wait for `+`
         // (RFC 3501 Section4.3).
         if i + 1 < segments.len()
-            && wait_for_continuation(wire_reader, state, event_sink, routing.as_deref_mut()).await?
+            && wait_for_continuation(
+                wire_reader,
+                state,
+                event_sink,
+                own_tag,
+                routing.as_deref_mut(),
+            )
+            .await?
                 == ContinuationOutcome::Rejected
         {
             // Refused: abandon every remaining segment of this command. See
@@ -220,6 +246,7 @@ pub(super) async fn send_chunked_segments(
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
     segments: &[Vec<Bytes>],
+    own_tag: &str,
 ) -> Result<(), Error> {
     for (i, segment) in segments.iter().enumerate() {
         let state_for_segment = if i == 0 {
@@ -239,7 +266,7 @@ pub(super) async fn send_chunked_segments(
                 .map_err(|e| e.with_attempt(state_for_segment))?;
         }
         if i + 1 < segments.len()
-            && wait_for_continuation(wire_reader, state, event_sink, None).await?
+            && wait_for_continuation(wire_reader, state, event_sink, own_tag, None).await?
                 == ContinuationOutcome::Rejected
         {
             // A state this path believes unreachable, raised after the
@@ -265,9 +292,23 @@ pub(super) async fn send_chunked_segments(
 /// This wait has two modes, and which one applies is decided entirely by
 /// whether the caller has other commands outstanding.
 ///
-/// With `routing: None` - single-command dispatch and IDLE - exactly one
-/// command is on the wire, so ANY tagged response is that command's, and any
-/// untagged response has no consumer to route to and becomes an event.
+/// With `routing: None` - single-command dispatch and APPEND - exactly one
+/// command is on the wire, `own_tag`, and any untagged response has no
+/// consumer to route to and becomes an event. A tagged response ends the
+/// wait:
+///
+/// * its own `NO`/`BAD` is the refusal of the command, an ordinary error that
+///   leaves the connection usable (the server ended the command, and the
+///   unsent remainder is never written);
+/// * its own `OK` means the server completed the command without granting
+///   the literal it was owed a `+` for. The exchange is over and the framing
+///   intact, so this is the non-fatal `ProtocolMissing`, and the remainder is
+///   likewise never written (it would be read as a new command line);
+/// * any other tag cannot belong to anything, since nothing else is
+///   outstanding: a desynchronization, `Protocol`, connection-fatal.
+///
+/// In pipeline mode `own_tag` is the command being written; the router
+/// carries the same fact in `sending` and decides by its own rules.
 ///
 /// With `routing: Some(..)` the caller is `run_pipeline_batch`, which sends
 /// command by command whenever a literal is synchronizing (`literal_mode` is
@@ -296,6 +337,7 @@ pub(super) async fn wait_for_continuation(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
+    own_tag: &str,
     mut routing: Option<&mut PipelineRouting<'_>>,
 ) -> Result<ContinuationOutcome, Error> {
     loop {
@@ -319,27 +361,41 @@ pub(super) async fn wait_for_continuation(
         let digest = state.apply_side_effects(&resp);
         match resp {
             crate::types::Response::Continuation(_) => return Ok(ContinuationOutcome::Granted),
-            crate::types::Response::Tagged(t) => {
-                // Server rejected the command before the literal was
-                // sent. The server processed the prefix, so this is
-                // Acknowledged. Side effects already applied (RFC 3501 Section4.3).
+            crate::types::Response::Tagged(t) if t.tag == own_tag => {
+                // The server ended the command before the literal was sent.
+                // It processed the prefix, so this is Acknowledged. Side
+                // effects already applied (RFC 3501 Section4.3).
                 super::emit_tagged_response_code_events(&t, event_sink);
                 return match t.status {
                     // NO/BAD are tagged responses - inherently Acknowledged.
                     StatusKind::No => Err(Error::no_with_code(t.text, t.code)),
                     StatusKind::Bad => Err(Error::bad_with_code(t.text, t.code)),
-                    StatusKind::Ok => Err(Error::Protocol(
-                        "unexpected OK before literal continuation \
-                         (RFC 3501 Section4.3)"
+                    StatusKind::Ok => Err(Error::ProtocolMissing(
+                        "command completed with a tagged OK before the server sent \
+                         the `+` continuation its synchronizing literal is owed \
+                         (RFC 3501 Section 4.3); the literal was not sent"
                             .into(),
                     )),
                 };
+            }
+            crate::types::Response::Tagged(t) => {
+                return Err(Error::Protocol(format!(
+                    "unexpected tag {:?} while waiting for a literal continuation \
+                     (expected {own_tag:?})",
+                    t.tag,
+                )));
             }
             crate::types::Response::Untagged(u) => {
                 // (I13): the shared arm emits alert/notification overflow
                 // before BYE handling, so ALERT codes on BYE responses are
                 // not lost.
-                super::process_untagged_as_event(digest, u, event_sink)?;
+                // The pre-literal bytes are on the wire: a BYE is InFlight.
+                super::process_untagged_as_event(
+                    digest,
+                    u,
+                    event_sink,
+                    TransmissionState::InFlight,
+                )?;
             }
             crate::types::Response::Greeting(_) => {
                 return Err(Error::Protocol("unexpected greeting".into()));

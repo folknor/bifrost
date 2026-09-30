@@ -745,6 +745,132 @@ async fn container_delete_deselects_a_target_left_selected_in_the_pool() {
     let _server = script.await.unwrap();
 }
 
+fn rev2_select_ok(tag: &str, mailbox: &str) -> String {
+    format!(
+        "* FLAGS (\\Deleted \\Seen)\r\n\
+         * 0 EXISTS\r\n\
+         * LIST () \"/\" {mailbox}\r\n\
+         * OK [UIDVALIDITY 1] selected\r\n\
+         {tag} OK [READ-WRITE] SELECT done\r\n"
+    )
+}
+
+/// A SELECT that gets its tagged OK and is then found incomplete (here: no
+/// EXISTS) has still moved the session onto the new mailbox. The checkout's
+/// affinity must follow, or `deselect_target` for that mailbox believes the
+/// OLD one is selected and skips the UNSELECT a DELETE or RENAME needs.
+#[tokio::test]
+async fn an_incomplete_select_still_moves_the_mailbox_affinity() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev2")).await;
+    let account = scripted_account(conn, 1);
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let archive = crate::types::MailboxName::new("Archive").unwrap();
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT \"INBOX\""), "got {select}");
+        respond(&mut server, &rev2_select_ok(tag_of(&select), "INBOX")).await;
+
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT \"Archive\""), "got {select}");
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Deleted \\Seen)\r\n\
+                 * LIST () \"/\" Archive\r\n\
+                 * OK [UIDVALIDITY 1] selected\r\n\
+                 {} OK [READ-WRITE] SELECT done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let unselect = read_line(&mut server).await;
+        assert!(
+            unselect.contains("UNSELECT"),
+            "Archive is selected, so it must be deselected, got {unselect}"
+        );
+        respond(
+            &mut server,
+            &format!("{} OK UNSELECT done\r\n", tag_of(&unselect)),
+        )
+        .await;
+        server
+    });
+
+    let mut pooled = account.pool.checkout_any().await.unwrap();
+    account
+        .select_folder(&mut pooled, &inbox, None, false)
+        .await
+        .unwrap();
+    let err = account
+        .select_folder(&mut pooled, &archive, None, false)
+        .await
+        .expect_err("a SELECT without EXISTS is incomplete");
+    assert!(
+        matches!(err, crate::Error::ProtocolMissing(_)),
+        "expected the post-OK omission, got {err:?}"
+    );
+    assert_eq!(pooled.selected_affinity(), Some(&archive));
+
+    pooled
+        .deselect_target(&archive, Duration::from_secs(5))
+        .await
+        .expect("UNSELECT succeeds");
+    let _server = tokio::time::timeout(Duration::from_secs(5), script)
+        .await
+        .expect("the UNSELECT must reach the server")
+        .unwrap();
+}
+
+/// A tagged NO to SELECT deselects the previous mailbox (RFC 3501 6.3.1). The
+/// affinity must drop it, or `deselect_target` for that mailbox issues an
+/// UNSELECT from the Authenticated state, which the connection refuses, and
+/// the DELETE or RENAME behind it fails for no reason.
+#[tokio::test]
+async fn a_refused_select_clears_the_mailbox_affinity() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev2")).await;
+    let account = scripted_account(conn, 1);
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let archive = crate::types::MailboxName::new("Archive").unwrap();
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT \"INBOX\""), "got {select}");
+        respond(&mut server, &rev2_select_ok(tag_of(&select), "INBOX")).await;
+
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT \"Archive\""), "got {select}");
+        respond(
+            &mut server,
+            &format!("{} NO [NONEXISTENT] no such mailbox\r\n", tag_of(&select)),
+        )
+        .await;
+        server
+    });
+
+    let mut pooled = account.pool.checkout_any().await.unwrap();
+    account
+        .select_folder(&mut pooled, &inbox, None, false)
+        .await
+        .unwrap();
+    account
+        .select_folder(&mut pooled, &archive, None, false)
+        .await
+        .expect_err("the server refused the SELECT");
+    assert_eq!(
+        pooled.connection().session_state(),
+        crate::connection::SessionState::Authenticated
+    );
+    assert_eq!(pooled.selected_affinity(), None);
+
+    pooled
+        .deselect_target(&inbox, Duration::from_secs(5))
+        .await
+        .expect("nothing is selected, so there is nothing to deselect");
+    let _server = script.await.unwrap();
+}
+
 /// On a pre-UNSELECT server the deselect fallback replaces the checked-out
 /// connection. It must release the old one BEFORE dialing the replacement:
 /// dialing first holds `pool_cap + 1` physical connections across the whole
@@ -2220,4 +2346,473 @@ async fn the_scope_lifecycle_stream_stays_open_until_shutdown() {
         .await
         .expect("shutdown must end the lifecycle stream");
     assert!(end.is_none(), "shutdown closes the stream, got {end:?}");
+}
+
+/// Drive one PIM entry point against a server whose SELECT/EXAMINE completes
+/// without the mandatory `UIDVALIDITY`, and return the error it surfaces.
+async fn pim_error_on_select_without_uidvalidity<T: std::fmt::Debug>(
+    call: impl FnOnce(
+        ImapAccount,
+    ) -> bifrost_types::AccountFuture<Result<T, bifrost_types::AccountError>>,
+) -> bifrost_types::AccountError {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let mut caps = super::test_support::stub_capabilities();
+    caps.pim_methods.add_to_container = true;
+    caps.pim_methods.message_hydrate = true;
+    caps.pim_methods.search = true;
+    caps.pim_methods.search_messages = true;
+    caps.pim_methods.remove_from_container = true;
+    caps.pim_methods.set_is_read = true;
+    let account = ImapAccount::new(ImapAccountParts {
+        capabilities: caps,
+        ..scripted_account_parts(conn, 1)
+    });
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE \"INBOX\"") || select.contains("SELECT \"INBOX\""),
+            "expected a select of INBOX, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                 * 1 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDNEXT 9] ok\r\n\
+                 {} OK done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let err = tokio::time::timeout(Duration::from_secs(5), call(account))
+        .await
+        .expect("the PIM call must not hang")
+        .expect_err("a SELECT without UIDVALIDITY cannot yield usable ids");
+    let _server = script.await.unwrap();
+    err
+}
+
+/// A SELECT that omits UIDVALIDITY is the server's omission. Every PIM
+/// primitive that reads it (copy, delete, flag, hydrate, and both search
+/// lanes) used to answer `Request(Malformed)` - `ClientBug`, blaming the
+/// caller - while the sync lanes reading the same field answered
+/// `Protocol(MissingField)`. All of them now agree on the provider's fault.
+#[tokio::test]
+async fn pim_select_without_uidvalidity_is_the_providers_missing_field() {
+    use bifrost_types::hydration::HydrationProjection;
+    use bifrost_types::{
+        AccountErrorKind, AccountOperation, MutationTarget, ProtocolErrorKind, RecoveryClass,
+        SearchFilter, SearchRequest,
+    };
+
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let id = super::encode_object_id(&inbox, 5, 3);
+    let in_inbox = || SearchRequest::filter(SearchFilter::In(ContainerId("INBOX".to_owned())));
+
+    let mut cases: Vec<(AccountOperation, bifrost_types::AccountError)> = Vec::new();
+    {
+        let id = id.clone();
+        cases.push((
+            AccountOperation::AddToContainer,
+            pim_error_on_select_without_uidvalidity(move |account| {
+                super::pim::add_to_container(
+                    account,
+                    MutationTarget::Message(id),
+                    ContainerId("Archive".to_owned()),
+                )
+            })
+            .await,
+        ));
+    }
+    {
+        let id = id.clone();
+        cases.push((
+            AccountOperation::RemoveFromContainer,
+            pim_error_on_select_without_uidvalidity(move |account| {
+                super::pim::remove_from_container(
+                    account,
+                    MutationTarget::Message(id),
+                    ContainerId("INBOX".to_owned()),
+                )
+            })
+            .await,
+        ));
+    }
+    {
+        let id = id.clone();
+        cases.push((
+            AccountOperation::SetIsRead,
+            pim_error_on_select_without_uidvalidity(move |account| {
+                super::pim::set_is_read(account, MutationTarget::Message(id), true)
+            })
+            .await,
+        ));
+    }
+    {
+        let id = id.clone();
+        cases.push((
+            AccountOperation::HydrateMessage,
+            pim_error_on_select_without_uidvalidity(move |account| {
+                super::pim::message_hydrate(account, id, HydrationProjection::Full)
+            })
+            .await,
+        ));
+    }
+    cases.push((
+        AccountOperation::Search,
+        pim_error_on_select_without_uidvalidity(move |account| {
+            super::pim::search(account, in_inbox())
+        })
+        .await,
+    ));
+    cases.push((
+        AccountOperation::SearchMessages,
+        pim_error_on_select_without_uidvalidity(move |account| {
+            super::pim::search_messages(account, in_inbox())
+        })
+        .await,
+    ));
+
+    for (op, err) in cases {
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+            "{op:?}: the omission is the server's, got {err:?}"
+        );
+        assert_eq!(
+            err.recovery(),
+            &RecoveryClass::ProviderContractViolation,
+            "{op:?}: got {err:?}"
+        );
+        assert_eq!(
+            err.operation(),
+            Some(op),
+            "{op:?}: the calling op rides along"
+        );
+    }
+}
+
+/// Run `message_hydrate` for INBOX uid 3 (UIDVALIDITY 5) against a server that
+/// selects INBOX at UIDVALIDITY 5 and answers the UID FETCH with `fetch_data`
+/// (untagged FETCH lines, possibly none) before its tagged OK.
+async fn hydrate_uid_3_against(
+    fetch_data: &'static str,
+) -> Result<bifrost_types::hydration::Message, bifrost_types::AccountError> {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let mut caps = super::test_support::stub_capabilities();
+    caps.pim_methods.message_hydrate = true;
+    let account = ImapAccount::new(ImapAccountParts {
+        capabilities: caps,
+        ..scripted_account_parts(conn, 1)
+    });
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE \"INBOX\""),
+            "expected EXAMINE, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Seen)\r\n\
+                 * 9 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 10] ok\r\n\
+                 {} OK [READ-ONLY] done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let fetch = read_line(&mut server).await;
+        assert!(
+            fetch.contains("UID FETCH 3"),
+            "expected UID FETCH 3, got {fetch}"
+        );
+        respond(
+            &mut server,
+            &format!("{fetch_data}{} OK done\r\n", tag_of(&fetch)),
+        )
+        .await;
+        server
+    });
+
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pim::message_hydrate(
+            account,
+            super::encode_object_id(&inbox, 5, 3),
+            bifrost_types::hydration::HydrationProjection::Headers,
+        ),
+    )
+    .await
+    .expect("message_hydrate must not hang");
+    let _server = script.await.unwrap();
+    result
+}
+
+/// A UID FETCH that completes without data for a UID valid in the current
+/// UIDVALIDITY epoch is how IMAP reports an expunged message (RFC 9051 6.4.9:
+/// a non-existent UID is ignored). That is `NotFound(Message)`, answered by
+/// the server, not the caller's malformed request. An unsolicited FETCH for a
+/// DIFFERENT uid in the same exchange must not stand in for the missing one:
+/// the answer used to be whatever sorted last in the collected responses.
+#[tokio::test]
+async fn message_hydrate_of_an_expunged_uid_is_not_found() {
+    use bifrost_types::{
+        AccountErrorKind, AccountOperation, Cause, ErrorScope, RecoveryClass, ResourceKind,
+        TransmissionState,
+    };
+
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let wanted = super::encode_object_id(&inbox, 5, 3);
+
+    for (label, data) in [
+        ("no FETCH data at all", ""),
+        (
+            "only an unsolicited FETCH for another uid",
+            "* 9 FETCH (UID 9 FLAGS (\\Seen))\r\n",
+        ),
+    ] {
+        let err = hydrate_uid_3_against(data).await.expect_err(label);
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::NotFound(ResourceKind::Message),
+            "{label}: got {err:?}"
+        );
+        assert_eq!(err.recovery(), &RecoveryClass::ProviderRefused, "{label}");
+        assert_eq!(
+            err.operation(),
+            Some(AccountOperation::HydrateMessage),
+            "{label}"
+        );
+        assert_eq!(
+            err.scope(),
+            Some(&ErrorScope::Message { id: wanted.clone() }),
+            "{label}"
+        );
+        assert!(
+            err.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Attempt(a) if a.transmission_state == TransmissionState::Acknowledged
+            )),
+            "{label}: the server answered, so the attempt is Acknowledged: {err:?}"
+        );
+    }
+
+    // Present alongside an unsolicited FETCH for a higher uid: the requested
+    // message is the answer, not the one that sorts last.
+    let message =
+        hydrate_uid_3_against("* 3 FETCH (UID 3 FLAGS ())\r\n* 9 FETCH (UID 9 FLAGS (\\Seen))\r\n")
+            .await
+            .expect("uid 3 was returned");
+    assert_eq!(message.id, wanted);
+}
+
+/// `add_to_container` and `message_hydrate` read their `pim_methods` flag like
+/// every sibling primitive: a false flag refuses before any wire work. The
+/// server half is dropped, so a method that reached the pool would surface a
+/// transport error instead of `Unsupported`.
+#[tokio::test]
+async fn add_to_container_and_message_hydrate_honour_their_capability_flags() {
+    use bifrost_types::{AccountErrorKind, AccountOperation, MutationTarget};
+
+    let (conn, server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    drop(server);
+    let caps = super::test_support::stub_capabilities();
+    assert!(!caps.pim_methods.add_to_container);
+    assert!(!caps.pim_methods.message_hydrate);
+    let account = ImapAccount::new(ImapAccountParts {
+        capabilities: caps,
+        ..scripted_account_parts(conn, 1)
+    });
+    // A well-formed id, so a missing gate proceeds toward the wire rather
+    // than failing id decode first.
+    let id = super::encode_object_id(&crate::types::MailboxName::new("INBOX").unwrap(), 5, 3);
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pim::add_to_container(
+            account.clone(),
+            MutationTarget::Message(id.clone()),
+            ContainerId("Archive".to_owned()),
+        ),
+    )
+    .await
+    .expect("must not hang")
+    .expect_err("a false add_to_container flag refuses");
+    assert_eq!(
+        err.kind(),
+        &AccountErrorKind::Unsupported(AccountOperation::AddToContainer)
+    );
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pim::message_hydrate(
+            account,
+            id,
+            bifrost_types::hydration::HydrationProjection::Headers,
+        ),
+    )
+    .await
+    .expect("must not hang")
+    .expect_err("a false message_hydrate flag refuses");
+    assert_eq!(
+        err.kind(),
+        &AccountErrorKind::Unsupported(AccountOperation::HydrateMessage)
+    );
+}
+
+/// `thread_hydrate` answers exactly one message per REQUESTED uid. The UID
+/// FETCH here carries, besides the two members: a trailing FLAGS-only
+/// response for uid 3 after its body-bearing one, and an unsolicited FETCH
+/// for uid 9, which is not in the thread. Each response used to become a
+/// `Message` of its own, so the thread came back with four messages - uid 3
+/// twice, one copy bodiless - and a stranger.
+#[tokio::test]
+async fn thread_hydrate_answers_once_per_requested_uid() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let mut caps = super::test_support::stub_capabilities();
+    caps.pim_methods.thread_hydrate = true;
+    let account = ImapAccount::new(ImapAccountParts {
+        capabilities: caps,
+        ..scripted_account_parts(conn, 1)
+    });
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let thread = super::encode_thread_id(&inbox, 5, &[3, 4]);
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE \"INBOX\""),
+            "expected EXAMINE, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Seen)\r\n\
+                 * 9 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 10] ok\r\n\
+                 {} OK [READ-ONLY] done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let fetch = read_line(&mut server).await;
+        assert!(
+            fetch.contains("UID FETCH"),
+            "expected UID FETCH, got {fetch}"
+        );
+        let body = "From: a@b.test\r\nSubject: hi\r\n\r\nhello there\r\n";
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 3 FLAGS () BODY[] {{{}}}\r\n{body})\r\n\
+                 * 1 FETCH (UID 3 FLAGS (\\Seen))\r\n\
+                 * 2 FETCH (UID 4 FLAGS ())\r\n\
+                 * 9 FETCH (UID 9 FLAGS (\\Seen))\r\n\
+                 {} OK done\r\n",
+                body.len(),
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+        server
+    });
+
+    let hydrated = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pim::thread_hydrate(account, thread),
+    )
+    .await
+    .expect("thread_hydrate must not hang")
+    .expect("the thread hydrates");
+    let _server = script.await.unwrap();
+
+    let ids: Vec<_> = hydrated.messages.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            super::encode_object_id(&inbox, 5, 3),
+            super::encode_object_id(&inbox, 5, 4),
+        ],
+        "one message per requested uid, and nothing else"
+    );
+    let first = &hydrated.messages[0];
+    assert!(
+        first
+            .body_text
+            .as_deref()
+            .is_some_and(|text| text.contains("hello there")),
+        "the trailing FLAGS-only response must not replace the body: {first:?}"
+    );
+}
+
+/// A tagged `NO` to the SELECT that PREPARES a mutation is the server's answer
+/// to the SELECT, not to the mutation: the COPY was never sent. The error must
+/// not carry the SELECT's `Acknowledged` evidence for the non-idempotent
+/// operation, or recovery would reconcile a copy that never happened.
+#[tokio::test]
+async fn a_refused_preflight_select_leaves_the_mutation_unsent() {
+    use bifrost_types::{AccountOperation, Cause, MutationTarget, TransmissionState};
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let mut caps = super::test_support::stub_capabilities();
+    caps.pim_methods.add_to_container = true;
+    let account = ImapAccount::new(ImapAccountParts {
+        capabilities: caps,
+        ..scripted_account_parts(conn, 1)
+    });
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("SELECT \"INBOX\""),
+            "expected SELECT, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!("{} NO mailbox busy\r\n", tag_of(&select)),
+        )
+        .await;
+        server
+    });
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pim::add_to_container(
+            account,
+            MutationTarget::Message(super::encode_object_id(&inbox, 5, 3)),
+            ContainerId("Archive".to_owned()),
+        ),
+    )
+    .await
+    .expect("add_to_container must not hang")
+    .expect_err("a refused SELECT fails the copy");
+    let _server = script.await.unwrap();
+
+    assert_eq!(err.operation(), Some(AccountOperation::AddToContainer));
+    let attempts: Vec<TransmissionState> = err
+        .chain()
+        .iter()
+        .filter_map(|cause| match cause {
+            Cause::Attempt(a) => Some(a.transmission_state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        attempts,
+        vec![TransmissionState::Unsent],
+        "the COPY was never sent: {err:?}"
+    );
 }

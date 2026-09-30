@@ -142,7 +142,17 @@ async fn an_earlier_commands_tagged_no_lands_in_its_own_result_slot() {
     assert_eq!(body, LITERAL_IDENTIFIER.as_bytes());
     let _trailer = read_line(&mut server).await;
 
-    respond(&mut server, &format!("{tag2} OK listrights done\r\n")).await;
+    // Command #2 gets its own LISTRIGHTS data (the identifier as a literal,
+    // since it is not ASCII) and its own OK, so its slot has a definite right
+    // answer: the parsed rights, not merely "some result other than #1's".
+    respond(
+        &mut server,
+        &format!(
+            "* LISTRIGHTS INBOX {{5}}\r\n{LITERAL_IDENTIFIER} lr x\r\n\
+             {tag2} OK listrights done\r\n"
+        ),
+    )
+    .await;
 
     let results = task.await.unwrap().expect("the batch must not abort");
     let err = results[0]
@@ -152,15 +162,13 @@ async fn an_earlier_commands_tagged_no_lands_in_its_own_result_slot() {
         format!("{err}").contains("myrights refused"),
         "wrong error routed to command #1: {err}"
     );
-    // Command #2's own outcome is its own business - this transcript sends it
-    // no LISTRIGHTS data, so its consumer may well complain. What must never
-    // happen is command #1's refusal surfacing as command #2's.
-    if let Err(ref e2) = results[1] {
-        assert!(
-            !format!("{e2}").contains("myrights refused"),
-            "command #1's failure was misattributed to command #2: {e2}"
-        );
-    }
+    let rights = results[1]
+        .as_ref()
+        .expect("command #1's refusal must not surface as command #2's")
+        .downcast_ref::<crate::types::ListRightsResponse>()
+        .expect("LISTRIGHTS output is a ListRightsResponse");
+    assert_eq!(rights.required, "lr");
+    assert_eq!(rights.optional, vec!["x".to_owned()]);
 }
 
 /// A `NO` answering the command whose literal is being negotiated is that
@@ -375,6 +383,80 @@ async fn a_tag_correlated_esearch_reaches_the_search_its_tag_names() {
         .expect("SEARCH RETURN output is an EsearchResponse");
     assert_eq!(second.tag.as_deref(), Some(tag2.as_str()));
     assert_eq!(second.all, vec![crate::types::UidRange::single(7)]);
+}
+
+/// A tag-correlated ESEARCH naming a pipelined search that has ALREADY
+/// finalized is surplus data for a completed command and is dropped, not
+/// published as an event.
+///
+/// The router used to let it fall through to head routing, where the still
+/// active first search buffered it as a foreign-tagged ESEARCH and surrendered
+/// it on its tagged OK, so it surfaced as an event the classifier says cannot
+/// exist (ESEARCH is `OnlySolicited` inside a search, `Impossible` elsewhere).
+/// The EXISTS beside it is the control: an ordinary `Either` response still
+/// reaches the event queue through the same consumer, so an empty queue is
+/// not what the assertion rests on.
+#[tokio::test]
+async fn a_surplus_esearch_for_a_finalized_search_is_dropped_not_published() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ESEARCH")).await;
+
+    let task = tokio::spawn(async move {
+        let results = conn
+            .pipeline()
+            .uid_search("ALL".to_owned())
+            .uid_search_return("ALL".to_owned(), vec!["ALL".to_owned()])
+            .execute_dynamic()
+            .await;
+        (conn, results)
+    });
+
+    let search = read_line(&mut server).await;
+    let tag1 = tag_of(&search).to_owned();
+    let search_return = read_line(&mut server).await;
+    let tag2 = tag_of(&search_return).to_owned();
+
+    // Command #2 completes first; a second ESEARCH naming it then arrives
+    // while command #1 is still the head.
+    respond(
+        &mut server,
+        &format!(
+            "* ESEARCH (TAG \"{tag2}\") UID ALL 7\r\n{tag2} OK search return done\r\n\
+             * ESEARCH (TAG \"{tag2}\") UID ALL 9\r\n* 5 EXISTS\r\n* SEARCH 3\r\n\
+             {tag1} OK search done\r\n"
+        ),
+    )
+    .await;
+
+    let (conn, results) = task.await.unwrap();
+    let results = results.expect("the batch must not abort");
+    let first = results[0]
+        .as_ref()
+        .expect("command #1 completes normally")
+        .downcast_ref::<crate::connection::SearchResult>()
+        .expect("SEARCH output is a SearchResult");
+    assert_eq!(first.ids, vec![3]);
+    let second = results[1]
+        .as_ref()
+        .expect("command #2 completes normally")
+        .downcast_ref::<crate::types::EsearchResponse>()
+        .expect("SEARCH RETURN output is an EsearchResponse");
+    assert_eq!(second.all, vec![crate::types::UidRange::single(7)]);
+
+    let events = conn.drain_events().await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, crate::connection::typed_event::TypedEvent::Exists(5))),
+        "the control EXISTS did not reach the event queue: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            crate::connection::typed_event::TypedEvent::Extension(u)
+                if matches!(**u, crate::types::response::UntaggedResponse::Esearch(_))
+        )),
+        "a surplus ESEARCH for a finalized search was published: {events:?}"
+    );
 }
 
 /// The tag the generator will produce after `tag`.

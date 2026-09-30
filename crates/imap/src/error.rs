@@ -138,11 +138,16 @@ pub(crate) enum Error {
     /// untagged STATUS / QUOTA / ACL / SEARCH it owes, a STATUS reply
     /// without the item asked for).
     ///
-    /// Behaves exactly like `Protocol` everywhere (connection-fatal, same
-    /// display text, same `ProviderContractViolation` recovery); only the
-    /// account kind is finer, `Protocol(MissingField)` instead of
-    /// `Protocol(ContractViolation)`, so diagnostics can tell "the server
-    /// left something out" from "the server sent something wrong".
+    /// Same display text and same `ProviderContractViolation` recovery as
+    /// `Protocol`; the account kind is finer, `Protocol(MissingField)`
+    /// instead of `Protocol(ContractViolation)`, so diagnostics can tell "the
+    /// server left something out" from "the server sent something wrong".
+    ///
+    /// Unlike `Protocol` it is NOT connection-fatal. It is only ever raised
+    /// once the exchange has completed (from `finalize`, on the command's own
+    /// tagged OK, or by the account layer afterwards), so the framing is
+    /// intact and the connection is reusable. It must not be used for an
+    /// omission noticed while the exchange is still open.
     #[error("protocol error: {0}")]
     ProtocolMissing(String),
 
@@ -444,13 +449,20 @@ impl Error {
     /// Server rejections and local validation failures leave command
     /// framing intact. Transport loss, BYE, parse failure, and protocol
     /// desynchronization do not.
+    ///
+    /// `ProtocolMissing` is deliberately absent: every producer raises it
+    /// from a consumer's `finalize`, after the command's own tagged OK was
+    /// read, or from the account layer after the command returned. An
+    /// omission is not a desynchronization - the server finished the
+    /// exchange and the next byte on the wire begins a fresh response - so
+    /// the connection stays reusable. A producer that could raise it with
+    /// the exchange unfinished must use `Protocol` instead.
     pub(crate) const fn is_connection_fatal(&self) -> bool {
         matches!(
             self,
             Self::Io { .. }
                 | Self::Bye { .. }
                 | Self::Protocol(_)
-                | Self::ProtocolMissing(_)
                 | Self::Parse(_)
                 | Self::Closed { .. }
                 | Self::DriverPanicked { .. }
@@ -501,6 +513,12 @@ impl Error {
     }
 
     /// Construct a `DriverGone` with no attempt-state evidence.
+    ///
+    /// Test-only. A driver death always has a phase relative to the caller
+    /// (`Unsent` when it never received a command, `InFlight` when it owned
+    /// one), and a missing phase reads as `Unsent`, so production code mints
+    /// through [`Error::driver_gone_at`] or `observe_driver_panic`.
+    #[cfg(test)]
     pub(crate) const fn driver_gone() -> Self {
         Self::DriverGone { attempt: None }
     }

@@ -368,8 +368,9 @@ impl ImapConnection {
     ///   require BINARY (RFC 3516 Sections 4.5.1-4.5.2).
     /// - On `IMAP4rev2`, those FETCH items are part of the base protocol
     ///   (RFC 9051 Appendix B).
-    /// - `SAVEDATE` requires SAVEDATE (RFC 8514 Section 3).
-    /// - `EMAILID` / `THREADID` require OBJECTID (RFC 8474 Sections 4 and 7).
+    /// - `SAVEDATE` requires SAVEDATE (RFC 8514 Section 3), on rev2 as well.
+    /// - `EMAILID` / `THREADID` require OBJECTID (RFC 8474 Sections 4 and 7),
+    ///   on rev2 as well.
     pub(super) fn validate_requested_fetch_items(&self, items: &[FetchAttr]) -> Result<(), Error> {
         let snap = self.state_rx.borrow();
         let usable = |capability: Capability| super::auth::snapshot_supports(&snap, &capability);
@@ -406,10 +407,14 @@ impl ImapConnection {
                     }
                 }
                 // RFC 9051 Appendix B: IMAP4rev2 folds the FETCH side of
-                // RFC 3516 into the base protocol, so explicit BINARY is
-                // only required on IMAP4rev1.
+                // RFC 3516 into the base protocol, but not its APPEND side,
+                // so the rev2 clause is asked here and NOT through
+                // `supports(Binary)`, which stays advertised-only.
                 FetchAttr::Binary { .. } | FetchAttr::BinarySize { .. }
-                    if !usable(Capability::Binary) =>
+                    if !crate::types::profile::binary_fetch_usable(
+                        &snap.capabilities,
+                        &snap.enabled,
+                    ) =>
                 {
                     return Err(Error::MissingCapability("BINARY".into()));
                 }
@@ -496,24 +501,6 @@ impl ImapConnection {
             .enabled
             .iter()
             .any(|e| e.eq_ignore_ascii_case("UTF8=ACCEPT"))
-    }
-
-    /// Determine the [`LiteralMode`] based on the server's advertised capabilities.
-    ///
-    /// RFC 7888 Section 4: LITERAL+  -  non-synchronizing literals of any size.
-    /// RFC 7888 Section 5: LITERAL-  -  non-synchronizing literals up to 4096 bytes.
-    /// RFC 9051 Appendix E item 2 / Section 4.3: pure `IMAP4rev2` includes the
-    /// same 4096-octet non-synchronizing literal behavior as LITERAL-.
-    /// RFC 3501 Section 4.3: otherwise, literals are synchronizing.
-    pub(super) fn literal_mode(&self) -> LiteralMode {
-        let snap = self.state_rx.borrow();
-        if snap.capabilities.contains(&Capability::LiteralPlus) {
-            LiteralMode::LiteralPlus
-        } else if super::auth::snapshot_supports(&snap, &Capability::LiteralMinus) {
-            LiteralMode::LiteralMinus
-        } else {
-            LiteralMode::Synchronizing
-        }
     }
 
     // -----------------------------------------------------------------------

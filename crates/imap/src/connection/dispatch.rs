@@ -142,10 +142,11 @@ pub(crate) struct Finalized<T> {
     /// something buried in the erased `Box<dyn Any>`, because the driver reads
     /// it: `is_connection_fatal` decides whether to close the command receiver
     /// and move protocol state BEFORE the result is published. A consumer
-    /// failure can be `Error::Protocol` (SCRAM completing before the
-    /// server-final verification) or `Error::ProtocolMissing` (CAPABILITY
-    /// with no capability data, STATUS with no matching response), and hiding
-    /// one inside `Any` would disable that handling.
+    /// failure can be connection-fatal (`Error::Protocol`: SCRAM completing
+    /// before the server-final verification) or not (`Error::ProtocolMissing`:
+    /// CAPABILITY with no capability data, STATUS with no matching response,
+    /// which the tagged completion leaves with the framing intact), and hiding
+    /// either inside `Any` would take that decision away from the driver.
     pub output: Result<T, Error>,
     /// Responses the consumer decided were not actually part of its
     /// solicited result. Dispatcher re-emits these to the event sink.
@@ -340,8 +341,9 @@ impl Consumer for CapabilityConsumer {
         } else if let Some(ResponseCode::Capability(c)) = tagged.code {
             c
         } else {
-            // Stays a real `Error` in `output`: the driver inspects it with
-            // `is_connection_fatal` before publishing the result.
+            // Stays a real `Error` in `output`, which the driver inspects with
+            // `is_connection_fatal` before publishing the result. An omission
+            // after the tagged OK is not fatal: the connection stays usable.
             return Finalized::failure(
                 Error::ProtocolMissing(
                     "CAPABILITY OK but no capability data in response \
@@ -395,6 +397,14 @@ impl Consumer for LogoutConsumer {
         // silently. Both arms surrender it. LOGOUT buffers everything it sees
         // (including the BYE itself, which `on_response` only flags rather
         // than consuming), and all of it is `Either` data.
+        //
+        // The tagged status is read FIRST. RFC 3501 Section 6.1.3 owes the
+        // BYE only ahead of a tagged OK: a server that refuses LOGOUT with
+        // NO/BAD has not begun closing, so its refusal is the answer and a
+        // missing BYE there is no omission at all.
+        if let Err(e) = tagged.require_ok() {
+            return Finalized::failure(e, self.buffered);
+        }
         if !self.saw_bye {
             return Finalized::failure(
                 Error::ProtocolMissing(
@@ -405,10 +415,7 @@ impl Consumer for LogoutConsumer {
                 self.buffered,
             );
         }
-        match tagged.require_ok() {
-            Ok(_) => Finalized::success((), self.buffered),
-            Err(e) => Finalized::failure(e, self.buffered),
-        }
+        Finalized::success((), self.buffered)
     }
 }
 

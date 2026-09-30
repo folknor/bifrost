@@ -2703,17 +2703,41 @@ fn append_literal8_plus_marker_matrix() {
         "BINARY without a literal extension"
     );
 
-    // Pure rev2: BINARY is implied and literal8 is always synchronizing.
-    let rev2 = EncodeOptions {
+    // Pure rev2 with BINARY advertised: literal8 is always synchronizing.
+    let rev2_binary = EncodeOptions {
         utf8_mode: true,
         literal_mode: LiteralMode::LiteralMinus,
-        capabilities: vec![Capability::Imap4Rev2, Capability::MultiAppend],
+        capabilities: vec![
+            Capability::Imap4Rev2,
+            Capability::MultiAppend,
+            Capability::Binary,
+        ],
         enabled: Vec::new(),
     };
     assert_eq!(
-        append_wire("A", "INBOX", &small, false, &rev2),
+        append_wire("A", "INBOX", &small, false, &rev2_binary),
         "A APPEND \"INBOX\" ~{100}\r\n<100>\r\n",
-        "rev2 literal8 has no `+` modifier, and NUL is allowed because BINARY is implied"
+        "rev2 literal8 has no `+` modifier"
+    );
+}
+
+/// RFC 9051 Appendix B: IMAP4rev2 folds in the BINARY FETCH items but not
+/// RFC 3516's APPEND extension, so a pure rev2 server that does not advertise
+/// BINARY is owed no `literal8` APPEND body. A NUL-bearing message is refused
+/// before any byte exists, exactly as on rev1.
+#[test]
+fn rev2_does_not_imply_binary_for_append() {
+    let rev2 = EncodeOptions {
+        utf8_mode: true,
+        literal_mode: LiteralMode::LiteralMinus,
+        capabilities: vec![Capability::Imap4Rev2],
+        enabled: Vec::new(),
+    };
+    let err = encode_append("A", "INBOX", &[append_nul_msg(100)], false, &rev2)
+        .expect_err("pure rev2 without BINARY cannot carry a NUL body");
+    assert!(
+        matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
+        "got {err:?}"
     );
 }
 

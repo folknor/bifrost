@@ -740,7 +740,9 @@ async fn dispatch_response_loop(
                 // (I13): emit alert/notification overflow before
                 // classification so they reach the event queue even
                 // when the response is routed to a consumer.
-                let code_emitted = process_untagged_prefix(digest, &u, event_sink)?;
+                // The command is on the wire: a BYE here is InFlight.
+                let code_emitted =
+                    process_untagged_prefix(digest, &u, event_sink, TransmissionState::InFlight)?;
 
                 let class_ctx = ClassificationContext {
                     notify: notify_before,
@@ -820,7 +822,7 @@ pub(in crate::connection) async fn run_append_command(
     // the only one that can arrive during the send. Errors before a tagged
     // response are Unsent or InFlight depending on where in the send they
     // occur; the sender stamps them. After the send, responses are InFlight.
-    send_chunked_segments(wire_reader, state, event_sink, encoded.segments()).await?;
+    send_chunked_segments(wire_reader, state, event_sink, encoded.segments(), &tag).await?;
 
     dispatch_response_loop(
         wire_reader,
@@ -920,9 +922,17 @@ fn publish_then_answer<T>(publish: impl FnOnce(), result_tx: oneshot::Sender<T>,
 /// `process_untagged_prefix` is that single application point, and keeping
 /// this unexported is what stops a fifth hand-rolled copy of the pair from
 /// drifting out of order again.
+///
+/// `phase` is how far the active command had got when the read happened.
+/// An untagged BYE does not complete that command, so its outcome is unknown
+/// once any of it is on the wire: every read loop today reads only after
+/// writing, and passes `InFlight`. The BYE used to carry no attempt at all,
+/// which reads as `Unsent` and let a non-idempotent command the server may
+/// have executed be retried blind.
 fn short_circuit_on_bye(
     digest: super::state::SideEffectDigest,
     response: &UntaggedResponse,
+    phase: bifrost_types::TransmissionState,
 ) -> Result<(), Error> {
     if !digest.had_bye() {
         return Ok(());
@@ -931,28 +941,31 @@ fn short_circuit_on_bye(
     let UntaggedResponse::Status { status, text, code } = response else {
         debug_assert!(false, "only an untagged BYE may set the BYE digest");
         // Raised mid-read, with the state machine already marked for BYE:
-        // the connection retires. An untagged BYE does not complete the
-        // active command, whose outcome is unknown, hence `InFlight`.
+        // the connection retires.
         return Err(Error::internal_mid_exchange(
             "BYE digest without a status response",
-            bifrost_types::TransmissionState::InFlight,
+            phase,
         ));
     };
     debug_assert!(matches!(status, UntaggedStatus::Bye));
-    Err(Error::bye_with_code(text.clone(), code.clone()))
+    Err(Error::bye_with_code(text.clone(), code.clone()).with_attempt(phase))
 }
 
 /// The shared prologue every driver read loop runs on an untagged response:
 /// emit response-code events, then fail the command if the response was a BYE.
 /// Returns whether a code event was emitted, which the caller uses to decide
 /// whether the response still needs a plain event of its own.
+///
+/// `phase` stamps the BYE error (see `short_circuit_on_bye`); each loop
+/// states how far its command had got rather than leaving it unstamped.
 pub(super) fn process_untagged_prefix(
     digest: super::state::SideEffectDigest,
     response: &UntaggedResponse,
     event_sink: &mut event_sink::DriverEventSink,
+    phase: bifrost_types::TransmissionState,
 ) -> Result<bool, Error> {
     let code_emitted = emit_untagged_response_code_events(response, event_sink);
-    short_circuit_on_bye(digest, response)?;
+    short_circuit_on_bye(digest, response, phase)?;
     Ok(code_emitted)
 }
 
@@ -960,13 +973,14 @@ pub(super) fn process_untagged_prefix(
 /// run the shared prologue, then forward the response as a typed event unless
 /// the prologue already published its critical code as one.
 ///
-/// Three read loops always answer an untagged response this way - the IDLE
-/// loop, the post-DONE IDLE drain, and the best-effort LOGOUT drain - and a
-/// fourth, the synchronizing-literal continuation wait, does so only WHEN IT
-/// HAS NO ROUTING CONTEXT, i.e. for single-command dispatch and IDLE. Under a pipelined batch
+/// Four read loops always answer an untagged response this way - IDLE's
+/// wait for its `+` grant, the IDLE loop, the post-DONE IDLE drain, and the
+/// best-effort LOGOUT drain - and a fifth, the synchronizing-literal
+/// continuation wait, does so only WHEN IT HAS NO ROUTING CONTEXT, i.e. for
+/// single-command dispatch. Under a pipelined batch
 /// that same wait does have consumers to route to - earlier commands in the
 /// batch are still outstanding - and takes the router instead; answering those
-/// responses here is what silently truncated a batch's results. The four
+/// responses here is what silently truncated a batch's results. The five
 /// differ in how they terminate and in what they do with a tagged response,
 /// but not here, so the "prologue, then forward iff no code event" pairing
 /// lives once. Loops that DO have a consumer (command dispatch, the pipeline
@@ -977,8 +991,9 @@ pub(super) fn process_untagged_as_event(
     digest: super::state::SideEffectDigest,
     response: Box<UntaggedResponse>,
     event_sink: &mut event_sink::DriverEventSink,
+    phase: bifrost_types::TransmissionState,
 ) -> Result<(), Error> {
-    let code_emitted = process_untagged_prefix(digest, &response, event_sink)?;
+    let code_emitted = process_untagged_prefix(digest, &response, event_sink, phase)?;
     if !code_emitted {
         let _ = event_sink.emit((*response).into());
     }

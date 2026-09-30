@@ -295,7 +295,14 @@ pub(super) async fn logout_best_effort(
             // that we care about, and the connection is going away.
             crate::types::Response::Tagged(_) => break,
             crate::types::Response::Untagged(u) => {
-                super::process_untagged_as_event(digest, u, event_sink)?;
+                // LOGOUT is on the wire. The drain's errors are discarded at
+                // teardown, but the phase is stated like every other loop's.
+                super::process_untagged_as_event(
+                    digest,
+                    u,
+                    event_sink,
+                    bifrost_types::TransmissionState::InFlight,
+                )?;
             }
             crate::types::Response::Continuation(_) | crate::types::Response::Greeting(_) => {}
         }
