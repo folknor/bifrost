@@ -1363,6 +1363,12 @@ fn check_absolute_series(
         if until.is_some_and(|(until_index, _)| index > until_index) {
             break;
         }
+        // A yearly series starts its walk at BYMONTH in the start's year,
+        // which can lie before the start's month: not an occurrence, whether
+        // or not that month has the day.
+        if index < start_index {
+            continue;
+        }
         let in_until_month = until.filter(|(until_index, _)| index == *until_index);
         let last_day = days_in_indexed_month(index);
         if day > last_day {
@@ -3186,6 +3192,9 @@ mod tests {
             // 2100 is not a leap year, the nineteenth candidate from 2028.
             ("FREQ=YEARLY;INTERVAL=4", "2028-02-29"),
             ("FREQ=YEARLY;INTERVAL=4;COUNT=19", "2028-02-29"),
+            // February 2028 precedes the start and is no occurrence, so
+            // COUNT=1 reaches February 2029, which Graph would clamp.
+            ("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29;COUNT=1", "2028-03-29"),
             // A huge interval must not overflow its way to acceptance.
             ("FREQ=MONTHLY;INTERVAL=4000000000", "2026-01-31"),
         ];
@@ -3216,6 +3225,9 @@ mod tests {
             ("FREQ=YEARLY;INTERVAL=4;COUNT=18", "2028-02-29"),
             // A day before the start in the start's month is not an occurrence.
             ("FREQ=MONTHLY;BYMONTHDAY=15;COUNT=1", "2026-01-20"),
+            // February 2027 lacks the 29th but precedes the start; the one
+            // occurrence is February 2028.
+            ("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29;COUNT=1", "2027-03-01"),
         ];
         for (rrule, start) in accepted {
             assert!(
