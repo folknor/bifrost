@@ -1232,18 +1232,19 @@ mod tests {
         assert_eq!(etag.as_deref(), Some("v2"));
     }
 
-    /// A recurrence-instance `EventId` is refused before anything is sent.
+    /// A recurrence-instance `EventId` is refused before anything is sent by the
+    /// two doors that act on the whole resource.
     ///
     /// `events_from_ical` mints `"{uri}#{recurrence_id}"` for override VEVENTs,
     /// and a URL fragment never goes on the wire - so unguarded, every one of
     /// these ids addressed the master resource. `event_delete` was the severe
     /// case: deleting one occurrence DELETEd the whole `.ics` and destroyed the
-    /// entire series.
+    /// entire series. (`event_get` and `event_update` resolve the qualified id
+    /// instead; see `a_listed_override_id_reads_and_updates_the_vevent_it_named`.)
     ///
     /// The script is deliberately EMPTY. Any request at all starves it and
     /// panics, so this fails loudly if a guard is removed rather than quietly
-    /// asserting on an error some other layer produced. All four write and read
-    /// doors are covered, because all four resolved the same wrong URL.
+    /// asserting on an error some other layer produced.
     #[tokio::test]
     async fn recurrence_instance_ids_are_refused_before_reaching_the_wire() {
         use bifrost_types::account::Account as _;
@@ -1264,14 +1265,6 @@ mod tests {
             .await
             .expect_err("deleting one occurrence must not delete the series");
         account
-            .event_get(instance.clone())
-            .await
-            .expect_err("reading one occurrence must not silently return the master");
-        account
-            .event_update(instance.clone(), bifrost_types::EventPatch::default())
-            .await
-            .expect_err("editing one occurrence must not rewrite the series");
-        account
             .event_rsvp(instance, bifrost_types::RsvpStatus::Accepted)
             .await
             .expect_err("answering for one occurrence must not answer for the series");
@@ -1280,6 +1273,109 @@ mod tests {
             transcripts(&script).is_empty(),
             "a refused instance id must reach no transport at all"
         );
+    }
+
+    /// An id the listing lanes minted for an override reads and updates the
+    /// VEVENT it named, over a resource that holds only overrides.
+    ///
+    /// The wire address is the resource alone (no fragment), and the PUT body
+    /// changes the named VEVENT and no other. Reverting `split_event_id` in
+    /// `fetch_event_from_url` (passing `None` as the instance) reads "First"
+    /// for the second id; reverting it in `event_update` PUTs to a fragment URL.
+    /// The bare id over several overrides is refused rather than answered with
+    /// the first, and a move on behalf of one override is refused before any
+    /// I/O (the empty script starves if the guard is removed).
+    #[tokio::test]
+    async fn a_listed_override_id_reads_and_updates_the_vevent_it_named() {
+        use bifrost_types::account::Account as _;
+
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260609T120000Z\r\n\
+                   SUMMARY:First\r\nDTSTART:20260609T140000Z\r\nDTEND:20260609T150000Z\r\n\
+                   END:VEVENT\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260616T120000Z\r\n\
+                   SUMMARY:Second\r\nDTSTART:20260616T140000Z\r\nDTEND:20260616T150000Z\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let ok = |status: StatusCode, body: &str| DavResponse {
+            status,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let second = bifrost_types::EventId(
+            "https://dav.example.test/calendar/series.ics#20260616T120000Z".to_string(),
+        );
+        let account_over = |script: &Arc<_>| {
+            let client = Arc::new(CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(script),
+            ));
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/")
+        };
+
+        let script = dav_script([
+            ok(StatusCode::OK, ics),
+            ok(StatusCode::OK, ics),
+            ok(StatusCode::NO_CONTENT, ""),
+        ]);
+        let account = account_over(&script);
+        let read = account.event_get(second.clone()).await.expect("resolves");
+        assert_eq!(read.title.as_deref(), Some("Second"));
+        assert_eq!(
+            read.id, second,
+            "the id read back is the id the listing gave"
+        );
+
+        let patch = bifrost_types::EventPatch {
+            title: Some(Some("Edited".to_string())),
+            ..Default::default()
+        };
+        account
+            .event_update(second.clone(), patch)
+            .await
+            .expect("an override is updated in place");
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].method.as_str(), "PUT");
+        assert_eq!(
+            requests[2].url, "https://dav.example.test/calendar/series.ics",
+            "the fragment never reaches the wire"
+        );
+        assert!(requests[2].body.contains("SUMMARY:First\r\n"));
+        assert!(requests[2].body.contains("SUMMARY:Edited\r\n"));
+        assert!(!requests[2].body.contains("SUMMARY:Second"));
+
+        // The bare id names none of two overrides.
+        let script = dav_script([ok(StatusCode::OK, ics)]);
+        let account = account_over(&script);
+        account
+            .event_get(bifrost_types::EventId(
+                "https://dav.example.test/calendar/series.ics".to_string(),
+            ))
+            .await
+            .expect_err("the bare id must not answer with the first override");
+        // An instance the resource no longer carries is absent.
+        let script = dav_script([ok(StatusCode::OK, ics)]);
+        let account = account_over(&script);
+        account
+            .event_get(bifrost_types::EventId(
+                "https://dav.example.test/calendar/series.ics#20990101T000000Z".to_string(),
+            ))
+            .await
+            .expect_err("an unknown instance is not the first override");
+
+        // A move relocates the whole resource, so it is refused before I/O.
+        let script = dav_script_empty();
+        let account = account_over(&script);
+        let moving = bifrost_types::EventPatch {
+            calendar_id: Some(bifrost_types::CalendarId(
+                "https://dav.example.test/other/".to_string(),
+            )),
+            ..Default::default()
+        };
+        account
+            .event_update(second, moving)
+            .await
+            .expect_err("one override cannot be moved out of its series");
+        assert!(transcripts(&script).is_empty());
     }
 
     /// An event resource the SERVER sent that will not tokenize is the

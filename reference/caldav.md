@@ -220,36 +220,48 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   and quoted-parameter splitting that tolerates `:`/`;`/`,` inside quoted
   values). Values are stored raw by caldata; text fields (summary,
   description, location, CN) are unescaped at read time via a single
-  left-to-right scan. `event_from_ical` projects the master for direct
-  get/update: the first VEVENT without a top-level `RECURRENCE-ID`, wherever it
-  sits in the body, or the first VEVENT when every one is an override (a single
-  edited instance stored alone). `target_block_index` is that selection and the
-  patch writer calls the same function, so a patch splices into the VEVENT the
-  event was read from; an override-first body patches its master, not its first
-  block; `events_from_ical` projects *every* VEVENT (master
+  left-to-right scan. `event_from_ical` projects the ONE VEVENT an event id addresses, and
+  `select_block_index` is that selection; the patch writer calls the same
+  function (keyed by the event's own `recurrence.recurrence_id`), so a patch
+  splices into the VEVENT the event was read from. A bare resource id is the
+  master: the first VEVENT without a top-level `RECURRENCE-ID`, wherever it sits
+  in the body (an override-first body patches its master, not its first block).
+  A resource holding only overrides has no master: a lone override is the event
+  of the bare id, and SEVERAL are `AmbiguousResource`, refused as a local
+  `Request(Malformed)` naming the qualified ids, because answering with the
+  first would return a VEVENT the id does not name.
+  `events_from_ical` projects *every* VEVENT (master
   plus each recurrence override / CANCEL), carrying RECURRENCE-ID and STATUS
   through, and is used by the range/search listing paths (override instances
-  take a recurrence-qualified `EventId` but keep the resource native id).
+  take a recurrence-qualified `EventId` but keep the resource native id). Both
+  it and `event_from_ical` mint ids through `event_id_for`, so a direct read
+  produces the id the listing gave.
 
-  **A recurrence-qualified `EventId` is READ-ONLY, and the account enforces
-  that.** `EventId("{uri}#{recurrence_id}")` exists so a consumer index can tell
-  the occurrences of a series apart; it is not addressable.
-  `client.resolve_url` returns an absolute href verbatim and a URL fragment is
-  never sent on the wire, so every such id resolves to the master resource.
-  `event_get`, `event_update`, `event_delete` and `event_rsvp` therefore refuse
-  an id containing `#` via `reject_recurrence_instance_id`, before any I/O, as
-  `Request(Malformed)` -> `ClientBug` (no retry or reopen heals a caller passing
-  a non-handle). Unguarded, `event_get` returned the master instead of the
-  instance asked for, `event_update` spliced and PUT the master so editing one
-  occurrence rewrote the series, `event_rsvp` answered for the series, and
+  **A recurrence-qualified `EventId` reads and updates the override it names;
+  delete and RSVP refuse it.** `EventId("{uri}#{recurrence_id}")` is minted for
+  every override the listing lanes return, so it is the only id a consumer
+  holds for one - including every VEVENT of a resource with no master.
+  `split_event_id` splits at the first `#` (a resolved resource URL cannot
+  contain a literal one), the wire address is the resource alone, and the
+  `RECURRENCE-ID` value selects the VEVENT by exact match against the value the
+  listing minted the id from. `event_get` returns that VEVENT under the id it
+  was asked for; an instance no VEVENT carries any more is `NotFound`.
+  `event_update` splices only that VEVENT and PUTs the resource, leaving every
+  other VEVENT byte for byte; a recurrence replacement stays `Unsupported`
+  (any override present), and a `calendar_id` move is refused before any I/O
+  because a MOVE relocates the whole series.
+  `event_delete` and `event_rsvp` still refuse an id containing `#` via
+  `reject_recurrence_instance_id`, before any I/O, as `Request(Malformed)` ->
+  `ClientBug`: a URL fragment is never sent, so the request would act on the
+  whole resource. Unguarded, `event_rsvp` answered for the series and
   `event_delete` DELETEd the whole `.ics` - **deleting one occurrence destroyed
   every occurrence**.
-  `recurrence_instance_ids_are_refused_before_reaching_the_wire` pins all four
-  against an empty transport script, so a removed guard starves the script
-  rather than failing quietly.
+  `recurrence_instance_ids_are_refused_before_reaching_the_wire` pins the two
+  refusals against an empty transport script, so a removed guard starves the
+  script rather than failing quietly; the read and update halves are pinned by
+  `a_listed_override_id_reads_and_updates_the_vevent_it_named`.
 
-  Real per-occurrence writes would mean resolving the resource, locating the
-  VEVENT by RECURRENCE-ID, and splicing or removing that component (an
+  Real per-occurrence delete would mean removing that component (an
   occurrence delete emitting `EXDATE` on the master, or `STATUS:CANCELLED` on
   the override - they differ in what attendees see). This is deliberately not
   scheduled. CalDAV is the only calendar crate with the problem, because it is
@@ -303,6 +315,11 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   acknowledged attempt, since it is read out of the server's answer, and scoped
   to the event like the other single-resource failures - and to *no* events in
   the listing lanes, never to a fabricated empty event.
+  A bare CR inside a value is one logical line to caldata's reader and is kept
+  in the value, so a text field projects with the `\r` in it and a preserved
+  line holding one is spliced verbatim. `escape_text` writes a CR (alone or
+  before an LF) as the `\n` line break; it used to delete a lone CR, merging the
+  two halves it separated when a consumer echoed the projected text back.
   Serialization-out (create/patch/RSVP) stays
   hand-rolled and verbatim-preserving: patches splice on *physical* lines,
   folding only newly emitted lines, so long preserved/unmodeled values

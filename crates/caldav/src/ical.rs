@@ -21,23 +21,53 @@ pub(crate) struct IcalParseError(pub(crate) String);
 pub(crate) enum EventProjectionError {
     Parse(IcalParseError),
     NoVevent,
+    /// The event id named a recurrence instance and no VEVENT of the resource
+    /// carries that `RECURRENCE-ID` (an override removed since the listing).
+    NoInstance,
+    /// The event id named the whole resource, which holds several overrides
+    /// and no master, so it addresses none of them in particular.
+    AmbiguousResource,
 }
 
-/// Project the master VEVENT of a resource: the first VEVENT without a
-/// top-level `RECURRENCE-ID`, or the first VEVENT when every one is an
-/// override (see `target_block_index`). Used by the direct `event_get` /
-/// `event_update` paths, and the patch writer splices into the same VEVENT.
+/// Split an event id into the resource it lives in and, for a
+/// recurrence-qualified id (`{uri}#{recurrence_id}`, the id the listing lanes
+/// mint for an override), the `RECURRENCE-ID` value it names. The resource is a
+/// resolved URL, in which a literal `#` cannot occur (a fragment is never part
+/// of an href), so the first `#` is the separator.
+pub(crate) fn split_event_id(id: &str) -> (&str, Option<&str>) {
+    match id.split_once('#') {
+        Some((resource, instance)) => (resource, Some(instance)),
+        None => (id, None),
+    }
+}
+
+/// The id a VEVENT is listed under: the resource URL for a master, the
+/// recurrence-qualified form for an override. `events_from_ical` and
+/// `event_from_ical` both mint through this, so an id a listing produced is
+/// the id a direct read of the same VEVENT produces.
+fn event_id_for(uri: &str, recurrence_id: Option<&str>) -> EventId {
+    match recurrence_id {
+        Some(recurrence_id) => EventId(format!("{uri}#{recurrence_id}")),
+        None => EventId(uri.to_string()),
+    }
+}
+
+/// Project the one VEVENT an event id addresses (see `select_block_index`):
+/// with `instance` the override carrying that `RECURRENCE-ID`, without it the
+/// resource's master. Used by the direct `event_get` / `event_update` paths,
+/// and the patch writer splices into the same VEVENT.
 pub(crate) fn event_from_ical(
     uri: String,
     calendar_id: CalendarId,
     etag: Option<String>,
     data: &str,
+    instance: Option<&str>,
 ) -> Result<CalendarEvent, EventProjectionError> {
     let mut blocks = parse_vevents(data).map_err(EventProjectionError::Parse)?;
-    let index = target_block_index(&blocks).ok_or(EventProjectionError::NoVevent)?;
+    let index = select_block_index(&blocks, instance)?;
     let block = blocks.swap_remove(index);
     Ok(project_event(
-        EventId(uri.clone()),
+        event_id_for(&uri, block_recurrence_id(&block)),
         uri,
         calendar_id,
         etag,
@@ -71,15 +101,7 @@ pub(crate) fn events_from_ical(
     Ok(blocks
         .into_iter()
         .map(|block| {
-            let recurrence_id = block
-                .props
-                .iter()
-                .find(|prop| prop.name == "RECURRENCE-ID")
-                .map(|prop| prop.value.clone());
-            let id = match &recurrence_id {
-                Some(recurrence_id) => EventId(format!("{uri}#{recurrence_id}")),
-                None => EventId(uri.clone()),
-            };
+            let id = event_id_for(&uri, block_recurrence_id(&block));
             project_event(
                 id,
                 uri.clone(),
@@ -271,8 +293,11 @@ pub(crate) fn patch_to_ical(
     if patch.recurrence.is_some() && blocks.iter().any(is_override_block) {
         return Err(PatchError::RecurrenceOverride);
     }
-    // The VEVENT `event_from_ical` projected, by the same selection.
-    let master = target_block_index(&blocks)
+    // The VEVENT `event_from_ical` projected, by the same selection: the event
+    // carries the `RECURRENCE-ID` of the override it was read from, and none
+    // when it is the master.
+    let master = select_block_index(&blocks, current.recurrence.recurrence_id.as_deref())
+        .ok()
         .and_then(|index| blocks.get(index))
         .ok_or(PatchError::NoSpliceableVevent)?;
 
@@ -454,19 +479,48 @@ fn is_override_block(block: &VeventBlock) -> bool {
     block.props.iter().any(|prop| prop.name == "RECURRENCE-ID")
 }
 
-/// The VEVENT an event id addresses. An event id is the resource URL (an id
-/// naming a recurrence instance, `{uri}#{recurrence_id}`, is refused before it
-/// gets here), and a resource is projected as its master: the first VEVENT that
-/// is not an override, wherever it sits in the body - servers do not promise
-/// document order. A resource holding only overrides (a single edited instance
-/// stored alone) has no master, and its first VEVENT is the event. Both the
-/// projection and the patch writer select through this, so the VEVENT a patch
-/// splices into is the one the event was read from.
-fn target_block_index(blocks: &[VeventBlock]) -> Option<usize> {
-    blocks
+/// The top-level `RECURRENCE-ID` value of a VEVENT, the same first-property
+/// read that mints an override's listing id and that `project_event` reports in
+/// `recurrence.recurrence_id`.
+fn block_recurrence_id(block: &VeventBlock) -> Option<&str> {
+    block
+        .props
         .iter()
-        .position(|block| !is_override_block(block))
-        .or_else(|| (!blocks.is_empty()).then_some(0))
+        .find(|prop| prop.name == "RECURRENCE-ID")
+        .map(|prop| prop.value.as_str())
+}
+
+/// The VEVENT an event id addresses.
+///
+/// A recurrence-qualified id (`instance` is the `RECURRENCE-ID` value) names the
+/// first VEVENT carrying exactly that value - the value the listing lanes
+/// minted the id from - and is `NoInstance` when none does. A bare resource id
+/// names the master: the first VEVENT that is not an override, wherever it sits
+/// in the body (servers do not promise document order). A resource holding only
+/// overrides has no master; a lone one is the event (a single edited instance
+/// stored alone), and several are `AmbiguousResource`, because answering with
+/// the first would hand back a VEVENT the id does not name while the listing
+/// showed each of them under its own id. Both the projection and the patch
+/// writer select through this, so the VEVENT a patch splices into is the one
+/// the event was read from.
+fn select_block_index(
+    blocks: &[VeventBlock],
+    instance: Option<&str>,
+) -> Result<usize, EventProjectionError> {
+    if blocks.is_empty() {
+        return Err(EventProjectionError::NoVevent);
+    }
+    if let Some(instance) = instance {
+        return blocks
+            .iter()
+            .position(|block| block_recurrence_id(block) == Some(instance))
+            .ok_or(EventProjectionError::NoInstance);
+    }
+    match blocks.iter().position(|block| !is_override_block(block)) {
+        Some(index) => Ok(index),
+        None if blocks.len() == 1 => Ok(0),
+        None => Err(EventProjectionError::AmbiguousResource),
+    }
 }
 
 /// Where a VEVENT block sits in the body, in caldata `LineReader` line
@@ -1435,9 +1489,12 @@ fn fold_ical_lines(lines: Vec<String>) -> String {
 }
 
 fn escape_text(value: &str) -> String {
+    // A CRLF pair and a lone CR are each one line break, as `escape_param`
+    // reads them. Dropping a lone CR merged the two halves it separated.
     value
         .replace('\\', "\\\\")
-        .replace('\r', "")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
         .replace('\n', "\\n")
         .replace(',', "\\,")
         .replace(';', "\\;")
@@ -1537,7 +1594,7 @@ mod tests {
         etag: Option<String>,
         data: &str,
     ) -> CalendarEvent {
-        event_from_ical(uri, calendar_id, etag, data).expect("valid iCalendar projects")
+        event_from_ical(uri, calendar_id, etag, data, None).expect("valid iCalendar projects")
     }
 
     #[test]
@@ -1707,6 +1764,7 @@ mod tests {
             CalendarId("/cal/".to_string()),
             None,
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=\"unterminated:20260602T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            None,
         );
 
         assert!(result.is_err());
@@ -2532,7 +2590,7 @@ mod tests {
     }
 
     /// A body whose first VEVENT is an override still projects, and patches,
-    /// the master. Reverting `target_block_index` to `blocks.first()` in
+    /// the master. Reverting `select_block_index` to `blocks.first()` in
     /// `event_from_ical` fails the projection assertion; reverting it in
     /// `patch_to_ical` alone splices "Updated" into the override.
     #[test]
@@ -2566,25 +2624,42 @@ mod tests {
         assert_eq!(reread.title.as_deref(), Some("Updated"));
     }
 
-    /// A resource holding only overrides has no master: the first VEVENT is the
-    /// event, a scalar patch lands on it, and a recurrence replacement is still
-    /// refused. Reverting the `or_else` fallback in `target_block_index` makes
-    /// the projection fail with `NoVevent`.
-    #[test]
-    fn an_override_only_body_patches_its_own_override() {
-        let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260609T120000Z\r\nSUMMARY:Alone\r\nDTSTART:20260609T140000Z\r\nDTEND:20260609T150000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260616T120000Z\r\nSUMMARY:Second\r\nDTSTART:20260616T140000Z\r\nDTEND:20260616T150000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let current = parse_event(
+    const LONE_OVERRIDE: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260609T120000Z\r\nSUMMARY:Alone\r\nDTSTART:20260609T140000Z\r\nDTEND:20260609T150000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    const TWO_OVERRIDES: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260609T120000Z\r\nSUMMARY:First\r\nDTSTART:20260609T140000Z\r\nDTEND:20260609T150000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260616T120000Z\r\nSUMMARY:Second\r\nDTSTART:20260616T140000Z\r\nDTEND:20260616T150000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    fn project_instance(
+        body: &str,
+        instance: Option<&str>,
+    ) -> Result<CalendarEvent, EventProjectionError> {
+        event_from_ical(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
             body,
+            instance,
+        )
+    }
+
+    /// A resource holding a single override and no master: the bare id is that
+    /// override, a scalar patch lands on it, and a recurrence replacement is
+    /// still refused. Reverting the `blocks.len() == 1` arm of
+    /// `select_block_index` makes the projection fail with `AmbiguousResource`.
+    #[test]
+    fn a_lone_override_is_the_event_of_its_bare_resource_id() {
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            LONE_OVERRIDE,
         );
         assert_eq!(current.title.as_deref(), Some("Alone"));
+        // Read by the bare id, it is still listed under its qualified id.
+        assert_eq!(current.id.0, "/cal/one.ics#20260609T120000Z");
 
         let patched = patch_to_ical(&current, &title_patch("Edited")).expect("splices");
         assert!(patched.contains("SUMMARY:Edited\r\n"));
         assert!(!patched.contains("SUMMARY:Alone"));
-        assert!(patched.contains("SUMMARY:Second\r\n"));
 
         let recurrence = EventPatch {
             recurrence: Some(EventRecurrence::default()),
@@ -2594,6 +2669,66 @@ mod tests {
             patch_to_ical(&current, &recurrence),
             Err(PatchError::RecurrenceOverride)
         );
+    }
+
+    /// Every id the listing mints for a resource of overrides reads back as the
+    /// VEVENT it named, and patches only that VEVENT. Reverting the `instance`
+    /// arm of `select_block_index` to the first-override fallback makes the
+    /// second instance project "First"; reverting the patch writer's
+    /// `current.recurrence.recurrence_id` argument to `None` splices "Edited"
+    /// into the first VEVENT instead.
+    #[test]
+    fn a_listed_override_id_reads_and_patches_the_vevent_it_named() {
+        let listed = events_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            TWO_OVERRIDES,
+        )
+        .expect("lists");
+        assert_eq!(listed.len(), 2);
+        for (listed_event, title) in listed.iter().zip(["First", "Second"]) {
+            let (resource, instance) = split_event_id(&listed_event.id.0);
+            assert_eq!(resource, "/cal/one.ics");
+            let read = project_instance(TWO_OVERRIDES, instance).expect("resolves");
+            assert_eq!(read.id, listed_event.id);
+            assert_eq!(read.title.as_deref(), Some(title));
+            assert_eq!(read.start, listed_event.start);
+
+            let patched = patch_to_ical(&read, &title_patch("Edited")).expect("splices");
+            let expected_other = if title == "First" { "Second" } else { "First" };
+            assert!(patched.contains("SUMMARY:Edited\r\n"));
+            assert!(!patched.contains(&format!("SUMMARY:{title}")));
+            assert!(patched.contains(&format!("SUMMARY:{expected_other}\r\n")));
+        }
+    }
+
+    /// A bare resource id over several overrides and no master names none of
+    /// them, and an instance nobody carries is absent, not the first. Reverting
+    /// the `AmbiguousResource` arm restores the silent first-override answer.
+    #[test]
+    fn a_bare_id_over_several_overrides_and_an_unknown_instance_are_refused() {
+        assert_eq!(
+            project_instance(TWO_OVERRIDES, None).expect_err("ambiguous"),
+            EventProjectionError::AmbiguousResource
+        );
+        assert_eq!(
+            project_instance(TWO_OVERRIDES, Some("20990101T000000Z")).expect_err("absent"),
+            EventProjectionError::NoInstance
+        );
+    }
+
+    /// With a master present the bare id stays the master and a qualified id
+    /// reaches the override, wherever each sits. Reverting the instance arm
+    /// makes the qualified read return the master.
+    #[test]
+    fn a_qualified_id_reaches_the_override_beside_a_master() {
+        let master = project_instance(OVERRIDE_FIRST, None).expect("master");
+        assert_eq!(master.title.as_deref(), Some("Master"));
+        let instance =
+            project_instance(OVERRIDE_FIRST, Some("20260609T120000Z")).expect("override");
+        assert_eq!(instance.title.as_deref(), Some("Override"));
+        assert_eq!(instance.id.0, "/cal/one.ics#20260609T120000Z");
     }
 
     /// Physical lines break on `\n` alone, with one `\r` before it dropped -
@@ -2628,10 +2763,39 @@ mod tests {
         );
     }
 
+    /// A bare CR inside a text value is kept by the reader, projects into the
+    /// model as a carriage return, and is written back as a LINE BREAK when the
+    /// field is echoed through a patch: it must not vanish (a title "one\rtwo"
+    /// became "onetwo") and must not reach the wire raw, where a reader that
+    /// does split on a bare CR would see a new content line.
+    #[test]
+    fn a_bare_cr_in_a_text_value_round_trips_as_a_break_not_a_deletion() {
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:one\rtwo\r\nDESCRIPTION:a\r\n b\rc\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            body,
+        );
+        assert_eq!(current.title.as_deref(), Some("one\rtwo"));
+        assert_eq!(current.description.as_deref(), Some("ab\rc"));
+
+        let echo = title_patch("one\rtwo");
+        let patched = patch_to_ical(&current, &echo).expect("splices");
+        assert!(
+            patched.contains("SUMMARY:one\\ntwo\r\n"),
+            "the CR is a break, not a deletion: {patched:?}"
+        );
+        assert!(
+            patched.contains("DESCRIPTION:a\r\n b\rc\r\n"),
+            "the untouched line keeps its CR verbatim: {patched:?}"
+        );
+    }
+
     /// A body broken only by bare CRs is one giant line to caldata: nothing
     /// projects, and a patch against such a stored body is refused rather than
     /// spliced at a guessed line. The patch case is refused by
-    /// `target_block_index` finding no VEVENT (reverting nothing there passes it
+    /// `select_block_index` finding no VEVENT (reverting nothing there passes it
     /// by design: both readers agree there is no event); the direct
     /// `splice_lines` case bites on the landing-line check, which is the only
     /// thing refusing a line number the body does not hold.
@@ -2643,7 +2807,8 @@ mod tests {
                 "/cal/one.ics".to_string(),
                 CalendarId("/cal/".to_string()),
                 None,
-                &cr_only
+                &cr_only,
+                None
             )
             .expect_err("no VEVENT is reachable"),
             EventProjectionError::NoVevent
@@ -2743,6 +2908,7 @@ mod tests {
             CalendarId("/cal/".to_string()),
             None,
             &body,
+            None,
         )
         .expect("non-ASCII property value remains a per-resource value");
 
@@ -2817,6 +2983,7 @@ mod tests {
             CalendarId("/cal/".to_string()),
             None,
             "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t1\r\nEND:VTODO\r\nEND:VCALENDAR\r\n",
+            None,
         );
 
         assert_eq!(

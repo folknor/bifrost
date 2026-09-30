@@ -22,7 +22,7 @@ use crate::client::{
 };
 use crate::ical::{
     EventProjectionError, PatchError, create_to_ical, event_from_ical, events_from_ical, new_uid,
-    patch_to_ical, rsvp_patch, rsvp_reply_ical,
+    patch_to_ical, rsvp_patch, rsvp_reply_ical, split_event_id,
 };
 use crate::parse::CalendarCollection;
 use crate::{CalDavConfig, CalDavCredentials};
@@ -277,7 +277,10 @@ impl CalDavAccount {
         event: EventId,
         operation: AccountOperation,
     ) -> Result<CalendarEvent, AccountError> {
-        let url = client.resolve_url(&event.0);
+        // A recurrence-qualified id reads the override it names out of the
+        // resource; the wire address is the resource alone.
+        let (resource, instance) = split_event_id(&event.0);
+        let url = client.resolve_url(resource);
         // The event's own collection is the first answer and almost always
         // available; the default is only reached for a native id whose parent
         // cannot be derived, and an account with no collections has none.
@@ -300,6 +303,7 @@ impl CalDavAccount {
             CalendarId(calendar_url),
             fetched.etag,
             &fetched.data,
+            instance,
         )
         // The body is the SERVER's answer to a GET, so a body that will not
         // tokenize is the provider's malformed response - `Protocol(ParseFailed)`
@@ -314,7 +318,18 @@ impl CalDavAccount {
         // its cause, and the parse case carried nothing.
         .map_err(|error| {
             let error = match error {
-                EventProjectionError::NoVevent => missing_event_error(operation, event.0.clone()),
+                EventProjectionError::NoVevent | EventProjectionError::NoInstance => {
+                    missing_event_error(operation, event.0.clone())
+                }
+                // A caller error, not the server's: the id does not say which
+                // of several overrides it wants, and the listing gave each its
+                // own qualified id.
+                EventProjectionError::AmbiguousResource => crate::client::local_error(
+                    operation,
+                    "the resource holds several recurrence overrides and no master, \
+                     so the bare resource id names none of them: address one by its \
+                     recurrence-qualified id",
+                ),
                 EventProjectionError::Parse(parse) => crate::client::parse_error(
                     operation,
                     format!("CalDAV resource is not valid iCalendar: {}", parse.0),
@@ -1018,7 +1033,6 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
-            reject_recurrence_instance_id(&event, AccountOperation::EventGet)?;
             Self::fetch_event_from_url(
                 client,
                 default_calendar_url,
@@ -1079,8 +1093,8 @@ impl Account for CalDavAccount {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
-            reject_recurrence_instance_id(&event, AccountOperation::EventUpdate)?;
-            let url = client.resolve_url(&event.0);
+            let (resource, instance) = split_event_id(&event.0);
+            let url = client.resolve_url(resource);
             // A `calendar_id` naming a collection other than the event's own is
             // a relocation. It used to return `Ok(())` having moved nothing,
             // then was refused outright; it is now performed.
@@ -1091,6 +1105,15 @@ impl Account for CalDavAccount {
                 .filter(|target| {
                     event_calendar_url(&url).is_some_and(|source| !same_url(target, &source))
                 });
+            // A MOVE relocates the whole resource, every occurrence with it,
+            // so it cannot be done on behalf of one override.
+            if instance.is_some() && relocation.is_some() {
+                return Err(crate::client::local_error(
+                    AccountOperation::EventUpdate,
+                    "a recurrence-instance event id cannot be moved to another \
+                     calendar: the move would relocate the whole series resource",
+                ));
+            }
             let current = Self::fetch_event_from_url(
                 Arc::clone(&client),
                 default_calendar_url,
@@ -1675,36 +1698,27 @@ struct EventSnapshot {
 /// `bifrost-dav-core`; only the magic bytes and the token's name differ.
 type EventSnapshotEntry = SnapshotEntry;
 
-/// Refuse an `EventId` that names one occurrence of a recurring series.
+/// Refuse an `EventId` that names one occurrence of a recurring series, for the
+/// operations that act on the whole resource.
 ///
 /// `events_from_ical` mints `EventId("{uri}#{recurrence_id}")` for an override
 /// VEVENT so a consumer's index can tell the occurrences of a series apart.
-/// That id is NOT addressable: `client.resolve_url` returns an absolute href
-/// verbatim, and a URL fragment is never sent on the wire, so every one of
-/// these ids silently resolves to the master resource. Unguarded,
-/// `event_get` returned the master instead of the instance asked for,
-/// `event_update` spliced and PUT the master so editing one occurrence
-/// rewrote the series, `event_rsvp` answered for the series, and
-/// `event_delete` DELETEd the whole `.ics` - deleting one occurrence
-/// destroyed every occurrence.
+/// `event_get` and `event_update` resolve such an id to the override it names
+/// (`split_event_id` peels the fragment off the wire address and the
+/// `RECURRENCE-ID` selects the VEVENT). `event_delete` and `event_rsvp` do not:
+/// a DELETE removes the whole `.ics`, so deleting one occurrence would destroy
+/// every occurrence, and an RSVP answers for the series through the outbox.
+/// Both would act on more than the id names, so they refuse before any I/O with
+/// `Request(Malformed)` -> `ClientBug`, which no retry or reopen can heal.
 ///
-/// A fragment id is therefore read-only, and saying so out loud is the whole
-/// point: `Request(Malformed)` classifies to `ClientBug`, which no retry or
-/// reopen can heal, and the caller learns the id is not a handle rather than
-/// discovering later that a series is gone. This mirrors CardDAV refusing a
-/// cross-address-book contact move through the same `local_error` helper.
-///
-/// Real per-occurrence support means resolving the resource, locating the
-/// VEVENT by `RECURRENCE-ID`, and splicing or removing that component (an
-/// occurrence delete emitting `EXDATE` on the master, or `STATUS:CANCELLED`
-/// on the override - they differ in what attendees see). That is deliberately
-/// NOT scheduled: this is the only calendar crate with the problem, because
-/// it is the only one whose provider has no per-occurrence resource. Graph
-/// syncs through `calendarView`, whose occurrences carry genuine Graph ids;
-/// JMAP keeps overrides inside the master object and returns `Unsupported`
-/// for one it cannot represent; Google's ids are `{calendar}::{event}` over
-/// the provider's own instance ids. None of them can inherit this bug, and
-/// none of them benefits from fixing it here.
+/// Real per-occurrence delete means an `EXDATE` on the master or
+/// `STATUS:CANCELLED` on the override - they differ in what attendees see -
+/// and is deliberately NOT scheduled: this is the only calendar crate with the
+/// problem, because it is the only one whose provider has no per-occurrence
+/// resource. Graph syncs through `calendarView`, whose occurrences carry
+/// genuine Graph ids; JMAP keeps overrides inside the master object and returns
+/// `Unsupported` for one it cannot represent; Google's ids are
+/// `{calendar}::{event}` over the provider's own instance ids.
 fn reject_recurrence_instance_id(
     event: &EventId,
     operation: AccountOperation,
@@ -1712,9 +1726,8 @@ fn reject_recurrence_instance_id(
     if event.0.contains('#') {
         return Err(crate::client::local_error(
             operation,
-            "recurrence-instance event ids are read-only: they address the whole \
-             series resource on the wire, so writing through one would change or \
-             destroy every occurrence",
+            "this operation cannot target one recurrence instance: it acts on the \
+             whole series resource, so it would change or destroy every occurrence",
         ));
     }
     Ok(())
