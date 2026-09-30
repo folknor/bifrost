@@ -454,7 +454,8 @@ step's await has answered:
   connection rather than leaking it. The close is awaited through the guard and
   cleared only once it returns, so a drop parked inside a close owes it again.
 - The rollback of provisional cursor rows (`rollback_owed`), armed
-  synchronously before the first `reattach_insert` and cleared once
+  synchronously before the first fresh-scope establishment (whose resume read
+  may claim a row) and cleared once
   `reattach_abort` answered.
 - The commit of those rows (`commit_owed`), which the swap converts the
   rollback into: past the swap an abort would delete cursors belonging to a
@@ -471,6 +472,18 @@ process-wide monotonic counter; `ReattachInsert`, `ReattachAbort` and
 abort deletes, and a commit promotes, only rows the named attempt owns; a later
 attempt inserting the same scope takes ownership. An acknowledged checkpoint
 still discharges a scope's provisional state whichever attempt owns it.
+
+A reattach that RESUMES a stored row (`run_establish` reading it through the
+writer's `GetChangeCursor`) passes its attempt as `claim_for`; if the row is
+still provisional the writer moves ownership to the resuming attempt, in queue
+order with inserts, aborts and commits. Without that, a dropped attempt's late
+abort deleted a row the installed topology depends on. A committed row has no
+provisional entry and is untouched, and reads outside a reattach (scope
+restart, and attach, which reads the store directly) never claim. The
+inventory fusion does not read stored cursors through the writer. Because the
+claim can land inside `run_establish`, the guard arms `rollback_owed` before
+each fresh-scope establishment rather than only before the first insert; an
+abort with nothing owned is a no-op.
 
 On a drop the guard enqueues the writer's `ReattachAbort` or `ReattachCommit`
 synchronously with `try_send`. That is deliberate: the request lands in the

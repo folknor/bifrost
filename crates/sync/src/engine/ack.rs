@@ -395,8 +395,22 @@ pub(super) async fn ack_writer(
                 provisional.retain(|_, owner| *owner != attempt);
                 continue;
             }
-            WriterRequest::GetChangeCursor { scope, done } => {
+            WriterRequest::GetChangeCursor {
+                scope,
+                claim_for,
+                done,
+            } => {
                 let result = store.get_change_cursor(&account_id, &scope).await;
+                // A reattach resuming a row another attempt inserted and has
+                // not settled takes it over, so that attempt's delayed abort
+                // cannot delete a row the resuming topology now depends on.
+                // Only an existing, still-provisional row moves; a committed
+                // row has no entry and a non-reattach read passes `None`.
+                if let (Some(attempt), Ok(Some(_))) = (claim_for, &result)
+                    && let Some(owner) = provisional.get_mut(&scope)
+                {
+                    *owner = attempt;
+                }
                 let _ = done.send(result);
                 continue;
             }
@@ -630,10 +644,15 @@ impl WriterHandle {
     pub(super) async fn get_change_cursor(
         &self,
         scope: CursorScope,
+        claim_for: Option<u64>,
     ) -> Result<Option<ChangeCursor>, Error> {
         let (done, recv) = oneshot::channel();
         self.tx
-            .send(WriterRequest::GetChangeCursor { scope, done })
+            .send(WriterRequest::GetChangeCursor {
+                scope,
+                claim_for,
+                done,
+            })
             .await
             .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
         recv.await

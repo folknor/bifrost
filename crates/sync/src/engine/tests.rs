@@ -2597,6 +2597,22 @@ impl ProvisionalWriter {
             .expect("writer alive");
     }
 
+    async fn read(&self, name: &str, claim_for: Option<u64>) -> bool {
+        let (done, wait) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::GetChangeCursor {
+                scope: Self::scope(name),
+                claim_for,
+                done,
+            })
+            .await
+            .expect("writer alive");
+        wait.await
+            .expect("writer answered")
+            .expect("read")
+            .is_some()
+    }
+
     async fn has(&self, name: &str) -> bool {
         self.store
             .get_change_cursor(&self.account, &Self::scope(name))
@@ -2662,6 +2678,55 @@ async fn a_reinserting_attempt_takes_ownership_of_the_scope() {
     assert!(
         !writer.has("shared").await,
         "the owning attempt's abort still rolls the row back"
+    );
+
+    writer.finish().await;
+}
+
+/// Attempt A inserts S and is dropped with its abort still in flight. Attempt B
+/// resumes S from the store and commits. S now belongs to the installed
+/// topology, so A's late abort must not delete it: B's resume read claimed it.
+#[tokio::test]
+async fn a_resuming_attempt_claims_a_provisional_row_from_a_stale_abort() {
+    let writer = ProvisionalWriter::spawn();
+
+    writer.insert(1, "s").await;
+    assert!(writer.read("s", Some(2)).await, "the row resumes as stored");
+    writer.commit(2).await;
+    writer.abort(1).await;
+
+    assert!(
+        writer.has("s").await,
+        "a stale abort must not delete a row a later attempt resumed and committed"
+    );
+
+    writer.finish().await;
+}
+
+/// A read outside a reattach claims nothing, and a claiming read of a row that
+/// is not provisional changes nothing.
+#[tokio::test]
+async fn only_a_reattach_resume_of_a_provisional_row_claims_it() {
+    let writer = ProvisionalWriter::spawn();
+
+    // A plain read (attach, scope restart) must not steal A's row.
+    writer.insert(1, "s").await;
+    assert!(writer.read("s", None).await);
+    writer.abort(1).await;
+    assert!(
+        !writer.has("s").await,
+        "a non-reattach read must leave the row with the attempt that inserted it"
+    );
+
+    // A committed row is not provisional: a claiming read leaves it alone, so
+    // the claimant's abort cannot delete it.
+    writer.insert(3, "committed").await;
+    writer.commit(3).await;
+    assert!(writer.read("committed", Some(4)).await);
+    writer.abort(4).await;
+    assert!(
+        writer.has("committed").await,
+        "resuming a committed row must not make it rollback-able"
     );
 
     writer.finish().await;

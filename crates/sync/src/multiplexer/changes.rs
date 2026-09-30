@@ -470,8 +470,17 @@ pub enum WriterRequest {
     /// durable state. Rows owned by other attempts stay provisional.
     ReattachCommit { attempt: u64 },
     /// Read one cursor through the same account-owned boundary used for writes.
+    ///
+    /// `claim_for` is set only by a reattach's resume read. When the row is
+    /// returned and is still provisional, ownership of it moves to that
+    /// attempt, ordered with inserts, aborts and commits: the resuming attempt
+    /// is about to install a topology that depends on the row, so a delayed
+    /// abort from the attempt that inserted it must no longer delete it. A row
+    /// that is not provisional is untouched, and a read with `None` (attach,
+    /// scope restart, anything outside a reattach) never claims.
     GetChangeCursor {
         scope: CursorScope,
+        claim_for: Option<u64>,
         done: oneshot::Sender<Result<Option<ChangeCursor>, Error>>,
     },
     /// Persist an established live cursor without making a coverage claim.
@@ -617,9 +626,12 @@ impl std::fmt::Debug for WriterRequest {
                 .debug_struct("ReattachCommit")
                 .field("attempt", attempt)
                 .finish(),
-            Self::GetChangeCursor { scope, .. } => f
+            Self::GetChangeCursor {
+                scope, claim_for, ..
+            } => f
                 .debug_struct("GetChangeCursor")
                 .field("scope", scope)
+                .field("claim_for", claim_for)
                 .finish(),
             Self::PersistEstablished { cursor, .. } => f
                 .debug_struct("PersistEstablished")

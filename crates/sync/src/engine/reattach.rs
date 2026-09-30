@@ -495,6 +495,7 @@ async fn re_establish_scope_with_backoff(
             Arc::clone(ctx.coverage),
             true,
             ctx.shutdown,
+            None,
         )
         .await
         {
@@ -1151,6 +1152,14 @@ pub(super) async fn reattach_account(
             // pre-check: a pre-check both races that read and, if it
             // swallowed a store error as "no row", would misclassify a
             // preexisting row as freshly created.
+            //
+            // The resume read claims a still-provisional row for this attempt
+            // (see `WriterRequest::GetChangeCursor`), so the abort or commit
+            // owed for it is armed BEFORE the read, synchronously: a drop
+            // parked inside `run_establish` after the claim must still settle
+            // the row, or it would stay owned by an attempt that never
+            // settles it. An abort with nothing owned is a no-op.
+            guard.rollback_owed = true;
             match run_establish(
                 ctx.account_id,
                 next.as_ref(),
@@ -1162,6 +1171,7 @@ pub(super) async fn reattach_account(
                 Arc::clone(ctx.coverage),
                 false,
                 ctx.shutdown,
+                Some(guard.attempt),
             )
             .await
             {
@@ -1266,7 +1276,9 @@ pub(super) async fn reattach_account(
         // The compensation is owed from BEFORE the first insert, synchronously,
         // so a drop parked inside an insert (whose request may already be
         // queued) still rolls back.
-        guard.rollback_owed = !newly_established.is_empty();
+        if !newly_established.is_empty() {
+            guard.rollback_owed = true;
+        }
         let attempt = guard.attempt;
         let durable_result = async {
             for cursor in &newly_established {
@@ -1691,12 +1703,19 @@ async fn run_establish(
     coverage: Arc<PendingCoverage>,
     persist_ready: bool,
     shutdown: &CancellationToken,
+    reattach_attempt: Option<u64>,
 ) -> Result<EstablishOrigin, Error> {
     let _activity = match control {
         Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
         None => None,
     };
-    match writer.get_change_cursor(scope.clone()).await {
+    // Only a reattach passes an attempt. Its resume read claims a still
+    // provisional row through the writer; every other caller reads without
+    // claiming.
+    match writer
+        .get_change_cursor(scope.clone(), reattach_attempt)
+        .await
+    {
         Ok(Some(existing)) if existing.validate_envelope().is_ok() => {
             // A stored cursor may be a mid-inventory page position rather
             // than a live changes cursor. Putting one into the registry
