@@ -37,7 +37,9 @@ use crate::client::{
     local_error, not_found_error, unsupported_error,
 };
 use crate::parse::{AddressBookCollection, CardDavFetchedVCard, CardDavMultigetReport};
-use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard_from_patch};
+use crate::vcard::{
+    VCardParseError, VCardWriteError, contact_from_vcard, vcard_from_create, vcard_from_patch,
+};
 
 /// The page size `contacts_list` serves.
 ///
@@ -1083,7 +1085,8 @@ impl Account for CardDavAccount {
             )?;
             let id = format!("{}.vcf", Uuid::new_v4());
             let url = append_path(&addressbook, &id);
-            let data = vcard_from_create(&contact, &id);
+            let data = vcard_from_create(&contact, &id)
+                .map_err(|error| write_error(AccountOperation::ContactCreate, error))?;
             client
                 .put_vcard(
                     &url,
@@ -1146,7 +1149,8 @@ impl Account for CardDavAccount {
                 &raw.data,
             )
             .map_err(|error| project_error(AccountOperation::ContactUpdate, &error))?;
-            let data = vcard_from_patch(&current, &raw.data, &patch);
+            let data = vcard_from_patch(&current, &raw.data, &patch)
+                .map_err(|error| write_error(AccountOperation::ContactUpdate, error))?;
             let url = client.resolve_url(&contact.0);
             let Some(target_addressbook) = relocation else {
                 return client
@@ -1517,6 +1521,17 @@ fn project_error(operation: AccountOperation, error: &VCardParseError) -> Accoun
     crate::client::parse_error(
         operation,
         format!("CardDAV vCard could not be parsed: {}", error.0),
+    )
+}
+
+/// A value the vCard writers refuse (`VCardWriteError`) is the caller's own
+/// request being unwritable: local `Request(Malformed)` naming the field, raised
+/// before any write goes out. The value itself is not echoed into the message,
+/// so a hostile string cannot reach a log through it.
+fn write_error(operation: AccountOperation, error: VCardWriteError) -> AccountError {
+    local_error(
+        operation,
+        format!("contact {} {}", error.field, error.reason),
     )
 }
 

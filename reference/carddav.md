@@ -202,6 +202,23 @@ narrowed the predicate.
   here, would make these fully structural). The create path emits a minimal
   `N` (mandatory in 3.0). A present-but-empty value is still
   indistinguishable from absent (the shared limitation calcard also has).
+
+  **The writers refuse what they cannot write; they never strip.** Every value
+  the writers emit goes through one of three treatments. TEXT (FN, N, UID, EMAIL,
+  TEL, ORG, TITLE, ADR components, NOTE, PHOTO URI) is escaped by `escape_text`
+  behind `text_value`: CR and LF become the `\n` line break, so nothing injects a
+  content line. TYPE parameter values (and the 3.0 PHOTO TYPE hint) are RFC 6868
+  caret-encoded by `escape_param` behind `param_value`, which carries CR, LF and
+  DQUOTE. The 4.0 inline PHOTO media type sits unescaped inside a `data:` URI,
+  which has no escape form, so it refuses every ASCII control character, line
+  breaks included. Tab is legal in TEXT and parameters. Any other ASCII control
+  character (NUL included) has no escape form in TEXT or a parameter and is
+  refused: `vcard_from_create` and `vcard_from_patch` return a `VCardWriteError`
+  naming the field, which `write_error` in `account.rs` maps to a local
+  `Request(Malformed)` before any request; the value is not echoed into the
+  message. Before this a control character passed straight through, and the
+  data URI media type accepted a line break that injected arbitrary content
+  lines. Pinned by `writers_refuse_control_characters_and_still_encode_line_breaks`.
   Parameter values use RFC 6868 caret encoding in both directions, so a
   quote or newline in a parameter survives a write/read round trip. For
   vCard 4 preference ordinals, the lowest valid ordinal within each

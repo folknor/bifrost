@@ -56,27 +56,76 @@ pub(crate) fn contact_from_vcard(
     })
 }
 
-pub(crate) fn vcard_from_create(contact: &ContactCreate, uid: &str) -> String {
+/// A consumer value the writers refuse to put on the wire.
+///
+/// The vCard writers emit `NAME:value` lines by concatenation. TEXT values
+/// (RFC 6350 s3.4) escape CR and LF as `\n`, and parameter values take the
+/// RFC 6868 caret form for CR, LF and DQUOTE, but every other ASCII control
+/// character (NUL included) has no escape form in either and is not valid vCard.
+/// It is REFUSED rather than stripped: a stripped value writes something the
+/// caller did not ask for. The account layer maps this to `Request(Malformed)`
+/// naming `field`, before any request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VCardWriteError {
+    pub(crate) field: &'static str,
+    pub(crate) reason: &'static str,
+}
+
+const CONTROL_CHARACTER: &str = "contains a control character";
+
+/// Any ASCII control character other than tab, CR and LF.
+fn is_unwritable_control(ch: char) -> bool {
+    ch.is_ascii_control() && !matches!(ch, '\t' | '\r' | '\n')
+}
+
+/// A TEXT value, escaped for the wire; refused when it holds a control
+/// character CR and LF do not cover.
+fn text_value(field: &'static str, value: &str) -> Result<String, VCardWriteError> {
+    if value.chars().any(is_unwritable_control) {
+        return Err(VCardWriteError {
+            field,
+            reason: CONTROL_CHARACTER,
+        });
+    }
+    Ok(escape_text(value))
+}
+
+/// A parameter value, RFC 6868 encoded; refused when it holds a control
+/// character the caret form cannot carry.
+fn param_value(field: &'static str, value: &str) -> Result<String, VCardWriteError> {
+    if value.chars().any(is_unwritable_control) {
+        return Err(VCardWriteError {
+            field,
+            reason: CONTROL_CHARACTER,
+        });
+    }
+    Ok(escape_param(value))
+}
+
+pub(crate) fn vcard_from_create(
+    contact: &ContactCreate,
+    uid: &str,
+) -> Result<String, VCardWriteError> {
     let version = VCardVersion::V4;
     let mut lines = vec![
         "BEGIN:VCARD".to_string(),
         "VERSION:4.0".to_string(),
-        format!("UID:{}", escape_text(uid)),
+        format!("UID:{}", text_value("uid", uid)?),
     ];
     // N is mandatory in vCard 3.0 and expected by several servers even on a
     // 4.0 card; synthesize a minimal structured name from the display name so
     // a created card is not rejected for the missing property.
-    append_n(&mut lines, contact.display_name.as_deref());
-    append_contact_fields(&mut lines, contact, version);
+    append_n(&mut lines, contact.display_name.as_deref())?;
+    append_contact_fields(&mut lines, contact, version)?;
     lines.push("END:VCARD".to_string());
-    fold_vcard_lines(lines)
+    Ok(fold_vcard_lines(lines))
 }
 
 pub(crate) fn vcard_from_patch(
     current: &ContactCard,
     source: &str,
     patch: &ContactPatch,
-) -> String {
+) -> Result<String, VCardWriteError> {
     // Detect the card's declared version so freshly emitted lines (TYPE/PREF
     // form, PHOTO form) match the version the preserved VERSION line keeps.
     let version = detect_version(source);
@@ -117,30 +166,30 @@ pub(crate) fn vcard_from_patch(
 
     let mut replacement = Vec::new();
     if let Some(display_name) = &patch.display_name {
-        append_fn(&mut replacement, display_name.as_deref());
+        append_fn(&mut replacement, display_name.as_deref())?;
     } else if !saw_fn {
-        append_fn(&mut replacement, current.display_name.as_deref());
+        append_fn(&mut replacement, current.display_name.as_deref())?;
     }
     if let Some(emails) = &patch.emails {
-        append_emails(&mut replacement, emails, version, &email_groups);
+        append_emails(&mut replacement, emails, version, &email_groups)?;
     }
     if let Some(phones) = &patch.phones {
-        append_phones(&mut replacement, phones, version, &phone_groups);
+        append_phones(&mut replacement, phones, version, &phone_groups)?;
     }
     if let Some(organizations) = &patch.organizations {
-        append_organizations(&mut replacement, organizations);
+        append_organizations(&mut replacement, organizations)?;
     }
     if let Some(addresses) = &patch.addresses {
-        append_addresses(&mut replacement, addresses, version, &address_groups);
+        append_addresses(&mut replacement, addresses, version, &address_groups)?;
     }
     if let Some(notes) = &patch.notes {
-        append_notes(&mut replacement, notes.as_deref());
+        append_notes(&mut replacement, notes.as_deref())?;
     }
     if let Some(photo_url) = &patch.photo_url {
-        append_photo(&mut replacement, photo_url.as_deref());
+        append_photo(&mut replacement, photo_url.as_deref())?;
     }
     if let Some(photo) = &patch.photo {
-        append_inline_photo(&mut replacement, photo.as_ref(), version);
+        append_inline_photo(&mut replacement, photo.as_ref(), version)?;
     }
 
     // Re-emit preserved lines verbatim (including their original fold
@@ -157,7 +206,7 @@ pub(crate) fn vcard_from_patch(
     if at >= preserved.len() && !replacement.is_empty() {
         out.push_str(&fold_vcard_lines(replacement));
     }
-    out
+    Ok(out)
 }
 
 /// vCard version the card declares, controlling the TYPE/PREF and inline PHOTO
@@ -197,26 +246,35 @@ fn group_for(groups: &[String], index: usize) -> Option<&str> {
     groups.get(index).map(String::as_str)
 }
 
-fn append_contact_fields(lines: &mut Vec<String>, contact: &ContactCreate, version: VCardVersion) {
-    append_fn(lines, contact.display_name.as_deref());
-    append_emails(lines, &contact.emails, version, &[]);
-    append_phones(lines, &contact.phones, version, &[]);
-    append_organizations(lines, &contact.organizations);
-    append_addresses(lines, &contact.addresses, version, &[]);
-    append_notes(lines, contact.notes.as_deref());
-    append_photo(lines, contact.photo_url.as_deref());
+fn append_contact_fields(
+    lines: &mut Vec<String>,
+    contact: &ContactCreate,
+    version: VCardVersion,
+) -> Result<(), VCardWriteError> {
+    append_fn(lines, contact.display_name.as_deref())?;
+    append_emails(lines, &contact.emails, version, &[])?;
+    append_phones(lines, &contact.phones, version, &[])?;
+    append_organizations(lines, &contact.organizations)?;
+    append_addresses(lines, &contact.addresses, version, &[])?;
+    append_notes(lines, contact.notes.as_deref())?;
+    append_photo(lines, contact.photo_url.as_deref())
 }
 
-fn append_fn(lines: &mut Vec<String>, display_name: Option<&str>) {
-    lines.push(format!("FN:{}", escape_text(display_name.unwrap_or(""))));
+fn append_fn(lines: &mut Vec<String>, display_name: Option<&str>) -> Result<(), VCardWriteError> {
+    lines.push(format!(
+        "FN:{}",
+        text_value("display name", display_name.unwrap_or(""))?
+    ));
+    Ok(())
 }
 
-fn append_n(lines: &mut Vec<String>, display_name: Option<&str>) {
+fn append_n(lines: &mut Vec<String>, display_name: Option<&str>) -> Result<(), VCardWriteError> {
     // Place the whole display name in the family-name slot; the remaining four
     // structured components stay empty. This is a deliberately minimal but
     // RFC-valid N so 3.0-strict servers accept the card.
-    let family = escape_text(display_name.unwrap_or(""));
+    let family = text_value("display name", display_name.unwrap_or(""))?;
     lines.push(format!("N:{family};;;;"));
+    Ok(())
 }
 
 fn append_emails(
@@ -224,15 +282,21 @@ fn append_emails(
     emails: &[ContactEmail],
     version: VCardVersion,
     groups: &[String],
-) {
+) -> Result<(), VCardWriteError> {
     for (index, email) in emails.iter().enumerate() {
         let prefix = group_prefix(group_for(groups, index));
-        let params = type_param(email.kind.as_deref(), email.is_primary, version);
+        let params = type_param(
+            "email type",
+            email.kind.as_deref(),
+            email.is_primary,
+            version,
+        )?;
         lines.push(format!(
             "{prefix}EMAIL{params}:{}",
-            escape_text(&email.value)
+            text_value("email", &email.value)?
         ));
     }
+    Ok(())
 }
 
 fn append_phones(
@@ -240,15 +304,27 @@ fn append_phones(
     phones: &[ContactPhone],
     version: VCardVersion,
     groups: &[String],
-) {
+) -> Result<(), VCardWriteError> {
     for (index, phone) in phones.iter().enumerate() {
         let prefix = group_prefix(group_for(groups, index));
-        let params = type_param(phone.kind.as_deref(), phone.is_primary, version);
-        lines.push(format!("{prefix}TEL{params}:{}", escape_text(&phone.value)));
+        let params = type_param(
+            "phone type",
+            phone.kind.as_deref(),
+            phone.is_primary,
+            version,
+        )?;
+        lines.push(format!(
+            "{prefix}TEL{params}:{}",
+            text_value("phone", &phone.value)?
+        ));
     }
+    Ok(())
 }
 
-fn append_organizations(lines: &mut Vec<String>, organizations: &[ContactOrganization]) {
+fn append_organizations(
+    lines: &mut Vec<String>,
+    organizations: &[ContactOrganization],
+) -> Result<(), VCardWriteError> {
     for organization in organizations {
         // ORG is a structured (`;`-delimited) value; the model carries only a
         // single name, but encoding it as components rather than escaping the
@@ -257,8 +333,8 @@ fn append_organizations(lines: &mut Vec<String>, organizations: &[ContactOrganiz
         let value = organization
             .name
             .split(';')
-            .map(escape_text)
-            .collect::<Vec<_>>()
+            .map(|part| text_value("organization name", part))
+            .collect::<Result<Vec<_>, _>>()?
             .join(";");
         // A title-only organization (the shape a standalone TITLE line parses
         // into) emits no ORG line: a bare `ORG:` would invent an empty
@@ -267,9 +343,13 @@ fn append_organizations(lines: &mut Vec<String>, organizations: &[ContactOrganiz
             lines.push(format!("ORG:{value}"));
         }
         if let Some(title) = organization.title.as_deref() {
-            lines.push(format!("TITLE:{}", escape_text(title)));
+            lines.push(format!(
+                "TITLE:{}",
+                text_value("organization title", title)?
+            ));
         }
     }
+    Ok(())
 }
 
 fn append_addresses(
@@ -277,10 +357,15 @@ fn append_addresses(
     addresses: &[ContactAddress],
     version: VCardVersion,
     groups: &[String],
-) {
+) -> Result<(), VCardWriteError> {
     for (index, address) in addresses.iter().enumerate() {
         let prefix = group_prefix(group_for(groups, index));
-        let params = type_param(address.kind.as_deref(), address.is_primary, version);
+        let params = type_param(
+            "address type",
+            address.kind.as_deref(),
+            address.is_primary,
+            version,
+        )?;
         // The 7 ADR components are: po-box; extended; street; locality;
         // region; postal; country. The model has no dedicated po-box/extended
         // slots, so the ordered `street` vector carries them: any leading
@@ -290,39 +375,57 @@ fn append_addresses(
         let street = address
             .street
             .iter()
-            .map(|value| escape_text(value))
-            .collect::<Vec<_>>()
+            .map(|value| text_value("address street", value))
+            .collect::<Result<Vec<_>, _>>()?
             .join("\\n");
         lines.push(format!(
             "{prefix}ADR{params}:;;{};{};{};{};{}",
             street,
-            escape_text(address.locality.as_deref().unwrap_or_default()),
-            escape_text(address.region.as_deref().unwrap_or_default()),
-            escape_text(address.postal_code.as_deref().unwrap_or_default()),
-            escape_text(address.country.as_deref().unwrap_or_default())
+            text_value(
+                "address locality",
+                address.locality.as_deref().unwrap_or_default()
+            )?,
+            text_value(
+                "address region",
+                address.region.as_deref().unwrap_or_default()
+            )?,
+            text_value(
+                "address postal code",
+                address.postal_code.as_deref().unwrap_or_default()
+            )?,
+            text_value(
+                "address country",
+                address.country.as_deref().unwrap_or_default()
+            )?
         ));
     }
+    Ok(())
 }
 
-fn append_notes(lines: &mut Vec<String>, notes: Option<&str>) {
+fn append_notes(lines: &mut Vec<String>, notes: Option<&str>) -> Result<(), VCardWriteError> {
     if let Some(notes) = notes {
-        lines.push(format!("NOTE:{}", escape_text(notes)));
+        lines.push(format!("NOTE:{}", text_value("notes", notes)?));
     }
+    Ok(())
 }
 
-fn append_photo(lines: &mut Vec<String>, photo_url: Option<&str>) {
+fn append_photo(lines: &mut Vec<String>, photo_url: Option<&str>) -> Result<(), VCardWriteError> {
     if let Some(photo_url) = photo_url {
-        lines.push(format!("PHOTO;VALUE=URI:{}", escape_text(photo_url)));
+        lines.push(format!(
+            "PHOTO;VALUE=URI:{}",
+            text_value("photo url", photo_url)?
+        ));
     }
+    Ok(())
 }
 
 fn append_inline_photo(
     lines: &mut Vec<String>,
     photo: Option<&ContactPhoto>,
     version: VCardVersion,
-) {
+) -> Result<(), VCardWriteError> {
     let Some(photo) = photo else {
-        return;
+        return Ok(());
     };
     let data = base64::engine::general_purpose::STANDARD.encode(&photo.data);
     let media = photo
@@ -337,6 +440,14 @@ fn append_inline_photo(
                 || "application/octet-stream".to_string(),
                 media_type_for_data_uri,
             );
+            // The data: URI is a URI value with no escape form, so a control
+            // character (a line break included) cannot be carried at all.
+            if media_type.chars().any(|ch| ch.is_ascii_control()) {
+                return Err(VCardWriteError {
+                    field: "photo media type",
+                    reason: CONTROL_CHARACTER,
+                });
+            }
             lines.push(format!("PHOTO:data:{media_type};base64,{data}"));
         }
         VCardVersion::V3 => {
@@ -344,13 +455,17 @@ fn append_inline_photo(
             let mut line = String::from("PHOTO;ENCODING=b");
             if let Some(media_type) = media {
                 line.push_str(";TYPE=");
-                line.push_str(&escape_param(&image_subtype(media_type).to_uppercase()));
+                line.push_str(&param_value(
+                    "photo media type",
+                    &image_subtype(media_type).to_uppercase(),
+                )?);
             }
             line.push(':');
             line.push_str(&data);
             lines.push(line);
         }
     }
+    Ok(())
 }
 
 /// Build a `image/<subtype>` media type for a 4.0 data: URI from either a bare
@@ -746,14 +861,19 @@ fn logical_line_groups(source: &str) -> Vec<LineGroup<'_>> {
     groups
 }
 
-fn type_param(kind: Option<&str>, primary: bool, version: VCardVersion) -> String {
+fn type_param(
+    field: &'static str,
+    kind: Option<&str>,
+    primary: bool,
+    version: VCardVersion,
+) -> Result<String, VCardWriteError> {
     let mut params = Vec::new();
     if let Some(kind) = kind.filter(|kind| !kind.is_empty()) {
         // The model carries TYPE values as a comma-joined string (the parse
         // path joins multi-TYPE that way); split them back into per-value TYPE
         // parameters so every type round-trips.
         for value in kind.split(',').filter(|value| !value.is_empty()) {
-            params.push(format!("TYPE={}", escape_param(value)));
+            params.push(format!("TYPE={}", param_value(field, value)?));
         }
     }
     if primary {
@@ -765,11 +885,11 @@ fn type_param(kind: Option<&str>, primary: bool, version: VCardVersion) -> Strin
             VCardVersion::V3 => "TYPE=PREF".to_string(),
         });
     }
-    if params.is_empty() {
+    Ok(if params.is_empty() {
         String::new()
     } else {
         format!(";{}", params.join(";"))
-    }
+    })
 }
 
 /// Collect every TYPE value across repeated `TYPE=` parameters and
@@ -1009,6 +1129,16 @@ fn photo_media_type(params: &[(String, Vec<String>)]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Test shims: the production writers are fallible (a control character
+    /// is refused); these shadow them for tests that feed writable input.
+    fn vcard_from_create(contact: &ContactCreate, uid: &str) -> String {
+        super::vcard_from_create(contact, uid).expect("writable contact")
+    }
+
+    fn vcard_from_patch(current: &ContactCard, source: &str, patch: &ContactPatch) -> String {
+        super::vcard_from_patch(current, source, patch).expect("writable patch")
+    }
+
     /// Test shim: the production projector is fallible (malformed bodies
     /// degrade to a per-resource skip); these tests feed well-formed input and
     /// expect a successful projection.
@@ -1203,7 +1333,7 @@ mod tests {
         assert_eq!(contact.organizations[0].name, "Acme;R&D;Lab");
 
         let mut lines = Vec::new();
-        append_organizations(&mut lines, &contact.organizations);
+        append_organizations(&mut lines, &contact.organizations).expect("writable");
         assert_eq!(lines[0], "ORG:Acme;R&D;Lab");
     }
 
@@ -1257,7 +1387,7 @@ mod tests {
         assert_eq!(comma.phones[0].kind.as_deref(), Some("home,work"));
 
         let mut lines = Vec::new();
-        append_phones(&mut lines, &repeated.phones, VCardVersion::V4, &[]);
+        append_phones(&mut lines, &repeated.phones, VCardVersion::V4, &[]).expect("writable");
         assert_eq!(lines[0], "TEL;TYPE=cell;TYPE=voice:+1");
     }
 
@@ -1412,8 +1542,160 @@ mod tests {
                 media_type: Some("PNG".to_string()),
             }),
             VCardVersion::V4,
-        );
+        )
+        .expect("writable");
         assert_eq!(lines[0], "PHOTO:data:image/png;base64,AQIDBA==");
+    }
+
+    fn refused_create(contact: &ContactCreate) -> VCardWriteError {
+        super::vcard_from_create(contact, "id-1").expect_err("the writer must refuse this value")
+    }
+
+    /// TEXT and parameter values holding a control character other than tab,
+    /// CR and LF are refused and named, on create and on patch, never
+    /// stripped. CR and LF stay escaped (TEXT) or caret-encoded (parameters),
+    /// and the inline PHOTO data URI, which has no escape form, refuses any
+    /// control character. Reverting `text_value`, `param_value` or the data URI
+    /// guard to a pass-through writes the value.
+    #[test]
+    fn writers_refuse_control_characters_and_still_encode_line_breaks() {
+        let named = |edit: &dyn Fn(&mut ContactCreate)| {
+            let mut contact = ContactCreate::default();
+            edit(&mut contact);
+            refused_create(&contact).field
+        };
+        assert_eq!(
+            named(&|c| c.display_name = Some("Ada\u{0}Lovelace".to_string())),
+            "display name"
+        );
+        assert_eq!(
+            named(&|c| c.emails = vec![ContactEmail {
+                value: "a@example.test\u{7}".to_string(),
+                kind: None,
+                is_primary: false,
+            }]),
+            "email"
+        );
+        assert_eq!(
+            named(&|c| c.emails = vec![ContactEmail {
+                value: "a@example.test".to_string(),
+                kind: Some("ho\u{1}me".to_string()),
+                is_primary: false,
+            }]),
+            "email type"
+        );
+        assert_eq!(
+            named(&|c| c.phones = vec![ContactPhone {
+                value: "+1\u{8}".to_string(),
+                kind: None,
+                is_primary: false,
+            }]),
+            "phone"
+        );
+        assert_eq!(
+            named(&|c| c.organizations = vec![ContactOrganization {
+                name: "Ac\u{b}me".to_string(),
+                title: None,
+            }]),
+            "organization name"
+        );
+        assert_eq!(
+            named(&|c| c.organizations = vec![ContactOrganization {
+                name: "Acme".to_string(),
+                title: Some("Boss\u{7f}".to_string()),
+            }]),
+            "organization title"
+        );
+        assert_eq!(
+            named(&|c| c.addresses = vec![ContactAddress {
+                kind: None,
+                formatted: None,
+                street: vec!["1 Main\u{c}St".to_string()],
+                locality: None,
+                region: None,
+                postal_code: None,
+                country: None,
+                is_primary: false
+            }]),
+            "address street"
+        );
+        assert_eq!(
+            named(&|c| c.addresses = vec![ContactAddress {
+                kind: None,
+                formatted: None,
+                street: Vec::new(),
+                locality: None,
+                region: None,
+                postal_code: None,
+                country: Some("No\u{0}rway".to_string()),
+                is_primary: false
+            }]),
+            "address country"
+        );
+        assert_eq!(
+            named(&|c| c.notes = Some("note\u{1b}".to_string())),
+            "notes"
+        );
+        assert_eq!(
+            named(&|c| c.photo_url = Some("https://x.test/\u{0}".to_string())),
+            "photo url"
+        );
+        assert_eq!(
+            super::vcard_from_create(&ContactCreate::default(), "id\u{0}1")
+                .expect_err("uid")
+                .field,
+            "uid"
+        );
+
+        // The 4.0 data URI carries the media type unescaped: even a line
+        // break is refused rather than injecting a content line.
+        let mut lines = Vec::new();
+        let error = append_inline_photo(
+            &mut lines,
+            Some(&ContactPhoto {
+                data: vec![1],
+                media_type: Some("image/png\r\nX-EVIL:1".to_string()),
+            }),
+            VCardVersion::V4,
+        )
+        .expect_err("a line break in the media type is refused");
+        assert_eq!(error.field, "photo media type");
+        assert!(lines.is_empty());
+
+        // Patch path: same emitters, same refusal.
+        let source = "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada\r\nEND:VCARD\r\n";
+        let current = parse_contact("/ab/1.vcf".to_string(), None, None, source);
+        let error = super::vcard_from_patch(
+            &current,
+            source,
+            &ContactPatch {
+                notes: Some(Some("a\u{0}b".to_string())),
+                ..ContactPatch::default()
+            },
+        )
+        .expect_err("a control character in a patched note is refused");
+        assert_eq!(error.field, "notes");
+
+        // Line breaks and tab remain writable and stay ONE content line.
+        let contact = ContactCreate {
+            notes: Some("one\r\ntwo\tthree\rfour\nfive".to_string()),
+            display_name: Some("Ada".to_string()),
+            emails: vec![ContactEmail {
+                value: "a@example.test".to_string(),
+                kind: Some("ho\r\nme".to_string()),
+                is_primary: false,
+            }],
+            ..ContactCreate::default()
+        };
+        let data = super::vcard_from_create(&contact, "id-1").expect("line breaks are writable");
+        assert!(
+            data.contains("NOTE:one\\ntwo\tthree\\nfour\\nfive\r\n"),
+            "{data}"
+        );
+        assert!(
+            data.contains("EMAIL;TYPE=ho^nme:a@example.test\r\n"),
+            "{data}"
+        );
     }
 
     #[test]

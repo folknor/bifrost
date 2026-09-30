@@ -333,7 +333,12 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   two halves it separated when a consumer echoed the projected text back.
   **The writers refuse what they cannot write; they never strip.** Every value
   the writers emit goes through one of three treatments. TEXT (SUMMARY,
-  DESCRIPTION, LOCATION, VTIMEZONE TZID) is escaped by `escape_text`. Parameter
+  DESCRIPTION, LOCATION, UID, VTIMEZONE TZID) is escaped by `escape_text` behind
+  `text_value`, which carries CR and LF as the `\n` line break and tab as is, and
+  refuses any other ASCII control character (RFC 5545 s3.3.11 excludes CONTROLs
+  from TEXT; NUL has no escape form). `create_to_ical` builds the VEVENT before
+  the VTIMEZONE blocks, so a zone the parameter writers refuse is named by its
+  parameter field ("start timezone") rather than by the VTIMEZONE TZID. Parameter
   values (CN, TZID) are RFC 6868 caret-encoded by `escape_param` behind
   `param_value`, which carries CR, LF and DQUOTE and refuses any other control
   character. A value type with no escape form - RECUR (`RRULE`), DATE-TIME
@@ -366,7 +371,8 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   `an_empty_end_on_a_patch_leaves_the_stored_end_untouched`; the value refusals
   by `create_refuses_line_breaks_in_unescapable_values`,
   `create_encodes_parameter_values_and_refuses_unencodable_ones`,
-  `patch_refuses_line_breaks_in_unescapable_values` and, at the account,
+  `patch_refuses_line_breaks_in_unescapable_values`,
+  `text_values_refuse_control_characters_and_still_escape_line_breaks` and, at the account,
   `unwritable_event_values_are_malformed_before_any_write`.
 
   Serialization-out (create/patch/RSVP) stays

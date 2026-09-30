@@ -261,32 +261,65 @@ fn param_value(field: &'static str, value: &str) -> Result<String, WriteError> {
     Ok(escape_param(value))
 }
 
+/// A TEXT value (RFC 5545 s3.3.11), escaped for the wire. CR and LF are
+/// escaped as the `\n` line break (`escape_text`), and tab is legal. Every
+/// other ASCII control character (NUL included) is excluded from TEXT by the
+/// grammar and has no escape form, so it is refused and named, never stripped.
+fn text_value(field: &'static str, value: &str) -> Result<String, WriteError> {
+    if value
+        .chars()
+        .any(|ch| ch.is_ascii_control() && !matches!(ch, '\t' | '\r' | '\n'))
+    {
+        return Err(WriteError {
+            field,
+            reason: CONTROL_CHARACTER,
+        });
+    }
+    Ok(escape_text(value))
+}
+
 pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> Result<String, WriteError> {
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_string(),
         "VERSION:2.0".to_string(),
         "PRODID:-//folknor//bifrost//EN".to_string(),
     ];
-    push_vtimezones(&mut lines, event);
-    lines.push("BEGIN:VEVENT".to_string());
-    lines.push(format!("UID:{uid}"));
-    push_optional(&mut lines, "SUMMARY", event.title.as_deref());
-    push_optional(&mut lines, "DESCRIPTION", event.description.as_deref());
-    push_optional(&mut lines, "LOCATION", event.location.as_deref());
-    push_start(&mut lines, &event.start, event.is_all_day)?;
-    push_end(&mut lines, &event.end, event.is_all_day)?;
-    lines.push(format!("STATUS:{}", ical_event_status(event.status)));
-    lines.push(format!("TRANSP:{}", transparency(event.availability)));
+    // The VEVENT is built first so a zone the parameter writers refuse is
+    // named by its parameter field ("start timezone") before the VTIMEZONE
+    // block, which spells the same value as TEXT, sees it.
+    let mut vevent = vec![
+        "BEGIN:VEVENT".to_string(),
+        format!("UID:{}", text_value("uid", uid)?),
+    ];
+    push_optional(&mut vevent, "SUMMARY", "title", event.title.as_deref())?;
+    push_optional(
+        &mut vevent,
+        "DESCRIPTION",
+        "description",
+        event.description.as_deref(),
+    )?;
+    push_optional(
+        &mut vevent,
+        "LOCATION",
+        "location",
+        event.location.as_deref(),
+    )?;
+    push_start(&mut vevent, &event.start, event.is_all_day)?;
+    push_end(&mut vevent, &event.end, event.is_all_day)?;
+    vevent.push(format!("STATUS:{}", ical_event_status(event.status)));
+    vevent.push(format!("TRANSP:{}", transparency(event.availability)));
     if let Some(classification) = classification(event.visibility) {
-        lines.push(format!("CLASS:{classification}"));
+        vevent.push(format!("CLASS:{classification}"));
     }
     if let Some(organizer) = &event.organizer {
-        lines.push(organizer_to_line(organizer)?);
+        vevent.push(organizer_to_line(organizer)?);
     }
-    push_recurrence(&mut lines, &event.recurrence)?;
+    push_recurrence(&mut vevent, &event.recurrence)?;
     for attendee in &event.attendees {
-        lines.push(attendee_to_line(attendee)?);
+        vevent.push(attendee_to_line(attendee)?);
     }
+    push_vtimezones(&mut lines, event)?;
+    lines.extend(vevent);
     lines.extend(["END:VEVENT".to_string(), "END:VCALENDAR".to_string()]);
     Ok(fold_ical_lines(lines))
 }
@@ -363,19 +396,30 @@ pub(crate) fn patch_to_ical(
     let mut replacements = Vec::new();
     let mut replace_names = Vec::new();
     if patch.title.is_some() {
-        push_optional(&mut replacements, "SUMMARY", merged.title.as_deref());
+        push_optional(
+            &mut replacements,
+            "SUMMARY",
+            "title",
+            merged.title.as_deref(),
+        )?;
         replace_names.push("SUMMARY");
     }
     if patch.description.is_some() {
         push_optional(
             &mut replacements,
             "DESCRIPTION",
+            "description",
             merged.description.as_deref(),
-        );
+        )?;
         replace_names.push("DESCRIPTION");
     }
     if patch.location.is_some() {
-        push_optional(&mut replacements, "LOCATION", merged.location.as_deref());
+        push_optional(
+            &mut replacements,
+            "LOCATION",
+            "location",
+            merged.location.as_deref(),
+        )?;
         replace_names.push("LOCATION");
     }
     if patch.start.is_some() || patch.is_all_day.is_some() {
@@ -530,7 +574,7 @@ pub(crate) fn rsvp_reply_ical(
         "VERSION:2.0".to_string(),
         "METHOD:REPLY".to_string(),
         "BEGIN:VEVENT".to_string(),
-        format!("UID:{}", escape_text(uid)),
+        format!("UID:{}", text_value("uid", uid)?),
         format!(
             "DTSTAMP:{}",
             Offset::UTC
@@ -1242,15 +1286,21 @@ fn mailto(value: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn push_optional(lines: &mut Vec<String>, name: &str, value: Option<&str>) {
+fn push_optional(
+    lines: &mut Vec<String>,
+    name: &str,
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), WriteError> {
     if let Some(value) = value.filter(|value| !value.is_empty()) {
-        lines.push(format!("{name}:{}", escape_text(value)));
+        lines.push(format!("{name}:{}", text_value(field, value)?));
     }
+    Ok(())
 }
 
-fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) {
+fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) -> Result<(), WriteError> {
     if event.is_all_day {
-        return;
+        return Ok(());
     }
     let mut tzids = Vec::new();
     // An empty end writes no DTEND, so its zone has nothing to describe.
@@ -1284,7 +1334,7 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) {
         let offset = tzid_offset_for_naive(&tzid, anchor);
 
         lines.push("BEGIN:VTIMEZONE".to_string());
-        lines.push(format!("TZID:{}", escape_text(&tzid)));
+        lines.push(format!("TZID:{}", text_value("vtimezone tzid", &tzid)?));
         // A single STANDARD block carrying the correct offset for the event's
         // instant. This is approximate for a recurring event that spans a DST
         // transition (off by the DST delta on the far side of the transition),
@@ -1314,6 +1364,7 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) {
         }
         lines.push("END:VTIMEZONE".to_string());
     }
+    Ok(())
 }
 
 /// Derive the wall-clock `NaiveDateTime` an event time names. With a TZID the
@@ -3652,6 +3703,67 @@ mod tests {
             panic!("an injected start must be refused");
         };
         assert_eq!(error.field, "start");
+    }
+
+    /// TEXT excludes control characters other than tab (RFC 5545 s3.3.11), and
+    /// they have no escape form: refused and named, on create and on a patch,
+    /// never stripped. CR and LF stay escaped as the `\n` line break, tab is
+    /// legal. Reverting `text_value` to a plain `escape_text` writes the NUL.
+    #[test]
+    fn text_values_refuse_control_characters_and_still_escape_line_breaks() {
+        let mut event = writable_create();
+        event.title = Some("Sta\u{0}nd-up".to_string());
+        assert_eq!(refusal(&event).field, "title");
+
+        let mut event = writable_create();
+        event.description = Some("bell\u{7}".to_string());
+        assert_eq!(refusal(&event).field, "description");
+
+        let mut event = writable_create();
+        event.location = Some("Room\u{7f}1".to_string());
+        assert_eq!(refusal(&event).field, "location");
+
+        let error = super::create_to_ical(&writable_create(), "uid\u{1b}1")
+            .expect_err("a control character in the uid is refused");
+        assert_eq!(error.field, "uid");
+
+        let current = patch_target();
+        for (patch, field) in [
+            (
+                EventPatch {
+                    title: Some(Some("a\u{0}b".to_string())),
+                    ..EventPatch::default()
+                },
+                "title",
+            ),
+            (
+                EventPatch {
+                    description: Some(Some("a\u{8}b".to_string())),
+                    ..EventPatch::default()
+                },
+                "description",
+            ),
+            (
+                EventPatch {
+                    location: Some(Some("a\u{c}b".to_string())),
+                    ..EventPatch::default()
+                },
+                "location",
+            ),
+        ] {
+            let Err(PatchError::Write(error)) = patch_to_ical(&current, &patch) else {
+                panic!("a control character in {field} must be refused");
+            };
+            assert_eq!(error.field, field);
+        }
+
+        let mut event = writable_create();
+        event.title = Some("one\r\ntwo\tthree\rfour\nfive".to_string());
+        let body = super::create_to_ical(&event, "uid-1").expect("line breaks and tab are TEXT");
+        assert!(
+            body.contains("SUMMARY:one\\ntwo\tthree\\nfour\\nfive\r\n"),
+            "{body}"
+        );
     }
 
     /// An empty start is never written: `DTSTART:` is invalid and no reading of
