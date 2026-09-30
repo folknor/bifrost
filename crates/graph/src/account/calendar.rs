@@ -1305,11 +1305,23 @@ fn graph_weekday(date: civil::Date) -> &'static str {
     GRAPH_WEEKDAYS[usize::from(date.weekday().to_sunday_zero_offset().unsigned_abs())]
 }
 
-/// How far an open-ended absolute series is walked. Which months a series
-/// visits repeats within a year of steps, and whether February has a 29th
-/// within four years, so eight years of candidates cover every case short of
-/// the Gregorian century rule.
-const ABSOLUTE_SERIES_HORIZON_MONTHS: i64 = 8 * 12;
+/// The Gregorian calendar repeats every 400 years: a month's length depends
+/// only on its month and on its year modulo 400.
+const GREGORIAN_CYCLE_MONTHS: i64 = 400 * 12;
+
+/// Days in a month, counted by its index `year * 12 + month - 1`. The year is
+/// reduced into one Gregorian cycle first, which leaves the answer unchanged
+/// and keeps any index inside the range `civil::Date` accepts.
+fn days_in_indexed_month(index: i64) -> i64 {
+    let year = 2000 + (index.div_euclid(12) - 2000).rem_euclid(400);
+    let month = index.rem_euclid(12) + 1;
+    match (i16::try_from(year), i8::try_from(month)) {
+        (Ok(year), Ok(month)) => civil::Date::new(year, month, 1)
+            .map(|first| i64::from(first.days_in_month()))
+            .unwrap_or(31),
+        _ => 31,
+    }
+}
 
 /// Refuse an absolute series that visits a month lacking its day.
 ///
@@ -1319,9 +1331,15 @@ const ABSOLUTE_SERIES_HORIZON_MONTHS: i64 = 8 * 12;
 /// day. Writing such a series would add occurrences the rule never asked for,
 /// so it is refused. Only the months the series actually visits count: the
 /// 31st every sixth month from July lands on July and January only and is
-/// written as is. The walk runs from the start's month in `step_months`
-/// steps; a candidate before the start is not an occurrence, `COUNT` counts
-/// only real occurrences, and `UNTIL` or the horizon ends an open series.
+/// written as is.
+///
+/// The walk runs from the start's month in `step_months` steps; a candidate
+/// before the start is not an occurrence, `COUNT` counts only real
+/// occurrences, and `UNTIL` ends the series. A month's length depends only on
+/// its position in the 400-year cycle, and the positions a series visits
+/// repeat after at most one cycle's worth of steps, so walking that many
+/// steps sees every month the series can ever reach: an open-ended or long
+/// series is decided exactly, not by a horizon.
 fn check_absolute_series(
     start: civil::Date,
     first_month: u32,
@@ -1330,41 +1348,42 @@ fn check_absolute_series(
     count: Option<u32>,
     until: Option<civil::Date>,
 ) -> Result<(), RecurrenceRefusal> {
+    let month_index = |date: civil::Date| i64::from(date.year()) * 12 + i64::from(date.month()) - 1;
     let first = i64::from(start.year()) * 12 + i64::from(first_month) - 1;
+    let start_index = month_index(start);
+    let until = until.map(|until| (month_index(until), i64::from(until.day())));
     let step = i64::from(step_months.max(1));
+    let day = i64::from(day);
     let mut occurrences = 0u32;
-    let mut offset = 0i64;
-    while offset <= ABSOLUTE_SERIES_HORIZON_MONTHS && count.is_none_or(|n| occurrences < n) {
-        let index = first + offset;
-        offset += step;
-        let (Ok(year), Ok(month)) = (i16::try_from(index / 12), i8::try_from(index % 12 + 1))
-        else {
-            break;
-        };
-        let Ok(first_of_month) = civil::Date::new(year, month, 1) else {
-            break;
-        };
-        if until.is_some_and(|until| first_of_month > until) {
+    for steps in 0..=GREGORIAN_CYCLE_MONTHS {
+        if count.is_some_and(|count| occurrences >= count) {
             break;
         }
-        let candidate = i8::try_from(day)
-            .ok()
-            .and_then(|day| civil::Date::new(year, month, day).ok());
-        match candidate {
+        let index = first + steps * step;
+        if until.is_some_and(|(until_index, _)| index > until_index) {
+            break;
+        }
+        let in_until_month = until.filter(|(until_index, _)| index == *until_index);
+        let last_day = days_in_indexed_month(index);
+        if day > last_day {
             // Graph puts this occurrence on the month's last day; past UNTIL
             // it would not be written at all, and the series is over.
-            None if until.is_some_and(|until| first_of_month.last_of_month() > until) => break,
+            if in_until_month.is_some_and(|(_, until_day)| last_day > until_day) {
+                break;
+            }
             // A date the month does not have always falls after a start in
             // that month, so it is a skipped occurrence, never a pre-start one.
-            None => {
-                return Err(unexpressible(format!(
-                    "Graph recurrence cannot express day {day} in a series that reaches \
-                     {year}-{month:02}, which lacks it: Graph moves such an occurrence to the \
-                     month's last day where RFC 5545 skips it"
-                )));
-            }
-            Some(date) if date < start || until.is_some_and(|until| date > until) => {}
-            Some(_) => occurrences += 1,
+            let (year, month) = (index.div_euclid(12), index.rem_euclid(12) + 1);
+            return Err(unexpressible(format!(
+                "Graph recurrence cannot express day {day} in a series that reaches \
+                 {year}-{month:02}, which lacks it: Graph moves such an occurrence to the \
+                 month's last day where RFC 5545 skips it"
+            )));
+        }
+        let before_start = index == start_index && day < i64::from(start.day());
+        let after_until = in_until_month.is_some_and(|(_, until_day)| day > until_day);
+        if !before_start && !after_until {
+            occurrences += 1;
         }
     }
     Ok(())
@@ -3161,6 +3180,14 @@ mod tests {
             ("FREQ=MONTHLY;BYMONTHDAY=30", "2026-02-10"),
             // Graph would write February 28th, inside UNTIL; RFC 5545 skips it.
             ("FREQ=MONTHLY;UNTIL=20260228", "2026-01-31"),
+            // The second candidate, 2037, is not a leap year: a horizon that
+            // stopped before it accepted this series.
+            ("FREQ=YEARLY;INTERVAL=9;COUNT=2", "2028-02-29"),
+            // 2100 is not a leap year, the nineteenth candidate from 2028.
+            ("FREQ=YEARLY;INTERVAL=4", "2028-02-29"),
+            ("FREQ=YEARLY;INTERVAL=4;COUNT=19", "2028-02-29"),
+            // A huge interval must not overflow its way to acceptance.
+            ("FREQ=MONTHLY;INTERVAL=4000000000", "2026-01-31"),
         ];
         for (rrule, start) in refused {
             assert!(
@@ -3183,8 +3210,10 @@ mod tests {
             ("FREQ=MONTHLY;COUNT=1", "2026-01-31"),
             // Graph would put February's occurrence on the 28th, past UNTIL.
             ("FREQ=MONTHLY;UNTIL=20260227", "2026-01-31"),
-            // Every fourth February from a leap year is always a leap one.
-            ("FREQ=YEARLY;INTERVAL=4", "2028-02-29"),
+            // Every fourth February from a leap year is a leap one until the
+            // century rule, so only a series ending before 2100 is exact.
+            ("FREQ=YEARLY;INTERVAL=4;UNTIL=20960301", "2028-02-29"),
+            ("FREQ=YEARLY;INTERVAL=4;COUNT=18", "2028-02-29"),
             // A day before the start in the start's month is not an occurrence.
             ("FREQ=MONTHLY;BYMONTHDAY=15;COUNT=1", "2026-01-20"),
         ];
