@@ -286,6 +286,9 @@ struct RequestBuilderInner {
     retry: Option<RetryPolicy>,
     /// Optional per-request timeout override.
     timeout: Option<Option<Duration>>,
+    /// Optional per-request redirect policy override. `None` uses the
+    /// account's `AccountSpec::follow_redirects`.
+    follow_redirects: Option<FollowRedirects>,
     /// Caller's override of whether replaying this request can change
     /// server state. `None` derives it from the HTTP method.
     idempotent: Option<bool>,
@@ -326,6 +329,7 @@ impl RequestBuilder {
                 quota_scope: None,
                 retry: None,
                 timeout: None,
+                follow_redirects: None,
                 idempotent: None,
                 bearer_auth: true,
                 pending_error: None,
@@ -461,6 +465,22 @@ impl RequestBuilder {
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.inner.timeout = Some(Some(timeout));
+        self
+    }
+
+    /// Override the account's redirect policy for this request only.
+    ///
+    /// `FollowRedirects::Disabled` hands every 3xx back to the caller as a
+    /// terminal response (status, headers and body), exactly as an account
+    /// attached with redirects disabled does; nothing is sent to the
+    /// `Location`. Meant for a request whose URL was admitted by a rule the
+    /// transport's redirect walk cannot apply to a hop - a pre-authenticated
+    /// upload URL is the standing case - where following a hop would send
+    /// the body somewhere the caller never admitted. `Enabled(policy)`
+    /// substitutes `policy` for the account's for this request's walk.
+    #[must_use]
+    pub fn follow_redirects(mut self, policy: FollowRedirects) -> Self {
+        self.inner.follow_redirects = Some(policy);
         self
     }
 
@@ -734,6 +754,7 @@ pub(crate) async fn send_streaming_inner(
         quota_scope: quota_scope_override,
         retry,
         timeout,
+        follow_redirects: redirect_override,
         idempotent,
         bearer_auth,
         pending_error,
@@ -750,7 +771,7 @@ pub(crate) async fn send_streaming_inner(
 
     let policy = retry.unwrap_or_else(|| account.default_retry().clone());
     let retry_attempt_limit = policy.max_attempts;
-    let redirect_policy = account.follow_redirects().clone();
+    let redirect_policy = redirect_override.unwrap_or_else(|| account.follow_redirects().clone());
     let deadline =
         RequestDeadline::from_timeout(timeout.unwrap_or_else(|| account.request_timeout()));
     if !headers.contains_key(reqwest::header::USER_AGENT) {
@@ -2338,6 +2359,59 @@ mod tests {
         assert_eq!(requests[1].url.as_str(), "https://target.test/final");
         assert_eq!(requests[1].body, None);
         assert!(!requests[1].headers.contains_key(AUTHORIZATION));
+    }
+
+    /// `follow_redirects(Disabled)` hands a 307 back to that one request
+    /// as a terminal response and sends nothing to its `Location`, while the
+    /// next request on the same account still walks the account's own
+    /// (enabled) policy. Without the override the first PUT would follow the
+    /// hop, replaying its body to the cleartext target.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_per_request_redirect_override_stops_only_that_request() {
+        let mut redirect_headers = HeaderMap::new();
+        redirect_headers.insert(
+            LOCATION,
+            HeaderValue::from_static("http://elsewhere.test/landing"),
+        );
+        let script = ScriptedDispatch::new([
+            canned_with_headers(
+                StatusCode::TEMPORARY_REDIRECT,
+                redirect_headers.clone(),
+                b"moved",
+            ),
+            canned_with_headers(StatusCode::TEMPORARY_REDIRECT, redirect_headers, b""),
+            canned(StatusCode::OK, b"followed"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+
+        let stopped = account
+            .put("https://upload.test/session")
+            .without_bearer_auth()
+            .follow_redirects(FollowRedirects::Disabled)
+            .body(Bytes::from_static(b"chunk"))
+            .send()
+            .await
+            .expect("a 3xx the request declined to follow is its response");
+        assert_eq!(stopped.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(stopped.body, Bytes::from_static(b"moved"));
+        assert_eq!(script.requests().len(), 1, "nothing went to the Location");
+
+        let followed = account
+            .put("https://upload.test/session")
+            .without_bearer_auth()
+            .body(Bytes::from_static(b"chunk"))
+            .send()
+            .await
+            .expect("the account policy still follows");
+        assert_eq!(followed.body, Bytes::from_static(b"followed"));
+        let requests = script.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].url.as_str(), "http://elsewhere.test/landing");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

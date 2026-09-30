@@ -827,6 +827,8 @@ pub struct AccountSpec {
     /// User-Agent header used for requests from this account.
     pub user_agent: String,
     /// Method-aware redirect policy, including the account's trusted hosts.
+    /// A single request can override it with
+    /// `RequestBuilder::follow_redirects`.
     pub follow_redirects: FollowRedirects,
     /// Refresh max-age for opaque bearer tokens without an expiry hint.
     pub token_max_age: Duration,
