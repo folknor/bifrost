@@ -17,7 +17,7 @@ use socket2::SockAddr;
 use socket2::{Domain, Protocol, Type};
 
 use super::metering::WireMetering;
-use super::{ConnectionState, TlsParameters};
+use super::{ConnectionState, DEFAULT_TLS_HANDSHAKE_TIMEOUT, TlsParameters};
 use crate::transport::smtp::{Error, error};
 
 /// A network stream
@@ -153,21 +153,28 @@ impl NetworkStream {
     /// up to the handshake boundary. Closing the gap would require a
     /// production seam that lets a test substitute the connector, not a new
     /// test.
-    pub(crate) fn connect<T: ToSocketAddrs>(
+    ///
+    /// Setup budgets, none of them a shared deadline: address resolution gets
+    /// `timeout` (see `resolve_within`), each candidate address then gets
+    /// `timeout` for its own `connect_timeout`, and the implicit-TLS handshake
+    /// gets `timeout` per socket read or write (see `upgrade_tls_bounded`).
+    pub(crate) fn connect<T: ToSocketAddrs + Send + 'static>(
         server: T,
         timeout: Option<Duration>,
         tls_parameters: Option<&TlsParameters>,
         local_addr: Option<IpAddr>,
     ) -> Result<NetworkStream, Error> {
-        fn try_connect<T: ToSocketAddrs>(
+        fn try_connect<T: ToSocketAddrs + Send + 'static>(
             server: T,
             timeout: Option<Duration>,
             local_addr: Option<IpAddr>,
         ) -> Result<TcpStream, Error> {
-            let addrs = server
-                .to_socket_addrs()
-                .map_err(error::connection_io)?
-                .filter(|resolved_addr| resolved_address_filter(resolved_addr, local_addr));
+            let addrs = resolve_within(
+                move || Ok(server.to_socket_addrs()?.collect::<Vec<_>>()),
+                timeout,
+            )?
+            .into_iter()
+            .filter(|resolved_addr| resolved_address_filter(resolved_addr, local_addr));
 
             let mut last_err = None;
 
@@ -202,9 +209,44 @@ impl NetworkStream {
         let tcp_stream = try_connect(server, timeout, local_addr)?;
         let mut stream = NetworkStream::new(InnerNetworkStream::Tcp(tcp_stream));
         if let Some(tls_parameters) = tls_parameters {
-            stream.upgrade_tls(tls_parameters)?;
+            stream.upgrade_tls_bounded(tls_parameters, timeout)?;
         }
         Ok(stream)
+    }
+
+    /// The implicit-TLS handshake at connect time, never unbounded.
+    ///
+    /// This runs before `SmtpConnection::set_timeout` has armed the socket, so
+    /// without this the handshake would block the thread on a peer that accepts
+    /// the TCP connection and then never answers the `ClientHello`, whatever
+    /// timeout was configured. The budget is the same one explicit STARTTLS
+    /// draws from: the configured operation timeout, armed as `SO_RCVTIMEO` /
+    /// `SO_SNDTIMEO`, so it bounds each read or write of the handshake and not
+    /// the handshake as a whole. With no configured timeout the default
+    /// handshake bound is armed for the handshake alone and the unbounded
+    /// setting put back afterwards.
+    fn upgrade_tls_bounded(
+        &mut self,
+        tls_parameters: &TlsParameters,
+        configured: Option<Duration>,
+    ) -> Result<(), Error> {
+        let bound = configured.unwrap_or(DEFAULT_TLS_HANDSHAKE_TIMEOUT);
+        self.set_read_timeout(Some(bound)).map_err(error::network)?;
+        self.set_write_timeout(Some(bound))
+            .map_err(error::network)?;
+        let result = self.upgrade_tls(tls_parameters);
+        if configured.is_none() {
+            // Restore even after a failure. A failed handshake has usually
+            // taken the socket with it, so this fails too and there is nothing
+            // to restore; the connection is broken either way.
+            let read = self.set_read_timeout(None);
+            let write = self.set_write_timeout(None);
+            result?;
+            read.map_err(error::network)?;
+            write.map_err(error::network)?;
+            return Ok(());
+        }
+        result
     }
 
     #[cfg(unix)]
@@ -254,7 +296,7 @@ impl NetworkStream {
         let stream = tls_parameters
             .connector
             .connect(tls_parameters.domain(), tcp_stream)
-            .map_err(error::tls)?;
+            .map_err(error::tls_handshake)?;
         Ok(InnerNetworkStream::NativeTls(stream))
     }
 
@@ -409,6 +451,46 @@ fn bind_local_address(
     Ok(())
 }
 
+/// Run a blocking address resolution under `timeout`.
+///
+/// `ToSocketAddrs` has no timeout parameter and `getaddrinfo` cannot be
+/// cancelled, so with a timeout the resolution runs on a helper thread and this
+/// waits for its result for at most `timeout`. On expiry the caller gets a
+/// `Timeout` error, but the helper thread is NOT stopped: it stays parked in the
+/// resolver until the OS resolver returns or gives up, then drops its result
+/// and exits. A stalled resolver therefore leaks one thread per timed-out
+/// attempt for as long as the stall lasts. That is the honest price of a bound
+/// on an uncancellable call. With no timeout the resolution runs inline on the
+/// calling thread, as `timeout(None)` means "do not limit my operations".
+///
+/// The budget is the configured timeout for resolution alone; the connect that
+/// follows draws its own.
+fn resolve_within<F>(resolve: F, timeout: Option<Duration>) -> Result<Vec<SocketAddr>, Error>
+where
+    F: FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    let Some(timeout) = timeout else {
+        return resolve().map_err(error::connection_io);
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("bifrost-smtp-resolve".to_owned())
+        .spawn(move || {
+            // The receiver is gone once the wait timed out; nobody wants this.
+            let _ = tx.send(resolve());
+        })
+        .map_err(error::connection_io)?;
+    match rx.recv_timeout(timeout) {
+        Ok(resolved) => resolved.map_err(error::connection_io),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(error::timeout("address resolution timed out"))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(error::connection(
+            "address resolver thread ended without a result",
+        )),
+    }
+}
+
 /// When we have an iterator of resolved remote addresses, we must filter them to be the same
 /// protocol as the local address binding. If no local address is set, then all will be matched.
 pub(crate) fn resolved_address_filter(
@@ -421,5 +503,108 @@ pub(crate) fn resolved_address_filter(
             IpAddr::V6(_) => local_addr.is_ipv6(),
         },
         None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::{DEFAULT_TLS_HANDSHAKE_TIMEOUT, NetworkStream, resolve_within};
+    use crate::transport::smtp::client::TlsParameters;
+    use crate::transport::smtp::test_support::Transcript;
+
+    /// A resolver that cannot finish until the test releases it, so the bound
+    /// is the only way `resolve_within` can return. No sleep is involved: an
+    /// unbounded implementation blocks here until the watchdog kills the test.
+    #[test]
+    fn a_stalled_resolution_times_out_at_the_bound() {
+        let (release, parked) = mpsc::channel::<()>();
+        let error = resolve_within(
+            move || {
+                let _ = parked.recv();
+                Ok(Vec::new())
+            },
+            Some(Duration::ZERO),
+        )
+        .expect_err("a resolution that never finishes must not be waited for");
+        assert!(error.is_timeout(), "expected a timeout, got: {error}");
+        drop(release);
+    }
+
+    #[test]
+    fn a_resolution_inside_the_bound_returns_its_addresses() {
+        let addr: SocketAddr = ([127, 0, 0, 1], 25).into();
+        let resolved = resolve_within(move || Ok(vec![addr]), Some(Duration::from_secs(30)))
+            .expect("a prompt resolver succeeds");
+        assert_eq!(resolved, vec![addr]);
+    }
+
+    #[test]
+    fn a_resolver_failure_is_a_connection_error_not_a_timeout() {
+        let error = resolve_within(
+            || Err(std::io::Error::other("no such host")),
+            Some(Duration::from_secs(30)),
+        )
+        .expect_err("the resolver failed");
+        assert!(error.is_connection(), "got: {error}");
+    }
+
+    #[test]
+    fn a_resolver_that_dies_without_a_result_is_not_a_timeout() {
+        let error = resolve_within(
+            || -> std::io::Result<Vec<SocketAddr>> { panic!("resolver panicked") },
+            Some(Duration::from_secs(30)),
+        )
+        .expect_err("no result was produced");
+        assert!(error.is_connection(), "got: {error}");
+    }
+
+    #[test]
+    fn an_unconfigured_resolution_runs_inline() {
+        let caller = std::thread::current().id();
+        let resolved = resolve_within(
+            move || {
+                assert_eq!(std::thread::current().id(), caller);
+                Ok(Vec::new())
+            },
+            None,
+        )
+        .expect("inline resolution");
+        assert!(resolved.is_empty());
+    }
+
+    /// Arm-and-restore around the implicit-TLS handshake, read back off the
+    /// transcript. The transcript stream cannot complete a handshake, but the
+    /// timeouts are armed before it is attempted, so the budget the handshake
+    /// draws from is observable without a socket. A real stalled handshake
+    /// needs a peer on a socket and stays out of scope.
+    fn implicit_tls_armed_timeouts(configured: Option<Duration>) -> Vec<Option<Duration>> {
+        let transcript = Transcript::new("");
+        let mut stream = NetworkStream::from_transcript(transcript.clone());
+        let tls = TlsParameters::new("smtp.example".to_owned()).unwrap();
+        stream
+            .upgrade_tls_bounded(&tls, configured)
+            .expect_err("the in-process transcript stream cannot complete a TLS handshake");
+        transcript.take_read_timeouts()
+    }
+
+    #[test]
+    fn the_implicit_tls_handshake_draws_the_configured_timeout() {
+        let configured = Duration::from_secs(7);
+        let armed = implicit_tls_armed_timeouts(Some(configured));
+        assert_eq!(armed, vec![Some(configured)], "armed: {armed:?}");
+    }
+
+    #[test]
+    fn an_unconfigured_implicit_tls_handshake_is_bounded_and_then_unbounded_again() {
+        let armed = implicit_tls_armed_timeouts(None);
+        assert_eq!(
+            armed,
+            vec![Some(DEFAULT_TLS_HANDSHAKE_TIMEOUT), None],
+            "armed: {armed:?}"
+        );
     }
 }

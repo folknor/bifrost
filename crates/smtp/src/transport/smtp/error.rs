@@ -506,6 +506,40 @@ pub(crate) fn tls<E: Into<BoxError>>(e: E) -> Error {
     Error::new(ErrorKind::Tls, Some(e))
 }
 
+/// A blocking TLS handshake failure. A handshake that ran into the socket's
+/// `SO_RCVTIMEO` / `SO_SNDTIMEO` is a `Timeout`, matching the async half's
+/// "TLS handshake timed out"; anything else is `Tls`. On a blocking socket a
+/// `WouldBlock` can only mean the armed timeout expired.
+pub(crate) fn tls_handshake<S>(e: native_tls::HandshakeError<S>) -> Error {
+    match e {
+        native_tls::HandshakeError::WouldBlock(_) => timeout("TLS handshake timed out"),
+        native_tls::HandshakeError::Failure(e) => {
+            if chain_has_io_timeout(&e) {
+                timeout("TLS handshake timed out")
+            } else {
+                tls(e)
+            }
+        }
+    }
+}
+
+/// True when any error in the source chain is an `io::Error` of a timeout kind.
+fn chain_has_io_timeout(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(e);
+    while let Some(err) = current {
+        if let Some(io) = err.downcast_ref::<io::Error>()
+            && matches!(
+                io.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            )
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 pub(crate) fn transport_shutdown() -> Error {
     Error::without_source(ErrorKind::TransportShutdown)
 }
@@ -586,6 +620,32 @@ mod tests {
         assert!(network_timeout.is_timeout());
         assert_eq!(connection_timeout.kind(), &ErrorKind::Timeout);
         assert!(connection_timeout.is_timeout());
+    }
+
+    #[test]
+    fn a_tls_failure_caused_by_an_io_timeout_is_found_in_the_source_chain() {
+        #[derive(Debug)]
+        struct Wrapper(io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("handshake failed")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+            assert!(super::chain_has_io_timeout(&Wrapper(io::Error::new(
+                kind, "slow"
+            ))));
+        }
+        assert!(!super::chain_has_io_timeout(&Wrapper(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "reset"
+        ))));
     }
 
     #[test]

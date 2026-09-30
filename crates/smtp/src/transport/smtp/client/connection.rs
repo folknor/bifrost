@@ -126,7 +126,7 @@ impl SmtpConnection {
     /// Sends EHLO and parses server information
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(crate) fn connect<A: ToSocketAddrs>(
+    pub(crate) fn connect<A: ToSocketAddrs + Send + 'static>(
         server: A,
         timeout: Option<Duration>,
         hello_name: &ClientId,
@@ -167,7 +167,7 @@ impl SmtpConnection {
         Ok(conn)
     }
 
-    pub(crate) fn connect_with_protocol<A: ToSocketAddrs>(
+    pub(crate) fn connect_with_protocol<A: ToSocketAddrs + Send + 'static>(
         server: A,
         timeout: Option<Duration>,
         hello_name: &ClientId,

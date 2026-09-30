@@ -40,11 +40,13 @@ rather than by its BOUND. The async half runs DNS, connect, TLS handshake,
 banner and EHLO under ONE shared `AsyncDeadline`, so async setup as a whole
 cannot exceed the configured timeout. The blocking half has no such thing, and
 is not merely looser - it is not bounded by that value at all:
-`to_socket_addrs()` resolves synchronously with no timeout, `connect_timeout`
-applies the full value to EACH candidate address in turn, the implicit-TLS handshake runs
-before `set_timeout` has armed the socket and so is unbounded (an explicit
-`STARTTLS` handshake is bounded on both halves, see "Async setup deadline"), and only the
-banner and EHLO reads are bounded, per reply, by `SO_RCVTIMEO`. A caller reading
+address resolution gets the full value to itself (see below), `connect_timeout`
+applies the full value to EACH candidate address in turn, the implicit-TLS and
+`STARTTLS` handshakes each get the value per socket read or write (see "Async
+setup deadline"), and the banner and EHLO reads are bounded, per reply, by
+`SO_RCVTIMEO`. Every phase is bounded, but by its own budget and never by a
+shared one, so the worst case is the sum of the budgets, multiplied by the
+candidate-address count for connect and by the round trips for the handshake. A caller reading
 "timeout" as a ceiling on how long a transport may take to produce a usable
 connection is therefore right on the async half and wrong on the blocking one.
 The difference is structural rather than an oversight: a blocking connect has no
@@ -305,9 +307,35 @@ bound, like every blocking timeout, not a shared deadline. Pinned without a
 socket by reading back the armed timeouts on the transcript stream
 (`an_unconfigured_starttls_handshake_is_bounded_and_then_unbounded_again`,
 `a_configured_starttls_timeout_is_left_alone`); a real stalled handshake needs a
-socket and stays out of scope. The blocking implicit-TLS handshake at connect
-time is NOT covered: it runs before any socket timeout exists, and is unbounded
-even with a configured timeout, as described under "Transport types".
+socket and stays out of scope.
+
+The blocking implicit-TLS handshake at connect time draws from the same budget
+(`NetworkStream::upgrade_tls_bounded`). It runs before `set_timeout` has armed
+the socket, so the dialer arms the configured timeout itself for the handshake
+(the default when none is configured, restored to unbounded afterwards). Pinned
+without a socket by `the_implicit_tls_handshake_draws_the_configured_timeout`
+and `an_unconfigured_implicit_tls_handshake_is_bounded_and_then_unbounded_again`.
+
+Blocking address resolution is bounded by `resolve_within`. `ToSocketAddrs` has
+no timeout parameter and `getaddrinfo` cannot be cancelled, so with a configured
+timeout the resolution runs on a helper thread and the caller waits for it at
+most that long; the budget is the configured timeout for resolution alone, and
+each connect attempt then draws its own. **A resolution that exceeds the bound
+leaves its helper thread running** until the OS resolver returns or gives up,
+after which the thread drops its result and exits, so a stalled resolver leaks
+one thread per timed-out attempt for the length of the stall. With
+`timeout(None)` resolution runs inline, unbounded. This is why the blocking
+connect path requires the address value to be `Send + 'static`. Pinned by
+`a_stalled_resolution_times_out_at_the_bound`, which parks the resolver on a
+channel the test never releases before the wait ends.
+
+A blocking handshake that runs into the socket timeout is classified `Timeout`
+(`error::tls_handshake`), matching the async half's "TLS handshake timed out";
+any other handshake failure stays `Tls`. This applies to STARTTLS and implicit
+TLS alike. On a blocking socket `HandshakeError::WouldBlock` can only mean the
+armed timeout expired. The `WouldBlock` arm itself cannot be built without a
+live handshake, so only the source-chain timeout detection is pinned
+(`a_tls_failure_caused_by_an_io_timeout_is_found_in_the_source_chain`).
 
 It measures on `tokio::time::Instant`, not `std`'s. Every timeout the deadline
 hands out is a `tokio::time::timeout`, and a deadline that reads a different

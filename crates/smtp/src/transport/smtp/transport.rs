@@ -913,8 +913,11 @@ impl SmtpClient {
             _ => None,
         };
 
-        let mut conn = SmtpConnection::connect_with_protocol::<(&str, u16)>(
-            (self.info.server.as_ref(), self.info.port),
+        // Owned, because resolution may move to a helper thread that outlives
+        // this call when it exceeds the timeout.
+        let server: &str = self.info.server.as_ref();
+        let mut conn = SmtpConnection::connect_with_protocol::<(String, u16)>(
+            (server.to_owned(), self.info.port),
             self.info.timeout,
             &self.info.hello_name,
             tls_parameters,

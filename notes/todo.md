@@ -85,9 +85,12 @@ item is what stops that.
 
 The laterals sweep's findings were built in one pass by a session that
 crashed before recording anything; the work was recovered, finished and
-committed 2026-09-30. The items below change a recovery class, a published
-type, or observable behaviour, and nobody ruled on them. Each is in the code
-now; the owner accepts it, or it is reverted as its own change.
+committed 2026-09-30, and the laterals it surfaced were then worked in
+further rounds the same day. The items below change a recovery class or
+observable behaviour, and nobody ruled on them. Each is in the code now; the
+owner accepts it, or it is reverted as its own change. Changes to a published
+type's shape are not listed: the owner ruled those need no ruling (see
+`AGENTS.md`).
 
 - **Recovery-class moves.** imap: SELECT without UIDVALIDITY at the PIM and
   search sites, `Request(Malformed)` to `Protocol(MissingField)`; hydrating an
@@ -100,7 +103,12 @@ now; the owner accepts it, or it is reverted as its own change.
   `missing_field` gains `Acknowledged`. caldav: `NoSpliceableVevent` and
   `MissingSourceBody` from `Unsupported` to `Internal(InvariantViolated)`.
   jmap: a dead-sink send from `Protocol(PartialResponse)` to
-  `Transport(Network)`, with an idempotency override.
+  `Transport(Network)`, with an idempotency override. smtp: a blocking
+  implicit-TLS or STARTTLS handshake that hits the socket timeout, and a
+  timed-out address resolution, from `Tls` to `Timeout`, matching the async
+  path. imap: an early tagged OK before a literal continuation inside a
+  pipeline, from a fatal `Protocol` to that command's non-fatal
+  `ProtocolMissing`, the batch continuing.
 - **New behaviour.** graph Autodiscover follows POX redirects, and a POX
   `Error` fails delegate discovery where it used to read as no delegates. EWS
   strict parsing turns an unknown entity into `MalformedXml`. A 3xx on a
@@ -109,52 +117,77 @@ now; the owner accepts it, or it is reverted as its own change.
   google coordinates the Gmail watch across instances through a process-wide
   static keyed by the lowercased address; an alias or differently-cased
   address gets no coordination.
-- **Published surface, additive but visible.** imap `CopyResult` and
-  `MoveResult` gain `copy_uid`, and on the UID MOVE fallback `MoveResult::code`
-  is now the UID EXPUNGE's tagged code, falling back to the COPY's. bifrost-net
-  gains `RequestBuilder::follow_redirects`. dav-core's public
-  `send_raw_request` debug-asserts where it used to return an error for an
-  untrusted final origin.
+- **Calendar writes refuse what they used to send.** An empty `start` is
+  `Request(Malformed)` in google, graph, caldav and jmap. An empty `end` on a
+  patch leaves the stored end alone in all four; on a create google, graph and
+  jmap refuse it as `Unsupported` while caldav writes no DTEND. google refuses
+  a malformed non-empty time locally, before a calendar move can half-apply;
+  jmap refuses an unparseable time, an end before its start and a mixed-shape
+  pair, and zoneless date-time pairs now get their real duration instead of
+  `PT0S`. graph refuses an RRULE, RDATE or EXDATE Graph cannot hold, and an
+  absolute day some visited month lacks.
+- **iCalendar and vCard writers refuse control characters.** caldav refuses
+  a control character in RECUR, DATE-TIME, CAL-ADDRESS and TEXT values and in
+  parameters, and carddav in TEXT, TYPE parameters and the PHOTO data-URI
+  media type, as `Request(Malformed)`; nothing is stripped.
+- **caldav override addressing.** A recurrence-qualified event id now reads
+  and updates the override it names, so updating an override is allowed where
+  every instance id used to be refused; a bare resource id over several
+  overrides with no master is refused as ambiguous, where it used to answer
+  with the first override.
+- **sync detach and reopen.** A `subscribe_push` that registers after detach
+  took the registry deletes the subscription it just created and returns
+  `AccountNotAttached`; a reattach whose install lands after detach tears the
+  replacement's subscriptions down and still returns `Ok`, the swap having
+  committed. A scope repair or schema recovery reaching a paused account
+  declines and leaves every cursor in place.
+- **Push handle formats.** A Graph webhook handle is now `graph1:` followed by
+  a token and its Graph subscription ids, an EWS one `ews1:` and a token;
+  handles persisted in the old format cannot tear down on a later
+  connection.
+- **Published items with changed behaviour.** On the UID MOVE fallback,
+  imap's `MoveResult::code` is now the UID EXPUNGE's tagged code, falling back
+  to the COPY's. dav-core's public `send_raw_request` debug-asserts where it
+  used to return an error for an untrusted final origin.
 
 ## Found 2026-09-30, not fixed
 
 Found while recovering and auditing the laterals work; none is ruled. Verify
 against the code before working any of them.
 
-- **google: an event with an unspecified end projects an empty `end`.** Landed
-  2026-09-30: `CalendarEvent.end` cannot be absent, so `endTimeUnspecified`
-  projects the empty `EventTime` tombstones already use. Consumers that
-  assumed only tombstones carry an empty end now see it on live events; the
-  honest shape is an optional `end` in `bifrost-types`, a published-surface
-  ruling. Every calendar crate now treats an echoed empty end on a patch as
-  "leave the end alone"; on a create google, graph and jmap refuse it as
-  `Unsupported`, while caldav writes no DTEND, which RFC 5545 allows.
-- **sync: an orphan retried on a later connection deletes nothing.** Graph,
-  IMAP and JMAP keep the handle-to-server-state map inside the account
-  instance, so a teardown retried against a newer connection returns `Ok`
-  without touching the server; a Graph webhook subscription then lives until
-  Graph expires it, about a day. Nothing fails forever, and the owning
-  account's `close()` deletes its own Graph rows, which covers the common path.
-  Closing it needs the handle to carry what the server needs, a shape change
-  to what push handles contain.
-- **sync: schema recovery and lifecycle scopes share the pause hole.**
-  `handle_schema_incompatible` deletes every scope's cursor, then
-  re-establishes each on the plain control, so a pause landing inside it loses
-  scopes the way `restart_scope` did before it learned to hold activity. A
-  `Created` lifecycle scope whose repair is declined under a pause has no
-  cursor to keep and is lost.
-- **sync: `replace` and `record` can land after detach's registry take.** The
-  orphan writes are sealed against detach inside the registry's shard lock;
-  the reattach commit's `replace` and `subscribe_push`'s `record` are not.
-- **jmap: an unparseable non-empty end still becomes `PT0S`.** `duration()`
-  falls back to a zero-length duration for any end it cannot parse, and a
-  garbage `start` is not validated, so a malformed time silently writes a
-  zero-length event. Separately, no brokkr sweep runs `crates/jmap/src/sync/`
-  tests under `brokkr test -p bifrost-jmap`, since the `sync` feature is only
-  donated in the workspace selection; they run only in a full check.
-- **caldav: TEXT values pass control characters other than CR and LF.**
-  `escape_text` handles line breaks, so nothing injects, but a NUL or other
-  control character in a summary or description writes invalid iCalendar.
+- **types: `CalendarEvent.end` should be optional.** `endTimeUnspecified`
+  in google projects the empty `EventTime` tombstones already use, because
+  `end` cannot be absent, so consumers that assumed only tombstones carry an
+  empty end now see it on live events, and every calendar crate has to read an
+  echoed empty end on a write as "no end". An `Option` end is the honest
+  shape; it was blocked on a published-surface ruling, which the owner's
+  2026-09-30 ruling on shape changes now covers, so it is buildable across
+  `bifrost-types` and all four calendar crates.
+- **graph: a push handle names the subscriptions of its subscribe time.** A
+  webhook handle now carries its Graph subscription ids, so an orphan torn
+  down on a later instance deletes them. A subscription the renewal worker
+  later recreated under a new id is not named, and lives until Graph expires
+  it; fixing that needs the engine to accept an updated handle. A handle is
+  not bound to its account, so a handle from another account in the same
+  tenant would delete that account's ids if handed to this instance. Handles
+  persisted before the id-carrying format keep the old no-op teardown.
+- **sync: detach can close the old account after a reattach opened its
+  replacement.** Detach does not wait for a consumer-driven reattach, so if it
+  loads and closes `current` before the swap, the replacement is never closed
+  and the old account is closed twice. Needs `close()` idempotence confirmed
+  across providers, or detach to exclude an in-flight swap. Separately, a
+  lifecycle scope parked under a pause survives the folder being deleted
+  during that pause and is established after resume for a folder that no
+  longer exists, ending in the retry-budget terminal event.
+- **jmap: two raw pass-throughs remain.** `jmap_utc_filter_time` sends an
+  unparseable `events_in_range` bound to the server unchanged, and
+  `jmap_time_from_shared` keeps a raw fallback that is unreachable for writes
+  now but would put raw text on the wire for a caller that skips
+  `validate_start`.
+- **carddav: a PHOTO URI is written with TEXT escaping.** RFC 6350 URI values
+  are not escaped, so commas and semicolons in the URL reach other clients as
+  `\,` and `\;`; this crate's reader unescapes them, so it round-trips here
+  only.
 
 ## Blocked on an unvalidated consumer contract
 
@@ -179,21 +212,6 @@ field defaulting to today's behaviour - take that, subject to every backend on
 the shared trait being able to honour it, since a field two of three
 implementations ignore is worse than no field. Otherwise leave the item parked
 and say so, as the `subsumed` entry now does.
-
-## Sync residuals
-
-The three items ruled on 2026-09-06 (the receipt bound, the explicit
-observer subscription, the teardown window) have all landed. Two earlier
-structural landings of the same week, the dav-core `ResponseParts` collapse
-and the smtp sans-I/O core, never received the cold review their rulings
-asked for. That review debt is still owed, and nothing else in this file
-tracks it.
-
-- **smtp: the blocking implicit-TLS handshake at connect time is unbounded
-  even with a timeout configured.** Noticed 2026-09-29 while bounding STARTTLS.
-  Documented as the blocking transport's structural difference, and its
-  address resolution is unbounded too. Recorded so the STARTTLS bound is not
-  mistaken for "every TLS handshake is bounded".
 
 ## bifrost-sync
 
