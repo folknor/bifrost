@@ -836,11 +836,14 @@ fn is_blank_time(time: &EventTime) -> bool {
 // be written; forwarding the empty value would send `dateTime: ""`, and
 // substituting the start would fabricate a zero-length end. What an empty end
 // can honestly mean on a write therefore depends on the write:
-// - a patch that does not move `start` leaves the stored end untouched, so the
-//   empty end is omitted and the read-modify-write round-trips;
-// - a patch that moves `start` would leave Google's stored placeholder end
-//   against a start it no longer matches, and a create must send some end, so
-//   both are `Unsupported`: the caller has to supply the end it wants.
+// - a patch leaves the stored end untouched, so the empty end is omitted and
+//   the read-modify-write round-trips. That holds whether or not the patch
+//   carries `start`: a consumer echoing the whole event sends its unchanged
+//   start back, and nothing here can tell an echo from a move without
+//   fetching the stored event. A real move past Google's stored placeholder
+//   end is refused by Google itself, with nothing invented on this side;
+// - a create must send some end, so it is `Unsupported`: the caller has to
+//   supply the end it wants.
 fn reject_unusable_write_times(
     operation: AccountOperation,
     start: Option<&EventTime>,
@@ -852,14 +855,12 @@ fn reject_unusable_write_times(
             "Google Calendar event `start` must not be empty".to_string(),
         ));
     }
-    let end_is_blank = end.is_some_and(is_blank_time);
-    let needs_an_end = operation == AccountOperation::EventCreate || start.is_some();
-    if end_is_blank && needs_an_end {
+    if operation == AccountOperation::EventCreate && end.is_some_and(is_blank_time) {
         return Err(error::into_account_error(
             crate::error::Error::unsupported_with(
                 operation,
-                "Google Calendar cannot write an event with no end: endTimeUnspecified is not \
-                 writable, so a create or a start move needs an explicit end",
+                "Google Calendar cannot create an event with no end: endTimeUnspecified is not \
+                 writable, so a create needs an explicit end",
             ),
             GmailErrorContext::calendar_collection(operation),
         ));
@@ -2616,30 +2617,31 @@ mod tests {
         assert!(script.requests().is_empty());
     }
 
-    /// Moving `start` while echoing the empty end would leave Google's
-    /// stored placeholder end against a start it no longer matches; the
-    /// caller must supply an end. Refused before the calendar move. Fails if
-    /// the `start.is_some()` condition in `reject_unusable_write_times` is
-    /// removed.
+    /// A consumer echoing the whole event sends its unchanged start back with
+    /// the empty end. That must not be refused: the start goes out, the end is
+    /// omitted. Fails if the empty-end refusal is widened to any patch that
+    /// carries `start`.
     #[tokio::test]
-    async fn update_moving_start_with_an_empty_end_is_refused_before_any_request() {
-        let (client, script) = scripted_client(Vec::new());
+    async fn update_echoing_start_with_an_empty_end_sends_start_and_omits_end() {
+        let (client, script) = scripted_client(vec![canned_json(StatusCode::OK, json!({}))]);
         let patch = EventPatch {
-            calendar_id: Some(CalendarId("destination".to_string())),
-            start: Some(write_time("2026-06-03T12:00:00Z")),
+            title: Some(Some("Renamed".to_string())),
+            start: Some(write_time("2026-06-02T12:00:00Z")),
             end: Some(write_time("")),
             ..EventPatch::default()
         };
 
-        let error = update(client, EventId("source::event-1".to_string()), patch)
+        update(client, EventId("primary::event-1".to_string()), patch)
             .await
-            .expect_err("a start move needs an explicit end");
+            .expect("an echoed start with an empty end is written");
 
-        assert!(matches!(
-            error.kind(),
-            AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
-        ));
-        assert!(script.requests().is_empty());
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(requests[0].body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["start"]["dateTime"], json!("2026-06-02T12:00:00Z"));
+        assert!(body.get("end").is_none());
+        assert!(body.get("endTimeUnspecified").is_none());
     }
 
     /// Fails if `reject_unusable_write_times` is removed from `create`: the

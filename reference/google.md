@@ -561,12 +561,13 @@ such an event is not refused. Consumers must treat an empty `end.value` on a
 live event as "no end", not parse it. `endTimeUnspecified` is not a writable
 Events property, so "no end" cannot be written, and an empty (or
 whitespace-only) `end` is never sent as `dateTime: ""`. A patch that echoes it
-without moving `start` omits `end`, leaving the stored end untouched, so a
-read-modify-write of such an event neither fails nor fabricates an end. A
-patch that moves `start` with an empty `end`, and a create with an empty `end`,
-are refused as `Unsupported` before any request: Google's stored placeholder
-would no longer match the new start, an insert needs some end, and inventing
-one is what the projection refused to do, so the caller must supply it. An
+omits `end`, leaving the stored end untouched, so a read-modify-write of such
+an event neither fails nor fabricates an end. That holds when the patch also
+carries `start`: an echoed unchanged start cannot be told from a move without
+fetching the event, and a real move past Google's stored placeholder end is
+refused by Google itself. A create with an empty `end` is refused as
+`Unsupported` before any request: an insert needs some end, and inventing one
+is what the projection refused to do, so the caller must supply it. An
 empty `start` has no "no start" reading and is refused as `Request(Malformed)`
 naming `start`. All of this runs in `reject_unusable_write_times`, before any
 request and, on update, before the calendar move, alongside the all-day check.
