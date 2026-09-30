@@ -363,6 +363,22 @@ pub(super) async fn wait_for_continuation(
 ) -> Result<ContinuationOutcome, Error> {
     loop {
         let utf8 = super::utf8_mode(state);
+        // Accepted limit: an own-tag reply here is classified non-fatal even
+        // when an EARLIER literal of the same command was already granted, so
+        // the inter-literal text has been written. That holds because every
+        // caller (`send_with_literal_sync`, `send_encoded_segments`,
+        // `send_chunked_segments`) makes the synchronizing marker the last
+        // byte written before this wait, and a conforming server answers only
+        // at a marker (RFC 3502 allows a `NO` there for a later MULTIAPPEND
+        // message), so it has read everything sent and the wire is in sync,
+        // exactly as for the first literal. A server that replied straight
+        // after a literal body with no marker would leave the unread
+        // remainder to be parsed as a new command line. Making every reply
+        // after a granted literal fatal would close that but drop the
+        // connection on the legitimate mid-MULTIAPPEND `NO`. This changes only
+        // if a real server is shown replying without a marker, or if a caller
+        // ever writes past the marker before waiting.
+        //
         // We have already sent the pre-literal bytes; a transport failure
         // reading the server's continuation grant is InFlight.
         let resp = wire_reader

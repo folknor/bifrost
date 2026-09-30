@@ -10,8 +10,11 @@
 
 use std::time::Duration;
 
-use crate::connection::test_support::{driver_pair, preauth_greeting, read_line, respond, tag_of};
+use crate::connection::test_support::{
+    driver_pair, preauth_greeting, read_exact, read_line, respond, tag_of,
+};
 use crate::error::Error;
+use crate::types::AppendMessage;
 
 const SYNC_LITERAL_CAPS: &str = "IMAP4rev1 ACL";
 const LITERAL_IDENTIFIER: &str = "\u{fc}ser";
@@ -95,4 +98,63 @@ async fn a_foreign_tag_before_the_continuation_is_fatal() {
     );
     let _ = release_tx.send(());
     script.await.unwrap();
+}
+
+/// A later message of a MULTIAPPEND refused with a tagged `NO` at its own
+/// marker (RFC 3502) is that command's ordinary refusal: the connection stays
+/// usable, message two's body is never written, and the next command's line is
+/// the very next thing on the wire.
+///
+/// The wire stays in sync only because the last byte written before each wait is
+/// the synchronizing marker, so the server has read everything the client sent
+/// when it answers. Reverting `wait_for_continuation` to treat an own-tag `NO`
+/// after a granted literal as fatal fails the `is_alive` and fatality
+/// assertions. Making `send_chunked_segments` write past the marker before the
+/// wait (for example the next segment's leading chunk) fails the NOOP-line
+/// assertion, because those bytes would arrive ahead of the NOOP.
+#[tokio::test]
+async fn a_later_multiappend_message_refused_at_its_marker_leaves_the_wire_in_sync() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 MULTIAPPEND")).await;
+
+    let script = tokio::spawn(async move {
+        let first = read_line(&mut server).await;
+        assert!(first.ends_with("{3}\r\n"), "first marker: {first:?}");
+        let tag = tag_of(&first).to_owned();
+        respond(&mut server, "+ go\r\n").await;
+
+        let body = read_exact(&mut server, 3).await;
+        assert_eq!(&body[..], b"one");
+        let second = read_line(&mut server).await;
+        assert_eq!(second, " {3}\r\n", "second marker must end the write");
+        respond(
+            &mut server,
+            &format!("{tag} NO [OVERQUOTA] second refused\r\n"),
+        )
+        .await;
+
+        let noop = read_line(&mut server).await;
+        assert!(
+            noop.contains("NOOP"),
+            "bytes were written past the refused marker: {noop:?}"
+        );
+        let tag = tag_of(&noop).to_owned();
+        respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+        server
+    });
+
+    let messages = [AppendMessage::new("one"), AppendMessage::new("two")];
+    let err = conn
+        .multi_append("INBOX", &messages, Duration::from_secs(5))
+        .await
+        .expect_err("the second message was refused");
+    assert!(matches!(err, Error::No { .. }), "got {err:?}");
+    assert!(!err.is_connection_fatal());
+    assert!(
+        conn.is_alive(),
+        "a refusal at a marker leaves the framing intact"
+    );
+    conn.noop(Duration::from_secs(5))
+        .await
+        .expect("the connection must carry the next command");
+    let _server = script.await.unwrap();
 }
