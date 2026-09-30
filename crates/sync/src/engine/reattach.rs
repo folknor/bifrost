@@ -511,24 +511,187 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
 /// recreate exactly the orphaned-webhook leak the retained-handle rule exists
 /// to prevent - a provider like Graph keeps delivering to the endpoint until
 /// the subscription expires on its own.
+///
+/// Cancellation-safe: a record leaves `replacements` only AFTER its delete has
+/// answered, and a refusal is restored to the registry in the same
+/// synchronous step that removes it. A drop parked inside a delete therefore
+/// leaves that record (and every later one) in the guard, whose `Drop` retires
+/// them; nothing is ever held only by a local that a drop would discard.
 async fn unwind_replacement_subscriptions(
     ctx: &RecoveryContext<'_>,
     next: &dyn Account,
-    replacements: &mut Vec<RegisteredSubscription>,
+    replacements: &mut ReplacementSubscriptions,
 ) {
-    let mut orphaned = Vec::new();
-    for replacement in replacements.drain(..) {
-        if let Err(cleanup) = next.push_unsubscribe(replacement.handle.clone()).await {
+    while let Some(front) = replacements.live.first() {
+        let result = next.push_unsubscribe(front.handle.clone()).await;
+        let replacement = replacements.live.remove(0);
+        if let Err(cleanup) = result {
             tracing::warn!(
                 target: "bifrost.sync.reopen",
                 account = ?ctx.account_id,
                 error = %cleanup,
                 "replacement push cleanup failed while unwinding reopen; retaining handle for retry"
             );
-            orphaned.push(replacement.into_orphan());
+            ctx.subscriptions
+                .restore(ctx.account_id.clone(), vec![replacement.into_orphan()]);
         }
     }
-    ctx.subscriptions.restore(ctx.account_id.clone(), orphaned);
+}
+
+/// The push subscriptions a reattach has created on its replacement and not yet
+/// handed to the registry.
+///
+/// `Account::close()` does not delete server-side subscriptions, and the
+/// registry does not know these handles until the cutover commits them, so a
+/// reattach future dropped between `push_subscribe` and the commit (a consumer
+/// timing out `SyncEngine::reattach`, a worker abort at the detach deadline)
+/// would leave them live on the provider and registered nowhere.
+///
+/// This guard owns them in the meantime. It is constructed at the top of
+/// `reattach_account`, before any subscription exists, so there is no window in
+/// which a subscription is live and unguarded: the future creates the first one
+/// only after being polled, by which time the guard is built, and a handle is
+/// pushed here in the same poll that `push_subscribe` returned it. Three exits:
+///
+/// - commit: `disarm` moves the handles into the registry, with no await between
+///   the disarm and the registry write, so no drop can land between them;
+/// - ordinary abort: `unwind_replacement_subscriptions` empties it, so the
+///   `Drop` finds nothing and cannot unwind twice;
+/// - drop: `Drop` spawns a task that deletes the remaining handles on the
+///   replacement (the only account that can be trusted to know them), records
+///   every refusal as an orphan, and closes the replacement, which nothing else
+///   will now do. With no runtime to spawn on, the handles are registered as
+///   orphans directly, undeleted.
+///
+/// Orphans are retried against whatever account is current when they are
+/// retried, not against the replacement that created them. That is the same
+/// accepted limitation as the ordinary abort's unwind, and it is the reason the
+/// spawned task tries the replacement itself first.
+///
+/// Known residue: a drop parked INSIDE `push_subscribe` may have created a
+/// subscription whose handle never reached this guard. That is the account
+/// implementation's cancellation contract, not something the engine can see.
+pub(super) struct ReplacementSubscriptions {
+    account: Arc<dyn Account>,
+    subscriptions: Arc<SubscriptionRegistry>,
+    account_id: AccountId,
+    shutdown: CancellationToken,
+    live: Vec<RegisteredSubscription>,
+}
+
+impl ReplacementSubscriptions {
+    fn new(ctx: &RecoveryContext<'_>, account: &Arc<dyn Account>) -> Self {
+        Self {
+            account: Arc::clone(account),
+            subscriptions: Arc::clone(ctx.subscriptions),
+            account_id: ctx.account_id.clone(),
+            shutdown: ctx.shutdown.clone(),
+            live: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, record: RegisteredSubscription) {
+        self.live.push(record);
+    }
+
+    /// The commit exit: the caller registers what this returns, synchronously.
+    fn disarm(&mut self) -> Vec<RegisteredSubscription> {
+        std::mem::take(&mut self.live)
+    }
+}
+
+impl Drop for ReplacementSubscriptions {
+    fn drop(&mut self) {
+        if self.live.is_empty() {
+            return;
+        }
+        let live = std::mem::take(&mut self.live);
+        let account = Arc::clone(&self.account);
+        let subscriptions = Arc::clone(&self.subscriptions);
+        let account_id = self.account_id.clone();
+        let shutdown = self.shutdown.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(retire_stranded_subscriptions(
+                    account,
+                    subscriptions,
+                    account_id,
+                    shutdown,
+                    live,
+                ));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "bifrost.sync.reopen",
+                    account = ?account_id,
+                    stranded = live.len(),
+                    "reattach dropped with no runtime to clean up on; registering replacement handles as orphans"
+                );
+                register_orphans(&subscriptions, &account_id, &shutdown, live);
+            }
+        }
+    }
+}
+
+/// Register `records` as orphans for retry, unless the slot is being torn down.
+/// Detach has already taken and discarded the account's registry entry, so an
+/// orphan added after it would sit under an id nothing retries.
+fn register_orphans(
+    subscriptions: &SubscriptionRegistry,
+    account_id: &AccountId,
+    shutdown: &CancellationToken,
+    records: Vec<RegisteredSubscription>,
+) {
+    if shutdown.is_cancelled() {
+        if !records.is_empty() {
+            tracing::warn!(
+                target: "bifrost.sync.reopen",
+                account = ?account_id,
+                stranded = records.len(),
+                "slot detached before dropped-reattach cleanup finished; leaving handles to provider expiry"
+            );
+        }
+        return;
+    }
+    subscriptions.restore(
+        account_id.clone(),
+        records
+            .into_iter()
+            .map(RegisteredSubscription::into_orphan)
+            .collect(),
+    );
+}
+
+/// Cleanup for a reattach future that was dropped after creating replacement
+/// subscriptions. Runs detached from the dropped future.
+async fn retire_stranded_subscriptions(
+    account: Arc<dyn Account>,
+    subscriptions: Arc<SubscriptionRegistry>,
+    account_id: AccountId,
+    shutdown: CancellationToken,
+    live: Vec<RegisteredSubscription>,
+) {
+    let mut refused = Vec::new();
+    for record in live {
+        if let Err(error) = account.push_unsubscribe(record.handle.clone()).await {
+            tracing::warn!(
+                target: "bifrost.sync.reopen",
+                account = ?account_id,
+                error = %error,
+                "replacement push cleanup failed after a dropped reattach; retaining handle for retry"
+            );
+            refused.push(record);
+        }
+    }
+    register_orphans(&subscriptions, &account_id, &shutdown, refused);
+    if let Err(error) = account.close().await {
+        tracing::warn!(
+            target: "bifrost.sync.reopen",
+            account = ?account_id,
+            error = %error,
+            "replacement account close failed after a dropped reattach"
+        );
+    }
 }
 
 /// Delete the durable cursor rows an aborted reattach created.
@@ -662,6 +825,10 @@ pub(super) async fn reattach_account(
     next.set_priority(ctx.control.priority_snapshot());
     next.set_bandwidth_cap(ctx.control.bandwidth_cap_snapshot());
 
+    // Built before any subscription can exist, and outside the async block so
+    // it outlives every abort path in it. See `ReplacementSubscriptions`.
+    let mut replacement_subscriptions = ReplacementSubscriptions::new(ctx, &next);
+
     let result = async {
         let discovered = discover_scopes_from(next.as_ref()).await?;
         let staged = Arc::new(CursorRegistry::new());
@@ -727,7 +894,6 @@ pub(super) async fn reattach_account(
             .collect();
 
         let previous_subscriptions = ctx.subscriptions.snapshot(ctx.account_id);
-        let mut replacement_subscriptions = Vec::with_capacity(previous_subscriptions.len());
         for record in previous_subscriptions.iter().filter(|record| {
             // Recreate what the consumer still WANTS, whatever the state of
             // the old handle's teardown. An orphan (not `desired`) is carried
@@ -759,6 +925,9 @@ pub(super) async fn reattach_account(
                 Ok(result) => {
                     let covered = accepted_push_scopes(&result);
                     if let Some(handle) = result.handle {
+                        // Straight into the guard: no await between the provider
+                        // answering and the handle being owned by something a
+                        // drop will clean up.
                         replacement_subscriptions.push(RegisteredSubscription {
                             handle,
                             scopes: covered,
@@ -824,6 +993,19 @@ pub(super) async fn reattach_account(
         // matter how many subscriptions the consumer holds. Stopping at the
         // first refusal made N failing records cost N + 1 attempts, and the
         // account-wide retry budget is three.
+        //
+        // Accepted gap: a handle deleted here stops delivering at once, and if a
+        // later refusal aborts the pass its record stays `torn_down` until the
+        // retry recreates it on the replacement, so that subscription delivers
+        // nothing for the span between the two attempts. Closing it by
+        // resubscribing on the old account was rejected: an abort here usually
+        // means the old connection is failing, so the resubscribe would
+        // likely fail too, and a success would mint a handle the retry must
+        // then tear down again, moving the hole instead of closing it. The cost
+        // is bounded, and the old account stays installed and syncing through
+        // its ordinary change streams until the retry commits. If the budget is
+        // exhausted the account pauses and the records stay `torn_down` and
+        // `desired`, recreated by whichever reopen next commits.
         let mut first_refusal: Option<AccountError> = None;
         for record in &previous_subscriptions {
             if record.torn_down {
@@ -885,7 +1067,11 @@ pub(super) async fn reattach_account(
             rollback_reattach_inserts(ctx).await;
             return Err(Error::Account(error));
         }
-        replacement_subscriptions.extend(carried_unconfirmed);
+        // Commit exit of the replacement-subscription guard. Nothing between
+        // here and `subscriptions.replace` awaits, so no drop can land after the
+        // guard lets go and before the registry holds the handles.
+        let mut installed_subscriptions = replacement_subscriptions.disarm();
+        installed_subscriptions.extend(carried_unconfirmed);
 
         // Take the final old-handle snapshot immediately before cutover.
         // replace_from advances the registry generation atomically with the
@@ -901,7 +1087,7 @@ pub(super) async fn reattach_account(
             *capabilities = next.capabilities().clone();
         }
         ctx.subscriptions
-            .replace(ctx.account_id.clone(), replacement_subscriptions);
+            .replace(ctx.account_id.clone(), installed_subscriptions);
         // The replacement open's skip lane supersedes the previous
         // one: a healed namespace disappears from it, a still-degraded
         // one reappears with a fresh classification.

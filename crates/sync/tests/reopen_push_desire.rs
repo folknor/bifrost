@@ -489,3 +489,209 @@ async fn a_consumer_unsubscribe_after_an_aborted_reopen_skips_deleted_handles() 
 
     engine.detach(&id).await.expect("detach");
 }
+
+/// Yield until `done` holds. Bounded by iterations, not the clock, so a cleanup
+/// that never happens fails the test rather than hanging it.
+async fn settle(mut done: impl FnMut() -> bool) {
+    for _ in 0..10_000 {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("condition never held");
+}
+
+/// Drive `SyncEngine::reattach` until `parked` holds, then drop the future
+/// there, as a consumer timeout or a worker abort would.
+async fn drop_reattach_once(engine: &SyncEngine, id: &AccountId, parked: impl FnMut() -> bool) {
+    let fut = engine.reattach(id);
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        _ = &mut fut => panic!("reattach finished before it parked"),
+        () = settle(parked) => {}
+    }
+}
+
+fn parked_forever() -> Arc<tokio::sync::Notify> {
+    Arc::new(tokio::sync::Notify::new())
+}
+
+/// The filed defect. The replacement's subscription exists, the old handle's
+/// teardown is parked, and the reattach future is dropped there. The
+/// subscription must be deleted on the replacement (and the replacement closed)
+/// rather than left live and registered nowhere, and a later reopen and
+/// consumer unsubscribe must see a coherent registry.
+///
+/// Reverting the `Drop` impl of `ReplacementSubscriptions` (or its spawn) leaves
+/// `call("replacement", "replacement")` out of the log and `replacement.closed`
+/// at zero, so `settle` panics.
+#[tokio::test]
+async fn a_reattach_dropped_after_creating_replacement_subscriptions_retires_them() {
+    let id = AccountId("reopen-dropped-in-teardown".into());
+    let log = Arc::new(PushLog::default());
+    let old = pushing("old", &log, 0);
+    *old.push_unsubscribe_park.lock().expect("park lock") = Some(parked_forever());
+    let replacement = pushing("replacement", &log, 0);
+    let later = pushing("later", &log, 0);
+    let engine = attached(
+        &id,
+        vec![
+            Arc::clone(&old),
+            Arc::clone(&replacement),
+            Arc::clone(&later),
+        ],
+    )
+    .await;
+
+    drop_reattach_once(&engine, &id, || log.unsubscribed().len() == 1).await;
+    settle(|| replacement.closed.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(
+        log.unsubscribed(),
+        vec![call("old", "old"), call("replacement", "replacement")],
+        "the replacement's own subscription is deleted on the replacement"
+    );
+    assert_eq!(old.closed.load(Ordering::SeqCst), 0, "old stays installed");
+
+    engine.reattach(&id).await.expect("a later reopen commits");
+    engine.unsubscribe_push(&id).await.expect("teardown");
+    assert_eq!(
+        log.unsubscribed()[2..],
+        [
+            // The retry re-deletes the old handle (the dropped delete never
+            // reported back), then the consumer's teardown hits the live one.
+            call("old", "old"),
+            call("later", "later"),
+        ],
+        "the dropped attempt's handle is not deleted or carried a second time"
+    );
+    assert_eq!(replacement.closed.load(Ordering::SeqCst), 1);
+
+    engine.detach(&id).await.expect("detach");
+}
+
+/// Same defect one await earlier: the future is dropped parked inside the
+/// SECOND `push_subscribe`, so the first replacement subscription exists and
+/// the guard must already own it. The parked call's own subscription is the
+/// account implementation's cancellation contract; the engine never received
+/// its handle and cannot delete it.
+///
+/// Reverting the `replacement_subscriptions.push(..)` into the guard makes the
+/// log lack the `replacement` delete.
+#[tokio::test]
+async fn a_reattach_dropped_between_two_replacement_subscribes_retires_the_first() {
+    let id = AccountId("reopen-dropped-in-subscribe".into());
+    let log = Arc::new(PushLog::default());
+    let replacement = pushing("replacement", &log, 0);
+    *replacement.push_subscribe_park.lock().expect("park lock") = Some((1, parked_forever()));
+    let engine = attached_with_subscriptions(
+        &id,
+        vec![pushing("old", &log, 0), Arc::clone(&replacement)],
+        2,
+    )
+    .await;
+
+    drop_reattach_once(&engine, &id, || log.subscribed().len() == 4).await;
+    settle(|| replacement.closed.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(
+        log.unsubscribed(),
+        vec![call("replacement", "replacement")],
+        "only the handle the engine actually received is retired"
+    );
+
+    engine.unsubscribe_push(&id).await.expect("teardown");
+    assert_eq!(
+        log.unsubscribed()[1..],
+        [call("old", "old"), call("old", "old-2")],
+        "the consumer's records were untouched by the dropped attempt"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}
+
+/// A cleanup delete that is refused must not lose the handle: it is registered
+/// as an orphan and retried by the next consumer teardown, against the account
+/// that is current then (here the still-installed old one).
+///
+/// Reverting `register_orphans` (the restore in the retire task) drops the
+/// `call("old", "replacement")` entry.
+#[tokio::test]
+async fn a_refused_cleanup_after_a_dropped_reattach_is_carried_as_an_orphan() {
+    let id = AccountId("reopen-dropped-cleanup-refused".into());
+    let log = Arc::new(PushLog::default());
+    let old = pushing("old", &log, 0);
+    *old.push_unsubscribe_park.lock().expect("park lock") = Some(parked_forever());
+    let replacement = pushing("replacement", &log, usize::MAX);
+    let engine = attached(&id, vec![Arc::clone(&old), Arc::clone(&replacement)]).await;
+
+    drop_reattach_once(&engine, &id, || log.unsubscribed().len() == 1).await;
+    settle(|| replacement.closed.load(Ordering::SeqCst) == 1).await;
+    assert_eq!(
+        log.unsubscribed().len(),
+        2,
+        "the cleanup tried and was refused"
+    );
+
+    engine.unsubscribe_push(&id).await.expect("teardown");
+    assert_eq!(
+        log.unsubscribed()[2..],
+        [call("old", "old"), call("old", "replacement")],
+        "the consumer's record, then the carried orphan"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}
+
+/// The commit path must disarm the guard: the subscriptions it created are
+/// the installed account's, and a guard that still owned them when the future
+/// finished would delete them.
+///
+/// Reverting the `disarm()` before the cutover makes the finished future's
+/// guard spawn a delete of `replacement` and close the live account.
+#[tokio::test]
+async fn a_committed_reattach_does_not_retire_the_subscriptions_it_installed() {
+    let id = AccountId("reopen-commit-disarms".into());
+    let log = Arc::new(PushLog::default());
+    let replacement = pushing("replacement", &log, 0);
+    let engine = attached(&id, vec![pushing("old", &log, 0), Arc::clone(&replacement)]).await;
+
+    engine.reattach(&id).await.expect("commit");
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(log.unsubscribed(), vec![call("old", "old")]);
+    assert_eq!(replacement.closed.load(Ordering::SeqCst), 0);
+
+    engine.detach(&id).await.expect("detach");
+}
+
+/// An ordinary abort already unwinds the replacement; the guard's drop must
+/// find nothing left and not unwind it a second time or close the replacement
+/// twice.
+///
+/// Reverting the removal of each record in `unwind_replacement_subscriptions`
+/// makes the guard's drop re-delete `aborted` and close it twice.
+#[tokio::test]
+async fn an_ordinary_abort_does_not_unwind_the_replacement_twice() {
+    let id = AccountId("reopen-abort-no-double-unwind".into());
+    let log = Arc::new(PushLog::default());
+    let aborted = pushing("aborted", &log, 0);
+    let engine = attached(
+        &id,
+        vec![pushing("old", &log, usize::MAX), Arc::clone(&aborted)],
+    )
+    .await;
+
+    assert!(matches!(engine.reattach(&id).await, Err(Error::Account(_))));
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        log.unsubscribed(),
+        vec![call("old", "old"), call("aborted", "aborted")]
+    );
+    assert_eq!(aborted.closed.load(Ordering::SeqCst), 1);
+
+    engine.detach(&id).await.expect("detach");
+}

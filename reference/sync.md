@@ -430,6 +430,37 @@ A repeat failure on an already-unconfirmed record is logged rather than
 aborting the swap, because a handle belonging to a long-dead connection
 must not wedge every future reopen.
 
+The replacement's subscriptions are cancellation-safe. `reattach_account`
+is reachable through a public future (`SyncEngine::reattach`, which a
+consumer may time out) and through the reopen listener (aborted at the
+detach deadline), so it can be dropped at any await. Every handle
+`push_subscribe` returns goes straight into a `ReplacementSubscriptions`
+guard, built at the top of the function before any subscription exists. It
+has three exits: the cutover `disarm`s it into the registry with no await
+between the two; an ordinary abort empties it through
+`unwind_replacement_subscriptions` (which removes a record only after its
+delete answered, restoring a refusal as an orphan in the same synchronous
+step), so its `Drop` finds nothing; and a drop spawns a task that deletes the
+remaining handles on the replacement, registers refusals as orphans (skipped
+once the slot's shutdown token is cancelled, since detach has already
+discarded the account's registry entry), and closes the replacement. With no
+runtime to spawn on the handles are registered as undeleted orphans. Orphans
+are retried against whichever account is current at that time, not the
+replacement that created them, which is why the task tries the replacement
+first. Two residues are known: a drop parked inside `push_subscribe` itself
+may leave a provider-side subscription whose handle the engine never received
+(the account implementation's cancellation contract), and a drop elsewhere in
+the pass does not close the replacement unless subscriptions were stranded.
+The rollback of provisional durable cursor rows likewise does not run on a
+drop.
+
+Accepted gap: a handle whose old-side teardown succeeded before a later
+refusal aborted the pass delivers nothing until the retry recreates it on the
+replacement (its record stays `torn_down` and `desired`). Resubscribing on
+the old account to cover the span was rejected: the abort usually means the
+old connection is failing, and a success would mint a handle the retry must
+tear down again.
+
 Cursor establishment for newly discovered scopes is staged in memory. After
 replacement subscription creation, reattach durably persists only the cursors
 it freshly created - a scope whose row already existed in the store (persisted

@@ -301,6 +301,14 @@ pub struct StubAccount {
     pub push_unsubscribe_strict: bool,
     /// Handles deleted by a successful `push_unsubscribe` on THIS account.
     pub push_deleted: Mutex<Vec<String>>,
+    /// Parks ONE `push_subscribe` call on the `Notify` once `n` subscriptions
+    /// under this account's label have already been made, then disarms. The
+    /// call is logged and its handle minted before it parks, so a caller that
+    /// drops it there has a provider-side subscription it never learned of.
+    pub push_subscribe_park: Mutex<Option<(usize, Arc<tokio::sync::Notify>)>>,
+    /// Parks the NEXT `push_unsubscribe` call on the `Notify`, then disarms.
+    /// The call is logged (and, on a strict provider, remembered) on entry.
+    pub push_unsubscribe_park: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 /// Observes the LIFETIME of a stalled provider stream, not just its effects.
@@ -422,6 +430,8 @@ impl StubAccount {
             push_unsubscribe_refused: Vec::new(),
             push_unsubscribe_strict: false,
             push_deleted: Mutex::new(Vec::new()),
+            push_subscribe_park: Mutex::new(None),
+            push_unsubscribe_park: Mutex::new(None),
         }
     }
 
@@ -632,21 +642,33 @@ impl Account for StubAccount {
         // single-subscription test reads `call("old", "old")`. Further ones
         // get `label-2`, `label-3`, ...: a test holding several subscriptions
         // on one account needs handles it can tell apart.
-        let handle = {
+        let (handle, park) = {
             let mut subscribed = self.push_log.subscribed.lock().expect("push log lock");
             let prior = subscribed
                 .iter()
                 .filter(|(label, _)| label == &self.push_label)
                 .count();
             subscribed.push((self.push_label.clone(), scopes.to_vec()));
-            if prior == 0 {
+            let mut armed = self
+                .push_subscribe_park
+                .lock()
+                .expect("subscribe park lock");
+            let park = match armed.as_ref() {
+                Some((after, _)) if *after == prior => armed.take().map(|(_, gate)| gate),
+                _ => None,
+            };
+            let handle = if prior == 0 {
                 SubscriptionHandle(self.push_label.clone())
             } else {
                 SubscriptionHandle(format!("{}-{}", self.push_label, prior + 1))
-            }
+            };
+            (handle, park)
         };
         let scopes = scopes.to_vec();
         Box::pin(async move {
+            if let Some(gate) = park {
+                gate.notified().await;
+            }
             Ok(bifrost_types::PushSubscription::all_succeeded(
                 handle, &scopes,
             ))
@@ -678,7 +700,15 @@ impl Account for StubAccount {
             deleted.push(handle.0);
         }
         drop(deleted);
+        let park = self
+            .push_unsubscribe_park
+            .lock()
+            .expect("unsubscribe park lock")
+            .take();
         Box::pin(async move {
+            if let Some(gate) = park {
+                gate.notified().await;
+            }
             if fail {
                 Err(push_teardown_refused())
             } else {
