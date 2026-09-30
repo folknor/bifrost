@@ -350,7 +350,11 @@ an RRULE at all (no `FREQ`, an unknown frequency, an unknown, repeated or
 that does not begin with a date is `Request(Malformed)` naming `start`.
 `RDATE` and `EXDATE` are refused `Unsupported`: Graph has no carrier for extra
 occurrences, and an excluded occurrence exists only as a deletion after the
-series is written, which one create or patch cannot do. Equivalent shapes are
+series is written, which one create or patch cannot do. An absolute day some
+recurring month lacks (the 29th to 31st of every month, February 29th every
+year, whether explicit or taken from the start) is `Unsupported`: RFC 5545
+skips a date the month does not have, while Graph moves the occurrence to the
+month's last day, so writing it would add occurrences. Equivalent shapes are
 rewritten rather than refused: `DAILY` with `BYDAY` at interval 1, and every
 such weekday of each month or year, become weekly patterns; a lone ordinal
 weekday (`2MO`, `-1FR`) becomes a relative pattern's index; values RFC 5545
@@ -363,7 +367,9 @@ range start, read from the event fetched for the update; on an event that does
 not recur yet it is `Unsupported`, since its UTC-normalised start can sit on a
 different day than the local one Graph wants and an empty `startDate` is never
 sent. A patch that moves `start` on a recurring event without restating the
-recurrence re-sends the event's own recurrence with the range start moved along.
+recurrence re-sends the event's own recurrence with the range start moved along;
+the moved start is read by the same rule as an anchor, so one that does not
+begin with a date is `Request(Malformed)` naming `start`.
 A patch recurrence carrying no rule and no dates clears the series
 (`"recurrence": null`). An empty attendee list in a patch is sent as `[]` and
 clears the attendees, where omitting it had left them in place. Outbound times map a conservative IANA

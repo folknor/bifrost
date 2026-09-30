@@ -136,10 +136,6 @@ against the code before working any of them.
   `roll_back_created` skips the remaining DELETEs, one dropped between the
   group insert and the return registers a group whose handle nobody received,
   and a create that failed after Graph made it is not rolled back.
-- **graph: `restarted_series` does not validate the moved start.** A patch
-  moving `start` on a recurring event to a non-date value writes an empty
-  `startDate`; `patch_recurrence` validates through `from_event_time`, this
-  path does not.
 - **caldav: a patch always splices into the first VEVENT**, so a body whose
   first VEVENT is an override, or a target that is itself an override, is
   patched in the wrong place. Pre-existing. `splice_lines` also pairs

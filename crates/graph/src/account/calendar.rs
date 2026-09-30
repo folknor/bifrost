@@ -640,7 +640,7 @@ fn create_recurrence(event: &EventCreate) -> Result<Option<GraphRecurrence>, Rec
     };
     let rule = graph_recurrence_rule(rrule)?;
     let anchor = RecurrenceAnchor::from_event_time(&event.start)?;
-    Ok(Some(rule.anchored(&anchor)))
+    rule.anchored(&anchor).map(Some)
 }
 
 /// Refuse the recurrence parts Graph has no field for, and an RRULE it
@@ -715,7 +715,7 @@ fn patch_recurrence(
     let operation = AccountOperation::EventUpdate;
     let refuse = |refusal: RecurrenceRefusal| refusal.into_account_error(operation);
     let Some(requested) = &patch.recurrence else {
-        return Ok(restarted_series(patch, series).map(Some));
+        return Ok(restarted_series(patch, series).map_err(refuse)?.map(Some));
     };
     validate_recurrence(requested).map_err(refuse)?;
     let Some(rrule) = requested.rrule.as_deref() else {
@@ -736,14 +736,27 @@ fn patch_recurrence(
             ));
         }
     };
-    Ok(Some(Some(rule.anchored(&anchor))))
+    Ok(Some(Some(rule.anchored(&anchor).map_err(refuse)?)))
 }
 
-fn restarted_series(patch: &EventPatch, series: CurrentSeries<'_>) -> Option<GraphRecurrence> {
-    let start = patch.start.as_ref()?;
-    let mut recurrence = series.recurrence?.clone();
-    recurrence.range.as_mut()?.start_date = Some(graph_recurrence_start_date(&start.value));
-    Some(recurrence)
+/// The event's own recurrence with its range start moved to the patch's new
+/// `start`, or `None` when the patch moves no start or the event does not
+/// recur. The moved start is read by the same rule as an explicit
+/// recurrence's anchor, so a value that is not a date is refused here too.
+fn restarted_series(
+    patch: &EventPatch,
+    series: CurrentSeries<'_>,
+) -> Result<Option<GraphRecurrence>, RecurrenceRefusal> {
+    let (Some(start), Some(current)) = (&patch.start, series.recurrence) else {
+        return Ok(None);
+    };
+    let anchor = RecurrenceAnchor::from_event_time(start)?;
+    let mut recurrence = current.clone();
+    let Some(range) = recurrence.range.as_mut() else {
+        return Ok(None);
+    };
+    range.start_date = Some(anchor.start.to_string());
+    Ok(Some(recurrence))
 }
 
 fn graph_event_from_patch(
@@ -1292,8 +1305,34 @@ fn graph_weekday(date: civil::Date) -> &'static str {
     GRAPH_WEEKDAYS[usize::from(date.weekday().to_sunday_zero_offset().unsigned_abs())]
 }
 
+/// Refuse an absolute day some recurring month lacks.
+///
+/// RFC 5545 skips a recurrence date that does not exist (the 31st of a
+/// 30-day month, February 29th outside a leap year). Graph's absolute
+/// patterns do not skip: Exchange moves the occurrence to the month's last
+/// day. So a series on the 29th, 30th or 31st of every month, or on February
+/// 29th every year, would be written with occurrences the rule never asked
+/// for, and it is refused. A day beyond what the month can ever hold yields no
+/// occurrences under RFC 5545 at all and is refused the same way.
+fn check_absolute_day(month: Option<u32>, day: u32) -> Result<(), RecurrenceRefusal> {
+    let always_present = match month {
+        None => day <= 28,
+        Some(2) => day <= 28,
+        Some(4 | 6 | 9 | 11) => day <= 30,
+        Some(_) => day <= 31,
+    };
+    if always_present {
+        Ok(())
+    } else {
+        Err(unexpressible(format!(
+            "Graph recurrence cannot express day {day} of a month that does not always have it: \
+             Graph moves such an occurrence to the month's last day where RFC 5545 skips it"
+        )))
+    }
+}
+
 impl GraphRecurrenceRule {
-    fn anchored(self, anchor: &RecurrenceAnchor) -> GraphRecurrence {
+    fn anchored(self, anchor: &RecurrenceAnchor) -> Result<GraphRecurrence, RecurrenceRefusal> {
         let start = anchor.start;
         let start_day = u32::from(start.day().unsigned_abs());
         let start_month = u32::from(start.month().unsigned_abs());
@@ -1316,7 +1355,9 @@ impl GraphRecurrenceRule {
                 "weekly"
             }
             PatternShape::AbsoluteMonthly(day) => {
-                pattern.day_of_month = Some(day.unwrap_or(start_day));
+                let day = day.unwrap_or(start_day);
+                check_absolute_day(None, day)?;
+                pattern.day_of_month = Some(day);
                 "absoluteMonthly"
             }
             PatternShape::RelativeMonthly { days, index } => {
@@ -1325,8 +1366,11 @@ impl GraphRecurrenceRule {
                 "relativeMonthly"
             }
             PatternShape::AbsoluteYearly { month, day } => {
-                pattern.month = Some(month.unwrap_or(start_month));
-                pattern.day_of_month = Some(day.unwrap_or(start_day));
+                let month = month.unwrap_or(start_month);
+                let day = day.unwrap_or(start_day);
+                check_absolute_day(Some(month), day)?;
+                pattern.month = Some(month);
+                pattern.day_of_month = Some(day);
                 "absoluteYearly"
             }
             PatternShape::RelativeYearly { month, days, index } => {
@@ -1355,7 +1399,7 @@ impl GraphRecurrenceRule {
         } else {
             "noEnd"
         };
-        GraphRecurrence {
+        Ok(GraphRecurrence {
             pattern: Some(pattern),
             range: Some(GraphRecurrenceRange {
                 kind: Some(range_kind.to_string()),
@@ -1364,7 +1408,7 @@ impl GraphRecurrenceRule {
                 recurrence_time_zone: None,
                 number_of_occurrences: self.count,
             }),
-        }
+        })
     }
 }
 
@@ -1378,7 +1422,7 @@ fn graph_recurrence_from_rrule(
             .ok_or_else(|| malformed_rrule("test start is not a date"))?,
         zone: None,
     };
-    graph_recurrence_rule(rrule).map(|rule| rule.anchored(&anchor))
+    graph_recurrence_rule(rrule)?.anchored(&anchor)
 }
 
 /// Map an RRULE onto a Graph recurrence pattern, or refuse it.
@@ -1691,15 +1735,6 @@ fn parse_rrule_byday(value: &str, frequency: &str) -> Result<Vec<RRuleByDay>, Re
         days.push(RRuleByDay { ordinal, day });
     }
     Ok(days)
-}
-
-fn graph_recurrence_start_date(value: &str) -> String {
-    let date = all_day_date(value).unwrap_or_else(|| value.to_string());
-    if date.len() >= 10 {
-        date[..10].to_string()
-    } else {
-        date
-    }
 }
 
 fn graph_day_to_rrule(day: &str) -> Option<&'static str> {
@@ -3027,6 +3062,84 @@ mod tests {
         let one_off =
             graph_event_from_patch(&moved, CurrentSeries::default()).expect("patch payload");
         assert!(one_off.recurrence.is_none());
+    }
+
+    /// The carried range start was cut from the moved `start` by byte
+    /// offset, so a value that is not a date was written as `startDate`, and
+    /// one with a multi-byte character straddling byte ten panicked. It is
+    /// now read by the anchor's own rule and refused as the caller's input.
+    #[test]
+    fn graph_event_patch_start_move_refuses_a_start_that_is_not_a_date() {
+        let existing = existing_series("2026-05-04");
+        let series = CurrentSeries {
+            recurrence: Some(&existing),
+            time_zone: None,
+        };
+        for value in ["2026-06-2\u{e9}", "not a date at all"] {
+            let moved = EventPatch {
+                start: Some(EventTime {
+                    value: value.to_string(),
+                    timezone: Some("UTC".to_string()),
+                }),
+                ..EventPatch::default()
+            };
+            let error = graph_event_from_patch(&moved, series)
+                .expect_err("a start that is not a date cannot anchor the series");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                ),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// RFC 5545 skips a date the month lacks; Graph's absolute patterns move
+    /// it to the month's last day. A series on a day some recurring month
+    /// lacks is refused rather than written with occurrences never asked for,
+    /// whether the day is explicit or taken from the start.
+    #[test]
+    fn an_absolute_day_some_month_lacks_is_refused() {
+        let refused = [
+            ("FREQ=MONTHLY;COUNT=3", "2026-01-31"),
+            ("FREQ=MONTHLY", "2026-01-29"),
+            ("FREQ=MONTHLY;BYMONTHDAY=30", "2026-01-01"),
+            ("FREQ=YEARLY", "2028-02-29"),
+            ("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29", "2026-01-01"),
+            ("FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=31", "2026-01-01"),
+        ];
+        for (rrule, start) in refused {
+            assert!(
+                matches!(
+                    graph_recurrence_from_rrule(rrule, start),
+                    Err(RecurrenceRefusal::Unsupported(_))
+                ),
+                "{rrule:?} from {start}"
+            );
+        }
+        let accepted = [
+            ("FREQ=MONTHLY", "2026-01-28"),
+            ("FREQ=MONTHLY;BYMONTHDAY=28", "2026-01-01"),
+            ("FREQ=YEARLY", "2026-01-31"),
+            ("FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=30", "2026-01-01"),
+        ];
+        for (rrule, start) in accepted {
+            assert!(
+                graph_recurrence_from_rrule(rrule, start).is_ok(),
+                "{rrule:?} from {start}"
+            );
+        }
+
+        // Through create, the refusal is the operation's Unsupported.
+        let mut event = recurring_create("FREQ=MONTHLY;COUNT=3");
+        event.start.value = "2026-01-31T12:00:00".to_string();
+        event.end.value = "2026-01-31T13:00:00".to_string();
+        let error = graph_event_from_create(&event).expect_err("the 31st every month is refused");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
+        );
     }
 
     /// An empty recurrence is how a patch makes a series a one-off: it goes
