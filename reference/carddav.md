@@ -43,7 +43,12 @@ principal lookup against the configured base URL, requires its result, and runs
 the rest of discovery normally, reusing nothing partially parsed from the probe
 and admitting no origin from it, while base-leg and post-principal failures
 still propagate. The accepted cost is a lost DIAGNOSTIC - an operator is not
-told that the well-known endpoint is serving truncated XML. `reference/caldav.md`
+told that the well-known endpoint is serving truncated XML. A document that
+parses but names nothing is a different failure: a configured base naming no
+current-user-principal, or a principal naming no `addressbook-home-set`, is
+`Protocol(MissingField)` through dav-core's `missing_field_error`, not
+`ParseFailed`, and is deliberately not an arm of the fallback predicate.
+`reference/caldav.md`
 carries the same reasoning at length, and the twin must not drift from it.
 
 The walk is no longer a twin at all: it is
@@ -117,8 +122,10 @@ narrowed the predicate.
   classified through `bifrost_net::into_account_error` as the transport
   classifies its own: `Protocol(ContractViolation)` with
   `Attempt(Acknowledged)`, not the `Request(Malformed)` it used to be. The
-  refused hop to an unadmitted origin stays a local `Request(Malformed)`;
-  `reference/caldav.md` carries the detail.
+  refused hop to an unadmitted origin stays a local `Request(Malformed)`, now
+  stamped with an `Acknowledged` attempt because the previous hop was answered;
+  `reference/caldav.md` carries the detail, including why the walk's closing
+  origin check is a `debug_assert`.
 - `parse.rs` - XML response parsers for addressbook discovery,
   contact listing, multiget hydration, depth-0 `getctag`, and nested href
   properties. Addressbook/listing/multiget and href-valued discovery
@@ -285,7 +292,9 @@ Supported contact primitives:
 - `contact_get` - a plain `GET` of the resource named by the contact id, with
   the validator read from the `ETag` response header and normalized exactly as
   the multiget `getetag` was, so snapshot comparison still compares like with
-  like. A missing resource maps to `NotFound(Contact)` scoped to the id.
+  like. A missing resource maps to `NotFound(Contact)` scoped to the id; the scope
+  decorates the classified 404, so the server's response text and the
+  acknowledged attempt survive.
   `contact_update` reads the current card through the same path. This was an
   `addressbook-multiget` REPORT against the collection DERIVED from the resource
   URL until the dav-bug-hunt round: that shape only works where the derivation
@@ -575,8 +584,10 @@ by `addressbook_element_outside_resourcetype_does_not_mark_a_collection`.
 TWO things deliberately stayed local, both behavioural differences rather than
 drift, and both of which the extraction would otherwise have silently flattened:
 
-- `not_found_error` attaches an `ErrorScope` naming the contact, where CalDAV's
-  `missing_event_error` puts the id in the cause.
+- `not_found_error` decorates the classified 404 with an `ErrorScope` naming the
+  contact, keeping the response text, where CalDAV's `missing_event_error`
+  wraps the dav-core constructor and puts the id in the cause. Both stamp an
+  `Acknowledged` attempt.
 - `send_status_request` returns the response ETag. `put_vcard` and
   `delete_vcard` hand that validator back to their callers; the CalDAV
   equivalents return `()`. Using the shared `DavDispatch::send_status_request`

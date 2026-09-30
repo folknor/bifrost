@@ -390,11 +390,30 @@ live and retryable instead of being closed with an orphaned subscription.
 before the swap closes the replacement and leaves the running handle
 installed - and any subscription already created on that replacement is
 torn down first, with every handle whose delete did not succeed kept in
-the registry as `teardown_unconfirmed`. `close()` does not delete
-server-side subscriptions, so a handle the engine forgets is an orphan
-that keeps delivering until the provider expires it; an unconfirmed
-record is therefore never recreated against a replacement, is carried
-across swaps, and is retried by the next reopen or `unsubscribe_push`.
+the registry as an orphan (`teardown_unconfirmed`, not `desired`).
+`close()` does not delete server-side subscriptions, so a handle the
+engine forgets is an orphan that keeps delivering until the provider
+expires it; an orphan is therefore never recreated against a replacement,
+is carried across swaps, and is retried by the next reopen or
+`unsubscribe_push`.
+Two independent flags sit on each registry record, and they answer
+different questions. `teardown_unconfirmed` says a server-side teardown
+of the handle was attempted and failed, so it may still be live and its
+teardown is retried. `desired` says the consumer still wants the
+coverage, so a reopen recreates it on the replacement. A record is always
+`desired`, `teardown_unconfirmed`, or both, and reopen recreation is
+driven by `desired` alone. The two were once one flag, and a reopen
+aborted by a failed old-side teardown then marked the consumer's live
+subscription as an orphan: the retry carried the old handle but never
+recreated it, and the subscription silently vanished. Such an aborted
+reopen (`mark_unconfirmed`) now leaves `desired` alone, since the old
+account stays installed and the coverage is still wanted. Only
+`into_orphan` clears `desired`, and it is applied to a consumer
+unsubscribe whose teardown failed, to a replacement-side handle unwound
+by an aborted reopen (the consumer's desire still lives in the record it
+was recreated from), and to an old handle carried past a committed reopen
+(its desire now lives in the recreated record; carrying it as desired too
+would subscribe twice on the next reopen).
 A repeat failure on an already-unconfirmed record is logged rather than
 aborting the swap, because a handle belonging to a long-dead connection
 must not wedge every future reopen.
@@ -1694,7 +1713,7 @@ closes silently (xc-2, ruled 2026-09-07: an explicit opt-in, leaving plain
 queue-for-later pattern silently, and a warning alone still left the consumer
 with nothing to act on). The detach runs whether or not the teardown succeeded
 - a subscription the provider refused to delete is retained
-`teardown_unconfirmed` and then dropped as stranded, with the same log line -
+as an orphan (`teardown_unconfirmed`, not `desired`) and then dropped as stranded, with the same log line -
 and the teardown error is returned unless the detach itself failed. Pinned by
 `detach_with_teardown_tears_push_subscriptions_down_before_detaching`, beside
 `detach_drops_push_records_so_a_reattach_cannot_reuse_dead_handles`, which

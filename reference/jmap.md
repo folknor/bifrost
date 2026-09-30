@@ -158,6 +158,16 @@ parse (an unbalanced or unknown template variable) is
 `downloadUrl`, `eventSourceUrl`), not the caller's `InvalidUrl`. `URLPart::parse`
 itself returns a bare description because it cannot know who wrote the
 template; `SessionState::derive` attaches the property.
+A template that parses must also be an absolute `http` / `https` URL with a
+host, checked on a probe expansion (each variable replaced by one unreserved
+character) so a legitimate level-1 template, including one whose host label is
+a variable, is never refused; `apiUrl` gets the same absoluteness check
+unexpanded, naming `apiUrl`. The upload and download templates and `apiUrl` are
+checked eagerly, because the account uses them throughout. `eventSourceUrl` is
+parsed with the session but a failure is only stored: `event_source_url()`
+returns a `Result` and raises `MalformedSessionUrl { property: "eventSourceUrl" }`
+at use, so a server whose EventSource template this crate cannot parse can still
+be opened for sync, which never touches EventSource.
 At the sync boundary, a method response whose `sessionState` differs marks the
 client stale and advances a watch generation. The always-driven scope lifecycle
 stream selects on that generation and terminates promptly with
@@ -387,9 +397,9 @@ The crate-internal JMAP error type uses structured variants. No
 - Local request refusals: `RequestEncode`, `RequestCallLimit { max }`, `RequestSizeLimit { max, size }`, `NoPrimaryAccount { capability }`.
 - Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `NotParsable`.
 - `InvalidUrl` - a URL the crate's own caller supplied is unusable. Its one remaining source is `Client::with_transport` given an empty session URL.
-- `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
+- `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: `apiUrl` and the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable, or not an absolute http or https URL; `eventSourceUrl` raises only when EventSource is used) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
 - `MalformedCapability { capability }` - an advertised capability whose object does not parse.
-- Behind the `websockets` feature: `WebSocketHandshake`, `WebSocketRuntime`, `WebSocketClosed`, `WebSocketSetup(WebSocketSetupError)`, `WebSocketNotConnected`.
+- Behind the `websockets` feature: `WebSocketHandshake`, `WebSocketRuntime` (a read-side failure after the handshake), `WebSocketSend` (a failed frame write to the connection's sink), `WebSocketClosed`, `WebSocketSetup(WebSocketSetupError)`, `WebSocketNotConnected`.
 - No `From<reqwest::Error>` - reqwest errors converted to TransportError at point of use. No `From<tokio_websockets::Error>` either - see "Error translation".
 
 Every variant's classification is listed under "Error translation" below.
@@ -545,7 +555,7 @@ Every await in the reader's lifecycle is cancellation-covered, so `close()` is p
 
 `push_stream` is a thin broadcast subscriber. A `Lagged` slot emits a coalesced `Invalidated { source: Coalesced, payload: Unknown }` so the engine full-repolls rather than losing notifications.
 
-`subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. Registry and enabled-union state commit only after the frame send succeeds. Subscribe outcomes account for every submitted position, including repeated scopes; unmapped scopes occupy the failed lane. When NO requested scope maps, the whole call errors (nothing was subscribed) as `Request(Malformed)`, not `Unsupported(PushSubscribe)`: the account advertised `PushCapability::InProcess`, so the fault is these arguments, and `Unsupported` would invite a consumer keying off the kind to downgrade push for the account wholesale. A frame that cannot be sent because no WebSocket is connected (`WebSocketNotConnected`) is reported as `Unsupported(PushSubscribe)` for both `subscribe` and `unsubscribe` (`apply_push_set`). That is a classification for the consumer, not an engine signal: `bifrost-sync` does not read the kind to change push behaviour. `close()` absorbs `WebSocketNotConnected` from its best-effort unsubscribe as success.
+`subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. Registry and enabled-union state commit only after the frame send succeeds, with one exception: an `unsubscribe` whose frame hits a dead sink (`WebSocketSend`) commits the removal and returns `Ok`. Push is enabled per connection, so a connection whose sink is dead has no subscription left to narrow, and the reader re-applies the committed narrowed union on its next connection. Reporting it as a failure made the engine's reopen fail its old-side teardown after every WebSocket drop. A `subscribe` on a dead sink still commits nothing and fails as a replayable `Transport(Network)`. Subscribe outcomes account for every submitted position, including repeated scopes; unmapped scopes occupy the failed lane. When NO requested scope maps, the whole call errors (nothing was subscribed) as `Request(Malformed)`, not `Unsupported(PushSubscribe)`: the account advertised `PushCapability::InProcess`, so the fault is these arguments, and `Unsupported` would invite a consumer keying off the kind to downgrade push for the account wholesale. A frame that cannot be sent because no WebSocket is connected (`WebSocketNotConnected`) is reported as `Unsupported(PushSubscribe)` for both `subscribe` and `unsubscribe` (`push_set_error`). That is a classification for the consumer, not an engine signal: `bifrost-sync` does not read the kind to change push behaviour. `close()` absorbs `WebSocketNotConnected` and `WebSocketSend` from its best-effort push disable as success (`close_outcome`): no connection or a finished one means no subscription is left to tear down. Any other failure is still a close failure.
 
 `scope_lifecycle_stream` polls `Mailbox/changes` against the primary mailbox state, hydrating changed names before advancing its state cache, then emits `ScopeLifecycle::Created`/`Renamed`/`Deleted`. A transient name-hydration failure leaves the state unchanged for replay; terminal/engine classes emit `Terminated`. Renames emit only when the stored and hydrated names differ and carry both names even when the stable scope id is unchanged.
 
@@ -886,13 +896,24 @@ arrived) and, unless its primary cause already is one, the typed
   neither, the fallback is `Transport(Network)` with no attempt cause.
 - WebSocket errors split by handshake position: `WebSocketHandshake`
   (pre-handshake) -> `Transport(Network)` + `Attempt(Unsent)`;
-  `WebSocketRuntime` (post-handshake) and `WebSocketClosed` ->
-  `Protocol(PartialResponse)` + `Attempt(Acknowledged)`. No blanket
+  `WebSocketRuntime` (post-handshake read side) and `WebSocketClosed` ->
+  `Protocol(PartialResponse)` + `Attempt(Acknowledged)`. `WebSocketSend` (every
+  sink write) -> `Transport(Network)` with `Attempt(Unsent)` for
+  `tokio_websockets::Error::AlreadyClosed`, which the library raises before
+  queueing the frame, and `Attempt(InFlight)` for any other error, which came
+  out of the flush; nothing was acknowledged, so it is never stamped
+  `Acknowledged`. Push-set frames (`push_set_error`) additionally carry an
+  idempotency override: an enable or disable frame carries the connection's
+  complete desired data-type set, so replaying it is safe, unlike the
+  central table's non-idempotent `PushSubscribe`, and the in-flight case
+  stays a replay rather than a reconcile. No blanket
   `From<tokio_websockets::Error>`; call sites map explicitly.
   `WebSocketSetup` splits by cause: `Tls` -> `Transport(Tls)` +
   `Attempt(Unsent)`, `InvalidHeader` -> `Request(Malformed)`,
   `Subprotocol` -> `SyncState(CapabilityChanged)`.
-  `WebSocketNotConnected` -> `Unsupported(operation)`.
+  `WebSocketNotConnected` -> `Unsupported(operation)` (unchanged on
+  `subscribe`; the push reader's re-enable cannot see it, since a
+  successful handshake has already installed the sink).
 - `NoPrimaryAccount` -> `Unsupported(operation)`, with the capability in the
   diagnostic: nothing was sent, and the server offers no account for that
   capability. Not `AuthLost` (re-authorizing cannot add an account to the

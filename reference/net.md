@@ -906,6 +906,20 @@ disabled in reqwest for every `Net`; bifrost-net follows them itself because
 the reqwest policy cannot rewrite methods, strip headers, or carry a different
 trusted-host allowlist for each account sharing the client.
 
+`RequestBuilder::follow_redirects(FollowRedirects)` is the per-request
+override of the account's policy (`#[must_use]`, additive; unset uses
+`AccountSpec::follow_redirects`). `Disabled` hands every 3xx back to that
+one request's caller as a terminal response, status, headers and body,
+and sends nothing to the `Location`; `Enabled(policy)` substitutes `policy`
+for the account's for that request's walk. The account's own policy is
+untouched for every other request. It exists for URLs admitted by a rule
+the shared walk cannot apply to a hop, the standing case being an
+anonymous provider-minted upload session URL (the Google Drive resumable
+session and the Graph OneDrive upload session answer chunk PUTs on one):
+a 307 or 308 there must not be walked through the shared redirect logic,
+which was never checked for where such a hop can lead or for an http
+downgrade, and would replay the chunk body to it.
+
 `Net::new` returns `Error::InvalidRequest` for bad TLS / client
 configuration data: corrupt native-tls root cert DER, reqwest
 rejection of the re-encoded DER, or client-builder failure. These

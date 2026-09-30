@@ -62,7 +62,11 @@ signal. The widening applies to the well-known probe only, never to a request
 against the configured base URL, where a parse failure is a real
 contract violation rather than evidence that this was never a discovery
 endpoint. A failure after the principal is identified is
-not a root-discovery fallback trigger.
+not a root-discovery fallback trigger: a principal whose answer parses but names
+no `calendar-home-set` is `Protocol(MissingField)` through the same
+`missing_field_error`, which is deliberately not an arm of the fallback
+predicate. `ParseFailed` says the XML was broken; `MissingField` says it was
+well-formed and silent, and both derive `ProviderContractViolation`.
 
 The `ContractViolation` arm exists because those redirect failures used to be
 `Request(Malformed)` and fell back through the refused-redirect arm;
@@ -80,8 +84,10 @@ The principal walk is not this crate's. It is
 legs run through one private `discover_principal(root)` inside it that performs
 the PROPFIND and the decode together, so the probe's parse failure surfaces as
 an `Err` the fallback predicate can read rather than being lifted past it. The
-base leg never consults the predicate, and a base answer naming no principal is
-`Protocol(ParseFailed)`. What stays here is the step after the principal: the
+base leg never consults the predicate, and a base answer that parses but names
+no principal is `Protocol(MissingField)` (built by dav-core's
+`missing_field_error`, with an acknowledged attempt), while a base body that will
+not parse stays `Protocol(ParseFailed)`. What stays here is the step after the principal: the
 multi-property principal PROPFIND in `discover_account_for_principal`. The walk
 is pinned once, for both dialects, in dav-core:
 `every_fallback_answer_retries_the_configured_base` (the hop-cap loop
@@ -144,10 +150,20 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   with no transmission evidence, and an undecodable `Location` was not an error
   at all: the 3xx came back as a response and the status ladder read it as a
   server refusal. The refused hop to an unadmitted origin is NOT among them; it
-  is this client's own credential-gate decision, raised by `auth_headers`, and
-  stays a local `Request(Malformed)`. Pinned by
-  `a_redirect_the_walk_will_not_follow_is_the_providers_contract_fault` in
-  dav-core.
+  is this client's own credential-gate decision, raised by the walk itself
+  before the next hop goes out, and stays a local `Request(Malformed)` - the
+  kind the discovery fallback predicate reads a refused well-known redirect by.
+  It is stamped with an `Acknowledged` attempt, because the previous hop was
+  sent and answered with the redirect being refused (the same stamp covers a
+  move `Destination` that cannot be rebased onto an admitted origin after a
+  redirect); a first-hop refusal in `auth_headers`, where nothing has been
+  sent, carries none. The stamp moves no recovery class. Pinned by
+  `a_redirect_the_walk_will_not_follow_is_the_providers_contract_fault` and
+  `a_refused_redirect_says_the_first_hop_was_answered` in dav-core. The walk's
+  closing check that the final response came from an admitted origin is a
+  `debug_assert`, not a refusal: every URL the walk sends to has already passed
+  the credential gate, and as a runtime check it would run after the request
+  had gone out.
 - `parse.rs` - XML response parsers for calendar discovery, event
   listing, multiget hydration, and nested href properties. Calendar
   collection metadata and href-valued discovery properties are staged per
@@ -257,8 +273,9 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   single bad resource into `Page::failed_ids`, while the single-resource
   paths (`event_get`, `event_update` and `event_rsvp`, all through
   `fetch_event_from_url`) surface `parse_error`: `Protocol(ParseFailed)` with
-  an acknowledged attempt, deriving `ProviderContractViolation`, because the
-  body is the server's answer to a GET. It was `local_error`
+  an acknowledged attempt and the event's `ErrorScope::Calendar` (the
+  single-resource overload below), deriving `ProviderContractViolation`,
+  because the body is the server's answer to a GET. It was `local_error`
   (`Request(Malformed)` -> `ClientBug`), which told the consumer to fix a
   request it had nothing to do with. Pinned for get and update by
   `an_unparseable_event_from_the_server_is_the_providers_fault`, which scripts
@@ -277,17 +294,34 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   off. An unknown zone or a mixed duration falls back to civil addition; an explicit end
   patch removes DURATION before emitting DTEND. A resource with no VEVENT
   (a VTODO or VJOURNAL sharing the collection) maps to
-  `NotFound(Calendar)` for `event_get`/`event_update` and to *no* events in
+  `NotFound(Calendar)` for `event_get`/`event_update` - stamped with an
+  acknowledged attempt, since it is read out of the server's answer, and scoped
+  to the event like the other single-resource failures - and to *no* events in
   the listing lanes, never to a fabricated empty event.
   Serialization-out (create/patch/RSVP) stays
   hand-rolled and verbatim-preserving: patches splice on *physical* lines,
   folding only newly emitted lines, so long preserved/unmodeled values
-  round-trip byte for byte. Replacement matching is case-insensitive and
+  round-trip byte for byte. The patch writer does not read the stored body by
+  line rules of its own. `parse_vevents` records a `BlockSpan` per VEVENT - the
+  caldata `LineReader` line numbers of its `END:VEVENT`, of each top-level
+  property and of its first nested component, where new properties land - and `patch_to_ical` works from those spans over the
+  same parse the projection ran, so a folded `END:VEVENT` or property name, a
+  blank line inside a fold, a lowercase `RECURRENCE-ID`, a trimmed property name
+  and a `RECURRENCE-ID` inside a nested component are read exactly as the projection read them.
+  `splice_lines` groups logical lines with that same reader (a head plus every
+  physical line up to the next head), emits untouched ones verbatim and folds
+  only the replacements. Replacement matching is case-insensitive and
   limited to depth-zero VEVENT properties, so VALARM properties are
   preserved; new event properties are inserted before the first nested
-  component. A body that offers no splice point (no `BEGIN:VEVENT`, or a
-  first VEVENT that never closes) is an error rather than an unchanged
-  write-back that would look like a successful edit. Parameter values use
+  component. An event with no stored source body is REFUSED, never rebuilt
+  from the model: a rebuild would silently drop alarms, time zones, overrides
+  and every property the model does not carry, and PUT the result as a
+  successful edit. `PatchError` classifies what stopped a patch:
+  `RecurrenceOverride` (a recurrence replacement on a resource with override
+  VEVENTs, an override being a VEVENT with a top-level `RECURRENCE-ID`) is
+  `Unsupported`, while `NoSpliceableVevent` and `MissingSourceBody` are
+  `Internal(InvariantViolated)` with no attempt, because an event projected
+  from its own body always has both. Parameter values use
   RFC 6868 caret encoding in both directions; caldata hands back raw
   parameters, so the decode of free-text parameters (CN, TZID) is this
   crate's. RFC 6868 defines no backslash escape, so a backslash is written
@@ -598,8 +632,9 @@ Supported calendar primitives:
   matching the create path. Non-VEVENT components such as
   VTIMEZONE are preserved on raw-backed updates. Multi-VEVENT recurrence
   override components are preserved for scalar patches, but recurrence
-  replacement is rejected for resources with override VEVENTs because the
-  shared recurrence model cannot rewrite those instances losslessly.
+  replacement is rejected as `Unsupported` for resources with override VEVENTs
+  because the shared recurrence model cannot rewrite those instances
+  losslessly.
 - `event_delete` - deletes the DAV resource. A target already gone (404 /
   410) is a success, and the DELETE replays after a mid-flight drop; see
   "DELETE is replayable" below.
@@ -1109,13 +1144,18 @@ for the crate's entire error surface, so
 `every_error_this_crate_mints_is_stamped_caldav` pins it; ablating the constant
 before that test existed failed exactly one unrelated assertion.
 
-What deliberately did NOT move: `not_found_error` differs between the crates.
-CardDAV's local `not_found_error` is a 404 `status_error` with an `ErrorScope`
-for the contact attached; CalDAV's `missing_event_error` is a thin wrapper over
+What deliberately did NOT move: `not_found_error` differs between the crates in
+construction, though not in what it stamps. Both carry an `Acknowledged`
+attempt, because both are read out of a server answer. CardDAV's local
+`not_found_error` decorates the already-classified 404 `status_error` with an
+`ErrorScope` for the contact, so the 404's response text survives; CalDAV's
+`missing_event_error` is a thin wrapper over
 `bifrost_dav_core::not_found_error`, which carries the id in the cause and
-attaches no scope. That is a real behavioural difference, not drift, and
-flattening it would have changed what consumers receive - so each crate keeps
-its own entry point.
+mints no body text, and the event scope is attached by the caller
+(`event_scope`, on the projection failures as on the GET failure). That is a
+real difference in what each error is built from, not drift, and flattening it
+would have changed what consumers receive - so each crate keeps its own entry
+point.
 
 ## This crate and bifrost-carddav are near-duplicates, and drift is the defect
 

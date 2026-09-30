@@ -34,8 +34,9 @@ Internal modules:
   `scope_lifecycle_stream`, `ScopeCache` / `ScopeSnapshot`.
 - `inventory.rs` - inventory pass and `get_stream` hydration.
 - `changes.rs` - history-id driven change stream.
-- `push.rs` - Cloud Pub/Sub `watch`/`stop`, `PubSubConfig`, and the
-  `PubSubControl` watch actor.
+- `push.rs` - Cloud Pub/Sub `watch`/`stop`, `PubSubConfig`, the
+  `PubSubControl` watch actor, and the process-wide `MailboxWatch`
+  registry that coordinates `users.stop` across instances of one mailbox.
 - `mutation.rs` - `bulk_set_flags`, `bulk_move`, `bulk_destroy`.
 - `pim.rs` - Phase 3.6 PIM primitives: message/thread label
   mutations, MIME send and drafts, search translation, container
@@ -59,14 +60,26 @@ Internal modules:
   loop also bounds total chunk attempts to the expected chunk count plus
   eight, so malicious tiny progress cannot hold the caller forever. Then a
   `permissions` POST (`type: anyone` / `type: domain` + account domain)
-  and a `webViewLink` GET. The 308 reaches the loop only via
-  bifrost-net's missing-`Location` passthrough.
+  and a `webViewLink` GET. The chunk PUTs and the session cancel run with
+  per-request `follow_redirects(FollowRedirects::Disabled)`, so every 3xx
+  reaches this module as a plain response and nothing is ever sent to a
+  `Location`. Drive's 308 carries a `Range` and no `Location` and arrives as
+  progress; a 3xx WITH a `Location` is a real redirect the resumable protocol
+  never uses and is `Protocol(ContractViolation)`, without echoing the
+  server-chosen `Location`. The permission body, and so the account domain,
+  is derived before the session POST: the account email is Gmail's own
+  profile value, so one with no domain is `Protocol(ParseFailed)` with
+  `AttemptCause(Unsent)`, refused with nothing sent rather than after the
+  upload, which would leave an uploaded file nothing shares.
   The upload's local refusals are classified by what happened, and only
   those raised before any request blame the caller: a mismatched declared
   size or an empty payload is `Request(Malformed)`, refused before the
   session POST, so no session exists to cancel. The refusals that follow a
   complete response carry `AttemptCause(Acknowledged)`: a 2xx session response with no `Location`
-  is `Protocol(MissingField)`; a present 308 `Range` that does not parse
+  is `Protocol(MissingField)`; a `Location` that is present but not
+  visible-ASCII text, or not an absolute http or https URL with a host, is
+  `Protocol(ParseFailed)`, since accepting it would send every chunk PUT and
+  the cancel to a bogus URL; a present 308 `Range` that does not parse
   is `Protocol(ParseFailed)`; a 308 claiming bytes never sent, fewer bytes
   than it already reported, or every byte without completing the upload is
   `Protocol(ContractViolation)`. A chunk that made no progress is legal
@@ -79,11 +92,12 @@ Internal modules:
   cause.
   A resumable session is server-side state that Drive holds for about a
   week, so any failure of the upload leg cancels its own session on the
-  way out: one un-retried `DELETE` against the session URI, bounded by a
-  30s deadline, whose own failure is swallowed rather than replacing the
+  way out: one un-retried `DELETE` against the session URI, bounded by its
+  own deadline (`GDRIVE_CANCEL_TIMEOUT`), whose own failure is swallowed rather than replacing the
   error the caller needs. Google's accepted-cancel status is `499`, which
   bifrost-net surfaces as `Err(Status)` and not `Ok`; `499`, `404` and
-  `410` all count as cancelled. When the cancel fails, the original
+  `410` all count as cancelled. A 3xx answer to the cancel is not followed
+  and is not an accepted cancel: the session counts as abandoned. When the cancel fails, the original
   `AccountError` is decorated through `into_builder` with support-only
   text recording the abandoned session - decoration only, so kind,
   message key and `RecoveryClass` are unchanged, and the pre-authenticated
@@ -188,8 +202,9 @@ requests off `account_net()` and so sits outside the accumulator; it feeds no
 `PubSubConfig`. `open(account_id)` asks the client for an
 account-scoped clone attached to `bifrost-net` under the engine
 `AccountId`, does one `users.getProfile` round-trip, parses
-`profile.historyId` into a `u64`, and stores the `GmailChangeState` as
-`seed_state`. The opened `GoogleAccount` retains:
+`profile.historyId` into a `u64` (a value that is present but not a number is
+`Protocol(ParseFailed)`, not a missing field), and stores the
+`GmailChangeState` as `seed_state`. The opened `GoogleAccount` retains:
 
 - `client: Arc<GmailClient>` (crate-private REST wrapper).
 - `capabilities: AccountCapabilities` snapshotted at open.
@@ -200,7 +215,9 @@ account-scoped clone attached to `bifrost-net` under the engine
   network call.
 - `pubsub: Arc<PubSubControl>` holding the watch actor command sender,
   shutdown token, and a `broadcast::Sender<WatchEvent>`. The actor task owns the
-  optional config, lifecycle state, and active-handle set exclusively.
+  optional config, lifecycle state, active-handle set, and its claim on the
+  mailbox's shared watch exclusively. It is built from the profile's email
+  address, the key under which instances coordinate `users.stop`.
 - `scope_cache: Arc<ScopeCacheState>` for the shared, refresh-on-stale label
   vocabulary used by canonicalization: an `RwLock<ScopeSnapshot>` for the
   snapshot plus a `tokio::sync::Mutex` that makes the refresh single-flight.
@@ -223,14 +240,18 @@ principal's own profile). `reopen`
 flows from the engine: it drops the previous `Arc` and calls the factory
 again with the same `AccountId`. The factory holds the credentials and
 client, so the new `GoogleAccount` carries a fresh
-`shutdown`/`pubsub`/`scope_cache` and reads the current profile at open.
+`shutdown`/`pubsub`/`scope_cache` and reads the current profile at open. The
+engine's reopen subscribes on the replacement before it tears down the old
+handle, so the two instances briefly share one mailbox and one remote watch;
+see the push section for how that is kept from killing the fresh watch.
 
 `close()` is idempotent and cancellation-safe. It marks `closed` and cancels
 `shutdown` synchronously, before the returned future exists, so the watch actor
 and the push and scope-lifecycle streams are retired whatever the caller does
 with that future. The future then makes a best-effort `users.stop` call for a
-locally active Gmail watch - it needs the transport, so it cannot precede the
-detach - and clears the watch state; the `bifrost-net` detach runs from a drop
+locally active Gmail watch, unless another instance in this process holds a
+live watch on the same mailbox (see the push section) - it needs the
+transport, so it cannot precede the detach - and clears the watch state; the `bifrost-net` detach runs from a drop
 guard constructed before the future is returned, and therefore happens on
 completion, on mid-poll cancellation, and when the future is dropped
 without ever being polled. A stop
@@ -1021,6 +1042,42 @@ enters `Unwatched`. The active-handle set lets multiple
 subscribers share one Gmail watch; correctness after restart does not depend on
 that in-memory set surviving.
 
+A Gmail watch belongs to the MAILBOX, not to the account instance that made it:
+`users.watch` on a mailbox that already has one replaces it, and `users.stop`
+takes no watch identity and stops whatever watch the mailbox has. Two live
+`GoogleAccount` instances for one mailbox therefore share one remote watch, and
+the engine's reopen creates exactly that pair. Uncoordinated, the old account's
+teardown `users.stop` killed the replacement's fresh watch and push stayed
+silently dead until the next renewal, up to six days. A process-wide
+`MailboxWatch`, found through a registry keyed by the lowercased address and
+holding weak references so an idle mailbox's entry is dropped, coordinates
+instances:
+
+- `holders` counts the actors in this process that currently own a live watch
+  on the mailbox. Each actor's `WatchOwnership` takes its claim right after a
+  successful `users.watch` (idempotent, so a renewal re-enters harmlessly) and
+  releases it when the actor is no longer `Watched` or `Renewing`, when a stop
+  completes or is deferred, and on drop, so a dead instance never pins another
+  instance's stop decision.
+- `exchange`, an async mutex, serializes every `users.watch` and `users.stop`
+  for the mailbox across instances, and the claim is taken inside that lock. A
+  stop decided on a zero count therefore cannot reach Gmail after another
+  instance's watch the count did not yet show.
+- Every teardown path (unsubscribe, close, the refused-commit stop in
+  `commit_watched`, and the handle-encode-failure rollback) goes through
+  `stop_exclusive`, which sends `users.stop` only when no OTHER holder exists;
+  otherwise it skips the wire call and the actor's claim moves to the other
+  holder. An instance that holds no watch of its own, such as one receiving a
+  handle persisted across a restart, also defers to a live holder.
+
+The bias is deliberate: a watch nobody stops is cheap (it expires, and a
+notification with no listener is dropped), while a watch stopped under a live
+listener silently kills push. Every ambiguity, such as a claim released late or
+a second consumer in the process using another topic, errs toward skipping the
+stop. Residual: instances in OTHER processes are invisible to the registry and
+`users.stop` cannot be scoped to a watch, so cross-process teardown of a shared
+mailbox can still stop a live watch until the next renewal.
+
 `push_stream` is a `broadcast::Receiver<WatchEvent>` adapter
 with shutdown wiring. `Lagged` is treated as a skip rather than
 an error.
@@ -1321,16 +1378,28 @@ Mapping highlights:
   - `Unsupported` and `BlobRangeUnsupported` -> `Unsupported(op)`.
   - `MissingField` (a response lacking something it must carry, such as a
     created event with no id or a live event missing start or end) ->
-    `Protocol(MissingField)`, with no attempt cause.
+    `Protocol(MissingField)`, with `AttemptCause(Acknowledged)`. Every
+    producer raises it after a complete response arrived, so it must never be
+    raised for a missing LOCAL value (that is `Internal`) or missing caller
+    input (`Request(Malformed)`). A field that is present but unusable is not
+    missing: a `historyId` that does not parse, in the profile or a history
+    page, is `Protocol(ParseFailed)`.
   - `ProviderResponse` (a complete, successful-status response that broke
     its exchange's contract, such as the Drive resumable upload's) ->
     `Protocol(MissingField | ParseFailed | ContractViolation)` by
     `ProviderFault`, with `AttemptCause(Acknowledged)`.
+  - `ProviderValueUnusable` (a value an EARLIER provider response supplied,
+    such as the profile's email address, is unusable for the request now being
+    built, which is refused before any byte is sent) -> the same `Protocol`
+    kinds by `ProviderFault`, but `AttemptCause(Unsent)`: the provider's
+    fault, yet this exchange never reached the wire. The Drive hosting
+    path's account-domain derivation is its producer.
   - `PageTokenRepeated` -> `Protocol(ContractViolation)`, acknowledged;
     `PageBudgetExceeded` -> `Internal(LimitExceeded)` (see Paging
     inventory above).
   - `Internal` (a state this crate believes impossible, such as a change
-    stream with no cursor) -> `Internal(InvariantViolated)`;
+    stream with no cursor, or one past its profile check with no start
+    history id) -> `Internal(InvariantViolated)`;
     `LimitExceededAfterResponse` (this crate's own limit stopping a
     multi-request exchange after every request sent was answered) ->
     `Internal(LimitExceeded)` with `AttemptCause(Acknowledged)`. Both
@@ -1400,6 +1469,12 @@ and each is also stated at the code it describes.
   fix.) Only `users.stop` remains inside the future, because it needs the
   transport the detach sheds, so retrying it after a cancelled close is not
   possible.
+- **Watch teardown is coordinated within a process only.** Instances of one
+  mailbox in this process share a `MailboxWatch` and skip `users.stop` while
+  another holds a live watch; instances in other processes are not visible and
+  `users.stop` cannot be scoped to a watch, so a stop from another process can
+  still kill a live watch until its next renewal. Errs toward skipping the
+  stop on every in-process ambiguity (see the push section).
 - **`open_blob_range` always returns a classified `Unsupported(OpenBlobRange)`**,
   including for a forged handle claiming `supports_range`. That is a decision
   that Gmail attachments have no byte-range transport, not a stub awaiting

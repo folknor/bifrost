@@ -50,28 +50,22 @@ item is what stops that.
 
 - **errors: findings from the local-refusal audit (part c) still open.**
   Filed 2026-09-29; the rest of the audit's findings landed 2026-09-30.
-  - JMAP `WebSocketNotConnected` (`sync/push.rs apply_push_set`) derives
-    terminal `Unsupported(PushSubscribe)` for a transient race. Analysed
-    2026-09-30: the sink is `None` only before the first handshake and is
-    never cleared, so the error means "the reader has not connected yet". The
-    engine does NOT read its kind: `subscribe_push` hands it to the consumer,
-    and during a reopen (`engine/reattach.rs`) any error from the
+  - JMAP `WebSocketNotConnected` (`sync/push.rs push_set_error`) still derives
+    terminal `Unsupported(PushSubscribe)` for a transient race. The sink is
+    `None` only before the first handshake and is never cleared, so the error
+    means "the reader has not connected yet". The engine does NOT read its
+    kind: during a reopen (`engine/reattach.rs`) any error from the
     replacement's `push_subscribe` aborts the attempt, so a slow or down
     WebSocket endpoint during reopen can exhaust `restart_account`'s three
-    attempts and pause the whole account, HTTP sync included. Reclassifying
-    fixes none of that. Recommendation: treat it as deferred success (commit
-    the desired set and return `Ok`; the reader re-applies `enabled` and
-    `push_state` on every connect, and `close()` already treats the error as
-    `Ok`; the lock order was traced and loses no update). Related: a send on a
-    dead sink becomes `Protocol(PartialResponse)` stamped `Acknowledged` though
-    nothing was acknowledged, which for non-idempotent `PushSubscribe` derives
-    a reconcile with no target; honest is `Transport(Network)` (`Unsent` when
-    the library refused before writing, else `InFlight`) with an idempotency
-    override, needing its own sink-send error variant. Knock-on, unverified
-    against `tokio_websockets`: the old account's `push_unsubscribe` on a dead
-    sink fails, its record is marked `teardown_unconfirmed`, and unconfirmed
-    records are never recreated, so a subscription can silently stop being
-    recreated after a reopen that follows a WebSocket drop. Wants a ruling.
+    attempts and pause the whole account, HTTP sync included. Recommendation:
+    treat it as deferred success (commit the desired set and return `Ok`; the
+    reader re-applies `enabled` and `push_state` on every connect, and
+    `close()` already treats the error as `Ok`). `subscribe` on a DEAD sink
+    has the same effect on reopen, since only `unsubscribe` absorbs
+    `WebSocketSend`. Wants a ruling. The dead-sink classification and the
+    `teardown_unconfirmed` knock-on landed 2026-09-30; unverified is their
+    premise that every `tokio_websockets` send error leaves the stream closed
+    for good, on which `unsubscribe` absorbing `WebSocketSend` rests.
   - SMTP `starttls` on a server without STARTTLS is `Request(Malformed)`,
     while IMAP's `StartTlsUnavailable` is `Authorization(PolicyBlocked)`: a
     parity question with a security-policy flavour, left alone.
@@ -87,80 +81,75 @@ item is what stops that.
     stopped at, a transport feature; sparred and accepted as conservative on
     2026-09-29, raised again by the cold review.
 
-## Found 2026-09-30 by the laterals sweep, not fixed
+## Landed 2026-09-30 without a ruling
 
-Each was found while fixing a neighbour and is outside what was built; none
-is ruled. Verify against the code before working any of them.
+The laterals sweep's findings were built in one pass by a session that
+crashed before recording anything; the work was recovered, finished and
+committed 2026-09-30. The items below change a recovery class, a published
+type, or observable behaviour, and nobody ruled on them. Each is in the code
+now; the owner accepts it, or it is reverted as its own change.
 
-- **graph: `push_subscribe` can leak live subscriptions.**
-  `finalize_push_outcomes` runs after the arm has registered the handle and
-  started the renewal worker; if it fails, the caller gets `Err` with no
-  handle, so the server subscriptions keep being renewed and can never be
-  unsubscribed.
-- **graph: calendar recurrence and patch gaps** (`calendar.rs`). An RRULE Graph
-  cannot express is silently dropped on create and patch, making a one-off
-  event (the test named `graph_event_create_rejects_unsupported_rrule_parts`
-  pins the drop); a patch recurrence with no `start` builds its range start
-  from an empty time; a patch setting attendees to an empty list sends nothing,
-  so attendees cannot be cleared.
-- **graph: OneDrive upload leftovers** (`cloud.rs`). A 307 or 308 on the
-  anonymous chunk PUT goes through bifrost-net's redirect walk, unchecked for
-  where it can lead or an http downgrade; an aborted or refused upload never
-  deletes its upload session; the upload-URL admission duplicates part of
-  `origin::validate`, whose natural home is `origin.rs`.
-- **graph: Autodiscover leftovers** (`autodiscover.rs`). A missing setting, an
-  in-body `ErrorCode` and "exceeded redirect limit" still map to
-  `Request(Malformed)` though they are provider faults;
-  `json_parse_to_account_error` labels every `GraphError::Json` a JSON parse
-  failure, which now includes Autodiscover XML and 202 range failures; the
-  EWS parsers (`ews/parse.rs`, `ews/xml_helpers.rs`) still use the lenient
-  `push_general_ref` and a `push_text` that drops unescape errors, so an
-  unknown entity silently vanishes from an EWS value (Autodiscover now uses
-  the strict `try_push_general_ref`).
-- **google: classification leftovers.** `changes.rs` reports a missing local
-  `start_history_id` as `Protocol(MissingField)` though it is local stream
-  state (`Internal(InvariantViolated)`); `missing_field` never records
-  `Acknowledged` though most callers raise it after a complete response;
-  `cloud.rs account_domain` refuses an account email with no domain as
-  `Request(Malformed)` though it comes from the profile, and only after the
-  upload, leaving an uploaded unshared file; `endTimeUnspecified` is not
-  modelled, so Google's placeholder end is projected as real; a Drive
-  resumable `Location` header that is present but not valid text reads as
-  missing (`MissingField`) where `ParseFailed` is honest.
-- **jmap:** `SessionState::derive` parses `eventSourceUrl` eagerly, so a server
-  whose EventSource template this crate cannot parse cannot be opened at all
-  though sync never uses EventSource; `session_template` checks only template
-  syntax, so a relative `uploadUrl` / `downloadUrl` / `eventSourceUrl` such as
-  `not-a-url/{accountId}` passes and later fails in the transport instead of
-  as `MalformedSessionUrl` (a check must not refuse RFC 6570 templates that
-  are legitimately absolute only after expansion); the `reader_pass` comment in `push.rs`
-  says the re-enable path can produce `WebSocketNotConnected`, which it
-  cannot.
-- **imap:** `account/pim.rs`'s "SELECT missing UIDVALIDITY" sites (four, plus
-  two in search) map to `pim_malformed`, blaming the caller for the server's
-  omission (changes the recovery class, so wants a ruling); a tagged code
-  (typically HIGHESTMODSEQ under QRESYNC) hides COPYUID on MOVE and COPY, which
-  then survives only as an event; a missing mandatory response retires a
-  connection whose framing is intact after the tagged OK; `ImapConnection::
-  literal_mode` in `helpers.rs` is a dead copy of the driver's rule that its
-  test exercises; the rev2 baseline may be too generous (from memory RFC 9051
-  Appendix E folds in neither OBJECTID nor SAVEDATE, and only the FETCH side
-  of BINARY); `Capability::StatusDeleted`'s doc cites RFC 9051 6.3.11 for a
-  token that section does not define; an ESEARCH whose tag names an already
-  finished command still becomes an event, where the surplus-results ruling
-  suggests dropping it; `idle.rs` and `ImapConnection::next_event` mint
-  `Error::driver_gone()` with no phase when the driver dies mid-IDLE, so an
-  in-flight IDLE reads as `Unsent` (low stakes, IDLE mutates nothing).
-- **dav:** a refused redirect to an unadmitted origin (`auth_headers`) is still
-  `local_error` with no attempt stamp though the first hop was sent;
-  `not_found_error` for a GET resource with no VEVENT carries no attempt stamp,
-  while CardDAV's local `not_found_error`, built on `status_error`, now stamps
-  `Acknowledged` as a side effect, so the two crates differ;
-  `patch_to_ical` failures map to `Unsupported`, arguably the provider's fault
-  when the server body has no place to splice the patch; the missing
-  current-user-principal and home-set errors are `ParseFailed` where
-  `MissingField` is more precise; the untrusted-origin check at the end of the
-  redirect walk looks unreachable.
+- **Recovery-class moves.** imap: SELECT without UIDVALIDITY at the PIM and
+  search sites, `Request(Malformed)` to `Protocol(MissingField)`; hydrating an
+  expunged UID, `Request(Malformed)` to `NotFound(Message)`. graph
+  Autodiscover in-body codes from `Request(Malformed)` to `NotFound`,
+  `RateLimited`, `Unavailable`, `ProviderRefused`, `MissingField`,
+  `ContractViolation` and `Internal(LimitExceeded)` by code. google:
+  `account_domain` to `ParseFailed`, `start_history_id` to
+  `Internal(InvariantViolated)`, `historyId` parse to `ParseFailed`,
+  `missing_field` gains `Acknowledged`. caldav: `NoSpliceableVevent` and
+  `MissingSourceBody` from `Unsupported` to `Internal(InvariantViolated)`.
+  jmap: a dead-sink send from `Protocol(PartialResponse)` to
+  `Transport(Network)`, with an idempotency override.
+- **New behaviour.** graph Autodiscover follows POX redirects, and a POX
+  `Error` fails delegate discovery where it used to read as no delegates. EWS
+  strict parsing turns an unknown entity into `MalformedXml`. A 3xx on a
+  OneDrive or Drive chunk PUT is a non-retryable `ContractViolation`. jmap
+  refuses a relative `apiUrl`. jmap `unsubscribe` on a dead sink returns `Ok`.
+  google coordinates the Gmail watch across instances through a process-wide
+  static keyed by the lowercased address; an alias or differently-cased
+  address gets no coordination.
+- **Published surface, additive but visible.** imap `CopyResult` and
+  `MoveResult` gain `copy_uid`, and on the UID MOVE fallback `MoveResult::code`
+  is now the UID EXPUNGE's tagged code, falling back to the COPY's. bifrost-net
+  gains `RequestBuilder::follow_redirects`. dav-core's public
+  `send_raw_request` debug-asserts where it used to return an error for an
+  untrusted final origin.
+
+## Found 2026-09-30, not fixed
+
+Found while recovering and auditing the laterals work; none is ruled. Verify
+against the code before working any of them.
+
+- **google: `endTimeUnspecified` is not modelled**, so Google's placeholder end
+  is projected as real.
+- **sync: the reopen attempt budget scales with subscription count.** A dead
+  old side marks only the first failing record per aborted attempt, so N
+  desired records whose teardown fails need N+1 attempts; with
+  `REOPEN_RETRY_BUDGET` at three, three such records pause the account, and
+  each aborted attempt creates and unwinds subscriptions on the replacement.
+  Records whose old teardown already succeeded before an abort are torn down
+  again on the next attempt, which a provider that errors on an unknown handle
+  would turn into another abort.
+- **graph: `push_subscribe` is not cancellation-safe.** A future dropped
+  mid-create leaves earlier creates live on the server, one dropped inside
+  `roll_back_created` skips the remaining DELETEs, one dropped between the
+  group insert and the return registers a group whose handle nobody received,
+  and a create that failed after Graph made it is not rolled back.
+- **graph: `restarted_series` does not validate the moved start.** A patch
+  moving `start` on a recurring event to a non-date value writes an empty
+  `startDate`; `patch_recurrence` validates through `from_event_time`, this
+  path does not.
+- **caldav: a patch always splices into the first VEVENT**, so a body whose
+  first VEVENT is an override, or a target that is itself an override, is
+  patched in the wrong place. Pre-existing. `splice_lines` also pairs
+  caldata's `LineReader` numbers with `str::lines` by index, unverified for a
+  bare CR line break.
+- **imap: pipelined and single-command literal waits disagree.** An early
+  tagged OK before a literal continuation is a non-fatal `ProtocolMissing`
+  outside a pipeline and a fatal `Protocol` inside one; nothing says whether
+  that is intended. No test covers the new own-tag and foreign-tag arms of
+  `wait_for_continuation`.
 
 ## Blocked on an unvalidated consumer contract
 

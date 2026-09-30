@@ -407,17 +407,17 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
     Ok(())
 }
 
-/// Whether a `ResponseCode` on an error-classed message names a fault this
-/// scan can map onto the shared taxonomy. An absent code says nothing, and
-/// `NoError` contradicts the `ResponseClass="Error"` it arrived with; both
-/// are failures the crate refuses to read as success, but neither can be
-/// classified, so a later message carrying a real code outranks them.
 fn scan_failed(reason: String) -> super::EwsError {
     super::EwsError::MalformedXml(bifrost_types::DiagnosticText::support_only(format!(
         "EWS response error scan failed: {reason}"
     )))
 }
 
+/// Whether a `ResponseCode` on an error-classed message names a fault this
+/// scan can map onto the shared taxonomy. An absent code says nothing, and
+/// `NoError` contradicts the `ResponseClass="Error"` it arrived with; both
+/// are failures the crate refuses to read as success, but neither can be
+/// classified, so a later message carrying a real code outranks them.
 fn is_classifiable(response_code: &str) -> bool {
     !response_code.is_empty() && response_code != "NoError"
 }

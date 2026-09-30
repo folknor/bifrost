@@ -62,8 +62,10 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   `PushEndpoint`, `GraphSubscriptionGroup`, `EwsSubscriptionState` /
   `EwsSubscriptionScope`); everything else is `pub(super)` inside `push`.
   - `push/dispatch.rs` - the two `Account` doors: the empty-scope refusal, the
-    per-scope poll-only split, the `PushMode` dispatch, and the positional
-    three-lane outcome ledger (`push_item_ids` / `finalize_push_outcomes`).
+    per-scope poll-only split, the `PushMode` dispatch (`subscribe_eligible`),
+    and the positional three-lane outcome ledger (`push_item_ids` /
+    `finalize_push_outcomes`). The dispatcher builds the ledger; each arm
+    closes it itself, before it registers anything.
   - `push/common.rs` - what both arms share: `PushEndpoint`, the two
     `Unsupported(PushSubscribe)` refusals (whole-request and scope-correlated),
     and `new_handle`.
@@ -117,9 +119,11 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   watermark + throttled deletion-scan poll, inventory/changes streams,
   `EwsItem` -> entry/change projectors, hierarchy discovery driver.
 - `autodiscover.rs` - Exchange Autodiscover: `GetUserSettings`
-  (public-folder routing, content-mailbox SMTP) and the
-  `alternativeMailboxes` delegate parser, wired into `open` via
-  `with_delegate_discovery()`, over `AccountNet`.
+  (public-folder routing, content-mailbox SMTP) and the POX
+  `alternativeMailboxes` delegate lookup, wired into `open` via
+  `with_delegate_discovery()`, over `AccountNet`. Both lookups follow in-body
+  redirects under one rule set (see the Autodiscover paragraphs under "Which
+  URLs may carry the bearer").
 
 `crates/graph/src/ews/`: `client.rs`
 (`EwsClient::execute(body, &EwsHeaders)`), `ops.rs` (`find_folder` /
@@ -167,17 +171,32 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   `open_raw_rfc822` (whole message via `/messages/{id}/$value`).
 - `cloud.rs` - `host_attachment`: OneDrive resumable upload + `createLink` in one
   call. Session/link POSTs go through `GraphClient::post` (conflict `rename`); the
-  pre-authed chunk PUT goes through `execute_aux` with `AuxTarget::Anonymous`
-  (no bearer) and resumes on `202 Accepted`. The session's `uploadUrl` is
-  admitted at receipt by `admit_upload_url`, before any PUT: an absolute
-  `https` URL on any host without userinfo, or plain `http` only on the
-  configured Graph origin (which already holds the account bearer); anything
-  else is `GraphError::ContractViolation` -> `Protocol(ContractViolation)`,
+  pre-authed chunk PUTs and the session cancel go through `execute_aux` with
+  `AuxTarget::Anonymous` (no bearer, redirects disabled per request) and the
+  upload resumes on `202 Accepted`. The session's `uploadUrl` is admitted at
+  receipt, before any PUT, by the rule that lives in `origin.rs` as
+  `Base::admit_upload` (reusing the shared `validate` shape rule), yielding an
+  `UploadUrl` that is the only thing the anonymous send path accepts. The rule:
+  an absolute `https` URL on any host without userinfo, or plain `http` only on
+  the configured Graph origin (which already holds the account bearer). This
+  module's `admit_upload_url` only classifies a refusal: anything else is
+  `GraphError::ContractViolation` -> `Protocol(ContractViolation)`,
   and the refusal never quotes the URL, since the URL is itself the session
   credential. Same-origin admission cannot apply (session URLs live on
   SharePoint and OneDrive hosts, never the Graph host) and there is no host
   allowlist: Microsoft documents `uploadUrl` as opaque, and the hosts vary by
-  tenant, product and national cloud. A 202 must carry a valid resume offset
+  tenant, product and national cloud. Redirects are disabled because the
+  transport's redirect walk cannot apply the upload rule to a hop, so following
+  one would send the chunk, and a URL that is itself a credential, somewhere
+  never admitted; Graph's upload flow does not redirect, so a 3xx on a chunk
+  PUT is `Protocol(ContractViolation)` naming the status and never the
+  `Location`. A failed upload deletes its session on its own bounded budget
+  (`SESSION_CANCEL_TIMEOUT`), separate from the upload budget because the upload
+  may have failed exactly because that budget ran out: one anonymous `DELETE`
+  on the admitted URL, never replacing the upload's own error, skipped once the
+  account has shut down and abandoned if shutdown fires mid-cancel, and not
+  spawned, so a caller who drops the hosting future gets no cancel and the
+  session expires on OneDrive's clock. A 202 must carry a valid resume offset
   (`admitted_resume_offset`): an unparseable body, a missing
   `nextExpectedRanges`, or a first entry that is not a byte range is
   `GraphError::Json` -> `Protocol(ParseFailed)`; an empty range list, an
@@ -287,8 +306,8 @@ Graph REST JSON calls. Both now share the REST dispatcher:
   old Graph-local queue handed back chunks regardless of range, so a ranged
   test could record a `ByteRange` the account never actually put on the wire.
   The scripted header is now checked against the real request.
-- `GraphClient::execute_aux` - the pre-authenticated OneDrive chunk PUT and
-  the Autodiscover POST. Deliberately NOT folded into `execute_wire`: that
+- `GraphClient::execute_aux` - the pre-authenticated OneDrive chunk PUTs and
+  session cancel `DELETE`, and the Autodiscover POST. Deliberately NOT folded into `execute_wire`: that
   funnel always sends a bearer and takes the client's concurrency permit,
   and a chunked upload holding a Graph permit per chunk would be different
   production behavior from the one this path has always had. The recorded
@@ -313,10 +332,41 @@ review-only rounds and immediately caught four defects, and the marginal gain
 
 Calendar/contact primitives live in `calendar.rs` and `contacts.rs`. Graph
 calendar `color` is a provider token (not projected); reads request `Prefer:
-outlook.timezone="UTC"`. Recurrence maps common daily/weekly/monthly/yearly
-patterns to RRULE and back; unsupported outbound parts reject serialization,
-unsupported inbound shapes are omitted, and `relativeMonthly`/`relativeYearly`
-lacking BYMONTHDAY+BYDAY reject locally. Outbound times map a conservative IANA
+outlook.timezone="UTC"`. Inbound, Graph's daily/weekly/monthly/yearly
+patterns map to an RRULE and an unrecognised inbound pattern shape is omitted;
+a weekly pattern with an interval above one also carries `WKST` from
+`firstDayOfWeek` (Graph's default Sunday when absent, RFC 5545's Monday
+implied when it is Monday). Outbound recurrence is REFUSED, never degraded,
+on both create and patch, because a dropped rule writes a one-off and a
+dropped part writes a different series than the one asked for. An RRULE that
+is valid RFC 5545 but that Graph's `patternedRecurrence` (or this mapping)
+cannot express is `Unsupported`: sub-daily frequencies, a `BYMONTHDAY` counted
+from the month end, several ordinal `BYDAY` values, a `BYSETPOS` outside 1 to 4
+or -1, a part Graph would ignore for the chosen pattern type (`BYDAY` on an
+absolute pattern, `BYMONTH` on anything but yearly, `BYSETPOS` on an absolute
+pattern), and the RRULE parts with no Graph field at all. A value that is not
+an RRULE at all (no `FREQ`, an unknown frequency, an unknown, repeated or
+`NAME=VALUE`-less part, both `COUNT` and `UNTIL`, a non-weekday `WKST`) is `Request(Malformed)` naming `recurrence.rrule`; a start
+that does not begin with a date is `Request(Malformed)` naming `start`.
+`RDATE` and `EXDATE` are refused `Unsupported`: Graph has no carrier for extra
+occurrences, and an excluded occurrence exists only as a deletion after the
+series is written, which one create or patch cannot do. Equivalent shapes are
+rewritten rather than refused: `DAILY` with `BYDAY` at interval 1, and every
+such weekday of each month or year, become weekly patterns; a lone ordinal
+weekday (`2MO`, `-1FR`) becomes a relative pattern's index; values RFC 5545
+takes from `DTSTART` (the weekday, the day of month, the month) come from the
+event start; a UTC `UNTIL` becomes the local end date in the event's zone
+(kept on its UTC date when the zone cannot be resolved); and `WKST` is carried
+as `firstDayOfWeek` on weekly patterns. The range `startDate` is the series'
+local start date. A recurrence patch with no `start` anchors on the series' own
+range start, read from the event fetched for the update; on an event that does
+not recur yet it is `Unsupported`, since its UTC-normalised start can sit on a
+different day than the local one Graph wants and an empty `startDate` is never
+sent. A patch that moves `start` on a recurring event without restating the
+recurrence re-sends the event's own recurrence with the range start moved along.
+A patch recurrence carrying no rule and no dates clears the series
+(`"recurrence": null`). An empty attendee list in a patch is sent as `[]` and
+clears the attendees, where omitting it had left them in place. Outbound times map a conservative IANA
 -> Windows table, refused pre-payload by what the refusal is about: a
 slash-shaped (IANA) id missing from the table may be a real zone this crate
 has no Windows name for, so it is `Unsupported`; a slash-free multi-word
@@ -436,9 +486,11 @@ The bearer-carrying send paths accept nothing else: `execute_wire`,
 `download_stream`, `EwsClient` (which holds its admitted endpoint or the
 reason there is none), and `execute_aux`, whose `AuxTarget::Bearer` takes an
 `AdmittedUrl` while `AuxTarget::Anonymous` (the pre-authenticated OneDrive
-chunk PUT) takes a string and never carries the bearer; its one caller hands
-it only a session URL `admit_upload_url` has already admitted under the
-upload rule (see `cloud.rs` above). Server links
+chunk PUTs and session cancel) takes an `UploadUrl` and never carries the
+bearer. Only `Base::admit_upload` builds an `UploadUrl`, so no string reaches
+the anonymous path unadmitted; its `Debug` names the origin and path only,
+since the query holds the session's pre-authentication (see `cloud.rs` above
+for the rule). Server links
 deserialize as `ProviderLink`, which has no accessor yielding a requestable
 string, so a link cannot be followed, minted into a caller cursor, or
 persisted into a checkpoint without admission. Each provenance is admitted
@@ -473,7 +525,44 @@ onto the Outlook origin. A cross-origin `RedirectUrl` is
 and a hybrid endpoint on another origin needs trust this client does not
 establish. A self-contradicting answer (a code without a target, a target
 without a redirect code, a URL named as a mailbox, an endpoint that is not an
-http URL) is the provider's malformed response.
+http URL, or in POX an `Action` the protocol does not define) is the
+provider's contract violation, `Protocol(ContractViolation)`: the document
+parsed in full, so it is not a parse failure. A document that is malformed,
+truncated or not an Autodiscover answer stays `Protocol(ParseFailed)`.
+
+The POX (`autodiscover.xml`) delegate lookup follows the same rules as the SOAP
+one. `<Action>redirectAddr</Action>` (a new mailbox against the same endpoint)
+and `redirectUrl` (the same mailbox at an endpoint that must admit onto the
+Outlook origin) are followed rather than read as "no delegates", which is what
+a hybrid tenant needs to find its delegates at all. A `RedirectWalk` records
+every (mailbox, endpoint) pair a lookup has asked, shared by the SOAP and POX
+paths, so a redirect back to a pair already asked is caught before the repeat is
+sent and is the provider's loop: `Protocol(ContractViolation)`. A chain of
+DISTINCT hops longer than `MAX_REDIRECTS` is this crate's own safety cap,
+`Internal(LimitExceeded)`, not the caller's input (it used to be
+`Request(Malformed)`) and not proof of a provider fault, since a long chain may
+be a legitimate deployment.
+
+Failures Autodiscover reports inside an HTTP 200 are classified by what the code
+says, never as the caller's input, since the lookup's only inputs are the
+account's own address and the settings this crate names
+(`graph_error::autodiscover_error_code_to_account_error`). `ServerBusy` is
+`Server(RateLimited)` at tenant throttle scope; `InternalServerError` is
+`Server(Unavailable)`; `InvalidUser` is `NotFound(Mailbox)`; `InvalidRequest` /
+`InvalidSetting` are `Request(Malformed)`, the answer an HTTP 400 would get; and
+`SettingIsNotAvailable`, `InvalidDomain`, `NotFederated` and any code this build
+does not know are the provider declining to answer, `Server(Error)` with no
+status, so `ProviderRefused`. All carry `Acknowledged` evidence and the verbatim
+code as the native code. A setting that is simply absent with no per-setting
+error to explain it is `Protocol(MissingField)`. POX numeric codes
+(`autodiscover_pox_error_to_account_error`) map only the two whose meaning is
+well established, `500` as `InvalidUser` and `600` as `InvalidRequest`; every
+other code, and an `<Error>` with no code, is `ProviderRefused`, because
+guessing a transient meaning for an unpinned numeric code would retry something
+that may be permanent. A POX `<Error>` fails the delegate lookup with that
+classification. Text runs that do not unescape are a malformed answer rather
+than silently dropped, since dropping one would splice its neighbours into a
+different address.
 
 `AccountFactory::open(account_id)` attaches the `GraphClient` to `bifrost-net`
 under the engine `AccountId`, validates the token with a `users/me` profile
@@ -594,8 +683,8 @@ mailboxes always install.
 hands back an account view whose primary client AND every shared-mailbox client
 report into one fresh accumulator - a foreign-mailbox request belongs to the
 batch that made it. The record sits at both wire funnels (`execute_wire` and
-`execute_aux`), so the pre-authenticated chunk PUT and the Autodiscover POST are
-counted too. Each engine stream takes one accumulator and each emitted batch
+`execute_aux`), so the pre-authenticated chunk PUTs, the session cancel and the
+Autodiscover POST are counted too. Each engine stream takes one accumulator and each emitted batch
 `take`s it.
 
 `metered()` is a `self.clone()` with two client fields swapped, so it produces
@@ -895,7 +984,9 @@ not a provider contract violation. The push door's ledger
 (`push/dispatch.rs finalize_push_outcomes`) classifies the same way for the
 same reason: every arm files each positional id exactly once from its own
 scope list, and server answers are looked up by key, never iterated into the
-ledger.
+ledger. Each push arm calls `finalize_push_outcomes` itself, before it inserts a
+handle or starts a worker (see the push section), so a `finalize` failure is
+raised while nothing is live.
 
 The `hydrated_from_value` projector maps `FlagsOnly`
 -> canonical flag `HashSet`; `Metadata`/body-bearing -> `metadata_or_flags`.
@@ -1037,8 +1128,13 @@ appended). An HTTP 200 whose body is malformed or truncated XML, or not an
 (`GraphError::Json` -> `Protocol(ParseFailed)`), never an empty or partial
 mailbox list; both Autodiscover parsers (`parse_alternative_mailboxes`,
 `parse_user_settings_response`) require one complete document with the
-expected root. Discovery at `open` stays best-effort and non-fatal: that
-failure, or a request failure, degrades to the config-supplied mailboxes
+expected root. The same holds for an in-body POX `<Error>`: it fails
+`discover_shared_mailboxes`, classified by its code, instead of reading as a
+user with no delegates, and POX `redirectAddr` / `redirectUrl` answers are
+followed under the same loop detection and hop cap as the SOAP lookups (see the
+Autodiscover paragraphs under "Which URLs may carry the bearer"). Discovery at
+`open` stays best-effort and non-fatal: that failure, or a request failure,
+degrades to the config-supplied mailboxes
 rather than failing `open`, and the skipped pass is recorded on
 `OpenedAccount::skipped_scopes` with its classified error so the
 degradation is reportable, not just logged. The EWS twin `ews_shared_scope_error` applies the same
@@ -1124,7 +1220,19 @@ boundary). It then groups by Graph
 subscription resource, files any scope with no subscribable resource into the
 failed lane, creates one server
 subscription per resource, and best-effort deletes any already-created
-subscriptions if a later create fails. The `SubscriptionHandle` is minted
+subscriptions if a later create fails or the outcome ledger cannot be closed
+(`roll_back_created`). Closing the ledger (`finalize_push_outcomes`) is the
+webhook arm's own step, taken after the last create and BEFORE the group is
+registered or the renewal worker started. It used to run in the dispatcher
+after the arm returned, so a `finalize` failure returned `Err` - no handle -
+over subscriptions the worker kept renewing and no caller could name to
+unsubscribe. Now that failure path has registered nothing and only rolls back
+the server-side creates; a DELETE that fails there is logged and left to
+Graph's own expiry, since no group holds the row. The EWS arm closes its ledger
+the same way before it installs scopes, bumps the topology or spawns the
+worker; it creates nothing server-side beforehand, so there is nothing to undo.
+The arm answers with `(Option<handle>, outcomes)` and the dispatcher only turns
+a handle-less answer into the whole-request `Err`. The `SubscriptionHandle` is minted
 BEFORE the first create: `new_handle` is fallible (a failed host entropy
 source is `Internal(RuntimeFailure)`, never retried), and a failure there has
 written nothing. Minted afterwards, the same failure would return an error
@@ -1786,7 +1894,11 @@ else: the rejection is always raised about a specific message, cursor scope,
 or subscription resource, and dropping `ctx.scope` left an operator a bare
 `request.malformed` with nothing to act on.
 A provider body that does not parse is `GraphError::Json` ->
-`Protocol(ParseFailed)`; a complete answer that parsed but is semantically
+`Protocol(ParseFailed)`. The variant is not JSON-only: Graph REST JSON, the
+Autodiscover XML answers and the OneDrive upload-session 202 and drive-item
+bodies all raise it, so its diagnostic label says only "provider response did
+not parse" and each producer's message names its own source and format (the
+REST funnel prefixes "Graph REST JSON body"). A complete answer that parsed but is semantically
 impossible (a repeated page link, an impossible upload offset, a refused
 upload URL) is `GraphError::ContractViolation` ->
 `Protocol(ContractViolation)`, both with `Acknowledged` evidence. The
@@ -1817,6 +1929,23 @@ Unclassifiable means either NO `ResponseCode` or the self-contradictory
 CLASSIFIABLE error later in the same body outranks the malformed report,
 since its code carries the real classification (`ErrorAccessDenied`
 quarantines just that scope).
+
+Every EWS reader is STRICT about references and attributes. Text runs, entity
+and character references, and attribute values all go through the shared
+`xml_helpers` functions (`try_push_general_ref`, the strict text and attribute
+readers), and one that does not resolve - an unknown entity such as `&bogus;`,
+an invalid character reference, an attribute list that does not parse - is
+`MalformedXml` (`Protocol(ParseFailed)`), never dropped. Dropping spliced the
+text on either side into a value the server never sent: a `ResponseCode` of
+`Error&bogus;AccessDenied` read as `ErrorAccessDenied` and quarantined a scope
+on a code that was never sent, and a success body carrying a bad reference
+passed the scan. The two whole-response scans apply it to fault text,
+`ResponseCode` and `MessageText`, and unescape `ResponseClass` before comparing
+it, so `&#69;rror` still reads as an error class. The per-operation parsers and
+the streaming parsers in `ews_stream.rs` (subscribe and notification, whose
+item, folder and subscription ids are unescaped rather than returned raw) do
+the same, and there is no lenient variant left: `ews_stream.rs` uses the shared
+`xml_escape` rather than a private copy.
 
 That scan is whole-RESPONSE: it produces one verdict for the body, exactly
 as the operation parsers produce one result. EWS, however, answers per entry
