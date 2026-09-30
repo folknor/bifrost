@@ -350,11 +350,13 @@ an RRULE at all (no `FREQ`, an unknown frequency, an unknown, repeated or
 that does not begin with a date is `Request(Malformed)` naming `start`.
 `RDATE` and `EXDATE` are refused `Unsupported`: Graph has no carrier for extra
 occurrences, and an excluded occurrence exists only as a deletion after the
-series is written, which one create or patch cannot do. An absolute day some
-recurring month lacks (the 29th to 31st of every month, February 29th every
-year, whether explicit or taken from the start) is `Unsupported`: RFC 5545
-skips a date the month does not have, while Graph moves the occurrence to the
-month's last day, so writing it would add occurrences. Equivalent shapes are
+series is written, which one create or patch cannot do. An absolute series
+that reaches a month lacking its day (the 31st every month from January,
+February 29th every year), whether the day is explicit or taken from the
+start, is `Unsupported`: RFC 5545 skips a date the month does not have, while
+Graph moves the occurrence to the month's last day, so writing it would add
+occurrences. Only the months the series actually visits within its `COUNT` or
+`UNTIL` count, so the 31st every sixth month from July is written as is. Equivalent shapes are
 rewritten rather than refused: `DAILY` with `BYDAY` at interval 1, and every
 such weekday of each month or year, become weekly patterns; a lone ordinal
 weekday (`2MO`, `-1FR`) becomes a relative pattern's index; values RFC 5545

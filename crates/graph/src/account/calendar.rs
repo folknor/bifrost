@@ -1305,30 +1305,69 @@ fn graph_weekday(date: civil::Date) -> &'static str {
     GRAPH_WEEKDAYS[usize::from(date.weekday().to_sunday_zero_offset().unsigned_abs())]
 }
 
-/// Refuse an absolute day some recurring month lacks.
+/// How far an open-ended absolute series is walked. Which months a series
+/// visits repeats within a year of steps, and whether February has a 29th
+/// within four years, so eight years of candidates cover every case short of
+/// the Gregorian century rule.
+const ABSOLUTE_SERIES_HORIZON_MONTHS: i64 = 8 * 12;
+
+/// Refuse an absolute series that visits a month lacking its day.
 ///
 /// RFC 5545 skips a recurrence date that does not exist (the 31st of a
 /// 30-day month, February 29th outside a leap year). Graph's absolute
 /// patterns do not skip: Exchange moves the occurrence to the month's last
-/// day. So a series on the 29th, 30th or 31st of every month, or on February
-/// 29th every year, would be written with occurrences the rule never asked
-/// for, and it is refused. A day beyond what the month can ever hold yields no
-/// occurrences under RFC 5545 at all and is refused the same way.
-fn check_absolute_day(month: Option<u32>, day: u32) -> Result<(), RecurrenceRefusal> {
-    let always_present = match month {
-        None => day <= 28,
-        Some(2) => day <= 28,
-        Some(4 | 6 | 9 | 11) => day <= 30,
-        Some(_) => day <= 31,
-    };
-    if always_present {
-        Ok(())
-    } else {
-        Err(unexpressible(format!(
-            "Graph recurrence cannot express day {day} of a month that does not always have it: \
-             Graph moves such an occurrence to the month's last day where RFC 5545 skips it"
-        )))
+/// day. Writing such a series would add occurrences the rule never asked for,
+/// so it is refused. Only the months the series actually visits count: the
+/// 31st every sixth month from July lands on July and January only and is
+/// written as is. The walk runs from the start's month in `step_months`
+/// steps; a candidate before the start is not an occurrence, `COUNT` counts
+/// only real occurrences, and `UNTIL` or the horizon ends an open series.
+fn check_absolute_series(
+    start: civil::Date,
+    first_month: u32,
+    step_months: u32,
+    day: u32,
+    count: Option<u32>,
+    until: Option<civil::Date>,
+) -> Result<(), RecurrenceRefusal> {
+    let first = i64::from(start.year()) * 12 + i64::from(first_month) - 1;
+    let step = i64::from(step_months.max(1));
+    let mut occurrences = 0u32;
+    let mut offset = 0i64;
+    while offset <= ABSOLUTE_SERIES_HORIZON_MONTHS && count.is_none_or(|n| occurrences < n) {
+        let index = first + offset;
+        offset += step;
+        let (Ok(year), Ok(month)) = (i16::try_from(index / 12), i8::try_from(index % 12 + 1))
+        else {
+            break;
+        };
+        let Ok(first_of_month) = civil::Date::new(year, month, 1) else {
+            break;
+        };
+        if until.is_some_and(|until| first_of_month > until) {
+            break;
+        }
+        let candidate = i8::try_from(day)
+            .ok()
+            .and_then(|day| civil::Date::new(year, month, day).ok());
+        match candidate {
+            // Graph puts this occurrence on the month's last day; past UNTIL
+            // it would not be written at all, and the series is over.
+            None if until.is_some_and(|until| first_of_month.last_of_month() > until) => break,
+            // A date the month does not have always falls after a start in
+            // that month, so it is a skipped occurrence, never a pre-start one.
+            None => {
+                return Err(unexpressible(format!(
+                    "Graph recurrence cannot express day {day} in a series that reaches \
+                     {year}-{month:02}, which lacks it: Graph moves such an occurrence to the \
+                     month's last day where RFC 5545 skips it"
+                )));
+            }
+            Some(date) if date < start || until.is_some_and(|until| date > until) => {}
+            Some(_) => occurrences += 1,
+        }
     }
+    Ok(())
 }
 
 impl GraphRecurrenceRule {
@@ -1347,6 +1386,17 @@ impl GraphRecurrenceRule {
             first_day_of_week: None,
             index: None,
         };
+        let until = self.until.map(|until| match until {
+            RRuleUntil::Local(date) => date,
+            RRuleUntil::Utc(at) => anchor
+                .zone
+                .as_ref()
+                .and_then(|zone| {
+                    let instant = Offset::UTC.to_timestamp(at).ok()?;
+                    Some(zone.to_datetime(instant).date())
+                })
+                .unwrap_or_else(|| at.date()),
+        });
         let kind = match self.shape {
             PatternShape::Daily => "daily",
             PatternShape::Weekly(days) => {
@@ -1356,7 +1406,7 @@ impl GraphRecurrenceRule {
             }
             PatternShape::AbsoluteMonthly(day) => {
                 let day = day.unwrap_or(start_day);
-                check_absolute_day(None, day)?;
+                check_absolute_series(start, start_month, self.interval, day, self.count, until)?;
                 pattern.day_of_month = Some(day);
                 "absoluteMonthly"
             }
@@ -1368,7 +1418,14 @@ impl GraphRecurrenceRule {
             PatternShape::AbsoluteYearly { month, day } => {
                 let month = month.unwrap_or(start_month);
                 let day = day.unwrap_or(start_day);
-                check_absolute_day(Some(month), day)?;
+                check_absolute_series(
+                    start,
+                    month,
+                    self.interval.saturating_mul(12),
+                    day,
+                    self.count,
+                    until,
+                )?;
                 pattern.month = Some(month);
                 pattern.day_of_month = Some(day);
                 "absoluteYearly"
@@ -1381,17 +1438,6 @@ impl GraphRecurrenceRule {
             }
         };
         pattern.kind = Some(kind.to_string());
-        let until = self.until.map(|until| match until {
-            RRuleUntil::Local(date) => date,
-            RRuleUntil::Utc(at) => anchor
-                .zone
-                .as_ref()
-                .and_then(|zone| {
-                    let instant = Offset::UTC.to_timestamp(at).ok()?;
-                    Some(zone.to_datetime(instant).date())
-                })
-                .unwrap_or_else(|| at.date()),
-        });
         let range_kind = if self.count.is_some() {
             "numbered"
         } else if until.is_some() {
@@ -3108,6 +3154,13 @@ mod tests {
             ("FREQ=YEARLY", "2028-02-29"),
             ("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29", "2026-01-01"),
             ("FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=31", "2026-01-01"),
+            // Every sixth month from August reaches February.
+            ("FREQ=MONTHLY;INTERVAL=6", "2026-08-31"),
+            // A leap-year start still reaches a February without a 29th.
+            ("FREQ=MONTHLY", "2028-01-29"),
+            ("FREQ=MONTHLY;BYMONTHDAY=30", "2026-02-10"),
+            // Graph would write February 28th, inside UNTIL; RFC 5545 skips it.
+            ("FREQ=MONTHLY;UNTIL=20260228", "2026-01-31"),
         ];
         for (rrule, start) in refused {
             assert!(
@@ -3123,6 +3176,17 @@ mod tests {
             ("FREQ=MONTHLY;BYMONTHDAY=28", "2026-01-01"),
             ("FREQ=YEARLY", "2026-01-31"),
             ("FREQ=YEARLY;BYMONTH=4;BYMONTHDAY=30", "2026-01-01"),
+            // Only the months the series visits count: July and January.
+            ("FREQ=MONTHLY;INTERVAL=6;COUNT=3", "2026-07-31"),
+            ("FREQ=MONTHLY;INTERVAL=12", "2026-01-31"),
+            // The series ends before it reaches a short month.
+            ("FREQ=MONTHLY;COUNT=1", "2026-01-31"),
+            // Graph would put February's occurrence on the 28th, past UNTIL.
+            ("FREQ=MONTHLY;UNTIL=20260227", "2026-01-31"),
+            // Every fourth February from a leap year is always a leap one.
+            ("FREQ=YEARLY;INTERVAL=4", "2028-02-29"),
+            // A day before the start in the start's month is not an occurrence.
+            ("FREQ=MONTHLY;BYMONTHDAY=15;COUNT=1", "2026-01-20"),
         ];
         for (rrule, start) in accepted {
             assert!(
