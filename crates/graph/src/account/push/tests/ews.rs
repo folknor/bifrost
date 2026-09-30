@@ -534,3 +534,55 @@ async fn a_received_ews_subscribe_keeps_its_registration() {
         worker.abort();
     }
 }
+
+/// A closed account is refused before the translation request, as the webhook
+/// arm refuses before its first POST: nothing is registered and no worker is
+/// spawned to exit at once.
+///
+/// Fails if the early `shutdown.is_cancelled()` check in `subscribe_ews` is
+/// removed (the empty script then panics on the translation POST).
+#[tokio::test]
+async fn subscribing_ews_on_a_closed_account_registers_nothing() {
+    let client = GraphClient::new("token");
+    client.script_rest([]);
+    let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
+    account.shutdown.cancel();
+
+    let error = spawn_subscribe_ews(&account)
+        .await
+        .expect("not aborted")
+        .expect_err("a closed account refuses");
+
+    assert!(matches!(error.kind(), AccountErrorKind::Internal(_)));
+    assert_eq!(client.wire_attempts(), 0);
+    assert_eq!(registration_count(&account), Some(0));
+    assert!(account.ews_worker.lock().await.is_none());
+}
+
+/// `close()` began while the translation was in flight: the registration step
+/// refuses instead of installing state no worker will stream.
+///
+/// Fails if the `shutdown.is_cancelled()` check under the write lock in
+/// `subscribe_ews` is removed.
+#[tokio::test]
+async fn an_ews_subscribe_racing_close_does_not_register() {
+    let client = GraphClient::new("token");
+    client.script_rest([translate_ok()]);
+    let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
+
+    let registration_blocked = account.ews_subscriptions.write().await;
+    let caller = spawn_subscribe_ews(&account);
+    assert!(
+        settle(|| client.wire_attempts() == 1).await,
+        "translation done, parked on the registration lock"
+    );
+    account.shutdown.cancel();
+    drop(registration_blocked);
+
+    caller
+        .await
+        .expect("not aborted")
+        .expect_err("a closing account hands out no handle");
+    assert_eq!(registration_count(&account), Some(0));
+    assert!(account.ews_worker.lock().await.is_none());
+}

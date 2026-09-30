@@ -146,6 +146,11 @@ pub(crate) async fn create(
 ) -> Result<EventId, AccountError> {
     reject_create_organizer(&event)?;
     reject_unwritable_status(event.status, AccountOperation::EventCreate)?;
+    reject_unusable_write_times(
+        AccountOperation::EventCreate,
+        Some(&event.start),
+        Some(&event.end),
+    )?;
     validate_event_create_timezones(&event)?;
     let calendar_id = event.calendar_id.0.clone();
     let prefix = account.client.api_path_prefix();
@@ -189,6 +194,45 @@ fn reject_unwritable_status(
     ))
 }
 
+fn is_blank_time(time: &EventTime) -> bool {
+    time.value.trim().is_empty()
+}
+
+/// Write-side guard for event times, run before any request.
+///
+/// The read projection yields an empty `EventTime` for "Graph did not say"
+/// (a delta tombstone with no `start` / `end`, or a `dateTime` that is null),
+/// and a consumer doing read-modify-write echoes it back. Written as is it
+/// reaches the wire as `dateTime: ""` under a defaulted UTC zone, which Graph
+/// refuses or, worse, reads as an unintended value. So:
+///
+/// - an empty `start` is `Request(Malformed)` on create and patch: there is
+///   no start to write and none this client may invent;
+/// - an empty `end` on a create is `Unsupported`: the caller must supply the
+///   end it wants, and no default is invented here;
+/// - an empty `end` on a patch is NOT refused: `graph_event_from_patch` omits
+///   it, so an echoed event leaves the stored end alone.
+fn reject_unusable_write_times(
+    operation: AccountOperation,
+    start: Option<&EventTime>,
+    end: Option<&EventTime>,
+) -> Result<(), AccountError> {
+    if start.is_some_and(is_blank_time) {
+        return Err(graph_error::invalid_argument_account_error(
+            operation,
+            "start",
+            "Graph event `start` must not be empty",
+        ));
+    }
+    if operation == AccountOperation::EventCreate && end.is_some_and(is_blank_time) {
+        return Err(unsupported_error(
+            operation,
+            "Graph event create needs an explicit end; an empty end cannot be written".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_event_create_timezones(event: &EventCreate) -> Result<(), AccountError> {
     validate_graph_time_zone(
         event.start.timezone.as_deref(),
@@ -226,6 +270,7 @@ pub(crate) async fn update(
     patch: EventPatch,
 ) -> Result<(), AccountError> {
     let operation = AccountOperation::EventUpdate;
+    reject_unusable_write_times(operation, patch.start.as_ref(), patch.end.as_ref())?;
     validate_event_patch_timezones(&patch)?;
     if let Some(status) = patch.status {
         reject_unwritable_status(status, operation)?;
@@ -771,12 +816,17 @@ fn graph_event_from_patch(
     // `dateTime` (the all-day shape) while `isAllDay` stays unset, Graph
     // keeps a previously-timed event timed at midnight instead of
     // converting it to all-day.
+    // An empty `end` is the projection's "no end" (see
+    // `reject_unusable_write_times`): echoing it back leaves the stored end
+    // alone, so it is dropped here before it can drive the all-day inference
+    // or be sent as `dateTime: ""`.
+    let end = patch.end.as_ref().filter(|time| !is_blank_time(time));
     let effective_all_day = patch.is_all_day.unwrap_or_else(|| {
         patch
             .start
             .as_ref()
             .map(|time| is_all_day_value(&time.value))
-            .or_else(|| patch.end.as_ref().map(|time| is_all_day_value(&time.value)))
+            .or_else(|| end.map(|time| is_all_day_value(&time.value)))
             .unwrap_or(false)
     });
     // Only emit `isAllDay` when the patch actually touches a time field
@@ -784,7 +834,7 @@ fn graph_event_from_patch(
     // event's all-day state as a side effect.
     let is_all_day_out = patch
         .is_all_day
-        .or_else(|| (patch.start.is_some() || patch.end.is_some()).then_some(effective_all_day));
+        .or_else(|| (patch.start.is_some() || end.is_some()).then_some(effective_all_day));
     Ok(GraphEventPatch {
         subject: patch.title.clone().map(|value| match value {
             Some(value) => Value::String(value),
@@ -810,10 +860,7 @@ fn graph_event_from_patch(
             .start
             .as_ref()
             .map(|time| graph_time(time, effective_all_day)),
-        end: patch
-            .end
-            .as_ref()
-            .map(|time| graph_time(time, effective_all_day)),
+        end: end.map(|time| graph_time(time, effective_all_day)),
         is_all_day: is_all_day_out,
         show_as: patch
             .availability
@@ -3301,6 +3348,129 @@ mod tests {
         // RFC 5545's default week start, written explicitly because Graph's
         // own default is Sunday.
         assert_eq!(body["recurrence"]["pattern"]["firstDayOfWeek"], "monday");
+    }
+
+    fn timed(value: &str) -> EventTime {
+        EventTime {
+            value: value.to_string(),
+            timezone: Some("UTC".to_string()),
+        }
+    }
+
+    fn create_with_times(start: &str, end: &str) -> EventCreate {
+        let mut event = recurring_create("FREQ=DAILY");
+        event.recurrence = EventRecurrence::default();
+        event.start = timed(start);
+        event.end = timed(end);
+        event
+    }
+
+    /// An empty `start` has nothing to write: refused as the caller's
+    /// malformed input before any request. Fails if the start arm of
+    /// `reject_unusable_write_times` is removed from `create` (the empty
+    /// script would then panic on the POST).
+    #[tokio::test]
+    async fn create_with_an_empty_start_is_refused_before_any_request() {
+        let (account, script) = scripted_search_account_pages(Vec::new());
+
+        let error = create(account, create_with_times("", "2026-06-02T13:00:00"))
+            .await
+            .expect_err("an empty start is malformed");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(script.requests().is_empty());
+    }
+
+    /// Graph's create needs an explicit end and none is invented: an empty
+    /// end is `Unsupported` before any request. Fails if the end arm of
+    /// `reject_unusable_write_times` is removed.
+    #[tokio::test]
+    async fn create_with_an_empty_end_is_refused_before_any_request() {
+        let (account, script) = scripted_search_account_pages(Vec::new());
+
+        let error = create(account, create_with_times("2026-06-02T12:00:00", " "))
+            .await
+            .expect_err("an empty end cannot be created");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
+        ));
+        assert!(script.requests().is_empty());
+    }
+
+    /// The empty-start refusal runs before the fetch and before the
+    /// calendar-move refusal (which would otherwise answer `Unsupported`).
+    /// Fails if the guard is removed from `update` or moved after
+    /// `reject_calendar_move`.
+    #[tokio::test]
+    async fn update_with_an_empty_start_is_refused_before_anything_else() {
+        let (account, script) = scripted_search_account_pages(Vec::new());
+        let patch = EventPatch {
+            calendar_id: Some(CalendarId("elsewhere".to_string())),
+            start: Some(timed("")),
+            ..EventPatch::default()
+        };
+
+        let error = update(account, EventId("calendar::e1".to_string()), patch)
+            .await
+            .expect_err("an empty start is malformed");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(script.requests().is_empty());
+    }
+
+    /// A read-modify-write echo carries the projection's empty end. The start
+    /// goes out, the end is omitted so the stored one is untouched, and no
+    /// `dateTime: ""` reaches the wire. Fails if the blank-end filter in
+    /// `graph_event_from_patch` is removed.
+    #[tokio::test]
+    async fn update_echoing_an_empty_end_omits_it_and_keeps_the_start() {
+        let (account, script) =
+            scripted_search_account_pages(vec![json!({"id": "e1", "changeKey": "ck1"}), json!({})]);
+        let patch = EventPatch {
+            start: Some(timed("2026-06-02T12:00:00")),
+            end: Some(timed("")),
+            ..EventPatch::default()
+        };
+
+        update(account, EventId("calendar::e1".to_string()), patch)
+            .await
+            .expect("an echoed empty end is accepted");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        let body: Value =
+            serde_json::from_slice(requests[1].body.as_ref().expect("patch carries a body"))
+                .expect("patch body is json");
+        assert_eq!(body["start"]["dateTime"], "2026-06-02T12:00:00");
+        assert!(body.get("end").is_none());
+    }
+
+    /// An empty end alone is not a time change: it must neither be sent nor
+    /// drive the all-day inference. Fails if the blank-end filter is applied
+    /// to the payload but not to `effective_all_day` / `isAllDay`.
+    #[test]
+    fn an_empty_end_alone_touches_no_time_field() {
+        let patch = graph_event_from_patch(
+            &EventPatch {
+                title: Some(Some("Renamed".to_string())),
+                end: Some(timed("")),
+                ..EventPatch::default()
+            },
+            CurrentSeries::default(),
+        )
+        .expect("patch payload");
+        let value = serde_json::to_value(&patch).expect("patch json");
+
+        assert!(value.get("end").is_none());
+        assert!(value.get("isAllDay").is_none());
     }
 
     /// An empty attendee list is how a patch clears attendees; it was

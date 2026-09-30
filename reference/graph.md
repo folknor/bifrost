@@ -83,7 +83,11 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   - `push/ews.rs` - the EWS streaming arm: `ews_subscribable_folder_id`, the
     `restId` -> `ewsId` translation (`translation_input_chunks` /
     `reconcile_translated_ews_scopes`), and the `EwsSubscriptionState`
-    registration plus topology bump the worker reads.
+    registration plus topology bump the worker reads. Like the webhook arm it
+    refuses a closed account (`shutdown` cancelled, which only `close()` does)
+    before the translation request, and re-checks under the registration write
+    lock for a `close()` that began mid-translation; no worker is spawned for a
+    dead account.
   - `push/tests/` - the push suite, split along the same seams: `fixtures.rs`
     (the subscription-row, scope, translation-input and ledger builders more
     than one arm needs), `webhook.rs`, `renewal.rs`, `ews.rs`, and
@@ -381,7 +385,17 @@ slash-shaped (IANA) id missing from the table may be a real zone this crate
 has no Windows name for, so it is `Unsupported`; a slash-free multi-word
 value passes through as a Windows id, and anything else that is neither
 (`"foo"`, `""`) is `Request(Malformed)` naming its field (`start.timezone` /
-`end.timezone`). An `EventId` without
+`end.timezone`). The read projection
+yields an EMPTY `EventTime` for "Graph did not say" (a delta tombstone with no
+`start` / `end`, or a null `dateTime`), and a read-modify-write consumer echoes
+it back; unguarded it reached the wire as `dateTime: ""` under a defaulted UTC
+zone. `reject_unusable_write_times` runs first in `create` and `update` (before
+the timezone checks, the fetch and the calendar-move refusal): an empty or
+whitespace `start` is `Request(Malformed)` naming `start` on both, and an empty
+`end` on a create is `Unsupported` (no end is invented). An empty `end` on a
+patch is not refused: `graph_event_from_patch` drops it, before it can feed the
+all-day inference or `isAllDay`, so an echoed event leaves the stored end
+alone. An `EventId` without
 the calendar separator was never minted here, so `split_event_id` refuses it
 as `Request(Malformed)` with field `event`. A server-derived organizer, a
 non-`Confirmed` status, and an RSVP value Graph has no action for stay

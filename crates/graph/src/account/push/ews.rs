@@ -139,6 +139,14 @@ pub(super) async fn subscribe_ews(
     if pending.is_empty() {
         return Ok((None, finalize_push_outcomes(outcomes, expected)?));
     }
+    // A closed account is refused before the translation request, as the
+    // webhook arm refuses before its first POST: registering here would only
+    // spawn a worker that sees the cancelled token and exits at once, leaving
+    // a registration no live worker streams. `shutdown` is cancelled by
+    // `close()` alone, so a live account never takes this branch.
+    if account.shutdown.is_cancelled() {
+        return Err(account_closed_error());
+    }
     let scopes = translate_ews_scopes(&account, pending, &mut outcomes).await?;
     let outcomes = finalize_push_outcomes(outcomes, expected)?;
     if scopes.is_empty() {
@@ -146,6 +154,12 @@ pub(super) async fn subscribe_ews(
     }
     let handle = new_handle()?;
     let mut registrations = account.ews_subscriptions.write().await;
+    // Re-checked under the write lock for a `close()` that began while the
+    // translation was in flight. Nothing server-side exists yet, so there is
+    // nothing to undo.
+    if account.shutdown.is_cancelled() {
+        return Err(account_closed_error());
+    }
     registrations.insert(handle.clone(), EwsSubscriptionState { scopes });
     // Armed in the same synchronous step as the insert: there is no await
     // between the two, so no drop point exists at which the registration is
@@ -165,6 +179,17 @@ pub(super) async fn subscribe_ews(
     crate::account::push_stream::ensure_ews_worker(account).await;
     registration.disarm();
     Ok((Some(handle), outcomes))
+}
+
+/// `push_subscribe` on (or racing) a closed account. Same classification as
+/// the webhook arm's refusal: a runtime failure, never retried.
+fn account_closed_error() -> AccountError {
+    into_account_error(
+        crate::error::GraphError::RuntimeFailure {
+            message: "the account is closed".to_string(),
+        },
+        GraphErrorContext::graph(AccountOperation::PushSubscribe),
+    )
 }
 
 /// Retires a registration whose `subscribe_ews` future was dropped before it
