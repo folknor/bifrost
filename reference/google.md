@@ -571,7 +571,19 @@ is what the projection refused to do, so the caller must supply it. An
 empty `start` has no "no start" reading and is refused as `Request(Malformed)`
 naming `start`. All of this runs in `reject_unusable_write_times`, before any
 request and, on update, before the calendar move, alongside the all-day check.
-RSVP patches only `attendees` and re-sends no time.
+The same guard checks the SHAPE of every non-empty start and end, as
+`Request(Malformed)`: a bare `YYYY-MM-DD` date for an all-day value (the write's
+`is_all_day`, or each value's own shape when a patch leaves it unset), an RFC
+3339 timestamp with an offset for a timed one, or a local date-time beside a
+`timezone`. Google would answer a bad value with a 400, which already
+classifies as the caller's malformed input with nothing sent in error, and that
+is honest on a create or a plain field patch. The local check exists for the
+update that also moves the calendar: `events.move` has already succeeded when
+the field patch is rejected, which surfaces as a non-replayable
+`Protocol(PartialResponse)`. Accepted limit: the `timezone` NAME is not
+validated (no time-zone database is carried, and a false refusal is worse than
+Google's 400), so an unknown zone combined with a calendar move can still end
+as `PartialResponse`. RSVP patches only `attendees` and re-sends no time.
 Projection failures are per item, not per page. `page_from_events` routes a
 refused event onto `Page::failed_ids` under its composite native id and
 serves the rest of the page, matching how bifrost-jmap and bifrost-caldav

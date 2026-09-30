@@ -153,6 +153,7 @@ pub(crate) fn create(
             AccountOperation::EventCreate,
             Some(&event.start),
             Some(&event.end),
+            Some(event.is_all_day),
         )?;
         let calendar_id = event.calendar_id.0.clone();
         let encoded = bifrost_net::url::encode_path_component(&calendar_id);
@@ -205,6 +206,7 @@ pub(crate) fn update(
                 AccountOperation::EventUpdate,
                 patch.start.as_ref(),
                 patch.end.as_ref(),
+                patch.is_all_day,
             )?;
         }
         let mut moved = false;
@@ -844,16 +846,46 @@ fn is_blank_time(time: &EventTime) -> bool {
 //   end is refused by Google itself, with nothing invented on this side;
 // - a create must send some end, so it is `Unsupported`: the caller has to
 //   supply the end it wants.
+//
+// A non-empty value must also have the shape Google will read, checked here
+// rather than left to Google's 400. Google does answer a malformed value with
+// a 400, which classifies as `Request(Malformed)` (the caller's input) with
+// nothing applied, and that is an honest outcome on a create or a plain field
+// patch. It is NOT on an update that also moves the event to another
+// calendar: `events.move` has already succeeded when the field patch is
+// rejected, and the failure surfaces as `Protocol(PartialResponse)` with a
+// move that cannot be replayed. Since this guard runs before the move, the
+// shape rules below (a bare `YYYY-MM-DD` date for an all-day value, a full
+// RFC 3339 timestamp with an offset or a local date-time plus a `timezone`
+// for a timed one) turn the common bad-input cases into a refusal that strands
+// nothing.
+//
+// Accepted limit: the `timezone` NAME is not validated (that would need a
+// time-zone database this crate does not carry, and a false refusal is worse
+// than Google's 400), and neither are calendar-valid corner cases beyond what
+// the date and timestamp parsers reject. An unknown zone name combined with a
+// calendar move can therefore still end as a `PartialResponse`; that is
+// documented in `reference/google.md`, not duplicated validation.
+//
+// `is_all_day` is the write's all-day flag when it states one; when it does
+// not (a patch that leaves it unset) each value is judged by its own shape,
+// exactly as `google_event_from_patch` chooses `date` versus `dateTime`.
 fn reject_unusable_write_times(
     operation: AccountOperation,
     start: Option<&EventTime>,
     end: Option<&EventTime>,
+    is_all_day: Option<bool>,
 ) -> Result<(), AccountError> {
     if start.is_some_and(is_blank_time) {
         return Err(caller_input_error(
             operation,
             "Google Calendar event `start` must not be empty".to_string(),
         ));
+    }
+    for (field, time) in [("start", start), ("end", end)] {
+        if let Some(time) = time.filter(|time| !is_blank_time(time)) {
+            reject_malformed_time_shape(operation, field, time, is_all_day)?;
+        }
     }
     if operation == AccountOperation::EventCreate && end.is_some_and(is_blank_time) {
         return Err(error::into_account_error(
@@ -866,6 +898,53 @@ fn reject_unusable_write_times(
         ));
     }
     Ok(())
+}
+
+fn reject_malformed_time_shape(
+    operation: AccountOperation,
+    field: &str,
+    time: &EventTime,
+    is_all_day: Option<bool>,
+) -> Result<(), AccountError> {
+    let value = time.value.as_str();
+    if is_all_day.unwrap_or_else(|| is_ymd_date(value)) {
+        if is_ymd_date(value) && value.parse::<jiff::civil::Date>().is_ok() {
+            return Ok(());
+        }
+        return Err(caller_input_error(
+            operation,
+            format!("Google Calendar all-day `{field}` must be a YYYY-MM-DD date"),
+        ));
+    }
+    let has_time_separator = value.contains('T');
+    if has_time_separator && has_rfc3339_offset(value) && value.parse::<jiff::Timestamp>().is_ok() {
+        return Ok(());
+    }
+    // A local date-time is only meaningful beside a `timezone`; Google reads
+    // it in that zone. Offset and `Z` forms were handled above, so anything
+    // still carrying one here is not a bare local time.
+    let is_bare_local = has_time_separator
+        && !value.contains(['+', 'Z', 'z', '['])
+        && !value
+            .rsplit('T')
+            .next()
+            .is_some_and(|time| time.contains('-'))
+        && value.parse::<jiff::civil::DateTime>().is_ok();
+    if is_bare_local
+        && time
+            .timezone
+            .as_deref()
+            .is_some_and(|zone| !zone.trim().is_empty())
+    {
+        return Ok(());
+    }
+    Err(caller_input_error(
+        operation,
+        format!(
+            "Google Calendar timed `{field}` must be an RFC 3339 timestamp with an offset, \
+             or a local date-time with a `timezone`"
+        ),
+    ))
 }
 
 fn google_range_bound(time: &EventTime, field: &'static str) -> Result<String, AccountError> {
@@ -2678,6 +2757,115 @@ mod tests {
         let error = update(client, EventId("source::event-1".to_string()), patch)
             .await
             .expect_err("a blank start is malformed");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(script.requests().is_empty());
+    }
+
+    /// Malformed non-empty times are refused locally, as the caller's input,
+    /// before any request. Fails if the shape check in
+    /// `reject_unusable_write_times` is removed: each case would reach the
+    /// (empty) script instead.
+    #[tokio::test]
+    async fn create_with_malformed_times_is_refused_before_any_request() {
+        let cases = [
+            // Timed, no offset and no timezone.
+            (
+                create_with("2026-06-02T12:00:00", "2026-06-02T13:00:00Z"),
+                "floating start",
+            ),
+            // Garbage.
+            (
+                create_with("tomorrow", "2026-06-02T13:00:00Z"),
+                "garbage start",
+            ),
+            (create_with("2026-06-02T12:00:00Z", "later"), "garbage end"),
+            // A date on a timed write.
+            (
+                create_with("2026-06-02", "2026-06-03"),
+                "date on a timed write",
+            ),
+            // A timestamp on an all-day write.
+            (
+                EventCreate {
+                    is_all_day: true,
+                    ..create_with("2026-06-02T12:00:00Z", "2026-06-03T12:00:00Z")
+                },
+                "timestamp on an all-day write",
+            ),
+            (
+                EventCreate {
+                    is_all_day: true,
+                    ..create_with("2026-13-45", "2026-06-03")
+                },
+                "impossible all-day date",
+            ),
+        ];
+        for (event, label) in cases {
+            let (client, script) = scripted_client(Vec::new());
+            let error = create(client, event).await.expect_err(label);
+            assert!(
+                matches!(
+                    error.kind(),
+                    AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+                ),
+                "{label}: {:?}",
+                error.kind()
+            );
+            assert!(script.requests().is_empty(), "{label}");
+        }
+    }
+
+    /// The forms the guard must keep accepting: offset, `Z`, local plus a
+    /// timezone, and an all-day date.
+    #[test]
+    fn well_formed_times_pass_the_shape_check() {
+        let op = AccountOperation::EventCreate;
+        let ok = |value: &str, timezone: Option<&str>, all_day: Option<bool>| {
+            reject_unusable_write_times(
+                op,
+                Some(&EventTime {
+                    value: value.to_string(),
+                    timezone: timezone.map(ToString::to_string),
+                }),
+                None,
+                all_day,
+            )
+            .unwrap_or_else(|error| panic!("{value}: {:?}", error.kind()));
+        };
+        ok("2026-06-02T12:00:00Z", None, Some(false));
+        ok("2026-06-02T12:00:00+02:00", None, None);
+        ok(
+            "2026-06-02T12:00:00-05:00",
+            Some("America/Chicago"),
+            Some(false),
+        );
+        ok("2026-06-02T12:00:00", Some("Europe/Oslo"), Some(false));
+        ok("2026-06-02T12:00:00.500", Some("Europe/Oslo"), None);
+        ok("2026-06-02", None, Some(true));
+        ok("2026-06-02", None, None);
+    }
+
+    /// The reason the shape check exists: with a calendar move in the same
+    /// update, Google's own 400 would arrive AFTER `events.move` succeeded
+    /// and surface as a non-replayable `PartialResponse`. Fails if the shape
+    /// check is removed: the move request would be issued.
+    #[tokio::test]
+    async fn update_with_a_malformed_end_and_a_move_is_refused_before_the_move() {
+        let (client, script) = scripted_client(Vec::new());
+        let patch = EventPatch {
+            calendar_id: Some(CalendarId("destination".to_string())),
+            start: Some(write_time("2026-06-02T12:00:00Z")),
+            end: Some(write_time("2026-06-02T13:00:00")),
+            ..EventPatch::default()
+        };
+
+        let error = update(client, EventId("source::event-1".to_string()), patch)
+            .await
+            .expect_err("a floating end without a timezone is malformed");
 
         assert!(matches!(
             error.kind(),
