@@ -13,11 +13,12 @@
 //! gathered downstream.
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AttendeeRole, Calendar, CalendarEvent,
-    CalendarId, CalendarProvenance, EventAttendee, EventAvailability, EventCreate, EventId,
-    EventOrganizer, EventPatch, EventRange, EventRecurrence, EventReminder, EventSearchRequest,
-    EventStatus, EventTime, EventVisibility, Page, ProtocolKind, ReminderRelativeTo,
-    ReminderTrigger, RsvpStatus,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation,
+    AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, Cause, DiagnosticText,
+    EventAttendee, EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
+    EventRecurrence, EventReminder, EventSearchRequest, EventStatus, EventTime, EventVisibility,
+    Page, Protocol, ProtocolKind, ReminderRelativeTo, ReminderTrigger, RequestCause,
+    RequestErrorKind, RsvpStatus,
 };
 use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Span, Timestamp, civil};
@@ -732,12 +733,29 @@ fn jmap_patch_from_event_patch(
     // patch carrying only `start` or only `end` cannot be applied losslessly
     // without reading the current event. Reject rather than silently keep a
     // stale duration (start-only) or drop the change entirely (end-only).
-    match (&patch.start, &patch.end) {
+    //
+    // An empty `start` is refused (see `reject_blank_start`). An empty `end`
+    // is the projection's "the provider did not say" echoed back by a
+    // read-modify-write, and on a patch it honestly means "no duration
+    // change": JSCalendar stores the end as `duration`, and a patch that omits
+    // `duration` leaves the stored one alone. Encoding it instead would send
+    // `PT0S` (`duration` cannot parse an empty end), silently collapsing the
+    // event to zero length. So a blank end is dropped from the patch: start
+    // and timeZone still apply, duration is untouched, and a blank end with
+    // no start is a no-op for the time fields.
+    reject_blank_start(patch.start.as_ref(), operation)?;
+    let end_is_blank = patch.end.as_ref().is_some_and(is_blank_time);
+    let end = patch.end.as_ref().filter(|end| !is_blank_time(end));
+    match (&patch.start, end) {
         (Some(start), Some(end)) => {
             let all_day = context.is_all_day;
             out.start(jmap_time_from_shared(start, all_day));
             out.time_zone(start.timezone.clone());
             out.duration(duration(&start.value, &end.value));
+        }
+        (Some(start), None) if end_is_blank => {
+            out.start(jmap_time_from_shared(start, context.is_all_day));
+            out.time_zone(start.timezone.clone());
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(unsupported(
@@ -937,6 +955,19 @@ fn write_event_create(
     }
     if let Some(location) = &event.location {
         target.locations(single_location(location));
+    }
+    // Neither bound may be empty on a create. An empty start is not a
+    // LocalDateTime (`Request(Malformed)`). An empty end cannot be encoded:
+    // `duration` would fall back to `PT0S`, and RFC 8984 also defaults an
+    // absent `duration` to `PT0S`, so either way the server would store a
+    // zero-length event the caller never asked for. The caller must supply the
+    // end it wants (`Unsupported`, matching bifrost-google's create).
+    reject_blank_start(Some(&event.start), operation)?;
+    if is_blank_time(&event.end) {
+        return Err(unsupported(
+            operation,
+            "JMAP cannot create an event with no end: JSCalendar derives the end from start + duration, so an empty end would be stored as a zero-length event; a create needs an explicit end",
+        ));
     }
     target.start(jmap_time_from_shared(&event.start, event.is_all_day));
     target.time_zone(event.start.timezone.clone());
@@ -1530,6 +1561,42 @@ fn single_location(value: &str) -> Map<String, Value> {
     let mut locations = Map::new();
     locations.insert("loc1".to_string(), Value::Object(location));
     locations
+}
+
+fn is_blank_time(time: &EventTime) -> bool {
+    time.value.trim().is_empty()
+}
+
+/// An empty `start` is malformed caller input on every write. JSCalendar
+/// `start` is a mandatory LocalDateTime, and the shared model's empty time is
+/// what a provider projects for "did not say" (this crate's own read path
+/// produces one when a server omits `start`), so a consumer echoing that
+/// value back would send `start: ""`. Refused before any request, as
+/// `Request(Malformed)` naming `start`.
+fn reject_blank_start(
+    start: Option<&EventTime>,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    if start.is_some_and(is_blank_time) {
+        return Err(blank_start_error(operation));
+    }
+    Ok(())
+}
+
+fn blank_start_error(operation: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("start"),
+            message: Some(DiagnosticText::support_only(
+                "JMAP calendar event `start` must not be empty",
+            )),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
 }
 
 fn duration(start: &str, end: &str) -> String {
@@ -2725,6 +2792,130 @@ mod tests {
             patch.properties.get("duration").and_then(Value::as_str),
             Some("PT5400S")
         );
+    }
+
+    fn create_with(start: &str, end: &str) -> EventCreate {
+        EventCreate {
+            calendar_id: CalendarId("cal".to_string()),
+            title: None,
+            description: None,
+            location: None,
+            start: time(start),
+            end: time(end),
+            is_all_day: false,
+            status: EventStatus::Confirmed,
+            availability: EventAvailability::Busy,
+            visibility: EventVisibility::Default,
+            organizer: None,
+            attendees: Vec::new(),
+            recurrence: EventRecurrence::default(),
+        }
+    }
+
+    /// The read path itself can hand a consumer an empty time: a server that
+    /// omits the mandatory `start` projects an empty start AND an empty end.
+    /// This pins that the empty-time write handling below is reachable from
+    /// this crate's own output, not just from other providers.
+    #[test]
+    fn a_server_event_without_start_projects_empty_times() {
+        let raw: JmapCalendarEvent = serde_json::from_value(json!({
+            "id": "e1",
+            "calendarIds": {"c1": true},
+            "duration": "PT1H"
+        }))
+        .expect("event parses");
+        let event = event_from_jmap(raw, AccountOperation::EventGet).expect("projects");
+        assert!(event.start.value.is_empty());
+        assert!(event.end.value.is_empty());
+    }
+
+    /// Fails if `reject_blank_start` is removed from `write_event_create`:
+    /// `start: ""` would be sent to the server.
+    #[test]
+    fn create_with_an_empty_start_is_malformed() {
+        let error = jmap_create_from_event(
+            &create_with("  ", "2026-06-02T13:00:00Z"),
+            AccountOperation::EventCreate,
+        )
+        .expect_err("empty start");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    }
+
+    /// Fails if the blank-end refusal is removed from `write_event_create`:
+    /// the create would carry `duration: PT0S`, a zero-length event.
+    #[test]
+    fn create_with_an_empty_end_is_unsupported_not_a_zero_length_event() {
+        let error = jmap_create_from_event(
+            &create_with("2026-06-02T12:00:00Z", ""),
+            AccountOperation::EventCreate,
+        )
+        .expect_err("empty end");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
+        ));
+    }
+
+    /// Fails if `reject_blank_start` is removed from
+    /// `jmap_patch_from_event_patch`.
+    #[test]
+    fn patch_with_an_empty_start_is_malformed() {
+        let error = patch_with_patch_context(
+            &EventPatch {
+                start: Some(time("")),
+                end: Some(time("2026-06-02T13:00:00Z")),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect_err("empty start");
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    }
+
+    /// A read-modify-write echoing start with an empty end applies the start
+    /// and leaves the stored `duration` alone. Fails if the blank-end filter
+    /// is removed: the patch would carry `duration: PT0S` (or be refused as a
+    /// single-bound patch).
+    #[test]
+    fn patch_echoing_start_with_an_empty_end_omits_duration() {
+        let patch = patch_with_patch_context(
+            &EventPatch {
+                title: Some(Some("Renamed".to_string())),
+                start: Some(time("2026-06-02T12:00:00Z")),
+                end: Some(time("")),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect("echo is written");
+        assert_eq!(
+            patch.properties.get("start").and_then(Value::as_str),
+            Some("2026-06-02T12:00:00")
+        );
+        assert!(patch.properties.get("duration").is_none());
+    }
+
+    /// An empty end alone is a no-op for the time fields, not an error and
+    /// not a duration write.
+    #[test]
+    fn patch_with_only_an_empty_end_writes_no_time_fields() {
+        let patch = patch_with_patch_context(
+            &EventPatch {
+                title: Some(Some("Renamed".to_string())),
+                end: Some(time("")),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect("empty end alone is omitted");
+        assert!(patch.properties.get("duration").is_none());
+        assert!(patch.properties.get("start").is_none());
     }
 
     #[test]
