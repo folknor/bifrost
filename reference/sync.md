@@ -443,8 +443,19 @@ delete answered, restoring a refusal as an orphan in the same synchronous
 step), so its `Drop` finds nothing; and a drop spawns a task that deletes the
 remaining handles on the replacement, registers refusals as orphans (skipped
 once the slot's shutdown token is cancelled, since detach has already
-discarded the account's registry entry), and closes the replacement. With no
-runtime to spawn on the handles are registered as undeleted orphans. Orphans
+discarded the account's registry entry), and closes the replacement. The task takes the
+slot's reopen lock around that registry write ONLY, never around the deletes or
+the close, so a concurrent reattach does not wait on its network calls: a
+reattach commits with `replace` built from its own snapshot, so an unlocked
+restore landing between that snapshot and the commit would be erased and the
+provider subscription never retried. Under the lock the restore lands before
+the snapshot (carried like any orphan) or after the commit (`restore` merges).
+The lock is taken before the shutdown check, since the wait can span a detach,
+and the dropped reattach's own reopen guard is released by the drop
+independently of the task, which only waits asynchronously. With no
+runtime to spawn on the handles are registered as undeleted orphans, without
+the lock: Drop cannot await, the dropping reattach usually still holds the
+lock, and with no runtime nothing can be running a concurrent reattach. Orphans
 are retried against whichever account is current at that time, not the
 replacement that created them, which is why the task tries the replacement
 first. Two residues are known: a drop parked inside `push_subscribe` itself

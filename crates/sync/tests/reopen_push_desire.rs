@@ -695,3 +695,72 @@ async fn an_ordinary_abort_does_not_unwind_the_replacement_twice() {
 
     engine.detach(&id).await.expect("detach");
 }
+
+/// A dropped reattach's detached cleanup must not restore a refused handle into
+/// the registry while a later reattach is between its snapshot and its commit.
+///
+/// The interleaving, pinned with the park gates: reattach A is dropped after
+/// creating `r1`'s subscription; the cleanup's delete of it is parked and will be
+/// refused. Reattach B starts and parks inside its own `push_subscribe`, so its
+/// registry snapshot exists. The cleanup's delete is then released and refused.
+/// B commits with `replace`, built from its snapshot alone. Unlocked, the orphan
+/// the cleanup restored in between is overwritten and the `r1` subscription is
+/// never retried; under the slot's reopen lock the restore waits for B's commit
+/// and merges into what B installed.
+///
+/// Removing the lock acquisition around `register_orphans` in
+/// `retire_stranded_subscriptions` drops `call("r2", "r1")` from the log.
+#[tokio::test]
+async fn a_cleanup_refusal_restored_mid_reattach_is_not_overwritten_by_its_commit() {
+    let id = AccountId("reopen-cleanup-restore-vs-commit".into());
+    let log = Arc::new(PushLog::default());
+    let old = pushing("old", &log, 0);
+    *old.push_unsubscribe_park.lock().expect("park lock") = Some(parked_forever());
+    let r1 = pushing("r1", &log, usize::MAX);
+    let cleanup_gate = parked_forever();
+    *r1.push_unsubscribe_park.lock().expect("park lock") = Some(Arc::clone(&cleanup_gate));
+    let r2 = pushing("r2", &log, 0);
+    let commit_gate = parked_forever();
+    *r2.push_subscribe_park.lock().expect("park lock") = Some((0, Arc::clone(&commit_gate)));
+    let engine = attached(
+        &id,
+        vec![Arc::clone(&old), Arc::clone(&r1), Arc::clone(&r2)],
+    )
+    .await;
+
+    // A: dropped with r1's subscription live; the cleanup parks in r1's delete.
+    drop_reattach_once(&engine, &id, || log.unsubscribed().len() == 1).await;
+    settle(|| log.unsubscribed().len() == 2).await;
+
+    // B: parked inside r2's subscribe, so its registry snapshot is taken.
+    let reattach_b = engine.reattach(&id);
+    tokio::pin!(reattach_b);
+    tokio::select! {
+        biased;
+        _ = &mut reattach_b => panic!("reattach B finished before it parked"),
+        () = settle(|| log.subscribed().iter().any(|(label, _)| label == "r2")) => {}
+    }
+
+    // The cleanup's delete is refused now, mid-B.
+    cleanup_gate.notify_one();
+    for _ in 0..100 {
+        tokio::select! {
+            biased;
+            _ = &mut reattach_b => panic!("reattach B finished while parked"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    commit_gate.notify_one();
+    reattach_b.await.expect("B commits");
+    settle(|| r1.closed.load(Ordering::SeqCst) == 1).await;
+
+    engine.unsubscribe_push(&id).await.expect("teardown");
+    assert_eq!(
+        log.unsubscribed()[3..],
+        [call("r2", "r2"), call("r2", "r1")],
+        "the refused cleanup handle survived B's commit as an orphan"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}

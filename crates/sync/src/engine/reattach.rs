@@ -576,6 +576,8 @@ pub(super) struct ReplacementSubscriptions {
     subscriptions: Arc<SubscriptionRegistry>,
     account_id: AccountId,
     shutdown: CancellationToken,
+    /// The slot's reopen lock, for the spawned cleanup's registry write.
+    reopen_lock: Arc<AsyncMutex<()>>,
     live: Vec<RegisteredSubscription>,
 }
 
@@ -586,6 +588,7 @@ impl ReplacementSubscriptions {
             subscriptions: Arc::clone(ctx.subscriptions),
             account_id: ctx.account_id.clone(),
             shutdown: ctx.shutdown.clone(),
+            reopen_lock: Arc::clone(ctx.reopen_lock),
             live: Vec::new(),
         }
     }
@@ -610,6 +613,7 @@ impl Drop for ReplacementSubscriptions {
         let subscriptions = Arc::clone(&self.subscriptions);
         let account_id = self.account_id.clone();
         let shutdown = self.shutdown.clone();
+        let reopen_lock = Arc::clone(&self.reopen_lock);
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 runtime.spawn(retire_stranded_subscriptions(
@@ -617,10 +621,19 @@ impl Drop for ReplacementSubscriptions {
                     subscriptions,
                     account_id,
                     shutdown,
+                    reopen_lock,
                     live,
                 ));
             }
             Err(_) => {
+                // No lock here, deliberately. Drop cannot await, and a blocking
+                // acquire would stall a non-async thread on a lock the dropping
+                // reattach itself usually still holds (its reopen guard lives in
+                // a frame that is being torn down around this one). It is also
+                // unnecessary: with no runtime nothing can be running a
+                // concurrent reattach, `unsubscribe_push`, or `subscribe_push`
+                // against this registry, so there is no snapshot to be
+                // overwritten.
                 tracing::warn!(
                     target: "bifrost.sync.reopen",
                     account = ?account_id,
@@ -664,11 +677,29 @@ fn register_orphans(
 
 /// Cleanup for a reattach future that was dropped after creating replacement
 /// subscriptions. Runs detached from the dropped future.
+///
+/// The deletes and the close run WITHOUT the slot's reopen lock, so a concurrent
+/// reattach never waits on this task's network calls. Only the registry write
+/// takes it. A reattach snapshots the registry and later overwrites it with
+/// `replace`, built from that snapshot alone: a refusal restored between the two
+/// (this task's delete failing while a later reattach is mid-flight) would be
+/// erased, and the provider subscription could never be retried. Under the lock
+/// the restore lands either before that reattach snapshots (which then carries it
+/// as it carries any orphan) or after it commits (`restore` merges into what it
+/// installed).
+///
+/// The lock is taken before `register_orphans` reads the shutdown token, not
+/// after: the wait can span a detach, and the check has to see it.
+///
+/// The dropped reattach's own reopen guard cannot deadlock this: the guard is
+/// released by the drop, independently of this task, and this task only ever
+/// waits on the lock asynchronously.
 async fn retire_stranded_subscriptions(
     account: Arc<dyn Account>,
     subscriptions: Arc<SubscriptionRegistry>,
     account_id: AccountId,
     shutdown: CancellationToken,
+    reopen_lock: Arc<AsyncMutex<()>>,
     live: Vec<RegisteredSubscription>,
 ) {
     let mut refused = Vec::new();
@@ -683,7 +714,10 @@ async fn retire_stranded_subscriptions(
             refused.push(record);
         }
     }
-    register_orphans(&subscriptions, &account_id, &shutdown, refused);
+    if !refused.is_empty() {
+        let _reopen_guard = reopen_lock.lock().await;
+        register_orphans(&subscriptions, &account_id, &shutdown, refused);
+    }
     if let Err(error) = account.close().await {
         tracing::warn!(
             target: "bifrost.sync.reopen",
