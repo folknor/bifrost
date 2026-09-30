@@ -146,6 +146,22 @@ against the code before working any of them.
   provisional cursor rows provisional until a later abort or commit. An orphan
   is retried against whatever account is current, which fails forever on a
   provider whose handles are account-local.
+- **sync: a pause landing during `restart_scope` loses the scope.**
+  `restart_scope` deletes the scope's in-memory and durable cursor, then
+  `run_establish` refuses with `Paused` and `re_establish_scope_with_backoff`
+  returns; `resume_account` only flips the boundary, and the multiplexer polls
+  only scopes still in the cursor registry, so the scope stays gone for the
+  rest of the attachment. Every `RestartScope` and downgrade-for-scope repair
+  is exposed. The obvious fix, waiting for `Run` and retrying, would hold the
+  reopen lock across an unbounded pause, which the dispatch comments already
+  record as hanging `unsubscribe_push`; wants a design (defer the delete until
+  activity is held, or requeue the repair on resume).
+- **sync: an orphan can land after detach's registry take.** The
+  dropped-reattach cleanup checks the shutdown token and then restores under
+  the reopen lock, but detach cancels the token before it takes the registry
+  and does not take the reopen lock, so on a multi-thread runtime an orphan
+  can be restored after the take and be inherited by a later attach of the
+  same id. Tiny window; closing it needs detach to synchronize on the lock.
 - **graph: `subscribe_ews` on a closed account** still registers and spawns a
   worker that exits at once. No server state is involved; the webhook arm
   refuses instead, so this is parity only.

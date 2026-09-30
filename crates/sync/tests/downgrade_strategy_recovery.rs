@@ -20,11 +20,11 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bifrost_sync::SyncEngine;
+use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore, SyncEngine};
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountFuture, AccountId,
     AccountOperation, Cause, Change, ChangeCursor, CursorScope, ErrorScope, ObjectType, StateCause,
@@ -203,4 +203,128 @@ async fn an_account_scoped_strategy_downgrade_restarts_the_account() {
         .expect("detach after recovery must not hang")
         .expect("detach succeeds");
     assert_eq!(staged.replacement.closed.load(Ordering::SeqCst), 1);
+}
+
+/// Serves `first` on the initial open, then refuses every later open. Counts
+/// every call, the initial one included.
+struct RefusingReplacementFactory {
+    first: Mutex<Option<Arc<StubAccount>>>,
+    opens: Arc<AtomicUsize>,
+}
+
+impl AccountFactory for RefusingReplacementFactory {
+    fn open(
+        &self,
+        _account_id: AccountId,
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let first = self.first.lock().expect("first lock").take();
+        Box::pin(async move {
+            match first {
+                Some(account) => {
+                    let account: Arc<dyn bifrost_types::Account> = account;
+                    Ok(bifrost_types::OpenedAccount::complete(account))
+                }
+                None => Err(common::close_refused()),
+            }
+        })
+    }
+}
+
+/// When every replacement open fails, the account restart exhausts its budget
+/// and pauses the account. The trailing scope repair must NOT run then:
+/// `restart_scope` deletes the scope's cursor before re-establishing it, the
+/// establishment is refused on a paused account, and after `resume_account`
+/// the scope would never sync again.
+///
+/// Runs under a paused clock so the restart backoff sleeps are virtual.
+#[tokio::test(start_paused = true)]
+async fn an_exhausted_downgrade_restart_pauses_without_deleting_the_scope_cursor() {
+    let id = AccountId("downgrade-exhausted".to_owned());
+    let first = failing_once(downgrade_error(ErrorScope::Cursor(SCOPE)));
+    let opens = Arc::new(AtomicUsize::new(0));
+    let factory: Arc<dyn AccountFactory> = Arc::new(RefusingReplacementFactory {
+        first: Mutex::new(Some(Arc::clone(&first))),
+        opens: Arc::clone(&opens),
+    });
+    let store = Arc::new(InMemoryCheckpointStore::default());
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    engine
+        .attach(id.clone(), factory)
+        .await
+        .expect("attach succeeds");
+    let mut control = engine
+        .account_control_stream(&id)
+        .expect("control stream for an attached account");
+
+    // Only a cursor that exists can be observed surviving.
+    assert!(
+        store
+            .get_change_cursor(&id, &SCOPE)
+            .await
+            .expect("cursor lookup")
+            .is_some(),
+        "attach must have persisted the scope's cursor, or survival proves nothing"
+    );
+
+    let pause = tokio::time::timeout(BOUND, async {
+        loop {
+            match control.recv().await {
+                Ok(bifrost_types::AccountControl::Pause(reason)) => break reason,
+                // `AccountControl` is `#[non_exhaustive]`; anything else is
+                // not the pause this test waits for.
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("control stream closed before the account paused")
+                }
+            }
+        }
+    })
+    .await
+    .expect("the account never paused after every replacement open failed");
+    assert_eq!(pause, bifrost_types::PauseReason::RetryBudgetExhausted);
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        4,
+        "one attach open plus a three-attempt restart budget"
+    );
+
+    // The scope repair, had it run, executes right after the restart returns,
+    // so give it every chance to run before reading.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(
+        store
+            .get_change_cursor(&id, &SCOPE)
+            .await
+            .expect("cursor lookup")
+            .is_some(),
+        "the scope's durable cursor was deleted by a scope repair that ran after \
+         the account restart gave up"
+    );
+
+    // After resume the scope must still be there to sync: the cursor survives
+    // and the first account is still the live one.
+    engine.resume_account(&id).expect("resume");
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(
+        store
+            .get_change_cursor(&id, &SCOPE)
+            .await
+            .expect("cursor lookup")
+            .is_some(),
+        "the scope's durable cursor did not survive the pause and resume"
+    );
+    assert_eq!(
+        first.closed.load(Ordering::SeqCst),
+        0,
+        "no replacement was ever swapped in, so the first account stays live"
+    );
+
+    tokio::time::timeout(BOUND, engine.detach(&id))
+        .await
+        .expect("detach after an exhausted restart must not hang")
+        .expect("detach succeeds");
 }

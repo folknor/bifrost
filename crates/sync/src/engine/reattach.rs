@@ -235,7 +235,14 @@ async fn handle_engine_directive(
                 )
                 .with_protocol_detail(DiagnosticText::support_only(format!("{downgrade:?}"))),
             );
-            restart_account(ctx).await;
+            // Only an account that actually restarted gets the scope repair.
+            // `restart_scope` deletes the scope's cursor before it
+            // re-establishes; after an exhausted budget the account is
+            // paused, the establishment is refused, and the deleted scope
+            // would stay gone after resume.
+            if !restart_account(ctx).await {
+                return;
+            }
             // If the originating error was scoped to a cursor, also
             // re-establish that scope so the downgrade takes effect
             // immediately rather than at the next poll.
@@ -1215,7 +1222,12 @@ pub(super) fn accepted_push_scopes(result: &bifrost_types::PushSubscription) -> 
 /// teardown failure included - the account is paused with
 /// `PauseReason::RetryBudgetExhausted` and the last `AccountError` is
 /// broadcast as `SyncEvent::Terminated`. (sync-D6, sync-D7)
-async fn restart_account(ctx: &RecoveryContext<'_>) {
+///
+/// Returns whether a replacement was actually swapped in. `false` covers the
+/// exhausted budget (the account is now paused), a detach, and shutdown; a
+/// caller must not run follow-up repairs against an account that did not
+/// restart.
+async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
     let mut delay = REOPEN_BACKOFF_INITIAL;
     let mut last_error: Option<AccountError> = None;
     let mut attempt = 0;
@@ -1224,12 +1236,12 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
         // request queued until resume instead of opening a replacement while
         // the account has promised to be idle.
         if !ctx.control.wait_until_running(ctx.shutdown).await {
-            return;
+            return false;
         }
         if attempt > 0 {
             let sleep_for = jittered(delay);
             if !sleep_unless_shutdown(sleep_for, ctx.shutdown).await {
-                return;
+                return false;
             }
             delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
         }
@@ -1240,10 +1252,10 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
             Err(ReplacementOpen::Paused) => continue,
             // The slot is being torn down. Nothing to restart, and the
             // replacement (if one was opened at all) has already been closed.
-            Err(ReplacementOpen::Detached) => return,
+            Err(ReplacementOpen::Detached) => return false,
             Ok((_reopen_guard, activity, next)) => {
                 match reattach_account(ctx, activity, next).await {
-                    Ok(()) => return,
+                    Ok(()) => return true,
                     Err(Error::Account(error) | Error::EstablishCursorTerminated(error)) => {
                         tracing::warn!(
                             target: "bifrost.sync.changes",
@@ -1293,6 +1305,7 @@ async fn restart_account(ctx: &RecoveryContext<'_>) {
         broadcast_terminated(ctx.changes_tx, CursorScope::Account, err);
     }
     engine_pause(ctx, PauseReason::RetryBudgetExhausted);
+    false
 }
 
 /// Engine-driven pause: publish `AccountControl::Pause(reason)` on the
