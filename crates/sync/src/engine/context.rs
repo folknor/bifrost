@@ -54,9 +54,30 @@ pub(super) struct SlotContext {
     /// How many published-but-unanswered backfill batches the account may have
     /// in flight before its cold-start producer parks.
     pub backfill_capacity: usize,
+    /// The slot's own reopen channel, for re-offering a declined scope repair.
+    pub reopen_tx: mpsc::Sender<ReopenRequest>,
+    /// Scope repairs declined under a pause that nothing else will raise again.
+    pub deferred_repairs: Arc<DeferredScopeRepairs>,
 }
 
 impl SlotContext {
+    /// Dispatch a classified error through recovery, and park a scope repair the
+    /// dispatch declined because the account was paused, when nothing else would
+    /// raise it again. See [`DeferredScopeRepairs`].
+    pub(super) async fn recover(&self, scope: Option<CursorScope>, error: AccountError) {
+        let writer = self.writer();
+        let recovery = self.recovery(&writer);
+        if let Some(declined) = handle_account_error(&recovery, scope, error).await {
+            self.deferred_repairs.park(
+                declined,
+                self.control.clone(),
+                Arc::clone(&self.cursors),
+                self.shutdown.clone(),
+                self.reopen_tx.clone(),
+            );
+        }
+    }
+
     /// The producer-side door onto the backfill bound, already carrying this
     /// slot's shutdown token so a parked producer always has a way out.
     ///

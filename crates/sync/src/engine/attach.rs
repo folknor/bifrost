@@ -507,6 +507,8 @@ impl SyncEngine {
             scheduler: self.scheduler.clone(),
             delivery: Arc::clone(&delivery),
             backfill_capacity: self.config.backfill.lane_capacity,
+            reopen_tx: reopen_tx.clone(),
+            deferred_repairs: Arc::new(DeferredScopeRepairs::new()),
         };
 
         let backfill_wiring = BackfillWiring {
@@ -555,9 +557,7 @@ impl SyncEngine {
                             let Some(req) = req else { return; };
                             match req {
                                 ReopenRequest::Recovery { scope, error } => {
-                                    let writer = reopen_ctx.writer();
-                                    let recovery = reopen_ctx.recovery(&writer);
-                                    handle_account_error(&recovery, scope, error).await;
+                                    reopen_ctx.recover(scope, error).await;
                                 }
                                 ReopenRequest::ScopeDeleted { scope } => {
                                     // A provider-deleted folder retires its
@@ -958,9 +958,7 @@ pub(super) async fn run_deferred_inventory_establishment(
                 );
             }
             Ok(crate::multiplexer::FusionOutcome::Terminated(error)) => {
-                let writer = ctx.writer();
-                let recovery = ctx.recovery(&writer);
-                handle_account_error(&recovery, Some(scope.clone()), error).await;
+                ctx.recover(Some(scope.clone()), error).await;
             }
             Err(err) => {
                 tracing::warn!(

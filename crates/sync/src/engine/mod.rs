@@ -88,8 +88,8 @@ use backfill::{BackfillWiring, run_backfill_orchestrator};
 use context::SlotContext;
 use lane::LaneGate;
 use reattach::{
-    RecoveryContext, ReplacementOpen, accepted_push_scopes, handle_account_error, log_open_skips,
-    open_replacement, reattach_account,
+    DeferredScopeRepairs, RecoveryContext, ReplacementOpen, accepted_push_scopes,
+    handle_account_error, log_open_skips, open_replacement, reattach_account,
 };
 
 /// Top-level engine.
@@ -1179,6 +1179,11 @@ impl SyncEngine {
         // its server-side subscription - created on a handle about to be
         // closed - kept delivering with nothing left able to tear it down.
         let _reopen_guard = slot.reopen_lock.lock().await;
+        // A detach that won while this call queued on the lock: creating a
+        // subscription now would only have to be torn down again below.
+        if slot.shutdown.is_cancelled() {
+            return Err(Error::AccountNotAttached(account_id.clone()));
+        }
         let account = slot.current.load_full();
         let result = account.push_subscribe(scopes).await?;
         let covered = accepted_push_scopes(&result);
@@ -1189,9 +1194,38 @@ impl SyncEngine {
                 "push scope rejected; retaining polling coverage"
             );
         }
-        if let Some(handle) = &result.handle {
-            self.subscriptions
-                .record(account_id.clone(), handle.clone(), covered);
+        if let Some(handle) = &result.handle
+            && !self.subscriptions.record(
+                account_id.clone(),
+                handle.clone(),
+                covered,
+                &slot.shutdown,
+            )
+        {
+            // Detach cancelled the slot while `push_subscribe` was in flight and
+            // may already have taken the registry, so the subscription just made
+            // cannot be registered: nothing could reach it afterwards, the id may
+            // already belong to a new incarnation, and the consumer is about to
+            // be told the call failed and so will not hold its handle. Tearing it
+            // down is the only owner-less outcome that leaks nothing, and it is
+            // not the queue-for-later pattern plain `detach` preserves - that is
+            // a consumer's deliberate keep of a subscription it knowingly made.
+            //
+            // Detached onto its own task and then awaited, so a caller that drops
+            // this future while the delete is parked cannot strand the handle.
+            let handle = handle.clone();
+            let cleanup = tokio::spawn(async move {
+                if let Err(error) = account.push_unsubscribe(handle).await {
+                    tracing::warn!(
+                        target: "bifrost.sync.push",
+                        error = ?error,
+                        "push subscription created during detach could not be torn down; \
+                         left to provider expiry"
+                    );
+                }
+            });
+            let _ = cleanup.await;
+            return Err(Error::AccountNotAttached(account_id.clone()));
         }
         Ok(result)
     }

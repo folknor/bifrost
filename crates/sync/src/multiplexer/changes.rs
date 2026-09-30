@@ -434,6 +434,7 @@ impl std::fmt::Debug for AckRequest {
 /// faithfully order the acknowledged write ahead of an unconditional delete and
 /// then destroy it. The writer therefore tracks which scopes are still
 /// provisional - see `ReattachInsert`.
+#[non_exhaustive]
 pub enum WriterRequest {
     /// Persist an acknowledged checkpoint. Also DISCHARGES any provisional
     /// mark on its scope: an acknowledgement is real committed consumer

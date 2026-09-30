@@ -507,9 +507,11 @@ without the lock (Drop cannot await, the dropping reattach usually still holds
 it, and with no runtime nothing can be running a concurrent reattach) and the
 close cannot run.
 
-Every orphan restore made off the detach path goes through
-`SubscriptionRegistry::restore_orphans`, which checks the slot's shutdown token
-INSIDE the registry's own shard lock, the same lock `take` runs under. Detach
+Every registry write made off the detach path is sealed the same way: orphan
+restores (`restore_orphans`), a consumer's `subscribe_push` registration
+(`record`) and the reattach commit's install (`replace`) each take the slot's
+shutdown token and read it INSIDE the registry's own shard lock, the same lock
+`take` runs under. Detach
 cancels the token before it takes the registry, so a restore is either ordered
 before the take (and discarded by it) or after it (and sees the cancelled token
 and refuses). A check made before the write, as the cleanup task once did,
@@ -521,6 +523,24 @@ network calls, detach does not wait for them, and a lock acquisition there would
 make the one call a consumer has for getting rid of an account wait on a wedged
 open. The same sealed write is used by the ordinary abort's unwind and by
 `unsubscribe_push`.
+
+A refused `record` or `replace` names subscriptions that are LIVE on the
+provider, so refusal is followed by teardown, not a drop. Detach's "leave
+subscriptions alive" policy is a consumer's deliberate keep of what it knowingly
+subscribed; neither of these is that. `subscribe_push` deletes the handle it just
+created (on its own spawned task, awaited, so a caller dropping the future while
+the delete is parked cannot strand it) and returns
+`Error::AccountNotAttached`, since the consumer is told the call failed and will
+never hold the handle; it also checks the token after taking the reopen lock, so
+a detach that won the queue creates nothing. A refused reattach install hands its
+records back: the replacement's `desired` handles go into the `ReattachGuard`
+synchronously, and are deleted after every step that publishes the cutover, so a
+drop anywhere still deletes them. The carried orphans, which name the previous
+connection's handles, are dropped as detach drops stranded records. The
+reattach still returns `Ok`: the swap committed, and reporting failure would send
+the caller's retry budget after a change that cannot be undone. Pinned by
+`a_subscription_registered_after_detachs_take_is_torn_down_not_inherited` and
+`a_reattach_commit_after_detachs_take_tears_down_what_it_could_not_register`.
 
 Orphans are retried against whichever account is current at that time, not the
 replacement that created them, which is why the cleanup task tries the
@@ -1834,13 +1854,35 @@ would be judged against the boundary the pause just flipped; the repair therefor
 runs them on `SyncControl::admitted_by(&activity)`, a clone whose registrations
 succeed because the guard it was derived from is still counted. The handle is
 passed whole, not dropped, because the inventory walk also publishes its
-checkpoints through it. Only the repair paths pass it: schema recovery, which
-deletes every scope before re-establishing, still establishes on the plain
-control, so it does not have this protection. A `Created` lifecycle scope has no cursor to keep, so a
-repair declined under a pause loses that request; the lifecycle event is
-consumed either way. Pinned by
+checkpoints through it. Pinned by
 `a_repair_reaching_a_paused_account_leaves_the_scope_for_the_poll_to_re_raise`
 and `a_pause_landing_mid_repair_waits_for_it_instead_of_stranding_the_scope`.
+
+Schema recovery follows the same discipline for the whole account: it registers
+activity before deleting any cursor, declines outright on a paused account (every
+cursor stays registered, so the poll raises the directive again after resume),
+and holds the registration through the last re-establishment, run on
+`admitted_by`. It deletes every scope before re-establishing any, so a pause
+landing inside it used to strand all of them. Pinned by
+`schema_recovery_reaching_a_paused_account_deletes_nothing_and_runs_after_resume`
+and `a_pause_landing_mid_schema_recovery_waits_for_it_instead_of_stranding_scopes`.
+
+A `Created` lifecycle scope has no cursor, so a repair declined under a pause has
+nothing for the poll to re-raise the directive from. `handle_account_error`
+returns the scope of a declined `RestartScope` that has no registered cursor, and
+`SlotContext::recover` (the reopen listener and the deferred-inventory worker
+both dispatch through it) parks it in the slot's `DeferredScopeRepairs`. Each
+parked scope is a small task that waits for the boundary to read `Run`, then
+sends the same synthesized restart directive back through the slot's reopen
+channel, so the repair re-runs through the ordinary dispatch, including the
+decline check should the account be paused again. It is a task, not a wait in
+the listener, because the listener serializes real directives and an unbounded
+pause would hold `RestartAccount` behind it. A scope parks at most once, the task
+skips a scope some other path established meanwhile (restarting a live cursor
+would reset healthy state), and it leaves through the shutdown token, so detach
+never waits on one. Pinned by
+`a_created_scope_declined_under_a_pause_is_established_after_resume` and
+`a_parked_scope_is_dropped_by_detach`.
 
 Two entry points sit one layer apart and their names read as near
 anagrams of each other, so it is worth naming the difference:

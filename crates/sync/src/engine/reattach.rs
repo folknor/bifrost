@@ -50,15 +50,22 @@ pub(crate) struct RecoveryContext<'a> {
 /// convenience-suggested scope: scope-bound directives use the
 /// directive's own scope when present; account-wide directives ignore
 /// it.
+///
+/// Returns the scope of a repair that was declined because the account is
+/// paused AND that nothing will raise again: a scope with no cursor registered
+/// (a lifecycle `Created` scope, which has no failing cursor for the poll to
+/// re-raise the directive from). The caller owes that scope a re-offer after
+/// resume, see [`DeferredScopeRepairs`]. Every other outcome is `None`.
 pub(crate) async fn handle_account_error(
     ctx: &RecoveryContext<'_>,
     scope: Option<CursorScope>,
     error: AccountError,
-) {
+) -> Option<CursorScope> {
     use crate::recovery::{RecoveryPlan, plan_recovery};
     // Clone so we can log structured fields after dispatch consumes
     // the value.
     let plan = plan_recovery(error.clone());
+    let mut deferred = None;
     match plan {
         RecoveryPlan::Retry(advice) => {
             // The reopen listener is a serialization point for real
@@ -121,7 +128,7 @@ pub(crate) async fn handle_account_error(
                 EngineDirective::RestartAccount | EngineDirective::DowngradeStrategy(_) => None,
                 _ => Some(ctx.reopen_lock.lock().await),
             };
-            handle_engine_directive(ctx, scope, directive, error).await;
+            deferred = handle_engine_directive(ctx, scope, directive, error).await;
         }
         RecoveryPlan::Terminal(fatal) => {
             // Broadcast already carried the terminating event. Emit a
@@ -144,6 +151,7 @@ pub(crate) async fn handle_account_error(
             );
         }
     }
+    deferred
 }
 
 /// Record any provider-documented throttle scope on the engine's
@@ -191,7 +199,10 @@ async fn handle_engine_directive(
     fallback_scope: Option<CursorScope>,
     directive: EngineDirective,
     error: AccountError,
-) {
+) -> Option<CursorScope> {
+    // The scope of a declined repair that nothing will raise again; see
+    // `handle_account_error`.
+    let mut deferred = None;
     // Every current directive has an explicit dispatch arm. The required
     // non-exhaustive fallback makes a future variant visible in logs until a
     // human gives it an intentional engine action.
@@ -200,15 +211,23 @@ async fn handle_engine_directive(
             // Pass the directive's own scope to broadcast_warning so
             // the multiplexer event's `scope` matches the affected
             // scope - not the worker-suggested fallback. (sync-N4)
-            restart_scope(ctx, directive_scope).await;
+            //
+            // A declined repair of a scope with no registered cursor - the
+            // synthesized directive a lifecycle `Created` raises, before any
+            // cursor exists - has no failing cursor to re-raise it after
+            // resume, so it is handed back for the listener to re-offer. A
+            // scope WITH a cursor needs nothing: the poll raises it again.
+            if !restart_scope(ctx, directive_scope.clone()).await
+                && ctx.cursors.snapshot(&directive_scope).is_none()
+            {
+                deferred = Some(directive_scope);
+            }
         }
         EngineDirective::DowngradeCapabilityForScope(directive_scope) => {
             // Registered before the warning, so a deferred repair does not
             // announce a downgrade that will be announced again when the poll
             // re-raises the directive after resume.
-            let Some(activity) = begin_scope_repair(ctx, &directive_scope) else {
-                return;
-            };
+            let activity = begin_scope_repair(ctx, &directive_scope)?;
             broadcast_warning(
                 ctx.changes_tx,
                 Some(directive_scope.clone()),
@@ -247,7 +266,7 @@ async fn handle_engine_directive(
             // paused, the establishment is refused, and the deleted scope
             // would stay gone after resume.
             if !restart_account(ctx).await {
-                return;
+                return None;
             }
             // If the originating error was scoped to a cursor, also
             // re-establish that scope so the downgrade takes effect
@@ -302,6 +321,84 @@ async fn handle_engine_directive(
             );
         }
     }
+    deferred
+}
+
+/// Scope repairs declined under a pause that nothing else will raise again,
+/// re-offered to the reopen listener once the account runs.
+///
+/// A repair of a scope that HAS a cursor needs no help: it declines without
+/// touching the cursor, and the poll raises the directive again after resume. A
+/// scope that has none - the directive a lifecycle `Created` synthesizes, before
+/// any cursor exists - is invisible to the multiplexer, which only polls
+/// registered scopes, so a declined repair of it was simply lost.
+///
+/// One instance per slot, owned by the reopen listener. Each parked scope is one
+/// small task that waits for the boundary to read `Run` and then sends the same
+/// synthesized directive back through the listener's own channel, so the repair
+/// runs through the ordinary dispatch (reopen lock, activity registration, the
+/// decline-under-pause check again). It is a task rather than a wait in the
+/// listener because the listener is the serialization point for real directives:
+/// blocking it across an unbounded pause would hold `RestartAccount` behind it.
+/// A scope is parked at most once, so repeated `Created` events during a long
+/// pause do not stack tasks; the task leaves through the shutdown token, so a
+/// detach never waits on one.
+pub(crate) struct DeferredScopeRepairs {
+    parked: Arc<std::sync::Mutex<HashSet<CursorScope>>>,
+}
+
+impl DeferredScopeRepairs {
+    pub(crate) fn new() -> Self {
+        Self {
+            parked: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Park `scope` until the account runs, then re-raise its restart directive
+    /// on `reopen_tx`. A no-op if it is already parked.
+    pub(crate) fn park(
+        &self,
+        scope: CursorScope,
+        control: SyncControl,
+        cursors: Arc<CursorRegistry>,
+        shutdown: CancellationToken,
+        reopen_tx: mpsc::Sender<ReopenRequest>,
+    ) {
+        let inserted = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(scope.clone());
+        if !inserted {
+            return;
+        }
+        let parked = Arc::clone(&self.parked);
+        tokio::spawn(async move {
+            let runs = control.wait_until_running(&shutdown).await;
+            // Unparked BEFORE the send, so a repair the listener declines again
+            // (a second pause) can park the scope afresh.
+            parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&scope);
+            // Something else established it while it waited (a second `Created`,
+            // a reattach): restarting a live cursor would reset healthy state.
+            if !runs || cursors.snapshot(&scope).is_some() {
+                return;
+            }
+            let error = crate::recovery::restart_scope_error(
+                scope.clone(),
+                bifrost_types::AccountOperation::SyncChanges,
+            );
+            tokio::select! {
+                () = shutdown.cancelled() => {}
+                _ = reopen_tx.send(ReopenRequest::Recovery {
+                    scope: Some(scope),
+                    error,
+                }) => {}
+            }
+        });
+    }
 }
 
 async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
@@ -319,6 +416,25 @@ async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
     // handle. Failure to re-establish a single scope escalates
     // per-scope (sync-D7): the account keeps running for the scopes
     // that succeed.
+    //
+    // The recovery deletes EVERY scope's cursor before it re-establishes any, so
+    // a pause landing inside it would strand all of them for the reason a scope
+    // repair must not (see `begin_scope_repair`): the establishment is
+    // refused on a paused account and nothing raises the directive again. It
+    // therefore registers activity before touching anything, declines outright
+    // on a paused account (the failing cursors stay registered and re-raise it
+    // after resume), and holds the registration through the last
+    // re-establishment, which runs on a control that registration admits.
+    let Some(activity) = ctx.control.begin_activity() else {
+        tracing::debug!(
+            target: "bifrost.sync.changes",
+            account = ?ctx.account_id,
+            "schema recovery deferred: the account is paused; every cursor stays registered \
+             so the poll raises the directive again after resume"
+        );
+        return;
+    };
+    let admitted = ctx.control.admitted_by(&activity);
     let scopes: Vec<CursorScope> = ctx.cursors.all_scopes();
     for s in &scopes {
         ctx.cursors.delete(s);
@@ -333,7 +449,7 @@ async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
         }
     }
     for s in scopes {
-        re_establish_scope_with_backoff(ctx, s, ctx.control).await;
+        re_establish_scope_with_backoff(ctx, s, &admitted).await;
     }
 }
 
@@ -1413,8 +1529,30 @@ pub(super) async fn reattach_account(
             };
             *capabilities = next.capabilities().clone();
         }
-        ctx.subscriptions
-            .replace(ctx.account_id.clone(), installed_subscriptions);
+        // Sealed against detach like every registry write (see
+        // `SubscriptionRegistry::replace`). A refusal means detach cancelled the
+        // slot after this reattach's last shutdown check and has taken, or will
+        // take, the registry: the replacement's handles are live on the account
+        // that just became current and nothing will ever hold them. They go
+        // straight back into the guard, in the same synchronous step, so a drop
+        // from here on still deletes them; the unwind that settles them runs at
+        // the end, after every step that publishes the cutover. The carried
+        // orphans name the PREVIOUS connection's handles and are dropped as detach
+        // drops stranded records, which its own take logs.
+        let mut refused_install = 0_usize;
+        if let Err(refused) = ctx.subscriptions.replace(
+            ctx.account_id.clone(),
+            installed_subscriptions,
+            ctx.shutdown,
+        ) {
+            for record in refused {
+                if record.desired {
+                    guard.push(record);
+                } else {
+                    refused_install += 1;
+                }
+            }
+        }
         // The replacement open's skip lane supersedes the previous
         // one: a healed namespace disappears from it, a still-degraded
         // one reappears with a fresh classification.
@@ -1456,6 +1594,24 @@ pub(super) async fn reattach_account(
                 );
             }
         }
+
+        // A refused install (detach won the race for the registry) left the
+        // replacement's handles in the guard. Tear them down now that nothing
+        // publishing the cutover is left to delay. The reattach still reports
+        // success: the swap committed and the replacement is the live account;
+        // it is the registration that was refused, and a failure here would send
+        // the caller's retry budget after a swap that cannot be undone.
+        if !guard.live.is_empty() || refused_install > 0 {
+            tracing::warn!(
+                target: "bifrost.sync.reopen",
+                account = ?ctx.account_id,
+                handles = guard.live.len(),
+                carried_orphans = refused_install,
+                "slot detached during reattach; tearing down the replacement's push \
+                 subscriptions, which no registry entry can hold"
+            );
+        }
+        unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard).await;
 
         // Through the guard, which owes this close until it returns: a drop
         // parked here (or before it) closes the old connection instead of

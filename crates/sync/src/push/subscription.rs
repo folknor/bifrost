@@ -6,6 +6,7 @@
 
 use bifrost_types::{AccountId, CursorScope, SubscriptionHandle};
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -70,18 +71,38 @@ impl SubscriptionRegistry {
         Self::default()
     }
 
-    /// Record a handle for an account.
-    pub fn record(&self, account: AccountId, handle: SubscriptionHandle, scopes: Vec<CursorScope>) {
-        self.inner
-            .entry(account)
-            .or_default()
-            .push(RegisteredSubscription {
-                handle,
-                scopes,
-                teardown_unconfirmed: false,
-                desired: true,
-                torn_down: false,
-            });
+    /// Record a handle for an account, unless the owning slot is being torn
+    /// down. Returns whether the record was written; `false` means the slot's
+    /// `shutdown` token was already cancelled and nothing was registered, so the
+    /// caller still owns a live subscription the registry will never hold.
+    ///
+    /// The token is read inside the entry's shard lock, for the reason
+    /// [`Self::restore_orphans`] gives: detach cancels the token before it takes
+    /// the account's records, so a write that reads the token here is either
+    /// ordered before the take (which discards it with the rest of the
+    /// incarnation) or after it, where the cancellation is visible and the write
+    /// is refused. A record landing after the take would sit under an id a later
+    /// attach of the same `AccountId` inherits.
+    #[must_use]
+    pub fn record(
+        &self,
+        account: AccountId,
+        handle: SubscriptionHandle,
+        scopes: Vec<CursorScope>,
+        shutdown: &CancellationToken,
+    ) -> bool {
+        let entry = self.inner.entry(account);
+        if shutdown.is_cancelled() {
+            return false;
+        }
+        entry.or_default().push(RegisteredSubscription {
+            handle,
+            scopes,
+            teardown_unconfirmed: false,
+            desired: true,
+            torn_down: false,
+        });
+        true
     }
 
     /// Take all records registered for an account that still have a
@@ -186,12 +207,42 @@ impl SubscriptionRegistry {
             .unwrap_or_default()
     }
 
-    pub(crate) fn replace(&self, account: AccountId, records: Vec<RegisteredSubscription>) {
-        if records.is_empty() {
-            self.inner.remove(&account);
-        } else {
-            self.inner.insert(account, records);
+    /// Install `records` as the account's whole registry entry, unless the
+    /// owning slot is being torn down. `Err` hands the records back untouched:
+    /// the `shutdown` token was already cancelled, nothing was written, and the
+    /// caller still owns whatever server-side subscriptions the records name.
+    ///
+    /// Sealed the same way as [`Self::restore_orphans`] and [`Self::record`], by
+    /// reading the token inside the entry's shard lock that [`Self::take`] runs
+    /// under. Installing an empty set only removes the entry, which detach's take
+    /// would have done anyway, so it is never refused.
+    pub(crate) fn replace(
+        &self,
+        account: AccountId,
+        records: Vec<RegisteredSubscription>,
+        shutdown: &CancellationToken,
+    ) -> Result<(), Vec<RegisteredSubscription>> {
+        match self.inner.entry(account) {
+            Entry::Occupied(mut occupied) => {
+                if records.is_empty() {
+                    occupied.remove();
+                } else if shutdown.is_cancelled() {
+                    return Err(records);
+                } else {
+                    occupied.insert(records);
+                }
+            }
+            Entry::Vacant(vacant) => {
+                if records.is_empty() {
+                    return Ok(());
+                }
+                if shutdown.is_cancelled() {
+                    return Err(records);
+                }
+                vacant.insert(records);
+            }
         }
+        Ok(())
     }
 
     /// Snapshot for tests.
@@ -227,11 +278,12 @@ mod tests {
     fn a_live_slot_keeps_its_restored_orphans() {
         let registry = SubscriptionRegistry::new();
         let account = AccountId("live".to_owned());
-        registry.record(
+        assert!(registry.record(
             account.clone(),
             SubscriptionHandle("wanted".to_owned()),
             vec![],
-        );
+            &CancellationToken::new(),
+        ));
         assert!(registry.restore_orphans(
             account.clone(),
             vec![orphan("refused")],
@@ -257,5 +309,61 @@ mod tests {
             registry.take(&account).is_empty(),
             "a later attach of the same id inherits nothing"
         );
+    }
+
+    /// A registration made after detach's take is refused, and leaves no entry.
+    #[test]
+    fn a_cancelled_slot_refuses_a_new_record_and_leaves_no_entry() {
+        let registry = SubscriptionRegistry::new();
+        let account = AccountId("detached-record".to_owned());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert!(registry.take(&account).is_empty());
+        assert!(!registry.record(
+            account.clone(),
+            SubscriptionHandle("late".to_owned()),
+            vec![],
+            &shutdown
+        ));
+        assert_eq!(registry.len(&account), 0);
+    }
+
+    /// A reattach commit landing after detach's take is refused, hands its
+    /// records back, and leaves nothing behind; an empty set is never refused.
+    #[test]
+    fn a_cancelled_slot_refuses_a_replacement_and_returns_the_records() {
+        let registry = SubscriptionRegistry::new();
+        let account = AccountId("detached-replace".to_owned());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert!(registry.take(&account).is_empty());
+        let refused = registry
+            .replace(account.clone(), vec![orphan("late")], &shutdown)
+            .expect_err("a cancelled slot refuses the install");
+        assert_eq!(refused.len(), 1);
+        assert_eq!(registry.len(&account), 0);
+        assert!(registry.replace(account, Vec::new(), &shutdown).is_ok());
+    }
+
+    /// A live slot's replacement swaps the whole entry.
+    #[test]
+    fn a_live_slot_installs_a_replacement() {
+        let registry = SubscriptionRegistry::new();
+        let account = AccountId("live-replace".to_owned());
+        let shutdown = CancellationToken::new();
+        assert!(registry.record(
+            account.clone(),
+            SubscriptionHandle("old".to_owned()),
+            vec![],
+            &shutdown
+        ));
+        assert!(
+            registry
+                .replace(account.clone(), vec![orphan("new")], &shutdown)
+                .is_ok()
+        );
+        let held = registry.snapshot(&account);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].handle, SubscriptionHandle("new".to_owned()));
     }
 }
