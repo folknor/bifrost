@@ -465,11 +465,20 @@ step's await has answered:
   queue depends on it, and the only await in that span is the commit's own
   channel send.
 
+Provisional state is attempt-scoped. Each guard mints a unique attempt id from a
+process-wide monotonic counter; `ReattachInsert`, `ReattachAbort` and
+`ReattachCommit` all carry it, and the writer keeps a scope-to-attempt map. An
+abort deletes, and a commit promotes, only rows the named attempt owns; a later
+attempt inserting the same scope takes ownership. An acknowledged checkpoint
+still discharges a scope's provisional state whichever attempt owns it.
+
 On a drop the guard enqueues the writer's `ReattachAbort` or `ReattachCommit`
 synchronously with `try_send`. That is deliberate: the request lands in the
-writer's queue ahead of anything a later reattach could insert, which a spawned
-task would not guarantee, and the writer's abort handles only rows still
-provisional. A full channel falls back to a spawned send. Then it spawns one
+writer's queue ahead of anything a later reattach could insert, and the writer's
+abort handles only rows still provisional. A full channel falls back to a
+spawned send, which has no ordering against the next reattach; that is safe
+because the attempt id stops the late request touching a newer attempt's rows.
+Then it spawns one
 task that deletes any remaining handles on the replacement, registers refusals
 as orphans, and closes whatever account is owed (a second close after a
 cancelled first one, since the cancelled call proved nothing). The deletes

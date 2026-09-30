@@ -160,7 +160,14 @@ pub(super) async fn ack_writer(
     // provisional turns the abort into a conditional delete, implemented here
     // rather than pushed onto every `CheckpointStore` backend as a
     // compare-and-swap it could get subtly wrong.
-    let mut provisional: HashSet<CursorScope> = HashSet::new();
+    //
+    // Each entry names the reattach ATTEMPT that owns the mark. An abort or
+    // commit acts only on rows its own attempt owns: a dropped reattach's guard
+    // can fall back to a spawned send that reaches this queue after the next
+    // attempt has already inserted, and an account-wide set let that stale
+    // abort delete the newer attempt's rows. A later attempt inserting a scope
+    // takes ownership of it.
+    let mut provisional: HashMap<CursorScope, u64> = HashMap::new();
     let mut pending_repairs: HashMap<
         crate::cursor::PublicationId,
         Vec<crate::repair::RepairResolution>,
@@ -191,10 +198,15 @@ pub(super) async fn ack_writer(
                 // checkpoint-bearing batches BEFORE cutover, so this genuinely
                 // happens: without the discharge, an abort would delete a
                 // cursor the consumer had already persisted against.
+                // Whichever attempt owns the mark.
                 provisional.remove(&req.scope);
                 req
             }
-            WriterRequest::ReattachInsert { cursor, done } => {
+            WriterRequest::ReattachInsert {
+                attempt,
+                cursor,
+                done,
+            } => {
                 let scope = cursor.scope.clone();
                 // Carries NO coverage report, which means "leave the ledger
                 // unchanged" - emphatically not "coverage is complete". A
@@ -212,7 +224,7 @@ pub(super) async fn ack_writer(
                     )
                     .await;
                 if result.is_ok() {
-                    provisional.insert(scope);
+                    provisional.insert(scope, attempt);
                 }
                 let _ = done.send(result);
                 continue;
@@ -358,8 +370,14 @@ pub(super) async fn ack_writer(
                 let _ = done.send(result);
                 continue;
             }
-            WriterRequest::ReattachAbort { done } => {
-                for scope in provisional.drain() {
+            WriterRequest::ReattachAbort { attempt, done } => {
+                let owned: Vec<CursorScope> = provisional
+                    .iter()
+                    .filter(|(_, owner)| **owner == attempt)
+                    .map(|(scope, _)| scope.clone())
+                    .collect();
+                for scope in owned {
+                    provisional.remove(&scope);
                     if let Err(error) = store.delete_change_cursor(&account_id, &scope).await {
                         tracing::error!(
                             target: "bifrost.sync.reopen",
@@ -373,8 +391,8 @@ pub(super) async fn ack_writer(
                 let _ = done.send(());
                 continue;
             }
-            WriterRequest::ReattachCommit => {
-                provisional.clear();
+            WriterRequest::ReattachCommit { attempt } => {
+                provisional.retain(|_, owner| *owner != attempt);
                 continue;
             }
             WriterRequest::GetChangeCursor { scope, done } => {
@@ -689,21 +707,29 @@ impl WriterHandle {
         self.tx.clone()
     }
 
-    pub(super) async fn reattach_insert(&self, cursor: ChangeCursor) -> Result<(), Error> {
+    pub(super) async fn reattach_insert(
+        &self,
+        attempt: u64,
+        cursor: ChangeCursor,
+    ) -> Result<(), Error> {
         let (done, recv) = oneshot::channel();
         self.tx
-            .send(WriterRequest::ReattachInsert { cursor, done })
+            .send(WriterRequest::ReattachInsert {
+                attempt,
+                cursor,
+                done,
+            })
             .await
             .map_err(|error| Error::Other(format!("writer channel closed: {error}")))?;
         recv.await
             .map_err(|error| Error::Other(format!("writer dropped before persisting: {error}")))?
     }
 
-    pub(super) async fn reattach_abort(&self) {
+    pub(super) async fn reattach_abort(&self, attempt: u64) {
         let (done, recv) = oneshot::channel();
         if self
             .tx
-            .send(WriterRequest::ReattachAbort { done })
+            .send(WriterRequest::ReattachAbort { attempt, done })
             .await
             .is_ok()
         {
@@ -711,9 +737,9 @@ impl WriterHandle {
         }
     }
 
-    pub(super) async fn reattach_commit(&self) -> Result<(), Error> {
+    pub(super) async fn reattach_commit(&self, attempt: u64) -> Result<(), Error> {
         self.tx
-            .send(WriterRequest::ReattachCommit)
+            .send(WriterRequest::ReattachCommit { attempt })
             .await
             .map_err(|error| Error::Other(format!("writer channel closed: {error}")))
     }

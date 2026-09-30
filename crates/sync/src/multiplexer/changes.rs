@@ -446,16 +446,29 @@ pub enum WriterRequest {
     /// not cut over put it there". Only such rows may be rolled back, which is
     /// what lets the abort path compensate by plain deletion without ever
     /// touching preexisting durable state.
+    ///
+    /// `attempt` is the unique id of the reattach attempt inserting the row.
+    /// The provisional mark is owned by that attempt, so a delayed abort or
+    /// commit from an EARLIER attempt (a dropped reattach's guard can fall back
+    /// to a spawned send with no ordering against the next reattach) cannot
+    /// touch this one's rows. A later attempt inserting the same scope takes
+    /// ownership of it.
     ReattachInsert {
+        attempt: u64,
         cursor: ChangeCursor,
         done: oneshot::Sender<Result<(), Error>>,
     },
-    /// The reattach aborted: delete the rows it inserted that are STILL
-    /// provisional. A scope whose checkpoint was acknowledged in the meantime
-    /// is no longer provisional and survives.
-    ReattachAbort { done: oneshot::Sender<()> },
-    /// The reattach cut over: its rows are now ordinary durable state.
-    ReattachCommit,
+    /// The named reattach attempt aborted: delete the rows IT owns that are
+    /// STILL provisional. A scope whose checkpoint was acknowledged in the
+    /// meantime is no longer provisional and survives, and so does a row now
+    /// owned by a different attempt.
+    ReattachAbort {
+        attempt: u64,
+        done: oneshot::Sender<()>,
+    },
+    /// The named reattach attempt cut over: the rows it owns are now ordinary
+    /// durable state. Rows owned by other attempts stay provisional.
+    ReattachCommit { attempt: u64 },
     /// Read one cursor through the same account-owned boundary used for writes.
     GetChangeCursor {
         scope: CursorScope,
@@ -589,12 +602,21 @@ impl std::fmt::Debug for WriterRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ack(request) => f.debug_tuple("Ack").field(request).finish(),
-            Self::ReattachInsert { cursor, .. } => f
+            Self::ReattachInsert {
+                attempt, cursor, ..
+            } => f
                 .debug_struct("ReattachInsert")
+                .field("attempt", attempt)
                 .field("scope", &cursor.scope)
                 .finish(),
-            Self::ReattachAbort { .. } => f.write_str("ReattachAbort"),
-            Self::ReattachCommit => f.write_str("ReattachCommit"),
+            Self::ReattachAbort { attempt, .. } => f
+                .debug_struct("ReattachAbort")
+                .field("attempt", attempt)
+                .finish(),
+            Self::ReattachCommit { attempt } => f
+                .debug_struct("ReattachCommit")
+                .field("attempt", attempt)
+                .finish(),
             Self::GetChangeCursor { scope, .. } => f
                 .debug_struct("GetChangeCursor")
                 .field("scope", scope)

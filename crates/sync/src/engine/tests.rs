@@ -2468,6 +2468,7 @@ async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
     for name in ["acked", "orphan"] {
         let (done, wait) = oneshot::channel();
         tx.send(WriterRequest::ReattachInsert {
+            attempt: 1,
             cursor: cursor(name),
             done,
         })
@@ -2491,7 +2492,7 @@ async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
     wait.await.expect("writer answered").expect("ack persisted");
 
     let (done, wait) = oneshot::channel();
-    tx.send(WriterRequest::ReattachAbort { done })
+    tx.send(WriterRequest::ReattachAbort { attempt: 1, done })
         .await
         .expect("writer alive");
     wait.await.expect("abort ran");
@@ -2515,6 +2516,155 @@ async fn an_aborted_reattach_spares_a_cursor_an_ack_has_claimed() {
 
     drop(tx);
     writer.await.expect("writer exits");
+}
+
+/// A running ack writer over an in-memory store, for the attempt-ownership
+/// tests below.
+struct ProvisionalWriter {
+    account: bifrost_types::AccountId,
+    store: Arc<DynCheckpointStore>,
+    tx: mpsc::Sender<WriterRequest>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProvisionalWriter {
+    fn spawn() -> Self {
+        let account = bifrost_types::AccountId("acct".into());
+        let store: Arc<DynCheckpointStore> =
+            Arc::new(crate::cursor::InMemoryCheckpointStore::default());
+        let (tx, rx) = mpsc::channel::<WriterRequest>(16);
+        let (boundary, _view) = crate::cancel::Boundary::new();
+        let (priority, _priority_view) =
+            tokio::sync::watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, _bandwidth_view) = tokio::sync::watch::channel(None);
+        let control =
+            crate::control::SyncControl::new(account.clone(), boundary, priority, bandwidth);
+        let task = tokio::spawn(ack_writer(
+            account.clone(),
+            Arc::clone(&store),
+            control,
+            Arc::new(crate::cursor::PendingCoverage::new()),
+            rx,
+        ));
+        Self {
+            account,
+            store,
+            tx,
+            task,
+        }
+    }
+
+    fn scope(name: &str) -> CursorScope {
+        CursorScope::Folder(FolderId(name.into()))
+    }
+
+    async fn insert(&self, attempt: u64, name: &str) {
+        use bifrost_types::{ChangeCursor, OpaqueChangeState, ProtocolKind};
+        let (done, wait) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::ReattachInsert {
+                attempt,
+                cursor: ChangeCursor {
+                    scope: Self::scope(name),
+                    server_state: OpaqueChangeState {
+                        protocol: ProtocolKind::Imap,
+                        envelope_version: 1,
+                        bytes: vec![1],
+                    },
+                    advanced_through: None,
+                    envelope_version: 1,
+                },
+                done,
+            })
+            .await
+            .expect("writer alive");
+        wait.await.expect("writer answered").expect("insert");
+    }
+
+    async fn abort(&self, attempt: u64) {
+        let (done, wait) = oneshot::channel();
+        self.tx
+            .send(WriterRequest::ReattachAbort { attempt, done })
+            .await
+            .expect("writer alive");
+        wait.await.expect("abort ran");
+    }
+
+    async fn commit(&self, attempt: u64) {
+        self.tx
+            .send(WriterRequest::ReattachCommit { attempt })
+            .await
+            .expect("writer alive");
+    }
+
+    async fn has(&self, name: &str) -> bool {
+        self.store
+            .get_change_cursor(&self.account, &Self::scope(name))
+            .await
+            .expect("store read")
+            .is_some()
+    }
+
+    async fn finish(self) {
+        drop(self.tx);
+        self.task.await.expect("writer exits");
+    }
+}
+
+/// A dropped reattach's abort can reach the writer AFTER the next reattach has
+/// inserted: the guard's synchronous enqueue falls back to a spawned send when
+/// the queue is full, and that send is unordered against the next attempt. The
+/// stale abort must delete only what its own attempt inserted, and the newer
+/// attempt's commit must still promote its row.
+#[tokio::test]
+async fn a_stale_abort_spares_a_later_attempts_rows() {
+    let writer = ProvisionalWriter::spawn();
+
+    writer.insert(1, "a-row").await;
+    writer.insert(2, "b-row").await;
+    writer.abort(1).await;
+
+    assert!(!writer.has("a-row").await, "the aborted attempt's row goes");
+    assert!(
+        writer.has("b-row").await,
+        "a delayed abort from attempt 1 must not delete attempt 2's row"
+    );
+
+    writer.commit(2).await;
+    // A later abort naming the committed attempt finds nothing provisional.
+    writer.abort(2).await;
+    assert!(
+        writer.has("b-row").await,
+        "attempt 2's commit must have promoted its row"
+    );
+
+    writer.finish().await;
+}
+
+/// When a later attempt re-inserts a scope an earlier attempt already marked,
+/// it takes ownership: the earlier attempt's abort spares the row, and only the
+/// owner's abort deletes it.
+#[tokio::test]
+async fn a_reinserting_attempt_takes_ownership_of_the_scope() {
+    let writer = ProvisionalWriter::spawn();
+
+    writer.insert(1, "shared").await;
+    writer.insert(2, "shared").await;
+    writer.abort(1).await;
+    assert!(
+        writer.has("shared").await,
+        "attempt 1 no longer owns the row attempt 2 re-inserted"
+    );
+
+    // The earlier attempt's commit is equally inert.
+    writer.commit(1).await;
+    writer.abort(2).await;
+    assert!(
+        !writer.has("shared").await,
+        "the owning attempt's abort still rolls the row back"
+    );
+
+    writer.finish().await;
 }
 
 #[test]

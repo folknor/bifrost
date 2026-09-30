@@ -697,15 +697,25 @@ pub(super) struct ReattachGuard {
     reopen_lock: Arc<AsyncMutex<()>>,
     /// The account's writer queue, for the synchronous compensation on drop.
     writer: tokio::sync::mpsc::Sender<WriterRequest>,
+    /// This attempt's unique id. It rides every provisional insert and the
+    /// abort or commit that settles them, so the writer touches only rows this
+    /// attempt owns, even when a delayed send from a dropped attempt arrives
+    /// after a later attempt has inserted.
+    attempt: u64,
     live: Vec<RegisteredSubscription>,
     close_owed: Option<Arc<dyn Account>>,
     rollback_owed: bool,
     commit_owed: bool,
 }
 
+/// Source of reattach attempt ids. Process-wide and monotonic, so an id is
+/// unique across every slot and every writer, not just within one account.
+static NEXT_REATTACH_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl ReattachGuard {
     fn new(ctx: &RecoveryContext<'_>, account: Arc<dyn Account>) -> Self {
         Self {
+            attempt: NEXT_REATTACH_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             close_owed: Some(Arc::clone(&account)),
             account,
             subscriptions: Arc::clone(ctx.subscriptions),
@@ -785,7 +795,10 @@ impl Drop for ReattachGuard {
             let (done, _ignored) = oneshot::channel();
             enqueue_writer_request(
                 &self.writer,
-                WriterRequest::ReattachAbort { done },
+                WriterRequest::ReattachAbort {
+                    attempt: self.attempt,
+                    done,
+                },
                 runtime.as_ref(),
                 &self.account_id,
             );
@@ -793,7 +806,9 @@ impl Drop for ReattachGuard {
         if self.commit_owed {
             enqueue_writer_request(
                 &self.writer,
-                WriterRequest::ReattachCommit,
+                WriterRequest::ReattachCommit {
+                    attempt: self.attempt,
+                },
                 runtime.as_ref(),
                 &self.account_id,
             );
@@ -976,7 +991,7 @@ async fn retire_stranded(stranded: Stranded) {
 /// drop parked inside this await still compensates (a second abort is
 /// idempotent: the first left nothing provisional).
 async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>, guard: &mut ReattachGuard) {
-    ctx.writer.reattach_abort().await;
+    ctx.writer.reattach_abort(guard.attempt).await;
     guard.rollback_owed = false;
 }
 
@@ -990,7 +1005,7 @@ async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>, guard: &mut Reatta
 /// `reattach_commit` is only a channel send), so a drop parked while the
 /// channel is full still promotes the rows.
 async fn commit_reattach_inserts(ctx: &RecoveryContext<'_>, guard: &mut ReattachGuard) {
-    if ctx.writer.reattach_commit().await.is_err() {
+    if ctx.writer.reattach_commit(guard.attempt).await.is_err() {
         tracing::error!(
             target: "bifrost.sync.reopen",
             account = ?ctx.account_id,
@@ -1252,9 +1267,10 @@ pub(super) async fn reattach_account(
         // so a drop parked inside an insert (whose request may already be
         // queued) still rolls back.
         guard.rollback_owed = !newly_established.is_empty();
+        let attempt = guard.attempt;
         let durable_result = async {
             for cursor in &newly_established {
-                ctx.writer.reattach_insert(cursor.clone()).await?;
+                ctx.writer.reattach_insert(attempt, cursor.clone()).await?;
             }
             Ok::<(), Error>(())
         }
