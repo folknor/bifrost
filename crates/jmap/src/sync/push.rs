@@ -152,11 +152,16 @@ pub(crate) trait PushTransport: Send + Sync + 'static {
     fn connect_push(&self) -> impl Future<Output = crate::Result<Self::Stream>> + Send;
 
     /// Apply `data_types` as the connection's push subscription.
+    ///
+    /// Returns the crate error unconverted, because the callers do not all
+    /// treat it alike: `unsubscribe` reads a failed sink write as a
+    /// completed removal (see there), `subscribe` reports it through
+    /// `push_set_error`, and the reader only needs to know it failed.
     fn set_push_data_types(
         &self,
         data_types: &DataTypeSet,
         push_state: Option<String>,
-    ) -> impl Future<Output = Result<(), AccountError>> + Send;
+    ) -> impl Future<Output = crate::Result<()>> + Send;
 
     /// Send a WebSocket ping on the current connection.
     ///
@@ -180,7 +185,7 @@ impl PushTransport for Client {
         &self,
         data_types: &DataTypeSet,
         push_state: Option<String>,
-    ) -> impl Future<Output = Result<(), AccountError>> + Send {
+    ) -> impl Future<Output = crate::Result<()>> + Send {
         apply_push_set(self, data_types, push_state)
     }
 
@@ -320,7 +325,8 @@ pub(crate) fn subscribe<T: PushTransport>(
         let union = union_data_types(&prospective);
         client
             .set_push_data_types(&union, push_state_guard.clone())
-            .await?;
+            .await
+            .map_err(push_set_error)?;
         subscriptions_guard.insert(handle.clone(), data_types);
         commit_push_set(&mut enabled_guard, &mut push_state_guard, union);
         Ok((handle, accepted))
@@ -341,9 +347,33 @@ pub(crate) fn unsubscribe<T: PushTransport>(
         let mut prospective = subscriptions_guard.clone();
         prospective.remove(&handle);
         let union = union_data_types(&prospective);
-        client
+        match client
             .set_push_data_types(&union, push_state_guard.clone())
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            // The frame could not be written because the connection is
+            // finished: every failed sink write leaves the stream closed
+            // for good. RFC 8887 push is enabled per connection, so the
+            // subscription this frame would have narrowed exists nowhere
+            // any more, and the removal is complete rather than pending.
+            // Commit it: the reader re-applies the committed `enabled`
+            // union on its next connection. It cannot apply a stale one:
+            // the send found the dead sink, so the reader had not yet
+            // installed its next connection, and its re-enable reads
+            // `enabled` only after installing it - behind the guard this
+            // call holds until the commit.
+            //
+            // Reporting this as a failure lost subscriptions. The engine's
+            // reopen tears down each old handle on the old account before
+            // cutover; after a WebSocket drop that account's sink is dead,
+            // the teardown failed, the reopen aborted, and the record was
+            // marked `teardown_unconfirmed` - which the next attempt
+            // carries but never recreates, so the consumer's subscription
+            // silently stopped existing on the replacement.
+            Err(crate::Error::WebSocketSend(_)) => {}
+            Err(err) => return Err(push_set_error(err)),
+        }
         subscriptions_guard.remove(&handle);
         commit_push_set(&mut enabled_guard, &mut push_state_guard, union);
         Ok(())
@@ -417,25 +447,41 @@ async fn apply_push_set(
     client: &Client,
     data_types: &DataTypeSet,
     push_state: Option<String>,
-) -> Result<(), AccountError> {
-    let result = if data_types.is_empty() {
+) -> crate::Result<()> {
+    if data_types.is_empty() {
         client.disable_push_ws().await
     } else {
         let values = data_types.iter().cloned().collect::<Vec<_>>();
         client.enable_push_ws(Some(values), push_state).await
-    };
+    }
+}
 
-    match result {
-        Ok(()) => Ok(()),
-        Err(crate::Error::WebSocketNotConnected) => Err(super::error::unsupported_error(
+/// Classify a failed push-set frame for the consumer.
+///
+/// The frame is replay-safe, whatever the central table says about
+/// `PushSubscribe`. That operation is non-idempotent because on webhook
+/// providers a subscribe CREATES a server resource, and replaying it after
+/// an in-flight drop can create a second one. A JMAP `WebSocketPushEnable`
+/// or `WebSocketPushDisable` creates nothing: it carries the complete
+/// desired data-type set for the connection, so applying it twice leaves
+/// the same state as applying it once. Without the override an in-flight
+/// sink failure derives `Reconcile(TransportDropAfterSend, [CheckTarget])`,
+/// which asks the consumer to read back a target that does not exist.
+fn push_set_error(err: crate::Error) -> AccountError {
+    match err {
+        crate::Error::WebSocketNotConnected => super::error::unsupported_error(
             AccountOperation::PushSubscribe,
             None,
             "JMAP push: WebSocket not connected",
-        )),
-        Err(err) => Err(super::error::into_account_error(
+        ),
+        err => super::error::into_account_error(
             err,
             super::error::JmapErrorContext::new(AccountOperation::PushSubscribe),
-        )),
+        )
+        .into_builder()
+        .idempotency_override(true)
+        .try_build()
+        .expect("valid account error classification"),
     }
 }
 
@@ -568,18 +614,21 @@ async fn reader_pass<T: PushTransport>(
 
     // A re-enable that never completes means the sink is wedged even
     // though the handshake answered; one that fails FAST means the link
-    // died between handshake and subscribe (`enable_push_ws` errors only
-    // when the sink send fails or the connection is already gone - a
-    // server-side rejection of the frame would arrive as a `RequestError`
-    // on the read stream instead). Either way this connection carries no
-    // applied subscription, so reading from it would announce
-    // `Reconnected` and then fall silent: a dead-push state the engine
-    // cannot tell apart from a quiet mailbox. Drop the connection and
-    // reconnect. Terminality is deliberately not consulted here: the only
-    // terminal-classified error this path produces is
-    // `WebSocketNotConnected -> Unsupported`, which in this position
-    // means the socket raced away (transient), and a genuinely terminal
-    // condition surfaces as such at the next handshake.
+    // died between handshake and subscribe. A server-side rejection of
+    // the frame never fails it - that arrives as a `RequestError` on the
+    // read stream instead. Either way this connection carries no applied
+    // subscription, so reading from it would announce `Reconnected` and
+    // then fall silent: a dead-push state the engine cannot tell apart
+    // from a quiet mailbox. Drop the connection and reconnect.
+    //
+    // Terminality is not consulted, because nothing this call can fail
+    // with here is terminal. `connect_ws` installs the new sink before it
+    // returns and nothing ever uninstalls one, so `WebSocketNotConnected`
+    // cannot occur after a successful handshake. What remains is a failed
+    // sink write (`WebSocketSend`, a transient `Transport(Network)`) and
+    // encoding the frame, which cannot fail for a data-type list and an
+    // optional string. A genuinely terminal condition surfaces as such at
+    // the next handshake.
     match bounded(
         shutdown,
         policy.connect_timeout,
@@ -710,7 +759,7 @@ async fn reenable_current_push_set<T: PushTransport>(
     transport: &T,
     enabled: &Arc<Mutex<DataTypeSet>>,
     push_state: &Arc<Mutex<Option<String>>>,
-) -> Result<(), AccountError> {
+) -> crate::Result<()> {
     let current = {
         let guard = enabled.lock().await;
         guard.clone()
@@ -1050,17 +1099,13 @@ mod tests {
             &self,
             data_types: &DataTypeSet,
             push_state: Option<String>,
-        ) -> Result<(), AccountError> {
+        ) -> crate::Result<()> {
             self.applied
                 .lock()
                 .expect("apply log")
                 .push((data_types.clone(), push_state));
             if self.fail {
-                Err(super::super::error::unsupported_error(
-                    AccountOperation::PushSubscribe,
-                    None,
-                    "scripted push refusal",
-                ))
+                Err(crate::Error::WebSocketNotConnected)
             } else {
                 Ok(())
             }
@@ -1069,6 +1114,202 @@ mod tests {
         async fn ping_push(&self) -> crate::Result<()> {
             Ok(())
         }
+    }
+
+    /// Push transport whose every push-set frame fails with `error()`.
+    struct FailingPushSetTransport {
+        error: fn() -> crate::Error,
+    }
+
+    impl PushTransport for FailingPushSetTransport {
+        type Stream = BoxedWsStream;
+
+        async fn connect_push(&self) -> crate::Result<Self::Stream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn set_push_data_types(
+            &self,
+            _data_types: &DataTypeSet,
+            _push_state: Option<String>,
+        ) -> crate::Result<()> {
+            Err((self.error)())
+        }
+
+        async fn ping_push(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn sink_refused() -> crate::Error {
+        crate::Error::WebSocketSend(tokio_websockets::Error::AlreadyClosed)
+    }
+
+    fn sink_failed_mid_flush() -> crate::Error {
+        crate::Error::WebSocketSend(tokio_websockets::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        )))
+    }
+
+    fn unrelated_failure() -> crate::Error {
+        crate::Error::NotParsable("scripted".to_string())
+    }
+
+    fn transmission_state(error: &AccountError) -> Option<bifrost_types::TransmissionState> {
+        error.chain().iter().find_map(|cause| match cause {
+            bifrost_types::Cause::Attempt(attempt) => Some(attempt.transmission_state),
+            _ => None,
+        })
+    }
+
+    /// A subscribe whose frame hit a dead sink was acknowledged by nobody.
+    /// It used to surface as `Protocol(PartialResponse)` stamped
+    /// `Acknowledged`, which for the non-idempotent `PushSubscribe` derived
+    /// a `PartialCompletionSignal` reconcile with no target to read back.
+    /// It is a network failure, `Unsent` when the library refused the frame
+    /// and `InFlight` when the flush failed, and replayable either way: the
+    /// frame carries the whole desired set, so sending it twice is sending
+    /// it once. Nothing is committed.
+    #[tokio::test]
+    async fn a_subscribe_on_a_dead_sink_is_a_replayable_network_failure() {
+        use bifrost_types::{
+            AccountErrorKind, RecoveryClass, RetryDisposition, TransmissionState,
+            TransportErrorKind,
+        };
+
+        for (error, expected) in [
+            (
+                sink_refused as fn() -> crate::Error,
+                TransmissionState::Unsent,
+            ),
+            (sink_failed_mid_flush, TransmissionState::InFlight),
+        ] {
+            let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+            let enabled = Arc::new(Mutex::new(HashSet::new()));
+            let failure = subscribe(
+                FailingPushSetTransport { error },
+                PushCapability::InProcess,
+                SubscriptionHandle("dead".to_string()),
+                vec![CursorScope::Type(ObjectType::Email)],
+                Arc::clone(&subscriptions),
+                Arc::clone(&enabled),
+                Arc::new(Mutex::new(None)),
+            )
+            .await
+            .expect_err("nothing was applied");
+
+            assert_eq!(
+                failure.kind(),
+                &AccountErrorKind::Transport(TransportErrorKind::Network),
+                "{expected:?}"
+            );
+            assert_eq!(transmission_state(&failure), Some(expected));
+            match failure.recovery() {
+                RecoveryClass::Retry(advice) => {
+                    assert_eq!(advice.disposition, RetryDisposition::SameRequest);
+                }
+                other => panic!("{expected:?}: expected a replay, got {other:?}"),
+            }
+            assert!(subscriptions.lock().await.is_empty());
+            assert!(enabled.lock().await.is_empty());
+        }
+    }
+
+    /// The knock-on the dead-sink failure caused. After a WebSocket drop
+    /// the engine's reopen tears each old handle down on the OLD account,
+    /// whose sink is dead; the teardown failed, the record was marked
+    /// `teardown_unconfirmed`, and unconfirmed records are never recreated
+    /// on the replacement, so the consumer's subscription vanished.
+    ///
+    /// Push is per connection, so the dead connection's subscription is
+    /// already gone: the removal succeeds and commits, and the next
+    /// connection's re-enable applies the narrowed union.
+    #[tokio::test]
+    async fn an_unsubscribe_on_a_dead_sink_completes_and_the_next_connection_applies_it() {
+        for error in [sink_refused as fn() -> crate::Error, sink_failed_mid_flush] {
+            let kept = SubscriptionHandle("kept".to_string());
+            let dropped = SubscriptionHandle("dropped".to_string());
+            let subscriptions = Arc::new(Mutex::new(HashMap::from([
+                (
+                    kept.clone(),
+                    [DataType::Email].into_iter().collect::<DataTypeSet>(),
+                ),
+                (
+                    dropped.clone(),
+                    [DataType::Mailbox].into_iter().collect::<DataTypeSet>(),
+                ),
+            ])));
+            let enabled = Arc::new(Mutex::new(
+                [DataType::Email, DataType::Mailbox].into_iter().collect(),
+            ));
+            let push_state = Arc::new(Mutex::new(Some("push-7".to_string())));
+
+            unsubscribe(
+                FailingPushSetTransport { error },
+                dropped.clone(),
+                Arc::clone(&subscriptions),
+                Arc::clone(&enabled),
+                Arc::clone(&push_state),
+            )
+            .await
+            .expect("the dead connection's subscription is already gone");
+
+            assert!(!subscriptions.lock().await.contains_key(&dropped));
+            assert!(subscriptions.lock().await.contains_key(&kept));
+
+            let applied = Arc::new(StdMutex::new(Vec::new()));
+            reenable_current_push_set(
+                &RecordingPushTransport {
+                    fail: false,
+                    applied: Arc::clone(&applied),
+                },
+                &enabled,
+                &push_state,
+            )
+            .await
+            .expect("re-enable succeeds");
+            let applied = applied.lock().expect("apply log").clone();
+            assert_eq!(
+                applied,
+                vec![(
+                    [DataType::Email].into_iter().collect::<DataTypeSet>(),
+                    Some("push-7".to_string())
+                )],
+                "the next connection carries the narrowed union and the live position"
+            );
+        }
+    }
+
+    /// The absorption is for a finished connection only. Any other failure
+    /// is still reported, and still commits nothing. (`WebSocketNotConnected`
+    /// is deliberately not the example: its treatment is a separate open
+    /// question, and this test is about the sink-write arm's reach.)
+    #[tokio::test]
+    async fn an_unsubscribe_that_fails_otherwise_still_fails_and_commits_nothing() {
+        let handle = SubscriptionHandle("only".to_string());
+        let subscriptions = Arc::new(Mutex::new(HashMap::from([(
+            handle.clone(),
+            [DataType::Email].into_iter().collect::<DataTypeSet>(),
+        )])));
+        let enabled = Arc::new(Mutex::new([DataType::Email].into_iter().collect()));
+
+        unsubscribe(
+            FailingPushSetTransport {
+                error: unrelated_failure,
+            },
+            handle.clone(),
+            Arc::clone(&subscriptions),
+            Arc::clone(&enabled),
+            Arc::new(Mutex::new(None)),
+        )
+        .await
+        .expect_err("only a failed sink write proves the connection finished");
+
+        assert!(subscriptions.lock().await.contains_key(&handle));
+        assert_eq!(
+            *enabled.lock().await,
+            [DataType::Email].into_iter().collect::<DataTypeSet>()
+        );
     }
 
     #[tokio::test]
@@ -1365,7 +1606,7 @@ mod tests {
             &self,
             _data_types: &DataTypeSet,
             _push_state: Option<String>,
-        ) -> impl Future<Output = Result<(), AccountError>> + Send {
+        ) -> impl Future<Output = crate::Result<()>> + Send {
             let entered = Arc::clone(&self.entered);
             let hang = self.hang == Hang::Reenable;
             async move {
@@ -1454,14 +1695,15 @@ mod tests {
             &self,
             _data_types: &DataTypeSet,
             _push_state: Option<String>,
-        ) -> impl Future<Output = Result<(), AccountError>> + Send {
+        ) -> impl Future<Output = crate::Result<()>> + Send {
             let attempts = Arc::clone(&self.attempts);
             async move {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(super::super::error::unsupported_error(
-                    AccountOperation::PushSubscribe,
-                    None,
-                    "JMAP push: WebSocket not connected",
+                // The shape a fast re-enable failure really takes: the
+                // link died between handshake and subscribe, and the
+                // library refuses the frame on the closed stream.
+                Err(crate::Error::WebSocketSend(
+                    tokio_websockets::Error::AlreadyClosed,
                 ))
             }
         }
@@ -1566,7 +1808,7 @@ mod tests {
             &self,
             _data_types: &DataTypeSet,
             _push_state: Option<String>,
-        ) -> Result<(), AccountError> {
+        ) -> crate::Result<()> {
             Ok(())
         }
 
@@ -1643,7 +1885,7 @@ mod tests {
             &self,
             _data_types: &DataTypeSet,
             _push_state: Option<String>,
-        ) -> Result<(), AccountError> {
+        ) -> crate::Result<()> {
             Ok(())
         }
 

@@ -1134,13 +1134,11 @@ impl SyncEngine {
                 if first_error.is_none() {
                     first_error = Some(error);
                 }
-                // The server side may still be live. Keep the record, but flag
-                // it so a reopen carries it for retry instead of recreating it
-                // against the replacement connection.
-                failed.push(RegisteredSubscription {
-                    teardown_unconfirmed: true,
-                    ..record
-                });
+                // The server side may still be live. Keep the record, but as
+                // an orphan: the consumer asked for it to go, so a reopen
+                // carries it for retry instead of recreating it against the
+                // replacement connection.
+                failed.push(record.into_orphan());
             }
         }
         self.subscriptions.restore(account_id.clone(), failed);

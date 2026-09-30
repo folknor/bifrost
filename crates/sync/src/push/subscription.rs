@@ -12,13 +12,40 @@ pub(crate) struct RegisteredSubscription {
     pub handle: SubscriptionHandle,
     pub scopes: Vec<CursorScope>,
     /// A server-side teardown for this handle was attempted and failed, so
-    /// the subscription may still be live on the provider. The record is kept
-    /// purely so the teardown can be retried; it is never recreated against a
-    /// replacement connection, and a further failed retry is logged rather
-    /// than aborting the caller - the handle may belong to a connection that
-    /// is already gone, and one unreachable orphan must not wedge every
-    /// future reopen.
+    /// the subscription may still be live on the provider. A further failed
+    /// retry is logged rather than aborting the caller - the handle may belong
+    /// to a connection that is already gone, and one unreachable orphan must
+    /// not wedge every future reopen.
+    ///
+    /// This says nothing about whether the consumer still wants the coverage;
+    /// that is `desired`. The two were once one flag, and a reopen whose
+    /// old-side teardown failed then treated the consumer's live subscription
+    /// as an orphan: the next attempt carried the old handle but never
+    /// recreated it on the replacement, so the subscription silently vanished.
     pub teardown_unconfirmed: bool,
+    /// The consumer still wants this subscription's coverage, so a reopen
+    /// recreates it on the replacement connection. False for a pure orphan -
+    /// a handle the consumer asked to tear down, a replacement-side handle
+    /// unwound by an aborted reopen, or an old handle carried past a
+    /// committed reopen whose desire now lives in the recreated record - which
+    /// is kept only so its server-side teardown can be retried and is never
+    /// recreated. A record is always `desired`, `teardown_unconfirmed`, or
+    /// both; `into_orphan` is the only way to clear `desired`.
+    pub desired: bool,
+}
+
+impl RegisteredSubscription {
+    /// This record as an orphan: its server-side teardown is unconfirmed and
+    /// nobody wants its coverage any more, so it is carried for retry and
+    /// never recreated.
+    #[must_use]
+    pub(crate) fn into_orphan(self) -> Self {
+        Self {
+            teardown_unconfirmed: true,
+            desired: false,
+            ..self
+        }
+    }
 }
 
 /// Per-engine subscription handle registry.
@@ -42,6 +69,7 @@ impl SubscriptionRegistry {
                 handle,
                 scopes,
                 teardown_unconfirmed: false,
+                desired: true,
             });
     }
 
@@ -67,7 +95,10 @@ impl SubscriptionRegistry {
 
     /// Flag a still-registered handle whose server-side teardown failed.
     /// Reopen keeps carrying the record and retrying it, but stops treating
-    /// its failure as a reason to abandon the swap.
+    /// its failure as a reason to abandon the swap. `desired` is left alone:
+    /// the caller is an aborted reopen, which leaves the old account
+    /// installed and the consumer still wanting the coverage, so the next
+    /// attempt must recreate it on its replacement.
     pub(crate) fn mark_unconfirmed(&self, account: &AccountId, handle: &SubscriptionHandle) {
         if let Some(mut records) = self.inner.get_mut(account) {
             for record in records.iter_mut() {

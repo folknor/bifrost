@@ -490,7 +490,7 @@ impl Client {
             .tx
             .send(Message::text(frame))
             .await
-            .map_err(crate::Error::WebSocketRuntime)?;
+            .map_err(crate::Error::WebSocketSend)?;
 
         Ok(request_id)
     }
@@ -519,7 +519,7 @@ impl Client {
         ws.tx
             .send(Message::text(frame))
             .await
-            .map_err(crate::Error::WebSocketRuntime)?;
+            .map_err(crate::Error::WebSocketSend)?;
 
         Ok(pending)
     }
@@ -593,7 +593,7 @@ impl Client {
             .tx
             .send(Message::text(frame))
             .await
-            .map_err(crate::Error::WebSocketRuntime)
+            .map_err(crate::Error::WebSocketSend)
     }
 
     pub(crate) async fn disable_push_ws(&self) -> crate::Result<()> {
@@ -609,7 +609,7 @@ impl Client {
             .tx
             .send(Message::text(frame))
             .await
-            .map_err(crate::Error::WebSocketRuntime)
+            .map_err(crate::Error::WebSocketSend)
     }
 
     pub(crate) async fn ws_ping(&self) -> crate::Result<()> {
@@ -621,7 +621,7 @@ impl Client {
             .tx
             .send(Message::ping(Bytes::new()))
             .await
-            .map_err(crate::Error::WebSocketRuntime)
+            .map_err(crate::Error::WebSocketSend)
     }
 }
 

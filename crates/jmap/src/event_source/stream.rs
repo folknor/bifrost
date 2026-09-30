@@ -125,7 +125,7 @@ impl<T: HttpTransport + SseTransport> Client<T> {
         let state = self.session_state();
         let mut event_source_url = String::with_capacity(state.session().event_source_url().len());
 
-        for part in state.event_source_url() {
+        for part in state.event_source_url()? {
             match part {
                 URLPart::Value(value) => {
                     event_source_url.push_str(value);
@@ -418,6 +418,44 @@ mod tests {
             "state": "s0"
         }))
         .expect("test session decodes")
+    }
+
+    /// The session's `eventSourceUrl` is checked when EventSource is used,
+    /// not when the client is built, so a server whose template this crate
+    /// cannot use still opens for sync. The failure surfaces here, at use,
+    /// as the server's malformed `eventSourceUrl` - before any stream opens.
+    #[tokio::test]
+    async fn a_malformed_event_source_template_is_refused_at_use() {
+        let session: Session = serde_json::from_value(json!({
+            "capabilities": {},
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "u@example.org",
+            "apiUrl": "https://example.org/jmap/",
+            "downloadUrl": "https://example.org/dl/{accountId}/{blobId}/{name}?accept={type}",
+            "uploadUrl": "https://example.org/ul/{accountId}/",
+            "eventSourceUrl": "es/?types={types}",
+            "state": "s0"
+        }))
+        .expect("test session decodes");
+        let client = Client::with_transport(
+            ScriptedTransport(vec![STATE_CHANGE.as_bytes().to_vec()]),
+            session,
+            "https://example.org/.well-known/jmap",
+        )
+        .expect("an unusable eventSourceUrl does not stop the client building");
+
+        match client
+            .event_source(None::<Vec<DataType>>, false, None, None)
+            .await
+        {
+            Err(crate::Error::MalformedSessionUrl { property, detail }) => {
+                assert_eq!(property, "eventSourceUrl");
+                assert!(detail.contains("es/?types={types}"), "{detail}");
+            }
+            Err(other) => panic!("expected MalformedSessionUrl, got {other:?}"),
+            Ok(_) => panic!("a malformed eventSourceUrl must not open a stream"),
+        }
     }
 
     #[tokio::test]

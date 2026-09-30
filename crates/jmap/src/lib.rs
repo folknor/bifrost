@@ -364,10 +364,29 @@ pub(crate) enum Error {
     /// stream failures.
     WebSocketHandshake(tokio_websockets::Error),
     #[cfg(feature = "websockets")]
-    /// WebSocket stream-level failure raised after the handshake
-    /// completed. Classifies as `Protocol(PartialResponse)` +
-    /// `Attempt(Acknowledged)`.
+    /// WebSocket READ-side failure raised after the handshake completed:
+    /// the stream the push reader consumes yielded an error. Classifies as
+    /// `Protocol(PartialResponse)` + `Attempt(Acknowledged)`. A failed
+    /// WRITE is [`Error::WebSocketSend`], never this.
     WebSocketRuntime(tokio_websockets::Error),
+    #[cfg(feature = "websockets")]
+    /// Writing a frame to an established connection's sink failed.
+    ///
+    /// Distinct from [`Error::WebSocketRuntime`] because nothing was
+    /// acknowledged: the frame either never left (the library refused it)
+    /// or its fate is unknown. `tokio_websockets` refuses with
+    /// `AlreadyClosed` from `start_send`, before the frame is queued, once
+    /// the stream has left its active state - which the read half does as
+    /// soon as it sees the peer's close, a read I/O error, or a protocol
+    /// error, and a previous failed write does too. Any other error is an
+    /// I/O failure while flushing, when some of the frame may have reached
+    /// the wire. Classifies as `Transport(Network)` with `Attempt(Unsent)`
+    /// for `AlreadyClosed` and `Attempt(InFlight)` otherwise.
+    ///
+    /// Every write failure leaves the stream closed for good (the library
+    /// moves it to `CloseAcknowledged`), so after one, this connection
+    /// will carry no further frame in either direction.
+    WebSocketSend(tokio_websockets::Error),
     #[cfg(feature = "websockets")]
     /// WebSocket peer closed the connection.
     WebSocketClosed,
@@ -504,6 +523,8 @@ impl Display for Error {
             Error::WebSocketHandshake(e) => write!(f, "WebSocket handshake error: {e}"),
             #[cfg(feature = "websockets")]
             Error::WebSocketRuntime(e) => write!(f, "WebSocket runtime error: {e}"),
+            #[cfg(feature = "websockets")]
+            Error::WebSocketSend(e) => write!(f, "WebSocket frame write failed: {e}"),
             #[cfg(feature = "websockets")]
             Error::WebSocketClosed => write!(f, "WebSocket connection closed"),
             #[cfg(feature = "websockets")]

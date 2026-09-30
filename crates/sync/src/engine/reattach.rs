@@ -498,17 +498,15 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
     );
 }
 
-/// Restart the whole account with exponential backoff and a retry
-/// budget. After three consecutive `factory.open` failures the account
-/// is paused with `PauseReason::RetryBudgetExhausted` and the last
-/// `AccountError` is broadcast as `SyncEvent::Terminated`. (sync-D6,
-/// sync-D7)
 /// Tear down the subscriptions already created on a replacement connection
 /// that is about to be discarded.
 ///
 /// Any handle whose delete did not succeed is registered against the account
-/// with `teardown_unconfirmed`, because the replacement is closed immediately
-/// after and `Account::close()` does not delete server-side subscriptions.
+/// as an orphan (`teardown_unconfirmed`, not `desired`), because the
+/// replacement is closed immediately after and `Account::close()` is not
+/// contracted to delete server-side subscriptions. It is not `desired`
+/// because the consumer's desire still lives in the record it was recreated
+/// from, which the abort leaves in the registry untouched.
 /// Without that record the engine would forget the handle entirely and
 /// recreate exactly the orphaned-webhook leak the retained-handle rule exists
 /// to prevent - a provider like Graph keeps delivering to the endpoint until
@@ -527,10 +525,7 @@ async fn unwind_replacement_subscriptions(
                 error = %cleanup,
                 "replacement push cleanup failed while unwinding reopen; retaining handle for retry"
             );
-            orphaned.push(RegisteredSubscription {
-                teardown_unconfirmed: true,
-                ..replacement
-            });
+            orphaned.push(replacement.into_orphan());
         }
     }
     ctx.subscriptions.restore(ctx.account_id.clone(), orphaned);
@@ -734,11 +729,18 @@ pub(super) async fn reattach_account(
         let previous_subscriptions = ctx.subscriptions.snapshot(ctx.account_id);
         let mut replacement_subscriptions = Vec::with_capacity(previous_subscriptions.len());
         for record in previous_subscriptions.iter().filter(|record| {
-            // An unconfirmed record is an orphan being carried for retry, not
-            // a live subscription the consumer asked for; recreating it on the
-            // replacement would double-subscribe the account.
-            !record.teardown_unconfirmed
-                && next.capabilities().push != bifrost_types::PushCapability::None
+            // Recreate what the consumer still WANTS, whatever the state of
+            // the old handle's teardown. An orphan (not `desired`) is carried
+            // for retry only; recreating it would double-subscribe the
+            // account. But a `desired` record may ALSO be
+            // `teardown_unconfirmed`: an earlier attempt failed to tear its
+            // old handle down and aborted, leaving the old account installed
+            // and the subscription live and wanted. Filtering on the teardown
+            // flag instead - as this once did - dropped exactly that record on
+            // the retry: its old handle was torn down or carried as an orphan,
+            // nothing replaced it, and the consumer's push coverage vanished
+            // without an error.
+            record.desired && next.capabilities().push != bifrost_types::PushCapability::None
         }) {
             let scopes: Vec<CursorScope> = record
                 .scopes
@@ -761,6 +763,7 @@ pub(super) async fn reattach_account(
                             handle,
                             scopes: covered,
                             teardown_unconfirmed: false,
+                            desired: true,
                         });
                     }
                 }
@@ -818,17 +821,25 @@ pub(super) async fn reattach_account(
             match teardown {
                 Ok(()) => {}
                 Err(error) if record.teardown_unconfirmed => {
-                    // Already an orphan. Its handle may belong to a connection
-                    // that is long gone, so a repeated failure must not block
-                    // the swap; keep carrying it so the next reopen or an
-                    // `unsubscribe_push` call can try again.
+                    // Its teardown already failed once. The handle may belong
+                    // to a connection that is long gone, so a repeated failure
+                    // must not block the swap; keep carrying it so the next
+                    // reopen or an `unsubscribe_push` call can try again.
+                    //
+                    // Carried as an ORPHAN even when it was `desired`: the loop
+                    // above has already recreated a desired record on the
+                    // replacement, and that new record is where the desire
+                    // lives now (or deliberately dropped it, when its scopes
+                    // vanished or the replacement has no push, exactly as for
+                    // a record with a confirmed teardown). Carrying the desire
+                    // here as well would make the next reopen subscribe twice.
                     tracing::warn!(
                         target: "bifrost.sync.reopen",
                         account = ?ctx.account_id,
                         error = %error,
                         "carrying push subscription whose teardown is still unconfirmed"
                     );
-                    carried_unconfirmed.push(record.clone());
+                    carried_unconfirmed.push(record.clone().into_orphan());
                 }
                 Err(error) => {
                     // The replacement's own subscriptions must not be stranded
@@ -942,6 +953,12 @@ pub(super) fn accepted_push_scopes(result: &bifrost_types::PushSubscription) -> 
         .collect()
 }
 
+/// Restart the whole account with exponential backoff and a retry
+/// budget. After three consecutive failed attempts - a `factory.open`
+/// failure or a replacement that could not be swapped in, an old-side push
+/// teardown failure included - the account is paused with
+/// `PauseReason::RetryBudgetExhausted` and the last `AccountError` is
+/// broadcast as `SyncEvent::Terminated`. (sync-D6, sync-D7)
 async fn restart_account(ctx: &RecoveryContext<'_>) {
     let mut delay = REOPEN_BACKOFF_INITIAL;
     let mut last_error: Option<AccountError> = None;

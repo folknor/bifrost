@@ -1353,14 +1353,31 @@ impl Account for JmapAccount {
             // return while the detached task was still running, which is
             // what made the reference's "awaits teardown" claim false.
             super::push::join_reader(&reader, teardown_timeout).await;
-            match result {
-                Ok(()) | Err(crate::Error::WebSocketNotConnected) => Ok(()),
-                Err(err) => Err(super::error::into_account_error(
-                    err,
-                    super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Close),
-                )),
-            }
+            close_outcome(result)
         })
+    }
+}
+
+/// What `close()` reports for its best-effort push disable.
+///
+/// Three outcomes are not close failures, for one reason: RFC 8887 push is
+/// enabled per connection, so a subscription cannot outlive its
+/// connection. No connection ever made (`WebSocketNotConnected`) has no
+/// subscription. A sink write that failed (`WebSocketSend`) found the
+/// connection finished - every failed write leaves the stream closed for
+/// good - so its subscription is already gone; this used to fail `close()`
+/// as a `Protocol(PartialResponse)` after every WebSocket drop, for a
+/// teardown that had nothing left to tear down. The timeout arm in
+/// `close()` is the same argument for a wedged sink.
+fn close_outcome(result: crate::Result<()>) -> Result<(), AccountError> {
+    match result {
+        Ok(()) | Err(crate::Error::WebSocketNotConnected | crate::Error::WebSocketSend(_)) => {
+            Ok(())
+        }
+        Err(err) => Err(super::error::into_account_error(
+            err,
+            super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Close),
+        )),
     }
 }
 
@@ -1498,6 +1515,27 @@ mod tests {
 
     fn folder_scope(account_id: &str) -> CursorScope {
         CursorScope::Folder(foreign::encode_foreign_account(account_id))
+    }
+
+    /// A close after a WebSocket drop finds the sink dead. The push
+    /// subscription died with that connection, so the disable that could
+    /// not be written is not a close failure. Anything else still is.
+    #[test]
+    fn a_dead_websocket_sink_is_not_a_close_failure() {
+        super::close_outcome(Err(crate::Error::WebSocketSend(
+            tokio_websockets::Error::AlreadyClosed,
+        )))
+        .expect("a refused frame on a closed connection");
+        super::close_outcome(Err(crate::Error::WebSocketSend(
+            tokio_websockets::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        )))
+        .expect("a write that failed mid-flush closes the connection too");
+        super::close_outcome(Err(crate::Error::WebSocketNotConnected))
+            .expect("no connection, no subscription");
+
+        let error = super::close_outcome(Err(crate::Error::NotParsable("frame".to_string())))
+            .expect_err("an unrelated failure is still reported");
+        assert_eq!(error.operation(), Some(AccountOperation::Close));
     }
 
     /// Discovery order. The `Type` scopes lead in a fixed order and only

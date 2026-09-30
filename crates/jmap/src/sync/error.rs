@@ -257,6 +257,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketRuntime(err) => websocket_runtime_error(err.to_string(), ctx),
         #[cfg(feature = "websockets")]
+        crate::Error::WebSocketSend(err) => websocket_send_error(&err, ctx),
+        #[cfg(feature = "websockets")]
         crate::Error::WebSocketClosed => {
             websocket_runtime_error("WebSocket connection closed by peer".to_string(), ctx)
         }
@@ -1635,6 +1637,39 @@ fn websocket_runtime_error(message: String, ctx: JmapErrorContext) -> AccountErr
     .expect("valid account error classification")
 }
 
+/// A frame write to an established WebSocket's sink failed.
+///
+/// `Transport(Network)`, because the connection is gone and nothing the
+/// server said is involved: this used to share `websocket_runtime_error`,
+/// which stamps `Acknowledged` on a frame nothing acknowledged and, for a
+/// non-idempotent operation, derived a `PartialCompletionSignal` reconcile.
+/// `AlreadyClosed` is `tokio_websockets` refusing in `start_send`, before
+/// the frame is queued, so it is `Unsent`; any other error came out of the
+/// flush, after some of the frame may have been written, so it is
+/// `InFlight`. Whether an in-flight failure replays or reconciles is then
+/// the operation's idempotency, which the caller owns.
+#[cfg(feature = "websockets")]
+fn websocket_send_error(err: &tokio_websockets::Error, ctx: JmapErrorContext) -> AccountError {
+    let transmission = if matches!(err, tokio_websockets::Error::AlreadyClosed) {
+        TransmissionState::Unsent
+    } else {
+        TransmissionState::InFlight
+    };
+    build(
+        AccountErrorKind::Transport(TransportErrorKind::Network),
+        Cause::Transport(TransportCause::new(
+            TransportKind::Network,
+            Some(DiagnosticText::support_only(format!(
+                "WebSocket frame write failed: {err}"
+            ))),
+        )),
+        &ctx,
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(transmission)))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Pre-handshake WebSocket failure. Classification is
 /// `Transport(Network) + Attempt(Unsent)` - no bytes from the JMAP
 /// request itself crossed the side-effect boundary. The blanket
@@ -2410,6 +2445,62 @@ mod tests {
         assert!(
             saw_acknowledged,
             "expected Attempt(Acknowledged) on the chain"
+        );
+    }
+
+    fn transmission_state(err: &AccountError) -> Option<TransmissionState> {
+        err.chain().iter().find_map(|cause| match cause {
+            Cause::Attempt(attempt) => Some(attempt.transmission_state),
+            _ => None,
+        })
+    }
+
+    /// A frame the library refused to queue on a closed stream reached
+    /// nobody. It used to classify with the read side as
+    /// `Protocol(PartialResponse)` + `Acknowledged`, which for a
+    /// non-idempotent operation derives a `PartialCompletionSignal`
+    /// reconcile of a write that never left the process.
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn a_frame_refused_on_a_closed_websocket_is_an_unsent_transport_failure() {
+        let err = into_account_error(
+            crate::Error::WebSocketSend(tokio_websockets::Error::AlreadyClosed),
+            JmapErrorContext::new(AccountOperation::PushSubscribe),
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Transport(TransportErrorKind::Network)
+        );
+        assert_eq!(transmission_state(&err), Some(TransmissionState::Unsent));
+        match err.recovery() {
+            RecoveryClass::Retry(advice) => {
+                assert_eq!(advice.disposition, RetryDisposition::SameRequest);
+            }
+            other => panic!("an unsent frame is replayable, got {other:?}"),
+        }
+    }
+
+    /// An I/O failure while flushing may have put part of the frame on the
+    /// wire, so it is `InFlight`: the operation's idempotency decides
+    /// between replay and read-back, not a fabricated acknowledgement.
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn a_frame_write_that_failed_mid_flush_is_an_in_flight_transport_failure() {
+        let err = into_account_error(
+            crate::Error::WebSocketSend(tokio_websockets::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            ))),
+            JmapErrorContext::new(AccountOperation::Send),
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Transport(TransportErrorKind::Network)
+        );
+        assert_eq!(transmission_state(&err), Some(TransmissionState::InFlight));
+        assert!(
+            matches!(err.recovery(), RecoveryClass::Reconcile(_)),
+            "a non-idempotent write lost mid-flight is read back, got {:?}",
+            err.recovery()
         );
     }
 

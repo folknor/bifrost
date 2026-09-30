@@ -67,6 +67,43 @@ pub fn close_refused() -> AccountError {
     .expect("valid account error classification")
 }
 
+/// A classified transport failure for a provider that could not delete a push
+/// subscription - a Graph 503 on the DELETE, a JMAP socket that died.
+pub fn push_teardown_refused() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
+        Cause::Transport(bifrost_types::TransportCause::new(
+            bifrost_types::TransportKind::Network,
+            None,
+        )),
+    )
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Push traffic recorded by every `StubAccount` sharing it, so a test can see
+/// which connection each subscribe and unsubscribe reached.
+#[derive(Debug, Default)]
+pub struct PushLog {
+    /// `(push_label of the account called, scopes)` per `push_subscribe`.
+    pub subscribed: Mutex<Vec<(String, Vec<CursorScope>)>>,
+    /// `(push_label of the account called, handle)` per `push_unsubscribe`,
+    /// failed calls included.
+    pub unsubscribed: Mutex<Vec<(String, SubscriptionHandle)>>,
+}
+
+impl PushLog {
+    #[must_use]
+    pub fn subscribed(&self) -> Vec<(String, Vec<CursorScope>)> {
+        self.subscribed.lock().expect("push log lock").clone()
+    }
+
+    #[must_use]
+    pub fn unsubscribed(&self) -> Vec<(String, SubscriptionHandle)> {
+        self.unsubscribed.lock().expect("push log lock").clone()
+    }
+}
+
 /// Neutral capability set: no push, no blob ranges, generous rate class.
 pub fn caps() -> AccountCapabilities {
     AccountCapabilities {
@@ -245,6 +282,15 @@ pub struct StubAccount {
     /// Same wedge for `inventory_partition_stream`, for the backfill runner's
     /// poll arm.
     pub partition_stall: Option<Arc<tokio::sync::Notify>>,
+    /// Names this account in `push_log`, and is the handle `push_subscribe`
+    /// mints, so a handle says which connection created it. Default `"stub"`.
+    pub push_label: String,
+    /// Where this account records its push traffic. Share one across the
+    /// accounts a factory hands out to see a reopen's calls in order.
+    pub push_log: Arc<PushLog>,
+    /// How many upcoming `push_unsubscribe` calls on THIS account fail with
+    /// [`push_teardown_refused`] before it starts succeeding. Default 0.
+    pub push_unsubscribe_failures: std::sync::atomic::AtomicUsize,
 }
 
 /// Observes the LIFETIME of a stalled provider stream, not just its effects.
@@ -360,6 +406,9 @@ impl StubAccount {
             inventory_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             changes_stall: None,
             partition_stall: None,
+            push_label: "stub".to_owned(),
+            push_log: Arc::new(PushLog::default()),
+            push_unsubscribe_failures: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -566,7 +615,12 @@ impl Account for StubAccount {
         &self,
         scopes: &[CursorScope],
     ) -> AccountFuture<Result<bifrost_types::PushSubscription, AccountError>> {
-        let handle = SubscriptionHandle("stub".to_owned());
+        self.push_log
+            .subscribed
+            .lock()
+            .expect("push log lock")
+            .push((self.push_label.clone(), scopes.to_vec()));
+        let handle = SubscriptionHandle(self.push_label.clone());
         let scopes = scopes.to_vec();
         Box::pin(async move {
             Ok(bifrost_types::PushSubscription::all_succeeded(
@@ -577,9 +631,28 @@ impl Account for StubAccount {
 
     fn push_unsubscribe(
         &self,
-        _handle: SubscriptionHandle,
+        handle: SubscriptionHandle,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Ok(()) })
+        self.push_log
+            .unsubscribed
+            .lock()
+            .expect("push log lock")
+            .push((self.push_label.clone(), handle));
+        let fail = self
+            .push_unsubscribe_failures
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        Box::pin(async move {
+            if fail {
+                Err(push_teardown_refused())
+            } else {
+                Ok(())
+            }
+        })
     }
 
     fn push_stream(&self) -> AccountStream<WatchEvent> {

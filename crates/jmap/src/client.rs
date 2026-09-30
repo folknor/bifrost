@@ -96,18 +96,85 @@ pub(crate) struct SessionState {
     api_url: String,
     upload_url: Vec<URLPart<blob::URLParameter>>,
     download_url: Vec<URLPart<blob::URLParameter>>,
-    event_source_url: Vec<URLPart<crate::event_source::URLParameter>>,
+    /// Parsed with the session, but a template that fails is stored as its
+    /// error detail and only raised when EventSource is actually used.
+    /// Nothing in the sync `Account` uses EventSource, so refusing the
+    /// whole session over it made a server whose EventSource template this
+    /// crate cannot parse impossible to open at all. The blob templates stay
+    /// eager because the account uses them throughout.
+    event_source_url: Result<Vec<URLPart<crate::event_source::URLParameter>>, String>,
     default_account_id: crate::core::id::AccountId,
 }
 
 /// Parse one of the session's URI templates. Every template a session
 /// carries is the server's, so one that does not parse is the provider's
 /// malformed session, named by the property that carried it.
+///
+/// A template that parses but is not an absolute `http` / `https` URL is
+/// refused here too. RFC 8620 §2 defines each of these properties as a URL
+/// (template) the client fetches, and a relative one such as
+/// `not-a-url/{accountId}` otherwise passed and only failed later, inside
+/// the transport, as a network-shaped error that blamed neither the server
+/// nor the property.
 fn session_template<P: crate::core::session::URLParser>(
     property: &'static str,
     url: &str,
 ) -> crate::Result<Vec<URLPart<P>>> {
-    URLPart::parse(url).map_err(|detail| crate::Error::MalformedSessionUrl { property, detail })
+    parse_session_template(url)
+        .map_err(|detail| crate::Error::MalformedSessionUrl { property, detail })
+}
+
+/// [`session_template`] without the property attached: the bare detail,
+/// for a template whose failure is stored and raised later.
+fn parse_session_template<P: crate::core::session::URLParser>(
+    url: &str,
+) -> Result<Vec<URLPart<P>>, String> {
+    URLPart::parse(url).and_then(|parts| require_absolute_http(url, &parts).map(|()| parts))
+}
+
+/// Check that a parsed template expands to an absolute `http` / `https` URL
+/// with a host.
+///
+/// The check runs on a probe expansion rather than on the raw template, so
+/// it cannot refuse a legitimate RFC 6570 level-1 template: every variable
+/// `URLPart` accepts (`accountId`, `blobId`, `name`, `type`, `types`,
+/// `closeafter`, `ping`) is replaced by one unreserved character, which is
+/// valid in a host label, a path segment and a query alike. JMAP servers put
+/// variables in the path and query, but a template whose host label is a
+/// variable (`https://{accountId}.example/`) is still absolute after
+/// expansion and still passes. Parsing uses the same WHATWG parser the
+/// transport (reqwest) hands URLs to, so what passes here is what the
+/// transport can address.
+fn require_absolute_http<P: crate::core::session::URLParser>(
+    template: &str,
+    parts: &[URLPart<P>],
+) -> Result<(), String> {
+    let mut probe = String::with_capacity(template.len());
+    for part in parts {
+        match part {
+            URLPart::Value(value) => probe.push_str(value),
+            URLPart::Parameter(_) => probe.push('x'),
+        }
+    }
+    require_absolute_http_url(template, &probe)
+}
+
+/// Check that `url` is an absolute `http` / `https` URL with a host.
+/// `shown` is what the error quotes: the template a probe was expanded
+/// from, or the URL itself.
+fn require_absolute_http_url(shown: &str, url: &str) -> Result<(), String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("not an absolute URL ({e}): {shown}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "scheme '{}' is not http or https: {shown}",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(format!("no host: {shown}"));
+    }
+    Ok(())
 }
 
 impl SessionState {
@@ -117,11 +184,22 @@ impl SessionState {
             .map(crate::core::id::AccountId::new)
             .unwrap_or_else(|| crate::core::id::AccountId::new(""));
 
+        // `apiUrl` is a plain URL, not a template, but the same rule holds:
+        // it is the server's, and a relative or non-http one otherwise
+        // failed later inside the transport, blaming nobody.
+        let api_url = session.api_url();
+        require_absolute_http_url(api_url, api_url).map_err(|detail| {
+            crate::Error::MalformedSessionUrl {
+                property: "apiUrl",
+                detail,
+            }
+        })?;
+
         Ok(Self {
-            api_url: session.api_url().to_string(),
+            api_url: api_url.to_string(),
             upload_url: session_template("uploadUrl", session.upload_url())?,
             download_url: session_template("downloadUrl", session.download_url())?,
-            event_source_url: session_template("eventSourceUrl", session.event_source_url())?,
+            event_source_url: parse_session_template(session.event_source_url()),
             default_account_id,
             session: Arc::new(session),
         })
@@ -143,8 +221,18 @@ impl SessionState {
         &self.download_url
     }
 
-    pub(crate) fn event_source_url(&self) -> &[URLPart<crate::event_source::URLParameter>] {
-        &self.event_source_url
+    /// The parsed EventSource template, or the session's malformed
+    /// `eventSourceUrl` - raised here, at use, rather than when the session
+    /// was derived.
+    pub(crate) fn event_source_url(
+        &self,
+    ) -> crate::Result<&[URLPart<crate::event_source::URLParameter>]> {
+        self.event_source_url
+            .as_deref()
+            .map_err(|detail| crate::Error::MalformedSessionUrl {
+                property: "eventSourceUrl",
+                detail: detail.clone(),
+            })
     }
 
     pub(crate) fn default_account_id(&self) -> &crate::core::id::AccountId {
@@ -501,17 +589,20 @@ mod session_state_tests {
         );
     }
 
-    /// The upload / download / EventSource templates come from the server's
-    /// session object, so one that does not parse is the provider's malformed
-    /// session, reported under the property that carried it. It used to
-    /// surface as the caller's `InvalidUrl`, which the account boundary maps
-    /// to `Request(Malformed)` - "fix your request" for a request nobody made.
+    /// The upload / download templates and the API URL come from the
+    /// server's session object, so one that is unusable is the provider's
+    /// malformed session, reported under the property that carried it. It
+    /// used to surface as the caller's `InvalidUrl`, which the account
+    /// boundary maps to `Request(Malformed)` - "fix your request" for a
+    /// request nobody made. (`eventSourceUrl` is deferred to use; see
+    /// `a_malformed_event_source_template_fails_only_at_use`.)
     #[test]
     fn a_malformed_session_template_names_the_servers_property() {
         for (property, bad) in [
             ("uploadUrl", "https://example.test/upload/{accountId"),
             ("downloadUrl", "https://example.test/dl/{notAVariable}"),
-            ("eventSourceUrl", "https://example.test/es?types={types"),
+            ("apiUrl", "jmap/api"),
+            ("apiUrl", "ftp://example.test/api"),
         ] {
             let mut session =
                 serde_json::from_str::<serde_json::Value>(&session_json("bad", "A1", "session-1"))
@@ -539,6 +630,147 @@ mod session_state_tests {
                 }
                 other => panic!("{property}: expected MalformedSessionUrl, got {other:?}"),
             }
+        }
+    }
+
+    /// Nothing in the sync `Account` uses EventSource, so a session whose
+    /// `eventSourceUrl` this crate cannot use must still open. It used to be
+    /// parsed eagerly and refused the whole client. The failure is raised
+    /// at use instead, still as the server's malformed `eventSourceUrl`.
+    #[test]
+    fn a_malformed_event_source_template_fails_only_at_use() {
+        for bad in [
+            "https://example.test/es?types={types",
+            "https://example.test/es{?types,closeafter,ping}",
+            "es/?types={types}",
+        ] {
+            let mut session =
+                serde_json::from_str::<serde_json::Value>(&session_json("es", "A1", "session-1"))
+                    .expect("fixture is json");
+            session["eventSourceUrl"] = json!(bad);
+            let session: Session = serde_json::from_value(session).expect("session parses");
+
+            let client = Client::with_transport(
+                RefreshingTransport {
+                    api_urls: Arc::new(Mutex::new(Vec::new())),
+                },
+                session,
+                "https://example.test/.well-known/jmap",
+            )
+            .unwrap_or_else(|e| panic!("{bad}: the client must still build, got {e:?}"));
+
+            match client.session_state().event_source_url() {
+                Err(crate::Error::MalformedSessionUrl { property, detail }) => {
+                    assert_eq!(property, "eventSourceUrl");
+                    assert!(detail.contains(bad), "{bad}: {detail}");
+                }
+                Err(other) => panic!("{bad}: expected MalformedSessionUrl, got {other:?}"),
+                Ok(_) => panic!("{bad}: a malformed template must fail at use"),
+            }
+        }
+    }
+
+    /// A template that parses but is not an absolute http(s) URL used to
+    /// pass `session_template` and fail later inside the transport, where
+    /// nothing named the server or the property. It is the provider's
+    /// malformed session and must be refused as one.
+    #[test]
+    fn a_relative_or_non_http_session_template_is_malformed() {
+        for bad in [
+            "not-a-url/{accountId}",
+            "/upload/{accountId}",
+            "{accountId}/upload",
+            "ftp://example.test/upload/{accountId}",
+            "file:///srv/upload/{accountId}",
+        ] {
+            match super::session_template::<crate::blob::URLParameter>("uploadUrl", bad) {
+                Err(crate::Error::MalformedSessionUrl { property, detail }) => {
+                    assert_eq!(property, "uploadUrl");
+                    assert!(detail.contains(bad), "{bad}: {detail}");
+                }
+                Err(other) => panic!("{bad}: expected MalformedSessionUrl, got {other:?}"),
+                Ok(_) => panic!("{bad}: a non-absolute template must be refused"),
+            }
+        }
+        for bad in ["es?types={types}", "wss://example.test/es?ping={ping}"] {
+            assert!(
+                matches!(
+                    super::session_template::<crate::event_source::URLParameter>(
+                        "eventSourceUrl",
+                        bad
+                    ),
+                    Err(crate::Error::MalformedSessionUrl {
+                        property: "eventSourceUrl",
+                        ..
+                    })
+                ),
+                "{bad}: a non-absolute template must be refused"
+            );
+        }
+
+        // Through the client door too: a session whose downloadUrl is
+        // relative does not build a client.
+        let mut session =
+            serde_json::from_str::<serde_json::Value>(&session_json("rel", "A1", "session-1"))
+                .expect("fixture is json");
+        session["downloadUrl"] = json!("dl/{accountId}/{blobId}/{name}/{type}");
+        let session: Session = serde_json::from_value(session).expect("session parses");
+        let error = Client::with_transport(
+            RefreshingTransport {
+                api_urls: Arc::new(Mutex::new(Vec::new())),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .err()
+        .expect("a relative downloadUrl must not build a client");
+        assert!(
+            matches!(
+                error,
+                crate::Error::MalformedSessionUrl {
+                    property: "downloadUrl",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// The absoluteness check must not refuse a legitimate RFC 6570 level-1
+    /// template: variables in the path, in the query, as a whole path
+    /// segment, glued to a literal, and even as a host label all expand to
+    /// an absolute http(s) URL.
+    #[test]
+    fn absolute_session_templates_with_variables_anywhere_are_accepted() {
+        for good in [
+            "https://example.test/dl/{accountId}/{blobId}/{name}?accept={type}",
+            "https://example.test/dl/{accountId}/{blobId}?name={name}&type={type}",
+            "https://example.test/upload?account={accountId}",
+            "https://example.test/upload/{accountId}/",
+            "http://127.0.0.1:8080/jmap/upload/{accountId}",
+            "https://[::1]:8443/dl/{accountId}{blobId}",
+            "HTTPS://Example.TEST/dl/{accountId}/{blobId}",
+            "https://{accountId}.example.test/dl/{blobId}",
+            "https://example.test{accountId}/{blobId}",
+        ] {
+            assert!(
+                super::session_template::<crate::blob::URLParameter>("downloadUrl", good).is_ok(),
+                "{good}: a legitimate template was refused"
+            );
+        }
+        for good in [
+            "https://example.test/es?types={types}&closeafter={closeafter}&ping={ping}",
+            "https://example.test/es/{types}/{closeafter}/{ping}",
+            "https://example.test/es",
+        ] {
+            assert!(
+                super::session_template::<crate::event_source::URLParameter>(
+                    "eventSourceUrl",
+                    good
+                )
+                .is_ok(),
+                "{good}: a legitimate template was refused"
+            );
         }
     }
 
@@ -619,7 +851,11 @@ mod session_state_tests {
             "https://new.example.test/upload/"
         );
         assert_eq!(
-            leading_value(state.event_source_url()),
+            leading_value(
+                state
+                    .event_source_url()
+                    .expect("the refreshed eventSourceUrl parses")
+            ),
             "https://new.example.test/es"
         );
 
