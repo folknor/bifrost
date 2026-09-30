@@ -10,10 +10,13 @@ use std::collections::HashMap;
 
 use bifrost_types::{CursorScope, FolderId, ObjectType};
 
+use crate::account::push::common::PushEndpoint;
 use crate::account::push::ews::{
     PendingEwsScope, TranslatedExchangeId, ews_subscribable_folder_id,
 };
 use crate::account::push::webhook::GraphSubscriptionState;
+use crate::account::{GraphAccount, PushMode};
+use crate::client::{GraphClient, ScriptedRestResponse};
 
 pub(super) fn state(server_id: &str, resource: &str) -> GraphSubscriptionState {
     GraphSubscriptionState {
@@ -88,4 +91,51 @@ pub(super) fn converted(source_id: &str, target_id: &str) -> TranslatedExchangeI
         target_id: Some(target_id.to_string()),
         error_details: None,
     }
+}
+
+// ---- webhook accounts on a scripted wire ---------------------------------
+//
+// The scripted wire is one ordered script shared by `script_rest` and
+// `script_aux_pending`, so a request can be parked forever (`Pending`)
+// between answered ones. Tests that use these run on the current-thread test
+// runtime: spawned work only advances when the test yields, which makes "drop
+// the future NOW" deterministic.
+
+pub(super) fn webhook_account(client: &GraphClient) -> GraphAccount {
+    let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    account.push_endpoint = Some(PushEndpoint {
+        webhook_url: "https://example.test/hook".to_string(),
+        client_state: "secret".to_string(),
+    });
+    account
+}
+
+pub(super) fn created(id: &str) -> ScriptedRestResponse {
+    ScriptedRestResponse::json(
+        reqwest::StatusCode::CREATED,
+        serde_json::json!({"id": id, "expirationDateTime": "2099-01-01T00:00:00Z"}),
+    )
+}
+
+pub(super) fn deleted() -> ScriptedRestResponse {
+    ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT)
+}
+
+/// Yield to the spawned work until `done` holds, bounded so a regression
+/// fails the assertion instead of hanging. Yields, never sleeps.
+pub(super) async fn settle(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..2000 {
+        if done() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    done()
+}
+
+pub(super) fn groups_empty(account: &GraphAccount) -> bool {
+    account
+        .graph_subscriptions
+        .try_read()
+        .is_ok_and(|groups| groups.is_empty())
 }

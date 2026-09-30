@@ -12,13 +12,13 @@ use crate::account::push::dispatch::push_item_ids;
 use crate::account::push::ews::{
     ConvertIdError, PendingEwsScope, TRANSLATE_EXCHANGE_IDS_MAX_INPUTS,
     TranslateExchangeIdsResponse, TranslatedExchangeId, ews_subscribable_folder_id,
-    reconcile_translated_ews_scopes, translate_error_context, translate_ews_scopes,
+    reconcile_translated_ews_scopes, subscribe_ews, translate_error_context, translate_ews_scopes,
     translation_input_chunks,
 };
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
 
-use super::fixtures::{converted, email_scope, ledger, no_chunk_failures, pending};
+use super::fixtures::{converted, email_scope, ledger, no_chunk_failures, pending, settle};
 
 /// The EWS Subscribe boundary and the webhook boundary must agree on
 /// what "subscribable" means. A non-folder scope contributes nothing
@@ -438,4 +438,99 @@ fn a_dropped_translation_request_retries_instead_of_reconciling() {
         GraphErrorContext::graph(AccountOperation::PushSubscribe),
     );
     assert!(reconciled.recovery().requires_reconciliation());
+}
+
+// ---- cancellation safety of `subscribe_ews` ------------------------------
+//
+// This arm creates no server state itself (the worker owns the EWS
+// Subscribe), so what a dropped caller can strand is the LOCAL registration:
+// installed under a handle nobody received, streamed by the worker until
+// `close()`. The window is the awaits after the insert.
+
+fn translate_ok() -> ScriptedRestResponse {
+    ScriptedRestResponse::json(
+        reqwest::StatusCode::OK,
+        serde_json::json!({"value":[{"sourceId":"inbox","targetId":"ews-inbox"}]}),
+    )
+}
+
+fn registration_count(account: &GraphAccount) -> Option<usize> {
+    account
+        .ews_subscriptions
+        .try_read()
+        .ok()
+        .map(|registrations| registrations.len())
+}
+
+fn spawn_subscribe_ews(
+    account: &GraphAccount,
+) -> tokio::task::JoinHandle<
+    Result<crate::account::push::dispatch::ArmOutcome, bifrost_types::AccountError>,
+> {
+    let account = account.clone();
+    let (item, scope, _) = pending(&["inbox"]).remove(0);
+    tokio::spawn(async move {
+        let expected = vec![item.clone()];
+        subscribe_ews(account, vec![(item, scope)], ledger(), &expected).await
+    })
+}
+
+/// The caller is dropped after the registration was inserted, while
+/// `ensure_ews_worker` waits for the worker slot. Nobody holds the handle, so
+/// the registration must be retired by the guard.
+///
+/// Fails if `RegistrationGuard` is not armed in `subscribe_ews` (or its drop
+/// stops calling `unsubscribe_ews`): the registration then stays for the life
+/// of the account.
+#[tokio::test]
+async fn a_dropped_ews_subscribe_retires_the_registration_nobody_received() {
+    let client = GraphClient::new("token");
+    client.script_rest([translate_ok()]);
+    let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
+
+    let slot_blocked = account.ews_worker.lock().await;
+    let caller = spawn_subscribe_ews(&account);
+    assert!(
+        settle(|| registration_count(&account) == Some(1)).await,
+        "registered, parked on the worker slot"
+    );
+    caller.abort();
+    let _ = caller.await;
+    drop(slot_blocked);
+
+    assert!(
+        settle(|| registration_count(&account) == Some(0)).await,
+        "the unreceived registration is retired"
+    );
+    assert!(
+        account.ews_worker.lock().await.is_none(),
+        "and no worker was left running for it"
+    );
+}
+
+/// The normal path disarms: a caller that receives the handle keeps its
+/// registration.
+///
+/// Fails if `subscribe_ews` stops calling `registration.disarm()`.
+#[tokio::test]
+async fn a_received_ews_subscribe_keeps_its_registration() {
+    let client = GraphClient::new("token");
+    client.script_rest([translate_ok()]);
+    let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
+    // A worker already occupies the slot, so none is spawned against the
+    // scripted wire.
+    *account.ews_worker.lock().await = Some(tokio::spawn(std::future::pending()));
+
+    let (handle, _) = spawn_subscribe_ews(&account)
+        .await
+        .expect("not aborted")
+        .expect("subscribe succeeds");
+    assert!(handle.is_some());
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(registration_count(&account), Some(1));
+    if let Some(worker) = account.ews_worker.lock().await.take() {
+        worker.abort();
+    }
 }

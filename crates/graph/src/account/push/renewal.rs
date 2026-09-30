@@ -70,7 +70,19 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
             scopes,
         } in due
         {
-            match renew_subscription(&account.client, &server_id, None).await {
+            // Cooperative cancellation, checked first (`biased`) at every due
+            // row: once `close()` has cancelled the token no further request
+            // is issued, and a PATCH already in flight is dropped. Dropping a
+            // renewal is harmless - it creates nothing, and the row it was
+            // extending is being deleted. The step that DOES create server
+            // state, the recreate below, runs in its own task and so is not
+            // affected by this worker being cancelled, joined or aborted.
+            let renewal = tokio::select! {
+                biased;
+                () = account.shutdown.cancelled() => return,
+                result = renew_subscription(&account.client, &server_id, None) => result,
+            };
+            match renewal {
                 Ok(new_expiry) => {
                     let mut groups = account.graph_subscriptions.write().await;
                     if let Some(group) = groups.get_mut(&handle)
@@ -112,7 +124,11 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
                                     recovered_gap = true;
                                     continue;
                                 }
-                                Ok(Replacement::HandleUnsubscribed) => continue,
+                                Ok(
+                                    Replacement::HandleUnsubscribed | Replacement::AccountClosed,
+                                ) => {
+                                    continue;
+                                }
                                 // Classify the failure that actually blocks
                                 // recovery. The original 404 only says the
                                 // old subscription is gone, which is already
@@ -252,12 +268,23 @@ pub(super) fn due_renewals(
 
 /// What happened to a subscription the renewal worker had to recreate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Replacement {
+pub(super) enum Replacement {
     /// The fresh subscription took the vanished one's place in the group.
     Installed,
     /// The handle stopped being registered while the create was in flight,
     /// so the fresh subscription was deleted again instead of installed.
     HandleUnsubscribed,
+    /// The account was already closed (or closing), so nothing was created.
+    AccountClosed,
+}
+
+/// Everything the replacement task owns.
+struct ReplaceRequest {
+    endpoint: PushEndpoint,
+    handle: SubscriptionHandle,
+    stale_server_id: String,
+    resource: String,
+    scopes: Vec<CursorScope>,
 }
 
 /// Create a replacement for a vanished subscription and install it under
@@ -266,7 +293,23 @@ enum Replacement {
 /// The create happens before any local state changes so a failure leaves the
 /// stale entry in place for the next renewal tick to retry - the resource
 /// keeps a row that reads as due rather than silently losing coverage.
-async fn replace_gone_subscription(
+///
+/// The create, the install and the undo run in a task the ACCOUNT's runtime
+/// owns; this future only awaits it. The renewal worker is cancelled by
+/// `close()`, aborted by `unsubscribe_graph` when the last group goes, and
+/// dropped by the runtime, and an inline body was torn down wherever it stood:
+/// after the create returned and before the new id was recorded, or in the
+/// middle of the undo DELETE, which stranded a live server subscription no
+/// group knew about. A spawned task is not torn down by its awaiter going
+/// away, and it has no hand-off to acknowledge: the install is its own effect
+/// (there is no caller holding a handle to it), so a lost result costs only
+/// the `Reconnected` the worker would have announced, and the worker is only
+/// ever cancelled when the account is closing or the handle is being retired.
+///
+/// What cannot be made safe: a create whose response never arrived may have
+/// succeeded on Graph and its id is unknowable (see `run_subscribe` in
+/// `webhook.rs`); it lives until Graph's own expiry.
+pub(super) async fn replace_gone_subscription(
     account: &GraphAccount,
     endpoint: &PushEndpoint,
     handle: &SubscriptionHandle,
@@ -274,9 +317,45 @@ async fn replace_gone_subscription(
     resource: &str,
     scopes: &[CursorScope],
 ) -> Result<Replacement, crate::error::GraphError> {
+    let account = account.clone();
+    let request = ReplaceRequest {
+        endpoint: endpoint.clone(),
+        handle: handle.clone(),
+        stale_server_id: stale_server_id.to_string(),
+        resource: resource.to_string(),
+        scopes: scopes.to_vec(),
+    };
+    tokio::spawn(async move { create_and_install_replacement(&account, request).await })
+        .await
+        .unwrap_or_else(|_| {
+            // The task panicked or the runtime is shutting down under it.
+            Err(crate::error::GraphError::RuntimeFailure {
+                message: "the webhook replacement task ended without an answer".to_string(),
+            })
+        })
+}
+
+async fn create_and_install_replacement(
+    account: &GraphAccount,
+    request: ReplaceRequest,
+) -> Result<Replacement, crate::error::GraphError> {
+    let ReplaceRequest {
+        endpoint,
+        handle,
+        stale_server_id,
+        resource,
+        scopes,
+    } = request;
+    // A closed account must not gain server-side state. The registration
+    // check under the write lock below is what covers a create already in
+    // flight when `close()` began; this one only spares the common case a
+    // POST that could only be rolled back.
+    if account.shutdown.is_cancelled() {
+        return Ok(Replacement::AccountClosed);
+    }
     let response = create_subscription(
         &account.client,
-        resource,
+        &resource,
         &endpoint.webhook_url,
         &endpoint.client_state,
         None,
@@ -285,14 +364,23 @@ async fn replace_gone_subscription(
     let replacement = GraphSubscriptionState {
         server_id: response.id,
         expires_at: response.expiration_date_time,
-        resource: resource.to_string(),
-        scopes: scopes.to_vec(),
+        resource,
+        scopes,
         warned_unparseable_expiry: false,
     };
     let created_id = replacement.server_id.clone();
 
     let mut groups = account.graph_subscriptions.write().await;
-    let installed = install_replacement(&mut groups, handle, stale_server_id, replacement);
+    // Checked under the write lock and paired with `retire_all_graph_
+    // subscriptions` cancelling the token BEFORE its walk, exactly like the
+    // registration in `create_and_register`: either this install lands before
+    // the cancel (and the walk, which snapshots under the same lock
+    // afterwards, sees it) or it observes the cancel and is undone. The group's
+    // `tearing_down` marker refuses the same install once the walk reaches
+    // its handle; this check keeps the rule local to the create instead of
+    // resting on the walk's ordering.
+    let installed = !account.shutdown.is_cancelled()
+        && install_replacement(&mut groups, &handle, &stale_server_id, replacement);
     drop(groups);
     if installed {
         return Ok(Replacement::Installed);

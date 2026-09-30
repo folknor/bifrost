@@ -1510,8 +1510,14 @@ impl Account for GraphAccount {
             // the ones retiring it, and both webhook subscriptions and EWS
             // streaming subscriptions outlive this process if nobody asks the
             // server to drop them.
+            //
+            // The retire walk is also what cancels the shutdown token, and
+            // it does so BEFORE it walks: the ordering is load-bearing for
+            // `push_subscribe` and the renewal recreate, both of which check
+            // the token under the lock they register under. There is no
+            // second `cancel()` here because the walk is infallible and
+            // cancels unconditionally as its first step.
             push::retire_all_graph_subscriptions(&account).await;
-            account.shutdown.cancel();
             if let Some(worker) = worker_slot::take_worker(&account.ews_worker).await {
                 // Join rather than abort: the worker observes the cancelled
                 // token, then sends an EWS `Unsubscribe` for whatever
@@ -1534,10 +1540,22 @@ impl Account for GraphAccount {
                     worker.abort();
                 }
             }
-            // The renewal worker holds no server-side state of its own (the
-            // subscriptions it renews are already deleted above), so aborting
-            // is honest here.
-            if let Some(worker) = worker_slot::take_worker(&account.graph_worker).await {
+            // The renewal worker stops cooperatively: it observes the
+            // cancelled token between renewals and drops an in-flight PATCH,
+            // and it awaits the task that recreates a vanished subscription,
+            // so joining it here also waits for that task's install-or-undo
+            // DELETE. The join is bounded like the EWS one, and aborting on
+            // timeout is safe rather than merely honest: the recreate runs
+            // in its own task, which an abort of the worker does not touch.
+            if let Some(mut worker) = worker_slot::take_worker(&account.graph_worker).await
+                && tokio::time::timeout(CLOSE_WORKER_JOIN_TIMEOUT, &mut worker)
+                    .await
+                    .is_err()
+            {
+                tracing::warn!(
+                    target: "bifrost_graph::webhooks",
+                    "Graph renewal worker did not stop within the close() budget; aborting"
+                );
                 worker.abort();
             }
             Ok(())

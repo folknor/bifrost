@@ -145,11 +145,17 @@ pub(super) async fn subscribe_ews(
         return Ok((None, outcomes));
     }
     let handle = new_handle()?;
-    account
-        .ews_subscriptions
-        .write()
-        .await
-        .insert(handle.clone(), EwsSubscriptionState { scopes });
+    let mut registrations = account.ews_subscriptions.write().await;
+    registrations.insert(handle.clone(), EwsSubscriptionState { scopes });
+    // Armed in the same synchronous step as the insert: there is no await
+    // between the two, so no drop point exists at which the registration is
+    // installed and unguarded. The awaits after it (the worker slot lock) are
+    // where a dropped caller would otherwise leave a registration whose handle
+    // nobody received - one no `push_unsubscribe` can ever name, that the
+    // worker would stream (and hold a server-side Exchange subscription for)
+    // until `close()`.
+    let registration = RegistrationGuard::new(account.clone(), handle.clone());
+    drop(registrations);
     // Bump the topology generation AFTER the map write: the worker only
     // re-reads the map after observing a generation it has not seen, so the
     // read this bump provokes is guaranteed to include the new registration.
@@ -157,7 +163,43 @@ pub(super) async fn subscribe_ews(
         .ews_topology
         .send_modify(|generation| *generation = generation.wrapping_add(1));
     crate::account::push_stream::ensure_ews_worker(account).await;
+    registration.disarm();
     Ok((Some(handle), outcomes))
+}
+
+/// Retires a registration whose `subscribe_ews` future was dropped before it
+/// returned the handle.
+///
+/// `unsubscribe_ews` is async (it takes the registration lock), so the drop
+/// hands it to a task on the current runtime; with no runtime to hand it to
+/// (the drop is itself runtime teardown) there is nothing left to leak into.
+struct RegistrationGuard {
+    armed: Option<(GraphAccount, SubscriptionHandle)>,
+}
+
+impl RegistrationGuard {
+    fn new(account: GraphAccount, handle: SubscriptionHandle) -> Self {
+        Self {
+            armed: Some((account, handle)),
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = None;
+    }
+}
+
+impl Drop for RegistrationGuard {
+    fn drop(&mut self) {
+        let Some((account, handle)) = self.armed.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = unsubscribe_ews(account, handle).await;
+            });
+        }
+    }
 }
 
 /// The error context for the translation request itself.

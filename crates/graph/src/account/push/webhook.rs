@@ -426,14 +426,15 @@ pub(super) async fn unsubscribe_graph(
 /// subscription per resource per reopen. Nothing in the `Account` contract
 /// promises `push_unsubscribe` before `close()`, so `close()` has to do it.
 ///
-/// Failures are logged, not returned: `close()` must still cancel the
-/// shutdown token and retire its workers, and the engine has no useful
+/// Failures are logged, not returned: `close()` must still retire its
+/// workers, and the engine has no useful
 /// recovery for "the server kept a subscription we asked it to drop".
 pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
-    // Cancel BEFORE the walk: an in-flight `push_subscribe` checks the token
-    // under the same write lock it registers under, so a group it registers
-    // either precedes this cancel (and is walked below) or is refused.
-    // `close()` cancels again afterwards; that is idempotent.
+    // Cancel BEFORE the walk: an in-flight `push_subscribe`, and a renewal
+    // recreate's install, check the token under the same write lock they
+    // register under, so a group or replacement they register either
+    // precedes this cancel (and is walked below) or is refused and rolled
+    // back. `close()` relies on this being its only cancel.
     account.shutdown.cancel();
     let handles: Vec<SubscriptionHandle> = account
         .graph_subscriptions

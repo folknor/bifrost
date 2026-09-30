@@ -12,7 +12,7 @@ use bifrost_types::{
 use crate::account::push::common::PushEndpoint;
 use crate::account::push::renewal::{
     RENEWAL_CHECK_INTERVAL, RENEWAL_THRESHOLD_MINUTES, due_renewals,
-    has_live_graph_subscription_group, install_replacement,
+    has_live_graph_subscription_group, install_replacement, replace_gone_subscription,
 };
 use crate::account::push::webhook::{
     GraphSubscriptionGroup, ensure_graph_worker, mark_group_tearing_down,
@@ -21,7 +21,9 @@ use crate::account::push::webhook::{
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
 
-use super::fixtures::{expiring, state};
+use super::fixtures::{
+    created, deleted, email_scope, expiring, groups_empty, settle, state, webhook_account,
+};
 
 /// A recreated subscription takes the vanished one's place inside the
 /// SAME group rather than piling up beside it: the stale `server_id`
@@ -656,6 +658,294 @@ async fn a_failed_tick_disconnects_and_the_next_successful_tick_reconnects() {
     );
 
     account.shutdown.cancel();
+}
+
+// ---- cancellation safety of the renewal recreate ------------------------
+//
+// `replace_gone_subscription` is driven directly, from a spawned stand-in
+// for the worker that the test aborts. The write lock on the group map is
+// held across the create so "the create returned, the id is not recorded
+// yet" is a state the test can sit in and act on.
+
+const RESOURCE: &str = "/me/mailFolders/inbox/messages";
+
+async fn account_with_stale_group(client: &GraphClient) -> (GraphAccount, SubscriptionHandle) {
+    let account = webhook_account(client);
+    let handle = SubscriptionHandle("h".to_string());
+    account.graph_subscriptions.write().await.insert(
+        handle.clone(),
+        GraphSubscriptionGroup::live(vec![expiring("stale", RESOURCE)]),
+    );
+    (account, handle)
+}
+
+/// A stand-in renewal worker: one recreate, awaited inline in a task the test
+/// can abort.
+fn spawn_recreate(
+    account: &GraphAccount,
+    handle: &SubscriptionHandle,
+) -> tokio::task::JoinHandle<
+    Result<crate::account::push::renewal::Replacement, crate::error::GraphError>,
+> {
+    let account = account.clone();
+    let handle = handle.clone();
+    tokio::spawn(async move {
+        let endpoint = account.push_endpoint.clone().expect("webhook endpoint");
+        replace_gone_subscription(
+            &account,
+            &endpoint,
+            &handle,
+            "stale",
+            RESOURCE,
+            &[email_scope("inbox")],
+        )
+        .await
+    })
+}
+
+/// The worker is aborted after the create returned and before its id is
+/// recorded. The create, the install and the undo belong to a task the abort
+/// cannot reach, so the replacement still lands in place of the stale row.
+///
+/// Fails if `replace_gone_subscription` awaits `create_and_install_replacement`
+/// inline instead of handing it to `tokio::spawn`: the abort then drops the
+/// future at the group write lock and "fresh" is never recorded.
+#[tokio::test]
+async fn an_aborted_recreate_still_installs_what_it_created() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("fresh")]);
+    let (account, handle) = account_with_stale_group(&client).await;
+
+    let blocked = account.graph_subscriptions.write().await;
+    let caller = spawn_recreate(&account, &handle);
+    assert!(settle(|| client.wire_attempts() == 1).await, "create done");
+    caller.abort();
+    let _ = caller.await;
+    drop(blocked);
+
+    let installed = settle(|| {
+        account.graph_subscriptions.try_read().is_ok_and(|groups| {
+            groups.get(&handle).is_some_and(|group| {
+                group.subscriptions.len() == 1 && group.subscriptions[0].server_id == "fresh"
+            })
+        })
+    })
+    .await;
+    assert!(installed, "the replacement takes the stale row's place");
+    assert_eq!(client.wire_attempts(), 1, "nothing was deleted");
+}
+
+/// The worker is aborted after the create returned, and the handle is retired
+/// before the install: the undo DELETE must still run, or the new server
+/// subscription is live with no group that knows it.
+///
+/// Fails if the undo in `create_and_install_replacement` is removed, or if the
+/// recreate runs inline (the abort then kills it at the write lock, before the
+/// undo).
+#[tokio::test]
+async fn an_aborted_recreate_for_a_retired_handle_still_deletes_the_new_subscription() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("fresh"), deleted()]);
+    let (account, handle) = account_with_stale_group(&client).await;
+
+    let mut blocked = account.graph_subscriptions.write().await;
+    let caller = spawn_recreate(&account, &handle);
+    assert!(settle(|| client.wire_attempts() == 1).await, "create done");
+    caller.abort();
+    let _ = caller.await;
+    // `push_unsubscribe` finished while the create was in flight.
+    blocked.clear();
+    drop(blocked);
+
+    assert!(
+        settle(|| client.wire_attempts() == 2).await,
+        "the orphaned replacement is deleted"
+    );
+    let requests = client.take_rest_requests();
+    let last = requests.last().expect("recorded");
+    assert_eq!(last.method.as_str(), "DELETE");
+    assert!(last.url.ends_with("/subscriptions/fresh"));
+    assert!(
+        groups_empty(&account),
+        "a retired handle is not resurrected"
+    );
+}
+
+/// `close()` cancels the token while a recreate is between its create and its
+/// install, against a group the walk has not reached yet. The install must
+/// refuse on the token and undo the create.
+///
+/// Fails if the `shutdown.is_cancelled()` check under the write lock in
+/// `create_and_install_replacement` is removed: the group is live and not
+/// `tearing_down`, so `install_replacement` alone would accept it.
+#[tokio::test]
+async fn a_recreate_racing_close_is_undone_not_installed() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("fresh"), deleted()]);
+    let (account, handle) = account_with_stale_group(&client).await;
+
+    let blocked = account.graph_subscriptions.write().await;
+    let caller = spawn_recreate(&account, &handle);
+    assert!(settle(|| client.wire_attempts() == 1).await, "create done");
+    account.shutdown.cancel();
+    drop(blocked);
+
+    let result = caller.await.expect("not aborted");
+    assert_eq!(
+        result.expect("the undo is not an error"),
+        crate::account::push::renewal::Replacement::HandleUnsubscribed
+    );
+    assert_eq!(client.wire_attempts(), 2, "the create was rolled back");
+    let groups = account.graph_subscriptions.read().await;
+    let ids: Vec<&str> = groups[&handle]
+        .subscriptions
+        .iter()
+        .map(|state| state.server_id.as_str())
+        .collect();
+    assert_eq!(ids, ["stale"], "the walk still finds only what it knows");
+}
+
+/// A recreate that starts on a closed account issues no POST at all.
+///
+/// Fails if the early `shutdown.is_cancelled()` check in
+/// `create_and_install_replacement` is removed.
+#[tokio::test]
+async fn a_recreate_on_a_closed_account_creates_nothing() {
+    let client = GraphClient::new("token");
+    client.script_rest([]);
+    let (account, handle) = account_with_stale_group(&client).await;
+    account.shutdown.cancel();
+
+    let result = spawn_recreate(&account, &handle)
+        .await
+        .expect("not aborted");
+    assert_eq!(
+        result.expect("no error"),
+        crate::account::push::renewal::Replacement::AccountClosed
+    );
+    assert_eq!(client.wire_attempts(), 0);
+}
+
+/// The worker stops on the token without being aborted: a renewal PATCH that
+/// is parked on the wire is dropped and the task returns.
+///
+/// Fails if the `shutdown.cancelled()` arm of the renewal `select!` in
+/// `run_graph_subscription_worker` is removed (the parked PATCH never
+/// resolves, so the worker never finishes).
+#[tokio::test(start_paused = true)]
+async fn the_worker_stops_on_cancellation_while_a_renewal_is_in_flight() {
+    let client = GraphClient::new("token");
+    client.script_aux_pending(1);
+    let (account, _handle) = account_with_stale_group(&client).await;
+
+    ensure_graph_worker(account.clone()).await;
+    for _ in 0..64 {
+        if client.wire_attempts() == 1 {
+            break;
+        }
+        tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(client.wire_attempts(), 1, "the renewal is on the wire");
+
+    let worker = account
+        .graph_worker
+        .lock()
+        .await
+        .take()
+        .expect("worker running");
+    account.shutdown.cancel();
+    assert!(settle(|| worker.is_finished()).await, "the worker returned");
+    worker.await.expect("it returned, it did not panic");
+}
+
+/// A cancel that lands while the worker is waiting for its due list issues no
+/// request at all: the token is read before the first PATCH, not after.
+///
+/// Fails if the `biased` cancelled arm is removed from the renewal `select!`:
+/// the scripted wire is empty, so a PATCH panics the worker task and the
+/// `await` below fails.
+#[tokio::test(start_paused = true)]
+async fn a_worker_cancelled_before_its_first_renewal_sends_nothing() {
+    let client = GraphClient::new("token");
+    client.script_rest([]);
+    let (account, _handle) = account_with_stale_group(&client).await;
+
+    let blocked = account.graph_subscriptions.write().await;
+    ensure_graph_worker(account.clone()).await;
+    // The worker wakes from its sleep and parks on the due list's lock.
+    tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    account.shutdown.cancel();
+    drop(blocked);
+
+    let worker = account
+        .graph_worker
+        .lock()
+        .await
+        .take()
+        .expect("worker running");
+    assert!(settle(|| worker.is_finished()).await, "the worker returned");
+    worker.await.expect("it returned, it did not panic");
+    assert_eq!(client.wire_attempts(), 0);
+}
+
+/// `close()` racing a recreate that has created but not installed. The
+/// create is walked or rolled back, and `close()` does not return until the
+/// worker - which awaits the undo - has stopped.
+///
+/// The undo DELETE is parked on the wire, so a `close()` that joins the worker
+/// takes the whole join budget (visible on the paused clock), while one that
+/// aborts it returns at once. The lock queue is FIFO, so the recreate's
+/// install is granted before the walk's read.
+///
+/// Fails if `close()` goes back to aborting the renewal worker (elapsed stays
+/// under the budget). Also hangs, and so fails the watchdog, if the token
+/// check under the install's write lock is removed: the replacement is then
+/// installed and the walk's DELETE consumes the parked script entry.
+#[tokio::test(start_paused = true)]
+async fn close_joins_the_worker_and_so_waits_for_the_recreates_undo() {
+    use bifrost_types::Account;
+
+    let client = GraphClient::new("token");
+    // POST create, then the undo DELETE parks forever, then the walk's DELETE.
+    client.script_rest([created("fresh")]);
+    client.script_aux_pending(1);
+    client.script_rest([deleted()]);
+    let (account, handle) = account_with_stale_group(&client).await;
+
+    let blocked = account.graph_subscriptions.write().await;
+    let recreate = spawn_recreate(&account, &handle);
+    assert!(settle(|| client.wire_attempts() == 1).await, "create done");
+    // The stand-in worker occupies the slot the way the real one does.
+    *account.graph_worker.lock().await = Some(tokio::spawn(async move {
+        let _ = recreate.await;
+    }));
+
+    let closing = account.clone();
+    let close = tokio::spawn(async move { Account::close(&closing).await });
+    assert!(
+        settle(|| account.shutdown.is_cancelled()).await,
+        "close reached its walk and cancelled the token"
+    );
+    drop(blocked);
+
+    let started = tokio::time::Instant::now();
+    close.await.expect("close ran").expect("close succeeds");
+    assert!(
+        started.elapsed() >= crate::account::CLOSE_WORKER_JOIN_TIMEOUT,
+        "close waited on the worker instead of aborting it"
+    );
+
+    let requests = client.take_rest_requests();
+    let urls: Vec<(&str, &str)> = requests
+        .iter()
+        .map(|request| (request.method.as_str(), request.url.as_str()))
+        .collect();
+    assert_eq!(urls.len(), 3, "create, undo, walk: {urls:?}");
+    assert!(urls[1].1.ends_with("/subscriptions/fresh") && urls[1].0 == "DELETE");
+    assert!(urls[2].1.ends_with("/subscriptions/stale") && urls[2].0 == "DELETE");
+    assert!(account.graph_worker.lock().await.is_none());
 }
 
 #[test]

@@ -17,7 +17,9 @@ use crate::account::push::webhook::{
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
 
-use super::fixtures::{email_scope, state};
+use super::fixtures::{
+    created, deleted, email_scope, groups_empty, settle, state, webhook_account,
+};
 
 #[test]
 fn graph_subscription_resource_uses_folder_messages() {
@@ -438,31 +440,8 @@ async fn a_first_webhook_subscribe_publishes_no_reconnect() {
 
 // ---- cancellation safety of the webhook `push_subscribe` ----------------
 //
-// The scripted wire is one ordered script shared by `script_rest` and
-// `script_aux_pending`, so a create can be parked forever (`Pending`) between
-// answered requests. Every test runs on the current-thread test runtime:
-// spawned work only advances when the test yields, which makes "drop the
-// future NOW" deterministic.
-
-fn webhook_account(client: &GraphClient) -> GraphAccount {
-    let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    account.push_endpoint = Some(PushEndpoint {
-        webhook_url: "https://example.test/hook".to_string(),
-        client_state: "secret".to_string(),
-    });
-    account
-}
-
-fn created(id: &str) -> ScriptedRestResponse {
-    ScriptedRestResponse::json(
-        reqwest::StatusCode::CREATED,
-        serde_json::json!({"id": id, "expirationDateTime": "2099-01-01T00:00:00Z"}),
-    )
-}
-
-fn deleted() -> ScriptedRestResponse {
-    ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT)
-}
+// The scripted-wire helpers (`webhook_account`, `created`, `deleted`,
+// `settle`, `groups_empty`) live in `fixtures`; the renewal suite uses them too.
 
 fn two_resources() -> Vec<CursorScope> {
     vec![
@@ -472,25 +451,6 @@ fn two_resources() -> Vec<CursorScope> {
             ty: ObjectType::Contact,
         },
     ]
-}
-
-/// Yield to the spawned work until `done` holds, bounded so a regression
-/// fails the assertion instead of hanging. Yields, never sleeps.
-async fn settle(mut done: impl FnMut() -> bool) -> bool {
-    for _ in 0..2000 {
-        if done() {
-            return true;
-        }
-        tokio::task::yield_now().await;
-    }
-    done()
-}
-
-fn groups_empty(account: &GraphAccount) -> bool {
-    account
-        .graph_subscriptions
-        .try_read()
-        .is_ok_and(|groups| groups.is_empty())
 }
 
 /// A future dropped after its first poll, while the create loop has not run

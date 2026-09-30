@@ -76,7 +76,8 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     `mark_group_tearing_down` / `remove_subscription_from_groups` pair that
     makes it race-free against renewal.
   - `push/renewal.rs` - the renewal health worker that re-issues expiring
-    subscriptions, recreates a vanished one (`replace_gone_subscription` /
+    subscriptions, recreates a vanished one (`replace_gone_subscription`, which
+    hands `create_and_install_replacement` to a spawned task, and
     `install_replacement`), emits Disconnected/Reconnected/Terminated on
     renewal failure, and retires its own worker slot.
   - `push/ews.rs` - the EWS streaming arm: `ews_subscribable_folder_id`, the
@@ -734,20 +735,21 @@ shutdown token); the factory holds the client, so the new account reads the
 token source's current value. `push_stream` wraps the broadcast receiver in a
 `stream::unfold` selecting against the same token.
 
-`close()` retires SERVER-side state before it cancels anything, because
-cancelling stops the very workers that would otherwise retire it, and neither
-kind of subscription dies because this process did. In order: it walks
-`graph_subscriptions` and runs `unsubscribe_graph` per handle
-(`retire_all_graph_subscriptions`, best-effort - a DELETE failure is logged,
-never returned, since `close()` must still complete and the engine has no
-recovery for "the server kept a subscription"); cancels the shutdown token;
+`close()` retires SERVER-side state before it stops any worker, because neither
+kind of subscription dies because this process did. In order:
+`retire_all_graph_subscriptions` cancels the shutdown token (its first step,
+before it looks at any group, and `close()`'s only cancel), then walks
+`graph_subscriptions` and runs the teardown per handle (best-effort - a DELETE
+failure is logged, never returned, since `close()` must still complete and the
+engine has no recovery for "the server kept a subscription"); `close()` then
 JOINS the EWS worker under `CLOSE_WORKER_JOIN_TIMEOUT` rather than aborting it,
 so the worker's own `Shutdown` arm gets to send its EWS `Unsubscribe` (aborting
 preempted exactly that, and Exchange caps streaming subscriptions per mailbox,
-so every reopen burned one until it timed out); and only then aborts the
-renewal worker, which by that point holds no server-side state of its own.
-Without the walk, each reopen stranded one live webhook subscription per
-resource still POSTing to the consumer's receiver.
+so every reopen burned one until it timed out); and finally JOINS the renewal
+worker under the same budget, aborting only on timeout (see "Cancellation
+safety of the renewal recreate"). Without the walk, each reopen stranded one
+live webhook subscription per resource still POSTing to the consumer's
+receiver.
 
 `run_worker`'s `Shutdown` and `Terminated` exits both call
 `release_subscription`, like the `Resubscribe` / `Disconnected` exits.
@@ -1386,11 +1388,57 @@ so there is nothing to DELETE by and it lives until Graph's own expiry.
 Recovering it would mean listing `/subscriptions` and deleting by resource and
 notification URL, which can also delete another process's identical
 subscription. A process exit or runtime shutdown kills the task like any other.
+The same holds for the renewal recreate below.
+
+#### Cancellation safety of the renewal recreate
+
+The renewal worker used to run `replace_gone_subscription` inline, and `close()`
+aborted the worker (as does `unsubscribe_graph` when the last group goes). An
+abort landing after the create returned and before the new id was recorded, or
+mid-way through the undo DELETE, stranded a live server subscription that no
+group knew. Now:
+
+- `replace_gone_subscription` spawns `create_and_install_replacement` on the
+  runtime and only awaits it. The create, the install and the undo belong to a
+  task the worker's abort, cancel or drop cannot reach. There is no ack
+  hand-off, unlike `push_subscribe`: the install is its own effect and no
+  caller holds anything that could be lost. A lost result costs only the
+  `Reconnected` the worker would have announced, and the worker is only ever
+  cancelled when the account is closing or the handle is being retired. A task
+  panic reaches the worker as `GraphError::RuntimeFailure`.
+- The install re-checks the shutdown token under the write lock it installs
+  under, and `retire_all_graph_subscriptions` cancels before it walks, so a
+  create racing `close()` is either installed before the cancel (the walk
+  snapshots it) or refused and deleted; never neither. The group's
+  `tearing_down` marker refuses the same install once the walk reaches that
+  handle; the token check keeps the rule local rather than resting on the
+  walk's ordering. A create that starts on an already closed account is
+  skipped (`Replacement::AccountClosed`).
+- A handle retired before the create returns (group gone) is the same undo:
+  the fresh subscription is DELETEd, and a failed DELETE is logged only. There
+  is no group left to hold the id for a retry, so it lives until Graph's
+  own expiry.
+- The worker is cooperative: each renewal PATCH is raced against the token
+  (`biased`, so a cancelled token sends nothing), and a PATCH in flight is
+  dropped, which is harmless because a renewal creates nothing. `close()` now
+  JOINS the worker under `CLOSE_WORKER_JOIN_TIMEOUT` and aborts only on
+  timeout. The join is what makes `close()` wait for an in-flight undo DELETE;
+  the abort on timeout is safe because that DELETE lives in the spawned task.
+  `unsubscribe_graph` still aborts the worker when the last group is removed,
+  which is likewise safe now.
 
 ### EWS streaming mode (`PushMode::EwsStreaming`)
 
 `push_subscribe` installs an `EwsSubscriptionState` and starts the EWS
-worker: it subscribes to the union of active folders, long-polls
+worker. The arm itself creates nothing server-side (the worker owns the EWS
+Subscribe, is never aborted except by `close()` after its bounded join, and
+never races its Subscribe against cancellation, so a Subscribe whose id it read
+is always released). What a dropped caller could strand is the LOCAL
+registration: inserted, then parked on the worker-slot lock, handle never
+delivered, streamed until `close()`. A `RegistrationGuard` is armed in the same
+synchronous step as the insert (no await between them) and, if dropped armed,
+spawns `unsubscribe_ews`; `subscribe_ews` disarms it just before returning the
+handle. The worker: it subscribes to the union of active folders, long-polls
 `GetStreamingEvents`, maps notifications to cursor scopes, and emits
 `Invalidated`. Failures use `ews_error_to_account_error`
 (terminal terminates; transient emits `Disconnected`, then both Subscribe
