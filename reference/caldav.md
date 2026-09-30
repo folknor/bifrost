@@ -220,8 +220,13 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   and quoted-parameter splitting that tolerates `:`/`;`/`,` inside quoted
   values). Values are stored raw by caldata; text fields (summary,
   description, location, CN) are unescaped at read time via a single
-  left-to-right scan. `event_from_ical` projects the master (first VEVENT)
-  for direct get/update; `events_from_ical` projects *every* VEVENT (master
+  left-to-right scan. `event_from_ical` projects the master for direct
+  get/update: the first VEVENT without a top-level `RECURRENCE-ID`, wherever it
+  sits in the body, or the first VEVENT when every one is an override (a single
+  edited instance stored alone). `target_block_index` is that selection and the
+  patch writer calls the same function, so a patch splices into the VEVENT the
+  event was read from; an override-first body patches its master, not its first
+  block; `events_from_ical` projects *every* VEVENT (master
   plus each recurrence override / CANCEL), carrying RECURRENCE-ID and STATUS
   through, and is used by the range/search listing paths (override instances
   take a recurrence-qualified `EventId` but keep the resource native id).
@@ -310,7 +315,14 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   and a `RECURRENCE-ID` inside a nested component are read exactly as the projection read them.
   `splice_lines` groups logical lines with that same reader (a head plus every
   physical line up to the next head), emits untouched ones verbatim and folds
-  only the replacements. Replacement matching is case-insensitive and
+  only the replacements. The physical lines come from `physical_lines`, which
+  splits exactly as caldata's `LineReader` does (on `\n` alone, dropping one
+  `\r` before it; a bare `\r` is a break to neither, so a value holding one is a
+  single logical line and a preserved `\r\r\n` ending keeps its first `\r`),
+  and the pairing is VERIFIED, not assumed: every logical line rebuilt from the
+  physical lines must equal what the reader produced, and the landing line must
+  exist, else `splice_lines` returns `None` and the patch is refused as
+  `NoSpliceableVevent` rather than spliced at a guessed line. Replacement matching is case-insensitive and
   limited to depth-zero VEVENT properties, so VALARM properties are
   preserved; new event properties are inserted before the first nested
   component. An event with no stored source body is REFUSED, never rebuilt
@@ -319,7 +331,11 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   successful edit. `PatchError` classifies what stopped a patch:
   `RecurrenceOverride` (a recurrence replacement on a resource with override
   VEVENTs, an override being a VEVENT with a top-level `RECURRENCE-ID`) is
-  `Unsupported`, while `NoSpliceableVevent` and `MissingSourceBody` are
+  `Unsupported`. The refusal still stands after the target selection above: the
+  replacement would orphan the overrides when the target is the master, and
+  rewrite an override's own `RECURRENCE-ID` when it is not. `NoSpliceableVevent`
+  (which also covers a body whose lines the splice cannot pair with the
+  reader's) and `MissingSourceBody` are
   `Internal(InvariantViolated)` with no attempt, because an event projected
   from its own body always has both. Parameter values use
   RFC 6868 caret encoding in both directions; caldata hands back raw

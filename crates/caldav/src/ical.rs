@@ -23,19 +23,19 @@ pub(crate) enum EventProjectionError {
     NoVevent,
 }
 
-/// Project the master (first) VEVENT of a resource. Used by the direct
-/// `event_get` / `event_update` paths, which operate on the master.
+/// Project the master VEVENT of a resource: the first VEVENT without a
+/// top-level `RECURRENCE-ID`, or the first VEVENT when every one is an
+/// override (see `target_block_index`). Used by the direct `event_get` /
+/// `event_update` paths, and the patch writer splices into the same VEVENT.
 pub(crate) fn event_from_ical(
     uri: String,
     calendar_id: CalendarId,
     etag: Option<String>,
     data: &str,
 ) -> Result<CalendarEvent, EventProjectionError> {
-    let block = parse_vevents(data)
-        .map_err(EventProjectionError::Parse)?
-        .into_iter()
-        .next()
-        .ok_or(EventProjectionError::NoVevent)?;
+    let mut blocks = parse_vevents(data).map_err(EventProjectionError::Parse)?;
+    let index = target_block_index(&blocks).ok_or(EventProjectionError::NoVevent)?;
+    let block = blocks.swap_remove(index);
     Ok(project_event(
         EventId(uri.clone()),
         uri,
@@ -268,14 +268,13 @@ pub(crate) fn patch_to_ical(
     // test `events_from_ical` applies when it mints an override's id - so one
     // nested inside a VALARM or a skipped component is not an override here
     // either.
-    if patch.recurrence.is_some()
-        && blocks
-            .iter()
-            .any(|block| block.props.iter().any(|prop| prop.name == "RECURRENCE-ID"))
-    {
+    if patch.recurrence.is_some() && blocks.iter().any(is_override_block) {
         return Err(PatchError::RecurrenceOverride);
     }
-    let master = blocks.first().ok_or(PatchError::NoSpliceableVevent)?;
+    // The VEVENT `event_from_ical` projected, by the same selection.
+    let master = target_block_index(&blocks)
+        .and_then(|index| blocks.get(index))
+        .ok_or(PatchError::NoSpliceableVevent)?;
 
     let mut replacements = Vec::new();
     let mut replace_names = Vec::new();
@@ -343,7 +342,7 @@ pub(crate) fn patch_to_ical(
         .map(|(_, line)| *line)
         .collect::<Vec<_>>();
     let insert_at = master.span.first_nested.unwrap_or(master.span.end);
-    Ok(splice_lines(raw_ical, insert_at, &removed, replacements))
+    splice_lines(raw_ical, insert_at, &removed, replacements).ok_or(PatchError::NoSpliceableVevent)
 }
 
 pub(crate) fn patch_event(current: &CalendarEvent, patch: &EventPatch) -> EventCreate {
@@ -448,6 +447,26 @@ struct VeventBlock {
     props: Vec<Prop>,
     alarms: Vec<Vec<Prop>>,
     span: BlockSpan,
+}
+
+/// An override is a VEVENT carrying a top-level `RECURRENCE-ID`.
+fn is_override_block(block: &VeventBlock) -> bool {
+    block.props.iter().any(|prop| prop.name == "RECURRENCE-ID")
+}
+
+/// The VEVENT an event id addresses. An event id is the resource URL (an id
+/// naming a recurrence instance, `{uri}#{recurrence_id}`, is refused before it
+/// gets here), and a resource is projected as its master: the first VEVENT that
+/// is not an override, wherever it sits in the body - servers do not promise
+/// document order. A resource holding only overrides (a single edited instance
+/// stored alone) has no master, and its first VEVENT is the event. Both the
+/// projection and the patch writer select through this, so the VEVENT a patch
+/// splices into is the one the event was read from.
+fn target_block_index(blocks: &[VeventBlock]) -> Option<usize> {
+    blocks
+        .iter()
+        .position(|block| !is_override_block(block))
+        .or_else(|| (!blocks.is_empty()).then_some(0))
 }
 
 /// Where a VEVENT block sits in the body, in caldata `LineReader` line
@@ -1290,36 +1309,71 @@ fn classification(visibility: EventVisibility) -> Option<&'static str> {
 /// it, re-wrapping every preserved line and, through an old WSP-eating
 /// unfolder, losing characters.
 ///
-/// Infallible: both line numbers come from a parse of this same text by this
-/// same reader, so the landing point always exists.
+/// Refuses (`None`) a body whose physical lines cannot be paired with the
+/// reader's line numbers, and a body with no line at `insert_at`. Neither is
+/// reachable from a well-formed parse; a silent mis-splice is the outcome that
+/// is not allowed, so a disagreement is an error rather than a guess.
 fn splice_lines(
     raw_ical: &str,
     insert_at: usize,
     removed: &[usize],
     replacements: Vec<String>,
-) -> String {
-    let physical = raw_ical
-        .lines()
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect::<Vec<_>>();
-    let heads = LineReader::from_slice(raw_ical.as_bytes())
-        .filter_map(Result::ok)
-        .map(|line| line.number())
-        .collect::<Vec<_>>();
-    let emit = |out: &mut String, from: usize, to: usize| {
-        for line in physical.get(from..to).unwrap_or_default() {
-            out.push_str(line);
-            out.push_str("\r\n");
-        }
+) -> Option<String> {
+    let physical = physical_lines(raw_ical);
+    let mut heads = Vec::new();
+    let mut unfolded = Vec::new();
+    for line in LineReader::from_slice(raw_ical.as_bytes()) {
+        let line = line.ok()?;
+        heads.push(line.number());
+        unfolded.push(line.as_str().to_owned());
+    }
+    // The pairing is verified, not assumed: every logical line, rebuilt from
+    // the physical lines this function will emit, must equal what the reader
+    // produced for it. A reader that broke lines differently (a bare CR, say)
+    // makes the rebuilt text differ or the numbers run past the end, and the
+    // body is refused.
+    let start_of = |head: usize| head.checked_sub(1);
+    let first_head = match heads.first() {
+        Some(&head) => start_of(head)?,
+        None => physical.len(),
     };
+    if physical
+        .get(..first_head)?
+        .iter()
+        .any(|line| !line.is_empty())
+    {
+        return None;
+    }
+    let mut groups = Vec::with_capacity(heads.len());
+    for (index, &head) in heads.iter().enumerate() {
+        let from = start_of(head)?;
+        let to = match heads.get(index + 1) {
+            Some(&next) => start_of(next)?,
+            None => physical.len(),
+        };
+        let group = physical.get(from..to).filter(|group| !group.is_empty())?;
+        let mut rebuilt = String::from(group[0]);
+        for line in &group[1..] {
+            if !line.is_empty() {
+                rebuilt.push_str(line.get(1..)?);
+            }
+        }
+        if rebuilt != unfolded[index] {
+            return None;
+        }
+        groups.push((head, group));
+    }
+    if !groups.iter().any(|&(head, _)| head == insert_at) {
+        return None;
+    }
 
     let mut out = String::new();
     let mut replacements = Some(replacements);
-    // Blank lines before the first logical line, which caldata skips.
-    let first_head = heads.first().map_or(physical.len(), |head| head - 1);
-    emit(&mut out, 0, first_head);
-    for (index, &head) in heads.iter().enumerate() {
-        let next = heads.get(index + 1).map_or(physical.len(), |next| next - 1);
+    for line in &physical[..first_head] {
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    for (head, group) in groups {
         if head == insert_at
             && let Some(replacements) = replacements.take()
         {
@@ -1328,9 +1382,34 @@ fn splice_lines(
         if removed.contains(&head) {
             continue;
         }
-        emit(&mut out, head - 1, next);
+        for line in group {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
     }
-    out
+    Some(out)
+}
+
+/// The physical lines of a body, split exactly as caldata's `LineReader` splits
+/// them: on `\n` only, dropping ONE `\r` directly before it, and a final
+/// segment without a `\n` kept as is. `str::lines` differs at the edges (it
+/// strips a further trailing `\r`), and a bare `\r` is a break to neither.
+fn physical_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        match rest.split_once('\n') {
+            Some((line, tail)) => {
+                lines.push(line.strip_suffix('\r').unwrap_or(line));
+                rest = tail;
+            }
+            None => {
+                lines.push(rest);
+                break;
+            }
+        }
+    }
+    lines
 }
 
 fn fold_ical_lines(lines: Vec<String>) -> String {
@@ -2441,6 +2520,150 @@ mod tests {
         .expect_err("a lowercase override is still an override");
 
         assert_eq!(error, PatchError::RecurrenceOverride);
+    }
+
+    const OVERRIDE_FIRST: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260609T120000Z\r\nSUMMARY:Override\r\nDTSTART:20260609T140000Z\r\nDTEND:20260609T150000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Master\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    fn title_patch(title: &str) -> EventPatch {
+        EventPatch {
+            title: Some(Some(title.to_string())),
+            ..EventPatch::default()
+        }
+    }
+
+    /// A body whose first VEVENT is an override still projects, and patches,
+    /// the master. Reverting `target_block_index` to `blocks.first()` in
+    /// `event_from_ical` fails the projection assertion; reverting it in
+    /// `patch_to_ical` alone splices "Updated" into the override.
+    #[test]
+    fn an_override_first_body_patches_the_master_it_projected() {
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            OVERRIDE_FIRST,
+        );
+        assert_eq!(current.title.as_deref(), Some("Master"));
+        assert_eq!(current.recurrence.recurrence_id, None);
+
+        let body = patch_to_ical(&current, &title_patch("Updated")).expect("splices the master");
+
+        let override_end = OVERRIDE_FIRST.find("END:VEVENT").expect("first VEVENT");
+        assert!(
+            body.starts_with(&OVERRIDE_FIRST[..override_end]),
+            "the override VEVENT is byte-identical: {body:?}"
+        );
+        assert!(body.contains("SUMMARY:Updated\r\n"));
+        assert!(!body.contains("SUMMARY:Master"));
+        assert!(body.contains("SUMMARY:Override\r\n"));
+        // The patched body still projects the same master.
+        let reread = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            &body,
+        );
+        assert_eq!(reread.title.as_deref(), Some("Updated"));
+    }
+
+    /// A resource holding only overrides has no master: the first VEVENT is the
+    /// event, a scalar patch lands on it, and a recurrence replacement is still
+    /// refused. Reverting the `or_else` fallback in `target_block_index` makes
+    /// the projection fail with `NoVevent`.
+    #[test]
+    fn an_override_only_body_patches_its_own_override() {
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260609T120000Z\r\nSUMMARY:Alone\r\nDTSTART:20260609T140000Z\r\nDTEND:20260609T150000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260616T120000Z\r\nSUMMARY:Second\r\nDTSTART:20260616T140000Z\r\nDTEND:20260616T150000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            body,
+        );
+        assert_eq!(current.title.as_deref(), Some("Alone"));
+
+        let patched = patch_to_ical(&current, &title_patch("Edited")).expect("splices");
+        assert!(patched.contains("SUMMARY:Edited\r\n"));
+        assert!(!patched.contains("SUMMARY:Alone"));
+        assert!(patched.contains("SUMMARY:Second\r\n"));
+
+        let recurrence = EventPatch {
+            recurrence: Some(EventRecurrence::default()),
+            ..EventPatch::default()
+        };
+        assert_eq!(
+            patch_to_ical(&current, &recurrence),
+            Err(PatchError::RecurrenceOverride)
+        );
+    }
+
+    /// Physical lines break on `\n` alone, with one `\r` before it dropped -
+    /// caldata's rule. Reverting `physical_lines` to `str::lines` plus a
+    /// `\r` strip fails the first case (it drops a second `\r`).
+    #[test]
+    fn physical_lines_split_exactly_as_the_line_reader_does() {
+        assert_eq!(physical_lines("a\r\r\nb\rc\nd"), vec!["a\r", "b\rc", "d"]);
+        assert_eq!(physical_lines("a\n\n"), vec!["a", ""]);
+        assert_eq!(physical_lines("a\r"), vec!["a\r"]);
+        assert!(physical_lines("").is_empty());
+    }
+
+    /// A bare CR is not a line break to caldata, so a value holding one is one
+    /// logical line and a preserved line ending in `\r\r\n` keeps its `\r`.
+    /// Reverting `physical_lines` to `str::lines` plus a `\r` strip fails the
+    /// last assertion.
+    #[test]
+    fn a_bare_cr_inside_a_preserved_line_survives_the_splice() {
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\nX-NOTE:one\rtwo\r\r\nX-TAIL:z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            body,
+        );
+        let patched = patch_to_ical(&current, &title_patch("New")).expect("splices");
+        assert!(patched.contains("SUMMARY:New\r\n"));
+        assert!(
+            patched.contains("X-NOTE:one\rtwo\r\r\nX-TAIL:z\r\n"),
+            "{patched:?}"
+        );
+    }
+
+    /// A body broken only by bare CRs is one giant line to caldata: nothing
+    /// projects, and a patch against such a stored body is refused rather than
+    /// spliced at a guessed line. The patch case is refused by
+    /// `target_block_index` finding no VEVENT (reverting nothing there passes it
+    /// by design: both readers agree there is no event); the direct
+    /// `splice_lines` case bites on the landing-line check, which is the only
+    /// thing refusing a line number the body does not hold.
+    #[test]
+    fn a_bare_cr_body_is_refused_not_mis_spliced() {
+        let cr_only = OVERRIDE_FIRST.replace("\r\n", "\r");
+        assert_eq!(
+            event_from_ical(
+                "/cal/one.ics".to_string(),
+                CalendarId("/cal/".to_string()),
+                None,
+                &cr_only
+            )
+            .expect_err("no VEVENT is reachable"),
+            EventProjectionError::NoVevent
+        );
+        let mut current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            OVERRIDE_FIRST,
+        );
+        current.raw_ical = Some(cr_only);
+        assert_eq!(
+            patch_to_ical(&current, &title_patch("New")),
+            Err(PatchError::NoSpliceableVevent)
+        );
+
+        assert_eq!(
+            splice_lines("BEGIN:VEVENT\r\nEND:VEVENT\r\n", 99, &[], Vec::new()),
+            None
+        );
     }
 
     #[test]
