@@ -31,9 +31,15 @@ pub(crate) enum EventProjectionError {
 
 /// Split an event id into the resource it lives in and, for a
 /// recurrence-qualified id (`{uri}#{recurrence_id}`, the id the listing lanes
-/// mint for an override), the `RECURRENCE-ID` value it names. The resource is a
-/// resolved URL, in which a literal `#` cannot occur (a fragment is never part
-/// of an href), so the first `#` is the separator.
+/// mint for an override), the `RECURRENCE-ID` value it names.
+///
+/// The first `#` is the separator, and that is correct because no resource URL
+/// holds one. A `#` in an href would be a fragment delimiter, so a conforming
+/// server percent-encodes a literal one (`%23`), which passes through here
+/// untouched. A server that sends one raw is normalized to `%23` where hrefs are
+/// resolved (`parse::resolve_href`), so the ids this crate mints hold exactly
+/// one `#` at most. Splitting at the FIRST one, not the last, also keeps a
+/// `RECURRENCE-ID` value that itself contained a `#` whole in the instance half.
 pub(crate) fn split_event_id(id: &str) -> (&str, Option<&str>) {
     match id.split_once('#') {
         Some((resource, instance)) => (resource, Some(instance)),
@@ -200,7 +206,62 @@ fn project_event(
     }
 }
 
-pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> String {
+/// A consumer value the writers refuse to put on the wire.
+///
+/// The iCalendar writers emit `NAME:value` lines by concatenation, so a value
+/// holding a line break would inject arbitrary content lines into the stored
+/// resource. TEXT values are escaped (`escape_text`) and parameter values are
+/// encoded (`escape_param`, RFC 6868), but a value type with no escape form -
+/// RECUR, DATE-TIME, CAL-ADDRESS - cannot carry a control character at all. It
+/// is REFUSED rather than stripped: a stripped value writes something the
+/// caller did not ask for. The account layer maps this to `Request(Malformed)`
+/// naming `field`, before any request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteError {
+    pub(crate) field: &'static str,
+    pub(crate) reason: &'static str,
+}
+
+const CONTROL_CHARACTER: &str = "contains a control character";
+const EMPTY_VALUE: &str = "is empty";
+
+/// A value type with no escaping (RECUR, DATE-TIME, CAL-ADDRESS URI): any ASCII
+/// control character, tab included, is refused, as is an empty value (`NAME:`
+/// is not a valid content line for any of them).
+fn plain_value<'a>(field: &'static str, value: &'a str) -> Result<&'a str, WriteError> {
+    if value.is_empty() {
+        return Err(WriteError {
+            field,
+            reason: EMPTY_VALUE,
+        });
+    }
+    if value.chars().any(|ch| ch.is_ascii_control()) {
+        return Err(WriteError {
+            field,
+            reason: CONTROL_CHARACTER,
+        });
+    }
+    Ok(value)
+}
+
+/// A parameter value, encoded for the wire. RFC 5545 s3.2 forbids control
+/// characters and DQUOTE inside one; RFC 6868 (`escape_param`) gives CR, LF and
+/// DQUOTE a caret form, so those are encoded. Tab is legal (WSP). Any other
+/// control character has no encoding and is refused.
+fn param_value(field: &'static str, value: &str) -> Result<String, WriteError> {
+    if value
+        .chars()
+        .any(|ch| ch.is_ascii_control() && !matches!(ch, '\t' | '\r' | '\n'))
+    {
+        return Err(WriteError {
+            field,
+            reason: CONTROL_CHARACTER,
+        });
+    }
+    Ok(escape_param(value))
+}
+
+pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> Result<String, WriteError> {
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_string(),
         "VERSION:2.0".to_string(),
@@ -212,33 +273,22 @@ pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> String {
     push_optional(&mut lines, "SUMMARY", event.title.as_deref());
     push_optional(&mut lines, "DESCRIPTION", event.description.as_deref());
     push_optional(&mut lines, "LOCATION", event.location.as_deref());
-    push_time(&mut lines, "DTSTART", &event.start, event.is_all_day);
-    push_time(&mut lines, "DTEND", &event.end, event.is_all_day);
+    push_start(&mut lines, &event.start, event.is_all_day)?;
+    push_end(&mut lines, &event.end, event.is_all_day)?;
     lines.push(format!("STATUS:{}", ical_event_status(event.status)));
     lines.push(format!("TRANSP:{}", transparency(event.availability)));
     if let Some(classification) = classification(event.visibility) {
         lines.push(format!("CLASS:{classification}"));
     }
     if let Some(organizer) = &event.organizer {
-        lines.push(organizer_to_line(organizer));
+        lines.push(organizer_to_line(organizer)?);
     }
-    if let Some(rrule) = &event.recurrence.rrule {
-        lines.push(format!("RRULE:{rrule}"));
-    }
-    for rdate in &event.recurrence.rdate {
-        lines.push(format!("RDATE:{rdate}"));
-    }
-    for exdate in &event.recurrence.exdate {
-        lines.push(format!("EXDATE:{exdate}"));
-    }
-    if let Some(recurrence_id) = &event.recurrence.recurrence_id {
-        lines.push(format!("RECURRENCE-ID:{recurrence_id}"));
-    }
+    push_recurrence(&mut lines, &event.recurrence)?;
     for attendee in &event.attendees {
-        lines.push(attendee_to_line(attendee));
+        lines.push(attendee_to_line(attendee)?);
     }
     lines.extend(["END:VEVENT".to_string(), "END:VCALENDAR".to_string()]);
-    fold_ical_lines(lines)
+    Ok(fold_ical_lines(lines))
 }
 
 /// Why a patch could not be spliced into the resource the server returned.
@@ -266,6 +316,15 @@ pub(crate) enum PatchError {
     /// `raw_ical`. An internal invariant, never the server's fault or the
     /// caller's.
     MissingSourceBody,
+    /// A value the patch would write cannot be put on the wire (see
+    /// `WriteError`): a request fault, `Request(Malformed)`.
+    Write(WriteError),
+}
+
+impl From<WriteError> for PatchError {
+    fn from(error: WriteError) -> Self {
+        Self::Write(error)
+    }
 }
 
 pub(crate) fn patch_to_ical(
@@ -320,17 +379,25 @@ pub(crate) fn patch_to_ical(
         replace_names.push("LOCATION");
     }
     if patch.start.is_some() || patch.is_all_day.is_some() {
-        push_time(
-            &mut replacements,
-            "DTSTART",
-            &merged.start,
-            merged.is_all_day,
-        );
-        replace_names.push("DTSTART");
+        // A start the caller supplied and left empty is a request for an
+        // invalid `DTSTART:`, refused. An empty MERGED start with no start in
+        // the patch is the stored event's own (a body with no DTSTART, which
+        // the projection tolerates): a patch that only flips `is_all_day`
+        // leaves it alone rather than fail on a field it never touched.
+        if patch.start.is_some() || !merged.start.value.is_empty() {
+            push_start(&mut replacements, &merged.start, merged.is_all_day)?;
+            replace_names.push("DTSTART");
+        }
     }
     if patch.end.is_some() || patch.is_all_day.is_some() {
-        push_time(&mut replacements, "DTEND", &merged.end, merged.is_all_day);
-        replace_names.extend(["DTEND", "DURATION"]);
+        // An empty end is "not stated", and it leaves the stored DTEND and
+        // DURATION exactly as they are: the projection yields an empty end for
+        // a body with no DTEND and no DURATION, and ALSO for a DURATION it
+        // cannot resolve, so an echoed empty end must never delete either.
+        if !merged.end.value.is_empty() {
+            push_end(&mut replacements, &merged.end, merged.is_all_day)?;
+            replace_names.extend(["DTEND", "DURATION"]);
+        }
     }
     if let Some(status) = patch.status {
         replacements.push(format!("STATUS:{}", ical_event_status(status)));
@@ -347,11 +414,13 @@ pub(crate) fn patch_to_ical(
         replace_names.push("CLASS");
     }
     if patch.recurrence.is_some() {
-        push_recurrence(&mut replacements, &merged.recurrence);
+        push_recurrence(&mut replacements, &merged.recurrence)?;
         replace_names.extend(["RRULE", "RDATE", "EXDATE", "RECURRENCE-ID"]);
     }
     if patch.attendees.is_some() {
-        replacements.extend(merged.attendees.iter().map(attendee_to_line));
+        for attendee in &merged.attendees {
+            replacements.push(attendee_to_line(attendee)?);
+        }
         replace_names.push("ATTENDEE");
     }
 
@@ -420,23 +489,42 @@ pub(crate) fn rsvp_patch(
     })
 }
 
+/// Why an iTIP reply could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyError {
+    /// The event lacks something a reply needs (attendee, organizer, uid):
+    /// this account cannot answer for it, `Unsupported`.
+    Missing(&'static str),
+    /// A value of the event cannot be written (see `WriteError`).
+    Write(WriteError),
+}
+
+impl From<WriteError> for ReplyError {
+    fn from(error: WriteError) -> Self {
+        Self::Write(error)
+    }
+}
+
 pub(crate) fn rsvp_reply_ical(
     current: &CalendarEvent,
     status: RsvpStatus,
     self_email: &str,
-) -> Result<String, &'static str> {
+) -> Result<String, ReplyError> {
     let mut attendee = current
         .attendees
         .iter()
         .find(|attendee| attendee.email.eq_ignore_ascii_case(self_email))
         .cloned()
-        .ok_or("authenticated attendee not found")?;
+        .ok_or(ReplyError::Missing("authenticated attendee not found"))?;
     attendee.status = status;
     let organizer = current
         .organizer
         .as_ref()
-        .ok_or("event organizer not found")?;
-    let uid = current.uid.as_deref().ok_or("event uid not found")?;
+        .ok_or(ReplyError::Missing("event organizer not found"))?;
+    let uid = current
+        .uid
+        .as_deref()
+        .ok_or(ReplyError::Missing("event uid not found"))?;
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_string(),
         "VERSION:2.0".to_string(),
@@ -450,10 +538,10 @@ pub(crate) fn rsvp_reply_ical(
                 .strftime("%Y%m%dT%H%M%SZ")
         ),
     ];
-    push_time(&mut lines, "DTSTART", &current.start, current.is_all_day);
-    push_time(&mut lines, "DTEND", &current.end, current.is_all_day);
-    lines.push(organizer_to_line(organizer));
-    lines.push(attendee_to_line(&attendee));
+    push_start(&mut lines, &current.start, current.is_all_day)?;
+    push_end(&mut lines, &current.end, current.is_all_day)?;
+    lines.push(organizer_to_line(organizer)?);
+    lines.push(attendee_to_line(&attendee)?);
     lines.push("END:VEVENT".to_string());
     lines.push("END:VCALENDAR".to_string());
     Ok(fold_ical_lines(lines))
@@ -1078,15 +1166,15 @@ fn organizer_from_property(prop: &Prop) -> Option<EventOrganizer> {
     })
 }
 
-fn organizer_to_line(organizer: &EventOrganizer) -> String {
+fn organizer_to_line(organizer: &EventOrganizer) -> Result<String, WriteError> {
     let mut line = String::from("ORGANIZER");
     if let Some(name) = &organizer.name {
         line.push_str(";CN=");
-        line.push_str(&escape_param(name));
+        line.push_str(&param_value("organizer name", name)?);
     }
     line.push_str(":mailto:");
-    line.push_str(&organizer.email);
-    line
+    line.push_str(plain_value("organizer email", &organizer.email)?);
+    Ok(line)
 }
 
 fn attendee_from_property(prop: &Prop) -> Option<EventAttendee> {
@@ -1098,11 +1186,11 @@ fn attendee_from_property(prop: &Prop) -> Option<EventAttendee> {
     })
 }
 
-fn attendee_to_line(attendee: &EventAttendee) -> String {
+fn attendee_to_line(attendee: &EventAttendee) -> Result<String, WriteError> {
     let mut line = String::from("ATTENDEE");
     if let Some(name) = &attendee.name {
         line.push_str(";CN=");
-        line.push_str(&escape_param(name));
+        line.push_str(&param_value("attendee name", name)?);
     }
     line.push_str(";ROLE=");
     line.push_str(match attendee.role {
@@ -1121,8 +1209,8 @@ fn attendee_to_line(attendee: &EventAttendee) -> String {
         RsvpStatus::NeedsAction | RsvpStatus::Unknown | _ => "NEEDS-ACTION",
     });
     line.push_str(":mailto:");
-    line.push_str(&attendee.email);
-    line
+    line.push_str(plain_value("attendee email", &attendee.email)?);
+    Ok(line)
 }
 
 fn attendee_role(value: Option<&str>) -> AttendeeRole {
@@ -1165,7 +1253,13 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) {
         return;
     }
     let mut tzids = Vec::new();
-    for tzid in [&event.start.timezone, &event.end.timezone]
+    // An empty end writes no DTEND, so its zone has nothing to describe.
+    let end_zone = if event.end.value.is_empty() {
+        &None
+    } else {
+        &event.end.timezone
+    };
+    for tzid in [&event.start.timezone, end_zone]
         .into_iter()
         .flatten()
         .filter(|tzid| !tzid.is_empty())
@@ -1283,30 +1377,100 @@ fn format_utc_offset(offset: Offset) -> String {
     format!("{sign}{:02}{:02}", abs / 3600, (abs % 3600) / 60)
 }
 
-fn push_time(lines: &mut Vec<String>, name: &str, time: &EventTime, is_all_day: bool) {
+/// Write `DTSTART`. An empty start is refused: `DTSTART:` is invalid
+/// iCalendar, and unlike an end there is no honest reading of "no start" - the
+/// event has no position. Providers project an empty `EventTime` for "did not
+/// say", and a consumer's read-modify-write echoes it back here.
+fn push_start(
+    lines: &mut Vec<String>,
+    time: &EventTime,
+    is_all_day: bool,
+) -> Result<(), WriteError> {
+    push_time(
+        lines,
+        "DTSTART",
+        time,
+        is_all_day,
+        ("start", "start timezone"),
+    )
+}
+
+/// Write `DTEND`, or nothing when the end is empty.
+///
+/// Unlike DTSTART, an empty end has an honest meaning in iCalendar: RFC 5545
+/// allows a VEVENT with neither DTEND nor DURATION (zero-length for a
+/// DATE-TIME start, one day for a DATE start), and this crate's own projection
+/// yields an empty end for exactly such a body. So an empty end is "no end
+/// stated" and is omitted, which round-trips: the stored event reads back with
+/// an empty end again. It is neither refused (a valid read-then-create would
+/// fail) nor written as `DTEND:` (invalid).
+fn push_end(lines: &mut Vec<String>, time: &EventTime, is_all_day: bool) -> Result<(), WriteError> {
+    if time.value.is_empty() {
+        return Ok(());
+    }
+    push_time(lines, "DTEND", time, is_all_day, ("end", "end timezone"))
+}
+
+fn push_time(
+    lines: &mut Vec<String>,
+    name: &str,
+    time: &EventTime,
+    is_all_day: bool,
+    (field, timezone_field): (&'static str, &'static str),
+) -> Result<(), WriteError> {
+    plain_value(field, &time.value)?;
+    // An empty TZID (the projection yields `Some("")` for `TZID=`) is no zone:
+    // `;TZID=:` is not a valid parameter, and the value must render as it does
+    // for a zoneless time (a `Z` instant stays UTC).
+    let zoneless;
+    let time = if time.timezone.as_deref() == Some("") {
+        zoneless = EventTime {
+            value: time.value.clone(),
+            timezone: None,
+        };
+        &zoneless
+    } else {
+        time
+    };
     let value = ical_time_from_event_time(time, is_all_day);
+    let timezone = time.timezone.as_deref();
     if is_all_day {
         lines.push(format!("{name};VALUE=DATE:{value}"));
-    } else if let Some(tzid) = &time.timezone {
-        lines.push(format!("{name};TZID={}:{}", escape_param(tzid), value));
+    } else if let Some(tzid) = timezone {
+        lines.push(format!(
+            "{name};TZID={}:{}",
+            param_value(timezone_field, tzid)?,
+            value
+        ));
     } else {
         lines.push(format!("{name}:{value}"));
     }
+    Ok(())
 }
 
-fn push_recurrence(lines: &mut Vec<String>, recurrence: &EventRecurrence) {
+fn push_recurrence(
+    lines: &mut Vec<String>,
+    recurrence: &EventRecurrence,
+) -> Result<(), WriteError> {
     if let Some(rrule) = &recurrence.rrule {
-        lines.push(format!("RRULE:{rrule}"));
+        lines.push(format!("RRULE:{}", plain_value("recurrence rrule", rrule)?));
     }
     for rdate in &recurrence.rdate {
-        lines.push(format!("RDATE:{rdate}"));
+        lines.push(format!("RDATE:{}", plain_value("recurrence rdate", rdate)?));
     }
     for exdate in &recurrence.exdate {
-        lines.push(format!("EXDATE:{exdate}"));
+        lines.push(format!(
+            "EXDATE:{}",
+            plain_value("recurrence exdate", exdate)?
+        ));
     }
     if let Some(recurrence_id) = &recurrence.recurrence_id {
-        lines.push(format!("RECURRENCE-ID:{recurrence_id}"));
+        lines.push(format!(
+            "RECURRENCE-ID:{}",
+            plain_value("recurrence id", recurrence_id)?
+        ));
     }
+    Ok(())
 }
 
 fn event_availability(value: Option<&str>) -> EventAvailability {
@@ -1584,6 +1748,13 @@ fn escape_param(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test shim: the production writer refuses unwritable values; the older
+    /// tests feed writable ones and read the body. The refusal tests call
+    /// `super::create_to_ical` directly.
+    fn create_to_ical(event: &EventCreate, uid: &str) -> String {
+        super::create_to_ical(event, uid).expect("a writable event")
+    }
 
     /// Test shim: the production projector is fallible (malformed bodies
     /// degrade to a per-resource skip); these tests feed well-formed input
@@ -3197,7 +3368,8 @@ mod tests {
             name: Some(name.to_string()),
             role: AttendeeRole::Required,
             status: RsvpStatus::NeedsAction,
-        });
+        })
+        .expect("writable attendee");
         let data = format!(
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\n{line}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
         );
@@ -3308,5 +3480,292 @@ mod tests {
 
         assert!(body.contains("SUMMARY:Plan\\nNext"));
         assert!(body.contains("DTSTART;TZID=\"Europe/Oslo:Main\":"));
+    }
+
+    fn writable_create() -> EventCreate {
+        EventCreate {
+            calendar_id: CalendarId("/cal/".to_string()),
+            title: Some("Plan".to_string()),
+            description: None,
+            location: None,
+            start: EventTime {
+                value: "2026-06-02T12:00:00Z".to_string(),
+                timezone: None,
+            },
+            end: EventTime {
+                value: "2026-06-02T13:00:00Z".to_string(),
+                timezone: None,
+            },
+            is_all_day: false,
+            status: EventStatus::Confirmed,
+            availability: EventAvailability::Busy,
+            visibility: EventVisibility::Default,
+            organizer: None,
+            attendees: Vec::new(),
+            recurrence: EventRecurrence::default(),
+        }
+    }
+
+    const INJECTION: &str = "FREQ=DAILY\r\nATTENDEE:mailto:evil@example.test";
+
+    fn attendee(email: &str, name: Option<&str>) -> EventAttendee {
+        EventAttendee {
+            email: email.to_string(),
+            name: name.map(ToString::to_string),
+            role: AttendeeRole::Required,
+            status: RsvpStatus::NeedsAction,
+        }
+    }
+
+    fn refusal(event: &EventCreate) -> WriteError {
+        super::create_to_ical(event, "uid-1").expect_err("the writer must refuse this value")
+    }
+
+    /// A value type with no escape form (RECUR, DATE-TIME, CAL-ADDRESS) that
+    /// holds a line break is refused and named, on the create path, instead of
+    /// injecting a content line. Reverting `plain_value` to a pass-through
+    /// writes the ATTENDEE line these values smuggle in.
+    #[test]
+    fn create_refuses_line_breaks_in_unescapable_values() {
+        let mut event = writable_create();
+        event.recurrence.rrule = Some(INJECTION.to_string());
+        assert_eq!(refusal(&event).field, "recurrence rrule");
+
+        let mut event = writable_create();
+        event.recurrence.rdate = vec![INJECTION.to_string()];
+        assert_eq!(refusal(&event).field, "recurrence rdate");
+
+        let mut event = writable_create();
+        event.recurrence.exdate = vec!["20260602T120000Z\nX-EVIL:1".to_string()];
+        assert_eq!(refusal(&event).field, "recurrence exdate");
+
+        let mut event = writable_create();
+        event.recurrence.recurrence_id = Some("20260602T120000Z\rX-EVIL:1".to_string());
+        assert_eq!(refusal(&event).field, "recurrence id");
+
+        let mut event = writable_create();
+        event.attendees = vec![attendee("a@example.test\r\nX-EVIL:1", None)];
+        assert_eq!(refusal(&event).field, "attendee email");
+
+        let mut event = writable_create();
+        event.organizer = Some(EventOrganizer {
+            email: "o@example.test\nX-EVIL:1".to_string(),
+            name: None,
+        });
+        assert_eq!(refusal(&event).field, "organizer email");
+
+        let mut event = writable_create();
+        event.start.value = "2026-06-02T12:00:00Z\r\nX-EVIL:1".to_string();
+        assert_eq!(refusal(&event).field, "start");
+
+        let mut event = writable_create();
+        event.end.value = "2026-06-02T13:00:00Z\nX-EVIL:1".to_string();
+        assert_eq!(refusal(&event).field, "end");
+    }
+
+    /// Parameter values are encoded, not refused, for the characters RFC 6868
+    /// can carry (DQUOTE, CR, LF), so the line stays ONE line and round-trips;
+    /// a control character it cannot carry is refused and named.
+    #[test]
+    fn create_encodes_parameter_values_and_refuses_unencodable_ones() {
+        let mut event = writable_create();
+        event.attendees = vec![attendee(
+            "a@example.test",
+            Some("Ada \"The\" Countess\r\nX-EVIL:1"),
+        )];
+        event.start.timezone = Some("Europe/Oslo".to_string());
+        let body = super::create_to_ical(&event, "uid-1").expect("encodable parameters");
+        assert!(!body.contains("\r\nX-EVIL"), "{body}");
+        let projected = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            &body,
+            None,
+        )
+        .expect("the written body reads back");
+        assert_eq!(
+            projected.attendees[0].name.as_deref(),
+            Some("Ada \"The\" Countess\nX-EVIL:1"),
+            "the encoded name decodes to the value the caller gave"
+        );
+
+        let mut event = writable_create();
+        event.attendees = vec![attendee("a@example.test", Some("Ada\u{0}Lovelace"))];
+        assert_eq!(refusal(&event).field, "attendee name");
+
+        let mut event = writable_create();
+        event.organizer = Some(EventOrganizer {
+            email: "o@example.test".to_string(),
+            name: Some("Own\u{7f}er".to_string()),
+        });
+        assert_eq!(refusal(&event).field, "organizer name");
+
+        let mut event = writable_create();
+        event.start.timezone = Some("Europe/\u{1}Oslo".to_string());
+        assert_eq!(refusal(&event).field, "start timezone");
+    }
+
+    fn patch_target() -> CalendarEvent {
+        parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        )
+    }
+
+    /// The patch splice writes through the same emitters, so the same values
+    /// are refused there, as `PatchError::Write`.
+    #[test]
+    fn patch_refuses_line_breaks_in_unescapable_values() {
+        let current = patch_target();
+        let recurrence = EventPatch {
+            recurrence: Some(EventRecurrence {
+                rrule: Some(INJECTION.to_string()),
+                ..EventRecurrence::default()
+            }),
+            ..EventPatch::default()
+        };
+        let Err(PatchError::Write(error)) = patch_to_ical(&current, &recurrence) else {
+            panic!("an injected RRULE must be refused");
+        };
+        assert_eq!(error.field, "recurrence rrule");
+
+        let attendees = EventPatch {
+            attendees: Some(vec![attendee("a@example.test\r\nX-EVIL:1", None)]),
+            ..EventPatch::default()
+        };
+        let Err(PatchError::Write(error)) = patch_to_ical(&current, &attendees) else {
+            panic!("an injected attendee address must be refused");
+        };
+        assert_eq!(error.field, "attendee email");
+
+        let start = EventPatch {
+            start: Some(EventTime {
+                value: "2026-06-02T12:00:00Z\nX-EVIL:1".to_string(),
+                timezone: None,
+            }),
+            ..EventPatch::default()
+        };
+        let Err(PatchError::Write(error)) = patch_to_ical(&current, &start) else {
+            panic!("an injected start must be refused");
+        };
+        assert_eq!(error.field, "start");
+    }
+
+    /// An empty start is never written: `DTSTART:` is invalid and no reading of
+    /// "no start" is honest. Refused on create and on a patch that carries it.
+    #[test]
+    fn an_empty_start_is_refused_on_create_and_patch() {
+        let mut event = writable_create();
+        event.start = EventTime {
+            value: String::new(),
+            timezone: None,
+        };
+        let error = refusal(&event);
+        assert_eq!((error.field, error.reason), ("start", "is empty"));
+
+        let patch = EventPatch {
+            start: Some(EventTime {
+                value: String::new(),
+                timezone: None,
+            }),
+            ..EventPatch::default()
+        };
+        let Err(PatchError::Write(error)) = patch_to_ical(&patch_target(), &patch) else {
+            panic!("an echoed empty start must be refused");
+        };
+        assert_eq!(error.field, "start");
+    }
+
+    /// An empty end means "no end stated", which iCalendar allows (neither
+    /// DTEND nor DURATION): create omits the line, and the stored event reads
+    /// back with an empty end again.
+    #[test]
+    fn an_empty_end_on_create_writes_no_dtend() {
+        let mut event = writable_create();
+        event.end = EventTime {
+            value: String::new(),
+            timezone: Some("Europe/Oslo".to_string()),
+        };
+        let body = super::create_to_ical(&event, "uid-1").expect("an empty end is writable");
+        assert!(!body.contains("DTEND"), "{body}");
+        assert!(
+            !body.contains("TZID:Europe/Oslo"),
+            "no zone for no end: {body}"
+        );
+        let projected = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            &body,
+            None,
+        )
+        .expect("reads back");
+        assert_eq!(projected.end.value, "");
+        assert_eq!(projected.start.value, "2026-06-02T12:00:00Z");
+    }
+
+    /// An empty end on a patch leaves the stored DTEND, and a stored DURATION
+    /// the projection could not resolve, untouched: the empty value is the
+    /// projection's "did not say", and an echo must not delete what it could
+    /// not read.
+    #[test]
+    fn an_empty_end_on_a_patch_leaves_the_stored_end_untouched() {
+        let empty_end = EventPatch {
+            title: Some(Some("Renamed".to_string())),
+            end: Some(EventTime {
+                value: String::new(),
+                timezone: None,
+            }),
+            ..EventPatch::default()
+        };
+        let body = patch_to_ical(&patch_target(), &empty_end).expect("splices");
+        assert!(body.contains("DTEND:20260602T130000Z\r\n"), "{body}");
+        assert!(body.contains("SUMMARY:Renamed"), "{body}");
+
+        let with_duration = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDURATION:garbage\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        assert_eq!(with_duration.end.value, "", "the duration did not resolve");
+        let body = patch_to_ical(&with_duration, &empty_end).expect("splices");
+        assert!(body.contains("DURATION:garbage\r\n"), "{body}");
+        assert!(!body.contains("DTEND"), "{body}");
+    }
+
+    /// An empty TZID projects from `TZID=` and is no zone; writing it back
+    /// would emit the invalid `;TZID=:`.
+    #[test]
+    fn an_empty_timezone_writes_no_tzid_parameter() {
+        let mut event = writable_create();
+        event.start.timezone = Some(String::new());
+        let body = super::create_to_ical(&event, "uid-1").expect("writable");
+        assert!(body.contains("DTSTART:20260602T120000Z\r\n"), "{body}");
+    }
+
+    /// `split_event_id` splits at the first `#`, so a percent-encoded `%23` in
+    /// the resource (what a conforming server sends for a literal one) stays in
+    /// the resource half, and the id a listing mints for an override splits back
+    /// into the parts it was built from.
+    #[test]
+    fn split_event_id_keeps_an_encoded_hash_in_the_resource() {
+        assert_eq!(
+            split_event_id("https://h/cal/a%23b.ics"),
+            ("https://h/cal/a%23b.ics", None)
+        );
+        let minted = event_id_for("https://h/cal/a%23b.ics", Some("20260609T120000Z"));
+        assert_eq!(
+            split_event_id(&minted.0),
+            ("https://h/cal/a%23b.ics", Some("20260609T120000Z"))
+        );
+        // A `#` inside the instance half stays whole in it.
+        assert_eq!(
+            split_event_id("https://h/cal/a.ics#2026#odd"),
+            ("https://h/cal/a.ics", Some("2026#odd"))
+        );
     }
 }

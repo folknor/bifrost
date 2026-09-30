@@ -1,9 +1,26 @@
-pub(crate) use bifrost_dav_core::resolve_href;
 use bifrost_dav_core::{
     MultiStatusSink, PropSet, ResponseParts, classify_207, commit_if_present, normalize_etag,
     parse_collection_property, parse_multistatus, same_dav_url, trimmed,
 };
 pub(crate) use bifrost_dav_core::{extract_href_properties, extract_href_property};
+
+/// Rebase a response href against its request URI, the one funnel every href
+/// this crate reads goes through.
+///
+/// A `#` in an href would be a URL fragment delimiter, so a conforming server
+/// percent-encodes a literal one as `%23` and never sends it raw. A server that
+/// does send one raw has still named a resource, and it means the character:
+/// `Url::join` would instead read it as a fragment, keep it in the resolved
+/// string, and drop it from every request, addressing the wrong resource. It is
+/// encoded here so that no resolved URL, and therefore no native id, ever holds
+/// a `#` other than the one `event_id_for` adds to qualify an override. That
+/// invariant is what `split_event_id` relies on.
+pub(crate) fn resolve_href(request_url: &str, href: &str) -> String {
+    if href.contains('#') {
+        return bifrost_dav_core::resolve_href(request_url, &href.replace('#', "%23"));
+    }
+    bifrost_dav_core::resolve_href(request_url, href)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CalendarCollection {
@@ -572,6 +589,27 @@ mod tests {
         assert_eq!(
             resolve_href("https://cal.example.test/homes/ada/", "team/one.ics"),
             "https://cal.example.test/homes/ada/team/one.ics"
+        );
+    }
+
+    /// A raw `#` in an href is read as the character, not a fragment: joined
+    /// as-is it stays in the resolved string yet never reaches a request, and
+    /// would make `split_event_id` cut the resource in two. A `%23` from a
+    /// conforming server is left alone, and no resolved href holds a raw `#`.
+    #[test]
+    fn a_raw_hash_in_an_href_resolves_as_a_literal_character() {
+        for href in [
+            "/cal/a#b.ics",
+            "cal/a#b.ics",
+            "https://h.example.test/cal/a#b.ics",
+        ] {
+            let resolved = resolve_href("https://h.example.test/cal/", href);
+            assert!(!resolved.contains('#'), "{href} -> {resolved}");
+            assert!(resolved.ends_with("/cal/a%23b.ics"), "{href} -> {resolved}");
+        }
+        assert_eq!(
+            resolve_href("https://h.example.test/cal/", "/cal/a%23b.ics"),
+            "https://h.example.test/cal/a%23b.ics"
         );
     }
 

@@ -1275,6 +1275,102 @@ mod tests {
         );
     }
 
+    /// An unwritable consumer value is `Request(Malformed)` naming its field.
+    /// A create sends nothing (the script is empty, so any request starves it),
+    /// and an update stops before the PUT (the script holds only the GET).
+    /// Reverting `plain_value` to a pass-through writes the injected line and
+    /// the create reaches the starved script instead of refusing.
+    #[tokio::test]
+    async fn unwritable_event_values_are_malformed_before_any_write() {
+        use bifrost_types::account::Account as _;
+
+        let account_over = |script: &Arc<_>| {
+            let client = Arc::new(CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(script),
+            ));
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/")
+        };
+        let create = |mutate: fn(&mut bifrost_types::EventCreate)| {
+            let mut event = bifrost_types::EventCreate {
+                calendar_id: bifrost_types::CalendarId(
+                    "https://dav.example.test/calendar/".to_string(),
+                ),
+                title: Some("one".to_string()),
+                description: None,
+                location: None,
+                start: bifrost_types::EventTime {
+                    value: "2026-06-02T09:00:00Z".to_string(),
+                    timezone: None,
+                },
+                end: bifrost_types::EventTime {
+                    value: "2026-06-02T10:00:00Z".to_string(),
+                    timezone: None,
+                },
+                is_all_day: false,
+                status: bifrost_types::EventStatus::Confirmed,
+                availability: bifrost_types::EventAvailability::Busy,
+                visibility: bifrost_types::EventVisibility::Default,
+                organizer: None,
+                attendees: Vec::new(),
+                recurrence: bifrost_types::EventRecurrence::default(),
+            };
+            mutate(&mut event);
+            event
+        };
+
+        let script = dav_script_empty();
+        let account = account_over(&script);
+        for event in [
+            create(|event| {
+                event.recurrence.rrule = Some("FREQ=DAILY\r\nATTENDEE:mailto:x@y".to_string());
+            }),
+            create(|event| event.start.value = String::new()),
+        ] {
+            let error = account
+                .event_create(event)
+                .await
+                .expect_err("an unwritable event must be refused");
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Request(RequestErrorKind::Malformed),
+                "{error:?}"
+            );
+        }
+        assert!(transcripts(&script).is_empty());
+
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\n\
+                   DTEND:20260602T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let script = dav_script([DavResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: ics.to_string(),
+            url: String::new(),
+        }]);
+        let account = account_over(&script);
+        let error = account
+            .event_update(
+                bifrost_types::EventId("https://dav.example.test/calendar/one.ics".to_string()),
+                bifrost_types::EventPatch {
+                    recurrence: Some(bifrost_types::EventRecurrence {
+                        rrule: Some("FREQ=DAILY\nX-EVIL:1".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an injected RRULE must be refused");
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::Malformed),
+            "{error:?}"
+        );
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 1, "only the GET went out");
+        assert_eq!(requests[0].method.as_str(), "GET");
+    }
+
     /// An id the listing lanes minted for an override reads and updates the
     /// VEVENT it named, over a resource that holds only overrides.
     ///

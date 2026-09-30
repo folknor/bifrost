@@ -241,8 +241,8 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   delete and RSVP refuse it.** `EventId("{uri}#{recurrence_id}")` is minted for
   every override the listing lanes return, so it is the only id a consumer
   holds for one - including every VEVENT of a resource with no master.
-  `split_event_id` splits at the first `#` (a resolved resource URL cannot
-  contain a literal one), the wire address is the resource alone, and the
+  `split_event_id` splits at the first `#`, the wire address is the resource
+  alone, and the
   `RECURRENCE-ID` value selects the VEVENT by exact match against the value the
   listing minted the id from. `event_get` returns that VEVENT under the id it
   was asked for; an instance no VEVENT carries any more is `NotFound`.
@@ -260,6 +260,17 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   refusals against an empty transport script, so a removed guard starves the
   script rather than failing quietly; the read and update halves are pinned by
   `a_listed_override_id_reads_and_updates_the_vevent_it_named`.
+
+  The first-`#` split is right because no resource URL holds a raw `#`: it would
+  be a URL fragment delimiter, so a conforming server percent-encodes a literal
+  one as `%23`, which the split leaves in the resource half. A server that sends
+  one raw is normalized where hrefs are resolved (`parse::resolve_href`, the one
+  funnel for every href this crate reads) to `%23`; otherwise `Url::join` keeps
+  it as a fragment, no request ever carries it, and the split would cut the
+  resource in two. Splitting at the FIRST `#` also keeps a `RECURRENCE-ID` value
+  that itself held one whole. Pinned by
+  `a_raw_hash_in_an_href_resolves_as_a_literal_character` and
+  `split_event_id_keeps_an_encoded_hash_in_the_resource`.
 
   Real per-occurrence delete would mean removing that component (an
   occurrence delete emitting `EXDATE` on the master, or `STATUS:CANCELLED` on
@@ -320,6 +331,44 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   line holding one is spliced verbatim. `escape_text` writes a CR (alone or
   before an LF) as the `\n` line break; it used to delete a lone CR, merging the
   two halves it separated when a consumer echoed the projected text back.
+  **The writers refuse what they cannot write; they never strip.** Every value
+  the writers emit goes through one of three treatments. TEXT (SUMMARY,
+  DESCRIPTION, LOCATION, VTIMEZONE TZID) is escaped by `escape_text`. Parameter
+  values (CN, TZID) are RFC 6868 caret-encoded by `escape_param` behind
+  `param_value`, which carries CR, LF and DQUOTE and refuses any other control
+  character. A value type with no escape form - RECUR (`RRULE`), DATE-TIME
+  (`DTSTART`, `DTEND`, `RDATE`, `EXDATE`, `RECURRENCE-ID`) and CAL-ADDRESS
+  (organizer and attendee addresses) - goes through `plain_value`, which refuses
+  an empty value and any ASCII control character. A refusal is a `WriteError`
+  naming the field (`create_to_ical` returns it, `PatchError::Write` and
+  `ReplyError::Write` carry it), mapped by `write_error` to a local
+  `Request(Malformed)`; a create sends nothing, an update has read the resource
+  but not written it. The value is not echoed into the message. Stripping was
+  rejected because it writes something the caller did not ask for; before this a
+  CR or LF in an `RRULE` injected arbitrary content lines into the stored
+  resource. An empty TZID (`TZID=` projects as `Some("")`) is no zone and
+  writes no parameter.
+
+  **Empty event times.** A provider projects an empty `EventTime` for "did not
+  say" and this crate's own projection does too (no `DTSTART`, no `DTEND` and
+  no resolvable `DURATION`), and a consumer's read-modify-write echoes it back.
+  An empty start is refused as malformed (`DTSTART:` is invalid and there is no
+  honest reading of an event with no position); a patch that only flips
+  `is_all_day` over a stored event with no DTSTART leaves it alone. An empty end
+  has an honest meaning here, unlike Google, because RFC 5545 allows neither
+  DTEND nor DURATION: on create it writes no DTEND (zero-length for a DATE-TIME
+  start, one day for a DATE start), which reads back as an empty end again, and
+  it is not refused. On a patch it leaves the stored DTEND and DURATION untouched,
+  since the empty value may stand for a DURATION the projection could not
+  resolve and deleting it would destroy data. A patch cannot clear an end.
+  Pinned by `an_empty_start_is_refused_on_create_and_patch`,
+  `an_empty_end_on_create_writes_no_dtend` and
+  `an_empty_end_on_a_patch_leaves_the_stored_end_untouched`; the value refusals
+  by `create_refuses_line_breaks_in_unescapable_values`,
+  `create_encodes_parameter_values_and_refuses_unencodable_ones`,
+  `patch_refuses_line_breaks_in_unescapable_values` and, at the account,
+  `unwritable_event_values_are_malformed_before_any_write`.
+
   Serialization-out (create/patch/RSVP) stays
   hand-rolled and verbatim-preserving: patches splice on *physical* lines,
   folding only newly emitted lines, so long preserved/unmodeled values

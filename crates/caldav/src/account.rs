@@ -21,8 +21,8 @@ use crate::client::{
     local_error, missing_event_error, unsupported_error,
 };
 use crate::ical::{
-    EventProjectionError, PatchError, create_to_ical, event_from_ical, events_from_ical, new_uid,
-    patch_to_ical, rsvp_patch, rsvp_reply_ical, split_event_id,
+    EventProjectionError, PatchError, ReplyError, WriteError, create_to_ical, event_from_ical,
+    events_from_ical, new_uid, patch_to_ical, rsvp_patch, rsvp_reply_ical, split_event_id,
 };
 use crate::parse::CalendarCollection;
 use crate::{CalDavConfig, CalDavCredentials};
@@ -1057,7 +1057,8 @@ impl Account for CalDavAccount {
             let uid = new_uid();
             let path = format!("{uid}.ics");
             let url = append_path(&calendar_url, &path);
-            let body = create_to_ical(&event, &uid);
+            let body = create_to_ical(&event, &uid)
+                .map_err(|error| write_error(AccountOperation::EventCreate, error))?;
             client
                 .put_event(
                     &url,
@@ -1179,8 +1180,11 @@ impl Account for CalDavAccount {
                 AccountOperation::EventRsvp,
             )
             .await?;
-            let reply = rsvp_reply_ical(&current, status, &rsvp_email)
-                .map_err(|_| unsupported_error(AccountOperation::EventRsvp))?;
+            let reply =
+                rsvp_reply_ical(&current, status, &rsvp_email).map_err(|error| match error {
+                    ReplyError::Missing(_) => unsupported_error(AccountOperation::EventRsvp),
+                    ReplyError::Write(error) => write_error(AccountOperation::EventRsvp, error),
+                })?;
             // Defensive on the success path: `rsvp_reply_ical` above
             // already fails when the event names no organizer, so this
             // guard cannot fire after it succeeded. Kept anyway - the
@@ -1468,6 +1472,7 @@ fn worse_recovery_option(
 fn patch_error(operation: AccountOperation, error: PatchError) -> AccountError {
     let detail = match error {
         PatchError::RecurrenceOverride => return unsupported_error(operation),
+        PatchError::Write(error) => return write_error(operation, error),
         PatchError::NoSpliceableVevent => {
             "CalDAV patch writer found no VEVENT in the body the event was projected from"
         }
@@ -1486,6 +1491,15 @@ fn patch_error(operation: AccountOperation, error: PatchError) -> AccountError {
     .operation(operation)
     .try_build()
     .expect("valid internal invariant classification")
+}
+
+/// A value the writers refuse (`WriteError`) is the caller's own request being
+/// unwritable: local `Request(Malformed)` naming the field, raised before any
+/// write goes out (a create sends nothing at all; an update has already read the
+/// resource it splices into, since the splice needs its body). The value itself is not echoed into the
+/// message, so a hostile string cannot reach a log through it.
+fn write_error(operation: AccountOperation, error: WriteError) -> AccountError {
+    crate::client::local_error(operation, format!("event {} {}", error.field, error.reason))
 }
 
 /// The scheduling POST completed before the local PUT began. Preserve that
