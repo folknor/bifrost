@@ -107,7 +107,13 @@ impl CardDavClient {
         extract_href_property(&response.text, "addressbook-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
             .map(|href| resolve_href(&response.url, &href))
-            .ok_or_else(|| parse_error(AccountOperation::Discover, "missing addressbook-home-set"))
+            .ok_or_else(|| {
+                bifrost_dav_core::missing_field_error(
+                    AccountOperation::Discover,
+                    "missing addressbook-home-set",
+                    DAV,
+                )
+            })
     }
 
     pub(crate) async fn list_addressbooks(
@@ -707,12 +713,20 @@ pub(crate) fn contact_scope(id: impl Into<String>) -> ErrorScope {
     }
 }
 
-pub(crate) fn not_found_error(operation: AccountOperation, id: impl Into<String>) -> AccountError {
-    status_error(operation, StatusCode::NOT_FOUND, String::new())
+/// Scope the server's own not-found answer to the contact it names.
+///
+/// DECORATES the classified 404 rather than minting a fresh one. The fresh
+/// `status_error(.., 404, String::new())` this used to build threw away the
+/// response body the server sent with the 404 - the one diagnostic an operator
+/// has for why a contact vanished - while keeping everything else. Decorating
+/// keeps the kind, the status, the acknowledged attempt and the body text, and
+/// adds only the scope.
+pub(crate) fn not_found_error(error: AccountError, id: impl Into<String>) -> AccountError {
+    error
         .into_builder()
         .scope(contact_scope(id))
         .try_build()
-        .expect("valid account error classification")
+        .expect("adding a scope cannot invalidate a classified error")
 }
 
 const PROPFIND_ADDRESSBOOK_HOME: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
@@ -777,7 +791,6 @@ mod tests {
             parse_error(AccountOperation::ContactGet, "bad"),
             transport_error(AccountOperation::ContactGet, "bad"),
             unsupported_error(AccountOperation::ContactGet),
-            not_found_error(AccountOperation::ContactGet, "one.vcf"),
         ];
         for error in errors {
             assert_eq!(
@@ -1274,6 +1287,72 @@ mod tests {
         );
     }
 
+    /// A missing contact keeps what the server said about it.
+    ///
+    /// `fetch_contact_resource` scopes the 404 to the contact. It used to do so
+    /// by REPLACING the classified error with a fresh 404 minted from an empty
+    /// body, so the server's response text - the only diagnostic an operator
+    /// has - was dropped. Against that code the text assertion fails. The kind,
+    /// scope and acknowledged attempt are pinned beside it so the decoration
+    /// cannot lose what the replacement kept.
+    #[tokio::test]
+    async fn a_missing_contact_keeps_the_servers_response_text() {
+        use bifrost_types::account::Account as _;
+
+        const EXPLANATION: &str = "contact was moved to the archive book";
+        let url = "https://dav.example.test/books/ada/personal/one.vcf";
+        let script = dav_script([DavResponse {
+            status: StatusCode::NOT_FOUND,
+            headers: HeaderMap::new(),
+            body: EXPLANATION.to_string(),
+            url: String::new(),
+        }]);
+        let client = Arc::new(CardDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account = crate::account::CardDavAccount::for_tests(
+            client,
+            "https://dav.example.test/books/ada/personal/",
+        );
+
+        let error = account
+            .contact_get(bifrost_types::ContactId(url.into()))
+            .await
+            .expect_err("a 404 is a missing contact");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::NotFound(ResourceKind::Contact)
+        );
+        assert!(
+            matches!(
+                error.scope(),
+                Some(ErrorScope::Contact { id }) if id.0 == url
+            ),
+            "the 404 is scoped to the contact: {:?}",
+            error.scope()
+        );
+        assert!(
+            error
+                .support_consented()
+                .support_text
+                .iter()
+                .any(|text| text.contains(EXPLANATION)),
+            "the server's response text survives: {error:?}"
+        );
+        assert!(
+            error.chain().iter().any(|cause| matches!(
+                cause,
+                bifrost_types::Cause::Attempt(attempt)
+                    if attempt.transmission_state
+                        == bifrost_types::TransmissionState::Acknowledged
+            )),
+            "a 404 is a server answer: {error:?}"
+        );
+        assert_eq!(transcripts(&script).len(), 1);
+    }
+
     /// A card the SERVER sent that will not parse is the provider's malformed
     /// response, on both single-resource doors that project it. Twin of
     /// `bifrost-caldav`'s `an_unparseable_event_from_the_server_is_the_providers_fault`.
@@ -1494,6 +1573,50 @@ mod tests {
                 "https://dav.example.test/principals/ada/".to_string(),
             ]
         );
+    }
+
+    /// A principal whose answer parses but names no addressbook home is a
+    /// MISSING FIELD, not a parse failure. Twin of `bifrost-caldav`'s test of
+    /// the same name. Against the code before the reclassification the kind
+    /// assertion fails on `ParseFailed`.
+    #[tokio::test]
+    async fn a_principal_naming_no_home_is_a_missing_field() {
+        let response = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let script = dav_script([
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
+            ),
+            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
+        ]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let error = client
+            .discover_addressbook_home()
+            .await
+            .expect_err("a principal naming no home cannot open");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::MissingField)
+        );
+        assert_eq!(error.recovery(), &RecoveryClass::ProviderContractViolation);
+        assert_eq!(error.protocol(), Some(Protocol::CardDav));
+        assert!(
+            error.chain().iter().any(|cause| matches!(
+                cause,
+                bifrost_types::Cause::Attempt(attempt)
+                    if attempt.transmission_state
+                        == bifrost_types::TransmissionState::Acknowledged
+            )),
+            "the principal answered: {error:?}"
+        );
+        assert_eq!(transcripts(&script).len(), 2);
     }
 
     /// Twin of `bifrost-caldav`'s

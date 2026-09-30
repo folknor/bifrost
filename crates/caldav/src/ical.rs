@@ -219,18 +219,63 @@ pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> String {
     fold_ical_lines(lines)
 }
 
+/// Why a patch could not be spliced into the resource the server returned.
+///
+/// The causes blame different parties, so they are kept apart rather than
+/// collapsed into one message: the caller maps each to its own kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PatchError {
+    /// A recurrence replacement on a resource carrying override VEVENTs. The
+    /// shared recurrence model cannot rewrite those instances losslessly, so
+    /// this is a request this client cannot express - `Unsupported`.
+    RecurrenceOverride,
+    /// The body holds no complete VEVENT to splice into, or will not tokenize.
+    ///
+    /// Unreachable through `event_update` / `event_rsvp`, and so an internal
+    /// invariant rather than the provider's fault: the event being patched was
+    /// projected from this very body by `parse_vevents`, and the splice works
+    /// from that same parse (see `BlockSpan`), so a body that projected an
+    /// event always has the VEVENT it came from. It was reachable while the
+    /// writer re-read the body with rules of its own, and every way it was
+    /// reachable was the two readers disagreeing, not the server erring.
+    NoSpliceableVevent,
+    /// The event carries no source body to splice into. Unreachable: every
+    /// event this crate patches came out of `project_event`, which always sets
+    /// `raw_ical`. An internal invariant, never the server's fault or the
+    /// caller's.
+    MissingSourceBody,
+}
+
 pub(crate) fn patch_to_ical(
     current: &CalendarEvent,
     patch: &EventPatch,
-) -> Result<String, &'static str> {
+) -> Result<String, PatchError> {
     let merged = patch_event(current, patch);
+    // Every event this crate patches was projected by `project_event`, which
+    // always sets `raw_ical`: the only callers hand in `current` straight from
+    // `fetch_event_from_url`. The branch this replaces rebuilt the whole
+    // resource from the model with `create_to_ical`, which would have silently
+    // dropped every property, VALARM, VTIMEZONE and override VEVENT the model
+    // does not carry, and PUT the result as a successful edit. It never ran;
+    // if it ever could, refusing is the only safe answer.
     let Some(raw_ical) = current.raw_ical.as_deref() else {
-        let uid = current.uid.as_deref().unwrap_or(&current.native_id);
-        return Ok(create_to_ical(&merged, uid));
+        return Err(PatchError::MissingSourceBody);
     };
-    if patch.recurrence.is_some() && has_recurrence_override_vevent(raw_ical) {
-        return Err("recurrence override patch unsupported");
+    // The same parse the projection ran, so the writer reads exactly the
+    // VEVENTs, properties and lines the event was built from.
+    let blocks = parse_vevents(raw_ical).map_err(|_| PatchError::NoSpliceableVevent)?;
+    // An override is a VEVENT carrying a top-level `RECURRENCE-ID`, the same
+    // test `events_from_ical` applies when it mints an override's id - so one
+    // nested inside a VALARM or a skipped component is not an override here
+    // either.
+    if patch.recurrence.is_some()
+        && blocks
+            .iter()
+            .any(|block| block.props.iter().any(|prop| prop.name == "RECURRENCE-ID"))
+    {
+        return Err(PatchError::RecurrenceOverride);
     }
+    let master = blocks.first().ok_or(PatchError::NoSpliceableVevent)?;
 
     let mut replacements = Vec::new();
     let mut replace_names = Vec::new();
@@ -286,8 +331,19 @@ pub(crate) fn patch_to_ical(
         replace_names.push("ATTENDEE");
     }
 
-    replace_first_vevent_properties(raw_ical, &replace_names, replacements)
-        .ok_or("iCalendar body has no spliceable VEVENT")
+    let removed = master
+        .props
+        .iter()
+        .zip(&master.span.prop_lines)
+        .filter(|(prop, _)| {
+            replace_names
+                .iter()
+                .any(|replace| prop.name.eq_ignore_ascii_case(replace))
+        })
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>();
+    let insert_at = master.span.first_nested.unwrap_or(master.span.end);
+    Ok(splice_lines(raw_ical, insert_at, &removed, replacements))
 }
 
 pub(crate) fn patch_event(current: &CalendarEvent, patch: &EventPatch) -> EventCreate {
@@ -391,6 +447,27 @@ pub(crate) fn new_uid() -> String {
 struct VeventBlock {
     props: Vec<Prop>,
     alarms: Vec<Vec<Prop>>,
+    span: BlockSpan,
+}
+
+/// Where a VEVENT block sits in the body, in caldata `LineReader` line
+/// numbers: the physical line each logical line starts on, 1-based.
+///
+/// This is what the patch writer splices by. It used to re-read the body with
+/// its own line grouping and its own `BEGIN`/`END` tracking, and every rule the
+/// two readers disagreed on - a folded delimiter, a blank line inside a fold,
+/// the case of a name, a trimmed name, a `RECURRENCE-ID` inside a nested
+/// component - was a body the projection read one way and the writer another.
+/// Recording the projection's own answer leaves nothing to disagree about.
+#[derive(Debug, Default)]
+struct BlockSpan {
+    /// The `END:VEVENT` line.
+    end: usize,
+    /// The first nested component (`VALARM` or anything the projection skips)
+    /// opened at the event's own level, which is where new properties go.
+    first_nested: Option<usize>,
+    /// The line of each entry in `props`, index for index.
+    prop_lines: Vec<usize>,
 }
 
 /// Tokenize a resource into every VEVENT block using caldata's streaming
@@ -413,6 +490,7 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
     let mut unknown_depth: usize = 0;
     for line in LineReader::from_slice(data.as_bytes()) {
         let line = line.map_err(|error| IcalParseError(error.to_string()))?;
+        let number = line.number();
         let normalized = normalize_exchange_cn_param(line.as_str());
         let mut parser = ContentLineParser::from_slice(normalized.as_bytes());
         let line = parser
@@ -439,7 +517,8 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
             continue;
         }
         if name == "END" && line.value.eq_ignore_ascii_case("VEVENT") {
-            if let Some(block) = current.take() {
+            if let Some(mut block) = current.take() {
+                block.span.end = number;
                 blocks.push(block);
             }
             alarm = None;
@@ -451,6 +530,7 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
             continue;
         };
         if name == "BEGIN" && line.value.eq_ignore_ascii_case("VALARM") {
+            block.span.first_nested.get_or_insert(number);
             alarm = Some(Vec::new());
             continue;
         }
@@ -465,6 +545,7 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
         // END. A stray END with nothing open is ignored rather than treated
         // as a property.
         if name == "BEGIN" {
+            block.span.first_nested.get_or_insert(number);
             unknown_depth = 1;
             continue;
         }
@@ -478,7 +559,10 @@ fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
         };
         match alarm.as_mut() {
             Some(alarm) => alarm.push(prop),
-            None => block.props.push(prop),
+            None => {
+                block.props.push(prop);
+                block.span.prop_lines.push(number);
+            }
         }
     }
     Ok(blocks)
@@ -1190,162 +1274,63 @@ fn classification(visibility: EventVisibility) -> Option<&'static str> {
     }
 }
 
-/// Splice replacements into the first VEVENT operating on *physical* lines.
+/// Splice replacements into a body, operating on *physical* lines.
 ///
-/// The previous implementation unfolded the whole document and re-folded it,
-/// so every preserved/unmodeled line was re-wrapped at column 75 and (via the
-/// old WSP-eating unfolder) could lose characters. Here untouched logical
-/// lines - including their original fold continuations - are emitted byte for
-/// byte; only the freshly emitted replacement lines are folded. A long
-/// preserved value therefore round-trips losslessly through an update.
+/// `insert_at` and `removed` are caldata `LineReader` line numbers taken from
+/// the projection's own parse (`BlockSpan`): the line the replacements go
+/// before, and the lines whose logical line they replace. The logical lines
+/// are grouped here by the same reader, so a logical line is its head plus
+/// every physical line up to the next head - fold continuations, and the
+/// blank lines caldata skips inside a fold, alike.
 ///
-/// Returns `None` when the body gave the splice nowhere to land: no
-/// `BEGIN:VEVENT`, or a first VEVENT whose nested components or own
-/// `END` never close. Emitting the body anyway would drop every patched
-/// property and PUT an unchanged resource back, which the caller cannot
-/// tell apart from a successful edit.
-fn replace_first_vevent_properties(
+/// Untouched logical lines, continuations included, are emitted byte for byte
+/// (line endings normalized to CRLF); only the freshly emitted replacement
+/// lines are folded, so a long preserved value round-trips losslessly. The
+/// previous implementation of this unfolded the whole document and re-folded
+/// it, re-wrapping every preserved line and, through an old WSP-eating
+/// unfolder, losing characters.
+///
+/// Infallible: both line numbers come from a parse of this same text by this
+/// same reader, so the landing point always exists.
+fn splice_lines(
     raw_ical: &str,
-    replace_names: &[&str],
+    insert_at: usize,
+    removed: &[usize],
     replacements: Vec<String>,
-) -> Option<String> {
-    let mut out = String::new();
-    let mut replacements = Some(replacements);
-    let mut in_first_event = false;
-    let mut finished_first_event = false;
-    let mut nested_component_depth = 0_usize;
-    for group in logical_line_groups(raw_ical) {
-        let name = ical_line_name(group.logical_head());
-        if name.is_some_and(|name| name.eq_ignore_ascii_case("BEGIN"))
-            && line_value(group.logical_head()).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
-            && !finished_first_event
-        {
-            in_first_event = true;
-            group.push_verbatim(&mut out);
-            continue;
-        }
-        if in_first_event
-            && nested_component_depth == 0
-            && name.is_some_and(|name| name.eq_ignore_ascii_case("END"))
-            && line_value(group.logical_head()).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
-        {
-            if let Some(replacements) = replacements.take() {
-                out.push_str(&fold_ical_lines(replacements));
-            }
-            in_first_event = false;
-            finished_first_event = true;
-            group.push_verbatim(&mut out);
-            continue;
-        }
-        if in_first_event
-            && name.is_some_and(|name| name.eq_ignore_ascii_case("BEGIN"))
-            && line_value(group.logical_head()).is_some()
-        {
-            if nested_component_depth == 0
-                && let Some(replacements) = replacements.take()
-            {
-                out.push_str(&fold_ical_lines(replacements));
-            }
-            nested_component_depth += 1;
-            group.push_verbatim(&mut out);
-            continue;
-        }
-        if in_first_event
-            && nested_component_depth > 0
-            && name.is_some_and(|name| name.eq_ignore_ascii_case("END"))
-            && line_value(group.logical_head()).is_some()
-        {
-            nested_component_depth -= 1;
-            group.push_verbatim(&mut out);
-            continue;
-        }
-        if in_first_event
-            && nested_component_depth == 0
-            && name.is_some_and(|name| {
-                replace_names
-                    .iter()
-                    .any(|replace| name.eq_ignore_ascii_case(replace))
-            })
-        {
-            continue;
-        }
-        group.push_verbatim(&mut out);
-    }
-    replacements.is_none().then_some(out)
-}
-
-fn has_recurrence_override_vevent(raw_ical: &str) -> bool {
-    let mut in_event = false;
-    for group in logical_line_groups(raw_ical) {
-        let head = group.logical_head();
-        let name = ical_line_name(head);
-        if name == Some("BEGIN")
-            && line_value(head).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
-        {
-            in_event = true;
-            continue;
-        }
-        if in_event
-            && name == Some("END")
-            && line_value(head).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
-        {
-            in_event = false;
-            continue;
-        }
-        if in_event && name == Some("RECURRENCE-ID") {
-            return true;
-        }
-    }
-    false
-}
-
-/// One logical content line as a run of physical lines: the head plus any
-/// folded continuation lines (those starting with SPACE or TAB). Carries its
-/// own trailing newline shape so it can be re-emitted verbatim.
-struct LineGroup<'a> {
-    physical: Vec<&'a str>,
-}
-
-impl<'a> LineGroup<'a> {
-    fn logical_head(&self) -> &'a str {
-        self.physical.first().copied().unwrap_or_default()
-    }
-
-    fn push_verbatim(&self, out: &mut String) {
-        for line in &self.physical {
+) -> String {
+    let physical = raw_ical
+        .lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect::<Vec<_>>();
+    let heads = LineReader::from_slice(raw_ical.as_bytes())
+        .filter_map(Result::ok)
+        .map(|line| line.number())
+        .collect::<Vec<_>>();
+    let emit = |out: &mut String, from: usize, to: usize| {
+        for line in physical.get(from..to).unwrap_or_default() {
             out.push_str(line);
             out.push_str("\r\n");
         }
-    }
-}
+    };
 
-/// Group `raw_ical` into logical lines without unfolding their content, so
-/// preserved lines can be re-emitted byte for byte. CR is trimmed from each
-/// physical line and re-added on emit; folding markers (leading WSP) stay
-/// attached to the continuation lines they belong to.
-fn logical_line_groups(raw_ical: &str) -> Vec<LineGroup<'_>> {
-    let mut groups: Vec<LineGroup<'_>> = Vec::new();
-    for raw in raw_ical.lines() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if (line.starts_with(' ') || line.starts_with('\t'))
-            && let Some(last) = groups.last_mut()
+    let mut out = String::new();
+    let mut replacements = Some(replacements);
+    // Blank lines before the first logical line, which caldata skips.
+    let first_head = heads.first().map_or(physical.len(), |head| head - 1);
+    emit(&mut out, 0, first_head);
+    for (index, &head) in heads.iter().enumerate() {
+        let next = heads.get(index + 1).map_or(physical.len(), |next| next - 1);
+        if head == insert_at
+            && let Some(replacements) = replacements.take()
         {
-            last.physical.push(line);
-        } else {
-            groups.push(LineGroup {
-                physical: vec![line],
-            });
+            out.push_str(&fold_ical_lines(replacements));
         }
+        if removed.contains(&head) {
+            continue;
+        }
+        emit(&mut out, head - 1, next);
     }
-    groups
-}
-
-fn ical_line_name(line: &str) -> Option<&str> {
-    line.split_once(':')?.0.split(';').next().map(str::trim)
-}
-
-fn line_value(line: &str) -> Option<&str> {
-    line.split_once(':').map(|(_, value)| value)
+    out
 }
 
 fn fold_ical_lines(lines: Vec<String>) -> String {
@@ -2346,23 +2331,8 @@ mod tests {
 
         let body = rsvp_reply_ical(&current, RsvpStatus::Accepted, "ada@example.test")
             .expect("itip reply");
-        let unfolded = logical_line_groups(&body)
-            .iter()
-            .map(|group| {
-                group
-                    .physical
-                    .iter()
-                    .enumerate()
-                    .map(|(index, line)| {
-                        if index == 0 {
-                            (*line).to_string()
-                        } else {
-                            // Strip exactly one leading fold WSP.
-                            line[1..].to_string()
-                        }
-                    })
-                    .collect::<String>()
-            })
+        let unfolded = LineReader::from_slice(body.as_bytes())
+            .map(|line| line.expect("the reply is UTF-8").as_str().to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -2427,7 +2397,50 @@ mod tests {
         )
         .expect_err("recurrence override patch should be refused");
 
-        assert_eq!(error, "recurrence override patch unsupported");
+        assert_eq!(error, PatchError::RecurrenceOverride);
+    }
+
+    /// Property names are case-insensitive, and caldata uppercases them, so the
+    /// projection sees a lowercase override. Against the exact-match guard this
+    /// patch was ACCEPTED and spliced into the master with the override left
+    /// in place.
+    #[test]
+    fn recurrence_patch_rejects_a_lowercase_override_vevent() {
+        let raw = "BEGIN:VCALENDAR\r\nbegin:vevent\r\nuid:u1\r\ndtstart:20260602T120000Z\r\ndtend:20260602T130000Z\r\nrrule:FREQ=WEEKLY\r\nend:vevent\r\nbegin:vevent\r\nuid:u1\r\nrecurrence-id:20260609T120000Z\r\nsummary:Override\r\ndtstart:20260609T140000Z\r\ndtend:20260609T150000Z\r\nend:vevent\r\nEND:VCALENDAR\r\n";
+        let projected = events_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            raw,
+        )
+        .expect("a lowercase body tokenizes");
+        assert_eq!(
+            projected.len(),
+            2,
+            "the projection reads the lowercase override as one"
+        );
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            raw,
+        );
+
+        let error = patch_to_ical(
+            &current,
+            &EventPatch {
+                recurrence: Some(EventRecurrence {
+                    rrule: Some("FREQ=DAILY;COUNT=2".to_string()),
+                    rdate: Vec::new(),
+                    exdate: Vec::new(),
+                    recurrence_id: None,
+                }),
+                ..EventPatch::default()
+            },
+        )
+        .expect_err("a lowercase override is still an override");
+
+        assert_eq!(error, PatchError::RecurrenceOverride);
     }
 
     #[test]
@@ -2612,7 +2625,138 @@ mod tests {
             },
         );
 
-        assert_eq!(result, Err("iCalendar body has no spliceable VEVENT"));
+        assert_eq!(result, Err(PatchError::NoSpliceableVevent));
+    }
+
+    /// The writer reads a property name exactly as caldata does, untrimmed.
+    /// `SUMMARY :Odd` is a property named `SUMMARY ` to caldata, so the
+    /// projection never read it as the title and a title patch must not touch
+    /// it. The writer used to trim names and deleted it along with the real
+    /// `SUMMARY`, destroying a line the model never held.
+    #[test]
+    fn a_title_patch_leaves_a_property_caldata_does_not_call_summary() {
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Real\r\nSUMMARY :Odd\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        assert_eq!(current.title.as_deref(), Some("Real"));
+
+        let body = patch_to_ical(
+            &current,
+            &EventPatch {
+                title: Some(Some("New".to_string())),
+                ..EventPatch::default()
+            },
+        )
+        .expect("patch");
+
+        assert!(!body.contains("SUMMARY:Real"), "{body}");
+        assert!(body.contains("SUMMARY :Odd\r\n"), "{body}");
+        assert!(body.contains("SUMMARY:New\r\n"), "{body}");
+    }
+
+    /// An override is a VEVENT with a TOP-LEVEL `RECURRENCE-ID`, as the
+    /// projection reads it; one inside a VALARM belongs to the alarm. The
+    /// writer used to count any `RECURRENCE-ID` between `BEGIN:VEVENT` and
+    /// `END:VEVENT` and refused this recurrence patch on a resource with no
+    /// override at all.
+    #[test]
+    fn a_recurrence_id_inside_an_alarm_is_not_an_override() {
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nRRULE:FREQ=WEEKLY\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nRECURRENCE-ID:20260609T120000Z\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        let body = patch_to_ical(
+            &current,
+            &EventPatch {
+                recurrence: Some(EventRecurrence {
+                    rrule: Some("FREQ=DAILY;COUNT=2".to_string()),
+                    rdate: Vec::new(),
+                    exdate: Vec::new(),
+                    recurrence_id: None,
+                }),
+                ..EventPatch::default()
+            },
+        )
+        .expect("no top-level RECURRENCE-ID, so no override");
+
+        assert!(body.contains("RRULE:FREQ=DAILY;COUNT=2\r\n"), "{body}");
+        assert!(!body.contains("FREQ=WEEKLY"), "{body}");
+        assert!(
+            body.contains("RECURRENCE-ID:20260609T120000Z\r\nEND:VALARM"),
+            "the alarm's own lines are untouched: {body}"
+        );
+    }
+
+    /// An event with no source body is refused, not rebuilt from the model.
+    /// Against the old fallback this returned `Ok` with a from-scratch
+    /// resource - here one that has lost the unmodeled `X-KEEP` property the
+    /// server holds, which is exactly the silent loss the refusal prevents.
+    #[test]
+    fn an_event_without_its_source_body_is_refused_rather_than_rebuilt() {
+        let mut current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\nX-KEEP:yes\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        current.raw_ical = None;
+
+        let result = patch_to_ical(
+            &current,
+            &EventPatch {
+                title: Some(Some("New".to_string())),
+                ..EventPatch::default()
+            },
+        );
+
+        assert_eq!(result, Err(PatchError::MissingSourceBody));
+    }
+
+    /// A fold may fall anywhere in a line (RFC 5545 s3.1), inside the
+    /// `END:VEVENT` delimiter and inside a property name included. The
+    /// projection reads the unfolded line; the splice used to read only the
+    /// first physical one, so against the old code this body projected and
+    /// then failed with no splice point, and a folded `SUMMARY` would have
+    /// escaped replacement and been written beside the new one.
+    #[test]
+    fn a_folded_delimiter_or_property_name_still_splices() {
+        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMM\r\n ARY:Old\r\nX-KEEP:yes\r\nEND:VEV\r\n ENT\r\nEND:VCALENDAR\r\n";
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            raw,
+        );
+        assert_eq!(
+            current.title.as_deref(),
+            Some("Old"),
+            "the projection unfolds"
+        );
+
+        let body = patch_to_ical(
+            &current,
+            &EventPatch {
+                title: Some(Some("New".to_string())),
+                ..EventPatch::default()
+            },
+        )
+        .expect("a legal folded body offers a splice point");
+
+        assert!(body.contains("SUMMARY:New\r\n"), "{body}");
+        assert!(
+            !body.contains("ARY:Old"),
+            "the folded SUMMARY is replaced: {body}"
+        );
+        assert!(
+            body.contains("X-KEEP:yes\r\nSUMMARY:New\r\nEND:VEV\r\n ENT\r\n"),
+            "preserved lines, including the folded delimiter, stay verbatim: {body}"
+        );
     }
 
     #[test]

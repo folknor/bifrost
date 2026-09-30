@@ -83,6 +83,16 @@ pub fn unsupported_error(operation: AccountOperation, protocol: DavProtocol) -> 
     .expect("valid account error classification")
 }
 
+/// The server answered, and what it answered says the resource named by `id`
+/// is not there - a GET that returned a calendar resource holding no VEVENT is
+/// the one caller.
+///
+/// Carries an ACKNOWLEDGED attempt, as [`status_error`] does: the verdict is
+/// read out of a server answer, so nothing about it is a local refusal. It
+/// carried none for a while, which read as `Unsent` in telemetry and support
+/// exports, while CardDAV's `not_found_error` - built on [`status_error`] -
+/// stamped `Acknowledged` for the same kind of answer. Not for a local
+/// refusal: that is [`local_error`].
 #[must_use]
 pub fn not_found_error(
     operation: AccountOperation,
@@ -96,6 +106,46 @@ pub fn not_found_error(
             id: Some(id.into()),
         }),
     )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .protocol(protocol.protocol())
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// A server answer that decoded but lacks a property the request exists to
+/// read - a principal lookup naming no `current-user-principal`, a principal
+/// naming no calendar or addressbook home.
+///
+/// `Protocol(MissingField)` rather than [`parse_error`]'s `ParseFailed`: the
+/// document parsed, it just did not say what it had to. Both derive
+/// `ProviderContractViolation`; the kind is what tells an operator which of the
+/// two happened. Carries an ACKNOWLEDGED attempt for the same reason
+/// [`parse_error`] does.
+///
+/// Deliberately NOT an arm of [`should_fallback_discovery`]. A well-known probe
+/// naming no principal already falls back, as a successful lookup returning
+/// nothing rather than as an error; the only producers of this kind are the
+/// configured-base leg and the steps after the principal, whose failures must
+/// propagate.
+#[must_use]
+pub fn missing_field_error(
+    operation: AccountOperation,
+    message: impl Into<String>,
+    protocol: DavProtocol,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: protocol.protocol(),
+            detail: Some(DiagnosticText::support_only(message)),
+        }),
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
     .protocol(protocol.protocol())
     .operation(operation)
     .try_build()
@@ -525,6 +575,18 @@ mod tests {
                 &into_redirect_loop(protocol),
                 protocol
             ));
+            // A missing discovery property is minted only by the base leg and
+            // the steps after the principal, never by the probe (a probe naming
+            // no principal falls back as an empty success), so it must not
+            // widen the predicate.
+            assert!(!should_fallback_discovery(
+                &missing_field_error(
+                    AccountOperation::Discover,
+                    "missing calendar-home-set",
+                    protocol,
+                ),
+                protocol
+            ));
         }
     }
 
@@ -588,6 +650,16 @@ mod tests {
             assert!(acknowledged(&parse_error(
                 AccountOperation::Discover,
                 "XML parse error",
+                protocol
+            )));
+            // A resource the server returned holding nothing of the dialect's
+            // kind is read out of its answer too. Carried no attempt before.
+            let missing_resource = not_found_error(AccountOperation::EventGet, "one.ics", protocol);
+            assert!(acknowledged(&missing_resource), "{missing_resource:?}");
+            assert_eq!(missing_resource.recovery(), &RecoveryClass::ProviderRefused);
+            assert!(acknowledged(&missing_field_error(
+                AccountOperation::Discover,
+                "missing current-user-principal",
                 protocol
             )));
             assert!(!acknowledged(&local_error(

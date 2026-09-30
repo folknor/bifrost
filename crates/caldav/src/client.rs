@@ -129,7 +129,13 @@ impl CalDavClient {
         let calendar_home = extract_href_property(&body, "calendar-home-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?
             .map(|href| resolve_href(&base, &href))
-            .ok_or_else(|| parse_error(AccountOperation::Discover, "missing calendar-home-set"))?;
+            .ok_or_else(|| {
+                bifrost_dav_core::missing_field_error(
+                    AccountOperation::Discover,
+                    "missing calendar-home-set",
+                    DAV,
+                )
+            })?;
         let hrefs = extract_href_properties(&body, "calendar-user-address-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?;
         let calendar_user_email = hrefs.iter().find_map(|href| mailto_email(href));
@@ -1332,6 +1338,14 @@ mod tests {
                 "{door}"
             );
             assert!(
+                matches!(
+                    error.scope(),
+                    Some(ErrorScope::Calendar { id }) if id.0 == url
+                ),
+                "{door}: scoped to the event like the GET failure: {:?}",
+                error.scope()
+            );
+            assert!(
                 error.chain().iter().any(|cause| matches!(
                     cause,
                     Cause::Attempt(attempt)
@@ -1342,6 +1356,191 @@ mod tests {
             );
         }
         assert_eq!(transcripts(&script).len(), 2, "one GET per door, no PUT");
+    }
+
+    /// A GET that returns a resource holding no VEVENT (a VTODO sharing the
+    /// collection) is `NotFound(Calendar)` read out of the SERVER's answer, so
+    /// it carries an acknowledged attempt - on both doors that project it.
+    ///
+    /// Against the code before the stamp the evidence assertion fails:
+    /// `bifrost_dav_core::not_found_error` pushed no attempt, so the error read
+    /// as `Unsent`, while CardDAV's `not_found_error` - built on `status_error`
+    /// - already stamped `Acknowledged` for the same kind of answer. One
+    /// response per call, so an update that went on to PUT starves the script.
+    #[tokio::test]
+    async fn a_resource_with_no_vevent_is_a_not_found_the_server_answered() {
+        use bifrost_types::account::Account as _;
+
+        const TASK: &str = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t1\r\nSUMMARY:Task\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let url = "https://dav.example.test/calendar/task.ics";
+        let task = || DavResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: TASK.to_string(),
+            url: String::new(),
+        };
+        let script = dav_script([task(), task()]);
+        let client = Arc::new(CalDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/");
+
+        let got = account
+            .event_get(bifrost_types::EventId(url.to_string()))
+            .await
+            .expect_err("a task is not an event");
+        let updated = account
+            .event_update(
+                bifrost_types::EventId(url.to_string()),
+                bifrost_types::EventPatch::default(),
+            )
+            .await
+            .expect_err("a task cannot be updated as an event");
+
+        for (door, error) in [("event_get", got), ("event_update", updated)] {
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::NotFound(ResourceKind::Calendar),
+                "{door}"
+            );
+            assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused, "{door}");
+            // Scoped to the event like the GET failure beside it; it carried
+            // the id only inside its cause.
+            assert!(
+                matches!(
+                    error.scope(),
+                    Some(ErrorScope::Calendar { id }) if id.0 == url
+                ),
+                "{door}: {:?}",
+                error.scope()
+            );
+            assert!(
+                error.chain().iter().any(|cause| matches!(
+                    cause,
+                    Cause::Attempt(attempt)
+                        if attempt.transmission_state
+                            == bifrost_types::TransmissionState::Acknowledged
+                )),
+                "{door}: the server answered the GET: {error:?}"
+            );
+        }
+        assert_eq!(transcripts(&script).len(), 2, "one GET per door, no PUT");
+    }
+
+    /// An event whose `END:VEVENT` delimiter is folded - legal, RFC 5545 s3.1
+    /// lets a fold fall anywhere - is updated, not refused.
+    ///
+    /// The projection unfolds and read the event fine; the splice read only
+    /// the first physical line, found no landing point, and `event_update`
+    /// answered `Unsupported` for an ordinary title edit. Against that code this
+    /// fails on the update itself. The PUT body is asserted, so a write-back
+    /// that dropped the patch would fail too.
+    #[tokio::test]
+    async fn an_event_with_a_folded_delimiter_is_updated() {
+        use bifrost_types::account::Account as _;
+
+        const FOLDED: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nEND:VEV\r\n ENT\r\nEND:VCALENDAR\r\n";
+        let url = "https://dav.example.test/calendar/one.ics";
+        let script = dav_script([
+            DavResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: FOLDED.to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            },
+        ]);
+        let client = Arc::new(CalDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/");
+
+        account
+            .event_update(
+                bifrost_types::EventId(url.to_string()),
+                bifrost_types::EventPatch {
+                    title: Some(Some("New".to_string())),
+                    ..bifrost_types::EventPatch::default()
+                },
+            )
+            .await
+            .expect("a legal folded body is updated");
+
+        let sent = transcripts(&script);
+        assert_eq!(sent.len(), 2, "the GET, then the PUT");
+        assert_eq!(sent[1].method, Method::PUT);
+        let body = &sent[1].body;
+        assert!(body.contains("SUMMARY:New\r\n"), "{body}");
+        assert!(!body.contains("SUMMARY:Old"), "{body}");
+    }
+
+    /// A body the projection reads is a body the writer can patch, even where
+    /// the body bends the grammar. The shape here is a blank line inside the
+    /// fold of `END:VEVENT`: RFC 5545 permits no empty content line, and
+    /// caldata's `LineReader` skips it and unfolds the delimiter, so the event
+    /// projects. The writer re-read the body with its own line grouping, took
+    /// the blank line for a line of its own, never found the end of the event,
+    /// and refused the update; it now splices by the projection's own parse.
+    ///
+    /// Against that code this fails on the update itself. The PUT body is
+    /// asserted, including the preserved blank-line fold, so a write-back that
+    /// dropped the patch or mangled the delimiter fails too.
+    #[tokio::test]
+    async fn an_event_with_a_blank_line_inside_a_fold_is_updated() {
+        use bifrost_types::account::Account as _;
+
+        const BLANK_IN_FOLD: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nEND:VEV\r\n\r\n ENT\r\nEND:VCALENDAR\r\n";
+        let url = "https://dav.example.test/calendar/one.ics";
+        let script = dav_script([
+            DavResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: BLANK_IN_FOLD.to_string(),
+                url: String::new(),
+            },
+            DavResponse {
+                status: StatusCode::NO_CONTENT,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: String::new(),
+            },
+        ]);
+        let client = Arc::new(CalDavClient::with_account_net(
+            "https://dav.example.test",
+            scripted_dav_net(&script),
+        ));
+        let account =
+            crate::account::CalDavAccount::for_tests(client, "https://dav.example.test/calendar/");
+
+        account
+            .event_update(
+                bifrost_types::EventId(url.to_string()),
+                bifrost_types::EventPatch {
+                    title: Some(Some("New".to_string())),
+                    ..bifrost_types::EventPatch::default()
+                },
+            )
+            .await
+            .expect("a body the projection reads is a body the writer patches");
+
+        let sent = transcripts(&script);
+        assert_eq!(sent.len(), 2, "the GET, then the PUT");
+        assert_eq!(sent[1].method, Method::PUT);
+        let body = &sent[1].body;
+        assert!(
+            body.contains("SUMMARY:New\r\nEND:VEV\r\n\r\n ENT\r\n"),
+            "the patch lands before the preserved delimiter: {body}"
+        );
+        assert!(!body.contains("SUMMARY:Old"), "{body}");
     }
 
     /// A discovery that enumerates no calendars leaves the OPENED account with
@@ -1846,6 +2045,51 @@ mod tests {
                 "https://dav.example.test/principals/ada/".to_string(),
             ]
         );
+    }
+
+    /// A principal whose answer parses but names no calendar home is a MISSING
+    /// FIELD, not a parse failure: the document was well-formed and silent.
+    /// Twin of `bifrost-carddav`'s
+    /// `a_principal_naming_no_home_is_a_missing_field`. Against the code before
+    /// the reclassification the kind assertion fails on `ParseFailed`.
+    #[tokio::test]
+    async fn a_principal_naming_no_home_is_a_missing_field() {
+        let response = |body: &str| DavResponse {
+            status: StatusCode::MULTI_STATUS,
+            headers: HeaderMap::new(),
+            body: body.to_string(),
+            url: String::new(),
+        };
+        let script = dav_script([
+            response(
+                "<D:current-user-principal xmlns:D=\"DAV:\"><D:href>/principals/ada/</D:href></D:current-user-principal>",
+            ),
+            response("<D:multistatus xmlns:D=\"DAV:\"/>"),
+        ]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+
+        let error = client
+            .discover_account()
+            .await
+            .expect_err("a principal naming no home cannot open");
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::MissingField)
+        );
+        assert_eq!(error.recovery(), &RecoveryClass::ProviderContractViolation);
+        assert_eq!(error.protocol(), Some(Protocol::CalDav));
+        assert!(
+            error.chain().iter().any(|cause| matches!(
+                cause,
+                Cause::Attempt(attempt)
+                    if attempt.transmission_state
+                        == bifrost_types::TransmissionState::Acknowledged
+            )),
+            "the principal answered: {error:?}"
+        );
+        assert_eq!(transcripts(&script).len(), 2);
     }
 
     /// A front end sitting on the origin root answers a PROPFIND with `200` and

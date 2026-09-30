@@ -235,7 +235,7 @@ impl CardDavAccount {
         let url = client.resolve_url(&contact.0);
         client.get_vcard(&url, operation).await.map_err(|error| {
             if matches!(error.kind(), AccountErrorKind::NotFound(_)) {
-                not_found_error(operation, contact.0.clone())
+                not_found_error(error, contact.0.clone())
             } else {
                 error
             }

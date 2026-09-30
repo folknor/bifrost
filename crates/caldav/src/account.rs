@@ -21,7 +21,7 @@ use crate::client::{
     local_error, missing_event_error, unsupported_error,
 };
 use crate::ical::{
-    EventProjectionError, create_to_ical, event_from_ical, events_from_ical, new_uid,
+    EventProjectionError, PatchError, create_to_ical, event_from_ical, events_from_ical, new_uid,
     patch_to_ical, rsvp_patch, rsvp_reply_ical,
 };
 use crate::parse::CalendarCollection;
@@ -306,12 +306,25 @@ impl CalDavAccount {
         // with an acknowledged attempt - never the caller's malformed request.
         // It was `local_error` (`Request(Malformed)` -> `ClientBug`), which told
         // the consumer to fix a request it had nothing to do with.
-        .map_err(|error| match error {
-            EventProjectionError::NoVevent => missing_event_error(operation, event.0),
-            EventProjectionError::Parse(parse) => crate::client::parse_error(
-                operation,
-                format!("CalDAV resource is not valid iCalendar: {}", parse.0),
-            ),
+        //
+        // Both projection failures carry `event_scope`, as the GET failure just
+        // above does: they are about the same resource, and a consumer routing
+        // on the scope must not lose the target because the server's answer
+        // failed one step later. The no-VEVENT case carried the id only inside
+        // its cause, and the parse case carried nothing.
+        .map_err(|error| {
+            let error = match error {
+                EventProjectionError::NoVevent => missing_event_error(operation, event.0.clone()),
+                EventProjectionError::Parse(parse) => crate::client::parse_error(
+                    operation,
+                    format!("CalDAV resource is not valid iCalendar: {}", parse.0),
+                ),
+            };
+            error
+                .into_builder()
+                .scope(event_scope(event.0))
+                .try_build()
+                .expect("adding a scope cannot invalidate a classified error")
         })
     }
 
@@ -1087,7 +1100,7 @@ impl Account for CalDavAccount {
             )
             .await?;
             let body = patch_to_ical(&current, &patch)
-                .map_err(|_| unsupported_error(AccountOperation::EventUpdate))?;
+                .map_err(|error| patch_error(AccountOperation::EventUpdate, error))?;
             let Some(target_calendar) = relocation else {
                 client
                     .put_event(
@@ -1165,8 +1178,8 @@ impl Account for CalDavAccount {
             let patch = rsvp_patch(&current, status, &rsvp_email).map_err(|_| {
                 rsvp_local_write_error(unsupported_error(AccountOperation::EventRsvp))
             })?;
-            let body = patch_to_ical(&current, &patch).map_err(|_| {
-                rsvp_local_write_error(unsupported_error(AccountOperation::EventRsvp))
+            let body = patch_to_ical(&current, &patch).map_err(|error| {
+                rsvp_local_write_error(patch_error(AccountOperation::EventRsvp, error))
             })?;
             let url = client.resolve_url(&event.0);
             client
@@ -1412,6 +1425,44 @@ fn worse_recovery_option(
         Some(candidate) => worse_recovery(current, candidate),
         None => current,
     }
+}
+
+/// Classify a patch that could not be spliced, by what stopped it.
+///
+/// Every cause used to map to `Unsupported`, which is right for one of them
+/// only: a recurrence replacement on a resource with override VEVENTs is a
+/// request this client cannot express.
+///
+/// The other two are this crate breaking its own invariant, so they are
+/// `Internal(InvariantViolated)` - never retried, reported as a bug - with no
+/// attempt, since no write was issued. An event with no source body cannot
+/// exist (`project_event` always sets one). A body with no VEVENT to splice
+/// into cannot either: the event was projected from that very body, and the
+/// writer splices by the projection's own parse, so the VEVENT it came from is
+/// always there. While the writer re-read the body by rules of its own it was
+/// reachable, and every body that reached it was the two readers disagreeing,
+/// not the server erring - which is why it is not the provider's fault.
+fn patch_error(operation: AccountOperation, error: PatchError) -> AccountError {
+    let detail = match error {
+        PatchError::RecurrenceOverride => return unsupported_error(operation),
+        PatchError::NoSpliceableVevent => {
+            "CalDAV patch writer found no VEVENT in the body the event was projected from"
+        }
+        PatchError::MissingSourceBody => {
+            "CalDAV event reached the patch writer without its source iCalendar body"
+        }
+    };
+    AccountErrorBuilder::new(
+        AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+        Cause::Internal(InternalCause::new(
+            InternalErrorKind::InvariantViolated,
+            Some(DiagnosticText::support_only(detail)),
+        )),
+    )
+    .protocol(Protocol::CalDav)
+    .operation(operation)
+    .try_build()
+    .expect("valid internal invariant classification")
 }
 
 /// The scheduling POST completed before the local PUT began. Preserve that
@@ -3329,6 +3380,42 @@ mod tests {
             RecoveryClass::Reconcile(advice)
                 if advice.reason == ReconcileReason::PartialCompletionSignal
         ));
+    }
+
+    /// A patch that cannot be spliced is classified by cause. Every cause was
+    /// `Unsupported`; against that code the invariant assertions fail. Only a
+    /// recurrence replacement over overrides is an operation this client
+    /// lacks; the other two cannot happen to an event projected from its own
+    /// body, so they report a bug here rather than blaming the caller or the
+    /// provider.
+    #[test]
+    fn an_unspliceable_patch_is_classified_by_cause() {
+        let refused = patch_error(
+            AccountOperation::EventUpdate,
+            PatchError::RecurrenceOverride,
+        );
+        assert_eq!(
+            refused.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        );
+
+        for cause in [
+            PatchError::NoSpliceableVevent,
+            PatchError::MissingSourceBody,
+        ] {
+            let invariant = patch_error(AccountOperation::EventUpdate, cause);
+            assert_eq!(
+                invariant.kind(),
+                &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated),
+                "{cause:?}"
+            );
+            assert_eq!(
+                invariant.recovery(),
+                &RecoveryClass::InternalFailure,
+                "{cause:?}"
+            );
+            assert_eq!(invariant.protocol(), Some(Protocol::CalDav), "{cause:?}");
+        }
     }
 
     #[test]

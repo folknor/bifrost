@@ -16,7 +16,7 @@
 use bifrost_types::{AccountError, AccountOperation};
 
 use crate::dispatch::DavDispatch;
-use crate::error::{parse_error, should_fallback_discovery};
+use crate::error::{missing_field_error, parse_error, should_fallback_discovery};
 use crate::multistatus::extract_href_property;
 use crate::xml::resolve_href;
 
@@ -40,7 +40,7 @@ impl DavDispatch {
     /// or when [`should_fallback_discovery`] reads its failure as "this is not a
     /// discovery endpoint". Any other probe failure fails the open. The base leg
     /// never consults the predicate: a failure there is the account's own, and a
-    /// base that names no principal is a `Protocol(ParseFailed)`.
+    /// base that names no principal is a `Protocol(MissingField)`.
     ///
     /// # Errors
     /// The probe's failure when it is not a fallback answer, the base leg's
@@ -61,10 +61,12 @@ impl DavDispatch {
         if let Some(principal) = from_well_known {
             return Ok(principal);
         }
+        // The base answered and its document parsed; it simply names no
+        // principal. That is a missing field, not a parse failure.
         self.discover_principal(self.base_url())
             .await?
             .ok_or_else(|| {
-                parse_error(
+                missing_field_error(
                     AccountOperation::Discover,
                     "missing current-user-principal",
                     protocol,
@@ -260,12 +262,18 @@ mod tests {
 
     /// The base leg never consults the fallback predicate: a body there that
     /// will not parse, or one naming no principal, is the account's own failure.
+    ///
+    /// Each is classified by what went wrong: a body that will not parse is
+    /// `ParseFailed`, and a document that parsed but names no principal is
+    /// `MissingField` (it was `ParseFailed` too, which told an operator the XML
+    /// was broken when it was merely silent).
     #[tokio::test]
     async fn the_base_leg_fails_on_what_the_probe_would_have_survived() {
         for protocol in [DavProtocol::CalDav, DavProtocol::CardDav] {
-            for (base_answer, label) in [
+            for (base_answer, expected, label) in [
                 (
                     answer(StatusCode::OK, INDEX_PAGE),
+                    ProtocolErrorKind::ParseFailed,
                     "an index page at the configured base",
                 ),
                 (
@@ -273,6 +281,7 @@ mod tests {
                         StatusCode::MULTI_STATUS,
                         "<D:multistatus xmlns:D=\"DAV:\"/>",
                     ),
+                    ProtocolErrorKind::MissingField,
                     "a configured base naming no principal",
                 ),
             ] {
@@ -284,13 +293,10 @@ mod tests {
                     .await
                     .expect_err(label);
 
-                assert!(
-                    matches!(
-                        error.kind(),
-                        AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
-                    ),
-                    "{protocol:?}, {label}: {:?}",
-                    error.kind()
+                assert_eq!(
+                    error.kind(),
+                    &AccountErrorKind::Protocol(expected),
+                    "{protocol:?}, {label}"
                 );
                 assert_eq!(error.protocol(), Some(protocol.protocol()));
                 assert_eq!(transcripts(&script).len(), 2, "{protocol:?}, {label}");

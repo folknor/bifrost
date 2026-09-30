@@ -343,8 +343,9 @@ impl DavDispatch {
     /// redirect, with no transmission evidence at all.
     ///
     /// The refused redirect to an unadmitted origin is deliberately NOT here: it
-    /// is this client's own credential-gate decision, raised by `auth_headers`
-    /// before the next hop goes out.
+    /// is this client's own credential-gate decision, raised by the walk before
+    /// the next hop goes out. It stays a local `Request(Malformed)`, carrying
+    /// the `Acknowledged` attempt the answered previous hop earned.
     fn redirect_error(&self, error: NetError, operation: AccountOperation) -> AccountError {
         into_account_error(
             error,
@@ -547,16 +548,25 @@ impl DavDispatch {
                 _ => None,
             };
             let Some(location) = location else {
-                if !self.is_trusted_url(&response.url) {
-                    return Err(local_error(
-                        operation,
-                        format!(
-                            "response arrived from an untrusted DAV origin: {}",
-                            response.url
-                        ),
-                        self.protocol,
-                    ));
-                }
+                // Cannot fire, which is why it is an assertion rather than a
+                // refusal. `response.url` is the URL of the request just sent,
+                // and every URL the walk sends to has passed the credential
+                // gate: each hop past the first is checked against
+                // `is_trusted_url` below before it goes out, and the first is
+                // the caller's, which every caller credentials through
+                // `auth_headers` - the same gate - for that same URL. The
+                // admitted set only ever grows, so nothing can untrust a URL
+                // between the check and the answer. As a runtime check it was
+                // also too late to protect anything: a request to an untrusted
+                // origin would already have been SENT by the time its answer
+                // was inspected here. What it can still catch is a caller that
+                // builds a request without gating its URL, and that is a bug in
+                // this workspace, which a debug build should surface loudly.
+                debug_assert!(
+                    self.is_trusted_url(&response.url),
+                    "DAV request reached an origin the credential gate never admitted: {}",
+                    response.url
+                );
                 return Ok(response);
             };
             let next = Url::parse(&response.url)
@@ -581,8 +591,19 @@ impl DavDispatch {
                     operation,
                 ));
             }
-            // Fresh credentials for the target origin; refused locally when
-            // the origin was never admitted by discovery.
+            // Refused locally when the origin was never admitted by discovery.
+            // The gate is checked here rather than left to `auth_headers`,
+            // whose own refusal is right for a first hop but not for this one:
+            // by now the server has answered the previous hop, and the error
+            // must say so (see `refused_after_answered_hop`).
+            if !self.is_trusted_url(next.as_str()) {
+                return Err(refused_after_answered_hop(local_error(
+                    operation,
+                    format!("refusing to follow a DAV redirect to an untrusted URL: {next}"),
+                    self.protocol,
+                )));
+            }
+            // Fresh credentials for the target origin.
             let auth = self.auth_headers(next.as_str(), operation).await?;
             let mut headers = request.headers.clone();
             headers.remove(AUTHORIZATION);
@@ -602,7 +623,7 @@ impl DavDispatch {
             // destination is a URL this client asks the server to write to, so
             // it carries the same admitted-origin requirement `move_resource`
             // enforced on the caller's value. The rebase happens only after
-            // `auth_headers` has admitted `next`, and the rebased URL is
+            // the gate has admitted `next`, and the rebased URL is
             // `next`-relative, so the requirement holds by construction; the
             // check below is the guard that keeps it holding if either half
             // moves. A destination on a different origin than the source is left
@@ -614,16 +635,21 @@ impl DavDispatch {
                 .and_then(|destination| rebase_destination(&request.url, &next, destination));
             if let Some(rebased) = rebased {
                 if !self.is_trusted_url(&rebased) {
-                    return Err(local_error(
+                    return Err(refused_after_answered_hop(local_error(
                         operation,
                         format!(
                             "refusing to name an untrusted DAV move destination after a redirect: {rebased}"
                         ),
                         self.protocol,
-                    ));
+                    )));
                 }
-                let value = HeaderValue::from_str(&rebased)
-                    .map_err(|error| local_error(operation, error.to_string(), self.protocol))?;
+                let value = HeaderValue::from_str(&rebased).map_err(|error| {
+                    refused_after_answered_hop(local_error(
+                        operation,
+                        error.to_string(),
+                        self.protocol,
+                    ))
+                })?;
                 headers.insert(HeaderName::from_static(DESTINATION), value);
             }
             request = DavRequest {
@@ -821,6 +847,28 @@ impl DavDispatch {
             self.protocol,
         ))
     }
+}
+
+/// Stamp a local refusal raised partway through the redirect walk with the
+/// transmission evidence it is owed.
+///
+/// The refusal itself stays this client's decision - `Request(Malformed)`, the
+/// kind `should_fallback_discovery` reads a refused well-known redirect by - but
+/// it is not the refusal of an UNSENT request: the previous hop went out and
+/// the server answered it with the redirect being refused. With no attempt
+/// cause it read as `Unsent` in telemetry and support exports, claiming nothing
+/// had left the process. `Acknowledged` is the honest state: the server
+/// answered, and a 3xx is an answer that did not act on the request. It moves
+/// no recovery class (`derive` reads a `Request` kind as `ClientBug` whatever
+/// the attempt says).
+fn refused_after_answered_hop(error: AccountError) -> AccountError {
+    error
+        .into_builder()
+        .push_cause(bifrost_types::Cause::Attempt(
+            bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
+        ))
+        .try_build()
+        .expect("an acknowledged attempt is valid on a local refusal")
 }
 
 /// Re-express `destination` against the URL the source was redirected to.
@@ -1226,6 +1274,59 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// A redirect to an origin the credential gate never admitted is refused
+    /// locally - the next hop never goes out - but the refusal carries the
+    /// ACKNOWLEDGED attempt the answered first hop earned.
+    ///
+    /// Against the code before the stamp the evidence assertion fails: the
+    /// refusal was a bare `local_error` with no attempt cause, which read as
+    /// `Unsent` though the server had answered. The kind stays
+    /// `Request(Malformed)`, because the well-known fallback predicate reads a
+    /// refused redirect by it; the first-hop gate in `auth_headers`, where
+    /// nothing has been sent, stays unstamped.
+    #[tokio::test]
+    async fn a_refused_redirect_says_the_first_hop_was_answered() {
+        let script = dav_script([dav_redirect(StatusCode::FOUND, "https://evil.test/dav/")]);
+        let dispatch = scripted_dispatch(scripted_dav_net(&script));
+
+        let error = dispatch
+            .propfind_raw(
+                &format!("{BASE}/start"),
+                "0",
+                "<propfind/>",
+                AccountOperation::Discover,
+            )
+            .await
+            .expect_err("a redirect to an unadmitted origin is refused");
+
+        assert_eq!(
+            transcripts(&script).len(),
+            1,
+            "the refused hop must not go out"
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+        assert!(
+            acknowledged(&error),
+            "the server answered the first hop: {error:?}"
+        );
+        assert!(crate::should_fallback_discovery(
+            &error,
+            DavProtocol::CalDav
+        ));
+
+        let first_hop = dispatch
+            .auth_headers("https://evil.test/dav/", AccountOperation::Discover)
+            .await
+            .expect_err("the gate refuses an unadmitted first hop");
+        assert!(
+            !acknowledged(&first_hop),
+            "nothing was sent before a first-hop refusal: {first_hop:?}"
+        );
     }
 
     /// A token source that always fails, with the error the case under test
