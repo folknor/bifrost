@@ -558,18 +558,19 @@ placeholder, not a real end. `CalendarEvent.end` is not optional, so the
 projection discards the placeholder and emits the same empty-valued `EventTime`
 the tombstone stub uses ("the provider did not say"), and a missing `end` on
 such an event is not refused. Consumers must treat an empty `end.value` on a
-live event as "no end", not parse it. The write side honours that same
-reading, so a read-modify-write of such an event neither fails nor fabricates
-an end. An empty (or whitespace-only) `end` in `EventCreate` or `EventPatch`
-means "no end" and is written as `endTimeUnspecified: true`, never as
-`dateTime: ""`. Create sends the start as the placeholder `end` (Google's insert
-requires one, and this is what Google reports for such events); a patch that
-also carries `start` does the same, and a patch without `start` sends the flag
-alone and leaves the stored end untouched. An empty `start` has no such
-reading and is refused as `Request(Malformed)` naming `start` before any
-request (`reject_unusable_write_times`); on update it runs before the calendar
-move, alongside the all-day check. RSVP patches only `attendees` and re-sends
-no time.
+live event as "no end", not parse it. `endTimeUnspecified` is not a writable
+Events property, so "no end" cannot be written, and an empty (or
+whitespace-only) `end` is never sent as `dateTime: ""`. A patch that echoes it
+without moving `start` omits `end`, leaving the stored end untouched, so a
+read-modify-write of such an event neither fails nor fabricates an end. A
+patch that moves `start` with an empty `end`, and a create with an empty `end`,
+are refused as `Unsupported` before any request: Google's stored placeholder
+would no longer match the new start, an insert needs some end, and inventing
+one is what the projection refused to do, so the caller must supply it. An
+empty `start` has no "no start" reading and is refused as `Request(Malformed)`
+naming `start`. All of this runs in `reject_unusable_write_times`, before any
+request and, on update, before the calendar move, alongside the all-day check.
+RSVP patches only `attendees` and re-sends no time.
 Projection failures are per item, not per page. `page_from_events` routes a
 refused event onto `Page::failed_ids` under its composite native id and
 serves the rest of the page, matching how bifrost-jmap and bifrost-caldav
