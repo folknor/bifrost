@@ -116,14 +116,20 @@ it, so no solicited response for it can exist and neither it nor any later
 command is an eligible owner. And its own tagged `NO`/`BAD` is its ordinary
 per-command result rather than a batch error: the sender abandons the rest of
 that command's bytes (the server has ended its parsing state, so the remainder
-would read as a new command) and the batch continues. A tagged `OK` there stays
-a hard protocol error, because it claims success for a command the server never
-finished receiving. This is what keeps a `NO` for command #1 from being
+would read as a new command) and the batch continues. A tagged `OK` there is
+the same non-fatal `ProtocolMissing` as outside a pipeline, recorded in that
+command's result slot (the consumer is discarded, never finalized, because
+finalizing would report success for a command that never ran; its pre-effects
+such as a NOTIFY registration are skipped) and the remainder abandoned like a
+`NO`. It is safe because the send phase is sequential while a literal is
+synchronizing: the only batch bytes on the wire are earlier commands (complete)
+and this command's first line, and no later command has been written for the
+server to read as the missing literal. This is what keeps a `NO` for command #1 from being
 reported as a failure of command #2, and what stops a `* MYRIGHTS` solicited by
 command #1 from being downgraded to an anonymous event while the batch
 completes with a silently short result.
 
-Outside a pipeline the continuation wait is told its command's own tag (`own_tag`, threaded through every send helper), because exactly one command is on the wire and the wait can therefore separate three tagged cases. The command's own `NO`/`BAD` is an ordinary refusal, `Acknowledged`, and the unsent remainder is never written. Its own `OK` with no `+` first is the server completing the command without granting the literal it owed: the exchange is over and the framing intact, so it is the non-fatal `ProtocolMissing`, and the remainder is likewise never written (it would be read as a new command line). Any other tag can belong to nothing, so it is a desynchronization, `Protocol`, connection-fatal. Under a pipeline the own-tag `OK` stays the fatal `Protocol` above, since there the router, not this wait, owns tag interpretation. IDLE does not use this wait: `wait_for_idle_grant` applies the same three rules to IDLE's `+` (own `NO`/`BAD` refuse IDLE, own `OK` without `+` is `ProtocolMissing`, a foreign tag is `Protocol`), with no literal to abandon, and stamps transport failures `InFlight` because the IDLE command is already on the wire.
+Outside a pipeline the continuation wait is told its command's own tag (`own_tag`, threaded through every send helper), because exactly one command is on the wire and the wait can therefore separate three tagged cases. The command's own `NO`/`BAD` is an ordinary refusal, `Acknowledged`, and the unsent remainder is never written. Its own `OK` with no `+` first is the server completing the command without granting the literal it owed: the exchange is over and the framing intact, so it is the non-fatal `ProtocolMissing`, and the remainder is likewise never written (it would be read as a new command line). Any other tag can belong to nothing, so it is a desynchronization, `Protocol`, connection-fatal. Under a pipeline the router owns tag interpretation but reaches the same verdicts (`early_ok_error` is the one shared definition of the own-tag `OK` error). One caveat applies to both modes: the "framing intact" argument is exact for the command's FIRST literal, whose preceding bytes are one CRLF-terminated line the server has necessarily consumed. Once an earlier literal was granted (a MULTIAPPEND's second body, a command with several literals), the inter-literal bytes were written before the early `OK` was read, and whether the server had already finished the command and reads them as a stray command line cannot be known from the wire; the non-fatal classification is not proven there. IDLE does not use this wait: `wait_for_idle_grant` applies the same three rules to IDLE's `+` (own `NO`/`BAD` refuse IDLE, own `OK` without `+` is `ProtocolMissing`, a foreign tag is `Protocol`), with no literal to abandon, and stamps transport failures `InFlight` because the IDLE command is already on the wire.
 
 Untagged ownership normally goes to the head consumer (the first still-active
 command eligible to own the response), with one exception taken first. An

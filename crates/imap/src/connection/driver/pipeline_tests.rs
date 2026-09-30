@@ -250,15 +250,19 @@ async fn the_sending_commands_own_rejection_is_its_result_not_a_batch_error() {
     );
 }
 
-/// A tagged `OK` for the command whose literal has not been granted stays a
-/// hard protocol error rather than becoming that command's result.
+/// A tagged `OK` for the command whose literal has not been granted is that
+/// command's own non-fatal `ProtocolMissing`, exactly as in the single-command
+/// wait, and the batch carries on.
 ///
-/// `NO`/`BAD` are an honest refusal of the prefix and can be finalized as the
-/// command's ordinary result. An `OK` cannot: it claims successful execution
-/// of a command the server has not received, and there is nothing that could
-/// have succeeded (RFC 3501 Section 4.3).
+/// The wire is still in sync: the send phase is sequential while a literal is
+/// synchronizing, so nothing of a later command has been written when the
+/// early `OK` arrives, and the abandoned remainder is never written. The proof
+/// is the third command: its line must be the very next thing on the wire
+/// (a written literal body would arrive first and be read as a command line).
+/// The `OK` is NOT finalized through the consumer, which would report success
+/// for a command that never ran.
 #[tokio::test]
-async fn a_tagged_ok_before_the_literal_continuation_is_a_protocol_error() {
+async fn a_tagged_ok_before_the_literal_continuation_is_that_commands_missing_result() {
     let (conn, mut server) = driver_pair(&preauth_greeting(SYNC_LITERAL_CAPS)).await;
 
     let task = tokio::spawn(async move {
@@ -268,24 +272,46 @@ async fn a_tagged_ok_before_the_literal_continuation_is_a_protocol_error() {
                 MailboxName::new("INBOX").unwrap(),
                 LITERAL_IDENTIFIER.to_owned(),
             )
+            .get_acl(MailboxName::new("INBOX").unwrap())
             .execute_dynamic()
             .await
     });
 
-    let _myrights = read_line(&mut server).await;
+    let myrights = read_line(&mut server).await;
+    let tag1 = tag_of(&myrights).to_owned();
     let listrights = read_line(&mut server).await;
     let tag2 = tag_of(&listrights).to_owned();
 
     respond(&mut server, &format!("{tag2} OK not really\r\n")).await;
 
-    let err = task
-        .await
-        .unwrap()
-        .expect_err("an OK without a continuation is a protocol violation");
+    let getacl = read_line(&mut server).await;
     assert!(
-        format!("{err}").contains("unexpected OK before literal continuation"),
-        "wrong error: {err}"
+        getacl.contains("GETACL"),
+        "the abandoned literal body reached the wire ahead of the next command: {getacl:?}"
     );
+    let tag3 = tag_of(&getacl).to_owned();
+    respond(
+        &mut server,
+        &format!("* MYRIGHTS INBOX lr\r\n{tag1} OK myrights done\r\n{tag3} OK getacl done\r\n"),
+    )
+    .await;
+
+    let results = task.await.unwrap().expect("the batch must not abort");
+    assert_eq!(results.len(), 3);
+    let err = results[1]
+        .as_ref()
+        .expect_err("an OK before the continuation is not a success");
+    assert!(
+        matches!(err, crate::error::Error::ProtocolMissing(_)),
+        "wrong error: {err:?}"
+    );
+    assert!(!err.is_connection_fatal());
+    let rights = results[0]
+        .as_ref()
+        .expect("command #1 still completes normally")
+        .downcast_ref::<String>()
+        .unwrap();
+    assert_eq!(rights, "lr");
 }
 
 /// A tagged response for a command the server has not been sent yet is a

@@ -116,8 +116,9 @@ pub(super) enum Routed {
     /// A `+` continuation. Grants the literal in the send phase; a protocol
     /// error in the step 4 loop.
     Continuation,
-    /// The tagged `NO`/`BAD` of the command currently negotiating its
-    /// literal. Already finalized into its own result slot; the sender must
+    /// The tagged `NO`/`BAD` (or an early `OK`, recorded as `ProtocolMissing`)
+    /// of the command currently negotiating its literal. Already finalized
+    /// into its own result slot; the sender must
     /// abandon the remainder of that command's bytes.
     OwnTagRejected,
     /// Routed; keep reading.
@@ -243,7 +244,17 @@ pub(super) fn route_pipeline_response(
     // registration as it stood when this response was produced.
     let notify_before = state.notify();
 
-    if let crate::types::Response::Tagged(ref t) = resp {
+    // The sending command's own tagged OK before its `+`: the command did not
+    // execute, so its pre-effects (a NOTIFY registration) must not install.
+    let early_own_ok = matches!(
+        resp,
+        crate::types::Response::Tagged(ref t)
+            if t.status == crate::types::response::StatusKind::Ok
+                && routing.sending.is_some()
+                && routing.sending == routing.tag_to_idx.get(&t.tag).copied()
+    );
+
+    if !early_own_ok && let crate::types::Response::Tagged(ref t) = resp {
         apply_pipeline_pre_effects(state, routing, t);
     }
 
@@ -271,17 +282,24 @@ pub(super) fn route_pipeline_response(
                 if idx == sending {
                     // The server answered the command whose literal it has
                     // not been given (RFC 3501 Section4.3).
-                    if matches!(t.status, crate::types::response::StatusKind::Ok) {
-                        // An OK claims successful execution of a command the
-                        // server has not received completely. NO/BAD are an
-                        // honest refusal of the prefix and can be finalized as
-                        // that command's ordinary result; a success cannot,
-                        // because there is nothing that could have succeeded.
-                        return Err(Error::Protocol(
-                            "unexpected OK before literal continuation \
-                             (RFC 3501 Section4.3)"
-                                .into(),
-                        ));
+                    if early_own_ok {
+                        // The same server behaviour the single-command wait
+                        // treats as a non-fatal `ProtocolMissing`, and it is
+                        // equally safe here: the send phase is sequential
+                        // whenever a literal is synchronizing, so the only
+                        // bytes of this batch on the wire are earlier
+                        // commands (complete) and this command's first line.
+                        // No later command has been written, so the server
+                        // cannot read one as the missing literal, and the
+                        // unsent remainder is dropped exactly as after a
+                        // `NO`. The consumer is discarded, NOT finalized:
+                        // finalizing would turn the OK into a success for a
+                        // command that never ran.
+                        if routing.consumers[idx].take().is_some() {
+                            routing.results[idx] = Some(Err(super::wire_send::early_ok_error()));
+                            *routing.completed += 1;
+                        }
+                        return Ok(Routed::OwnTagRejected);
                     }
                 } else if idx > sending {
                     // A completion for a command still unsent: the server

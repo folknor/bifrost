@@ -280,6 +280,22 @@ pub(super) async fn send_chunked_segments(
     Ok(())
 }
 
+/// The error for a command whose own tagged `OK` arrived before the `+`
+/// continuation its synchronizing literal is owed.
+///
+/// One definition for the single-command wait and the pipeline router, so the
+/// two cannot drift apart on what this server behaviour means: the non-fatal
+/// `ProtocolMissing`, because the server finished the exchange, the framing is
+/// intact, and the unsent remainder is never written.
+pub(super) fn early_ok_error() -> Error {
+    Error::ProtocolMissing(
+        "command completed with a tagged OK before the server sent \
+         the `+` continuation its synchronizing literal is owed \
+         (RFC 3501 Section 4.3); the literal was not sent"
+            .into(),
+    )
+}
+
 /// Wait for a server continuation response (`+ ...`) during
 /// synchronizing-literal sends (RFC 3501 Section4.3, Section7.5).
 ///
@@ -325,8 +341,13 @@ pub(super) async fn send_chunked_segments(
 /// * the tagged `NO`/`BAD` of the command being written is its own ordinary
 ///   per-command result, and the wait answers `Rejected` so the sender
 ///   abandons the rest of that command rather than failing the batch;
-/// * a tagged `OK` for the command being written stays a protocol error: it
-///   claims successful execution of a command the server has not received.
+/// * a tagged `OK` for the command being written is that command's result too,
+///   as the same non-fatal `ProtocolMissing` the single-command mode raises
+///   (see [`early_ok_error`]), and the wait answers `Rejected`. Nothing of any
+///   later command has been written - the send phase is sequential whenever a
+///   literal is synchronizing - so the server cannot read a later command's
+///   bytes as the missing literal, and the next command goes out as a fresh
+///   command line exactly as after a `NO`.
 ///
 /// Both halves matter. Answering a foreign tagged response here destroyed an
 /// earlier command's real result and reported its `NO` as a failure of the
@@ -370,12 +391,7 @@ pub(super) async fn wait_for_continuation(
                     // NO/BAD are tagged responses - inherently Acknowledged.
                     StatusKind::No => Err(Error::no_with_code(t.text, t.code)),
                     StatusKind::Bad => Err(Error::bad_with_code(t.text, t.code)),
-                    StatusKind::Ok => Err(Error::ProtocolMissing(
-                        "command completed with a tagged OK before the server sent \
-                         the `+` continuation its synchronizing literal is owed \
-                         (RFC 3501 Section 4.3); the literal was not sent"
-                            .into(),
-                    )),
+                    StatusKind::Ok => Err(early_ok_error()),
                 };
             }
             crate::types::Response::Tagged(t) => {
@@ -403,3 +419,7 @@ pub(super) async fn wait_for_continuation(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wire_send_tests.rs"]
+mod tests;
