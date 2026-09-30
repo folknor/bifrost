@@ -123,37 +123,37 @@ against the code before working any of them.
 
 - **google: an event with an unspecified end projects an empty `end`.** Landed
   2026-09-30: `CalendarEvent.end` cannot be absent, so `endTimeUnspecified`
-  projects the empty `EventTime` tombstones already use, rather than Google's
-  placeholder. Consumers that assumed only tombstones carry an empty end now
-  see it on live events; the honest shape is an optional `end` in
-  `bifrost-types`, a published-surface ruling. Related: an empty `end` echoed
-  back in `EventPatch` or `EventCreate` is sent to Google as `dateTime: ""`,
-  with no guard.
-- **sync: `reattach_account` dropped mid-way leaks replacement
-  subscriptions.** A future dropped after replacement subscriptions are created
-  and before the swap or `unwind_replacement_subscriptions` leaves them live
-  and unregistered; there is no drop guard. Pre-existing. After an aborted
-  reopen that tore some old handles down, those subscriptions deliver nothing
-  until the retry recreates them on the replacement.
-- **graph: the renewal worker's `replace_gone_subscription` is the same
-  shape** as the cancellation hole fixed in `push_subscribe`: it creates a
-  subscription inside a task that `close()` aborts and the retire path
-  cancels, so an abort mid-create can strand a server subscription. The EWS
-  push arm's drop behaviour was not audited beyond its creating nothing
-  server-side before registration.
-- **caldav: an override-only resource shows only its first override** to
-  `event_get` and `event_update`, while range and search listings see every
-  override. Also unexamined: caldata's `LineReader` keeps a bare CR inside a
-  value, and this crate's text and parameter handling may not expect one.
-- **imap: an early tagged reply after a LATER literal of the same command.**
-  The early-OK and `NO`/`BAD` paths are safe for a command's first literal,
-  since the only bytes on the wire are its first line. For MULTIAPPEND or any
-  command with several literals, the text between literals is written before
-  the reply is read. A conforming server can only answer at a literal marker,
-  which that text ends in, so the wire stays in sync; a server answering
-  straight after a literal body would desync it while the error reads
-  non-fatal. Low risk; making any reply after a granted literal fatal would
-  close it.
+  projects the empty `EventTime` tombstones already use, and an empty `end` on
+  a create or patch writes `endTimeUnspecified` back. Consumers that assumed
+  only tombstones carry an empty end now see it on live events; the honest
+  shape is an optional `end` in `bifrost-types`, a published-surface ruling.
+- **calendar crates: empty or malformed event times on writes.** Google now
+  refuses an empty `start` and reads an empty `end` as "no end"; graph, caldav
+  and jmap were not checked for the same hole, where a projected empty
+  `EventTime` echoed into a write reaches the wire. In google a malformed
+  non-empty time (a non-date all-day value, a timed value with no offset) is
+  still sent as given.
+- **caldav: raw values in iCalendar writers.** `RRULE`, `RECURRENCE-ID` and
+  possibly attendee address values are written as `NAME:value` with no line
+  break stripping, so a consumer value containing CR or LF injects iCalendar
+  lines. Unaudited. Separately, an href containing a literal `#` would make
+  `split_event_id` split in the wrong place; percent-encoding makes it
+  unlikely.
+- **sync: reopen drop points the replacement guard does not cover.** A
+  reattach dropped before any replacement subscription exists, or during the
+  final `next.close()` or `previous.close()`, leaks that account's connection;
+  a dropped reattach never calls `rollback_reattach_inserts`, leaving
+  provisional cursor rows provisional until a later abort or commit. An orphan
+  is retried against whatever account is current, which fails forever on a
+  provider whose handles are account-local.
+- **graph: `subscribe_ews` on a closed account** still registers and spawns a
+  worker that exits at once. No server state is involved; the webhook arm
+  refuses instead, so this is parity only.
+- **imap: multi-literal commands outside APPEND lack a transcript test.** The
+  later-literal early-reply limit is documented at `wait_for_continuation` and
+  pinned for MULTIAPPEND; nothing pins it through `send_with_literal_sync` or
+  `send_encoded_segments`, such as a pipelined batch with two synchronizing
+  literals.
 
 ## Blocked on an unvalidated consumer contract
 

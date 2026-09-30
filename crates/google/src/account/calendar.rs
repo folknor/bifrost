@@ -149,6 +149,7 @@ pub(crate) fn create(
 ) -> AccountFuture<Result<EventId, AccountError>> {
     Box::pin(async move {
         reject_create_organizer(&event)?;
+        reject_unusable_write_times(AccountOperation::EventCreate, Some(&event.start))?;
         let calendar_id = event.calendar_id.0.clone();
         let encoded = bifrost_net::url::encode_path_component(&calendar_id);
         let url = format!("{}/calendars/{encoded}/events", client.calendar_base());
@@ -196,6 +197,7 @@ pub(crate) fn update(
         // destination calendar.
         if has_field_patch {
             reject_unexpressible_all_day_patch(&patch)?;
+            reject_unusable_write_times(AccountOperation::EventUpdate, patch.start.as_ref())?;
         }
         let mut moved = false;
         if let Some(target_calendar) = patch.calendar_id.as_ref()
@@ -689,7 +691,18 @@ fn google_event_from_create(event: &EventCreate) -> GoogleEventPatch {
         description: event.description.clone().map(Some),
         location: event.location.clone().map(Some),
         start: Some(google_time(&event.start, event.is_all_day)),
-        end: Some(google_time(&event.end, event.is_all_day)),
+        // Google's insert requires an `end`, so an unspecified end is
+        // written the way Google itself reports one: the start as the
+        // placeholder plus `endTimeUnspecified: true`.
+        end: Some(google_time(
+            if is_blank_time(&event.end) {
+                &event.start
+            } else {
+                &event.end
+            },
+            event.is_all_day,
+        )),
+        end_time_unspecified: is_blank_time(&event.end).then_some(true),
         status: Some(google_event_status(event.status).to_string()),
         attendees: non_empty(event.attendees.iter().map(google_attendee)),
         recurrence: recurrence_lines(&event.recurrence),
@@ -713,10 +726,31 @@ fn google_event_from_patch(patch: &EventPatch) -> GoogleEventPatch {
             .start
             .as_ref()
             .map(|time| google_time(time, patch.is_all_day.unwrap_or(is_ymd_date(&time.value)))),
-        end: patch
+        // An empty `end` is the projection's "no end" for an
+        // `endTimeUnspecified` event (see `reject_unusable_write_times`),
+        // so echoing it back sets that flag rather than sending
+        // `dateTime: ""`. A patch that also moves `start` (an all-day flip
+        // always does) carries the start as the placeholder `end`, in the
+        // start's shape, because Google validates end against start; a
+        // patch without a start sends the flag alone and leaves the stored
+        // end untouched.
+        end: patch.end.as_ref().and_then(|time| {
+            if is_blank_time(time) {
+                patch.start.as_ref().map(|start| {
+                    google_time(start, patch.is_all_day.unwrap_or(is_ymd_date(&start.value)))
+                })
+            } else {
+                Some(google_time(
+                    time,
+                    patch.is_all_day.unwrap_or(is_ymd_date(&time.value)),
+                ))
+            }
+        }),
+        end_time_unspecified: patch
             .end
             .as_ref()
-            .map(|time| google_time(time, patch.is_all_day.unwrap_or(is_ymd_date(&time.value)))),
+            .filter(|time| is_blank_time(time))
+            .map(|_| true),
         status: patch
             .status
             .map(|status| google_event_status(status).to_string()),
@@ -798,6 +832,40 @@ fn google_time(time: &EventTime, all_day: bool) -> GoogleEventTime {
             time_zone: time.timezone.clone(),
         }
     }
+}
+
+fn is_blank_time(time: &EventTime) -> bool {
+    time.value.trim().is_empty()
+}
+
+// Write-side guard for event times, run before any request (and, on update,
+// before the calendar move) so a refused patch strands nothing.
+//
+// `start` must carry a value. The empty `EventTime` is what the read side
+// projects for a cancelled tombstone, and Google has no meaning for a start
+// of `dateTime: ""`, so an empty start is malformed caller input:
+// `Request(Malformed)` naming `start`.
+//
+// An empty `end` is NOT refused. The projection emits it for an event whose
+// resource says `endTimeUnspecified: true` ("no end", documented in
+// `reference/google.md`), so a consumer that reads an event and writes it
+// back carries exactly that value. Refusing it would make read-modify-write
+// of such an event fail; forwarding it would send `dateTime: ""`; substituting
+// the start would fabricate a zero-length end. The only reading that
+// round-trips is the one the read side started from, so an empty `end` is
+// written as `endTimeUnspecified: true` (see `google_event_from_create` and
+// `google_event_from_patch`).
+fn reject_unusable_write_times(
+    operation: AccountOperation,
+    start: Option<&EventTime>,
+) -> Result<(), AccountError> {
+    if start.is_some_and(is_blank_time) {
+        return Err(caller_input_error(
+            operation,
+            "Google Calendar event `start` must not be empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn google_range_bound(time: &EventTime, field: &'static str) -> Result<String, AccountError> {
@@ -1251,6 +1319,8 @@ struct GoogleEventPatch {
     start: Option<GoogleEventTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     end: Option<GoogleEventTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_time_unspecified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2478,6 +2548,184 @@ mod tests {
             ..EventPatch::default()
         })
         .expect("all-day patch carrying both bounds is expressible");
+    }
+
+    fn write_time(value: &str) -> EventTime {
+        EventTime {
+            value: value.to_string(),
+            timezone: None,
+        }
+    }
+
+    fn create_with(start: &str, end: &str) -> EventCreate {
+        EventCreate {
+            calendar_id: CalendarId("primary".to_string()),
+            title: None,
+            description: None,
+            location: None,
+            start: write_time(start),
+            end: write_time(end),
+            is_all_day: false,
+            status: EventStatus::Confirmed,
+            availability: EventAvailability::Busy,
+            visibility: EventVisibility::Default,
+            organizer: None,
+            attendees: Vec::new(),
+            recurrence: EventRecurrence::default(),
+        }
+    }
+
+    /// Fails if the `end_time_unspecified` line in `google_event_from_patch`
+    /// or the blank-end branch of its `end` mapping is reverted: the patch
+    /// would send `dateTime: ""` and no flag.
+    #[test]
+    fn patch_echoing_an_empty_end_sets_end_time_unspecified() {
+        let value = serde_json::to_value(google_event_from_patch(&EventPatch {
+            end: Some(write_time("")),
+            ..EventPatch::default()
+        }))
+        .expect("patch json");
+
+        assert_eq!(value["endTimeUnspecified"], json!(true));
+        assert!(value.get("end").is_none(), "no empty dateTime is sent");
+    }
+
+    /// Same lines as above; also pins that a patch moving `start` carries the
+    /// start as the placeholder end instead of an empty one.
+    #[test]
+    fn patch_with_start_and_empty_end_uses_start_as_placeholder_end() {
+        let value = serde_json::to_value(google_event_from_patch(&EventPatch {
+            start: Some(write_time("2026-06-02T12:00:00Z")),
+            end: Some(write_time("")),
+            ..EventPatch::default()
+        }))
+        .expect("patch json");
+
+        assert_eq!(value["endTimeUnspecified"], json!(true));
+        assert_eq!(value["end"]["dateTime"], json!("2026-06-02T12:00:00Z"));
+    }
+
+    /// Fails if the flag mapping is reverted to always-`None`: a real end
+    /// must not mark the event unspecified.
+    #[test]
+    fn patch_with_a_real_end_does_not_set_end_time_unspecified() {
+        let value = serde_json::to_value(google_event_from_patch(&EventPatch {
+            end: Some(write_time("2026-06-02T13:00:00Z")),
+            ..EventPatch::default()
+        }))
+        .expect("patch json");
+
+        assert!(value.get("endTimeUnspecified").is_none());
+        assert_eq!(value["end"]["dateTime"], json!("2026-06-02T13:00:00Z"));
+    }
+
+    /// Fails if the blank-end branch in `google_event_from_create` is
+    /// reverted: `end.dateTime` would be `""` and the flag absent.
+    #[test]
+    fn create_with_an_empty_end_writes_placeholder_end_and_flag() {
+        let value = serde_json::to_value(google_event_from_create(&create_with(
+            "2026-06-02T12:00:00Z",
+            "",
+        )))
+        .expect("create json");
+
+        assert_eq!(value["endTimeUnspecified"], json!(true));
+        assert_eq!(value["end"]["dateTime"], json!("2026-06-02T12:00:00Z"));
+    }
+
+    /// The all-day shape survives: a date start with an empty end writes a
+    /// `date` placeholder, never `dateTime`.
+    #[test]
+    fn all_day_create_with_an_empty_end_keeps_the_date_shape() {
+        let mut event = create_with("2026-06-02", "");
+        event.is_all_day = true;
+        let value = serde_json::to_value(google_event_from_create(&event)).expect("create json");
+
+        assert_eq!(value["end"]["date"], json!("2026-06-02"));
+        assert!(value["end"].get("dateTime").is_none());
+    }
+
+    /// Fails if `reject_unusable_write_times` is removed from `create`: the
+    /// request would be sent with `dateTime: ""` (the scripted client has no
+    /// response, so the call would fail differently and the request list
+    /// would be non-empty).
+    #[tokio::test]
+    async fn create_with_an_empty_start_is_refused_before_any_request() {
+        let (client, script) = scripted_client(Vec::new());
+
+        let error = create(client, create_with("", "2026-06-02T13:00:00Z"))
+            .await
+            .expect_err("an empty start is malformed");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(script.requests().is_empty());
+    }
+
+    /// Fails if `reject_unusable_write_times` is removed from `update`, or
+    /// moved after the calendar move: a whitespace-only start must not issue
+    /// the move nor the patch.
+    #[tokio::test]
+    async fn update_with_a_blank_start_is_refused_before_the_move() {
+        let (client, script) = scripted_client(Vec::new());
+        let patch = EventPatch {
+            calendar_id: Some(CalendarId("destination".to_string())),
+            start: Some(write_time("  ")),
+            ..EventPatch::default()
+        };
+
+        let error = update(client, EventId("source::event-1".to_string()), patch)
+            .await
+            .expect_err("a blank start is malformed");
+
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(script.requests().is_empty());
+    }
+
+    /// End to end: the read-modify-write of an unspecified-end event. Read
+    /// projects the empty end, the echoed patch goes out with the flag and
+    /// no empty `dateTime`. Fails if the `end` mapping in
+    /// `google_event_from_patch` is reverted.
+    #[tokio::test]
+    async fn round_tripping_an_unspecified_end_event_neither_fails_nor_invents_an_end() {
+        let read = event_from_google(
+            "primary".to_string(),
+            GoogleEvent {
+                id: Some("e1".to_string()),
+                start: Some(timed("2026-06-02T12:00:00Z")),
+                end: Some(timed("2026-06-02T12:00:00Z")),
+                end_time_unspecified: Some(true),
+                ..GoogleEvent::default()
+            },
+            AccountOperation::EventGet,
+        )
+        .expect("unspecified end projects");
+        assert!(read.end.value.is_empty());
+
+        let (client, script) = scripted_client(vec![canned_json(StatusCode::OK, json!({}))]);
+        update(
+            client,
+            EventId("primary::e1".to_string()),
+            EventPatch {
+                title: Some(Some("Renamed".to_string())),
+                end: Some(read.end),
+                ..EventPatch::default()
+            },
+        )
+        .await
+        .expect("the echoed empty end is accepted");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(requests[0].body.as_ref().expect("body")).expect("json");
+        assert_eq!(body["endTimeUnspecified"], json!(true));
+        assert!(body.get("end").is_none());
     }
 
     #[test]
