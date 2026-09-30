@@ -111,8 +111,14 @@ pub(crate) async fn handle_account_error(
             // does need is taken inside `open_replacement`, spanning only
             // the open and the swap. Reintroducing an acquisition here
             // deadlocks against that one rather than silently regressing.
+            //
+            // `DowngradeStrategy` restarts the account too, so the same
+            // holds: taking the lock here made its `restart_account` wait
+            // forever on `open_replacement`'s acquisition of this very
+            // (non-reentrant) mutex, hanging recovery on the first strategy
+            // downgrade. Its trailing scope restart takes the lock itself.
             let _reopen_guard = match directive {
-                EngineDirective::RestartAccount => None,
+                EngineDirective::RestartAccount | EngineDirective::DowngradeStrategy(_) => None,
                 _ => Some(ctx.reopen_lock.lock().await),
             };
             handle_engine_directive(ctx, scope, directive, error).await;
@@ -233,7 +239,12 @@ async fn handle_engine_directive(
             // If the originating error was scoped to a cursor, also
             // re-establish that scope so the downgrade takes effect
             // immediately rather than at the next poll.
+            // The dispatch took no lock for this directive (see there); the
+            // scope restart needs the same serialization every other scope
+            // repair runs under, so it takes it now that the account restart
+            // has released it.
             if let Some(ErrorScope::Cursor(scoped)) = error.scope() {
+                let _reopen_guard = ctx.reopen_lock.lock().await;
                 restart_scope(ctx, scoped.clone()).await;
             }
         }
