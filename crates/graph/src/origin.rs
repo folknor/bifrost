@@ -16,6 +16,11 @@
 //! URLs on the service root that issued them, and a national cloud is a
 //! separately configured base, so a link on any other origin is not followed.
 //!
+//! The one URL that may leave for another origin is a OneDrive upload
+//! session URL, which never carries the bearer; it is admitted here too, under
+//! its own rule ([`Base::admit_upload`]), and reaches the wire only as an
+//! [`UploadUrl`].
+//!
 //! Server links arrive as [`ProviderLink`], which deliberately has no
 //! accessor that yields a requestable string: the compiler, not review,
 //! stops one from being followed, minted into a caller cursor, or persisted
@@ -91,6 +96,35 @@ impl fmt::Debug for AdmittedUrl {
         write!(
             f,
             "AdmittedUrl({}{}{query})",
+            self.0.origin().ascii_serialization(),
+            self.0.path()
+        )
+    }
+}
+
+/// A OneDrive upload session URL (`createUploadSession`'s `uploadUrl`),
+/// admitted for the anonymous chunk PUTs and the session DELETE. Only
+/// [`Base::admit_upload`] builds one, and the anonymous send path accepts
+/// nothing else, so no string reaches it without admission. It never carries
+/// the bearer: the URL is its own credential.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct UploadUrl(Url);
+
+impl UploadUrl {
+    /// The serialized URL, which is exactly what goes on the wire.
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for UploadUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The session's pre-authentication rides in the query; a Debug names
+        // the origin and path only.
+        let query = if self.0.query().is_some() { "?.." } else { "" };
+        write!(
+            f,
+            "UploadUrl({}{}{query})",
             self.0.origin().ascii_serialization(),
             self.0.path()
         )
@@ -193,6 +227,47 @@ impl Base {
             return Err(Refusal::Target("link is not an absolute URL".to_string()));
         }
         self.admit(&link.0)
+    }
+
+    /// Admit an upload session URL a `createUploadSession` answer named, at
+    /// receipt and before any byte is sent to it. `self` is the Graph
+    /// api-base.
+    ///
+    /// The URL carries no bearer, but it receives the attachment bytes and is
+    /// itself a credential, so where it points still matters. It must have
+    /// the shape every URL here must have ([`validate`]: http or https, a
+    /// host, no userinfo, as parsed or as written) and be absolute. Then
+    /// `https` is admitted on any host, and plain `http` only on this base's
+    /// own origin, which the consumer already trusts with the account bearer
+    /// itself, so admitting it widens nothing (a local harness serves Graph
+    /// that way). Plain `http` anywhere else is refused: the bytes and the
+    /// credential would cross the network in the clear.
+    ///
+    /// Same-origin admission, the rule for every bearer-carrying URL, does
+    /// not fit: real session URLs live on SharePoint and OneDrive hosts,
+    /// never on the Graph host. Nor does an allowlist of upload hosts:
+    /// Microsoft documents `uploadUrl` as an opaque URL, not a host set, and
+    /// the hosts in use vary by tenant, product and national cloud
+    /// (`*-my.sharepoint.com`, vanity SharePoint domains, consumer OneDrive,
+    /// the sovereign clouds), so a list would refuse working tenants on a
+    /// guess. The URL arrives inside a Graph answer the client fetched over
+    /// the same TLS channel as its bearer, so a party able to choose the host
+    /// could already read that answer; what admission can and does prevent is
+    /// the credential leaving over plain http or behind a misleading
+    /// authority.
+    ///
+    /// Every refusal is [`Refusal::Target`] and never quotes the URL; the
+    /// caller classifies it (the provider named a destination this client
+    /// will not send to).
+    pub(crate) fn admit_upload(&self, raw: &str) -> Result<UploadUrl, Refusal> {
+        let url = validate(raw).map_err(Refusal::Target)?;
+        match url.scheme() {
+            "https" => Ok(UploadUrl(url)),
+            _ if self.url().is_some_and(|base| base.origin() == url.origin()) => Ok(UploadUrl(url)),
+            _ => Err(Refusal::Target(
+                "plain http off the configured Graph origin".to_string(),
+            )),
+        }
     }
 }
 
@@ -359,6 +434,61 @@ mod tests {
                 "{link:?} must be refused"
             );
         }
+    }
+
+    /// Upload session URLs: https on any host (real session hosts are
+    /// SharePoint and OneDrive, never the Graph host), plain http only on
+    /// the base's own origin, and the shape rule every other URL here obeys.
+    #[test]
+    fn upload_admission_takes_https_anywhere_and_http_only_on_the_base_origin() {
+        for admitted in [
+            "https://contoso-my.sharepoint.com/personal/u/_api/v2.0/uploadSession?tempauth=x",
+            "HTTPS://api.onedrive.com/rup/abc",
+        ] {
+            assert!(graph().admit_upload(admitted).is_ok(), "{admitted}");
+        }
+        let local = Base::parse("http://127.0.0.1:8181/v1.0");
+        assert_eq!(
+            local
+                .admit_upload("http://127.0.0.1:8181/upload/abc")
+                .expect("same origin")
+                .as_str(),
+            "http://127.0.0.1:8181/upload/abc"
+        );
+        for refused in [
+            "http://127.0.0.1:8182/upload/abc",
+            "http://localhost:8181/upload/abc",
+            "http://user@127.0.0.1:8181/upload/abc",
+            "https://user:secret@upload.example/session/abc",
+            "https://upload.example@attacker.example/session/abc",
+            // An empty userinfo is dropped by the parser, so only the
+            // authority as written shows it; the shared shape rule reads
+            // both.
+            "https://@upload.example/session/abc",
+            "ftp://upload.example/session/abc",
+            "/session/abc",
+            "not a url",
+        ] {
+            assert!(
+                matches!(local.admit_upload(refused), Err(Refusal::Target(_))),
+                "{refused} must be refused"
+            );
+        }
+        // Plain http is refused everywhere against an unusable base, which
+        // has no origin to trust.
+        assert!(
+            Base::parse("not a url")
+                .admit_upload("http://127.0.0.1:8181/upload/abc")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_upload_url_debug_does_not_spill_the_session_credential() {
+        let url = graph()
+            .admit_upload("https://upload.example/session/abc?tempauth=secret")
+            .expect("https");
+        assert!(!format!("{url:?}").contains("secret"), "{url:?}");
     }
 
     #[test]

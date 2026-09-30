@@ -669,4 +669,88 @@ mod tests {
 </s:Envelope>"#;
         assert!(check_response_error(xml).is_ok());
     }
+
+    fn assert_malformed(result: Result<(), EwsError>, label: &str) {
+        match result {
+            Err(EwsError::MalformedXml(_)) => {}
+            other => panic!("{label}: expected MalformedXml, got {other:?}"),
+        }
+    }
+
+    /// Both whole-response scans folded references leniently, so an unknown
+    /// entity vanished and the text on either side spliced together: a
+    /// `ResponseCode` of `Error&bogus;AccessDenied` read as
+    /// `ErrorAccessDenied` and quarantined a scope on a code the server never
+    /// sent, and a success body carrying a bad reference passed the scan.
+    /// Each is malformed XML now, like a reader error.
+    #[test]
+    fn an_unresolvable_reference_fails_both_response_scans() {
+        let error = |code: &str| {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m"><s:Body><m:FindItemResponse>
+<m:ResponseMessages><m:FindItemResponseMessage ResponseClass="Error">
+<m:ResponseCode>{code}</m:ResponseCode>
+</m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse></s:Body></s:Envelope>"#
+            )
+        };
+        let fault = |text: &str| {
+            format!(
+                r#"<soap:Envelope xmlns:soap="s"><soap:Body><soap:Fault>
+<faultcode>soap:Server</faultcode><faultstring>{text}</faultstring>
+</soap:Fault></soap:Body></soap:Envelope>"#
+            )
+        };
+        let success = r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:FindItemResponse><m:ResponseMessages><m:FindItemResponseMessage ResponseClass="Success">
+<m:ResponseCode>NoError</m:ResponseCode><t:Subject>R&bogus;D</t:Subject>
+</m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse></s:Body></s:Envelope>"#;
+
+        // The well-formed spellings still classify.
+        assert!(matches!(
+            check_response_error(&error("Error&#65;ccessDenied")),
+            Err(EwsError::SoapFault {
+                code: SoapFaultCode::ErrorAccessDenied,
+                ..
+            })
+        ));
+        assert!(matches!(
+            check_soap_fault(&fault("busy &amp; failing")),
+            Err(EwsError::SoapFault {
+                code: SoapFaultCode::Server,
+                ..
+            })
+        ));
+
+        for bad in ["Error&bogus;AccessDenied", "Error&#xD800;AccessDenied"] {
+            assert_malformed(check_response_error(&error(bad)), bad);
+        }
+        assert_malformed(check_response_error(success), "success body");
+        assert_malformed(check_soap_fault(&fault("busy &bogus; failing")), "fault");
+        assert_malformed(check_soap_fault(success), "success body");
+    }
+
+    /// `ResponseClass` was compared raw, so an error message whose class the
+    /// server spelled with a character reference (`&#69;rror`) did not read
+    /// as an error at all and the failed body passed the scan; an
+    /// unresolvable reference in it passed too. The attribute now unescapes
+    /// strictly.
+    #[test]
+    fn the_response_class_attribute_is_unescaped_strictly() {
+        let body = |class: &str| {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m"><s:Body><m:FindItemResponse>
+<m:ResponseMessages><m:FindItemResponseMessage ResponseClass="{class}">
+<m:ResponseCode>ErrorAccessDenied</m:ResponseCode>
+</m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse></s:Body></s:Envelope>"#
+            )
+        };
+        assert!(matches!(
+            check_response_error(&body("&#69;rror")),
+            Err(EwsError::SoapFault {
+                code: SoapFaultCode::ErrorAccessDenied,
+                ..
+            })
+        ));
+        assert_malformed(check_response_error(&body("Err&bogus;")), "ResponseClass");
+    }
 }

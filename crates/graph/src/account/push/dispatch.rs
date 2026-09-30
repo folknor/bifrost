@@ -51,15 +51,42 @@ pub(crate) async fn push_subscribe(
     if eligible.is_empty() {
         return Err(unsupported_push_error());
     }
-    let handle = match account.push_mode {
-        PushMode::GraphSubscriptions => subscribe_graph(account, eligible, &mut outcomes).await?,
-        PushMode::EwsStreaming => subscribe_ews(account, eligible, &mut outcomes).await?,
+    subscribe_eligible(account, eligible, outcomes, &expected).await
+}
+
+/// What an arm answers once its ledger is closed: the handle it registered
+/// (none when every eligible scope failed) and the finalized outcomes.
+pub(super) type ArmOutcome = (
+    Option<SubscriptionHandle>,
+    bifrost_types::BatchOutcome<CursorScope>,
+);
+
+/// Dispatch the eligible scopes to the configured arm and shape its answer.
+///
+/// Each arm closes the ledger ITSELF, immediately before it registers
+/// anything: a `finalize` failure must be raised while nothing is live yet.
+/// Finalizing here, after the arm returned, meant the handle was already
+/// registered and its worker running when the `Err` - carrying no handle -
+/// went back to a caller who could therefore never unsubscribe it.
+///
+/// Split out of `push_subscribe` so a test can hand it a ledger the arm
+/// cannot close, which no real request can produce.
+pub(super) async fn subscribe_eligible(
+    account: GraphAccount,
+    eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
+    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
+    expected: &[bifrost_types::BatchItemId],
+) -> Result<bifrost_types::PushSubscription, AccountError> {
+    let (handle, outcomes) = match account.push_mode {
+        PushMode::GraphSubscriptions => {
+            subscribe_graph(account, eligible, outcomes, expected).await?
+        }
+        PushMode::EwsStreaming => subscribe_ews(account, eligible, outcomes, expected).await?,
     };
-    let outcomes = finalize_push_outcomes(outcomes, &expected)?;
     // The arm produced no handle, which it does only when every eligible
     // scope ended up on the failed lane. That is the same "no scope was
-    // subscribable at all" whole-request fault the pre-dispatch filter above
-    // answers with `Err`, and it must answer the same way: a `PushSubscription`
+    // subscribable at all" whole-request fault `push_subscribe`'s
+    // pre-dispatch filter answers with `Err`, and it must answer the same way: a `PushSubscription`
     // with no handle is not a subscription, and returning one on the `Ok` arm
     // hands a caller matching on success an all-failed ledger and nothing to
     // unsubscribe.
@@ -86,7 +113,10 @@ pub(super) fn push_item_ids(len: usize) -> Vec<bifrost_types::BatchItemId> {
 /// key, never iterated into the ledger. Nothing server-supplied can therefore
 /// make `finalize` fail, and a failure is `Internal(InvariantViolated)`, not
 /// the provider contract violation it used to be filed as.
-fn finalize_push_outcomes(
+///
+/// Called by each arm BEFORE it registers a handle or starts a worker, never
+/// after: see `subscribe_eligible`.
+pub(super) fn finalize_push_outcomes(
     outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
     expected: &[bifrost_types::BatchItemId],
 ) -> Result<bifrost_types::BatchOutcome<CursorScope>, AccountError> {

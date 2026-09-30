@@ -2,15 +2,16 @@
 //! and which are per request, in both push modes.
 
 use bifrost_types::{
-    AccountErrorKind, AccountOperation, CursorScope, ErrorScope, FolderId, ObjectType,
+    AccountErrorKind, AccountOperation, CursorScope, ErrorScope, FolderId, InternalErrorKind,
+    ObjectType,
 };
 
 use crate::account::push::common::{PushEndpoint, new_handle};
-use crate::account::push::dispatch::push_subscribe;
+use crate::account::push::dispatch::{push_item_ids, push_subscribe, subscribe_eligible};
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
 
-use super::fixtures::email_scope;
+use super::fixtures::{email_scope, ledger};
 
 /// A scope that cannot resolve to a Graph resource must never be
 /// silently dropped from an otherwise-successful subscription: the
@@ -249,6 +250,88 @@ async fn a_webhook_request_whose_every_scope_dies_in_the_arm_is_a_whole_request_
         "the sibling failure's causes must survive: {:?}",
         error.chain()
     );
+}
+
+/// A ledger the arm cannot close must fail the request BEFORE anything is
+/// live. `finalize` used to run in the dispatcher after the arm had
+/// registered its handle and started its worker, so the `Err` - which
+/// carries no handle - left a registration the worker kept renewing (or
+/// streaming) and that no caller could ever unsubscribe.
+///
+/// No real request can produce an unclosable ledger, so the test hands the
+/// arm an `expected` list with one lane id it never files.
+#[tokio::test]
+async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
+    // Webhook: the create has already happened when the ledger is closed,
+    // so the failure path must roll it back instead of registering it.
+    let client = GraphClient::new("token");
+    client.script_rest([
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::CREATED,
+            serde_json::json!({"id":"first","expirationDateTime":"2099-01-01T00:00:00Z"}),
+        ),
+        ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+    ]);
+    let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    account.push_endpoint = Some(PushEndpoint {
+        webhook_url: "https://example.test/webhook".to_string(),
+        client_state: "secret".to_string(),
+    });
+    let expected = push_item_ids(2);
+    let error = subscribe_eligible(
+        account.clone(),
+        vec![(expected[0].clone(), email_scope("inbox"))],
+        ledger(),
+        &expected,
+    )
+    .await
+    .expect_err("an unfiled lane id cannot close");
+    assert_eq!(
+        error.kind(),
+        &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
+    );
+    assert!(
+        account.graph_subscriptions.read().await.is_empty(),
+        "no group may be registered behind an Err that carries no handle"
+    );
+    assert!(
+        account.graph_worker.lock().await.is_none(),
+        "no renewal worker may be started for it"
+    );
+    let requests = client.take_rest_requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["POST", "DELETE"],
+        "the created subscription is rolled back on the server"
+    );
+    assert!(requests[1].url.ends_with("/subscriptions/first"));
+
+    // EWS: nothing server-side exists before registration, so the failure
+    // must simply never install the scopes, bump the topology, or spawn.
+    let client = GraphClient::new("token");
+    client.script_rest([ScriptedRestResponse::json(
+        reqwest::StatusCode::OK,
+        serde_json::json!({"value":[{"sourceId":"rest-inbox","targetId":"ews-inbox"}]}),
+    )]);
+    let account = GraphAccount::new_for_tests(client, PushMode::EwsStreaming);
+    let error = subscribe_eligible(
+        account.clone(),
+        vec![(expected[0].clone(), email_scope("rest-inbox"))],
+        ledger(),
+        &expected,
+    )
+    .await
+    .expect_err("an unfiled lane id cannot close");
+    assert_eq!(
+        error.kind(),
+        &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
+    );
+    assert!(account.ews_subscriptions.read().await.is_empty());
+    assert!(account.ews_worker.lock().await.is_none());
+    assert_eq!(*account.ews_topology.borrow(), 0);
 }
 
 /// The same rule on the EWS arm, where every scope is refused by

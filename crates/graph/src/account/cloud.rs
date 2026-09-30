@@ -7,7 +7,9 @@
 //! `db: &ReadDbState` ratatoskr handle into the session/link `client.post`
 //! calls; the rewrite drops both. The session/link POSTs route through
 //! `GraphClient::post` (AccountNet supplies the Bearer); the pre-authenticated
-//! chunk PUT goes through the raw builder with `.without_bearer_auth()`.
+//! chunk PUTs and the session cancel go through `GraphClient::execute_aux`
+//! with `AuxTarget::Anonymous`, which carries no bearer and follows no
+//! redirect.
 //!
 //! De-brand: ratatoskr uploaded into a `"Ratatoskr Attachments"` folder. This
 //! uses a neutral, consumer-agnostic `"Attachments"` folder. A future
@@ -31,8 +33,9 @@ use serde::{Deserialize, Serialize};
 
 use super::graph_error::{GraphErrorContext, into_account_error, invalid_account_error};
 use crate::account::GraphAccount;
-use crate::client::GraphClient;
+use crate::client::{AuxTarget, GraphClient};
 use crate::error::{GraphError, GraphResponseError};
+use crate::origin::{Refusal, UploadUrl};
 
 /// Minimum alignment for upload chunks (320 KiB per Graph API spec).
 const CHUNK_ALIGNMENT: usize = 320 * 1024;
@@ -166,73 +169,74 @@ fn admitted_resume_offset(
     Ok(next)
 }
 
-/// An upload session URL admitted for the chunk PUTs. Only
-/// [`admit_upload_url`] builds one, so the PUT loop cannot be handed a URL
-/// that skipped admission.
-struct UploadSessionUrl(reqwest::Url);
-
-impl std::fmt::Debug for UploadSessionUrl {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The session credential rides in the query; a Debug names the
-        // origin and path only.
-        let query = if self.0.query().is_some() { "?.." } else { "" };
-        write!(
-            f,
-            "UploadSessionUrl({}{}{query})",
-            self.0.origin().ascii_serialization(),
-            self.0.path()
-        )
-    }
-}
-
 /// Admit the `uploadUrl` a `createUploadSession` answer named, at receipt and
-/// before any byte is sent to it.
-///
-/// The URL carries no Graph bearer, but it receives the attachment bytes and
-/// is itself a credential (the session's pre-authentication rides in it), so
-/// where it points still matters. Admitted: an absolute `https` URL with a
-/// host and no userinfo, on any host; or an `http` URL on the configured
-/// Graph origin, which the consumer already trusts with the account bearer
-/// itself, so admitting it widens nothing (a local harness serves Graph that
-/// way). Refused: plain `http` anywhere else (the bytes and the credential
-/// would cross the network in the clear), userinfo (an authority that reads
-/// as one host and sends to another), and anything that is not an absolute
-/// http(s) URL.
-///
-/// Same-origin admission, the rule for every bearer-carrying URL, does not
-/// fit: real session URLs live on SharePoint and OneDrive hosts, never on
-/// the Graph host. Nor does an allowlist of upload hosts: Microsoft documents
-/// `uploadUrl` as an opaque URL, not a host set, and the hosts in use vary by
-/// tenant, product and national cloud (`*-my.sharepoint.com`, vanity
-/// SharePoint domains, consumer OneDrive, the sovereign clouds), so a list
-/// would refuse working tenants on a guess. The URL arrives inside a Graph
-/// answer the client fetched over the same TLS channel as its bearer, so a
-/// party able to choose the host could already read that answer; what
-/// admission can and does prevent is the credential leaving over plain http
-/// or behind a misleading authority.
+/// before any byte is sent to it. The rule itself lives with every other
+/// admission rule in `crate::origin` (`Base::admit_upload`); this is where a
+/// refusal is classified.
 ///
 /// A refusal is the provider's contract violation: Graph answered, and the
-/// answer names a destination this client will not send to.
-fn admit_upload_url(client: &GraphClient, raw: &str) -> Result<UploadSessionUrl, GraphError> {
-    // The reasons never quote the URL: it is a credential.
-    let refuse = |reason: &str| {
+/// answer names a destination this client will not send to. The reason never
+/// quotes the URL, since the URL is itself the session credential.
+fn admit_upload_url(client: &GraphClient, raw: &str) -> Result<UploadUrl, GraphError> {
+    client.admit_upload(raw).map_err(|refusal| {
+        let reason = match refusal {
+            Refusal::Target(reason) | Refusal::InvalidBase(reason) => reason,
+        };
         contract_violation(format!(
             "OneDrive createUploadSession named an upload URL this client will not send \
              the attachment to: {reason}"
         ))
+    })
+}
+
+/// Budget for the best-effort session cancel after a failed upload. Its own,
+/// not the remainder of `UPLOAD_TOTAL_TIMEOUT`: the upload may have failed
+/// precisely because that budget ran out, and a cancel handed a spent deadline
+/// would never be sent.
+const SESSION_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Best-effort cancel of an upload session that will not be completed:
+/// `DELETE` on the admitted session URL, anonymous like the chunk PUTs.
+/// OneDrive otherwise keeps the session (and the bytes already accepted into
+/// it) until it expires on its own.
+///
+/// Never replaces the upload's own error, whatever the cancel does. Bounded
+/// by [`SESSION_CANCEL_TIMEOUT`] and abandoned the moment the account shuts
+/// down, so a failed upload cannot hold up `close()`; it is not attempted at
+/// all once the shutdown has already fired. Nothing is spawned: a caller that
+/// drops the hosting future drops the cancel with it, and the session
+/// expires on OneDrive's clock, which is the most a detached task outliving
+/// the account could have promised anyway.
+///
+/// A cancel racing a final chunk PUT that was cut short (an `InFlight`
+/// failure) is harmless either way: a session that already produced its
+/// drive item is gone, and deleting a session never deletes a created file;
+/// one that had not yet completed is stopped, which leaves the reconciliation
+/// that `InFlight` asks for a clean answer.
+async fn cancel_upload_session(
+    client: &GraphClient,
+    upload_url: &UploadUrl,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    if shutdown.is_cancelled() {
+        return;
+    }
+    let cancel = client.execute_aux(
+        "DELETE",
+        AuxTarget::Anonymous(upload_url),
+        &[],
+        Bytes::new(),
+        Some(SESSION_CANCEL_TIMEOUT),
+    );
+    let outcome = tokio::select! {
+        biased;
+        outcome = cancel => outcome,
+        () = shutdown.cancelled() => return,
     };
-    let url = reqwest::Url::parse(raw).map_err(|_| refuse("not an absolute URL"))?;
-    if url.host().is_none() {
-        return Err(refuse("the URL has no host"));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(refuse("the URL carries userinfo"));
-    }
-    match url.scheme() {
-        "https" => Ok(UploadSessionUrl(url)),
-        "http" if client.admit_target(url.as_str()).is_ok() => Ok(UploadSessionUrl(url)),
-        "http" => Err(refuse("plain http off the configured Graph origin")),
-        _ => Err(refuse("the URL is not http or https")),
+    if outcome.is_err() {
+        // The error is not logged: a transport message can name the URL,
+        // which is the session credential.
+        tracing::debug!("OneDrive upload session cancel failed; the session will expire");
     }
 }
 
@@ -336,8 +340,9 @@ async fn create_upload_session(
 /// the upload), and refuse a 202 that names no valid offset inside the bytes
 /// just sent rather than guess one (`admitted_resume_offset`). Any other
 /// status -> classified error. OneDrive's 202 resume signal never enters
-/// bifrost-net's redirect path, so the Drive-specific 308 passthrough does
-/// not apply here. The whole upload is bounded by
+/// bifrost-net's redirect path, and the PUT is sent with redirects disabled,
+/// so any 3xx is refused as a contract violation rather than followed. The
+/// whole upload is bounded by
 /// `UPLOAD_TOTAL_TIMEOUT` and aborts if the account shutdown token fires.
 ///
 /// The budget is enforced INSIDE the transport, not by a timer around the
@@ -346,9 +351,12 @@ async fn create_upload_session(
 /// waiting to dispatch, `InFlight` awaiting headers, a partial response after
 /// them. A timer around the whole loop threw that stage away, and used to
 /// report the expiry as a provider parse failure the provider never caused.
+///
+/// A failed upload cancels its session (`cancel_upload_session`) before the
+/// failure is returned, unchanged.
 async fn upload_file_chunked(
     client: &GraphClient,
-    upload_url: &UploadSessionUrl,
+    upload_url: &UploadUrl,
     data: Bytes,
     chunk_size: usize,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -362,12 +370,29 @@ async fn upload_file_chunked(
     );
 
     let deadline = tokio::time::Instant::now() + UPLOAD_TOTAL_TIMEOUT;
-    upload_chunks(client, upload_url, data, chunk_size, shutdown, deadline).await
+    upload_or_cancel(client, upload_url, data, chunk_size, shutdown, deadline).await
+}
+
+/// [`upload_chunks`], then the session cancel if it failed. The failure is
+/// returned unchanged.
+async fn upload_or_cancel(
+    client: &GraphClient,
+    upload_url: &UploadUrl,
+    data: Bytes,
+    chunk_size: usize,
+    shutdown: &tokio_util::sync::CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Result<String, GraphError> {
+    let uploaded = upload_chunks(client, upload_url, data, chunk_size, shutdown, deadline).await;
+    if uploaded.is_err() {
+        cancel_upload_session(client, upload_url, shutdown).await;
+    }
+    uploaded
 }
 
 async fn upload_chunks(
     client: &GraphClient,
-    upload_url: &UploadSessionUrl,
+    upload_url: &UploadUrl,
     data: Bytes,
     chunk_size: usize,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -401,7 +426,7 @@ async fn upload_chunks(
         let headers = [("Content-Range", content_range.as_str())];
         let put = client.execute_aux(
             "PUT",
-            crate::client::AuxTarget::Anonymous(upload_url.0.as_str()),
+            AuxTarget::Anonymous(upload_url),
             &headers,
             chunk,
             Some(remaining),
@@ -427,7 +452,7 @@ async fn upload_chunks(
             200 | 201 => {
                 let item: DriveItemResponse = serde_json::from_slice(response.body.as_ref())
                     .map_err(|e| GraphError::Json {
-                        message: e.to_string(),
+                        message: format!("OneDrive upload drive item JSON body: {e}"),
                         body: if response.body.is_empty() {
                             None
                         } else {
@@ -441,17 +466,30 @@ async fn upload_chunks(
             // PUT, so there is no safe default: a 202 without a valid offset
             // inside `offset..=end` is refused, never resumed at `end`.
             202 => offset = admitted_resume_offset(&response.body, offset, end, total)?,
+            // A redirect. The chunk PUT is sent with redirects disabled (the
+            // session URL was admitted under a rule no hop is checked
+            // against), so every 3xx arrives here. Graph's resumable upload
+            // never redirects a chunk PUT, so this is the provider breaking
+            // the upload contract, not a transient server fault to retry.
+            // The message names the status only: a `Location` may carry the
+            // session credential.
+            300..=399 => {
+                return Err(contract_violation(format!(
+                    "OneDrive answered an upload chunk PUT with redirect {status}, \
+                     which the resumable upload protocol does not use"
+                )));
+            }
             // Everything else. This arm is DELIBERATELY not pinned by a test,
             // and cannot be reached by the failure statuses it reads as though
             // it handled them: bifrost-net resolves 4xx/5xx into an `Err`
-            // before a response ever surfaces here, so the only status that
-            // arrives is a passed-through 3xx the transport's redirect walk
-            // declined to follow. The arm is kept, and kept classifying with
-            // the real response headers and body rather than a synthesized
-            // error, because "the transport handed us a status we did not
-            // expect" must not be silently treated as success. If bifrost-net
-            // ever stops pre-resolving error statuses, this becomes the live
-            // error path and wants a scripted test.
+            // before a response ever surfaces here, and a 3xx takes the arm
+            // above, so what could arrive is a 1xx or a nonstandard 2xx. The
+            // arm is kept, and kept classifying with the real response
+            // headers and body rather than a synthesized error, because "the
+            // transport handed us a status we did not expect" must not be
+            // silently treated as success. If bifrost-net ever stops
+            // pre-resolving error statuses, this becomes the live error path
+            // and wants a scripted test.
             _ => {
                 let err =
                     GraphResponseError::from_response(status, response.headers, response.body);
@@ -538,7 +576,7 @@ mod tests {
     const SESSION_URL: &str = "https://upload.example/session/abc?token=preauth";
 
     /// `SESSION_URL`, through the same admission production applies.
-    fn session(client: &GraphClient) -> UploadSessionUrl {
+    fn session(client: &GraphClient) -> UploadUrl {
         admit_upload_url(client, SESSION_URL).expect("an https session URL is admitted")
     }
 
@@ -786,6 +824,30 @@ mod tests {
         }
     }
 
+    /// The final chunk's 200/201 must carry the drive item. One that does not
+    /// decode is the provider's parse failure, and since `GraphError::Json`'s
+    /// label names no format, its message must say which body failed: it
+    /// used to carry serde's bare text, naming neither OneDrive nor JSON.
+    #[tokio::test]
+    async fn an_undecodable_drive_item_names_its_source() {
+        let (error, puts) = refusal_of_first_answer(
+            b"01234",
+            ScriptedRestResponse::text(reqwest::StatusCode::CREATED, "<html>ok</html>"),
+        )
+        .await;
+        assert_eq!(puts, 1);
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ParseFailed
+            )
+        );
+        assert!(
+            format!("{error:?}").contains("OneDrive upload drive item JSON body"),
+            "{error:?}"
+        );
+    }
+
     /// A 202 that parses but names an impossible offset is the provider's
     /// CONTRACT VIOLATION, not a parse failure: an empty range list (a 202
     /// that wants nothing more), an offset that does not advance (which
@@ -950,7 +1012,7 @@ mod tests {
         let local = GraphClient::with_api_base("http://127.0.0.1:8181/v1.0", "token");
         let admitted =
             admit_upload_url(&local, "http://127.0.0.1:8181/upload/abc").expect("same origin");
-        assert_eq!(admitted.0.as_str(), "http://127.0.0.1:8181/upload/abc");
+        assert_eq!(admitted.as_str(), "http://127.0.0.1:8181/upload/abc");
         for refused in [
             "http://127.0.0.1:8182/upload/abc",
             "http://localhost:8181/upload/abc",
@@ -1079,6 +1141,218 @@ mod tests {
         assert!(!aux[0].bearer);
         assert_eq!(aux[0].header("Content-Range"), Some("bytes 0-10/11"));
         assert_eq!(aux[0].body, payload);
+    }
+
+    /// Host `payload` through the public entry point against a scripted
+    /// session answer followed by `aux` (chunk PUTs, then the cancel).
+    async fn host_with(
+        aux: impl IntoIterator<Item = ScriptedRestResponse>,
+    ) -> (GraphClient, bifrost_types::AccountError) {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "uploadUrl": SESSION_URL, "expirationDateTime": "2099-01-01T00:00:00Z" }),
+        )]);
+        client.script_aux(aux);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let payload = Bytes::from_static(b"0123456789AB");
+        let error = host_attachment(
+            account,
+            payload.clone(),
+            CloudUploadMeta::new(
+                "a.txt",
+                "text/plain",
+                payload.len() as u64,
+                ShareScope::Organization,
+            ),
+        )
+        .await
+        .expect_err("the upload fails");
+        (client, error)
+    }
+
+    fn assert_cancelled_once(client: &GraphClient, puts: usize) {
+        let aux = client.take_aux_requests();
+        let methods: Vec<&str> = aux.iter().map(|request| request.method.as_str()).collect();
+        let mut expected = vec!["PUT"; puts];
+        expected.push("DELETE");
+        assert_eq!(methods, expected);
+        let cancel = aux.last().expect("the cancel");
+        assert_eq!(
+            cancel.url, SESSION_URL,
+            "the cancel goes to the admitted URL"
+        );
+        assert!(
+            !cancel.bearer,
+            "the session cancel must never carry the Graph bearer"
+        );
+        assert!(cancel.body.is_empty());
+    }
+
+    /// An upload that fails after its session exists cancels the session
+    /// (OneDrive would otherwise keep it, and the bytes it accepted, until
+    /// it expires), and the caller still sees the upload's own failure.
+    /// Against the old code the DELETE was never sent, so the scripted 204
+    /// was left unconsumed and the recorded requests held one PUT.
+    #[tokio::test]
+    async fn a_refused_upload_cancels_its_session_and_keeps_its_own_error() {
+        let (client, error) = host_with([
+            accepted(json!({ "nextExpectedRanges": ["20-"] })),
+            ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+        ])
+        .await;
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        assert_cancelled_once(&client, 1);
+        assert_eq!(
+            client.take_rest_requests().len(),
+            1,
+            "no sharing link for a failed upload"
+        );
+    }
+
+    /// A redirect on the chunk PUT is not followed: the session URL was
+    /// admitted under the upload rule, and a hop (here to plain http) would
+    /// send the chunk somewhere never admitted. It is the provider's
+    /// contract violation, the session is cancelled, and the cancel does not
+    /// follow a redirect either. The script holds exactly the session, the
+    /// PUT and the DELETE answers, so a followed hop on either leg exhausts
+    /// it and panics. Against the old code the PUT's hop consumed the
+    /// DELETE's answer.
+    #[tokio::test]
+    async fn a_redirected_chunk_put_is_a_contract_violation_and_is_not_followed() {
+        let hop = |status| {
+            ScriptedRestResponse::text(status, "moved")
+                .with_header("Location", "http://elsewhere.example/landing")
+        };
+        let (client, error) = host_with([
+            hop(reqwest::StatusCode::TEMPORARY_REDIRECT),
+            hop(reqwest::StatusCode::PERMANENT_REDIRECT),
+        ])
+        .await;
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        assert!(!error.recovery().is_retryable(), "{:?}", error.recovery());
+        assert!(
+            !format!("{error:?}").contains("elsewhere.example"),
+            "{error:?}"
+        );
+        assert_eq!(client.wire_attempts(), 3, "session, PUT, DELETE and no hop");
+        assert_cancelled_once(&client, 1);
+    }
+
+    /// A chunk the server refuses with an error status cancels the session
+    /// too, and a cancel that itself fails does not replace the upload's
+    /// error.
+    #[tokio::test]
+    async fn a_failed_cancel_does_not_mask_the_upload_error() {
+        let (client, error) = host_with([
+            ScriptedRestResponse::empty(reqwest::StatusCode::CONFLICT),
+            ScriptedRestResponse::empty(reqwest::StatusCode::FORBIDDEN),
+        ])
+        .await;
+        // The PUT's 409, not the cancel's 403.
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::ConcurrencyConflict
+        );
+        assert_cancelled_once(&client, 1);
+    }
+
+    /// The upload budget running out is exactly when a cancel matters, and
+    /// is also when a cancel sharing that budget could never be sent: it
+    /// gets its own. The failure is still the upload's own timeout.
+    #[tokio::test]
+    async fn a_spent_upload_budget_still_cancels_the_session() {
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT)]);
+
+        let error = upload_or_cancel(
+            &client,
+            &session(&client),
+            Bytes::from_static(b"0123456789AB"),
+            5,
+            &CancellationToken::new(),
+            tokio::time::Instant::now(),
+        )
+        .await
+        .expect_err("the budget is spent");
+        assert!(
+            matches!(
+                &error,
+                GraphError::Net(bifrost_net::Error::Timeout {
+                    transmission_state: TransmissionState::Unsent,
+                })
+            ),
+            "{error:?}"
+        );
+        assert_cancelled_once(&client, 0);
+    }
+
+    /// A cancel that never answers is bounded by its own budget, and the
+    /// upload's failure comes back once it lapses.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_cancel_is_bounded() {
+        let client = GraphClient::new("token");
+        client.script_aux([accepted(json!({ "nextExpectedRanges": [] }))]);
+        client.script_aux_pending(1);
+        let started = tokio::time::Instant::now();
+
+        let error = upload_file_chunked(
+            &client,
+            &session(&client),
+            Bytes::from_static(b"0123456789AB"),
+            CHUNK_ALIGNMENT,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("the upload is refused");
+        assert!(
+            matches!(&error, GraphError::ContractViolation { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), SESSION_CANCEL_TIMEOUT);
+        assert_cancelled_once(&client, 1);
+    }
+
+    /// A shutdown that lands while the cancel is outstanding abandons it at
+    /// once: a failed upload must not hold up `close()`.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_abandons_an_outstanding_cancel() {
+        let client = GraphClient::new("token");
+        client.script_aux([accepted(json!({ "nextExpectedRanges": [] }))]);
+        client.script_aux_pending(1);
+        let shutdown = CancellationToken::new();
+        let trigger = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            trigger.cancel();
+        });
+        let started = tokio::time::Instant::now();
+
+        let error = upload_file_chunked(
+            &client,
+            &session(&client),
+            Bytes::from_static(b"0123456789AB"),
+            CHUNK_ALIGNMENT,
+            &shutdown,
+        )
+        .await
+        .expect_err("the upload is refused");
+        assert!(
+            matches!(&error, GraphError::ContractViolation { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(1));
+        assert_cancelled_once(&client, 1);
     }
 
     #[test]

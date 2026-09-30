@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
 
 use crate::error::{GraphError, GraphResponseError};
-use crate::origin::{AdmittedUrl, Base, ProviderLink, Refusal};
+use crate::origin::{AdmittedUrl, Base, ProviderLink, Refusal, UploadUrl};
 
 pub(crate) const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
 
@@ -179,8 +179,8 @@ pub(crate) enum AuxTarget<'a> {
     /// Carries the bearer; admitted onto a configured origin.
     Bearer(&'a AdmittedUrl),
     /// Carries no bearer: a URL that is its own credential (the OneDrive
-    /// pre-authenticated upload session).
-    Anonymous(&'a str),
+    /// pre-authenticated upload session), admitted under the upload rule.
+    Anonymous(&'a UploadUrl),
 }
 
 #[cfg(test)]
@@ -591,6 +591,12 @@ impl GraphClient {
         self.inner.api_base.admit(target)
     }
 
+    /// Admit a OneDrive upload session URL under the upload rule (see
+    /// `Base::admit_upload`). The caller classifies the refusal.
+    pub(crate) fn admit_upload(&self, raw: &str) -> Result<UploadUrl, Refusal> {
+        self.inner.api_base.admit_upload(raw)
+    }
+
     /// A crate-built Autodiscover / EWS path, admitted onto the Outlook
     /// origin.
     pub(crate) fn outlook_url(&self, path: &str) -> Result<AdmittedUrl, GraphError> {
@@ -944,10 +950,11 @@ impl GraphClient {
     }
 
     /// The one place the two NON-REST wire paths leave this crate: the
-    /// pre-authenticated OneDrive chunk PUT (bearer suppressed, because the
-    /// session URL carries its own credential and forwarding the Graph
-    /// token to it would leak it) and the Autodiscover POST (XML to the
-    /// Autodiscover origin, which is not the Graph host).
+    /// pre-authenticated OneDrive upload session (chunk PUTs and the cancel
+    /// DELETE, bearer suppressed, because the session URL carries its own
+    /// credential and forwarding the Graph token to it would leak it) and
+    /// the Autodiscover POST (XML to the Autodiscover origin, which is not
+    /// the Graph host).
     ///
     /// Deliberately NOT folded into `execute_wire`: that funnel takes the
     /// client's concurrency permit and always sends a bearer, and a chunked
@@ -971,7 +978,7 @@ impl GraphClient {
     ) -> Result<RestResponse, GraphError> {
         let (url, bearer) = match target {
             AuxTarget::Bearer(url) => (url.as_str(), true),
-            AuxTarget::Anonymous(url) => (url, false),
+            AuxTarget::Anonymous(url) => (url.as_str(), false),
         };
         #[cfg(test)]
         self.record_aux(method, url, headers, bearer, &body);
@@ -979,12 +986,22 @@ impl GraphClient {
         let mut builder = match method {
             "POST" => account_net.post(url),
             "PUT" => account_net.put(url),
+            // The OneDrive upload session cancel.
+            "DELETE" => account_net.delete(url),
             other => {
                 unreachable!("unsupported HTTP method passed to GraphClient::execute_aux: {other}")
             }
         };
         if !bearer {
-            builder = builder.without_bearer_auth();
+            // An anonymous target was admitted under the upload rule, which
+            // the transport's redirect walk cannot apply to a hop: following
+            // one would send the chunk (and a URL that is itself the
+            // credential's destination) somewhere never admitted, over plain
+            // http included. Graph's upload flow does not redirect, so a 3xx
+            // comes back to the caller as the response it is.
+            builder = builder
+                .without_bearer_auth()
+                .follow_redirects(bifrost_net::FollowRedirects::Disabled);
         }
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
@@ -1397,8 +1414,11 @@ fn parse_json_response<T: DeserializeOwned>(response: RestResponse) -> Result<T,
         return Err(GraphError::Response(err));
     }
 
+    // `GraphError::Json` is shared with the Autodiscover XML and OneDrive
+    // upload readers, and its diagnostic label names no format, so the
+    // message says which body failed.
     serde_json::from_slice(body.as_ref()).map_err(|e| GraphError::Json {
-        message: e.to_string(),
+        message: format!("Graph REST JSON body: {e}"),
         body: if body.is_empty() { None } else { Some(body) },
     })
 }
@@ -1418,6 +1438,26 @@ fn check_response_status(response: RestResponse) -> Result<(), GraphError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Json` diagnostic label is format-neutral because Autodiscover
+    /// XML and OneDrive upload failures share the variant, so a Graph REST
+    /// body that does not decode must say so itself. It used to carry only
+    /// serde's bare message, naming neither Graph nor JSON.
+    #[test]
+    fn a_graph_rest_parse_failure_names_graph_json() {
+        let response = RestResponse {
+            status: reqwest::StatusCode::OK,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from_static(b"{not json"),
+        };
+        match parse_json_response::<serde_json::Value>(response) {
+            Err(GraphError::Json { message, body }) => {
+                assert!(message.starts_with("Graph REST JSON body: "), "{message}");
+                assert_eq!(body.as_deref(), Some(&b"{not json"[..]));
+            }
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn trims_api_base() {

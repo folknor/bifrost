@@ -4,6 +4,8 @@ use bifrost_types::{
     EventPatch, EventRange, EventRecurrence, EventSearchRequest, EventStatus, EventTime,
     EventVisibility, Page, ProtocolKind, RsvpStatus,
 };
+use jiff::civil;
+use jiff::tz::{Offset, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -121,13 +123,21 @@ pub(crate) async fn get(
     event: EventId,
 ) -> Result<CalendarEvent, AccountError> {
     let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventGet)?;
-    let path = event_url(&account, &calendar_id, &event_id);
-    let event = account
+    let event = fetch_graph_event(&account, &calendar_id, &event_id).await?;
+    Ok(event_from_graph(calendar_id, event))
+}
+
+async fn fetch_graph_event(
+    account: &GraphAccount,
+    calendar_id: &str,
+    event_id: &str,
+) -> Result<GraphEvent, AccountError> {
+    let path = event_url(account, calendar_id, event_id);
+    account
         .client
         .get_json_prefer::<GraphEvent>(&path, EVENT_TIMEZONE_PREFER)
         .await
-        .map_err(|error| into_error(error, AccountOperation::EventGet))?;
-    Ok(event_from_graph(calendar_id, event))
+        .map_err(|error| into_error(error, AccountOperation::EventGet))
 }
 
 pub(crate) async fn create(
@@ -141,9 +151,10 @@ pub(crate) async fn create(
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_path_component(&calendar_id);
     let path = format!("{prefix}/calendars/{encoded}/events");
+    let body = graph_event_from_create(&event)?;
     let created = account
         .client
-        .post::<GraphEvent, _>(&path, &graph_event_from_create(&event))
+        .post::<GraphEvent, _>(&path, &body)
         .await
         .map_err(|error| into_error(error, AccountOperation::EventCreate))?;
     Ok(EventId(join_event_id(&calendar_id, &created.id)))
@@ -214,26 +225,47 @@ pub(crate) async fn update(
     event: EventId,
     patch: EventPatch,
 ) -> Result<(), AccountError> {
+    let operation = AccountOperation::EventUpdate;
     validate_event_patch_timezones(&patch)?;
     if let Some(status) = patch.status {
-        reject_unwritable_status(status, AccountOperation::EventUpdate)?;
+        reject_unwritable_status(status, operation)?;
     }
-    let current = get(account.clone(), event.clone()).await?;
-    let calendar_id = patch
-        .calendar_id
-        .clone()
-        .unwrap_or_else(|| current.calendar_id.clone())
-        .0;
-    let (_, native_event_id) = split_event_id(&event.0, AccountOperation::EventUpdate)?;
-    let etag = current.etag.clone();
-    let path = event_url(&account, &calendar_id, &native_event_id);
-    let body = graph_event_from_patch(&patch);
-    let result = if let Some(etag) = etag.as_deref() {
+    // Refuse a recurrence Graph cannot take before spending the fetch; the
+    // range anchor a rule may still need is resolved against the fetched
+    // event below.
+    if let Some(recurrence) = &patch.recurrence {
+        validate_recurrence(recurrence).map_err(|refusal| refusal.into_account_error(operation))?;
+    }
+    let (event_calendar_id, native_event_id) = split_event_id(&event.0, operation)?;
+    reject_calendar_move(&patch, &event_calendar_id)?;
+    let current = fetch_graph_event(&account, &event_calendar_id, &native_event_id).await?;
+    let series = CurrentSeries {
+        recurrence: current.recurrence.as_ref(),
+        time_zone: current.original_start_time_zone.as_deref(),
+    };
+    let body = graph_event_from_patch(&patch, series)?;
+    let path = event_url(&account, &event_calendar_id, &native_event_id);
+    let result = if let Some(etag) = current.change_key.as_deref() {
         account.client.patch_if_match(&path, etag, &body).await
     } else {
         account.client.patch(&path, &body).await
     };
-    result.map_err(|error| into_error(error, AccountOperation::EventUpdate))
+    result.map_err(|error| into_error(error, operation))
+}
+
+/// Graph has no move for events: PATCHing an event under another calendar's
+/// path edits it where it is. A patch naming a calendar other than the one the
+/// event id carries (including any calendar for a mailbox-scoped search hit,
+/// whose calendar is unknown) is refused rather than reported as a move that
+/// never happened.
+fn reject_calendar_move(patch: &EventPatch, event_calendar_id: &str) -> Result<(), AccountError> {
+    match &patch.calendar_id {
+        Some(calendar) if calendar.0 != event_calendar_id => Err(unsupported_error(
+            AccountOperation::EventUpdate,
+            "Graph event update cannot move an event to another calendar".to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 pub(crate) async fn delete(account: GraphAccount, event: EventId) -> Result<(), AccountError> {
@@ -575,8 +607,10 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
     }
 }
 
-fn graph_event_from_create(event: &EventCreate) -> GraphEventPatch {
-    GraphEventPatch {
+fn graph_event_from_create(event: &EventCreate) -> Result<GraphEventPatch, AccountError> {
+    let recurrence = create_recurrence(event)
+        .map_err(|refusal| refusal.into_account_error(AccountOperation::EventCreate))?;
+    Ok(GraphEventPatch {
         subject: event.title.clone().map(Value::String),
         body: event.description.as_ref().map(|description| {
             json!(GraphBody {
@@ -595,11 +629,128 @@ fn graph_event_from_create(event: &EventCreate) -> GraphEventPatch {
         show_as: Some(show_as(event.availability).to_string()),
         sensitivity: Some(sensitivity(event.visibility).to_string()),
         attendees: non_empty(event.attendees.iter().map(graph_attendee)),
-        recurrence: recurrence_from_event(event),
+        recurrence: recurrence.map(Some),
+    })
+}
+
+fn create_recurrence(event: &EventCreate) -> Result<Option<GraphRecurrence>, RecurrenceRefusal> {
+    validate_recurrence(&event.recurrence)?;
+    let Some(rrule) = event.recurrence.rrule.as_deref() else {
+        return Ok(None);
+    };
+    let rule = graph_recurrence_rule(rrule)?;
+    let anchor = RecurrenceAnchor::from_event_time(&event.start)?;
+    Ok(Some(rule.anchored(&anchor)))
+}
+
+/// Refuse the recurrence parts Graph has no field for, and an RRULE it
+/// cannot take, before any payload is built.
+///
+/// Graph's `patternedRecurrence` is a pattern plus a range, nothing else.
+/// RDATE's extra occurrences have no carrier at all, and EXDATE exists in
+/// Graph only as occurrences deleted after the series is written, which a
+/// single create or patch cannot do. Dropping either writes a different series
+/// than the one asked for.
+fn validate_recurrence(recurrence: &EventRecurrence) -> Result<(), RecurrenceRefusal> {
+    if !recurrence.rdate.is_empty() {
+        return Err(unexpressible(
+            "Graph recurrence has no RDATE: extra occurrences cannot be written",
+        ));
+    }
+    if !recurrence.exdate.is_empty() {
+        return Err(unexpressible(
+            "Graph recurrence has no EXDATE: an occurrence is removed by deleting it once the \
+             series exists",
+        ));
+    }
+    if let Some(rrule) = recurrence.rrule.as_deref() {
+        graph_recurrence_rule(rrule)?;
+    }
+    Ok(())
+}
+
+/// What `update` learned about the event it is patching.
+#[derive(Debug, Default, Clone, Copy)]
+struct CurrentSeries<'a> {
+    /// The event's recurrence as Graph holds it; `None` for a one-off or an
+    /// occurrence.
+    recurrence: Option<&'a GraphRecurrence>,
+    /// The event's `originalStartTimeZone`.
+    time_zone: Option<&'a str>,
+}
+
+impl CurrentSeries<'_> {
+    /// The anchor of the series as it stands. The range `startDate` is a
+    /// plain date Graph reports untouched by the UTC `Prefer` the read uses,
+    /// so it is the series' local start date.
+    fn start_anchor(&self) -> Option<RecurrenceAnchor> {
+        let range = self.recurrence?.range.as_ref()?;
+        let start = parse_start_date(range.start_date.as_deref()?)?;
+        let zone = range
+            .recurrence_time_zone
+            .as_deref()
+            .or(self.time_zone)
+            .and_then(resolve_time_zone);
+        Some(RecurrenceAnchor { start, zone })
     }
 }
 
-fn graph_event_from_patch(patch: &EventPatch) -> GraphEventPatch {
+/// The recurrence write a patch makes: `None` leaves it alone, `Some(None)`
+/// clears it (`"recurrence": null`), `Some(Some(_))` writes a series.
+///
+/// Graph's `recurrenceRange.startDate` must be the series' local start date.
+/// A patch carrying `start` supplies it. Without one, an event that already
+/// recurs keeps its own range start. An event that does not recur yet has no
+/// such date, and its UTC-normalised `start` can sit on a different calendar
+/// day than the local one Graph wants, so that patch is refused as
+/// `Unsupported` rather than anchored on a guessed date.
+///
+/// A patch that moves `start` on a recurring event without restating the
+/// recurrence re-sends the event's own recurrence with the range start moved
+/// along, so the range never disagrees with the event it belongs to.
+fn patch_recurrence(
+    patch: &EventPatch,
+    series: CurrentSeries<'_>,
+) -> Result<Option<Option<GraphRecurrence>>, AccountError> {
+    let operation = AccountOperation::EventUpdate;
+    let refuse = |refusal: RecurrenceRefusal| refusal.into_account_error(operation);
+    let Some(requested) = &patch.recurrence else {
+        return Ok(restarted_series(patch, series).map(Some));
+    };
+    validate_recurrence(requested).map_err(refuse)?;
+    let Some(rrule) = requested.rrule.as_deref() else {
+        // A recurrence with no rule and no dates is how a patch makes the
+        // event a one-off again.
+        return Ok(Some(None));
+    };
+    let rule = graph_recurrence_rule(rrule).map_err(refuse)?;
+    let anchor = match (&patch.start, series.start_anchor()) {
+        (Some(start), _) => RecurrenceAnchor::from_event_time(start).map_err(refuse)?,
+        (None, Some(anchor)) => anchor,
+        (None, None) => {
+            return Err(unsupported_error(
+                operation,
+                "Graph recurrence on an event that does not recur yet needs start in the same \
+                 patch: the range start is the event's local start date"
+                    .to_string(),
+            ));
+        }
+    };
+    Ok(Some(Some(rule.anchored(&anchor))))
+}
+
+fn restarted_series(patch: &EventPatch, series: CurrentSeries<'_>) -> Option<GraphRecurrence> {
+    let start = patch.start.as_ref()?;
+    let mut recurrence = series.recurrence?.clone();
+    recurrence.range.as_mut()?.start_date = Some(graph_recurrence_start_date(&start.value));
+    Some(recurrence)
+}
+
+fn graph_event_from_patch(
+    patch: &EventPatch,
+    series: CurrentSeries<'_>,
+) -> Result<GraphEventPatch, AccountError> {
+    let recurrence = patch_recurrence(patch, series)?;
     // Effective all-day flag for the time emission. With no explicit
     // `is_all_day`, a date-only start/end value infers all-day. The same
     // value must then drive both the `start`/`end` dateTime shape AND the
@@ -621,7 +772,7 @@ fn graph_event_from_patch(patch: &EventPatch) -> GraphEventPatch {
     let is_all_day_out = patch
         .is_all_day
         .or_else(|| (patch.start.is_some() || patch.end.is_some()).then_some(effective_all_day));
-    GraphEventPatch {
+    Ok(GraphEventPatch {
         subject: patch.title.clone().map(|value| match value {
             Some(value) => Value::String(value),
             None => Value::Null,
@@ -657,32 +808,14 @@ fn graph_event_from_patch(patch: &EventPatch) -> GraphEventPatch {
         sensitivity: patch
             .visibility
             .map(|visibility| sensitivity(visibility).to_string()),
+        // An empty list is sent as `[]`: it is how a patch clears every
+        // attendee, and omitting it left the old attendees in place.
         attendees: patch
             .attendees
             .as_ref()
-            .and_then(|attendees| non_empty(attendees.iter().map(graph_attendee))),
-        recurrence: patch.recurrence.as_ref().and_then(|recurrence| {
-            let event = EventCreate {
-                calendar_id: patch
-                    .calendar_id
-                    .clone()
-                    .unwrap_or_else(|| CalendarId(DEFAULT_CALENDAR_ID.to_string())),
-                title: None,
-                description: None,
-                location: None,
-                start: patch.start.clone().unwrap_or_else(empty_time),
-                end: patch.end.clone().unwrap_or_else(empty_time),
-                is_all_day: patch.is_all_day.unwrap_or(false),
-                status: EventStatus::Confirmed,
-                availability: EventAvailability::Busy,
-                visibility: EventVisibility::Default,
-                organizer: None,
-                attendees: Vec::new(),
-                recurrence: recurrence.clone(),
-            };
-            recurrence_from_event(&event)
-        }),
-    }
+            .map(|attendees| attendees.iter().map(graph_attendee).collect()),
+        recurrence,
+    })
 }
 
 fn event_url(account: &GraphAccount, calendar_id: &str, event_id: &str) -> String {
@@ -786,63 +919,147 @@ fn validate_graph_time_zone(
     }
 }
 
+/// The outbound IANA -> Windows time zone mapping, one row per Windows id.
+/// The first IANA id of a row is the one that Windows id resolves back to
+/// when an event's own zone is needed (reading a UTC RRULE `UNTIL` as a local
+/// date), so it is the row's canonical zone.
+const WINDOWS_ZONES: &[(&str, &[&str])] = &[
+    ("UTC", &["Etc/UTC", "UTC"]),
+    (
+        "W. Europe Standard Time",
+        &[
+            "Europe/Berlin",
+            "Europe/Amsterdam",
+            "Europe/Busingen",
+            "Europe/Oslo",
+            "Europe/Rome",
+            "Europe/Stockholm",
+            "Europe/Vienna",
+            "Europe/Zurich",
+        ],
+    ),
+    (
+        "Romance Standard Time",
+        &[
+            "Europe/Paris",
+            "Europe/Brussels",
+            "Europe/Copenhagen",
+            "Europe/Madrid",
+        ],
+    ),
+    (
+        "Central Europe Standard Time",
+        &[
+            "Europe/Budapest",
+            "Europe/Bratislava",
+            "Europe/Ljubljana",
+            "Europe/Prague",
+            "Europe/Warsaw",
+            "Europe/Zagreb",
+        ],
+    ),
+    (
+        "GMT Standard Time",
+        &["Europe/London", "Europe/Dublin", "Europe/Lisbon"],
+    ),
+    ("GTB Standard Time", &["Europe/Bucharest", "Europe/Athens"]),
+    (
+        "FLE Standard Time",
+        &[
+            "Europe/Helsinki",
+            "Europe/Kyiv",
+            "Europe/Riga",
+            "Europe/Sofia",
+            "Europe/Tallinn",
+            "Europe/Vilnius",
+        ],
+    ),
+    ("Turkey Standard Time", &["Europe/Istanbul"]),
+    ("Russian Standard Time", &["Europe/Moscow"]),
+    (
+        "Eastern Standard Time",
+        &[
+            "America/New_York",
+            "America/Detroit",
+            "America/Indiana/Indianapolis",
+            "America/Toronto",
+        ],
+    ),
+    ("Central Standard Time", &["America/Chicago"]),
+    ("Mountain Standard Time", &["America/Denver"]),
+    ("US Mountain Standard Time", &["America/Phoenix"]),
+    (
+        "Pacific Standard Time",
+        &["America/Los_Angeles", "America/Vancouver"],
+    ),
+    ("Alaskan Standard Time", &["America/Anchorage"]),
+    ("Hawaiian Standard Time", &["Pacific/Honolulu"]),
+    ("Central Standard Time (Mexico)", &["America/Mexico_City"]),
+    (
+        "SA Pacific Standard Time",
+        &["America/Bogota", "America/Lima", "America/Guayaquil"],
+    ),
+    ("Pacific SA Standard Time", &["America/Santiago"]),
+    ("E. South America Standard Time", &["America/Sao_Paulo"]),
+    (
+        "Argentina Standard Time",
+        &["America/Argentina/Buenos_Aires"],
+    ),
+    ("Egypt Standard Time", &["Africa/Cairo"]),
+    ("South Africa Standard Time", &["Africa/Johannesburg"]),
+    ("Arabian Standard Time", &["Asia/Dubai"]),
+    ("Israel Standard Time", &["Asia/Jerusalem"]),
+    ("Tokyo Standard Time", &["Asia/Tokyo"]),
+    ("Korea Standard Time", &["Asia/Seoul"]),
+    ("China Standard Time", &["Asia/Shanghai"]),
+    ("Hong Kong Standard Time", &["Asia/Hong_Kong"]),
+    ("Singapore Standard Time", &["Asia/Singapore"]),
+    ("India Standard Time", &["Asia/Kolkata"]),
+    ("E. Australia Standard Time", &["Australia/Brisbane"]),
+    ("W. Australia Standard Time", &["Australia/Perth"]),
+    (
+        "AUS Eastern Standard Time",
+        &["Australia/Sydney", "Australia/Melbourne"],
+    ),
+    ("New Zealand Standard Time", &["Pacific/Auckland"]),
+];
+
 fn graph_time_zone_name(timezone: Option<&str>) -> Option<&str> {
-    Some(match timezone.unwrap_or("UTC") {
-        "UTC" | "Etc/UTC" => "UTC",
-        "Europe/Amsterdam" | "Europe/Berlin" | "Europe/Busingen" | "Europe/Oslo"
-        | "Europe/Rome" | "Europe/Stockholm" | "Europe/Vienna" | "Europe/Zurich" => {
-            "W. Europe Standard Time"
-        }
-        "Europe/Brussels" | "Europe/Copenhagen" | "Europe/Madrid" | "Europe/Paris" => {
-            "Romance Standard Time"
-        }
-        "Europe/Bratislava" | "Europe/Budapest" | "Europe/Ljubljana" | "Europe/Prague"
-        | "Europe/Warsaw" | "Europe/Zagreb" => "Central Europe Standard Time",
-        "Europe/Dublin" | "Europe/Lisbon" | "Europe/London" => "GMT Standard Time",
-        "Europe/Athens" | "Europe/Bucharest" => "GTB Standard Time",
-        "Europe/Helsinki" | "Europe/Kyiv" | "Europe/Riga" | "Europe/Sofia" | "Europe/Tallinn"
-        | "Europe/Vilnius" => "FLE Standard Time",
-        "Europe/Istanbul" => "Turkey Standard Time",
-        "Europe/Moscow" => "Russian Standard Time",
-        "America/Detroit"
-        | "America/Indiana/Indianapolis"
-        | "America/New_York"
-        | "America/Toronto" => "Eastern Standard Time",
-        "America/Chicago" => "Central Standard Time",
-        "America/Denver" => "Mountain Standard Time",
-        "America/Phoenix" => "US Mountain Standard Time",
-        "America/Los_Angeles" | "America/Vancouver" => "Pacific Standard Time",
-        "America/Anchorage" => "Alaskan Standard Time",
-        "Pacific/Honolulu" => "Hawaiian Standard Time",
-        "America/Mexico_City" => "Central Standard Time (Mexico)",
-        "America/Bogota" | "America/Lima" | "America/Guayaquil" => "SA Pacific Standard Time",
-        "America/Santiago" => "Pacific SA Standard Time",
-        "America/Sao_Paulo" => "E. South America Standard Time",
-        "America/Argentina/Buenos_Aires" => "Argentina Standard Time",
-        "Africa/Cairo" => "Egypt Standard Time",
-        "Africa/Johannesburg" => "South Africa Standard Time",
-        "Asia/Dubai" => "Arabian Standard Time",
-        "Asia/Jerusalem" => "Israel Standard Time",
-        "Asia/Tokyo" => "Tokyo Standard Time",
-        "Asia/Seoul" => "Korea Standard Time",
-        "Asia/Shanghai" => "China Standard Time",
-        "Asia/Hong_Kong" => "Hong Kong Standard Time",
-        "Asia/Singapore" => "Singapore Standard Time",
-        "Asia/Kolkata" => "India Standard Time",
-        "Australia/Brisbane" => "E. Australia Standard Time",
-        "Australia/Perth" => "W. Australia Standard Time",
-        "Australia/Melbourne" | "Australia/Sydney" => "AUS Eastern Standard Time",
-        "Pacific/Auckland" => "New Zealand Standard Time",
-        // An IANA id we don't have a Windows mapping for: reject locally.
-        value if value.contains('/') => return None,
-        // A slash-free string is treated as an already-Windows tz id so
-        // they round-trip. Windows tz ids are multi-word (e.g. "W. Europe
-        // Standard Time"); the sole single-token id is "UTC" (handled
-        // above). Reject a slash-free single token as junk rather than
-        // forwarding an unresolvable tz to Graph.
-        value if value.contains(' ') => value,
-        _ => return None,
-    })
+    let value = timezone.unwrap_or("UTC");
+    if let Some((windows, _)) = WINDOWS_ZONES.iter().find(|(_, iana)| iana.contains(&value)) {
+        return Some(*windows);
+    }
+    // An IANA id we don't have a Windows mapping for: reject locally.
+    if value.contains('/') {
+        return None;
+    }
+    // A slash-free string is treated as an already-Windows tz id so they
+    // round-trip. Windows tz ids are multi-word (e.g. "W. Europe Standard
+    // Time"); the sole single-token id is "UTC" (in the table). Reject a
+    // slash-free single token as junk rather than forwarding an unresolvable
+    // tz to Graph.
+    value.contains(' ').then_some(value)
+}
+
+/// The IANA id an event zone name stands for: an IANA id as is, a Windows id
+/// through its `WINDOWS_ZONES` row. `None` for anything else, including a
+/// Windows id outside the table and Graph's `tzone://Microsoft/Custom`.
+fn iana_zone_name(name: &str) -> Option<&str> {
+    let iana = WINDOWS_ZONES
+        .iter()
+        .find(|(windows, _)| *windows == name)
+        .and_then(|(_, iana)| iana.first().copied())
+        .unwrap_or(name);
+    (iana.contains('/') && !iana.starts_with("tzone:")).then_some(iana)
+}
+
+/// Resolve an event zone name against the tz database. `None` when the name
+/// is unknown or the database lacks it.
+fn resolve_time_zone(name: &str) -> Option<TimeZone> {
+    if matches!(name, "UTC" | "Etc/UTC") {
+        return Some(TimeZone::UTC);
+    }
+    TimeZone::get(iana_zone_name(name)?).ok()
 }
 
 fn all_day_date(value: &str) -> Option<String> {
@@ -907,6 +1124,14 @@ fn rrule_from_graph(recurrence: &GraphRecurrence) -> Option<String> {
     }
     if let Some(interval) = pattern.interval.filter(|interval| *interval > 1) {
         parts.push(format!("INTERVAL={interval}"));
+        // The week start changes a weekly series only when it skips weeks.
+        // RFC 5545 assumes Monday; Graph's documented default is Sunday.
+        if pattern.kind.as_deref() == Some("weekly") {
+            let week_start = pattern.first_day_of_week.as_deref().unwrap_or("sunday");
+            if let Some(day) = graph_day_to_rrule(week_start).filter(|day| *day != "MO") {
+                parts.push(format!("WKST={day}"));
+            }
+        }
     }
     if let Some(range) = recurrence.range.as_ref() {
         match range.kind.as_deref() {
@@ -941,110 +1166,531 @@ fn push_relative_rule_parts(pattern: &GraphRecurrencePattern, parts: &mut Vec<St
     }
 }
 
-fn recurrence_from_event(event: &EventCreate) -> Option<GraphRecurrence> {
-    let rrule = event.recurrence.rrule.as_deref()?;
-    graph_recurrence_from_rrule(rrule, graph_recurrence_start_date(&event.start.value))
+/// Why an RRULE cannot be written to Graph, classified by what the refusal is
+/// about. A well-formed rule that Graph's `patternedRecurrence` (or this
+/// mapping) cannot express is `Unsupported`: the gap is the provider's or this
+/// client's, not the caller's. A value that is not an RFC 5545 RRULE at all is
+/// the caller's malformed input, `Request(Malformed)` naming
+/// `recurrence.rrule`. Either way the write is refused: dropping the rule would
+/// turn a recurring event into a one-off, and dropping one part of it would
+/// write a different series than the one asked for.
+#[derive(Debug)]
+enum RecurrenceRefusal {
+    Unsupported(String),
+    Malformed {
+        field: &'static str,
+        message: String,
+    },
 }
 
-fn graph_recurrence_from_rrule(rrule: &str, start_date: String) -> Option<GraphRecurrence> {
-    let parsed = ParsedRRule::parse(rrule);
-    if !parsed.keys_supported(&[
-        "FREQ",
-        "INTERVAL",
-        "BYMONTH",
-        "BYMONTHDAY",
-        "BYDAY",
-        "BYSETPOS",
-        "COUNT",
-        "UNTIL",
-    ]) {
-        return None;
-    }
-    let frequency = parsed.value("FREQ")?;
-    let mut pattern = GraphRecurrencePattern {
-        kind: Some(
-            match frequency {
-                "DAILY" => "daily",
-                "WEEKLY" => "weekly",
-                "MONTHLY" if parsed.value("BYMONTHDAY").is_some() => "absoluteMonthly",
-                "MONTHLY" => "relativeMonthly",
-                "YEARLY" if parsed.value("BYMONTHDAY").is_some() => "absoluteYearly",
-                "YEARLY" => "relativeYearly",
-                _ => return None,
+impl RecurrenceRefusal {
+    fn into_account_error(self, operation: AccountOperation) -> AccountError {
+        match self {
+            Self::Unsupported(message) => unsupported_error(operation, message),
+            Self::Malformed { field, message } => {
+                graph_error::invalid_argument_account_error(operation, field, message)
             }
-            .to_string(),
-        ),
-        interval: parsed
-            .value("INTERVAL")
-            .and_then(|value| value.parse().ok()),
-        month: parsed.value("BYMONTH").and_then(|value| value.parse().ok()),
-        day_of_month: parsed
-            .value("BYMONTHDAY")
-            .and_then(|value| value.parse().ok()),
-        days_of_week: parsed.value("BYDAY").map(|value| {
-            value
-                .split(',')
-                .filter_map(rrule_day_to_graph)
-                .map(ToString::to_string)
-                .collect()
-        }),
-        index: parsed
-            .value("BYSETPOS")
-            .and_then(rrule_setpos_to_graph)
-            .map(ToString::to_string),
-    };
-    if pattern.interval.is_none() {
-        pattern.interval = Some(1);
+        }
     }
-    if pattern.days_of_week.as_ref().is_some_and(Vec::is_empty) {
-        return None;
+}
+
+fn unexpressible(message: impl Into<String>) -> RecurrenceRefusal {
+    RecurrenceRefusal::Unsupported(message.into())
+}
+
+fn malformed_rrule(message: impl Into<String>) -> RecurrenceRefusal {
+    RecurrenceRefusal::Malformed {
+        field: "recurrence.rrule",
+        message: message.into(),
     }
-    // Graph relative monthly/yearly patterns require daysOfWeek; an
-    // RRULE with neither BYMONTHDAY (which would have selected the
-    // absolute kind) nor BYDAY cannot build a valid pattern, and Graph
-    // rejects it with 400. Reject locally before payload construction.
-    if matches!(
-        pattern.kind.as_deref(),
-        Some("relativeMonthly" | "relativeYearly")
-    ) && pattern.days_of_week.is_none()
-    {
-        return None;
-    }
-    if parsed.value("BYSETPOS").is_some() && pattern.index.is_none() {
-        return None;
-    }
-    // A relative monthly/yearly pattern requires an `index`
-    // (first/second/.../last). Graph silently defaults a missing index to
-    // "first", so an RRULE like `FREQ=MONTHLY;BYDAY=MO` (every Monday)
-    // would become "first Monday" without the caller's knowledge. We
-    // cannot represent "every Monday" as a Graph relative pattern, so
-    // reject locally rather than ship a silently-narrowed recurrence.
-    if matches!(
-        pattern.kind.as_deref(),
-        Some("relativeMonthly" | "relativeYearly")
-    ) && pattern.index.is_none()
-    {
-        return None;
-    }
-    Some(GraphRecurrence {
-        pattern: Some(pattern),
-        range: Some(GraphRecurrenceRange {
-            kind: Some(
-                if parsed.value("COUNT").is_some() {
-                    "numbered"
-                } else if parsed.value("UNTIL").is_some() {
-                    "endDate"
-                } else {
-                    "noEnd"
-                }
+}
+
+/// Graph's pattern shape for a validated RRULE. A `None` is a value RFC 5545
+/// takes from DTSTART when the rule leaves it out; `anchored` fills it from
+/// the event start.
+#[derive(Debug)]
+enum PatternShape {
+    Daily,
+    /// `None` is the start's weekday.
+    Weekly(Option<Vec<&'static str>>),
+    /// `None` is the start's day of the month.
+    AbsoluteMonthly(Option<u32>),
+    RelativeMonthly {
+        days: Vec<&'static str>,
+        index: &'static str,
+    },
+    /// `None`s are the start's month and day.
+    AbsoluteYearly {
+        month: Option<u32>,
+        day: Option<u32>,
+    },
+    RelativeYearly {
+        month: u32,
+        days: Vec<&'static str>,
+        index: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RRuleUntil {
+    /// A DATE, or a floating DATE-TIME: already the event's local date.
+    Local(civil::Date),
+    /// A UTC DATE-TIME, whose local date depends on the event's time zone.
+    Utc(civil::DateTime),
+}
+
+/// A validated RRULE in Graph's terms, still waiting for the event start it
+/// is anchored on.
+#[derive(Debug)]
+struct GraphRecurrenceRule {
+    shape: PatternShape,
+    interval: u32,
+    /// Graph name of the RRULE's WKST, RFC 5545's default Monday when absent.
+    first_day_of_week: &'static str,
+    count: Option<u32>,
+    until: Option<RRuleUntil>,
+}
+
+/// What a rule is anchored on: the event's local start date, and the zone a
+/// UTC `UNTIL` is read in. `zone` is `None` when the event's zone cannot be
+/// resolved, which leaves such an `UNTIL` on its UTC date.
+#[derive(Debug, Clone)]
+struct RecurrenceAnchor {
+    start: civil::Date,
+    zone: Option<TimeZone>,
+}
+
+impl RecurrenceAnchor {
+    fn from_event_time(time: &EventTime) -> Result<Self, RecurrenceRefusal> {
+        let start = parse_start_date(&time.value).ok_or_else(|| RecurrenceRefusal::Malformed {
+            field: "start",
+            message: "Graph recurrence needs the event start to begin with a YYYY-MM-DD date"
                 .to_string(),
-            ),
-            start_date: Some(start_date),
-            end_date: parsed.value("UNTIL").map(rrule_until_to_graph_date),
-            recurrence_time_zone: None,
-            number_of_occurrences: parsed.value("COUNT").and_then(|value| value.parse().ok()),
-        }),
+        })?;
+        Ok(Self {
+            start,
+            zone: resolve_time_zone(time.timezone.as_deref().unwrap_or("UTC")),
+        })
+    }
+}
+
+fn parse_start_date(value: &str) -> Option<civil::Date> {
+    value.get(..10)?.parse().ok()
+}
+
+const GRAPH_WEEKDAYS: [&str; 7] = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+];
+
+fn graph_weekday(date: civil::Date) -> &'static str {
+    GRAPH_WEEKDAYS[usize::from(date.weekday().to_sunday_zero_offset().unsigned_abs())]
+}
+
+impl GraphRecurrenceRule {
+    fn anchored(self, anchor: &RecurrenceAnchor) -> GraphRecurrence {
+        let start = anchor.start;
+        let start_day = u32::from(start.day().unsigned_abs());
+        let start_month = u32::from(start.month().unsigned_abs());
+        let names =
+            |days: Vec<&'static str>| Some(days.into_iter().map(ToString::to_string).collect());
+        let mut pattern = GraphRecurrencePattern {
+            kind: None,
+            interval: Some(self.interval),
+            month: None,
+            day_of_month: None,
+            days_of_week: None,
+            first_day_of_week: None,
+            index: None,
+        };
+        let kind = match self.shape {
+            PatternShape::Daily => "daily",
+            PatternShape::Weekly(days) => {
+                pattern.days_of_week = names(days.unwrap_or_else(|| vec![graph_weekday(start)]));
+                pattern.first_day_of_week = Some(self.first_day_of_week.to_string());
+                "weekly"
+            }
+            PatternShape::AbsoluteMonthly(day) => {
+                pattern.day_of_month = Some(day.unwrap_or(start_day));
+                "absoluteMonthly"
+            }
+            PatternShape::RelativeMonthly { days, index } => {
+                pattern.days_of_week = names(days);
+                pattern.index = Some(index.to_string());
+                "relativeMonthly"
+            }
+            PatternShape::AbsoluteYearly { month, day } => {
+                pattern.month = Some(month.unwrap_or(start_month));
+                pattern.day_of_month = Some(day.unwrap_or(start_day));
+                "absoluteYearly"
+            }
+            PatternShape::RelativeYearly { month, days, index } => {
+                pattern.month = Some(month);
+                pattern.days_of_week = names(days);
+                pattern.index = Some(index.to_string());
+                "relativeYearly"
+            }
+        };
+        pattern.kind = Some(kind.to_string());
+        let until = self.until.map(|until| match until {
+            RRuleUntil::Local(date) => date,
+            RRuleUntil::Utc(at) => anchor
+                .zone
+                .as_ref()
+                .and_then(|zone| {
+                    let instant = Offset::UTC.to_timestamp(at).ok()?;
+                    Some(zone.to_datetime(instant).date())
+                })
+                .unwrap_or_else(|| at.date()),
+        });
+        let range_kind = if self.count.is_some() {
+            "numbered"
+        } else if until.is_some() {
+            "endDate"
+        } else {
+            "noEnd"
+        };
+        GraphRecurrence {
+            pattern: Some(pattern),
+            range: Some(GraphRecurrenceRange {
+                kind: Some(range_kind.to_string()),
+                start_date: Some(start.to_string()),
+                end_date: until.as_ref().map(ToString::to_string),
+                recurrence_time_zone: None,
+                number_of_occurrences: self.count,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+fn graph_recurrence_from_rrule(
+    rrule: &str,
+    start_date: &str,
+) -> Result<GraphRecurrence, RecurrenceRefusal> {
+    let anchor = RecurrenceAnchor {
+        start: parse_start_date(start_date)
+            .ok_or_else(|| malformed_rrule("test start is not a date"))?,
+        zone: None,
+    };
+    graph_recurrence_rule(rrule).map(|rule| rule.anchored(&anchor))
+}
+
+/// Map an RRULE onto a Graph recurrence pattern, or refuse it.
+///
+/// Every part must land in the pattern with its meaning intact. Equivalent
+/// shapes are rewritten: every-day-on-these-weekdays (DAILY with BYDAY) and
+/// every-such-weekday of each month or year are weekly patterns, a lone
+/// ordinal weekday (`2MO`, `-1FR`) is a relative pattern's index, and values
+/// RFC 5545 takes from DTSTART come from the event start. A part Graph would
+/// ignore for the chosen pattern type (BYDAY on an absolute pattern, BYMONTH
+/// on anything but yearly, BYSETPOS on an absolute pattern) would widen or
+/// narrow the series without the caller's knowledge, so it is refused rather
+/// than sent.
+fn graph_recurrence_rule(rrule: &str) -> Result<GraphRecurrenceRule, RecurrenceRefusal> {
+    let parsed = ParsedRRule::parse(rrule)?;
+    let frequency = parsed
+        .value("FREQ")
+        .ok_or_else(|| malformed_rrule("RRULE has no FREQ"))?
+        .to_ascii_uppercase();
+    match frequency.as_str() {
+        "DAILY" | "WEEKLY" | "MONTHLY" | "YEARLY" => {}
+        "SECONDLY" | "MINUTELY" | "HOURLY" => {
+            return Err(unexpressible(format!(
+                "Graph recurrence has no FREQ={frequency}"
+            )));
+        }
+        _ => {
+            return Err(malformed_rrule(format!(
+                "RRULE FREQ {frequency:?} is not an RFC 5545 frequency"
+            )));
+        }
+    }
+    let interval = parsed
+        .value("INTERVAL")
+        .map(|value| rrule_positive(value, "INTERVAL"))
+        .transpose()?
+        .unwrap_or(1);
+    let count = parsed
+        .value("COUNT")
+        .map(|value| rrule_positive(value, "COUNT"))
+        .transpose()?;
+    let until = parsed.value("UNTIL").map(parse_rrule_until).transpose()?;
+    if count.is_some() && until.is_some() {
+        return Err(malformed_rrule("RRULE sets both COUNT and UNTIL"));
+    }
+    let month = rrule_single_number(&parsed, "BYMONTH", 1..=12)?;
+    let day_of_month = rrule_single_number(&parsed, "BYMONTHDAY", -31..=31)?;
+    if day_of_month.is_some_and(|day| day < 0) {
+        return Err(unexpressible(
+            "Graph recurrence cannot count BYMONTHDAY from the end of the month",
+        ));
+    }
+    let set_pos = rrule_single_number(&parsed, "BYSETPOS", -366..=366)?;
+    let index = set_pos
+        .map(|position| {
+            rrule_setpos_to_graph(position).ok_or_else(|| {
+                unexpressible(format!(
+                    "Graph recurrence index has no BYSETPOS={position}; it holds 1 to 4 or -1"
+                ))
+            })
+        })
+        .transpose()?;
+    let month = month.map(i32::unsigned_abs);
+    let day_of_month = day_of_month.map(i32::unsigned_abs);
+    let days = parsed
+        .value("BYDAY")
+        .map(|value| parse_rrule_byday(value, &frequency))
+        .transpose()?;
+    // WKST is carried as Graph's `firstDayOfWeek` on weekly patterns, the
+    // only Graph pattern it changes; elsewhere RFC 5545 gives it meaning only
+    // alongside BYWEEKNO, which is refused above.
+    let first_day_of_week = parsed
+        .value("WKST")
+        .map(|week_start| {
+            rrule_day_to_graph(&week_start.to_ascii_uppercase()).ok_or_else(|| {
+                malformed_rrule(format!("RRULE WKST {week_start:?} is not a weekday"))
+            })
+        })
+        .transpose()?
+        .unwrap_or("monday");
+
+    let forbid = |key: &str, present: bool| {
+        if present {
+            Err(unexpressible(format!(
+                "Graph recurrence cannot express {key} with FREQ={frequency} in this shape"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    let shape = match frequency.as_str() {
+        "DAILY" => {
+            forbid("BYMONTH", month.is_some())?;
+            forbid("BYMONTHDAY", day_of_month.is_some())?;
+            forbid("BYSETPOS", index.is_some())?;
+            match days {
+                None => PatternShape::Daily,
+                // Every day, kept to the listed weekdays, is a weekly pattern
+                // on those days. With INTERVAL > 1 the day stride and the week
+                // no longer line up.
+                Some(days) if interval == 1 => PatternShape::Weekly(Some(plain_days(&days))),
+                Some(_) => {
+                    return Err(unexpressible(
+                        "Graph recurrence cannot express BYDAY on a FREQ=DAILY rule with \
+                         INTERVAL > 1",
+                    ));
+                }
+            }
+        }
+        "WEEKLY" => {
+            forbid("BYMONTH", month.is_some())?;
+            forbid("BYMONTHDAY", day_of_month.is_some())?;
+            forbid("BYSETPOS", index.is_some())?;
+            PatternShape::Weekly(days.as_deref().map(plain_days))
+        }
+        "MONTHLY" => {
+            // BYMONTH on a MONTHLY rule keeps some months only; Graph's
+            // monthly patterns run every month.
+            forbid("BYMONTH", month.is_some())?;
+            if let Some(day) = day_of_month {
+                forbid("BYDAY", days.is_some())?;
+                forbid("BYSETPOS", index.is_some())?;
+                PatternShape::AbsoluteMonthly(Some(day))
+            } else if let Some(days) = days {
+                match relative_days(&days, index)? {
+                    Some((days, index)) => PatternShape::RelativeMonthly { days, index },
+                    // Every listed weekday of every month is every such
+                    // weekday: a weekly pattern.
+                    None if interval == 1 => PatternShape::Weekly(Some(plain_days(&days))),
+                    None => {
+                        return Err(unexpressible(
+                            "Graph recurrence cannot express every BYDAY weekday of every n-th \
+                             month",
+                        ));
+                    }
+                }
+            } else {
+                forbid("BYSETPOS", index.is_some())?;
+                PatternShape::AbsoluteMonthly(None)
+            }
+        }
+        // YEARLY; FREQ was validated above.
+        _ => {
+            if let Some(day) = day_of_month {
+                forbid("BYDAY", days.is_some())?;
+                forbid("BYSETPOS", index.is_some())?;
+                let Some(month) = month else {
+                    return Err(unexpressible(
+                        "Graph recurrence cannot express BYMONTHDAY in every month of a \
+                         FREQ=YEARLY rule without BYMONTH",
+                    ));
+                };
+                PatternShape::AbsoluteYearly {
+                    month: Some(month),
+                    day: Some(day),
+                }
+            } else if let Some(days) = days {
+                let plain = index.is_none() && days.iter().all(|day| day.ordinal.is_none());
+                match month {
+                    // With BYMONTH, a BYDAY ordinal counts within the month.
+                    Some(month) => match relative_days(&days, index)? {
+                        Some((days, index)) => PatternShape::RelativeYearly { month, days, index },
+                        None => {
+                            return Err(unexpressible(
+                                "Graph recurrence cannot express every BYDAY weekday of one \
+                                 month",
+                            ));
+                        }
+                    },
+                    // Every listed weekday of every year is a weekly pattern.
+                    None if plain && interval == 1 => PatternShape::Weekly(Some(plain_days(&days))),
+                    None => {
+                        return Err(unexpressible(
+                            "Graph recurrence cannot express a BYDAY weekday counted through a \
+                             whole year",
+                        ));
+                    }
+                }
+            } else {
+                forbid("BYSETPOS", index.is_some())?;
+                PatternShape::AbsoluteYearly { month, day: None }
+            }
+        }
+    };
+    Ok(GraphRecurrenceRule {
+        shape,
+        interval,
+        first_day_of_week,
+        count,
+        until,
     })
+}
+
+/// One BYDAY item: a Graph weekday name and its RFC 5545 ordinal, if any.
+#[derive(Debug, Clone, Copy)]
+struct RRuleByDay {
+    ordinal: Option<i32>,
+    day: &'static str,
+}
+
+fn plain_days(days: &[RRuleByDay]) -> Vec<&'static str> {
+    days.iter().map(|day| day.day).collect()
+}
+
+/// The `daysOfWeek` and `index` of a Graph relative pattern, or `None` when
+/// the BYDAY list names every such weekday (no position at all).
+///
+/// Graph's `index` picks ONE day out of the `daysOfWeek` set, which is exactly
+/// BYSETPOS over plain weekdays. An ordinal weekday maps the same way only on
+/// its own: `1MO,1TU` is the first Monday AND the first Tuesday, two
+/// occurrences, where Graph's first of Monday-or-Tuesday is one.
+fn relative_days(
+    days: &[RRuleByDay],
+    index: Option<&'static str>,
+) -> Result<Option<(Vec<&'static str>, &'static str)>, RecurrenceRefusal> {
+    if days.iter().all(|day| day.ordinal.is_none()) {
+        return Ok(index.map(|index| (plain_days(days), index)));
+    }
+    match days {
+        [
+            RRuleByDay {
+                ordinal: Some(ordinal),
+                day,
+            },
+        ] if index.is_none() => rrule_setpos_to_graph(*ordinal)
+            .map(|index| Some((vec![*day], index)))
+            .ok_or_else(|| {
+                unexpressible(format!(
+                    "Graph recurrence index has no position {ordinal}; it holds 1 to 4 or -1"
+                ))
+            }),
+        _ => Err(unexpressible(
+            "Graph recurrence cannot express several ordinal BYDAY values, or an ordinal BYDAY \
+             with BYSETPOS",
+        )),
+    }
+}
+
+fn rrule_positive(value: &str, key: &str) -> Result<u32, RecurrenceRefusal> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| malformed_rrule(format!("RRULE {key} {value:?} is not a positive integer")))
+}
+
+/// Parse a BYxxx list Graph holds as one value. Each item must be a non-zero
+/// integer within `range`; more than one item is a list Graph has no field
+/// for.
+fn rrule_single_number(
+    parsed: &ParsedRRule<'_>,
+    key: &str,
+    range: std::ops::RangeInclusive<i32>,
+) -> Result<Option<i32>, RecurrenceRefusal> {
+    let Some(value) = parsed.value(key) else {
+        return Ok(None);
+    };
+    let mut numbers = Vec::new();
+    for item in value.split(',') {
+        let number = item
+            .parse::<i32>()
+            .ok()
+            .filter(|number| *number != 0 && range.contains(number))
+            .ok_or_else(|| {
+                malformed_rrule(format!("RRULE {key} value {item:?} is out of range"))
+            })?;
+        numbers.push(number);
+    }
+    match numbers.as_slice() {
+        [number] => Ok(Some(*number)),
+        _ => Err(unexpressible(format!(
+            "Graph recurrence holds a single {key} value"
+        ))),
+    }
+}
+
+/// Parse a BYDAY list. An ordinal prefix (`2MO`, `-1FR`) is not valid on a
+/// DAILY or WEEKLY rule at all.
+fn parse_rrule_byday(value: &str, frequency: &str) -> Result<Vec<RRuleByDay>, RecurrenceRefusal> {
+    let mut days = Vec::new();
+    for item in value.split(',') {
+        let split = item
+            .len()
+            .checked_sub(2)
+            .filter(|at| item.is_char_boundary(*at));
+        let Some((ordinal, day)) = split.map(|at| item.split_at(at)) else {
+            return Err(malformed_rrule(format!(
+                "RRULE BYDAY value {item:?} is not a weekday"
+            )));
+        };
+        let Some(day) = rrule_day_to_graph(&day.to_ascii_uppercase()) else {
+            return Err(malformed_rrule(format!(
+                "RRULE BYDAY value {item:?} is not a weekday"
+            )));
+        };
+        let ordinal = if ordinal.is_empty() {
+            None
+        } else {
+            let parsed = ordinal
+                .parse::<i32>()
+                .ok()
+                .filter(|ordinal| *ordinal != 0 && (-53..=53).contains(ordinal));
+            if parsed.is_none() || matches!(frequency, "DAILY" | "WEEKLY") {
+                return Err(malformed_rrule(format!(
+                    "RRULE BYDAY value {item:?} has an invalid ordinal for FREQ={frequency}"
+                )));
+            }
+            parsed
+        };
+        days.push(RRuleByDay { ordinal, day });
+    }
+    Ok(days)
 }
 
 fn graph_recurrence_start_date(value: &str) -> String {
@@ -1093,51 +1739,115 @@ fn graph_index_to_setpos(index: &str) -> Option<i32> {
     }
 }
 
-fn rrule_setpos_to_graph(index: &str) -> Option<&'static str> {
-    match index {
-        "1" => Some("first"),
-        "2" => Some("second"),
-        "3" => Some("third"),
-        "4" => Some("fourth"),
-        "-1" => Some("last"),
+fn rrule_setpos_to_graph(position: i32) -> Option<&'static str> {
+    match position {
+        1 => Some("first"),
+        2 => Some("second"),
+        3 => Some("third"),
+        4 => Some("fourth"),
+        -1 => Some("last"),
         _ => None,
     }
 }
 
-fn rrule_until_to_graph_date(value: &str) -> String {
-    if value.len() >= 8 {
-        format!("{}-{}-{}", &value[0..4], &value[4..6], &value[6..8])
-    } else {
-        value.to_string()
-    }
+/// RFC 5545 UNTIL is a DATE (`YYYYMMDD`), a floating DATE-TIME
+/// (`YYYYMMDDTHHMMSS`) or a UTC DATE-TIME (the same with `Z`). Graph's range
+/// end is a local date, which a UTC value only yields once the event's time
+/// zone is known.
+fn parse_rrule_until(value: &str) -> Result<RRuleUntil, RecurrenceRefusal> {
+    let number = |range: std::ops::Range<usize>| -> Option<i16> {
+        let digits = value.get(range)?;
+        if !digits.as_bytes().iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    let two = |at: usize| number(at..at + 2).and_then(|value| i8::try_from(value).ok());
+    let date = || civil::Date::new(number(0..4)?, two(4)?, two(6)?).ok();
+    let time = || civil::Time::new(two(9)?, two(11)?, two(13)?, 0).ok();
+    let bytes = value.as_bytes();
+    let parsed = match (bytes.len(), bytes.get(8), bytes.get(15)) {
+        (8, _, _) => date().map(RRuleUntil::Local),
+        (15, Some(b'T'), _) => date().zip(time()).map(|(date, _)| RRuleUntil::Local(date)),
+        (16, Some(b'T'), Some(b'Z')) => date()
+            .zip(time())
+            .map(|(date, time)| RRuleUntil::Utc(date.to_datetime(time))),
+        _ => None,
+    };
+    parsed.ok_or_else(|| {
+        malformed_rrule(format!(
+            "RRULE UNTIL {value:?} is not an RFC 5545 date or date-time"
+        ))
+    })
 }
 
+/// RRULE parts this mapping translates into a Graph pattern.
+const RRULE_MAPPED_PARTS: &[&str] = &[
+    "FREQ",
+    "INTERVAL",
+    "BYMONTH",
+    "BYMONTHDAY",
+    "BYDAY",
+    "BYSETPOS",
+    "COUNT",
+    "UNTIL",
+    "WKST",
+];
+
+/// Well-formed RRULE parts (RFC 5545, plus RFC 7529's RSCALE and SKIP) that
+/// Graph's `patternedRecurrence` has no field for.
+const RRULE_UNMAPPED_PARTS: &[&str] = &[
+    "BYSECOND",
+    "BYMINUTE",
+    "BYHOUR",
+    "BYYEARDAY",
+    "BYWEEKNO",
+    "RSCALE",
+    "SKIP",
+];
+
 struct ParsedRRule<'a> {
-    parts: Vec<(&'a str, &'a str)>,
+    parts: Vec<(String, &'a str)>,
 }
 
 impl<'a> ParsedRRule<'a> {
-    fn parse(value: &'a str) -> Self {
-        let parts = value
-            .split(';')
-            .filter_map(|part| part.split_once('='))
-            .collect();
-        Self { parts }
+    fn parse(value: &'a str) -> Result<Self, RecurrenceRefusal> {
+        let mut parts: Vec<(String, &'a str)> = Vec::new();
+        // An empty segment (a trailing `;`) carries no rule part, so skipping
+        // it drops nothing.
+        for part in value.split(';').filter(|part| !part.is_empty()) {
+            let Some((key, value)) = part.split_once('=') else {
+                return Err(malformed_rrule(format!(
+                    "RRULE part {part:?} is not NAME=VALUE"
+                )));
+            };
+            let key = key.to_ascii_uppercase();
+            if value.is_empty() {
+                return Err(malformed_rrule(format!("RRULE part {key} has no value")));
+            }
+            if parts.iter().any(|(seen, _)| *seen == key) {
+                return Err(malformed_rrule(format!("RRULE repeats {key}")));
+            }
+            if RRULE_UNMAPPED_PARTS.contains(&key.as_str()) || key.starts_with("X-") {
+                return Err(unexpressible(format!(
+                    "Graph recurrence cannot express RRULE part {key}"
+                )));
+            }
+            if !RRULE_MAPPED_PARTS.contains(&key.as_str()) {
+                return Err(malformed_rrule(format!(
+                    "RRULE part {key} is not an RFC 5545 rule part"
+                )));
+            }
+            parts.push((key, value));
+        }
+        Ok(Self { parts })
     }
 
     fn value(&self, key: &str) -> Option<&'a str> {
         self.parts
             .iter()
-            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| *value)
-    }
-
-    fn keys_supported(&self, supported: &[&str]) -> bool {
-        self.parts.iter().all(|(key, _)| {
-            supported
-                .iter()
-                .any(|supported_key| key.eq_ignore_ascii_case(supported_key))
-        })
     }
 }
 
@@ -1388,6 +2098,9 @@ struct GraphEvent {
     response_status: Option<Value>,
     is_cancelled: Option<bool>,
     change_key: Option<String>,
+    /// The zone the event was created in (a Windows id, usually): the zone a
+    /// UTC RRULE `UNTIL` is read in when a patch does not restate `start`.
+    original_start_time_zone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1411,8 +2124,9 @@ struct GraphEventPatch {
     sensitivity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attendees: Option<Vec<GraphAttendee>>,
+    /// `Some(None)` serializes as `null`, which clears the recurrence.
     #[serde(skip_serializing_if = "Option::is_none")]
-    recurrence: Option<GraphRecurrence>,
+    recurrence: Option<Option<GraphRecurrence>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1503,6 +2217,8 @@ struct GraphRecurrencePattern {
     #[serde(skip_serializing_if = "Option::is_none")]
     days_of_week: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    first_day_of_week: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     index: Option<String>,
 }
 
@@ -1580,6 +2296,7 @@ mod tests {
                 response_status: Some(json!({"response": "tentativelyAccepted"})),
                 is_cancelled: Some(true),
                 change_key: Some("etag".to_string()),
+                original_start_time_zone: None,
             },
         );
 
@@ -1616,6 +2333,7 @@ mod tests {
             response_status: None,
             is_cancelled: None,
             change_key: None,
+            original_start_time_zone: None,
         };
 
         let exception = GraphEvent {
@@ -1667,7 +2385,8 @@ mod tests {
                 status: RsvpStatus::Accepted,
             }],
             recurrence: EventRecurrence::default(),
-        });
+        })
+        .expect("create payload");
 
         assert_eq!(
             patch
@@ -1846,12 +2565,16 @@ mod tests {
 
     #[test]
     fn graph_event_patch_preserves_scalar_clear_semantics() {
-        let patch = graph_event_from_patch(&EventPatch {
-            title: Some(None),
-            description: Some(None),
-            location: Some(Some("Room 1".to_string())),
-            ..EventPatch::default()
-        });
+        let patch = graph_event_from_patch(
+            &EventPatch {
+                title: Some(None),
+                description: Some(None),
+                location: Some(Some("Room 1".to_string())),
+                ..EventPatch::default()
+            },
+            CurrentSeries::default(),
+        )
+        .expect("patch payload");
         let value = serde_json::to_value(&patch).expect("patch json");
 
         assert!(value.get("subject").is_some_and(Value::is_null));
@@ -1870,13 +2593,17 @@ mod tests {
         // A date-only start with no explicit is_all_day must emit
         // isAllDay:true alongside the midnight dateTime, else Graph keeps
         // the event timed at midnight.
-        let patch = graph_event_from_patch(&EventPatch {
-            start: Some(EventTime {
-                value: "2026-06-02".to_string(),
-                timezone: Some("UTC".to_string()),
-            }),
-            ..EventPatch::default()
-        });
+        let patch = graph_event_from_patch(
+            &EventPatch {
+                start: Some(EventTime {
+                    value: "2026-06-02".to_string(),
+                    timezone: Some("UTC".to_string()),
+                }),
+                ..EventPatch::default()
+            },
+            CurrentSeries::default(),
+        )
+        .expect("patch payload");
         let value = serde_json::to_value(&patch).expect("patch json");
         assert_eq!(value.get("isAllDay"), Some(&json!(true)));
         assert_eq!(
@@ -1890,13 +2617,17 @@ mod tests {
 
     #[test]
     fn timed_start_patch_does_not_set_all_day() {
-        let patch = graph_event_from_patch(&EventPatch {
-            start: Some(EventTime {
-                value: "2026-06-02T09:30:00".to_string(),
-                timezone: Some("UTC".to_string()),
-            }),
-            ..EventPatch::default()
-        });
+        let patch = graph_event_from_patch(
+            &EventPatch {
+                start: Some(EventTime {
+                    value: "2026-06-02T09:30:00".to_string(),
+                    timezone: Some("UTC".to_string()),
+                }),
+                ..EventPatch::default()
+            },
+            CurrentSeries::default(),
+        )
+        .expect("patch payload");
         let value = serde_json::to_value(&patch).expect("patch json");
         assert_eq!(value.get("isAllDay"), Some(&json!(false)));
     }
@@ -1905,27 +2636,39 @@ mod tests {
     fn metadata_only_patch_omits_all_day() {
         // A patch touching no time field must not flip the event's
         // all-day state.
-        let patch = graph_event_from_patch(&EventPatch {
-            title: Some(Some("Renamed".to_string())),
-            ..EventPatch::default()
-        });
+        let patch = graph_event_from_patch(
+            &EventPatch {
+                title: Some(Some("Renamed".to_string())),
+                ..EventPatch::default()
+            },
+            CurrentSeries::default(),
+        )
+        .expect("patch payload");
         let value = serde_json::to_value(&patch).expect("patch json");
         assert!(value.get("isAllDay").is_none());
     }
 
+    /// FREQ=MONTHLY;BYDAY=MO (every Monday) has no Graph relative-pattern
+    /// index, and Graph would silently default a missing one to "first".
+    /// Every Monday of every month is every Monday, so it is written as a
+    /// weekly pattern instead. Every Monday of June has no Graph shape.
     #[test]
-    fn relative_monthly_without_index_is_rejected() {
-        // FREQ=MONTHLY;BYDAY=MO (every Monday) has no Graph relative-
-        // pattern index; Graph would silently default to "first", so we
-        // reject locally rather than ship a narrowed recurrence.
-        assert!(
-            graph_recurrence_from_rrule("FREQ=MONTHLY;BYDAY=MO", "2026-06-02".to_string())
-                .is_none()
-        );
-        assert!(
-            graph_recurrence_from_rrule("FREQ=YEARLY;BYMONTH=6;BYDAY=MO", "2026-06-02".to_string())
-                .is_none()
-        );
+    fn relative_monthly_without_index_is_weekly_or_refused() {
+        let every_monday = graph_recurrence_from_rrule("FREQ=MONTHLY;BYDAY=MO", "2026-06-02")
+            .expect("every Monday maps");
+        let pattern = every_monday.pattern.expect("pattern");
+        assert_eq!(pattern.kind.as_deref(), Some("weekly"));
+        assert_eq!(pattern.days_of_week, Some(vec!["monday".to_string()]));
+        assert_eq!(pattern.index, None);
+
+        assert!(matches!(
+            graph_recurrence_from_rrule("FREQ=MONTHLY;INTERVAL=2;BYDAY=MO", "2026-06-02"),
+            Err(RecurrenceRefusal::Unsupported(_))
+        ));
+        assert!(matches!(
+            graph_recurrence_from_rrule("FREQ=YEARLY;BYMONTH=6;BYDAY=MO", "2026-06-02"),
+            Err(RecurrenceRefusal::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -1981,6 +2724,7 @@ mod tests {
                 response_status: None,
                 is_cancelled: None,
                 change_key: None,
+                original_start_time_zone: None,
             },
         );
 
@@ -2011,7 +2755,8 @@ mod tests {
             organizer: None,
             attendees: Vec::new(),
             recurrence: EventRecurrence::default(),
-        });
+        })
+        .expect("create payload");
 
         assert_eq!(patch.is_all_day, Some(true));
         assert_eq!(
@@ -2048,6 +2793,7 @@ mod tests {
                         month: None,
                         day_of_month: None,
                         days_of_week: Some(vec!["monday".to_string(), "wednesday".to_string()]),
+                        first_day_of_week: Some("monday".to_string()),
                         index: None,
                     }),
                     range: Some(GraphRecurrenceRange {
@@ -2062,6 +2808,7 @@ mod tests {
                 response_status: None,
                 is_cancelled: None,
                 change_key: None,
+                original_start_time_zone: None,
             },
         );
 
@@ -2096,8 +2843,12 @@ mod tests {
                 rrule: Some("FREQ=MONTHLY;BYDAY=MO;BYSETPOS=2;COUNT=3".to_string()),
                 ..EventRecurrence::default()
             },
-        });
-        let recurrence = patch.recurrence.expect("recurrence");
+        })
+        .expect("create payload");
+        let recurrence = patch
+            .recurrence
+            .expect("recurrence write")
+            .expect("a series, not a clear");
         let pattern = recurrence.pattern.expect("pattern");
         let range = recurrence.range.expect("range");
 
@@ -2109,9 +2860,8 @@ mod tests {
         assert_eq!(range.number_of_occurrences, Some(3));
     }
 
-    #[test]
-    fn graph_event_create_rejects_unsupported_rrule_parts() {
-        let patch = graph_event_from_create(&EventCreate {
+    fn recurring_create(rrule: &str) -> EventCreate {
+        EventCreate {
             calendar_id: CalendarId("calendar".to_string()),
             title: None,
             description: None,
@@ -2131,21 +2881,387 @@ mod tests {
             organizer: None,
             attendees: Vec::new(),
             recurrence: EventRecurrence {
-                rrule: Some("FREQ=MONTHLY;BYDAY=MO;BYHOUR=9".to_string()),
+                rrule: Some(rrule.to_string()),
                 ..EventRecurrence::default()
             },
-        });
+        }
+    }
 
-        assert!(patch.recurrence.is_none());
+    /// An RRULE Graph cannot express used to be dropped from the payload,
+    /// creating a one-off event where a series was asked for.
+    #[test]
+    fn graph_event_create_rejects_unsupported_rrule_parts() {
+        let error = graph_event_from_create(&recurring_create("FREQ=MONTHLY;BYDAY=MO;BYHOUR=9"))
+            .expect_err("an unexpressible RRULE must refuse the create");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
+        );
     }
 
     #[test]
-    fn graph_recurrence_rejects_relative_monthly_without_byday() {
-        assert!(graph_recurrence_from_rrule("FREQ=MONTHLY", "2026-06-02".to_string()).is_none());
-        assert!(
-            graph_recurrence_from_rrule("FREQ=YEARLY;BYMONTH=6", "2026-06-02".to_string())
-                .is_none()
+    fn graph_event_create_rejects_malformed_rrule_as_caller_input() {
+        let error = graph_event_from_create(&recurring_create("FREQ=WEEKLY;INTERVAL=abc"))
+            .expect_err("a malformed RRULE must refuse the create");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         );
+        assert_eq!(error.recovery(), &bifrost_types::RecoveryClass::ClientBug);
+    }
+
+    fn recurrence_patch(rrule: &str, start: Option<&str>) -> EventPatch {
+        EventPatch {
+            start: start.map(|value| EventTime {
+                value: value.to_string(),
+                timezone: Some("UTC".to_string()),
+            }),
+            recurrence: Some(EventRecurrence {
+                rrule: Some(rrule.to_string()),
+                ..EventRecurrence::default()
+            }),
+            ..EventPatch::default()
+        }
+    }
+
+    /// The patch path dropped an unexpressible RRULE too, leaving the
+    /// series unchanged while the update reported success.
+    #[test]
+    fn graph_event_patch_rejects_unsupported_rrule_parts() {
+        let error = graph_event_from_patch(
+            &recurrence_patch("FREQ=DAILY;BYHOUR=9", Some("2026-06-02T12:00:00")),
+            CurrentSeries::default(),
+        )
+        .expect_err("an unexpressible RRULE must refuse the patch");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        );
+    }
+
+    fn range_start(patch: &GraphEventPatch) -> Option<&str> {
+        patch
+            .recurrence
+            .as_ref()
+            .and_then(Option::as_ref)
+            .and_then(|recurrence| recurrence.range.as_ref())
+            .and_then(|range| range.start_date.as_deref())
+    }
+
+    /// A recurrence as Graph reports it for a series that began on
+    /// `start_date`, the only part of it the anchoring reads.
+    fn existing_series(start_date: &str) -> GraphRecurrence {
+        GraphRecurrence {
+            pattern: Some(GraphRecurrencePattern {
+                kind: Some("daily".to_string()),
+                interval: Some(1),
+                month: None,
+                day_of_month: None,
+                days_of_week: None,
+                first_day_of_week: None,
+                index: None,
+            }),
+            range: Some(GraphRecurrenceRange {
+                kind: Some("noEnd".to_string()),
+                start_date: Some(start_date.to_string()),
+                end_date: None,
+                recurrence_time_zone: None,
+                number_of_occurrences: None,
+            }),
+        }
+    }
+
+    /// A recurrence patch without `start` built its range from an empty
+    /// time, sending `startDate: ""`. An event that already recurs is
+    /// anchored on its own series start; one that does not is refused.
+    #[test]
+    fn graph_event_patch_recurrence_without_start_is_anchored_or_refused() {
+        let patch = recurrence_patch("FREQ=DAILY;COUNT=3", None);
+
+        let existing = existing_series("2026-05-04");
+        let series = CurrentSeries {
+            recurrence: Some(&existing),
+            time_zone: None,
+        };
+
+        let anchored = graph_event_from_patch(&patch, series).expect("series start anchors");
+        assert_eq!(range_start(&anchored), Some("2026-05-04"));
+
+        let error = graph_event_from_patch(&patch, CurrentSeries::default())
+            .expect_err("no start and no series start must be refused");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        );
+
+        // A start in the same patch wins over the old series start.
+        let restarted = graph_event_from_patch(
+            &recurrence_patch("FREQ=DAILY;COUNT=3", Some("2026-06-02T12:00:00")),
+            series,
+        )
+        .expect("patch start anchors");
+        assert_eq!(range_start(&restarted), Some("2026-06-02"));
+    }
+
+    /// Moving `start` on a recurring event without restating the recurrence
+    /// re-sends the event's own recurrence with the range start moved along.
+    #[test]
+    fn graph_event_patch_start_move_carries_the_series_range_along() {
+        let existing = existing_series("2026-05-04");
+        let series = CurrentSeries {
+            recurrence: Some(&existing),
+            time_zone: None,
+        };
+        let moved = EventPatch {
+            start: Some(EventTime {
+                value: "2026-06-09T12:00:00".to_string(),
+                timezone: Some("UTC".to_string()),
+            }),
+            ..EventPatch::default()
+        };
+
+        let patch = graph_event_from_patch(&moved, series).expect("patch payload");
+        assert_eq!(range_start(&patch), Some("2026-06-09"));
+
+        // A one-off has no recurrence to carry.
+        let one_off =
+            graph_event_from_patch(&moved, CurrentSeries::default()).expect("patch payload");
+        assert!(one_off.recurrence.is_none());
+    }
+
+    /// An empty recurrence is how a patch makes a series a one-off: it goes
+    /// out as `"recurrence": null`, distinct from a patch that omits it.
+    #[test]
+    fn graph_event_patch_with_empty_recurrence_clears_it() {
+        let patch = graph_event_from_patch(
+            &EventPatch {
+                recurrence: Some(EventRecurrence::default()),
+                ..EventPatch::default()
+            },
+            CurrentSeries::default(),
+        )
+        .expect("patch payload");
+        let value = serde_json::to_value(&patch).expect("patch json");
+        assert!(value.get("recurrence").is_some_and(Value::is_null));
+
+        let untouched = graph_event_from_patch(&EventPatch::default(), CurrentSeries::default())
+            .expect("patch payload");
+        let value = serde_json::to_value(&untouched).expect("patch json");
+        assert!(value.get("recurrence").is_none());
+    }
+
+    /// Through `update` itself: the series start comes off the fetched
+    /// event and reaches the PATCH body on the wire.
+    #[tokio::test]
+    async fn update_anchors_a_startless_recurrence_patch_on_the_series_start() {
+        let current = json!({
+            "id": "e1",
+            "changeKey": "ck1",
+            "recurrence": {
+                "pattern": {"type": "daily", "interval": 1},
+                "range": {"type": "noEnd", "startDate": "2026-05-04"}
+            }
+        });
+        let (account, script) = scripted_search_account_pages(vec![current, json!({})]);
+
+        update(
+            account,
+            EventId("calendar::e1".to_string()),
+            recurrence_patch("FREQ=WEEKLY;BYDAY=MO", None),
+        )
+        .await
+        .expect("update succeeds");
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].method, reqwest::Method::PATCH);
+        let body: Value =
+            serde_json::from_slice(requests[1].body.as_ref().expect("patch carries a body"))
+                .expect("patch body is json");
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2026-05-04");
+        assert_eq!(body["recurrence"]["pattern"]["type"], "weekly");
+        // RFC 5545's default week start, written explicitly because Graph's
+        // own default is Sunday.
+        assert_eq!(body["recurrence"]["pattern"]["firstDayOfWeek"], "monday");
+    }
+
+    /// An empty attendee list is how a patch clears attendees; it was
+    /// omitted from the body, so the old attendees stayed.
+    #[test]
+    fn graph_event_patch_with_no_attendees_clears_them() {
+        let patch = graph_event_from_patch(
+            &EventPatch {
+                attendees: Some(Vec::new()),
+                ..EventPatch::default()
+            },
+            CurrentSeries::default(),
+        )
+        .expect("patch payload");
+        let value = serde_json::to_value(&patch).expect("patch json");
+        assert_eq!(value.get("attendees"), Some(&json!([])));
+
+        // A patch not touching attendees still leaves them alone.
+        let untouched = graph_event_from_patch(&EventPatch::default(), CurrentSeries::default())
+            .expect("patch");
+        let value = serde_json::to_value(&untouched).expect("patch json");
+        assert!(value.get("attendees").is_none());
+    }
+
+    /// RFC 5545 takes whatever a rule leaves out from DTSTART, so a bare
+    /// MONTHLY or a YEARLY with only BYMONTH is the start's day of the month
+    /// (and day of the year), not something Graph cannot express.
+    #[test]
+    fn graph_recurrence_takes_missing_values_from_the_start() {
+        let monthly = graph_recurrence_from_rrule("FREQ=MONTHLY", "2026-06-02")
+            .expect("bare MONTHLY maps")
+            .pattern
+            .expect("pattern");
+        assert_eq!(monthly.kind.as_deref(), Some("absoluteMonthly"));
+        assert_eq!(monthly.day_of_month, Some(2));
+
+        let yearly = graph_recurrence_from_rrule("FREQ=YEARLY;BYMONTH=6", "2026-06-02")
+            .expect("YEARLY with BYMONTH maps")
+            .pattern
+            .expect("pattern");
+        assert_eq!(yearly.kind.as_deref(), Some("absoluteYearly"));
+        assert_eq!(yearly.month, Some(6));
+        assert_eq!(yearly.day_of_month, Some(2));
+
+        let bare_yearly = graph_recurrence_from_rrule("FREQ=YEARLY", "2026-06-02")
+            .expect("bare YEARLY maps")
+            .pattern
+            .expect("pattern");
+        assert_eq!(bare_yearly.month, Some(6));
+        assert_eq!(bare_yearly.day_of_month, Some(2));
+
+        // 2026-06-02 is a Tuesday.
+        let weekly = graph_recurrence_from_rrule("FREQ=WEEKLY", "2026-06-02")
+            .expect("bare WEEKLY maps")
+            .pattern
+            .expect("pattern");
+        assert_eq!(weekly.days_of_week, Some(vec!["tuesday".to_string()]));
+    }
+
+    /// WKST changes which weeks an every-other-week rule lands on, so it is
+    /// carried as `firstDayOfWeek` on weekly patterns (RFC 5545's default
+    /// Monday when absent) and read back only where it differs from Monday
+    /// and matters.
+    #[test]
+    fn wkst_is_carried_as_first_day_of_week_and_round_trips() {
+        let first_day = |rrule: &str| {
+            graph_recurrence_from_rrule(rrule, "2026-06-01")
+                .expect("rule maps")
+                .pattern
+                .expect("pattern")
+                .first_day_of_week
+        };
+        assert_eq!(
+            first_day("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO;WKST=SU").as_deref(),
+            Some("sunday")
+        );
+        assert_eq!(
+            first_day("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO").as_deref(),
+            Some("monday")
+        );
+        // A pattern that is not weekly has no week start to carry.
+        assert_eq!(first_day("FREQ=DAILY;WKST=SU"), None);
+
+        let round_trip = |rrule: &str| {
+            let recurrence = graph_recurrence_from_rrule(rrule, "2026-06-01").expect("rule maps");
+            rrule_from_graph(&recurrence).expect("rrule")
+        };
+        assert_eq!(
+            round_trip("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO;WKST=SU"),
+            "FREQ=WEEKLY;BYDAY=MO;INTERVAL=2;WKST=SU"
+        );
+        assert_eq!(
+            round_trip("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO"),
+            "FREQ=WEEKLY;BYDAY=MO;INTERVAL=2"
+        );
+
+        // A Graph weekly pattern with no `firstDayOfWeek` is read at Graph's
+        // documented default, Sunday.
+        let mut recurrence =
+            graph_recurrence_from_rrule("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO", "2026-06-01")
+                .expect("rule maps");
+        recurrence
+            .pattern
+            .as_mut()
+            .expect("pattern")
+            .first_day_of_week = None;
+        assert_eq!(
+            rrule_from_graph(&recurrence).as_deref(),
+            Some("FREQ=WEEKLY;BYDAY=MO;INTERVAL=2;WKST=SU")
+        );
+    }
+
+    fn rrule_verdict(rrule: &str) -> &'static str {
+        match graph_recurrence_rule(rrule) {
+            Ok(_) => "ok",
+            Err(RecurrenceRefusal::Unsupported(_)) => "unsupported",
+            Err(RecurrenceRefusal::Malformed { .. }) => "malformed",
+        }
+    }
+
+    /// Each rule here was once turned into something other than what it
+    /// says: dropped whole (a one-off event), or written with a part Graph
+    /// ignores for that pattern type, or with an unparseable value quietly
+    /// defaulted. Every one is now refused, and the refusal says whether the
+    /// rule is valid but beyond Graph (`unsupported`) or not an RRULE at all
+    /// (`malformed`).
+    #[test]
+    fn rrules_graph_cannot_take_are_refused_by_kind() {
+        let cases = [
+            // Valid RFC 5545 that Graph's patternedRecurrence cannot hold.
+            ("FREQ=DAILY;BYHOUR=9", "unsupported"),
+            ("FREQ=WEEKLY;BYDAY=MO;X-NAME=1", "unsupported"),
+            ("FREQ=HOURLY", "unsupported"),
+            ("FREQ=DAILY;INTERVAL=2;BYDAY=MO,TU,WE,TH,FR", "unsupported"),
+            ("FREQ=MONTHLY;BYMONTHDAY=13;BYDAY=FR", "unsupported"),
+            ("FREQ=MONTHLY;BYMONTHDAY=1,15", "unsupported"),
+            ("FREQ=MONTHLY;BYMONTHDAY=-1", "unsupported"),
+            ("FREQ=MONTHLY;BYMONTH=6;BYMONTHDAY=1", "unsupported"),
+            ("FREQ=WEEKLY;BYDAY=MO;BYSETPOS=1", "unsupported"),
+            ("FREQ=MONTHLY;BYDAY=MO;BYSETPOS=5", "unsupported"),
+            ("FREQ=MONTHLY;BYDAY=1MO,1TU", "unsupported"),
+            ("FREQ=MONTHLY;BYDAY=5MO", "unsupported"),
+            ("FREQ=MONTHLY;BYDAY=2MO;BYSETPOS=1", "unsupported"),
+            ("FREQ=YEARLY;BYMONTHDAY=15", "unsupported"),
+            // Not an RRULE.
+            ("", "malformed"),
+            ("BYDAY=MO", "malformed"),
+            ("FREQ=SOMETIMES", "malformed"),
+            ("FREQ=DAILY;GARBAGE", "malformed"),
+            ("FREQ=DAILY;FOO=1", "malformed"),
+            ("FREQ=DAILY;FREQ=WEEKLY", "malformed"),
+            ("FREQ=DAILY;INTERVAL=abc", "malformed"),
+            ("FREQ=DAILY;INTERVAL=0", "malformed"),
+            ("FREQ=DAILY;COUNT=3;UNTIL=20290602", "malformed"),
+            ("FREQ=DAILY;UNTIL=2029", "malformed"),
+            ("FREQ=WEEKLY;BYDAY=MO,XX", "malformed"),
+            ("FREQ=WEEKLY;BYDAY=2MO", "malformed"),
+            ("FREQ=YEARLY;BYMONTH=13;BYMONTHDAY=1", "malformed"),
+            ("FREQ=WEEKLY;WKST=XX", "malformed"),
+            // Accepted: the shape is Graph's own, or an equivalent one, or
+            // RFC 5545 takes the missing values from DTSTART.
+            ("FREQ=DAILY", "ok"),
+            ("FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR", "ok"),
+            ("FREQ=MONTHLY", "ok"),
+            ("FREQ=MONTHLY;BYDAY=2MO", "ok"),
+            ("FREQ=MONTHLY;BYDAY=-1FR", "ok"),
+            ("FREQ=YEARLY", "ok"),
+            ("FREQ=YEARLY;BYMONTH=6", "ok"),
+            ("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO;WKST=MO", "ok"),
+            ("freq=weekly;byday=mo,we;", "ok"),
+            ("FREQ=WEEKLY;BYDAY=MO;WKST=MO", "ok"),
+            ("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO;WKST=SU", "ok"),
+            ("FREQ=MONTHLY;BYMONTHDAY=15;UNTIL=20290602T000000Z", "ok"),
+            ("FREQ=YEARLY;BYMONTH=6;BYMONTHDAY=2;COUNT=5", "ok"),
+            ("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1", "ok"),
+        ];
+        for (rrule, expected) in cases {
+            assert_eq!(rrule_verdict(rrule), expected, "{rrule:?}");
+        }
     }
 
     #[test]
@@ -2175,8 +3291,12 @@ mod tests {
                 ),
                 ..EventRecurrence::default()
             },
-        });
-        let recurrence = patch.recurrence.expect("recurrence");
+        })
+        .expect("create payload");
+        let recurrence = patch
+            .recurrence
+            .expect("recurrence write")
+            .expect("a series, not a clear");
         let pattern = recurrence.pattern.expect("pattern");
         let range = recurrence.range.expect("range");
 
@@ -2210,6 +3330,7 @@ mod tests {
                 response_status: None,
                 is_cancelled: None,
                 change_key: None,
+                original_start_time_zone: None,
             },
         );
 

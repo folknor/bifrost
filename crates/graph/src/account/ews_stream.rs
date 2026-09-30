@@ -13,6 +13,7 @@ use tokio::sync::watch;
 
 use crate::ews::{
     EwsBodyStream, EwsClient, EwsError, EwsExecute, EwsHeaders, check_response_error,
+    try_push_general_ref, xml_escape,
 };
 
 use super::GraphAccount;
@@ -317,12 +318,12 @@ pub(crate) fn parse_streaming_notifications(
                     };
                 }
                 if in_event && local == "ItemId" {
-                    current.item_id = attr(event, "Id");
-                    current.item_change_key = attr(event, "ChangeKey");
+                    current.item_id = attr(event, "Id")?;
+                    current.item_change_key = attr(event, "ChangeKey")?;
                 }
                 if in_event && local == "ParentFolderId" {
-                    current.parent_folder_id = attr(event, "Id");
-                    current.parent_folder_change_key = attr(event, "ChangeKey");
+                    current.parent_folder_id = attr(event, "Id")?;
+                    current.parent_folder_change_key = attr(event, "ChangeKey")?;
                 }
                 current_tag = local;
                 buf.clear();
@@ -330,19 +331,16 @@ pub(crate) fn parse_streaming_notifications(
             Ok(Event::Empty(ref event)) => {
                 let local = local_name(event.name().as_ref()).to_string();
                 if in_event && local == "ItemId" {
-                    current.item_id = attr(event, "Id");
-                    current.item_change_key = attr(event, "ChangeKey");
+                    current.item_id = attr(event, "Id")?;
+                    current.item_change_key = attr(event, "ChangeKey")?;
                 }
                 if in_event && local == "ParentFolderId" {
-                    current.parent_folder_id = attr(event, "Id");
-                    current.parent_folder_change_key = attr(event, "ChangeKey");
+                    current.parent_folder_id = attr(event, "Id")?;
+                    current.parent_folder_change_key = attr(event, "ChangeKey")?;
                 }
             }
-            Ok(Event::Text(ref event)) => {
-                if let Ok(text) = unescape(event.as_ref()) {
-                    buf.push_str(&text);
-                }
-            }
+            Ok(Event::Text(ref event)) => push_text(event, &mut buf)?,
+            Ok(Event::GeneralRef(ref event)) => push_ref(event, &mut buf)?,
             Ok(Event::End(ref event)) => {
                 let local = local_name(event.name().as_ref()).to_string();
                 let trimmed = buf.trim();
@@ -393,11 +391,8 @@ pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<String>, String>
                 current_tag = local_name(event.name().as_ref()).to_string();
                 buf.clear();
             }
-            Ok(Event::Text(ref event)) => {
-                if let Ok(text) = unescape(event.as_ref()) {
-                    buf.push_str(&text);
-                }
-            }
+            Ok(Event::Text(ref event)) => push_text(event, &mut buf)?,
+            Ok(Event::GeneralRef(ref event)) => push_ref(event, &mut buf)?,
             Ok(Event::End(ref event)) => {
                 let local = local_name(event.name().as_ref()).to_string();
                 let trimmed = buf.trim();
@@ -937,27 +932,46 @@ fn event_type_for(local: &str) -> Option<EwsStreamingEventType> {
     }
 }
 
-fn attr(event: &BytesStart<'_>, name: &str) -> Option<String> {
-    event
-        .attributes()
-        .flatten()
-        .find_map(|attr| (local_name(attr.key.as_ref()) == name).then(|| attr.value.into_owned()))
+/// A named attribute (matched on its local name), unescaped; `None` when
+/// absent. Strict like the text readers: an attribute list that does not
+/// parse, or a value whose reference does not resolve, is `Err`. The raw
+/// value used to be returned, so an escaped id kept its `&amp;`, and a
+/// malformed attribute was skipped as if absent.
+fn attr(event: &BytesStart<'_>, name: &str) -> Result<Option<String>, String> {
+    for attr in event.attributes() {
+        let attr = attr.map_err(|error| format!("malformed EWS XML attribute: {error}"))?;
+        if local_name(attr.key.as_ref()) == name {
+            return unescape(&attr.value)
+                .map(|value| Some(value.into_owned()))
+                .map_err(|error| format!("malformed EWS XML attribute {name}: {error}"));
+        }
+    }
+    Ok(None)
 }
 
 fn local_name(raw: &str) -> &str {
     raw.rsplit_once(':').map_or(raw, |(_, local)| local)
 }
 
-fn non_empty(value: &str) -> Option<String> {
-    (!value.is_empty()).then(|| value.to_string())
+/// Append one unescaped text run; one that does not unescape is a malformed
+/// response, never dropped.
+fn push_text(event: &quick_xml::events::BytesText<'_>, buf: &mut String) -> Result<(), String> {
+    let text =
+        unescape(event.as_ref()).map_err(|error| format!("malformed EWS XML text: {error}"))?;
+    buf.push_str(&text);
+    Ok(())
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+/// Fold one entity or character reference back into the text run. quick-xml
+/// emits every reference as its own event; these parsers once had no arm for
+/// it, so even `&amp;` vanished from a value. An unknown entity or invalid
+/// character reference is a malformed response.
+fn push_ref(event: &quick_xml::events::BytesRef<'_>, buf: &mut String) -> Result<(), String> {
+    try_push_general_ref(event, buf).map_err(|reason| format!("malformed EWS XML: {reason}"))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 #[cfg(test)]
@@ -1457,6 +1471,83 @@ mod tests {
         assert_eq!(local_name("t:ItemId"), "ItemId");
         assert_eq!(local_name("ItemId"), "ItemId");
         assert_eq!(local_name(""), "");
+    }
+
+    /// Both streaming parsers had no `GeneralRef` arm, so every reference -
+    /// even `&amp;` - vanished from a subscription id, and an unknown entity
+    /// or invalid character reference parsed on as if absent. References now
+    /// fold back in, and an unresolvable one is a malformed response.
+    #[test]
+    fn stream_parsers_resolve_references_and_refuse_unresolvable_ones() {
+        let notification = |id: &str| {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:GetStreamingEventsResponse><m:Notifications><t:Notification>
+<t:SubscriptionId>{id}</t:SubscriptionId>
+<t:NewMailEvent><t:ItemId Id="i1"/><t:ParentFolderId Id="f1"/></t:NewMailEvent>
+</t:Notification></m:Notifications></m:GetStreamingEventsResponse></s:Body></s:Envelope>"#
+            )
+        };
+        let subscribe = |id: &str| {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m"><s:Body><m:SubscribeResponse>
+<m:ResponseMessages><m:SubscribeResponseMessage ResponseClass="Success">
+<m:SubscriptionId>{id}</m:SubscriptionId>
+</m:SubscribeResponseMessage></m:ResponseMessages></m:SubscribeResponse></s:Body></s:Envelope>"#
+            )
+        };
+
+        let parsed = parse_streaming_notifications(&notification("a&amp;b&#x43;"))
+            .expect("well-formed references parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].subscription_id.as_deref(), Some("a&bC"));
+        assert_eq!(
+            parse_subscribe_response(&subscribe("a&amp;b&#x43;")).expect("parses"),
+            vec!["a&bC".to_string()]
+        );
+
+        for bad in ["a&bogus;b", "a&#xD800;b"] {
+            assert!(
+                parse_streaming_notifications(&notification(bad)).is_err(),
+                "notification {bad:?}"
+            );
+            assert!(
+                parse_subscribe_response(&subscribe(bad)).is_err(),
+                "subscribe {bad:?}"
+            );
+        }
+    }
+
+    /// Attribute values were read raw: an escaped item or folder id kept its
+    /// `&amp;` (so the invalidation named an id the server never meant), and
+    /// an unresolvable reference passed through as text. Both the Start and
+    /// the Empty spelling of the id elements unescape strictly now.
+    #[test]
+    fn stream_id_attributes_unescape_strictly() {
+        let notification = |item: &str, folder: &str| {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:GetStreamingEventsResponse><m:Notifications><t:Notification>
+<t:SubscriptionId>sub-1</t:SubscriptionId>
+<t:NewMailEvent><t:ItemId Id="{item}" ChangeKey="c&amp;k"/>
+<t:ParentFolderId Id="{folder}"></t:ParentFolderId></t:NewMailEvent>
+</t:Notification></m:Notifications></m:GetStreamingEventsResponse></s:Body></s:Envelope>"#
+            )
+        };
+
+        let parsed = parse_streaming_notifications(&notification("i&amp;1", "f&#x41;"))
+            .expect("well-formed attributes parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].item_id.as_deref(), Some("i&1"));
+        assert_eq!(parsed[0].item_change_key.as_deref(), Some("c&k"));
+        assert_eq!(parsed[0].parent_folder_id.as_deref(), Some("fA"));
+
+        for (item, folder) in [("i&bogus;", "f1"), ("i1", "f&#xD800;")] {
+            assert!(
+                parse_streaming_notifications(&notification(item, folder)).is_err(),
+                "{item} / {folder}"
+            );
+        }
     }
 
     // ----- worker-loop tests over the scripted EWS transport -----

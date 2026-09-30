@@ -69,8 +69,9 @@ pub(super) fn pending(folders: &[&str]) -> Vec<PendingEwsScope> {
         .collect()
 }
 
-/// A fresh per-request ledger for a `reconcile_translated_ews_scopes`
-/// call made outside `push_subscribe`.
+/// A fresh per-request ledger for a call made below `push_subscribe`
+/// (`reconcile_translated_ews_scopes`, or `subscribe_eligible` driven with a
+/// lane list of the test's choosing).
 pub(super) fn ledger() -> bifrost_types::BatchOutcomeBuilder<CursorScope> {
     bifrost_types::BatchOutcomeBuilder::new()
 }

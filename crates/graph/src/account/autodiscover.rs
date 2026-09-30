@@ -11,16 +11,20 @@
 //! it does not route through `ews_error_to_account_error`.
 
 use bifrost_net::error::cap_status_body;
-use bifrost_types::{AccountError, AccountOperation};
+use bifrost_types::{AccountError, AccountOperation, ProtocolErrorKind};
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 
 use super::GraphAccount;
 use super::cursor::PublicFolderRouting;
-use super::graph_error::{GraphErrorContext, into_account_error, response_to_account_error_pub};
+use super::graph_error::{
+    GraphErrorContext, autodiscover_error_code_to_account_error,
+    autodiscover_pox_error_to_account_error, into_account_error, provider_answer_violation,
+    response_to_account_error_pub,
+};
 use crate::client::AuxTarget;
-use crate::error::GraphResponseError;
+use crate::error::{GraphError, GraphResponseError};
 use crate::ews::try_push_general_ref;
 use crate::origin::AdmittedUrl;
 
@@ -38,6 +42,10 @@ const AUTODISCOVER_SOAP_PATH: &str = "/autodiscover/autodiscover.svc";
 
 const REDIRECT_ADDRESS: &str = "RedirectAddress";
 const REDIRECT_URL: &str = "RedirectUrl";
+
+/// How many in-body redirects one `GetUserSettings` lookup follows before
+/// giving up: a safety cap this crate imposes on itself.
+const MAX_REDIRECTS: usize = 5;
 
 /// The POX Autodiscover endpoint under a given Outlook origin.
 #[cfg(test)]
@@ -67,6 +75,87 @@ enum SoapStep {
     Endpoint(AdmittedUrl),
 }
 
+/// POX `<Action>` values that redirect.
+const POX_REDIRECT_ADDR: &str = "redirectAddr";
+const POX_REDIRECT_URL: &str = "redirectUrl";
+
+/// What one POX (`autodiscover.xml`) answer asks the delegate lookup to do.
+enum PoxStep {
+    /// The answer is the mailbox list (possibly empty).
+    Mailboxes(Vec<SharedMailbox>),
+    /// `redirectAddr`: ask again for this mailbox at the same endpoint.
+    Mailbox(String),
+    /// `redirectUrl`: ask again for the same mailbox at this endpoint.
+    Endpoint(AdmittedUrl),
+}
+
+/// The (mailbox, endpoint) pairs one Autodiscover lookup has asked, so a
+/// redirect back to one of them is caught as the loop it is before the
+/// repeat is sent. Shared by the SOAP and POX lookups, which follow
+/// redirects under the same rules.
+#[derive(Default)]
+struct RedirectWalk {
+    asked: Vec<(String, AdmittedUrl)>,
+}
+
+impl RedirectWalk {
+    /// Record the next request, or refuse it as a redirect loop: a pair
+    /// already asked is a loop the provider built
+    /// (`Protocol(ContractViolation)`).
+    fn visit(
+        &mut self,
+        lookup: &str,
+        email: &str,
+        url: &AdmittedUrl,
+        ctx: &GraphErrorContext,
+    ) -> Result<(), AccountError> {
+        if self
+            .asked
+            .iter()
+            .any(|(seen_email, seen_url)| seen_email == email && seen_url == url)
+        {
+            return Err(contradictory_answer(
+                format!(
+                    "{lookup} redirected back to a mailbox and endpoint already asked \
+                     (a redirect loop)"
+                ),
+                ctx,
+            ));
+        }
+        self.asked.push((email.to_string(), url.clone()));
+        Ok(())
+    }
+}
+
+/// A redirect chain of distinct hops longer than [`MAX_REDIRECTS`]: this
+/// crate's own safety cap, `Internal(LimitExceeded)` like a pagination
+/// walk's page budget. Not the caller's input, and not proof of a provider
+/// fault either, since a long chain may be a legitimate deployment.
+fn redirect_limit(lookup: &str, ctx: GraphErrorContext) -> AccountError {
+    into_account_error(
+        GraphError::LimitExceeded {
+            message: format!(
+                "{lookup} redirected more than {MAX_REDIRECTS} times without an answer"
+            ),
+        },
+        ctx,
+    )
+}
+
+/// The POX `alternativeMailboxes` request for one mailbox.
+fn build_pox_request(email: &str) -> String {
+    let escaped_email = quick_xml::escape::escape(email);
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">
+  <Request>
+    <EMailAddress>{escaped_email}</EMailAddress>
+    <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>
+  </Request>
+</Autodiscover>"#
+    )
+}
+
 /// The code, when it reports anything other than success.
 fn failing_code(code: Option<&str>) -> Option<&str> {
     code.filter(|code| !code.is_empty() && !code.eq_ignore_ascii_case("NoError"))
@@ -87,10 +176,53 @@ fn is_http_url(target: &str) -> bool {
 /// The body is not attached: Autodiscover answers name mailboxes.
 fn malformed_answer(message: String, ctx: GraphErrorContext) -> AccountError {
     into_account_error(
-        crate::error::GraphError::Json {
+        GraphError::Json {
             message,
             body: None,
         },
+        ctx,
+    )
+}
+
+/// An Autodiscover answer that parsed but contradicts itself or the lookup
+/// (a redirect code with no target, a redirect loop): the provider's
+/// contract breach (`Protocol(ContractViolation)`, `Acknowledged`), not a
+/// parse failure - the document was read in full.
+fn contradictory_answer(message: String, ctx: &GraphErrorContext) -> AccountError {
+    provider_answer_violation(ProtocolErrorKind::ContractViolation, message, ctx)
+}
+
+/// A `GetUserSettings` answer that resolved without the setting the lookup
+/// needs. Nothing about this is the caller's input: the setting name is this
+/// crate's, and the answer is the provider's.
+///
+/// Exchange reports a setting it will not give out per setting, in
+/// `UserSettingErrors` (`SettingIsNotAvailable` for a tenant with no public
+/// folders, say), and that code is classified like any other in-body code.
+/// A setting that is simply absent, with no per-setting error to explain
+/// it, is a `NoError` answer missing what it was asked for:
+/// `Protocol(MissingField)`.
+fn missing_setting(
+    parsed: &UserSettingsResponse,
+    setting: &str,
+    ctx: &GraphErrorContext,
+) -> AccountError {
+    if let Some(error) = parsed
+        .setting_errors
+        .iter()
+        .find(|error| error.setting.eq_ignore_ascii_case(setting))
+        && let Some(code) = failing_code(Some(error.code.as_str()))
+    {
+        return autodiscover_error_code_to_account_error(
+            &format!("Autodiscover setting {setting}"),
+            code,
+            error.message.as_deref(),
+            ctx,
+        );
+    }
+    provider_answer_violation(
+        ProtocolErrorKind::MissingField,
+        format!("Autodiscover GetUserSettings answer is missing {setting}"),
         ctx,
     )
 }
@@ -146,16 +278,17 @@ impl GraphAccount {
         &self,
         user_email: &str,
     ) -> Result<PublicFolderRouting, AccountError> {
-        let settings = self
+        let parsed = self
             .soap_get_user_settings(
                 user_email,
                 &["PublicFolderInformation", "InternalRpcClientServer"],
             )
             .await?;
-        public_folder_routing_from_settings(&settings).ok_or_else(|| {
-            super::graph_error::invalid_account_error(
-                AccountOperation::Discover,
-                "Autodiscover response missing PublicFolderInformation",
+        public_folder_routing_from_settings(&parsed.settings).ok_or_else(|| {
+            missing_setting(
+                &parsed,
+                "PublicFolderInformation",
+                &GraphErrorContext::graph(AccountOperation::Discover),
             )
         })
     }
@@ -166,16 +299,18 @@ impl GraphAccount {
         &self,
         replica_smtp: &str,
     ) -> Result<String, AccountError> {
-        let settings = self
+        let parsed = self
             .soap_get_user_settings(replica_smtp, &["AutoDiscoverSMTPAddress"])
             .await?;
-        settings
-            .into_iter()
-            .find_map(|(name, value)| (name == "AutoDiscoverSMTPAddress").then_some(value))
+        parsed
+            .settings
+            .iter()
+            .find_map(|(name, value)| (name == "AutoDiscoverSMTPAddress").then(|| value.clone()))
             .ok_or_else(|| {
-                super::graph_error::invalid_account_error(
-                    AccountOperation::Discover,
-                    "Autodiscover response missing AutoDiscoverSMTPAddress",
+                missing_setting(
+                    &parsed,
+                    "AutoDiscoverSMTPAddress",
+                    &GraphErrorContext::graph(AccountOperation::Discover),
                 )
             })
     }
@@ -192,49 +327,169 @@ impl GraphAccount {
     /// degrades to the config-supplied mailboxes on any `Err` and records
     /// the skipped pass on `skipped_scopes`, so a bad answer is now
     /// reportable instead of silent.
+    ///
+    /// The POX protocol also answers inside an HTTP 200 with things that are
+    /// not a mailbox list, and each used to read as "no delegates":
+    ///
+    /// - An `<Error>` fails the lookup, classified by its code
+    ///   (`graph_error::autodiscover_pox_error_to_account_error`).
+    /// - `<Action>redirectAddr</Action>` / `redirectUrl` are FOLLOWED under
+    ///   exactly the rules the SOAP lookup applies: a new mailbox against the
+    ///   same endpoint, or the same mailbox at an endpoint that must admit
+    ///   onto the Outlook origin (a cross-origin one is
+    ///   `Unsupported(Discover)`, since the POST carries the bearer), with
+    ///   the same loop detection and [`MAX_REDIRECTS`] cap. Following rather
+    ///   than refusing is what a hybrid tenant needs to find its delegates at
+    ///   all, and the admission rule already makes a hop safe; reporting the
+    ///   redirect instead would fail every such tenant's pass for nothing.
+    /// - A redirect that contradicts itself (an action with no target, a
+    ///   target with no redirect action, a URL named as a mailbox, an
+    ///   endpoint that is not a URL, an action this protocol does not
+    ///   define) is the provider's contract violation.
     pub(crate) async fn discover_shared_mailboxes(
         &self,
         user_email: &str,
     ) -> Result<Vec<SharedMailbox>, AccountError> {
-        let escaped_email = quick_xml::escape::escape(user_email);
-        let body = format!(
-            r#"<?xml version="1.0" encoding="utf-8"?>
-<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">
-  <Request>
-    <EMailAddress>{escaped_email}</EMailAddress>
-    <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>
-  </Request>
-</Autodiscover>"#
-        );
+        const LOOKUP: &str = "Autodiscover alternativeMailboxes";
         let ctx = GraphErrorContext::graph(AccountOperation::Discover);
-        let url = self
+        let mut url = self
             .client
             .outlook_url(AUTODISCOVER_XML_PATH)
             .map_err(|error| into_account_error(error, ctx.clone()))?;
-        let xml = self.autodiscover_post(&url, "text/xml", None, body).await?;
-        parse_alternative_mailboxes(&xml).map_err(|reason| {
-            malformed_answer(format!("Autodiscover alternativeMailboxes: {reason}"), ctx)
+        let mut email = user_email.to_string();
+        let mut walk = RedirectWalk::default();
+
+        for _ in 0..=MAX_REDIRECTS {
+            walk.visit(LOOKUP, &email, &url, &ctx)?;
+            let body = build_pox_request(&email);
+            let xml = self.autodiscover_post(&url, "text/xml", None, body).await?;
+            let answer = parse_pox_response(&xml)
+                .map_err(|reason| malformed_answer(format!("{LOOKUP}: {reason}"), ctx.clone()))?;
+            match self.pox_next_step(LOOKUP, answer, &ctx)? {
+                PoxStep::Mailboxes(mailboxes) => return Ok(mailboxes),
+                PoxStep::Mailbox(next) => email = next,
+                PoxStep::Endpoint(next) => url = next,
+            }
+        }
+
+        Err(redirect_limit(LOOKUP, ctx))
+    }
+
+    /// Decide what one POX answer asks for. See `discover_shared_mailboxes`.
+    fn pox_next_step(
+        &self,
+        lookup: &str,
+        answer: PoxAnswer,
+        ctx: &GraphErrorContext,
+    ) -> Result<PoxStep, AccountError> {
+        if let Some(error) = answer.error {
+            return Err(autodiscover_pox_error_to_account_error(
+                lookup,
+                &error.code,
+                error.message.as_deref(),
+                ctx,
+            ));
+        }
+        let contradiction = |message: String| contradictory_answer(message, ctx);
+        let action = answer
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|action| !action.is_empty());
+        let is_redirect = action.is_some_and(|action| {
+            action.eq_ignore_ascii_case(POX_REDIRECT_ADDR)
+                || action.eq_ignore_ascii_case(POX_REDIRECT_URL)
+        });
+        if !is_redirect && (answer.redirect_addr.is_some() || answer.redirect_url.is_some()) {
+            return Err(contradiction(format!(
+                "{lookup} named a redirect target without a redirect Action"
+            )));
+        }
+        match action {
+            None => Ok(PoxStep::Mailboxes(answer.mailboxes)),
+            Some(action) if action.eq_ignore_ascii_case("settings") => {
+                Ok(PoxStep::Mailboxes(answer.mailboxes))
+            }
+            Some(action) if action.eq_ignore_ascii_case(POX_REDIRECT_ADDR) => {
+                let Some(target) = answer.redirect_addr else {
+                    return Err(contradiction(format!(
+                        "{lookup} {action} carried no RedirectAddr"
+                    )));
+                };
+                if is_http_url(&target) {
+                    return Err(contradiction(format!(
+                        "{lookup} redirectAddr named a URL, not a mailbox"
+                    )));
+                }
+                Ok(PoxStep::Mailbox(target))
+            }
+            Some(action) if action.eq_ignore_ascii_case(POX_REDIRECT_URL) => {
+                let Some(target) = answer.redirect_url else {
+                    return Err(contradiction(format!(
+                        "{lookup} {action} carried no RedirectUrl"
+                    )));
+                };
+                if !is_http_url(&target) {
+                    return Err(contradiction(format!(
+                        "{lookup} redirectUrl did not name an http or https URL"
+                    )));
+                }
+                self.admit_redirect_endpoint(&target).map(PoxStep::Endpoint)
+            }
+            Some(action) => Err(contradiction(format!(
+                "{lookup} answered with Action {action}, which the protocol does not define"
+            ))),
+        }
+    }
+
+    /// Admit an Autodiscover redirect endpoint onto the configured Outlook
+    /// origin, or refuse it as `Unsupported(Discover)`: the POST carries the
+    /// account bearer, so a cross-origin endpoint could only leak it.
+    fn admit_redirect_endpoint(&self, target: &str) -> Result<AdmittedUrl, AccountError> {
+        self.client.admit_outlook_target(target).map_err(|refusal| {
+            super::graph_error::unsupported_account_error(AccountOperation::Discover)
+                .into_builder()
+                .text(bifrost_types::DiagnosticText::support_only(format!(
+                    "Autodiscover redirected to an endpoint this client will not \
+                     send the account credential to: {refusal}"
+                )))
+                .try_build()
+                .expect("valid account error classification")
         })
     }
 
+    /// Run one `GetUserSettings` lookup to its answer, following in-body
+    /// redirects, and return the parsed answer that carries the settings.
+    ///
+    /// Autodiscover redirects (`RedirectAddress` to a new email,
+    /// `RedirectUrl` to a new endpoint) are common for hybrid / on-prem
+    /// tenants and ride in-body, not as an HTTP 3xx. The chain ends two ways
+    /// short of an answer, and they are told apart because the blame
+    /// differs:
+    ///
+    /// - A redirect back to a (mailbox, endpoint) pair already asked is a
+    ///   loop the provider built: `Protocol(ContractViolation)`, detected
+    ///   before the repeat is sent.
+    /// - A chain of distinct hops longer than [`MAX_REDIRECTS`] may be a
+    ///   legitimate if unusual deployment; stopping there is this crate's own
+    ///   safety cap, so it is `Internal(LimitExceeded)`, like a pagination
+    ///   walk's page budget. Neither is the caller's input, which is what
+    ///   the `Request(Malformed)` this used to raise claimed.
     async fn soap_get_user_settings(
         &self,
         email: &str,
         settings: &[&str],
-    ) -> Result<Vec<(String, String)>, AccountError> {
-        // Autodiscover redirects (`RedirectAddress` to a new email,
-        // `RedirectUrl` to a new endpoint) are common for hybrid /
-        // on-prem tenants and ride in-body, not as an HTTP 3xx. Follow a
-        // bounded chain; the cap guards against a redirect loop.
-        const MAX_REDIRECTS: usize = 5;
+    ) -> Result<UserSettingsResponse, AccountError> {
         let ctx = GraphErrorContext::graph(AccountOperation::Discover);
         let mut url = self
             .client
             .outlook_url(AUTODISCOVER_SOAP_PATH)
             .map_err(|error| into_account_error(error, ctx.clone()))?;
         let mut email = email.to_string();
+        let mut walk = RedirectWalk::default();
 
         for _ in 0..=MAX_REDIRECTS {
+            walk.visit("Autodiscover GetUserSettings", &email, &url, &ctx)?;
             let body = build_get_user_settings_soap(&email, settings);
             let xml = self
                 .autodiscover_post(
@@ -255,16 +510,13 @@ impl GraphAccount {
             })?;
 
             match self.next_step(&parsed, &ctx)? {
-                SoapStep::Settings => return Ok(parsed.settings),
+                SoapStep::Settings => return Ok(parsed),
                 SoapStep::Mailbox(next) => email = next,
                 SoapStep::Endpoint(next) => url = next,
             }
         }
 
-        Err(super::graph_error::invalid_account_error(
-            AccountOperation::Discover,
-            "Autodiscover GetUserSettings exceeded redirect limit",
-        ))
+        Err(redirect_limit("Autodiscover GetUserSettings", ctx))
     }
 
     /// Decide what one `GetUserSettings` answer asks for.
@@ -285,20 +537,21 @@ impl GraphAccount {
     /// is `Unsupported(Discover)`, not a provider fault; a redirect answer
     /// that contradicts itself (a code with no target, a target with no
     /// redirect code, a URL named as a mailbox, an endpoint that is not a
-    /// URL) is the provider's malformed response.
+    /// URL) is the provider's contract breach. Any other failing code is
+    /// classified by what it says
+    /// (`graph_error::autodiscover_error_code_to_account_error`).
     fn next_step(
         &self,
         parsed: &UserSettingsResponse,
         ctx: &GraphErrorContext,
     ) -> Result<SoapStep, AccountError> {
-        let malformed = |message: String| malformed_answer(message, ctx.clone());
+        let malformed = |message: String| contradictory_answer(message, ctx);
         let failure = |code: &str, message: Option<&str>| {
-            super::graph_error::invalid_account_error(
-                AccountOperation::Discover,
-                format!(
-                    "Autodiscover GetUserSettings error {code}: {}",
-                    message.unwrap_or("")
-                ),
+            autodiscover_error_code_to_account_error(
+                "Autodiscover GetUserSettings",
+                code,
+                message,
+                ctx,
             )
         };
 
@@ -342,19 +595,7 @@ impl GraphAccount {
                         "Autodiscover RedirectUrl did not name an http or https URL".to_string(),
                     ));
                 }
-                self.client
-                    .admit_outlook_target(target)
-                    .map(SoapStep::Endpoint)
-                    .map_err(|refusal| {
-                        super::graph_error::unsupported_account_error(AccountOperation::Discover)
-                            .into_builder()
-                            .text(bifrost_types::DiagnosticText::support_only(format!(
-                                "Autodiscover redirected to an endpoint this client will not \
-                                 send the account credential to: {refusal}"
-                            )))
-                            .try_build()
-                            .expect("valid account error classification")
-                    })
+                self.admit_redirect_endpoint(target).map(SoapStep::Endpoint)
             }
             (Some(code), _) => Err(failure(code, answer.message.as_deref())),
         }
@@ -449,6 +690,18 @@ pub(crate) struct UserSettingsResponse {
     pub(crate) response: SoapAnswer,
     /// The first `<a:UserResponse>`'s markers (one user is requested).
     pub(crate) user: SoapAnswer,
+    /// The first `<a:UserResponse>`'s `<a:UserSettingErrors>`: why a
+    /// requested setting is absent, when the server says.
+    pub(crate) setting_errors: Vec<SettingError>,
+}
+
+/// One `<a:UserSettingError>`: the server's reason for not returning one
+/// requested setting.
+#[derive(Debug, Default)]
+pub(crate) struct SettingError {
+    pub(crate) setting: String,
+    pub(crate) code: String,
+    pub(crate) message: Option<String>,
 }
 
 /// One level's in-body error and redirect markers.
@@ -551,8 +804,9 @@ fn parse_user_settings_response(xml: &str) -> Result<UserSettingsResponse, Strin
     let mut in_user_response = false;
     let mut seen_user_response = false;
     // Inside `<a:UserSettingErrors>`, whose per-setting `ErrorCode`s are
-    // not the user's answer.
+    // not the user's answer; they are collected per setting instead.
     let mut in_setting_errors = false;
+    let mut setting_error = SettingError::default();
     let mut current_name = String::new();
     let mut current_value = String::new();
     let mut current_tag = String::new();
@@ -571,6 +825,7 @@ fn parse_user_settings_response(xml: &str) -> Result<UserSettingsResponse, Strin
                     }
                     "UserResponse" if !seen_user_response => in_user_response = true,
                     "UserSettingErrors" => in_setting_errors = true,
+                    "UserSettingError" => setting_error = SettingError::default(),
                     _ => {}
                 }
                 current_tag = name;
@@ -594,7 +849,18 @@ fn parse_user_settings_response(xml: &str) -> Result<UserSettingsResponse, Strin
                         "Value" => current_value = trimmed.to_string(),
                         _ => {}
                     }
-                } else if !in_setting_errors && (in_user_response || !seen_user_response) {
+                } else if in_setting_errors {
+                    if in_user_response {
+                        match current_tag.as_str() {
+                            "SettingName" => setting_error.setting = trimmed.to_string(),
+                            "ErrorCode" => setting_error.code = trimmed.to_string(),
+                            "ErrorMessage" if !trimmed.is_empty() => {
+                                setting_error.message = Some(trimmed.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if in_user_response || !seen_user_response {
                     // Response-level or user-level markers, never a
                     // per-setting error and never a second user's answer.
                     let answer = if in_user_response {
@@ -631,6 +897,13 @@ fn parse_user_settings_response(xml: &str) -> Result<UserSettingsResponse, Strin
                     "UserResponse" if in_user_response => {
                         in_user_response = false;
                         seen_user_response = true;
+                    }
+                    "UserSettingError"
+                        if in_setting_errors
+                            && in_user_response
+                            && !setting_error.setting.is_empty() =>
+                    {
+                        out.setting_errors.push(std::mem::take(&mut setting_error));
                     }
                     "UserSettingErrors" => in_setting_errors = false,
                     _ => {}
@@ -675,14 +948,46 @@ pub(crate) fn merge_shared_mailboxes(
     merged
 }
 
-/// Parse `AlternativeMailbox` elements from an Autodiscover XML response. A
-/// document that is malformed, truncated, or not an `Autodiscover` answer
-/// at all is `Err` with the reason, never an empty mailbox list.
+/// The parsed shape of a POX (`autodiscover.xml`) answer. Like SOAP, POX
+/// reports failures and redirects inside an HTTP 200 - an `<Error>` element,
+/// or an `<Action>` of `redirectAddr` / `redirectUrl` - so the mailbox list
+/// alone cannot tell "no delegates" from "no answer".
+#[derive(Debug, Default)]
+struct PoxAnswer {
+    mailboxes: Vec<SharedMailbox>,
+    /// The first `<Error>`, if the answer carries one.
+    error: Option<PoxError>,
+    /// `<Account><Action>`: `settings`, `redirectAddr`, or `redirectUrl`.
+    action: Option<String>,
+    redirect_addr: Option<String>,
+    redirect_url: Option<String>,
+}
+
+/// One POX `<Error>`: a numeric `<ErrorCode>` and a `<Message>`.
+#[derive(Debug, Default)]
+struct PoxError {
+    code: String,
+    message: Option<String>,
+}
+
+/// The mailbox list of a POX answer, for the parser tests.
+#[cfg(test)]
 fn parse_alternative_mailboxes(xml: &str) -> Result<Vec<SharedMailbox>, String> {
+    parse_pox_response(xml).map(|answer| answer.mailboxes)
+}
+
+/// Parse a POX Autodiscover answer: its `AlternativeMailbox` elements plus
+/// the in-body error and redirect markers. A document that is malformed,
+/// truncated, or not an `Autodiscover` answer at all is `Err` with the
+/// reason, never an empty mailbox list.
+fn parse_pox_response(xml: &str) -> Result<PoxAnswer, String> {
     let mut reader = Reader::from_str(xml);
+    let mut answer = PoxAnswer::default();
     let mut mailboxes = Vec::new();
     let mut shape = DocumentShape::new("Autodiscover");
 
+    // Inside the first `<Error>`; a later one is ignored.
+    let mut in_error = false;
     let mut in_alternative_mailbox = false;
     let mut current_type = String::new();
     let mut current_display_name = String::new();
@@ -701,25 +1006,59 @@ fn parse_alternative_mailboxes(xml: &str) -> Result<Vec<SharedMailbox>, String> 
                     current_display_name.clear();
                     current_smtp.clear();
                 }
+                if name == "Error" && answer.error.is_none() {
+                    in_error = true;
+                    answer.error = Some(PoxError::default());
+                }
                 current_tag = name;
                 buf.clear();
             }
             Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
             Ok(Event::GeneralRef(ref e)) => try_push_general_ref(e, &mut buf)?,
             Ok(Event::Empty(ref e)) => {
-                shape.open(e.name().local_name().as_ref(), true)?;
+                let name = e.name().local_name().as_ref().to_owned();
+                shape.open(&name, true)?;
+                // `<Error/>` still reports a failure, one with no code.
+                if name == "Error" && answer.error.is_none() {
+                    answer.error = Some(PoxError::default());
+                }
             }
             Ok(Event::End(ref e)) => {
                 shape.close()?;
                 let name = e.name().local_name().as_ref().to_owned();
+                let trimmed = buf.trim();
                 if in_alternative_mailbox {
-                    let trimmed = buf.trim();
                     match current_tag.as_str() {
                         "Type" => current_type = trimmed.to_string(),
                         "DisplayName" => current_display_name = trimmed.to_string(),
                         "SmtpAddress" => current_smtp = trimmed.to_string(),
                         _ => {}
                     }
+                } else if in_error {
+                    if let Some(error) = answer.error.as_mut() {
+                        match current_tag.as_str() {
+                            "ErrorCode" => error.code = trimmed.to_string(),
+                            "Message" if !trimmed.is_empty() => {
+                                error.message = Some(trimmed.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if !trimmed.is_empty() {
+                    let slot = match current_tag.as_str() {
+                        "Action" => Some(&mut answer.action),
+                        "RedirectAddr" => Some(&mut answer.redirect_addr),
+                        "RedirectUrl" => Some(&mut answer.redirect_url),
+                        _ => None,
+                    };
+                    if let Some(slot) = slot
+                        && slot.is_none()
+                    {
+                        *slot = Some(trimmed.to_string());
+                    }
+                }
+                if name == "Error" && in_error {
+                    in_error = false;
                 }
                 if name == "AlternativeMailbox" {
                     in_alternative_mailbox = false;
@@ -745,7 +1084,8 @@ fn parse_alternative_mailboxes(xml: &str) -> Result<Vec<SharedMailbox>, String> 
     }
 
     shape.finish()?;
-    Ok(mailboxes)
+    answer.mailboxes = mailboxes;
+    Ok(answer)
 }
 
 /// A text run that does not unescape is a malformed answer, not an empty
@@ -1032,11 +1372,169 @@ mod tests {
             .discover_public_folder_routing("ghost@contoso.com")
             .await
             .expect_err("an in-body error fails the lookup");
-        assert!(matches!(
+        // The server does not know the mailbox: the provider's answer about
+        // it, never the caller's malformed input.
+        assert_eq!(
             error.kind(),
-            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
-        ));
+            &bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Mailbox)
+        );
         assert_eq!(client.take_aux_requests().len(), 1);
+    }
+
+    /// Every in-body `ErrorCode` used to land on `Request(Malformed)`, so a
+    /// throttled or failing Autodiscover server told the consumer to fix a
+    /// request it never shaped, and was never retried. The code says what
+    /// happened; the kind follows it.
+    #[tokio::test]
+    async fn an_in_body_error_code_is_classified_by_what_it_says() {
+        use bifrost_types::{
+            AccountErrorKind, RecoveryClass, RequestErrorKind, ServerErrorKind, ThrottleScope,
+        };
+        for (code, want) in [
+            (
+                "ServerBusy",
+                AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            ),
+            (
+                "InternalServerError",
+                AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            ),
+            (
+                "InvalidRequest",
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+            ),
+            (
+                "NotFederated",
+                AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            ),
+            (
+                "InvalidDomain",
+                AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            ),
+            (
+                "SomeCodeFromTheFuture",
+                AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            ),
+        ] {
+            let (error, requests) = content_mailbox_error(user_answer_xml(code, None)).await;
+            assert_eq!(requests, 1, "{code}");
+            assert_eq!(error.kind(), &want, "{code}");
+            assert!(format!("{error:?}").contains(code), "{code}: {error:?}");
+            match code {
+                "ServerBusy" => match error.recovery() {
+                    RecoveryClass::Retry(advice) => {
+                        assert_eq!(advice.throttle_scope, Some(ThrottleScope::Tenant));
+                    }
+                    other => panic!("ServerBusy must retry, got {other:?}"),
+                },
+                "InternalServerError" => assert!(error.recovery().is_retryable()),
+                "InvalidRequest" => {}
+                _ => assert_eq!(error.recovery(), &RecoveryClass::ProviderRefused, "{code}"),
+            }
+        }
+    }
+
+    /// A `NoError` answer that lacks the setting the lookup asked for used to
+    /// be `Request(Malformed)`. With no reason given it is the provider's
+    /// incomplete answer; with a per-setting `UserSettingErrors` entry the
+    /// server said why, and that code decides.
+    #[tokio::test]
+    async fn a_missing_setting_is_the_providers_answer_not_the_callers_input() {
+        let (error, requests) =
+            content_mailbox_error(user_settings_xml("SomethingElse", "unrelated@contoso.com"))
+                .await;
+        assert_eq!(requests, 1);
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::MissingField
+            )
+        );
+
+        let refused = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            xmlns:a="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+  <s:Body><a:GetUserSettingsResponseMessage><a:Response>
+    <a:ErrorCode>NoError</a:ErrorCode>
+    <a:UserResponses><a:UserResponse>
+      <a:ErrorCode>NoError</a:ErrorCode>
+      <a:UserSettingErrors><a:UserSettingError>
+        <a:ErrorCode>SettingIsNotAvailable</a:ErrorCode>
+        <a:ErrorMessage>No public folders.</a:ErrorMessage>
+        <a:SettingName>PublicFolderInformation</a:SettingName>
+      </a:UserSettingError></a:UserSettingErrors>
+      <a:UserSettings />
+    </a:UserResponse></a:UserResponses>
+  </a:Response></a:GetUserSettingsResponseMessage></s:Body>
+</s:Envelope>"#;
+        let client = GraphClient::new("token");
+        client.script_aux([ScriptedRestResponse::text(reqwest::StatusCode::OK, refused)]);
+        let error = test_account(client)
+            .discover_public_folder_routing("user@contoso.com")
+            .await
+            .expect_err("no routing without PublicFolderInformation");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Server(bifrost_types::ServerErrorKind::Error {
+                status: None
+            })
+        );
+        assert!(
+            format!("{error:?}").contains("SettingIsNotAvailable"),
+            "{error:?}"
+        );
+    }
+
+    /// A redirect back to a mailbox already asked is a loop the provider
+    /// built: refused before the repeat is sent, as a contract violation. The
+    /// old code sent every hop up to the cap and then blamed the caller.
+    #[tokio::test]
+    async fn a_redirect_loop_is_the_providers_contract_violation() {
+        let client = GraphClient::new("token");
+        client.script_aux([
+            ScriptedRestResponse::text(
+                reqwest::StatusCode::OK,
+                &redirect_xml("RedirectAddress", "other@contoso.com"),
+            ),
+            ScriptedRestResponse::text(
+                reqwest::StatusCode::OK,
+                &redirect_xml("RedirectAddress", "replica@contoso.com"),
+            ),
+        ]);
+        let error = test_account(client.clone())
+            .discover_content_mailbox("replica@contoso.com")
+            .await
+            .expect_err("a loop never answers");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+        assert_eq!(client.take_aux_requests().len(), 2);
+    }
+
+    /// A chain of distinct hops past the cap is this crate's own limit, not
+    /// the caller's malformed request and not proof of a provider fault.
+    #[tokio::test]
+    async fn a_redirect_chain_past_the_cap_is_a_local_limit() {
+        let client = GraphClient::new("token");
+        client.script_aux((0..=MAX_REDIRECTS).map(|hop| {
+            ScriptedRestResponse::text(
+                reqwest::StatusCode::OK,
+                &redirect_xml("RedirectAddress", &format!("hop{hop}@contoso.com")),
+            )
+        }));
+        let error = test_account(client.clone())
+            .discover_content_mailbox("replica@contoso.com")
+            .await
+            .expect_err("the chain never answers");
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::LimitExceeded
+            )
+        );
+        assert_eq!(client.take_aux_requests().len(), MAX_REDIRECTS + 1);
     }
 
     /// The token leak this closes: the Autodiscover POST carries the account
@@ -1104,10 +1602,10 @@ mod tests {
     async fn a_user_level_error_under_a_response_level_no_error_fails_the_lookup() {
         let (error, requests) = content_mailbox_error(user_answer_xml("InvalidUser", None)).await;
         assert_eq!(requests, 1);
-        assert!(matches!(
+        assert_eq!(
             error.kind(),
-            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
-        ));
+            &bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Mailbox)
+        );
         assert!(
             format!("{error:?}").contains("InvalidUser"),
             "the refusal names its code: {error:?}"
@@ -1261,6 +1759,225 @@ mod tests {
             .await
             .expect_err("a truncated answer is not an empty one");
         assert_parse_failed(&error);
+    }
+
+    /// A POX answer body: `inner` inside `<Autodiscover><Response>`.
+    fn pox(inner: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">
+  <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a">{inner}</Response>
+</Autodiscover>"#
+        )
+    }
+
+    fn pox_redirect(action: &str, element: &str, target: &str) -> String {
+        pox(&format!(
+            "<Account><Action>{action}</Action><{element}>{target}</{element}></Account>"
+        ))
+    }
+
+    fn pox_mailbox(smtp: &str) -> String {
+        pox(&format!(
+            "<Account><Action>settings</Action><AlternativeMailbox><Type>Delegate</Type>\
+             <SmtpAddress>{smtp}</SmtpAddress></AlternativeMailbox></Account>"
+        ))
+    }
+
+    fn ok(body: &str) -> ScriptedRestResponse {
+        ScriptedRestResponse::text(reqwest::StatusCode::OK, body)
+    }
+
+    /// Run delegate discovery over `answers`; the error plus how many POSTs
+    /// went out.
+    async fn delegate_error(
+        answers: Vec<ScriptedRestResponse>,
+    ) -> (bifrost_types::AccountError, usize) {
+        let client = GraphClient::new("token");
+        client.script_aux(answers);
+        let error = test_account(client.clone())
+            .discover_shared_mailboxes("user@contoso.com")
+            .await
+            .expect_err("the answer must fail discovery");
+        (error, client.take_aux_requests().len())
+    }
+
+    /// A POX `<Error>` inside an HTTP 200 used to parse as an answer with
+    /// no `AlternativeMailbox`, so a refused lookup read as "this user has
+    /// no delegates" and `open` recorded nothing skipped. The numeric code
+    /// is classified; only the two codes with a pinned meaning map onto a
+    /// specific kind.
+    #[tokio::test]
+    async fn a_pox_error_fails_delegate_discovery_classified_by_its_code() {
+        use bifrost_types::{AccountErrorKind, RequestErrorKind, ResourceKind, ServerErrorKind};
+        for (error, want, native) in [
+            (
+                "<Error Time=\"1\" Id=\"2\"><ErrorCode>500</ErrorCode>\
+                 <Message>The email address can't be found.</Message><DebugData /></Error>",
+                AccountErrorKind::NotFound(ResourceKind::Mailbox),
+                Some("500"),
+            ),
+            (
+                "<Error><ErrorCode>600</ErrorCode><Message>Invalid Request</Message></Error>",
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Some("600"),
+            ),
+            (
+                "<Error><ErrorCode>601</ErrorCode></Error>",
+                AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+                Some("601"),
+            ),
+            (
+                "<Error/>",
+                AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+                None,
+            ),
+        ] {
+            let (err, requests) = delegate_error(vec![ok(&pox(error))]).await;
+            assert_eq!(requests, 1, "{error}");
+            assert_eq!(err.kind(), &want, "{error}");
+            if let Some(native) = native {
+                assert!(format!("{err:?}").contains(native), "{error}: {err:?}");
+            }
+        }
+    }
+
+    /// POX redirects used to be ignored, so a hybrid tenant's delegate pass
+    /// found nothing. `redirectAddr` asks again for the new mailbox at the
+    /// same endpoint; `redirectUrl` on the Outlook origin asks again for the
+    /// same mailbox there.
+    #[tokio::test]
+    async fn pox_redirects_are_followed_to_the_mailbox_list() {
+        let client = GraphClient::new("token");
+        client.script_aux([
+            ok(&pox_redirect(
+                "redirectAddr",
+                "RedirectAddr",
+                "user@contoso.mail.onmicrosoft.com",
+            )),
+            ok(&pox_redirect(
+                "redirectUrl",
+                "RedirectUrl",
+                "https://outlook.office365.com/autodiscover/tenant/autodiscover.xml",
+            )),
+            ok(&pox_mailbox("sales@contoso.com")),
+        ]);
+        let mailboxes = test_account(client.clone())
+            .discover_shared_mailboxes("user@contoso.com")
+            .await
+            .expect("the redirect chain resolves");
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].smtp_address, "sales@contoso.com");
+
+        let requests = client.take_aux_requests();
+        assert_eq!(requests.len(), 3);
+        let xml_url = format!(
+            "{}/autodiscover/autodiscover.xml",
+            crate::client::OUTLOOK_BASE
+        );
+        assert_eq!(requests[0].url, xml_url);
+        assert_eq!(requests[1].url, xml_url);
+        assert_eq!(
+            requests[2].url,
+            "https://outlook.office365.com/autodiscover/tenant/autodiscover.xml"
+        );
+        let asked: Vec<bool> = requests
+            .iter()
+            .map(|request| {
+                String::from_utf8(request.body.to_vec())
+                    .expect("UTF-8 body")
+                    .contains("<EMailAddress>user@contoso.mail.onmicrosoft.com</EMailAddress>")
+            })
+            .collect();
+        assert_eq!(asked, vec![false, true, true]);
+    }
+
+    /// The bearer rides on the POX POST too, so a cross-origin `redirectUrl`
+    /// is refused before any request, exactly as on the SOAP lookup.
+    #[tokio::test]
+    async fn a_cross_origin_pox_redirect_url_is_refused() {
+        let (error, requests) = delegate_error(vec![ok(&pox_redirect(
+            "redirectUrl",
+            "RedirectUrl",
+            "https://attacker.example/autodiscover/autodiscover.xml",
+        ))])
+        .await;
+        assert_eq!(requests, 1);
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Discover)
+        );
+    }
+
+    /// A POX redirect that contradicts itself is the provider's contract
+    /// violation, never guessed into a mailbox list, a mailbox, or an
+    /// endpoint.
+    #[tokio::test]
+    async fn an_inconsistent_pox_answer_is_a_contract_violation() {
+        for answer in [
+            pox("<Account><Action>redirectAddr</Action></Account>"),
+            pox("<Account><Action>redirectUrl</Action></Account>"),
+            pox_redirect("redirectAddr", "RedirectAddr", "https://attacker.example/x"),
+            pox_redirect("redirectUrl", "RedirectUrl", "someone@contoso.com"),
+            pox_redirect("settings", "RedirectAddr", "someone@contoso.com"),
+            pox("<Account><RedirectUrl>https://outlook.office365.com/x</RedirectUrl></Account>"),
+            pox("<Account><Action>somethingNew</Action></Account>"),
+        ] {
+            let (error, requests) = delegate_error(vec![ok(&answer)]).await;
+            assert_eq!(requests, 1, "{answer}");
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::ContractViolation
+                ),
+                "{answer}"
+            );
+        }
+    }
+
+    /// POX redirects share the SOAP lookup's loop and cap rules.
+    #[tokio::test]
+    async fn pox_redirect_loops_and_long_chains_end_the_walk() {
+        let (error, requests) = delegate_error(vec![
+            ok(&pox_redirect(
+                "redirectAddr",
+                "RedirectAddr",
+                "other@contoso.com",
+            )),
+            ok(&pox_redirect(
+                "redirectAddr",
+                "RedirectAddr",
+                "user@contoso.com",
+            )),
+        ])
+        .await;
+        assert_eq!(requests, 2);
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        );
+
+        let (error, requests) = delegate_error(
+            (0..=MAX_REDIRECTS)
+                .map(|hop| {
+                    ok(&pox_redirect(
+                        "redirectAddr",
+                        "RedirectAddr",
+                        &format!("hop{hop}@contoso.com"),
+                    ))
+                })
+                .collect(),
+        )
+        .await;
+        assert_eq!(requests, MAX_REDIRECTS + 1);
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::LimitExceeded
+            )
+        );
     }
 
     /// A per-setting `ErrorCode` inside `UserSettingErrors` is not the

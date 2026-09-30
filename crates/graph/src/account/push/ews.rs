@@ -19,6 +19,7 @@ use crate::account::graph_error::{
 };
 
 use super::common::{new_handle, unsupported_push_scope_error};
+use super::dispatch::{ArmOutcome, finalize_push_outcomes};
 
 #[derive(Debug, Clone)]
 pub(crate) struct EwsSubscriptionState {
@@ -109,11 +110,21 @@ pub(super) fn ews_subscribable_folder_id(scope: &CursorScope) -> Option<String> 
     Some(parsed.native_id().to_string())
 }
 
+/// The EWS arm of `push_subscribe`: translate, close the ledger, and only
+/// then register the scopes and start the worker.
+///
+/// The ledger is closed before the registration for the same reason as the
+/// webhook arm: a `finalize` failure after the insert returned `Err` with no
+/// handle over a registration the worker kept streaming and nothing could
+/// ever unsubscribe. This arm creates nothing server-side before the insert
+/// (the worker owns the EWS Subscribe), so closing first leaves a failure
+/// with nothing to undo.
 pub(super) async fn subscribe_ews(
     account: GraphAccount,
     eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
-    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
-) -> Result<Option<SubscriptionHandle>, AccountError> {
+    mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
+    expected: &[bifrost_types::BatchItemId],
+) -> Result<ArmOutcome, AccountError> {
     let mut pending = Vec::with_capacity(eligible.len());
     for (item, scope) in eligible {
         // An unsubscribable shape (non-`FolderType`, or a foreign mailbox
@@ -126,11 +137,12 @@ pub(super) async fn subscribe_ews(
         pending.push((item, scope, source_id));
     }
     if pending.is_empty() {
-        return Ok(None);
+        return Ok((None, finalize_push_outcomes(outcomes, expected)?));
     }
-    let scopes = translate_ews_scopes(&account, pending, outcomes).await?;
+    let scopes = translate_ews_scopes(&account, pending, &mut outcomes).await?;
+    let outcomes = finalize_push_outcomes(outcomes, expected)?;
     if scopes.is_empty() {
-        return Ok(None);
+        return Ok((None, outcomes));
     }
     let handle = new_handle()?;
     account
@@ -145,7 +157,7 @@ pub(super) async fn subscribe_ews(
         .ews_topology
         .send_modify(|generation| *generation = generation.wrapping_add(1));
     crate::account::push_stream::ensure_ews_worker(account).await;
-    Ok(Some(handle))
+    Ok((Some(handle), outcomes))
 }
 
 /// The error context for the translation request itself.

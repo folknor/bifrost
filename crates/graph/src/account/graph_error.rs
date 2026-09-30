@@ -416,15 +416,177 @@ fn soap_fault_to_account_error(
     finish(builder, ctx)
 }
 
+/// Classify an Autodiscover `GetUserSettings` in-body `ErrorCode`.
+///
+/// Autodiscover reports its failures inside an HTTP 200, so none of these
+/// is the caller's input: the lookup's only inputs are the account's own
+/// address and the settings this crate names. The code says what happened,
+/// and the kind follows it (the `ErrorCode` enumeration of the Autodiscover
+/// SOAP protocol):
+///
+/// - `ServerBusy` is throttling: `Server(RateLimited)`, bucketed at the
+///   tenant like EWS `ErrorServerBusy`.
+/// - `InternalServerError` is the server's own failure, the in-body twin of
+///   an HTTP 500: `Server(Unavailable)`, retried.
+/// - `InvalidUser` names a mailbox the server does not know:
+///   `NotFound(Mailbox)`.
+/// - `InvalidRequest` / `InvalidSetting` say the request this crate built
+///   was refused as malformed, the same answer an HTTP 400 gets:
+///   `Request(Malformed)`.
+/// - `SettingIsNotAvailable`, `InvalidDomain`, `NotFederated`, and any code
+///   this build does not know are the provider declining to answer:
+///   `Server(Error)` with no status, so `ProviderRefused`. An unrecognised
+///   code is still a refusal (it is not `NoError`), so it is not read as an
+///   unknown protocol state.
+///
+/// `what` names the answer level for the support text (the lookup, or one
+/// setting). The verbatim code rides as the native code.
+#[must_use]
+pub(crate) fn autodiscover_error_code_to_account_error(
+    what: &str,
+    code: &str,
+    message: Option<&str>,
+    ctx: &GraphErrorContext,
+) -> AccountError {
+    autodiscover_error(what, code, code, message, ctx)
+}
+
+/// Classify an in-body `<Error>` of a POX (`autodiscover.xml`) Autodiscover
+/// answer, whose `ErrorCode` is numeric rather than the SOAP protocol's
+/// named codes.
+///
+/// Only the two codes whose meaning is well established map onto a SOAP
+/// equivalent: `500` ("the e-mail address cannot be found") classifies as
+/// `InvalidUser`, and `600` ("invalid request") as `InvalidRequest`. Every
+/// other code - including an `<Error>` with no code at all - is the
+/// provider declining to answer (`ProviderRefused`), the table's fallback
+/// for an unrecognised code; guessing a transient meaning for a numeric
+/// code nobody here has pinned would retry something that may be
+/// permanent. The native code stays the verbatim number.
+#[must_use]
+pub(crate) fn autodiscover_pox_error_to_account_error(
+    what: &str,
+    code: &str,
+    message: Option<&str>,
+    ctx: &GraphErrorContext,
+) -> AccountError {
+    let code = code.trim();
+    let classify_as = match code {
+        "500" => "InvalidUser",
+        "600" => "InvalidRequest",
+        other => other,
+    };
+    autodiscover_error(what, classify_as, code, message, ctx)
+}
+
+/// The shared Autodiscover table: `classify_as` picks the kind (a SOAP
+/// `ErrorCode` name), `native_code` is what the server actually sent.
+fn autodiscover_error(
+    what: &str,
+    classify_as: &str,
+    native_code: &str,
+    message: Option<&str>,
+    ctx: &GraphErrorContext,
+) -> AccountError {
+    let code = native_code;
+    let is = |name: &str| classify_as.eq_ignore_ascii_case(name);
+    let (kind, cause, throttle) = if is("ServerBusy") {
+        (
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
+            true,
+        )
+    } else if is("InternalServerError") {
+        (
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            false,
+        )
+    } else if is("InvalidUser") {
+        (
+            AccountErrorKind::NotFound(ResourceKind::Mailbox),
+            Cause::Request(RequestCause::NotFound {
+                what: ResourceKind::Mailbox,
+                id: None,
+            }),
+            false,
+        )
+    } else if is("InvalidRequest") || is("InvalidSetting") {
+        (
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(format!("{what} refused the request: {code}")),
+            }),
+            false,
+        )
+    } else {
+        (
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            Cause::Server(ServerCause::Error { status: None }),
+            false,
+        )
+    };
+    let shown = if code.is_empty() {
+        "without a code"
+    } else {
+        code
+    };
+    let detail = match message.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(message) => format!("{what} error {shown}: {message}"),
+        None => format!("{what} error {shown}"),
+    };
+    let mut builder = base_builder(ctx, kind, cause).text(DiagnosticText::support_only(detail));
+    if !code.is_empty() {
+        builder = builder.native_code(code.to_string());
+    }
+    builder = push_attempt(builder, TransmissionState::Acknowledged);
+    if throttle && let Some(scope) = throttle_scope_for(ctx) {
+        builder = builder.throttle_scope(scope);
+    }
+    finish(builder, ctx)
+}
+
+/// A complete provider answer, read in full, that breaks the protocol's
+/// contract without failing to parse: a field the answer must carry is
+/// absent (`MissingField`), or the answer contradicts itself
+/// (`ContractViolation`). The provider answered, so the evidence is
+/// `Acknowledged`.
+#[must_use]
+pub(crate) fn provider_answer_violation(
+    kind: ProtocolErrorKind,
+    detail: String,
+    ctx: &GraphErrorContext,
+) -> AccountError {
+    let detail = DiagnosticText::support_only(detail);
+    let builder = base_builder(
+        ctx,
+        AccountErrorKind::Protocol(kind),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: ctx.protocol,
+            detail: Some(detail.clone()),
+        }),
+    )
+    .text(detail);
+    finish(push_attempt(builder, TransmissionState::Acknowledged), ctx)
+}
+
+/// `GraphError::Json`: a success body that did not parse.
+///
+/// The variant is no longer only Graph REST JSON: the Autodiscover XML
+/// parsers and the OneDrive upload-session 202 read raise it too, each with a
+/// message naming its source. The label therefore claims only what every
+/// producer shares - the provider's response could not be read - and leaves
+/// the format and source to the producer's message, rather than calling an
+/// XML document a JSON parse failure.
 fn json_parse_to_account_error(
     message: &str,
     body: Option<bytes::Bytes>,
     ctx: &GraphErrorContext,
 ) -> AccountError {
     let detail = if message.trim().is_empty() {
-        DiagnosticText::support_only("Graph response JSON parse failed".to_string())
+        DiagnosticText::support_only("provider response did not parse".to_string())
     } else {
-        DiagnosticText::support_only(format!("Graph response JSON parse failed: {message}"))
+        DiagnosticText::support_only(format!("provider response did not parse: {message}"))
     };
     let mut builder = base_builder(
         ctx,
@@ -2376,6 +2538,35 @@ mod tests {
             err.kind(),
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
         ));
+    }
+
+    /// `GraphError::Json` also carries the Autodiscover XML parsers' and the
+    /// OneDrive 202 range read's failures. The diagnostic used to call every
+    /// one of them a "Graph response JSON parse failed", so a support export
+    /// for a truncated Autodiscover XML answer named the wrong format and
+    /// the wrong service. The producer's message names its source; the
+    /// label must not contradict it.
+    #[test]
+    fn a_non_json_parse_failure_is_not_labelled_a_json_parse() {
+        for message in [
+            "Autodiscover GetUserSettings: malformed XML: unexpected end",
+            "OneDrive 202 nextExpectedRanges entry is not a byte range",
+        ] {
+            let err = into_account_error(
+                GraphError::Json {
+                    message: message.to_string(),
+                    body: None,
+                },
+                graph_ctx(AccountOperation::Discover),
+            );
+            let debug = format!("{err:?}");
+            assert!(!debug.contains("JSON"), "{debug}");
+            assert!(debug.contains(message), "{debug}");
+            assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
+            );
+        }
     }
 
     // `GraphAccount::remove_from_container` is a one-line tail call to

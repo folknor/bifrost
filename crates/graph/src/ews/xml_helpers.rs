@@ -1,6 +1,6 @@
 use quick_xml::Reader;
 use quick_xml::escape::{resolve_xml_entity, unescape};
-use quick_xml::events::{BytesRef, Event};
+use quick_xml::events::{BytesRef, BytesText, Event};
 
 // SOAP envelope.
 
@@ -147,15 +147,26 @@ pub(crate) fn is_distinguished_folder_id(id: &str) -> bool {
     )
 }
 
-/// Read a named attribute off a start/empty tag, returning the empty
-/// string when absent.
-pub(crate) fn extract_attribute(e: &quick_xml::events::BytesStart<'_>, attr_name: &str) -> String {
-    for attr in e.attributes().flatten() {
+/// Read a named attribute off a start/empty tag, unescaped, returning the
+/// empty string when absent.
+///
+/// Strict like the text readers: an attribute list that does not parse, or
+/// a value whose entity or character reference does not resolve, is `Err`
+/// with the reason. The raw value used to be returned as-is, so `&amp;` in
+/// an id stayed escaped and a malformed attribute was skipped as if absent.
+pub(crate) fn extract_attribute(
+    e: &quick_xml::events::BytesStart<'_>,
+    attr_name: &str,
+) -> Result<String, String> {
+    for attr in e.attributes() {
+        let attr = attr.map_err(|error| format!("malformed XML attribute: {error}"))?;
         if attr.key.as_ref() == attr_name {
-            return attr.value.into_owned();
+            return unescape(&attr.value)
+                .map(std::borrow::Cow::into_owned)
+                .map_err(|error| format!("malformed XML attribute {attr_name}: {error}"));
         }
     }
-    String::new()
+    Ok(String::new())
 }
 
 // SOAP fault check.
@@ -190,11 +201,17 @@ pub(crate) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
                 buf.clear();
             }
             Ok(Event::Text(ref e)) => {
-                if let Ok(text) = unescape(e.as_ref()) {
-                    buf.push_str(&text);
+                if let Err(error) = push_text(e, &mut buf) {
+                    xml_error = Some(error);
+                    break;
                 }
             }
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::GeneralRef(ref e)) => {
+                if let Err(error) = try_push_general_ref(e, &mut buf) {
+                    xml_error = Some(error);
+                    break;
+                }
+            }
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
@@ -294,7 +311,7 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
             Ok(Event::Start(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
-                if extract_attribute(e, "ResponseClass") == "Error" {
+                if extract_attribute(e, "ResponseClass").map_err(scan_failed)? == "Error" {
                     in_error_message = true;
                     error_message_element = Some(local.to_string());
                 }
@@ -306,12 +323,14 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
                 }
                 buf.clear();
             }
-            Ok(Event::Text(ref e)) => {
-                if let Ok(text) = unescape(e.as_ref()) {
-                    buf.push_str(&text);
-                }
+            // A reference or text run that does not resolve is malformed XML
+            // exactly like a reader error, and reported the same way: it
+            // used to vanish, so a `ResponseCode` or `MessageText` could
+            // read as a token the server never sent.
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf).map_err(scan_failed)?,
+            Ok(Event::GeneralRef(ref e)) => {
+                try_push_general_ref(e, &mut buf).map_err(scan_failed)?;
             }
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
@@ -353,11 +372,7 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
             // A parse error here is reported as malformed XML, identical
             // to the per-operation parsers, rather than silently treated
             // as success.
-            Err(error) => {
-                return Err(super::EwsError::MalformedXml(DiagnosticText::support_only(
-                    format!("EWS response error scan failed: {error}"),
-                )));
-            }
+            Err(error) => return Err(scan_failed(error.to_string())),
             _ => {}
         }
     }
@@ -397,6 +412,12 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
 /// `NoError` contradicts the `ResponseClass="Error"` it arrived with; both
 /// are failures the crate refuses to read as success, but neither can be
 /// classified, so a later message carrying a real code outranks them.
+fn scan_failed(reason: String) -> super::EwsError {
+    super::EwsError::MalformedXml(bifrost_types::DiagnosticText::support_only(format!(
+        "EWS response error scan failed: {reason}"
+    )))
+}
+
 fn is_classifiable(response_code: &str) -> bool {
     !response_code.is_empty() && response_code != "NoError"
 }
@@ -409,15 +430,22 @@ fn unclassifiable_detail(element: &str, response_code: &str) -> String {
     }
 }
 
-// quick-xml 0.36+ emits Event::GeneralRef separately from Event::Text, so
-// every parser that accumulates body text needs to fold these back in or
-// `&lt;` and friends silently vanish.
-pub(crate) fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
-    let _ = try_push_general_ref(e, buf);
+/// Append one unescaped text run. A run that does not unescape is `Err` with
+/// the reason, never dropped.
+fn push_text(e: &BytesText<'_>, buf: &mut String) -> Result<(), String> {
+    let text = unescape(e.as_ref()).map_err(|error| format!("malformed XML text: {error}"))?;
+    buf.push_str(&text);
+    Ok(())
 }
 
-/// Strict twin of [`push_general_ref`]: an unknown entity or an invalid
-/// character reference is `Err` with the reference text instead of vanishing.
+/// Fold one entity or character reference back into a text run.
+///
+/// quick-xml 0.36+ emits `Event::GeneralRef` separately from `Event::Text`,
+/// so every parser that accumulates body text must fold these back in or
+/// `&lt;` and friends vanish. An unknown entity or an invalid character
+/// reference is `Err` with the reference text: it is malformed XML, and
+/// dropping it would leave a value the server never sent. There is no
+/// lenient twin; every parser surfaces the `Err` through its own error path.
 pub(crate) fn try_push_general_ref(e: &BytesRef<'_>, buf: &mut String) -> Result<(), String> {
     let name: &str = e.as_ref();
     if let Some(rest) = name.strip_prefix('#') {

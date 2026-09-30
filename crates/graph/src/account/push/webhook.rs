@@ -18,6 +18,7 @@ use crate::webhooks::{create_subscription, delete_subscription};
 use super::common::{
     mark_push_reconnected, new_handle, unsupported_push_error, unsupported_push_scope_error,
 };
+use super::dispatch::{ArmOutcome, finalize_push_outcomes};
 use super::renewal::run_graph_subscription_worker;
 
 #[derive(Debug, Clone)]
@@ -71,11 +72,23 @@ pub(crate) struct GraphSubscriptionState {
     pub(crate) warned_unparseable_expiry: bool,
 }
 
+/// The webhook arm of `push_subscribe`: create one server subscription per
+/// resource, close the ledger, and only then register and start renewing.
+///
+/// The ledger is closed HERE, between the last create and the registration,
+/// not by the dispatcher afterwards. `finalize` is fallible (an unfiled or
+/// double-filed lane id is this crate's invariant breaking), and it used to
+/// run after the group was registered and the renewal worker started: a
+/// failure returned `Err` - no handle - over subscriptions the worker kept
+/// renewing and no caller could ever name to unsubscribe. Closed before the
+/// registration, the failure path has registered nothing and only has to
+/// roll back the server-side creates, exactly as a failed create does.
 pub(super) async fn subscribe_graph(
     account: GraphAccount,
     eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
-    outcomes: &mut bifrost_types::BatchOutcomeBuilder<CursorScope>,
-) -> Result<Option<SubscriptionHandle>, AccountError> {
+    mut outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
+    expected: &[bifrost_types::BatchItemId],
+) -> Result<ArmOutcome, AccountError> {
     let Some(endpoint) = account.push_endpoint.clone() else {
         return Err(unsupported_push_error());
     };
@@ -106,7 +119,7 @@ pub(super) async fn subscribe_graph(
         }
     }
     if grouped.is_empty() {
-        return Ok(None);
+        return Ok((None, finalize_push_outcomes(outcomes, expected)?));
     }
 
     // Mint the handle BEFORE the first create. `new_handle` is fallible
@@ -146,18 +159,7 @@ pub(super) async fn subscribe_graph(
                 // reach these subscriptions to tear them down. Retain none
                 // of them. Cleanup is best effort: preserve the create
                 // error the caller needs to act on even if a DELETE fails.
-                for subscription in &subscriptions {
-                    if let Err(cleanup_error) =
-                        delete_subscription(&account.client, &subscription.server_id).await
-                    {
-                        tracing::warn!(
-                            target: "bifrost_graph::webhooks",
-                            server_id = %subscription.server_id,
-                            error = ?cleanup_error,
-                            "failed to roll back Graph webhook subscription"
-                        );
-                    }
-                }
+                roll_back_created(&account, &subscriptions).await;
                 return Err(into_account_error(
                     error,
                     GraphErrorContext::graph(AccountOperation::PushSubscribe),
@@ -165,6 +167,17 @@ pub(super) async fn subscribe_graph(
             }
         }
     }
+
+    // Every lane must be filed before anything becomes live. See the
+    // function doc: on this path nothing is registered and no worker was
+    // started, so rolling back the creates is the whole cleanup.
+    let outcomes = match finalize_push_outcomes(outcomes, expected) {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            roll_back_created(&account, &subscriptions).await;
+            return Err(error);
+        }
+    };
 
     account
         .graph_subscriptions
@@ -181,7 +194,30 @@ pub(super) async fn subscribe_graph(
     // still emits.
     mark_push_reconnected(&account);
     ensure_graph_worker(account).await;
-    Ok(Some(handle))
+    Ok((Some(handle), outcomes))
+}
+
+/// Best-effort DELETE of subscriptions this request created but will never
+/// register or return a handle for.
+///
+/// Nothing downstream can reach these rows once the request fails - they are
+/// in no group, so neither `push_unsubscribe` nor `close()` walks them - so a
+/// DELETE that fails here leaves the subscription to Graph's own expiry.
+/// Failures are logged, not returned: the caller needs the error that failed
+/// the request, not the cleanup's.
+async fn roll_back_created(account: &GraphAccount, subscriptions: &[GraphSubscriptionState]) {
+    for subscription in subscriptions {
+        if let Err(cleanup_error) =
+            delete_subscription(&account.client, &subscription.server_id).await
+        {
+            tracing::warn!(
+                target: "bifrost_graph::webhooks",
+                server_id = %subscription.server_id,
+                error = ?cleanup_error,
+                "failed to roll back Graph webhook subscription"
+            );
+        }
+    }
 }
 
 pub(super) async fn unsubscribe_graph(

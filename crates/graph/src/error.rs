@@ -17,8 +17,8 @@ use serde::Deserialize;
 
 /// Top-level Graph error. Either the request never received a
 /// response (`Net`), the response decoded with a non-success status
-/// (`Response`), or a success response failed local JSON parsing
-/// (`Json`).
+/// (`Response`), or a success body failed local parsing (`Json`), among the
+/// local and contract variants below.
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum GraphError {
@@ -37,8 +37,10 @@ pub(crate) enum GraphError {
     /// typed `GraphSignal`, never on `error.message` substrings.
     Response(GraphResponseError),
 
-    /// Local JSON parse of a Graph success body failed. This is a
-    /// provider-contract violation, not a transport error.
+    /// A provider success body did not parse (`Protocol(ParseFailed)`), not
+    /// a transport error. Despite the name it is not JSON-only: Graph REST
+    /// JSON, the Autodiscover XML answers, and the OneDrive upload-session
+    /// 202 body all raise it, so `message` must name its source and format.
     Json {
         message: String,
         body: Option<Bytes>,

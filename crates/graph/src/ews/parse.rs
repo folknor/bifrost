@@ -21,7 +21,7 @@ use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 
 use super::EwsError;
-use super::xml_helpers::{extract_attribute, push_general_ref, strip_ns};
+use super::xml_helpers::{extract_attribute, strip_ns, try_push_general_ref};
 
 // ── Result types ────────────────────────────────────────────
 
@@ -202,18 +202,18 @@ pub(crate) fn parse_find_folder_response(xml: &str) -> Result<Vec<EwsFolder>, Ew
                 buf.clear();
 
                 if in_folder && local == "FolderId" {
-                    folder_id = extract_attribute(e, "Id");
+                    folder_id = attribute(e, "Id")?;
                 }
             }
             Ok(Event::Empty(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 if in_folder && local == "FolderId" {
-                    folder_id = extract_attribute(e, "Id");
+                    folder_id = attribute(e, "Id")?;
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf),
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
@@ -303,27 +303,27 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
                     current_property_tag.clear();
                 }
                 if in_extended_property && local == "ExtendedFieldURI" {
-                    current_property_tag = extract_attribute(e, "PropertyTag");
+                    current_property_tag = attribute(e, "PropertyTag")?;
                 }
                 current_tag = local.to_string();
                 buf.clear();
 
                 if in_folder && local == "FolderId" {
-                    folder_id = extract_attribute(e, "Id");
+                    folder_id = attribute(e, "Id")?;
                 }
             }
             Ok(Event::Empty(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
                 if in_folder && local == "FolderId" {
-                    folder_id = extract_attribute(e, "Id");
+                    folder_id = attribute(e, "Id")?;
                 }
                 if in_extended_property && local == "ExtendedFieldURI" {
-                    current_property_tag = extract_attribute(e, "PropertyTag");
+                    current_property_tag = attribute(e, "PropertyTag")?;
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf),
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
@@ -479,11 +479,9 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                     in_mailbox = true;
                 }
                 if local == "RootFolder" {
-                    total_count = extract_attribute(e, "TotalItemsInView")
-                        .parse()
-                        .unwrap_or(0);
-                    includes_last = extract_attribute(e, "IncludesLastItemInRange") == "true";
-                    next_offset = extract_attribute(e, "IndexedPagingOffset").parse().ok();
+                    total_count = attribute(e, "TotalItemsInView")?.parse().unwrap_or(0);
+                    includes_last = attribute(e, "IncludesLastItemInRange")? == "true";
+                    next_offset = attribute(e, "IndexedPagingOffset")?.parse().ok();
                 }
 
                 current_tag = local.to_string();
@@ -492,8 +490,8 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                 // Direct-child `ItemId` only (a Start `ItemId` sits one
                 // level below the item element).
                 if in_item && local == "ItemId" && depth == item_depth + 1 {
-                    item_id = extract_attribute(e, "Id");
-                    change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
+                    item_id = attribute(e, "Id")?;
+                    change_key = Some(attribute(e, "ChangeKey")?).filter(|s| !s.is_empty());
                 }
             }
             Ok(Event::Empty(ref e)) => {
@@ -503,19 +501,17 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                 // element (at `depth`); accept it only when that element is
                 // the item itself.
                 if in_item && local == "ItemId" && depth == item_depth {
-                    item_id = extract_attribute(e, "Id");
-                    change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
+                    item_id = attribute(e, "Id")?;
+                    change_key = Some(attribute(e, "ChangeKey")?).filter(|s| !s.is_empty());
                 }
                 if local == "RootFolder" {
-                    total_count = extract_attribute(e, "TotalItemsInView")
-                        .parse()
-                        .unwrap_or(0);
-                    includes_last = extract_attribute(e, "IncludesLastItemInRange") == "true";
-                    next_offset = extract_attribute(e, "IndexedPagingOffset").parse().ok();
+                    total_count = attribute(e, "TotalItemsInView")?.parse().unwrap_or(0);
+                    includes_last = attribute(e, "IncludesLastItemInRange")? == "true";
+                    next_offset = attribute(e, "IndexedPagingOffset")?.parse().ok();
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf),
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
@@ -689,13 +685,13 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                     && local == "AttachmentId"
                     && depth == attachment_depth + 1
                 {
-                    attachment.attachment_id = extract_attribute(e, "Id");
+                    attachment.attachment_id = attribute(e, "Id")?;
                 }
                 // Direct-child `ItemId` only (Start form: one level below),
                 // and never one nested inside an attachment.
                 if in_item && !in_attachments && local == "ItemId" && depth == item_depth + 1 {
-                    item_id = extract_attribute(e, "Id");
-                    change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
+                    item_id = attribute(e, "Id")?;
+                    change_key = Some(attribute(e, "ChangeKey")?).filter(|s| !s.is_empty());
                 }
             }
             Ok(Event::Empty(ref e)) => {
@@ -707,17 +703,17 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                     && local == "AttachmentId"
                     && depth == attachment_depth
                 {
-                    attachment.attachment_id = extract_attribute(e, "Id");
+                    attachment.attachment_id = attribute(e, "Id")?;
                 }
                 // Direct-child `ItemId` only (Empty form: child of the
                 // currently-open element at `depth`).
                 if in_item && !in_attachments && local == "ItemId" && depth == item_depth {
-                    item_id = extract_attribute(e, "Id");
-                    change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
+                    item_id = attribute(e, "Id")?;
+                    change_key = Some(attribute(e, "ChangeKey")?).filter(|s| !s.is_empty());
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf),
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name().as_ref().to_owned();
                 let local = strip_ns(&name);
@@ -866,7 +862,7 @@ pub(crate) fn parse_get_attachment_response(xml: &str) -> Result<EwsAttachmentCo
                     in_nested_item = true;
                 }
                 if local == "AttachmentId" {
-                    attachment_id = extract_attribute(e, "Id");
+                    attachment_id = attribute(e, "Id")?;
                 }
                 current_tag = local.to_string();
                 buf.clear();
@@ -874,11 +870,11 @@ pub(crate) fn parse_get_attachment_response(xml: &str) -> Result<EwsAttachmentCo
             Ok(Event::Empty(ref e)) => {
                 let name_bytes = e.name().as_ref().to_owned();
                 if strip_ns(&name_bytes) == "AttachmentId" {
-                    attachment_id = extract_attribute(e, "Id");
+                    attachment_id = attribute(e, "Id")?;
                 }
             }
-            Ok(Event::Text(ref e)) => push_text(e, &mut buf),
-            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf)?,
+            Ok(Event::GeneralRef(ref e)) => push_ref(e, &mut buf)?,
             Ok(Event::End(ref e)) => {
                 let name_bytes = e.name().as_ref().to_owned();
                 let local = strip_ns(&name_bytes);
@@ -981,10 +977,27 @@ fn default_item_class(item_class: &str) -> String {
     }
 }
 
-fn push_text(e: &quick_xml::events::BytesText<'_>, buf: &mut String) {
-    if let Ok(text) = unescape(e.as_ref()) {
-        buf.push_str(&text);
-    }
+/// A text run that does not unescape is a malformed response, not an empty
+/// run: dropping it would splice the text on either side into a different
+/// value (a subject, an address, an id).
+fn push_text(e: &quick_xml::events::BytesText<'_>, buf: &mut String) -> Result<(), EwsError> {
+    let text = unescape(e.as_ref()).map_err(|error| malformed(format!("EWS text: {error}")))?;
+    buf.push_str(&text);
+    Ok(())
+}
+
+/// A named attribute, unescaped (empty when absent); one that does not
+/// parse or unescape is a malformed response.
+fn attribute(e: &quick_xml::events::BytesStart<'_>, name: &str) -> Result<String, EwsError> {
+    extract_attribute(e, name).map_err(|reason| malformed(format!("EWS {reason}")))
+}
+
+/// quick-xml emits every entity and character reference as its own event,
+/// so each parser folds them back into the text run. An unknown entity or an
+/// invalid character reference is a malformed response: it used to vanish,
+/// leaving a value the server never sent.
+fn push_ref(e: &quick_xml::events::BytesRef<'_>, buf: &mut String) -> Result<(), EwsError> {
+    try_push_general_ref(e, buf).map_err(|reason| malformed(format!("EWS text: {reason}")))
 }
 
 #[cfg(test)]
@@ -1845,5 +1858,168 @@ mod tests {
 
         let empty = decode_replica_list(&BASE64.encode(b"")).expect("decode empty");
         assert!(empty.is_empty());
+    }
+
+    /// Every operation parser, as a function from one text value embedded in
+    /// an otherwise well-formed response to the field that value lands in.
+    fn text_value_parsers() -> Vec<(&'static str, TextValueParser)> {
+        fn folder(tag: &str, value: &str) -> String {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:{tag}Response><m:ResponseMessages><m:{tag}ResponseMessage ResponseClass="Success">
+<m:ResponseCode>NoError</m:ResponseCode><m:RootFolder><t:Folders><t:Folder>
+<t:FolderId Id="F1"/><t:DisplayName>{value}</t:DisplayName>
+</t:Folder></t:Folders></m:RootFolder></m:{tag}ResponseMessage></m:ResponseMessages>
+</m:{tag}Response></s:Body></s:Envelope>"#
+            )
+        }
+        fn item(tag: &str, value: &str) -> String {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:{tag}Response><m:ResponseMessages><m:{tag}ResponseMessage ResponseClass="Success">
+<m:ResponseCode>NoError</m:ResponseCode><m:RootFolder><t:Items><t:Message>
+<t:ItemId Id="I1"/><t:Subject>{value}</t:Subject>
+</t:Message></t:Items></m:RootFolder></m:{tag}ResponseMessage></m:ResponseMessages>
+</m:{tag}Response></s:Body></s:Envelope>"#
+            )
+        }
+        fn find_folder(value: &str) -> Result<String, EwsError> {
+            let folders = parse_find_folder_response(&folder("FindFolder", value))?;
+            Ok(folders[0].display_name.clone())
+        }
+        fn get_folder(value: &str) -> Result<String, EwsError> {
+            Ok(parse_get_folder_response(&folder("GetFolder", value))?.display_name)
+        }
+        fn find_item(value: &str) -> Result<String, EwsError> {
+            let result = parse_find_items_response(&item("FindItem", value))?;
+            Ok(result.items[0].subject.clone().unwrap_or_default())
+        }
+        fn get_item(value: &str) -> Result<String, EwsError> {
+            Ok(parse_get_item_response(&item("GetItem", value))?
+                .subject
+                .unwrap_or_default())
+        }
+        fn get_attachment(value: &str) -> Result<String, EwsError> {
+            let xml = format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:GetAttachmentResponse><m:ResponseMessages>
+<m:GetAttachmentResponseMessage ResponseClass="Success"><m:Attachments>
+<t:FileAttachment><t:AttachmentId Id="A1"/><t:Name>{value}</t:Name></t:FileAttachment>
+</m:Attachments></m:GetAttachmentResponseMessage></m:ResponseMessages>
+</m:GetAttachmentResponse></s:Body></s:Envelope>"#
+            );
+            Ok(parse_get_attachment_response(&xml)?
+                .name
+                .unwrap_or_default())
+        }
+        vec![
+            ("FindFolder", find_folder as TextValueParser),
+            ("GetFolder", get_folder as TextValueParser),
+            ("FindItem", find_item as TextValueParser),
+            ("GetItem", get_item as TextValueParser),
+            ("GetAttachment", get_attachment as TextValueParser),
+        ]
+    }
+
+    type TextValueParser = fn(&str) -> Result<String, EwsError>;
+
+    /// Every operation parser, as a function from one `Id` attribute value
+    /// embedded in an otherwise well-formed response to the id it parses.
+    fn id_attribute_parsers() -> Vec<(&'static str, TextValueParser)> {
+        fn folder(tag: &str, id: &str) -> String {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:{tag}Response><m:ResponseMessages><m:{tag}ResponseMessage ResponseClass="Success">
+<m:ResponseCode>NoError</m:ResponseCode><m:RootFolder><t:Folders><t:Folder>
+<t:FolderId Id="{id}"/><t:DisplayName>Docs</t:DisplayName>
+</t:Folder></t:Folders></m:RootFolder></m:{tag}ResponseMessage></m:ResponseMessages>
+</m:{tag}Response></s:Body></s:Envelope>"#
+            )
+        }
+        fn item(tag: &str, id: &str) -> String {
+            format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:{tag}Response><m:ResponseMessages><m:{tag}ResponseMessage ResponseClass="Success">
+<m:ResponseCode>NoError</m:ResponseCode><m:RootFolder><t:Items><t:Message>
+<t:ItemId Id="{id}" ChangeKey="CK"/><t:Subject>Hi</t:Subject>
+</t:Message></t:Items></m:RootFolder></m:{tag}ResponseMessage></m:ResponseMessages>
+</m:{tag}Response></s:Body></s:Envelope>"#
+            )
+        }
+        fn find_folder(id: &str) -> Result<String, EwsError> {
+            let folders = parse_find_folder_response(&folder("FindFolder", id))?;
+            Ok(folders[0].folder_id.clone())
+        }
+        fn get_folder(id: &str) -> Result<String, EwsError> {
+            Ok(parse_get_folder_response(&folder("GetFolder", id))?.folder_id)
+        }
+        fn find_item(id: &str) -> Result<String, EwsError> {
+            let result = parse_find_items_response(&item("FindItem", id))?;
+            Ok(result.items[0].item_id.clone())
+        }
+        fn get_item(id: &str) -> Result<String, EwsError> {
+            Ok(parse_get_item_response(&item("GetItem", id))?.item_id)
+        }
+        fn get_attachment(id: &str) -> Result<String, EwsError> {
+            let xml = format!(
+                r#"<s:Envelope xmlns:s="s" xmlns:m="m" xmlns:t="t"><s:Body>
+<m:GetAttachmentResponse><m:ResponseMessages>
+<m:GetAttachmentResponseMessage ResponseClass="Success"><m:Attachments>
+<t:FileAttachment><t:AttachmentId Id="{id}"/><t:Name>a.txt</t:Name></t:FileAttachment>
+</m:Attachments></m:GetAttachmentResponseMessage></m:ResponseMessages>
+</m:GetAttachmentResponse></s:Body></s:Envelope>"#
+            );
+            Ok(parse_get_attachment_response(&xml)?.attachment_id)
+        }
+        vec![
+            ("FindFolder", find_folder as TextValueParser),
+            ("GetFolder", get_folder as TextValueParser),
+            ("FindItem", find_item as TextValueParser),
+            ("GetItem", get_item as TextValueParser),
+            ("GetAttachment", get_attachment as TextValueParser),
+        ]
+    }
+
+    /// Attribute values were returned raw, so an id the server escaped kept
+    /// its `&amp;` (a different id from the one the server meant, which the
+    /// next request would then name), and an unresolvable reference passed
+    /// through as if it were text. Ids now unescape, strictly.
+    #[test]
+    fn an_id_attribute_unescapes_strictly_in_every_parser() {
+        for (parser, parse) in id_attribute_parsers() {
+            assert_eq!(
+                parse("a&amp;b&#x43;").expect("well-formed id parses"),
+                "a&bC",
+                "{parser}"
+            );
+            for bad in ["a&bogus;b", "a&#xD800;b"] {
+                match parse(bad) {
+                    Err(EwsError::MalformedXml(_)) => {}
+                    other => panic!("{parser} parsed id {bad:?} as {:?}", other.map(|_| ())),
+                }
+            }
+        }
+    }
+
+    /// The lenient reference folding dropped an unknown entity or an invalid
+    /// character reference and parsed on, so `R&bogus;D` came back as `RD`:
+    /// a folder name, subject, or attachment name the server never sent.
+    /// Every parser now reports the body as malformed; the predefined
+    /// entities and valid character references still decode.
+    #[test]
+    fn an_unresolvable_reference_is_a_malformed_response_in_every_parser() {
+        for (parser, parse) in text_value_parsers() {
+            assert_eq!(
+                parse("R&amp;D &#x41;&#66;").expect("well-formed value parses"),
+                "R&D AB",
+                "{parser}"
+            );
+            for bad in ["R&bogus;D", "R&#xD800;D", "R&#xZZ;D"] {
+                match parse(bad) {
+                    Err(EwsError::MalformedXml(_)) => {}
+                    other => panic!("{parser} parsed {bad:?} as {:?}", other.map(|_| ())),
+                }
+            }
+        }
     }
 }
