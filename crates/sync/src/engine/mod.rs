@@ -1141,7 +1141,19 @@ impl SyncEngine {
                 failed.push(record.into_orphan());
             }
         }
-        self.subscriptions.restore(account_id.clone(), failed);
+        // A detach racing this call has already cancelled the slot and may
+        // already have taken the registry; the sealed write drops the orphans
+        // then, rather than leaving them under an id a later attach inherits.
+        if !self
+            .subscriptions
+            .restore_orphans(account_id.clone(), failed, &slot.shutdown)
+        {
+            tracing::debug!(
+                target: "bifrost.sync.push",
+                account = ?account_id,
+                "account detached during unsubscribe_push; refused handles are left to provider expiry"
+            );
+        }
         match first_error {
             Some(error) => Err(Error::Account(error)),
             None => Ok(()),

@@ -203,6 +203,12 @@ async fn handle_engine_directive(
             restart_scope(ctx, directive_scope).await;
         }
         EngineDirective::DowngradeCapabilityForScope(directive_scope) => {
+            // Registered before the warning, so a deferred repair does not
+            // announce a downgrade that will be announced again when the poll
+            // re-raises the directive after resume.
+            let Some(activity) = begin_scope_repair(ctx, &directive_scope) else {
+                return;
+            };
             broadcast_warning(
                 ctx.changes_tx,
                 Some(directive_scope.clone()),
@@ -212,7 +218,7 @@ async fn handle_engine_directive(
                 )
                 .with_protocol_detail(DiagnosticText::support_only(format!("{directive_scope:?}"))),
             );
-            restart_scope(ctx, directive_scope).await;
+            restart_scope_admitted(ctx, directive_scope, &activity).await;
         }
         EngineDirective::RestartAccount => {
             restart_account(ctx).await;
@@ -249,7 +255,10 @@ async fn handle_engine_directive(
             // The dispatch took no lock for this directive (see there); the
             // scope restart needs the same serialization every other scope
             // repair runs under, so it takes it now that the account restart
-            // has released it.
+            // has released it. A pause landing between the account restart and
+            // this repair makes `restart_scope` decline without touching the
+            // scope: the account is already downgraded, and the poll raises the
+            // scope's directive again after resume.
             if let Some(ErrorScope::Cursor(scoped)) = error.scope() {
                 let _reopen_guard = ctx.reopen_lock.lock().await;
                 restart_scope(ctx, scoped.clone()).await;
@@ -324,7 +333,7 @@ async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
         }
     }
     for s in scopes {
-        re_establish_scope_with_backoff(ctx, s).await;
+        re_establish_scope_with_backoff(ctx, s, ctx.control).await;
     }
 }
 
@@ -356,7 +365,56 @@ const REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 /// that scope, and the operator is alerted via
 /// `Warning::OperatorAttentionNeeded`. The other scopes keep running.
 /// (sync-D6, sync-D7)
-async fn restart_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
+///
+/// Returns whether the repair started. `false` means the account was paused or
+/// pausing, nothing was touched, and the scope's failing cursor is still in the
+/// registry for the poll to raise the directive against again after resume.
+async fn restart_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) -> bool {
+    let Some(activity) = begin_scope_repair(ctx, &scope) else {
+        return false;
+    };
+    restart_scope_admitted(ctx, scope, &activity).await;
+    true
+}
+
+/// Register the activity a scope repair runs under, or decline the repair.
+///
+/// A repair deletes the scope's cursor and then re-establishes it, and the
+/// establishment is refused on a paused account. A pause landing between the
+/// two used to strand the scope for good: the cursor was gone, the
+/// establishment returned `Paused`, and the multiplexer only polls scopes still
+/// in the cursor registry, so nothing ever raised the directive again.
+///
+/// The repair must not wait for `Run` instead. The dispatch holds the reopen
+/// lock, and a consumer can hold the account paused indefinitely; a wait here
+/// would hang `unsubscribe_push`, which needs that lock, for the whole pause
+/// (the same reason `RestartAccount` takes no lock in the dispatch). So a
+/// refused registration means: do nothing at all, and let the still-registered
+/// failing cursor re-raise the directive after resume.
+///
+/// Once this returns a guard the pause waits for the repair rather than landing
+/// inside it. The guard has to be held from before the delete, and the
+/// establishment underneath runs on [`SyncControl::admitted_by`] this guard, not
+/// on a second registration a mid-repair pause would refuse.
+fn begin_scope_repair(ctx: &RecoveryContext<'_>, scope: &CursorScope) -> Option<SyncActivityGuard> {
+    let activity = ctx.control.begin_activity();
+    if activity.is_none() {
+        tracing::debug!(
+            target: "bifrost.sync.changes",
+            account = ?ctx.account_id,
+            scope = ?scope,
+            "scope repair deferred: the account is paused; the failing cursor stays registered \
+             so the poll raises the directive again after resume"
+        );
+    }
+    activity
+}
+
+async fn restart_scope_admitted(
+    ctx: &RecoveryContext<'_>,
+    scope: CursorScope,
+    activity: &SyncActivityGuard,
+) {
     ctx.cursors.delete(&scope);
     if let Err(err) = ctx.writer.reset_scope_for_restart(scope.clone()).await {
         tracing::warn!(
@@ -367,7 +425,8 @@ async fn restart_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
             "RestartScope: durable scope reset failed"
         );
     }
-    re_establish_scope_with_backoff(ctx, scope).await;
+    let admitted = ctx.control.admitted_by(activity);
+    re_establish_scope_with_backoff(ctx, scope, &admitted).await;
 }
 
 /// Quarantine a single scope: delete its in-memory and durable cursor and
@@ -402,7 +461,17 @@ async fn disable_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
     );
 }
 
-async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: CursorScope) {
+/// `control` is what the establishment registers its own activity on: the
+/// account's plain control for a caller holding no registration, or the handle
+/// [`SyncControl::admitted_by`] a registration the caller already holds, so a
+/// pause that lands mid-repair cannot refuse the nested one. It is also what
+/// the inventory walk under the establishment publishes its checkpoints
+/// through, which is why it is passed whole rather than dropped.
+async fn re_establish_scope_with_backoff(
+    ctx: &RecoveryContext<'_>,
+    scope: CursorScope,
+    control: &SyncControl,
+) {
     let mut delay = REOPEN_BACKOFF_INITIAL;
     let mut last_account_error: Option<AccountError> = None;
     for attempt in 0..REOPEN_RETRY_BUDGET {
@@ -422,7 +491,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
             Arc::clone(ctx.cursors),
             ctx.writer,
             Arc::clone(ctx.delivery),
-            Some(ctx.control),
+            Some(control),
             Arc::clone(ctx.coverage),
             true,
             ctx.shutdown,
@@ -538,7 +607,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
 async fn unwind_replacement_subscriptions(
     ctx: &RecoveryContext<'_>,
     next: &dyn Account,
-    replacements: &mut ReplacementSubscriptions,
+    replacements: &mut ReattachGuard,
 ) {
     while let Some(front) = replacements.live.first() {
         let result = next.push_unsubscribe(front.handle.clone()).await;
@@ -550,64 +619,103 @@ async fn unwind_replacement_subscriptions(
                 error = %cleanup,
                 "replacement push cleanup failed while unwinding reopen; retaining handle for retry"
             );
-            ctx.subscriptions
-                .restore(ctx.account_id.clone(), vec![replacement.into_orphan()]);
+            // Through the sealed write, not a bare restore: this abort can run
+            // after a detach that never waited for it, and an orphan landing
+            // after detach's registry take is inherited by a later attach.
+            register_orphans(
+                ctx.subscriptions,
+                ctx.account_id,
+                ctx.shutdown,
+                vec![replacement],
+            );
         }
     }
 }
 
-/// The push subscriptions a reattach has created on its replacement and not yet
-/// handed to the registry.
+/// Everything a reattach owes for the replacement connection it holds, until the
+/// step that settles each debt has answered.
 ///
 /// `Account::close()` does not delete server-side subscriptions, and the
-/// registry does not know these handles until the cutover commits them, so a
-/// reattach future dropped between `push_subscribe` and the commit (a consumer
-/// timing out `SyncEngine::reattach`, a worker abort at the detach deadline)
-/// would leave them live on the provider and registered nowhere.
+/// registry does not know a replacement's handles until the cutover commits
+/// them, so a reattach future dropped anywhere (a consumer timing out
+/// `SyncEngine::reattach`, a worker abort at the detach deadline) would strand
+/// the replacement connection, its subscriptions, and any cursor rows it had
+/// persisted provisionally.
 ///
-/// This guard owns them in the meantime. It is constructed at the top of
-/// `reattach_account`, before any subscription exists, so there is no window in
-/// which a subscription is live and unguarded: the future creates the first one
-/// only after being polled, by which time the guard is built, and a handle is
-/// pushed here in the same poll that `push_subscribe` returned it. Three exits:
+/// The guard is armed at CONSTRUCTION, never inside an async body a poll late:
+/// `open_replacement` builds it in the same synchronous step that receives the
+/// replacement from the factory, and it travels with the replacement into
+/// `reattach_account`, so there is no interval, a drop before that function's
+/// first poll included, in which a live replacement is owned only by a local. It
+/// tracks four debts:
 ///
-/// - commit: `disarm` moves the handles into the registry, with no await between
-///   the disarm and the registry write, so no drop can land between them;
-/// - ordinary abort: `unwind_replacement_subscriptions` empties it, so the
-///   `Drop` finds nothing and cannot unwind twice;
-/// - drop: `Drop` spawns a task that deletes the remaining handles on the
-///   replacement (the only account that can be trusted to know them), records
-///   every refusal as an orphan, and closes the replacement, which nothing else
-///   will now do. With no runtime to spawn on, the handles are registered as
-///   orphans directly, undeleted.
+/// - `live`, the push handles the replacement created. A handle is pushed here
+///   in the same poll that `push_subscribe` returned it. The commit `disarm`s
+///   them into the registry with no await between the two; an ordinary abort
+///   empties them through `unwind_replacement_subscriptions`, which removes a
+///   record only after its delete answered.
+/// - `close_owed`, the account whose `close()` is still owed: the replacement
+///   until the swap, and from `swapped` on the previous account. It is closed
+///   through [`Self::close_owed`], which clears the debt only once the close has
+///   RETURNED, so a drop parked inside a close owes it again.
+/// - `rollback_owed`, the compensation for rows `reattach_insert` may have
+///   written. Armed synchronously before the first insert, cleared once
+///   `reattach_abort` answered.
+/// - `commit_owed`, which `swapped` converts the rollback into. Past the swap an
+///   abort would delete cursors belonging to a reattach that succeeded, so a drop
+///   there must promote the rows instead. Cleared once the commit is enqueued.
+///
+/// On drop, the writer request is enqueued SYNCHRONOUSLY with `try_send`: it
+/// lands in the writer's queue ahead of anything a later reattach could insert,
+/// which a spawned task would not guarantee, and the abort only ever deletes rows
+/// still provisional. A full channel falls back to a spawned send. Then a task is
+/// spawned to delete the remaining `live` handles on the replacement (the only
+/// account that can be trusted to know them), record every refusal as an orphan,
+/// and close what is owed. With no runtime to spawn on, the handles are
+/// registered as orphans directly, undeleted, and the close cannot run.
 ///
 /// Orphans are retried against whatever account is current when they are
-/// retried, not against the replacement that created them. That is the same
-/// accepted limitation as the ordinary abort's unwind, and it is the reason the
-/// spawned task tries the replacement itself first.
+/// retried, not against the replacement that created them. That is an accepted
+/// limit, benign in this workspace because no provider rejects a handle it does
+/// not know (the retry clears the orphan and cannot fail forever), and it is the
+/// reason the spawned task tries the replacement itself first. It is not a
+/// guarantee of deletion: Graph, IMAP and JMAP keep a handle's server state in
+/// the account instance, so a retry that reaches a newer connection is a no-op
+/// and the provider-side subscription then lives until it expires. See
+/// `reference/sync.md`.
 ///
 /// Known residue: a drop parked INSIDE `push_subscribe` may have created a
 /// subscription whose handle never reached this guard. That is the account
 /// implementation's cancellation contract, not something the engine can see.
-pub(super) struct ReplacementSubscriptions {
+pub(super) struct ReattachGuard {
+    /// The replacement connection. Deletes of `live` run against it.
     account: Arc<dyn Account>,
     subscriptions: Arc<SubscriptionRegistry>,
     account_id: AccountId,
     shutdown: CancellationToken,
     /// The slot's reopen lock, for the spawned cleanup's registry write.
     reopen_lock: Arc<AsyncMutex<()>>,
+    /// The account's writer queue, for the synchronous compensation on drop.
+    writer: tokio::sync::mpsc::Sender<WriterRequest>,
     live: Vec<RegisteredSubscription>,
+    close_owed: Option<Arc<dyn Account>>,
+    rollback_owed: bool,
+    commit_owed: bool,
 }
 
-impl ReplacementSubscriptions {
-    fn new(ctx: &RecoveryContext<'_>, account: &Arc<dyn Account>) -> Self {
+impl ReattachGuard {
+    fn new(ctx: &RecoveryContext<'_>, account: Arc<dyn Account>) -> Self {
         Self {
-            account: Arc::clone(account),
+            close_owed: Some(Arc::clone(&account)),
+            account,
             subscriptions: Arc::clone(ctx.subscriptions),
             account_id: ctx.account_id.clone(),
             shutdown: ctx.shutdown.clone(),
             reopen_lock: Arc::clone(ctx.reopen_lock),
+            writer: ctx.writer.sender(),
             live: Vec::new(),
+            rollback_owed: false,
+            commit_owed: false,
         }
     }
 
@@ -619,31 +727,100 @@ impl ReplacementSubscriptions {
     fn disarm(&mut self) -> Vec<RegisteredSubscription> {
         std::mem::take(&mut self.live)
     }
+
+    /// The cutover happened: the replacement is now the live account and the
+    /// previous one is what needs closing, and the provisional rows are now the
+    /// installed topology's, to be promoted rather than rolled back. Called
+    /// synchronously right after the swap, with no await in between.
+    fn swapped(&mut self, previous: Arc<dyn Account>) {
+        self.close_owed = Some(previous);
+        self.rollback_owed = false;
+        self.commit_owed = true;
+    }
+
+    /// Close whatever account is owed, and stop owing it once the close returned.
+    async fn close_owed(&mut self) -> Result<(), AccountError> {
+        let Some(account) = self.close_owed.clone() else {
+            return Ok(());
+        };
+        let result = account.close().await;
+        self.close_owed = None;
+        result
+    }
 }
 
-impl Drop for ReplacementSubscriptions {
+/// Enqueue a writer request from a `Drop`. Never blocks: a closed channel means
+/// the writer is gone (the slot was detached) and there is nothing to
+/// compensate against; a full one falls back to a spawned send.
+fn enqueue_writer_request(
+    writer: &mpsc::Sender<WriterRequest>,
+    request: WriterRequest,
+    runtime: Option<&tokio::runtime::Handle>,
+    account_id: &AccountId,
+) {
+    match writer.try_send(request) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(request)) => {
+            if let Some(runtime) = runtime {
+                let writer = writer.clone();
+                runtime.spawn(async move {
+                    let _ = writer.send(request).await;
+                });
+            } else {
+                tracing::error!(
+                    target: "bifrost.sync.reopen",
+                    account = ?account_id,
+                    "writer queue full and no runtime on a dropped reattach; \
+                     provisional cursor rows keep their state until a later abort or commit"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for ReattachGuard {
     fn drop(&mut self) {
-        if self.live.is_empty() {
-            return;
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        if self.rollback_owed {
+            let (done, _ignored) = oneshot::channel();
+            enqueue_writer_request(
+                &self.writer,
+                WriterRequest::ReattachAbort { done },
+                runtime.as_ref(),
+                &self.account_id,
+            );
+        }
+        if self.commit_owed {
+            enqueue_writer_request(
+                &self.writer,
+                WriterRequest::ReattachCommit,
+                runtime.as_ref(),
+                &self.account_id,
+            );
         }
         let live = std::mem::take(&mut self.live);
+        let close = self.close_owed.take();
+        if live.is_empty() && close.is_none() {
+            return;
+        }
         let account = Arc::clone(&self.account);
         let subscriptions = Arc::clone(&self.subscriptions);
         let account_id = self.account_id.clone();
         let shutdown = self.shutdown.clone();
         let reopen_lock = Arc::clone(&self.reopen_lock);
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                runtime.spawn(retire_stranded_subscriptions(
+        match runtime {
+            Some(runtime) => {
+                runtime.spawn(retire_stranded(Stranded {
                     account,
                     subscriptions,
                     account_id,
                     shutdown,
                     reopen_lock,
                     live,
-                ));
+                    close,
+                }));
             }
-            Err(_) => {
+            None => {
                 // No lock here, deliberately. Drop cannot await, and a blocking
                 // acquire would stall a non-async thread on a lock the dropping
                 // reattach itself usually still holds (its reopen guard lives in
@@ -656,7 +833,9 @@ impl Drop for ReplacementSubscriptions {
                     target: "bifrost.sync.reopen",
                     account = ?account_id,
                     stranded = live.len(),
-                    "reattach dropped with no runtime to clean up on; registering replacement handles as orphans"
+                    close_owed = close.is_some(),
+                    "reattach dropped with no runtime to clean up on; registering replacement \
+                     handles as orphans, and an account owed a close cannot be closed"
                 );
                 register_orphans(&subscriptions, &account_id, &shutdown, live);
             }
@@ -665,36 +844,54 @@ impl Drop for ReplacementSubscriptions {
 }
 
 /// Register `records` as orphans for retry, unless the slot is being torn down.
-/// Detach has already taken and discarded the account's registry entry, so an
-/// orphan added after it would sit under an id nothing retries.
+///
+/// The teardown check is made by the registry, inside the shard lock `take`
+/// runs under (`SubscriptionRegistry::restore_orphans`), not here beforehand.
+/// Detach cancels the shutdown token and only later takes and discards the
+/// account's registry entry, so an orphan written after that take would sit
+/// under an id a later attach of the same `AccountId` inherits. A check made
+/// before the write leaves a gap on a multi-thread runtime between reading the
+/// token and writing the entry, wide enough for detach to cancel AND take.
 fn register_orphans(
     subscriptions: &SubscriptionRegistry,
     account_id: &AccountId,
     shutdown: &CancellationToken,
     records: Vec<RegisteredSubscription>,
 ) {
-    if shutdown.is_cancelled() {
-        if !records.is_empty() {
-            tracing::warn!(
-                target: "bifrost.sync.reopen",
-                account = ?account_id,
-                stranded = records.len(),
-                "slot detached before dropped-reattach cleanup finished; leaving handles to provider expiry"
-            );
-        }
+    if records.is_empty() {
         return;
     }
-    subscriptions.restore(
-        account_id.clone(),
-        records
-            .into_iter()
-            .map(RegisteredSubscription::into_orphan)
-            .collect(),
-    );
+    let stranded = records.len();
+    let orphans = records
+        .into_iter()
+        .map(RegisteredSubscription::into_orphan)
+        .collect();
+    if !subscriptions.restore_orphans(account_id.clone(), orphans, shutdown) {
+        tracing::warn!(
+            target: "bifrost.sync.reopen",
+            account = ?account_id,
+            stranded,
+            "slot detached before a refused push cleanup could be registered; leaving handles to provider expiry"
+        );
+    }
 }
 
-/// Cleanup for a reattach future that was dropped after creating replacement
-/// subscriptions. Runs detached from the dropped future.
+/// What a dropped reattach's cleanup task needs, gathered by the guard's `Drop`.
+struct Stranded {
+    /// The replacement, which the `live` deletes run against.
+    account: Arc<dyn Account>,
+    subscriptions: Arc<SubscriptionRegistry>,
+    account_id: AccountId,
+    shutdown: CancellationToken,
+    reopen_lock: Arc<AsyncMutex<()>>,
+    live: Vec<RegisteredSubscription>,
+    /// The account still owed a `close()`: the replacement before the swap, the
+    /// previous account after it.
+    close: Option<Arc<dyn Account>>,
+}
+
+/// Cleanup for a reattach future that was dropped while owing something.
+/// Runs detached from the dropped future.
 ///
 /// The deletes and the close run WITHOUT the slot's reopen lock, so a concurrent
 /// reattach never waits on this task's network calls. Only the registry write
@@ -703,23 +900,24 @@ fn register_orphans(
 /// (this task's delete failing while a later reattach is mid-flight) would be
 /// erased, and the provider subscription could never be retried. Under the lock
 /// the restore lands either before that reattach snapshots (which then carries it
-/// as it carries any orphan) or after it commits (`restore` merges into what it
-/// installed).
-///
-/// The lock is taken before `register_orphans` reads the shutdown token, not
-/// after: the wait can span a detach, and the check has to see it.
+/// as it carries any orphan) or after it commits (`restore_orphans` merges into
+/// what it installed). The lock is for THAT ordering only; the detach race is
+/// closed by the registry's own check, which the lock could not close because
+/// detach does not take it.
 ///
 /// The dropped reattach's own reopen guard cannot deadlock this: the guard is
 /// released by the drop, independently of this task, and this task only ever
 /// waits on the lock asynchronously.
-async fn retire_stranded_subscriptions(
-    account: Arc<dyn Account>,
-    subscriptions: Arc<SubscriptionRegistry>,
-    account_id: AccountId,
-    shutdown: CancellationToken,
-    reopen_lock: Arc<AsyncMutex<()>>,
-    live: Vec<RegisteredSubscription>,
-) {
+async fn retire_stranded(stranded: Stranded) {
+    let Stranded {
+        account,
+        subscriptions,
+        account_id,
+        shutdown,
+        reopen_lock,
+        live,
+        close,
+    } = stranded;
     let mut refused = Vec::new();
     for record in live {
         if let Err(error) = account.push_unsubscribe(record.handle.clone()).await {
@@ -736,12 +934,14 @@ async fn retire_stranded_subscriptions(
         let _reopen_guard = reopen_lock.lock().await;
         register_orphans(&subscriptions, &account_id, &shutdown, refused);
     }
-    if let Err(error) = account.close().await {
+    if let Some(owed) = close
+        && let Err(error) = owed.close().await
+    {
         tracing::warn!(
             target: "bifrost.sync.reopen",
             account = ?account_id,
             error = %error,
-            "replacement account close failed after a dropped reattach"
+            "account close failed after a dropped reattach"
         );
     }
 }
@@ -771,8 +971,13 @@ async fn retire_stranded_subscriptions(
 /// its own; a plain FIFO queue would order the acknowledged write first and
 /// then faithfully destroy it. The provisional set is what makes this a
 /// conditional delete.
-async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>) {
+///
+/// The guard's `rollback_owed` is cleared only once the writer answered, so a
+/// drop parked inside this await still compensates (a second abort is
+/// idempotent: the first left nothing provisional).
+async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>, guard: &mut ReattachGuard) {
     ctx.writer.reattach_abort().await;
+    guard.rollback_owed = false;
 }
 
 /// Promote this reattach's provisional rows to ordinary durable state.
@@ -780,7 +985,11 @@ async fn rollback_reattach_inserts(ctx: &RecoveryContext<'_>) {
 /// Called after the cutover commits, past the last point an abort can occur.
 /// Without it the scopes stay marked provisional and the NEXT reattach's abort
 /// would delete cursors belonging to a reattach that succeeded.
-async fn commit_reattach_inserts(ctx: &RecoveryContext<'_>) {
+///
+/// The guard's `commit_owed` is cleared once the request is enqueued (a
+/// `reattach_commit` is only a channel send), so a drop parked while the
+/// channel is full still promotes the rows.
+async fn commit_reattach_inserts(ctx: &RecoveryContext<'_>, guard: &mut ReattachGuard) {
     if ctx.writer.reattach_commit().await.is_err() {
         tracing::error!(
             target: "bifrost.sync.reopen",
@@ -788,6 +997,7 @@ async fn commit_reattach_inserts(ctx: &RecoveryContext<'_>) {
             "writer channel closed before the reattach could be committed"
         );
     }
+    guard.commit_owed = false;
 }
 
 /// Why no replacement connection was opened.
@@ -826,7 +1036,7 @@ pub(super) enum ReplacementOpen {
 /// something a caller can express.
 pub(super) async fn open_replacement(
     ctx: &RecoveryContext<'_>,
-) -> Result<(OwnedMutexGuard<()>, SyncActivityGuard, OpenedAccount), ReplacementOpen> {
+) -> Result<(OwnedMutexGuard<()>, SyncActivityGuard, Replacement), ReplacementOpen> {
     let activity = ctx
         .control
         .begin_activity()
@@ -847,18 +1057,45 @@ pub(super) async fn open_replacement(
     }
     match ctx.factory.open(ctx.account_id.clone()).await {
         Ok(next) => {
+            // Owned by the guard from this synchronous step on, so nothing
+            // below, and nothing between here and `reattach_account`'s first
+            // poll, can drop the connection without closing it.
+            let OpenedAccount {
+                account,
+                skipped_scopes,
+            } = next;
+            let mut guard = ReattachGuard::new(ctx, account);
             if ctx.shutdown.is_cancelled() {
                 // Close what we opened. Best-effort, exactly like every other
                 // abort path here: the alternative is an owner-less connection.
-                let _ = next.account.close().await;
+                // Through the guard, so a drop parked in this close owes it
+                // again rather than abandoning it.
+                let _ = guard.close_owed().await;
                 return Err(ReplacementOpen::Detached);
             }
-            Ok((reopen_guard, activity, next))
+            Ok((
+                reopen_guard,
+                activity,
+                Replacement {
+                    guard,
+                    skipped_scopes,
+                },
+            ))
         }
         // Dropping `activity` here is the point: the failed open registered
         // no lasting work, so quiescence must not stay blocked on it.
         Err(error) => Err(ReplacementOpen::Failed(error)),
     }
+}
+
+/// A freshly opened replacement connection and the guard that owns it.
+///
+/// The guard is part of the value rather than built by the consumer, so a
+/// `Replacement` dropped anywhere, before `reattach_account` is polled included,
+/// closes the connection it holds. See [`ReattachGuard`].
+pub(super) struct Replacement {
+    guard: ReattachGuard,
+    skipped_scopes: Vec<SkippedScope>,
 }
 
 /// Swap in a replacement connection. `activity` is the registration taken by
@@ -867,19 +1104,16 @@ pub(super) async fn open_replacement(
 pub(super) async fn reattach_account(
     ctx: &RecoveryContext<'_>,
     activity: SyncActivityGuard,
-    next: OpenedAccount,
+    replacement: Replacement,
 ) -> Result<(), Error> {
     let _activity = activity;
-    let OpenedAccount {
-        account: next,
+    let Replacement {
+        mut guard,
         skipped_scopes: next_skips,
-    } = next;
+    } = replacement;
+    let next = Arc::clone(&guard.account);
     next.set_priority(ctx.control.priority_snapshot());
     next.set_bandwidth_cap(ctx.control.bandwidth_cap_snapshot());
-
-    // Built before any subscription can exist, and outside the async block so
-    // it outlives every abort path in it. See `ReplacementSubscriptions`.
-    let mut replacement_subscriptions = ReplacementSubscriptions::new(ctx, &next);
 
     let result = async {
         let discovered = discover_scopes_from(next.as_ref()).await?;
@@ -980,7 +1214,7 @@ pub(super) async fn reattach_account(
                         // Straight into the guard: no await between the provider
                         // answering and the handle being owned by something a
                         // drop will clean up.
-                        replacement_subscriptions.push(RegisteredSubscription {
+                        guard.push(RegisteredSubscription {
                             handle,
                             scopes: covered,
                             teardown_unconfirmed: false,
@@ -990,12 +1224,7 @@ pub(super) async fn reattach_account(
                     }
                 }
                 Err(error) => {
-                    unwind_replacement_subscriptions(
-                        ctx,
-                        next.as_ref(),
-                        &mut replacement_subscriptions,
-                    )
-                    .await;
+                    unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard).await;
                     return Err(Error::Account(error));
                 }
             }
@@ -1018,6 +1247,11 @@ pub(super) async fn reattach_account(
         // replacement inventory pass broadcasts checkpoint-bearing batches
         // before the cutover. The writer also marks these scopes provisional so
         // an abort deletes only rows no acknowledgement has claimed.
+        //
+        // The compensation is owed from BEFORE the first insert, synchronously,
+        // so a drop parked inside an insert (whose request may already be
+        // queued) still rolls back.
+        guard.rollback_owed = !newly_established.is_empty();
         let durable_result = async {
             for cursor in &newly_established {
                 ctx.writer.reattach_insert(cursor.clone()).await?;
@@ -1026,9 +1260,8 @@ pub(super) async fn reattach_account(
         }
         .await;
         if let Err(error) = durable_result {
-            rollback_reattach_inserts(ctx).await;
-            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut replacement_subscriptions)
-                .await;
+            rollback_reattach_inserts(ctx, &mut guard).await;
+            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard).await;
             return Err(error);
         }
 
@@ -1067,6 +1300,17 @@ pub(super) async fn reattach_account(
                 // an unknown-handle error on a strict provider.
                 continue;
             }
+            // Accepted limit: a carried orphan is retried here against whatever
+            // account is current, which may be a later connection than the one
+            // that minted the handle. The handle belongs to the same account id
+            // and credentials, and no provider in this workspace rejects a
+            // handle it does not know, so the retry clears the orphan rather
+            // than failing forever. It does not promise a deletion: Graph, IMAP
+            // and JMAP hold a handle's server state in the account instance, so
+            // a retry that reaches a newer connection is a no-op and the
+            // provider-side subscription then lives until it expires (Graph's
+            // webhook rows are also deleted by the owning account's `close()`).
+            // `unsubscribe_push` retries on the same terms.
             let teardown = previous.push_unsubscribe(record.handle.clone()).await;
             match teardown {
                 Ok(()) => {
@@ -1114,15 +1358,14 @@ pub(super) async fn reattach_account(
             // server-side subscriptions, so any handle whose teardown did not
             // succeed stays in the registry - on whichever side it was
             // created - and is retried later.
-            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut replacement_subscriptions)
-                .await;
-            rollback_reattach_inserts(ctx).await;
+            unwind_replacement_subscriptions(ctx, next.as_ref(), &mut guard).await;
+            rollback_reattach_inserts(ctx, &mut guard).await;
             return Err(Error::Account(error));
         }
         // Commit exit of the replacement-subscription guard. Nothing between
         // here and `subscriptions.replace` awaits, so no drop can land after the
         // guard lets go and before the registry holds the handles.
-        let mut installed_subscriptions = replacement_subscriptions.disarm();
+        let mut installed_subscriptions = guard.disarm();
         installed_subscriptions.extend(carried_unconfirmed);
 
         // Take the final old-handle snapshot immediately before cutover.
@@ -1130,6 +1373,10 @@ pub(super) async fn reattach_account(
         // topology swap, so an old stream that finishes later cannot write a
         // cursor minted by the retired connection into this new topology.
         let previous = ctx.current.swap(Arc::new(Arc::clone(&next)));
+        // No await between the swap and this: from here a drop must close the
+        // OLD account (the replacement is live) and promote the provisional
+        // rows instead of rolling them back.
+        guard.swapped(Arc::clone(previous.as_ref()));
         ctx.cursors.replace_topology_preserving_cursors(&staged);
         {
             let mut capabilities = match ctx.capabilities.write() {
@@ -1161,7 +1408,7 @@ pub(super) async fn reattach_account(
         // send, and the lifecycle reader is waiting on that watch to resubscribe
         // to the replacement handle - no await belongs between the topology swap
         // and the bump that publishes it.
-        commit_reattach_inserts(ctx).await;
+        commit_reattach_inserts(ctx, &mut guard).await;
 
         // Delete vanished-scope rows only now that the cutover is committed.
         // Nothing after this point can abort the swap, so no compensation is
@@ -1182,7 +1429,10 @@ pub(super) async fn reattach_account(
             }
         }
 
-        if let Err(error) = previous.close().await {
+        // Through the guard, which owes this close until it returns: a drop
+        // parked here (or before it) closes the old connection instead of
+        // leaking it.
+        if let Err(error) = guard.close_owed().await {
             tracing::warn!(
                 target: "bifrost.sync.reopen",
                 account = ?ctx.account_id,
@@ -1195,7 +1445,7 @@ pub(super) async fn reattach_account(
     .await;
 
     if result.is_err()
-        && let Err(error) = next.close().await
+        && let Err(error) = guard.close_owed().await
     {
         tracing::warn!(
             target: "bifrost.sync.reopen",

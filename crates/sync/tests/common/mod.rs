@@ -309,6 +309,16 @@ pub struct StubAccount {
     /// Parks the NEXT `push_unsubscribe` call on the `Notify`, then disarms.
     /// The call is logged (and, on a strict provider, remembered) on entry.
     pub push_unsubscribe_park: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// How many upcoming `establish_initial_cursor` calls on THIS account fail
+    /// with [`push_teardown_refused`] (a classified, retryable transport
+    /// error) before it starts succeeding. Default 0. The call is still
+    /// recorded in `established`. Set it AFTER attach, which establishes too.
+    pub establish_failures: std::sync::atomic::AtomicUsize,
+    /// Notified (`notify_one`, so a permit is stored if nobody waits yet) each
+    /// time an `establish_initial_cursor` call fails on account of
+    /// `establish_failures`. Lets a test act between an establishment attempt
+    /// and its retry.
+    pub establish_failed: Arc<tokio::sync::Notify>,
 }
 
 /// Observes the LIFETIME of a stalled provider stream, not just its effects.
@@ -432,6 +442,8 @@ impl StubAccount {
             push_deleted: Mutex::new(Vec::new()),
             push_subscribe_park: Mutex::new(None),
             push_unsubscribe_park: Mutex::new(None),
+            establish_failures: std::sync::atomic::AtomicUsize::new(0),
+            establish_failed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -556,6 +568,18 @@ impl Account for StubAccount {
             .lock()
             .expect("established lock")
             .push(scope.clone());
+        let failing = self
+            .establish_failures
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        if failing {
+            self.establish_failed.notify_one();
+            return Box::pin(async { Err(push_teardown_refused()) });
+        }
         let establishment = (self.establishment)(&scope);
         Box::pin(async move { Ok(establishment) })
     }

@@ -430,40 +430,101 @@ A repeat failure on an already-unconfirmed record is logged rather than
 aborting the swap, because a handle belonging to a long-dead connection
 must not wedge every future reopen.
 
-The replacement's subscriptions are cancellation-safe. `reattach_account`
-is reachable through a public future (`SyncEngine::reattach`, which a
-consumer may time out) and through the reopen listener (aborted at the
-detach deadline), so it can be dropped at any await. Every handle
-`push_subscribe` returns goes straight into a `ReplacementSubscriptions`
-guard, built at the top of the function before any subscription exists. It
-has three exits: the cutover `disarm`s it into the registry with no await
-between the two; an ordinary abort empties it through
-`unwind_replacement_subscriptions` (which removes a record only after its
-delete answered, restoring a refusal as an orphan in the same synchronous
-step), so its `Drop` finds nothing; and a drop spawns a task that deletes the
-remaining handles on the replacement, registers refusals as orphans (skipped
-once the slot's shutdown token is cancelled, since detach has already
-discarded the account's registry entry), and closes the replacement. The task takes the
-slot's reopen lock around that registry write ONLY, never around the deletes or
-the close, so a concurrent reattach does not wait on its network calls: a
-reattach commits with `replace` built from its own snapshot, so an unlocked
-restore landing between that snapshot and the commit would be erased and the
-provider subscription never retried. Under the lock the restore lands before
-the snapshot (carried like any orphan) or after the commit (`restore` merges).
-The lock is taken before the shutdown check, since the wait can span a detach,
-and the dropped reattach's own reopen guard is released by the drop
-independently of the task, which only waits asynchronously. With no
-runtime to spawn on the handles are registered as undeleted orphans, without
-the lock: Drop cannot await, the dropping reattach usually still holds the
-lock, and with no runtime nothing can be running a concurrent reattach. Orphans
-are retried against whichever account is current at that time, not the
-replacement that created them, which is why the task tries the replacement
-first. Two residues are known: a drop parked inside `push_subscribe` itself
-may leave a provider-side subscription whose handle the engine never received
-(the account implementation's cancellation contract), and a drop elsewhere in
-the pass does not close the replacement unless subscriptions were stranded.
-The rollback of provisional durable cursor rows likewise does not run on a
-drop.
+A reattach is cancellation-safe end to end. `reattach_account` is reachable
+through a public future (`SyncEngine::reattach`, which a consumer may time out)
+and through the reopen listener (aborted at the detach deadline), so it can be
+dropped at any await, and what it owns has to be cleaned up by something a drop
+still runs. That something is a `ReattachGuard`, armed at CONSTRUCTION: it is
+built inside `open_replacement` in the same synchronous step that receives the
+replacement from the factory, and travels with it (`Replacement`) into
+`reattach_account`, so there is no interval, including one before the
+function's first poll, in which a live replacement is owned only by a local. It
+tracks four debts, each cleared by the step that settles it and only after that
+step's await has answered:
+
+- Push handles the replacement created (`live`). Each handle
+  `push_subscribe` returns goes straight into the guard. The cutover `disarm`s
+  them into the registry with no await between the two; an ordinary abort
+  empties them through `unwind_replacement_subscriptions` (which removes a
+  record only after its delete answered, restoring a refusal as an orphan in
+  the same synchronous step).
+- The close owed to an account. Until the swap that is the replacement; the
+  swap (`swapped`, with no await after it) hands the guard the previous account
+  instead, so a drop between the swap and `previous.close()` closes the old
+  connection rather than leaking it. The close is awaited through the guard and
+  cleared only once it returns, so a drop parked inside a close owes it again.
+- The rollback of provisional cursor rows (`rollback_owed`), armed
+  synchronously before the first `reattach_insert` and cleared once
+  `reattach_abort` answered.
+- The commit of those rows (`commit_owed`), which the swap converts the
+  rollback into: past the swap an abort would delete cursors belonging to a
+  reattach that succeeded, so a drop there must promote them, not roll them back.
+  Cleared once the commit is enqueued. That conversion is not observable from a
+  test: once a commit has landed the writer's abort finds nothing provisional
+  and is a no-op, so only a drop between the swap and the commit reaching the
+  queue depends on it, and the only await in that span is the commit's own
+  channel send.
+
+On a drop the guard enqueues the writer's `ReattachAbort` or `ReattachCommit`
+synchronously with `try_send`. That is deliberate: the request lands in the
+writer's queue ahead of anything a later reattach could insert, which a spawned
+task would not guarantee, and the writer's abort handles only rows still
+provisional. A full channel falls back to a spawned send. Then it spawns one
+task that deletes any remaining handles on the replacement, registers refusals
+as orphans, and closes whatever account is owed (a second close after a
+cancelled first one, since the cancelled call proved nothing). The deletes
+and the close run without the slot's reopen lock, so a concurrent reattach does
+not wait on network calls; only the registry write takes it, because a reattach
+commits with `replace` built from its own snapshot, so an unlocked restore
+landing between that snapshot and the commit would be erased and the provider
+subscription never retried. Under the lock the restore lands before the
+snapshot (carried like any orphan) or after the commit (`restore_orphans`
+merges).
+With no runtime to spawn on the handles are registered as undeleted orphans
+without the lock (Drop cannot await, the dropping reattach usually still holds
+it, and with no runtime nothing can be running a concurrent reattach) and the
+close cannot run.
+
+Every orphan restore made off the detach path goes through
+`SubscriptionRegistry::restore_orphans`, which checks the slot's shutdown token
+INSIDE the registry's own shard lock, the same lock `take` runs under. Detach
+cancels the token before it takes the registry, so a restore is either ordered
+before the take (and discarded by it) or after it (and sees the cancelled token
+and refuses). A check made before the write, as the cleanup task once did,
+leaves a window on a multi-thread runtime: the token is read, detach cancels
+and takes, and the orphan then lands under an id a later attach of the same
+`AccountId` inherits. Detach does not take the reopen lock to close that window,
+deliberately: consumer-driven reattaches hold it across `factory.open()` and
+network calls, detach does not wait for them, and a lock acquisition there would
+make the one call a consumer has for getting rid of an account wait on a wedged
+open. The same sealed write is used by the ordinary abort's unwind and by
+`unsubscribe_push`.
+
+Orphans are retried against whichever account is current at that time, not the
+replacement that created them, which is why the cleanup task tries the
+replacement itself first. That is an accepted limit and it is benign in this
+workspace: no provider rejects a handle it does not know (IMAP, JMAP and Graph
+answer `Ok` without touching the wire; Google re-derives the mailbox's watch
+state), so a retry on a later connection clears the orphan and cannot fail
+forever. It does not always delete anything: Graph, IMAP and JMAP keep the
+handle's server state in the account instance, so a retry that reaches a newer
+connection is a no-op and the provider-side subscription then lives until it
+expires (Graph's webhook rows are also deleted by the owning account's
+`close()`, which the guard runs).
+Known residue: a drop parked inside `push_subscribe` itself may leave a
+provider-side subscription whose handle the engine never received (the account
+implementation's cancellation contract).
+
+Pinned by `reopen_drop_points.rs` (a drop before any replacement subscription
+existed closes the replacement, a drop rolls back the rows it inserted, a drop
+inside the final close of the old account re-issues that close and leaves the
+committed rows alone, and a committed reattach owes nothing) and
+`detach_orphan_race.rs` (an orphan restored after detach's take is not
+inherited by the next attach), with the registry-level check itself pinned in
+`push/subscription.rs`. No drop point exists between `open_replacement`
+returning and `reattach_account`'s first poll today (the two are one
+expression), so that interval is covered structurally, by building the guard
+inside the former, rather than by a test that could not reach it.
 
 Accepted gap: a handle whose old-side teardown succeeded before a later
 refusal aborted the pass delivers nothing until the retry recreates it on the
@@ -1732,6 +1793,32 @@ a swap, so `handle_account_error` still takes the lock around them - and
 skips it for `RestartAccount` precisely because that path reaches
 `open_replacement`; reintroducing it there deadlocks loudly instead of
 regressing quietly.
+
+The scope repair (`RestartScope`, `DowngradeCapabilityForScope`, and the
+trailing repair of `DowngradeStrategy`) deletes the scope's in-memory and
+durable cursor and then re-establishes it, and holds the reopen lock throughout,
+so it may not wait for `Run` either. It registers activity first
+(`begin_scope_repair`) and, if the account is paused or pausing, DECLINES: it
+deletes nothing and returns. The failing cursor stays in the registry, the scope
+stays polled, and the poll raises the directive again after resume. Before this
+the repair deleted first and the establishment's own registration was refused
+under the pause, which stranded the scope for good: the multiplexer only polls
+scopes still in the cursor registry, so nothing raised the directive again. Once
+the repair has started it holds that one registration from before the delete
+through the establishment, so a pause waits for a bounded repair rather than
+landing inside it. The establishment underneath registers activity of its own
+(`run_establish`, and the inventory walk it may run), and a second registration
+would be judged against the boundary the pause just flipped; the repair therefore
+runs them on `SyncControl::admitted_by(&activity)`, a clone whose registrations
+succeed because the guard it was derived from is still counted. The handle is
+passed whole, not dropped, because the inventory walk also publishes its
+checkpoints through it. Only the repair paths pass it: schema recovery, which
+deletes every scope before re-establishing, still establishes on the plain
+control, so it does not have this protection. A `Created` lifecycle scope has no cursor to keep, so a
+repair declined under a pause loses that request; the lifecycle event is
+consumed either way. Pinned by
+`a_repair_reaching_a_paused_account_leaves_the_scope_for_the_poll_to_re_raise`
+and `a_pause_landing_mid_repair_waits_for_it_instead_of_stranding_the_scope`.
 
 Two entry points sit one layer apart and their names read as near
 anagrams of each other, so it is worth naming the difference:

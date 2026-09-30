@@ -6,6 +6,7 @@
 
 use bifrost_types::{AccountId, CursorScope, SubscriptionHandle};
 use dashmap::DashMap;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RegisteredSubscription {
@@ -101,13 +102,42 @@ impl SubscriptionRegistry {
         }
     }
 
-    /// Restore records whose server-side teardown failed. Merge rather than
-    /// replace so a concurrent `subscribe_push` registration is preserved.
-    pub(crate) fn restore(&self, account: AccountId, records: Vec<RegisteredSubscription>) {
+    /// Restore records whose server-side teardown failed, unless the owning slot
+    /// is being torn down. Merge rather than replace so a concurrent
+    /// `subscribe_push` registration is preserved. Returns whether the records
+    /// were written; `false` means the slot's `shutdown` token was already
+    /// cancelled and they were dropped.
+    ///
+    /// The token is read INSIDE the entry's shard lock, which is the lock
+    /// [`Self::take`] removes under, and that is the point. Detach cancels the
+    /// token BEFORE it takes the account's records, so this write is either
+    /// ordered before the take (which then discards it, as it discards
+    /// everything of that incarnation) or after it, where the cancellation is
+    /// already visible and the write is refused. A token check made before
+    /// calling, with the write a separate step, leaves an interval on a
+    /// multi-thread runtime in which detach can cancel AND take, and the orphan
+    /// then lands under an id a later attach of the same `AccountId` inherits.
+    ///
+    /// Detach does not take the slot's reopen lock to close that interval: a
+    /// consumer-driven reattach holds it across `factory.open()` and network
+    /// calls, detach does not wait for those, and a lock acquisition there would
+    /// make the one call a consumer has for getting rid of an account wait on a
+    /// wedged open.
+    pub(crate) fn restore_orphans(
+        &self,
+        account: AccountId,
+        records: Vec<RegisteredSubscription>,
+        shutdown: &CancellationToken,
+    ) -> bool {
         if records.is_empty() {
-            return;
+            return true;
         }
-        self.inner.entry(account).or_default().extend(records);
+        let entry = self.inner.entry(account);
+        if shutdown.is_cancelled() {
+            return false;
+        }
+        entry.or_default().extend(records);
+        true
     }
 
     /// Flag a still-registered handle whose server-side teardown failed.
@@ -174,5 +204,58 @@ impl SubscriptionRegistry {
     #[must_use]
     pub fn total(&self) -> usize {
         self.inner.iter().map(|r| r.value().len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn orphan(handle: &str) -> RegisteredSubscription {
+        RegisteredSubscription {
+            handle: SubscriptionHandle(handle.to_owned()),
+            scopes: Vec::new(),
+            teardown_unconfirmed: false,
+            desired: true,
+            torn_down: false,
+        }
+        .into_orphan()
+    }
+
+    /// A live slot's orphans are merged into what is registered.
+    #[test]
+    fn a_live_slot_keeps_its_restored_orphans() {
+        let registry = SubscriptionRegistry::new();
+        let account = AccountId("live".to_owned());
+        registry.record(
+            account.clone(),
+            SubscriptionHandle("wanted".to_owned()),
+            vec![],
+        );
+        assert!(registry.restore_orphans(
+            account.clone(),
+            vec![orphan("refused")],
+            &CancellationToken::new()
+        ));
+        assert_eq!(registry.len(&account), 2);
+    }
+
+    /// Once the slot's token is cancelled, an orphan is refused: detach cancels
+    /// before it takes, so a write ordered after the take must see the
+    /// cancellation and leave nothing behind for a later attach to inherit.
+    #[test]
+    fn a_cancelled_slot_refuses_orphans_and_leaves_no_entry() {
+        let registry = SubscriptionRegistry::new();
+        let account = AccountId("detached".to_owned());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        // Detach's order: cancel, then take.
+        assert!(registry.take(&account).is_empty());
+        assert!(!registry.restore_orphans(account.clone(), vec![orphan("late")], &shutdown));
+        assert_eq!(registry.len(&account), 0);
+        assert!(
+            registry.take(&account).is_empty(),
+            "a later attach of the same id inherits nothing"
+        );
     }
 }

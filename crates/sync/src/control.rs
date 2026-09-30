@@ -25,6 +25,13 @@ use crate::cancel::{Boundary, BoundaryRequest};
 #[derive(Clone)]
 pub struct SyncControl {
     inner: Arc<SyncControlInner>,
+    /// Set only on the clone [`SyncControl::admitted_by`] returns. Such a
+    /// handle registers activity unconditionally, because a live
+    /// [`SyncActivityGuard`] already keeps the account non-quiescent: the
+    /// boundary check exists to keep NEW work out of a paused account, and the
+    /// holder's own nested work is not new. Never set on a handle that leaves
+    /// the crate or outlives the guard it was derived from.
+    admitted: bool,
 }
 
 /// Latest checkpoint snapshot carried by the `watch` channel. The
@@ -132,6 +139,30 @@ impl SyncControl {
                 bandwidth_cap,
                 bandwidth_observed: AtomicU64::new(0),
             }),
+            admitted: false,
+        }
+    }
+
+    /// A handle for work nested inside `held`, whose own activity
+    /// registrations succeed whatever the boundary reads.
+    ///
+    /// A repair that holds one registration from before its first mutation
+    /// through its last has already been admitted; the establishment it runs
+    /// registers activity of its own (`run_establish`, and the inventory walk
+    /// under it). Those nested registrations must not be re-judged against the
+    /// boundary: a pause landing mid-repair flips it to `Pause`, the nested
+    /// registration would be refused, and the repair would strand exactly the
+    /// half-done state holding the registration was meant to prevent. The pause
+    /// still waits for the repair, because `held` is still counted.
+    #[must_use]
+    pub(crate) fn admitted_by(&self, held: &SyncActivityGuard) -> Self {
+        debug_assert!(
+            Arc::ptr_eq(&self.inner, &held.control.inner),
+            "an activity guard admits nested work only on its own control"
+        );
+        Self {
+            inner: Arc::clone(&self.inner),
+            admitted: true,
         }
     }
 
@@ -226,7 +257,7 @@ impl SyncControl {
     #[must_use]
     pub(crate) fn begin_activity(&self) -> Option<SyncActivityGuard> {
         self.inner.active.fetch_add(1, Ordering::SeqCst);
-        if matches!(self.inner.boundary.snapshot(), BoundaryRequest::Run) {
+        if self.admitted || matches!(self.inner.boundary.snapshot(), BoundaryRequest::Run) {
             Some(SyncActivityGuard {
                 control: self.clone(),
             })
@@ -684,6 +715,36 @@ mod tests {
             control.begin_activity().is_none(),
             "paused accounts must refuse every new engine activity registration"
         );
+    }
+
+    /// Work nested inside a held registration is admitted under a pause, and a
+    /// pause still waits for the outer registration.
+    #[tokio::test]
+    async fn a_registration_nested_in_a_held_one_survives_a_pause_landing_between() {
+        let control = control();
+        let held = control.begin_activity().expect("running activity");
+        let nested_control = control.admitted_by(&held);
+
+        let waiter_control = control.clone();
+        let waiter = tokio::spawn(async move { waiter_control.pause().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "the held registration is counted");
+        assert!(
+            control.begin_activity().is_none(),
+            "a plain registration is refused once the pause has flipped the boundary"
+        );
+
+        let nested = nested_control
+            .begin_activity()
+            .expect("a nested registration is not new work");
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "the nested registration still keeps the account non-quiescent"
+        );
+        drop(nested);
+        waiter.await.expect("waiter task").expect("pause");
     }
 
     /// A `Stop` ends a waiter that can no longer be satisfied.
