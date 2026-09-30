@@ -69,6 +69,11 @@ restatement, including this one.
   `cargo install` resolves, so no sibling member can donate a feature back.
   Every default feature of this crate is optional, so the zero-feature build is
   a promise to consumers.
+- `jmap-sync` - `bifrost-jmap` with its non-default `sync` feature, pinned to
+  `feature_unification = "package"`. A focused `brokkr test -p bifrost-jmap`
+  otherwise never compiles `crates/jmap/src/sync/`, since only bifrost-sync
+  donates the feature; package resolution also proves `sync` enables
+  everything it needs itself.
 - `install-shape` - every published crate at its default features, pinned to
   `feature_unification = "package"`, so each builds and passes its tests the
   way a downstream dependent resolves it. Its `packages` list must be kept in
@@ -250,6 +255,11 @@ The rule: **a change that removes or renames a published item stops and asks the
 repository owner**, no matter which document recommends it and no matter how
 confident the argument. "Build, don't defer" settles build-versus-defer. It does
 not settle delete-versus-keep.
+
+Changing the SHAPE of a published type is ruled fine (2026-09-30): adding or
+reshaping fields or variants, turning a unit variant into a struct variant, and
+the like need no ruling, and no compatibility variant or shim is kept for the
+old shape. The crates are pre-1.0. Removal and renaming still stop and ask.
 
 ### The recurring defect shape is a fix that opens a new hole one layer up
 

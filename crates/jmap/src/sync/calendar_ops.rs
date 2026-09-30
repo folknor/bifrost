@@ -734,7 +734,9 @@ fn jmap_patch_from_event_patch(
     // without reading the current event. Reject rather than silently keep a
     // stale duration (start-only) or drop the change entirely (end-only).
     //
-    // An empty `start` is refused (see `reject_blank_start`). An empty `end`
+    // An empty or unparseable `start` is refused (see `validate_start`), and a
+    // non-empty `end` that cannot be parsed, or precedes the start, is refused
+    // by `event_duration`. An empty `end`
     // is the projection's "the provider did not say" echoed back by a
     // read-modify-write, and on a patch it honestly means "no duration
     // change": JSCalendar stores the end as `duration`, and a patch that omits
@@ -743,15 +745,16 @@ fn jmap_patch_from_event_patch(
     // event to zero length. So a blank end is dropped from the patch: start
     // and timeZone still apply, duration is untouched, and a blank end with
     // no start is a no-op for the time fields.
-    reject_blank_start(patch.start.as_ref(), operation)?;
+    validate_start(patch.start.as_ref(), context.is_all_day, operation)?;
     let end_is_blank = patch.end.as_ref().is_some_and(is_blank_time);
     let end = patch.end.as_ref().filter(|end| !is_blank_time(end));
     match (&patch.start, end) {
         (Some(start), Some(end)) => {
             let all_day = context.is_all_day;
+            let value = event_duration(start, end, all_day, operation)?;
             out.start(jmap_time_from_shared(start, all_day));
             out.time_zone(start.timezone.clone());
-            out.duration(duration(&start.value, &end.value));
+            out.duration(value);
         }
         (Some(start), None) if end_is_blank => {
             out.start(jmap_time_from_shared(start, context.is_all_day));
@@ -962,7 +965,7 @@ fn write_event_create(
     // absent `duration` to `PT0S`, so either way the server would store a
     // zero-length event the caller never asked for. The caller must supply the
     // end it wants (`Unsupported`, matching bifrost-google's create).
-    reject_blank_start(Some(&event.start), operation)?;
+    validate_start(Some(&event.start), event.is_all_day, operation)?;
     if is_blank_time(&event.end) {
         return Err(unsupported(
             operation,
@@ -971,7 +974,12 @@ fn write_event_create(
     }
     target.start(jmap_time_from_shared(&event.start, event.is_all_day));
     target.time_zone(event.start.timezone.clone());
-    target.duration(duration(&event.start.value, &event.end.value));
+    target.duration(event_duration(
+        &event.start,
+        &event.end,
+        event.is_all_day,
+        operation,
+    )?);
     target.show_without_time(event.is_all_day);
     target.status(jmap_event_status(event.status));
     target.free_busy_status(jmap_availability(event.availability));
@@ -1567,30 +1575,99 @@ fn is_blank_time(time: &EventTime) -> bool {
     time.value.trim().is_empty()
 }
 
-/// An empty `start` is malformed caller input on every write. JSCalendar
-/// `start` is a mandatory LocalDateTime, and the shared model's empty time is
-/// what a provider projects for "did not say" (this crate's own read path
-/// produces one when a server omits `start`), so a consumer echoing that
-/// value back would send `start: ""`. Refused before any request, as
+/// The shapes of event time this crate maps onto JSCalendar.
+enum Moment {
+    /// A bare date (`2026-06-02`).
+    Date(civil::Date),
+    /// A zoneless date-time (`2026-06-02T10:00:00`).
+    Local(civil::DateTime),
+    /// A UTC or offset date-time (`2026-06-02T10:00:00Z`, `...+02:00`).
+    Instant(Timestamp),
+}
+
+impl Moment {
+    /// The calendar date the value falls on, used for all-day arithmetic.
+    fn date(&self) -> civil::Date {
+        match self {
+            Self::Date(date) => *date,
+            Self::Local(datetime) => datetime.date(),
+            Self::Instant(instant) => Offset::UTC.to_datetime(*instant).date(),
+        }
+    }
+}
+
+fn classify_time(value: &str) -> Option<Moment> {
+    if value.len() == 10 {
+        return civil::Date::strptime("%Y-%m-%d", value)
+            .ok()
+            .map(Moment::Date);
+    }
+    if let Ok(instant) = value.parse::<Timestamp>() {
+        return Some(Moment::Instant(instant));
+    }
+    value.parse::<civil::DateTime>().ok().map(Moment::Local)
+}
+
+/// Parse one event bound, refusing anything this crate cannot map. An empty
+/// value is refused as its own case: JSCalendar `start` is a mandatory
+/// LocalDateTime, and the shared model's empty time is what a provider
+/// projects for "did not say" (this crate's own read path produces one when a
+/// server omits `start`), so a consumer echoing it back would send
+/// `start: ""`. An all-day event accepts only a bare date or a zoneless
+/// date-time, since its wire form is midnight on the date.
+fn parse_time(
+    time: &EventTime,
+    field: &'static str,
+    is_all_day: bool,
+    operation: AccountOperation,
+) -> Result<Moment, AccountError> {
+    if is_blank_time(time) {
+        return Err(malformed_time(
+            operation,
+            field,
+            format!("JMAP calendar event `{field}` must not be empty"),
+        ));
+    }
+    match classify_time(&time.value) {
+        Some(Moment::Instant(_)) if is_all_day => Err(malformed_time(
+            operation,
+            field,
+            format!("JMAP all-day event `{field}` must be a date or a zoneless date-time"),
+        )),
+        Some(moment) => Ok(moment),
+        None => Err(malformed_time(
+            operation,
+            field,
+            format!(
+                "JMAP calendar event `{field}` is not a date, a local date-time or an RFC 3339 date-time"
+            ),
+        )),
+    }
+}
+
+/// Validate an event `start` on its own. Refused before any request, as
 /// `Request(Malformed)` naming `start`.
-fn reject_blank_start(
+fn validate_start(
     start: Option<&EventTime>,
+    is_all_day: bool,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    if start.is_some_and(is_blank_time) {
-        return Err(blank_start_error(operation));
+    if let Some(start) = start {
+        parse_time(start, "start", is_all_day, operation)?;
     }
     Ok(())
 }
 
-fn blank_start_error(operation: AccountOperation) -> AccountError {
+fn malformed_time(
+    operation: AccountOperation,
+    field: &'static str,
+    message: String,
+) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
         Cause::Request(RequestCause::InvalidArgument {
-            field: Some("start"),
-            message: Some(DiagnosticText::support_only(
-                "JMAP calendar event `start` must not be empty",
-            )),
+            field: Some(field),
+            message: Some(DiagnosticText::support_only(message)),
         }),
     )
     .protocol(Protocol::Jmap)
@@ -1599,28 +1676,66 @@ fn blank_start_error(operation: AccountOperation) -> AccountError {
     .expect("valid account error classification")
 }
 
-fn duration(start: &str, end: &str) -> String {
-    if start.len() == 10
-        && end.len() == 10
-        && let (Ok(start), Ok(end)) = (
-            civil::Date::strptime("%Y-%m-%d", start),
-            civil::Date::strptime("%Y-%m-%d", end),
+/// The JSCalendar `duration` for a shared start and (exclusive) end.
+///
+/// Both bounds must parse and the end must not precede the start; anything
+/// else is `Request(Malformed)` naming the offending field. There is no
+/// fallback duration: a zero-length event is never written for a time this
+/// crate could not read.
+fn event_duration(
+    start: &EventTime,
+    end: &EventTime,
+    is_all_day: bool,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    let start = parse_time(start, "start", is_all_day, operation)?;
+    let end = parse_time(end, "end", is_all_day, operation)?;
+    let before_start = || {
+        malformed_time(
+            operation,
+            "end",
+            "JMAP calendar event `end` is before `start`".to_string(),
         )
-    {
+    };
+    let days = |start: civil::Date, end: civil::Date| {
+        let days = (end - start).get_days();
+        if days < 0 {
+            return Err(before_start());
+        }
         // `EventTime`'s all-day end is exclusive, so the JSCalendar
         // duration is exactly end - start days (a single all-day event,
         // start D / end D+1, is P1D).
-        let days = (end - start).get_days().max(0);
-        return format!("P{days}D");
+        Ok(format!("P{days}D"))
+    };
+    let seconds = |start: Timestamp, end: Timestamp| {
+        let seconds = end.duration_since(start).as_secs();
+        if seconds < 0 {
+            return Err(before_start());
+        }
+        Ok(format!("PT{seconds}S"))
+    };
+    let local = |datetime: civil::DateTime| {
+        Offset::UTC.to_timestamp(datetime).map_err(|_| {
+            malformed_time(
+                operation,
+                "end",
+                "JMAP calendar event time is outside the representable range".to_string(),
+            )
+        })
+    };
+    if is_all_day {
+        return days(start.date(), end.date());
     }
-    let Ok(start) = start.parse::<Timestamp>() else {
-        return "PT0S".to_string();
-    };
-    let Ok(end) = end.parse::<Timestamp>() else {
-        return "PT0S".to_string();
-    };
-    let seconds = end.duration_since(start).as_secs().max(0);
-    format!("PT{seconds}S")
+    match (start, end) {
+        (Moment::Date(start), Moment::Date(end)) => days(start, end),
+        (Moment::Instant(start), Moment::Instant(end)) => seconds(start, end),
+        (Moment::Local(start), Moment::Local(end)) => seconds(local(start)?, local(end)?),
+        _ => Err(malformed_time(
+            operation,
+            "end",
+            "JMAP calendar event `start` and `end` must use the same time shape".to_string(),
+        )),
+    }
 }
 
 fn shared_time_from_jmap(value: &str, is_all_day: bool) -> String {
@@ -2218,8 +2333,133 @@ mod tests {
     fn duration_handles_all_day_dates() {
         // All-day ends are exclusive: a single all-day event is start D /
         // end D+1 (P1D); a three-day event is start D / end D+3 (P3D).
-        assert_eq!(duration("2026-06-02", "2026-06-03"), "P1D");
-        assert_eq!(duration("2026-06-02", "2026-06-05"), "P3D");
+        let op = AccountOperation::EventCreate;
+        let dur = |start: &str, end: &str, all_day: bool| {
+            event_duration(&time(start), &time(end), all_day, op).expect("valid times")
+        };
+        assert_eq!(dur("2026-06-02", "2026-06-03", true), "P1D");
+        assert_eq!(dur("2026-06-02", "2026-06-05", true), "P3D");
+        assert_eq!(dur("2026-06-02", "2026-06-05", false), "P3D");
+    }
+
+    fn assert_malformed_field(error: &AccountError, expected: &str) {
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        let text = format!("{error:?}");
+        assert!(
+            text.contains(&format!("field: Some(\"{expected}\")")),
+            "expected field {expected}: {text}"
+        );
+    }
+
+    /// Fails if `event_duration` falls back to a zero-length duration for a
+    /// time it cannot parse.
+    #[test]
+    fn unparseable_bounds_are_malformed_naming_the_field() {
+        let op = AccountOperation::EventCreate;
+        let bad_end = event_duration(&time("2026-06-02T12:00:00Z"), &time("tomorrow"), false, op)
+            .expect_err("garbage end");
+        assert_malformed_field(&bad_end, "end");
+        let bad_start = event_duration(
+            &time("not-a-time"),
+            &time("2026-06-02T12:00:00Z"),
+            false,
+            op,
+        )
+        .expect_err("garbage start");
+        assert_malformed_field(&bad_start, "start");
+        let bad_date = validate_start(Some(&time("2026-13-45")), true, op).expect_err("bad date");
+        assert_malformed_field(&bad_date, "start");
+    }
+
+    /// Fails if an end before its start is clamped instead of refused.
+    #[test]
+    fn end_before_start_is_malformed() {
+        let op = AccountOperation::EventCreate;
+        for (start, end, all_day) in [
+            ("2026-06-02T13:00:00Z", "2026-06-02T12:00:00Z", false),
+            ("2026-06-02T13:00:00", "2026-06-02T12:00:00", false),
+            ("2026-06-05", "2026-06-02", true),
+        ] {
+            let error = event_duration(&time(start), &time(end), all_day, op)
+                .expect_err("end before start");
+            assert_malformed_field(&error, "end");
+        }
+    }
+
+    /// Fails if a local date-time pair still collapses to `PT0S` (it did not
+    /// parse as an instant) or if mixed shapes are silently compared.
+    #[test]
+    fn local_and_offset_times_have_real_durations() {
+        let op = AccountOperation::EventCreate;
+        assert_eq!(
+            event_duration(
+                &time("2026-06-02T12:00:00"),
+                &time("2026-06-02T13:30:00"),
+                false,
+                op
+            )
+            .expect("local"),
+            "PT5400S"
+        );
+        assert_eq!(
+            event_duration(
+                &time("2026-06-02T12:00:00+02:00"),
+                &time("2026-06-02T12:00:00Z"),
+                false,
+                op
+            )
+            .expect("offset"),
+            "PT7200S"
+        );
+        let mixed = event_duration(
+            &time("2026-06-02T12:00:00"),
+            &time("2026-06-02T13:00:00Z"),
+            false,
+            op,
+        )
+        .expect_err("mixed shapes");
+        assert_malformed_field(&mixed, "end");
+    }
+
+    /// Fails if create or patch send a request-bound value for an
+    /// unparseable time.
+    #[test]
+    fn create_and_patch_refuse_unparseable_times() {
+        let error = jmap_create_from_event(
+            &create_with("2026-06-02T12:00:00Z", "later"),
+            AccountOperation::EventCreate,
+        )
+        .expect_err("bad end");
+        assert_malformed_field(&error, "end");
+        let error = jmap_create_from_event(
+            &create_with("garbage", "2026-06-02T12:00:00Z"),
+            AccountOperation::EventCreate,
+        )
+        .expect_err("bad start");
+        assert_malformed_field(&error, "start");
+        let error = patch_with_patch_context(
+            &EventPatch {
+                start: Some(time("2026-06-02T12:00:00Z")),
+                end: Some(time("garbage")),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect_err("bad patch end");
+        assert_malformed_field(&error, "end");
+        let error = patch_with_patch_context(
+            &EventPatch {
+                start: Some(time("garbage")),
+                end: Some(time("")),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect_err("bad patch start with blank end");
+        assert_malformed_field(&error, "start");
     }
 
     #[test]
@@ -2829,7 +3069,7 @@ mod tests {
         assert!(event.end.value.is_empty());
     }
 
-    /// Fails if `reject_blank_start` is removed from `write_event_create`:
+    /// Fails if `validate_start` is removed from `write_event_create`:
     /// `start: ""` would be sent to the server.
     #[test]
     fn create_with_an_empty_start_is_malformed() {
@@ -2859,7 +3099,7 @@ mod tests {
         ));
     }
 
-    /// Fails if `reject_blank_start` is removed from
+    /// Fails if `validate_start` is removed from
     /// `jmap_patch_from_event_patch`.
     #[test]
     fn patch_with_an_empty_start_is_malformed() {

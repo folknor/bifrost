@@ -333,6 +333,22 @@ pub(crate) fn subscribe<T: PushTransport>(
     })
 }
 
+/// Tear down a subscription handle.
+///
+/// This crate's push is RFC 8887 WebSocket enable/disable only: a handle is a
+/// key into the in-memory `subscriptions` registry, and the server-side state
+/// it stands for (the enabled data-type set) belongs to the socket and dies
+/// with it. No RFC 8620 section 7.2 `PushSubscription` object is ever created
+/// (the `push_subscription` module is an unwired wire-type surface), so there
+/// is nothing that outlives a connection for a handle to name.
+///
+/// That is why the engine's retry of an orphaned handle against a NEWER
+/// account instance is correct and deletes nothing: the handle is unknown to
+/// the new instance's registry, `prospective` equals the current registry, and
+/// the frame re-sends the union the new connection already holds. It is
+/// idempotent, and no other subscription is narrowed. If a
+/// `PushSubscription`-backed mode is ever added, the handle must carry the
+/// server id so any instance can destroy it.
 pub(crate) fn unsubscribe<T: PushTransport>(
     client: T,
     handle: SubscriptionHandle,
@@ -1464,6 +1480,39 @@ mod tests {
             None,
             "a reconnect after the subscription was retired must start cold"
         );
+    }
+
+    /// An orphaned handle retried against a newer instance is unknown there.
+    /// Push state is per-connection, so that must delete nothing: the live
+    /// subscription survives and the frame re-sends the union it already held.
+    #[tokio::test]
+    async fn unsubscribing_an_unknown_handle_leaves_live_subscriptions_intact() {
+        let applied = Arc::new(StdMutex::new(Vec::new()));
+        let live = SubscriptionHandle("live".to_string());
+        let email: DataTypeSet = [DataType::Email].into_iter().collect();
+        let subscriptions = Arc::new(Mutex::new(HashMap::from([(live.clone(), email.clone())])));
+        let enabled = Arc::new(Mutex::new(email.clone()));
+        let push_state = Arc::new(Mutex::new(Some("push-3".to_string())));
+
+        unsubscribe(
+            RecordingPushTransport {
+                fail: false,
+                applied: Arc::clone(&applied),
+            },
+            SubscriptionHandle("orphan-from-old-connection".to_string()),
+            Arc::clone(&subscriptions),
+            Arc::clone(&enabled),
+            Arc::clone(&push_state),
+        )
+        .await
+        .expect("unknown handle unsubscribes cleanly");
+
+        assert!(subscriptions.lock().await.contains_key(&live));
+        assert_eq!(*enabled.lock().await, email);
+        assert_eq!(push_state.lock().await.as_deref(), Some("push-3"));
+        let frames = applied.lock().expect("apply log");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, email, "the frame must not narrow the union");
     }
 
     /// The replay is only as good as the capture. A frame carrying a
