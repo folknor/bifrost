@@ -1353,6 +1353,40 @@ Three further rules make the renewal path safe:
   reconciler turns into a full reconcile across every registered scope, so
   without it the missed changes wait for the ordinary poll interval.
 
+#### Cancellation safety of the webhook `push_subscribe`
+
+`subscribe_graph` does its synchronous work inline (endpoint check, resource
+grouping, handle mint, the closed-account refusal) and then hands the creates,
+the rollback, the ledger close and the registration to a task spawned on the
+runtime (`run_subscribe` / `create_and_register`); the caller's future only
+awaits it. Dropping the caller therefore cannot skip a rollback DELETE, unwind
+the create loop over live creates, or die between the `graph_subscriptions`
+insert and the return. Nothing is spawned or written before the first poll, so
+a future dropped before it has nothing to leak; the "guard" is the spawn, not an
+object built inside the async body.
+
+The result hand-off is two-phase: a successful `oneshot::send` is not receipt
+(the value dies with a receiver that is dropped unpolled), so the waiter acks in
+the same synchronous step that takes the result, and the task treats a failed
+send or a missing ack as "no caller holds this handle" and retires the group
+through `unsubscribe_graph`. If a DELETE fails there the group stays registered
+and tearing down, so `close()` retries it. On the normal path the ack disarms
+the cleanup.
+
+`close()` interaction: `retire_all_graph_subscriptions` cancels the account
+shutdown token BEFORE walking the groups, and the registration step checks the
+token under the same write lock it inserts under. A subscribe that registers
+first is walked by the retire; one that registers after sees the cancel, rolls
+back its creates and returns an error. A subscribe on an already closed account
+is refused before its first POST.
+
+Not made safe: a create whose response never arrived (timeout, reset) may have
+succeeded on Graph, but the subscription id exists only in the unread response,
+so there is nothing to DELETE by and it lives until Graph's own expiry.
+Recovering it would mean listing `/subscriptions` and deleting by resource and
+notification URL, which can also delete another process's identical
+subscription. A process exit or runtime shutdown kills the task like any other.
+
 ### EWS streaming mode (`PushMode::EwsStreaming`)
 
 `push_subscribe` installs an `EwsSubscriptionState` and starts the EWS

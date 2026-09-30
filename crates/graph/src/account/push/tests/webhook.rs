@@ -435,3 +435,265 @@ async fn a_first_webhook_subscribe_publishes_no_reconnect() {
         "the latch is cleared by the edge it fires on"
     );
 }
+
+// ---- cancellation safety of the webhook `push_subscribe` ----------------
+//
+// The scripted wire is one ordered script shared by `script_rest` and
+// `script_aux_pending`, so a create can be parked forever (`Pending`) between
+// answered requests. Every test runs on the current-thread test runtime:
+// spawned work only advances when the test yields, which makes "drop the
+// future NOW" deterministic.
+
+fn webhook_account(client: &GraphClient) -> GraphAccount {
+    let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    account.push_endpoint = Some(PushEndpoint {
+        webhook_url: "https://example.test/hook".to_string(),
+        client_state: "secret".to_string(),
+    });
+    account
+}
+
+fn created(id: &str) -> ScriptedRestResponse {
+    ScriptedRestResponse::json(
+        reqwest::StatusCode::CREATED,
+        serde_json::json!({"id": id, "expirationDateTime": "2099-01-01T00:00:00Z"}),
+    )
+}
+
+fn deleted() -> ScriptedRestResponse {
+    ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT)
+}
+
+fn two_resources() -> Vec<CursorScope> {
+    vec![
+        email_scope("inbox"),
+        CursorScope::FolderType {
+            folder: FolderId("contacts".to_string()),
+            ty: ObjectType::Contact,
+        },
+    ]
+}
+
+/// Yield to the spawned work until `done` holds, bounded so a regression
+/// fails the assertion instead of hanging. Yields, never sleeps.
+async fn settle(mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..2000 {
+        if done() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    done()
+}
+
+fn groups_empty(account: &GraphAccount) -> bool {
+    account
+        .graph_subscriptions
+        .try_read()
+        .is_ok_and(|groups| groups.is_empty())
+}
+
+/// A future dropped after its first poll, while the create loop has not run
+/// to its end, must still complete the loop and roll back what it created
+/// (the second create fails, so the first must be deleted). Inline, the drop
+/// unwinds the loop wherever it is and the first subscription stays live on
+/// Graph until its expiry.
+///
+/// A parked (`Pending`) create cannot be used here: the spawned task is
+/// deliberately not cancelled by the drop, so it would wait on that create
+/// too, and the scripted wire cannot release it.
+///
+/// Fails if `subscribe_graph` awaits `create_and_register` inline instead of
+/// handing it to `tokio::spawn` (the first poll then either completes the
+/// whole flow, failing the pending assertion, or is dropped mid-way).
+#[tokio::test]
+async fn dropping_subscribe_mid_create_loop_rolls_back_the_earlier_creates() {
+    let client = GraphClient::new("token");
+    client.script_rest([
+        created("first"),
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error":{"code":"ErrorInternalServerError","message":"no"}}),
+        ),
+        deleted(),
+    ]);
+    let account = webhook_account(&client);
+
+    let mut fut = Box::pin(push_subscribe(account.clone(), two_resources()));
+    assert!(
+        futures::FutureExt::now_or_never(fut.as_mut()).is_none(),
+        "the request is handed to a task and the caller waits"
+    );
+    drop(fut);
+
+    assert!(
+        settle(|| client.wire_attempts() == 3).await,
+        "the abandoned request must still issue the rollback DELETE"
+    );
+    let requests = client.take_rest_requests();
+    let last = requests.last().expect("requests recorded");
+    assert_eq!(last.method.as_str(), "DELETE");
+    assert!(last.url.ends_with("/subscriptions/first"));
+    assert!(groups_empty(&account));
+}
+
+/// A future dropped after the creates but while registration is blocked must
+/// not leave a registered group behind a handle nobody received.
+///
+/// Fails if the abandoned-result teardown in `run_subscribe` (the
+/// `result_tx.send` failure arm) is removed.
+#[tokio::test]
+async fn dropping_subscribe_before_registration_tears_down_the_orphan() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("first"), created("second"), deleted(), deleted()]);
+    let account = webhook_account(&client);
+
+    let registration_blocked = account.graph_subscriptions.write().await;
+    let caller = tokio::spawn(push_subscribe(account.clone(), two_resources()));
+    assert!(
+        settle(|| client.wire_attempts() == 2).await,
+        "both creates done"
+    );
+    caller.abort();
+    let _ = caller.await;
+    drop(registration_blocked);
+
+    assert!(
+        settle(|| client.wire_attempts() == 4).await,
+        "the orphaned group's subscriptions are deleted"
+    );
+    assert!(
+        settle(|| groups_empty(&account)).await,
+        "no group stays registered under a handle nobody holds"
+    );
+}
+
+/// The result was delivered into the channel but the future was dropped
+/// before it took it. A successful `oneshot::send` is not receipt, so the
+/// task waits for the waiter's ack.
+///
+/// Fails if `run_subscribe` stops waiting for `ack_rx` (treating a
+/// successful send as receipt).
+#[tokio::test]
+async fn dropping_subscribe_with_the_result_in_flight_tears_down_the_group() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("only"), deleted()]);
+    let account = webhook_account(&client);
+
+    let mut fut = Box::pin(push_subscribe(account.clone(), vec![email_scope("inbox")]));
+    assert!(
+        futures::FutureExt::now_or_never(fut.as_mut()).is_none(),
+        "spawned, awaiting"
+    );
+    assert!(
+        settle(|| !groups_empty(&account)).await,
+        "the task registered the group and delivered its result"
+    );
+    drop(fut);
+
+    assert!(
+        settle(|| groups_empty(&account)).await,
+        "an unreceived handle's group is retired"
+    );
+    let requests = client.take_rest_requests();
+    assert_eq!(requests.last().expect("recorded").method.as_str(), "DELETE");
+}
+
+/// The normal path must disarm: a caller that receives the handle keeps the
+/// registered group and nothing is deleted behind its back.
+///
+/// Fails if the waiter stops acking (`ack_tx.send`), because the task then
+/// retires a group the caller legitimately holds.
+#[tokio::test]
+async fn a_received_subscribe_is_not_torn_down() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("only")]);
+    let account = webhook_account(&client);
+
+    let subscription = push_subscribe(account.clone(), vec![email_scope("inbox")])
+        .await
+        .expect("subscribe succeeds");
+    let handle = subscription.handle.clone().expect("a handle");
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        account
+            .graph_subscriptions
+            .read()
+            .await
+            .contains_key(&handle)
+    );
+    assert_eq!(client.wire_attempts(), 1, "no DELETE was issued");
+}
+
+/// Nothing is written until the future is first polled, so a future dropped
+/// before its first poll has nothing to leak.
+#[tokio::test]
+async fn a_subscribe_dropped_before_its_first_poll_touches_nothing() {
+    let client = GraphClient::new("token");
+    client.script_rest([]);
+    let account = webhook_account(&client);
+
+    drop(push_subscribe(account.clone(), two_resources()));
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(client.wire_attempts(), 0);
+    assert!(groups_empty(&account));
+}
+
+/// A closed account refuses before creating anything server-side.
+///
+/// Fails if the early `shutdown.is_cancelled()` check in `subscribe_graph` is
+/// removed.
+#[tokio::test]
+async fn subscribing_on_a_closed_account_creates_nothing() {
+    let client = GraphClient::new("token");
+    client.script_rest([]);
+    let account = webhook_account(&client);
+    account.shutdown.cancel();
+
+    assert!(
+        push_subscribe(account.clone(), two_resources())
+            .await
+            .is_err()
+    );
+    assert_eq!(client.wire_attempts(), 0);
+}
+
+/// `close()` began while a subscribe was already past its creates: the
+/// registration must refuse and roll back instead of installing a group the
+/// finished `close()` walk will never see.
+///
+/// Fails if the `shutdown.is_cancelled()` check under the write lock in
+/// `create_and_register` is removed.
+#[tokio::test]
+async fn a_subscribe_racing_close_rolls_back_instead_of_registering() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("only"), deleted()]);
+    let account = webhook_account(&client);
+
+    let registration_blocked = account.graph_subscriptions.write().await;
+    let caller = tokio::spawn(push_subscribe(account.clone(), vec![email_scope("inbox")]));
+    assert!(settle(|| client.wire_attempts() == 1).await, "create done");
+    account.shutdown.cancel();
+    drop(registration_blocked);
+
+    let result = caller.await.expect("caller not aborted");
+    assert!(result.is_err(), "a closing account hands out no handle");
+    assert_eq!(client.wire_attempts(), 2, "the create was rolled back");
+    assert!(groups_empty(&account));
+}
+
+/// `close()`'s retire walk cancels the token first: that is what pairs with
+/// the registration-time check above.
+///
+/// Fails if `retire_all_graph_subscriptions` stops cancelling the token.
+#[tokio::test]
+async fn retiring_all_subscriptions_cancels_the_shutdown_token_first() {
+    let account =
+        GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+    retire_all_graph_subscriptions(&account).await;
+    assert!(account.shutdown.is_cancelled());
+}

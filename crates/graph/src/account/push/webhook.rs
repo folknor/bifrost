@@ -83,6 +83,10 @@ pub(crate) struct GraphSubscriptionState {
 /// renewing and no caller could ever name to unsubscribe. Closed before the
 /// registration, the failure path has registered nothing and only has to
 /// roll back the server-side creates, exactly as a failed create does.
+///
+/// The creates, rollback and registration run in a spawned task so a dropped
+/// caller cannot strand them; see the comments at the spawn and on
+/// `run_subscribe`.
 pub(super) async fn subscribe_graph(
     account: GraphAccount,
     eligible: Vec<(bifrost_types::BatchItemId, CursorScope)>,
@@ -130,6 +134,136 @@ pub(super) async fn subscribe_graph(
     // by, orphaning them until they expire.
     let handle = new_handle()?;
 
+    // A closed account must not gain server-side state. `close()` walks the
+    // registered groups once; a create that started after that walk could
+    // only ever be rolled back. Refusing here, before the first POST, keeps
+    // the common case (subscribing on a dead account) from touching the
+    // server at all; the registration step re-checks under the write lock
+    // for the create that was already in flight when `close()` began.
+    if account.shutdown.is_cancelled() {
+        return Err(account_closed_error());
+    }
+
+    // Everything from here on runs in a task the ACCOUNT's runtime owns, and
+    // this future only waits on it. `push_subscribe` is a caller-visible
+    // future and callers drop those (a timeout, a `select!`, an aborted
+    // reattach); dropped mid-way, a body that ran inline would strand every
+    // server-side create made so far, skip the remaining rollback DELETEs, or
+    // leave a registered group whose handle nobody received. A spawned task
+    // is not torn down by its awaiter going away, so the creates, the
+    // rollback and the registration each run to completion.
+    //
+    // Nothing is spawned, and nothing has been written, until this future is
+    // first polled and reaches this point, so a future dropped before its
+    // first poll has nothing to leak: the guard is the spawn itself, not an
+    // object constructed inside the async body.
+    //
+    // The hand-off is two-phase because a delivered result is not a received
+    // one: a `oneshot` send succeeds while the receiver is alive even if the
+    // receiver's future is then dropped without ever being polled again, and
+    // the value dies with it. The waiter therefore acks, in the same
+    // synchronous step that takes the result, and the task treats a missing
+    // ack (or a failed send) as "the handle was never received" and tears the
+    // registered group down. Exactly one side ever cleans up.
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(run_subscribe(
+        account,
+        SubscribeRequest {
+            endpoint,
+            grouped,
+            handle,
+            outcomes,
+            expected: expected.to_vec(),
+        },
+        result_tx,
+        ack_rx,
+    ));
+    let Ok(result) = result_rx.await else {
+        // The task ended without answering: it panicked, or the runtime is
+        // shutting down under it. Nothing more can be done from here.
+        return Err(into_account_error(
+            crate::error::GraphError::RuntimeFailure {
+                message: "the push_subscribe task ended without an answer".to_string(),
+            },
+            GraphErrorContext::graph(AccountOperation::PushSubscribe),
+        ));
+    };
+    // No await between taking the result and acking it: there is no drop
+    // point between "received" and "acknowledged".
+    let _ = ack_tx.send(());
+    result
+}
+
+/// Everything the spawned subscribe task owns.
+struct SubscribeRequest {
+    endpoint: super::common::PushEndpoint,
+    grouped: HashMap<String, Vec<(bifrost_types::BatchItemId, CursorScope)>>,
+    handle: SubscriptionHandle,
+    outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope>,
+    expected: Vec<bifrost_types::BatchItemId>,
+}
+
+/// The spawned half of the webhook `push_subscribe`: create, register, and
+/// hand the result to the waiter, tearing the group down again if the waiter
+/// never took it.
+///
+/// What cannot be made safe, and why:
+/// - A create whose response never arrived (a timeout, a reset) may have
+///   succeeded on Graph. The subscription id exists only in the response we
+///   did not read, so there is nothing to DELETE by; it lives until Graph's
+///   own expiry (about a day) and posts to the receiver meanwhile. Recovering
+///   it would mean listing `/subscriptions` and deleting by resource and
+///   notification URL, which could also delete another process's identical
+///   subscription; that is a product decision, not something to do silently
+///   here.
+/// - A process exit or runtime shutdown kills this task like any other, with
+///   the same result for whatever it had created.
+async fn run_subscribe(
+    account: GraphAccount,
+    request: SubscribeRequest,
+    result_tx: tokio::sync::oneshot::Sender<Result<ArmOutcome, AccountError>>,
+    ack_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let handle = request.handle.clone();
+    let result = create_and_register(&account, request).await;
+    if result.is_err() {
+        // Nothing registered, so nothing to retire; a dropped waiter has
+        // nobody to tell.
+        let _ = result_tx.send(result);
+        return;
+    }
+    let received = result_tx.send(result).is_ok() && ack_rx.await.is_ok();
+    if received {
+        return;
+    }
+    // The group is registered and the worker running, but no caller holds
+    // the handle, so no `push_unsubscribe` will ever name it. Retire it the
+    // way a caller would. If a DELETE fails the group stays registered
+    // (marked `tearing_down`), which is exactly what lets `close()` retry it.
+    if let Err(error) = unsubscribe_graph(account, handle).await {
+        let telemetry = error.telemetry_fields();
+        tracing::warn!(
+            target: "bifrost_graph::push",
+            message_key = telemetry.message_key,
+            recovery = telemetry.recovery_discriminant,
+            "could not retire a Graph webhook subscription whose subscribe was abandoned"
+        );
+    }
+}
+
+async fn create_and_register(
+    account: &GraphAccount,
+    request: SubscribeRequest,
+) -> Result<ArmOutcome, AccountError> {
+    let SubscribeRequest {
+        endpoint,
+        grouped,
+        handle,
+        mut outcomes,
+        expected,
+    } = request;
+    let expected = expected.as_slice();
     let mut subscriptions = Vec::new();
     for (resource, covered) in grouped {
         match create_subscription(
@@ -159,7 +293,11 @@ pub(super) async fn subscribe_graph(
                 // reach these subscriptions to tear them down. Retain none
                 // of them. Cleanup is best effort: preserve the create
                 // error the caller needs to act on even if a DELETE fails.
-                roll_back_created(&account, &subscriptions).await;
+                //
+                // This rolls back only what we hold ids for. THIS create may
+                // itself have succeeded on Graph (a timeout after the server
+                // acted): its id is unknowable, see `run_subscribe`.
+                roll_back_created(account, &subscriptions).await;
                 return Err(into_account_error(
                     error,
                     GraphErrorContext::graph(AccountOperation::PushSubscribe),
@@ -174,16 +312,25 @@ pub(super) async fn subscribe_graph(
     let outcomes = match finalize_push_outcomes(outcomes, expected) {
         Ok(outcomes) => outcomes,
         Err(error) => {
-            roll_back_created(&account, &subscriptions).await;
+            roll_back_created(account, &subscriptions).await;
             return Err(error);
         }
     };
 
-    account
-        .graph_subscriptions
-        .write()
-        .await
-        .insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
+    let mut groups = account.graph_subscriptions.write().await;
+    // Checked under the write lock, and paired with `retire_all_graph_
+    // subscriptions` cancelling the token BEFORE it walks the groups: either
+    // this insert lands before the cancel (and the walk, which needs the read
+    // lock afterwards, sees and deletes it) or it sees the cancel here and
+    // rolls back. Without the pairing a `close()` that walked the groups while
+    // this task was mid-create would leave a registered group nobody retires.
+    if account.shutdown.is_cancelled() {
+        drop(groups);
+        roll_back_created(account, &subscriptions).await;
+        return Err(account_closed_error());
+    }
+    groups.insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
+    drop(groups);
     // Only on the recovery EDGE. `Reconnected` is the engine's account-wide
     // full-reconcile trigger, and a first subscribe has no gap to cover: the
     // engine established or resumed these cursors moments earlier and is
@@ -192,9 +339,19 @@ pub(super) async fn subscribe_graph(
     // redundant reconcile over every registered scope. A subscribe that lands
     // while the renewal worker has push latched down is a real recovery and
     // still emits.
-    mark_push_reconnected(&account);
-    ensure_graph_worker(account).await;
+    mark_push_reconnected(account);
+    ensure_graph_worker(account.clone()).await;
     Ok((Some(handle), outcomes))
+}
+
+/// `push_subscribe` on (or racing) a closed account.
+fn account_closed_error() -> AccountError {
+    into_account_error(
+        crate::error::GraphError::RuntimeFailure {
+            message: "the account is closed".to_string(),
+        },
+        GraphErrorContext::graph(AccountOperation::PushSubscribe),
+    )
 }
 
 /// Best-effort DELETE of subscriptions this request created but will never
@@ -273,6 +430,11 @@ pub(super) async fn unsubscribe_graph(
 /// shutdown token and retire its workers, and the engine has no useful
 /// recovery for "the server kept a subscription we asked it to drop".
 pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
+    // Cancel BEFORE the walk: an in-flight `push_subscribe` checks the token
+    // under the same write lock it registers under, so a group it registers
+    // either precedes this cancel (and is walked below) or is refused.
+    // `close()` cancels again afterwards; that is idempotent.
+    account.shutdown.cancel();
     let handles: Vec<SubscriptionHandle> = account
         .graph_subscriptions
         .read()
