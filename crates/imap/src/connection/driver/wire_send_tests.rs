@@ -158,3 +158,104 @@ async fn a_later_multiappend_message_refused_at_its_marker_leaves_the_wire_in_sy
         .expect("the connection must carry the next command");
     let _server = script.await.unwrap();
 }
+
+/// A SETMETADATA value that cannot be quoted (it opens with CRLF), `len` bytes
+/// long, filled with `fill`. Two of these force two classic literals.
+fn metadata_value(fill: u8, len: usize) -> Vec<u8> {
+    let mut v = b"\r\n".to_vec();
+    v.resize(len, fill);
+    v
+}
+
+/// Drive one two-literal SETMETADATA whose second literal is refused with a
+/// tagged `NO` at its marker, and assert the connection is intact afterwards.
+///
+/// `len` is the size of each value; the capability set decides which send path
+/// carries the command.
+async fn refused_second_metadata_literal_leaves_the_wire_in_sync(caps: &str, len: usize) {
+    let (conn, mut server) = driver_pair(&preauth_greeting(caps)).await;
+    let first_value = metadata_value(b'a', len);
+    let second_value = metadata_value(b'b', len);
+    let marker = format!("{{{len}}}\r\n");
+
+    let script = {
+        let first_value = first_value.clone();
+        tokio::spawn(async move {
+            let first = read_line(&mut server).await;
+            assert!(first.contains("SETMETADATA"), "not SETMETADATA: {first:?}");
+            assert!(first.ends_with(&marker), "first marker: {first:?}");
+            let tag = tag_of(&first).to_owned();
+            respond(&mut server, "+ go\r\n").await;
+
+            let body = read_exact(&mut server, len).await;
+            assert_eq!(body, first_value);
+            let second = read_line(&mut server).await;
+            assert!(
+                second.ends_with(&marker),
+                "second marker must end the write: {second:?}"
+            );
+            respond(
+                &mut server,
+                &format!("{tag} NO [OVERQUOTA] second refused\r\n"),
+            )
+            .await;
+
+            // The second value opens with CRLF, so had any of it been written
+            // this read would return a bare CRLF instead of the NOOP line.
+            let noop = read_line(&mut server).await;
+            assert!(
+                noop.contains("NOOP"),
+                "bytes were written past the refused marker: {noop:?}"
+            );
+            let tag = tag_of(&noop).to_owned();
+            respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+            server
+        })
+    };
+
+    let err = conn
+        .set_metadata(
+            "INBOX",
+            &[
+                ("/private/a", Some(&first_value[..])),
+                ("/private/b", Some(&second_value[..])),
+            ],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("the second literal was refused");
+    assert!(matches!(err, Error::No { .. }), "got {err:?}");
+    assert!(!err.is_connection_fatal());
+    assert!(
+        conn.is_alive(),
+        "a refusal at a marker leaves the framing intact"
+    );
+    conn.noop(Duration::from_secs(5))
+        .await
+        .expect("the connection must carry the next command");
+    let _server = script.await.unwrap();
+}
+
+/// The pre-split segment path (`send_encoded_segments`, no literal extension):
+/// a later literal of a non-APPEND command refused at its marker is that
+/// command's ordinary non-fatal refusal, and the second body is never written.
+///
+/// Making `send_encoded_segments` write the next segment before the wait fails
+/// the NOOP-line assertion; treating the own-tag `NO` after a granted literal
+/// as fatal fails the `is_alive` assertion.
+#[tokio::test]
+async fn a_later_literal_of_a_segmented_command_refused_at_its_marker_leaves_the_wire_in_sync() {
+    refused_second_metadata_literal_leaves_the_wire_in_sync("IMAP4rev1 METADATA", 6).await;
+}
+
+/// The flat-buffer path (`send_with_literal_sync`): under `LITERAL-` a literal
+/// over 4096 bytes stays synchronizing, so two such values run the same
+/// marker-by-marker send over the patched buffer.
+///
+/// Writing past the second marker before the wait fails the NOOP-line
+/// assertion; a fatal classification fails the `is_alive` assertion.
+#[tokio::test]
+async fn a_later_literal_of_a_flat_command_refused_at_its_marker_leaves_the_wire_in_sync() {
+    refused_second_metadata_literal_leaves_the_wire_in_sync("IMAP4rev1 METADATA LITERAL-", 4097)
+        .await;
+}

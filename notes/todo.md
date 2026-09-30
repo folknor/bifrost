@@ -123,53 +123,38 @@ against the code before working any of them.
 
 - **google: an event with an unspecified end projects an empty `end`.** Landed
   2026-09-30: `CalendarEvent.end` cannot be absent, so `endTimeUnspecified`
-  projects the empty `EventTime` tombstones already use, and an empty `end` on
-  a create or patch writes `endTimeUnspecified` back. Consumers that assumed
-  only tombstones carry an empty end now see it on live events; the honest
-  shape is an optional `end` in `bifrost-types`, a published-surface ruling.
-- **calendar crates: empty or malformed event times on writes.** Google now
-  refuses an empty `start` and reads an empty `end` as "no end"; graph, caldav
-  and jmap were not checked for the same hole, where a projected empty
-  `EventTime` echoed into a write reaches the wire. In google a malformed
-  non-empty time (a non-date all-day value, a timed value with no offset) is
-  still sent as given.
-- **caldav: raw values in iCalendar writers.** `RRULE`, `RECURRENCE-ID` and
-  possibly attendee address values are written as `NAME:value` with no line
-  break stripping, so a consumer value containing CR or LF injects iCalendar
-  lines. Unaudited. Separately, an href containing a literal `#` would make
-  `split_event_id` split in the wrong place; percent-encoding makes it
-  unlikely.
-- **sync: reopen drop points the replacement guard does not cover.** A
-  reattach dropped before any replacement subscription exists, or during the
-  final `next.close()` or `previous.close()`, leaks that account's connection;
-  a dropped reattach never calls `rollback_reattach_inserts`, leaving
-  provisional cursor rows provisional until a later abort or commit. An orphan
-  is retried against whatever account is current, which fails forever on a
-  provider whose handles are account-local.
-- **sync: a pause landing during `restart_scope` loses the scope.**
-  `restart_scope` deletes the scope's in-memory and durable cursor, then
-  `run_establish` refuses with `Paused` and `re_establish_scope_with_backoff`
-  returns; `resume_account` only flips the boundary, and the multiplexer polls
-  only scopes still in the cursor registry, so the scope stays gone for the
-  rest of the attachment. Every `RestartScope` and downgrade-for-scope repair
-  is exposed. The obvious fix, waiting for `Run` and retrying, would hold the
-  reopen lock across an unbounded pause, which the dispatch comments already
-  record as hanging `unsubscribe_push`; wants a design (defer the delete until
-  activity is held, or requeue the repair on resume).
-- **sync: an orphan can land after detach's registry take.** The
-  dropped-reattach cleanup checks the shutdown token and then restores under
-  the reopen lock, but detach cancels the token before it takes the registry
-  and does not take the reopen lock, so on a multi-thread runtime an orphan
-  can be restored after the take and be inherited by a later attach of the
-  same id. Tiny window; closing it needs detach to synchronize on the lock.
-- **graph: `subscribe_ews` on a closed account** still registers and spawns a
-  worker that exits at once. No server state is involved; the webhook arm
-  refuses instead, so this is parity only.
-- **imap: multi-literal commands outside APPEND lack a transcript test.** The
-  later-literal early-reply limit is documented at `wait_for_continuation` and
-  pinned for MULTIAPPEND; nothing pins it through `send_with_literal_sync` or
-  `send_encoded_segments`, such as a pipelined batch with two synchronizing
-  literals.
+  projects the empty `EventTime` tombstones already use. Consumers that
+  assumed only tombstones carry an empty end now see it on live events; the
+  honest shape is an optional `end` in `bifrost-types`, a published-surface
+  ruling. Every calendar crate now treats an echoed empty end on a patch as
+  "leave the end alone"; on a create google, graph and jmap refuse it as
+  `Unsupported`, while caldav writes no DTEND, which RFC 5545 allows.
+- **sync: an orphan retried on a later connection deletes nothing.** Graph,
+  IMAP and JMAP keep the handle-to-server-state map inside the account
+  instance, so a teardown retried against a newer connection returns `Ok`
+  without touching the server; a Graph webhook subscription then lives until
+  Graph expires it, about a day. Nothing fails forever, and the owning
+  account's `close()` deletes its own Graph rows, which covers the common path.
+  Closing it needs the handle to carry what the server needs, a shape change
+  to what push handles contain.
+- **sync: schema recovery and lifecycle scopes share the pause hole.**
+  `handle_schema_incompatible` deletes every scope's cursor, then
+  re-establishes each on the plain control, so a pause landing inside it loses
+  scopes the way `restart_scope` did before it learned to hold activity. A
+  `Created` lifecycle scope whose repair is declined under a pause has no
+  cursor to keep and is lost.
+- **sync: `replace` and `record` can land after detach's registry take.** The
+  orphan writes are sealed against detach inside the registry's shard lock;
+  the reattach commit's `replace` and `subscribe_push`'s `record` are not.
+- **jmap: an unparseable non-empty end still becomes `PT0S`.** `duration()`
+  falls back to a zero-length duration for any end it cannot parse, and a
+  garbage `start` is not validated, so a malformed time silently writes a
+  zero-length event. Separately, no brokkr sweep runs `crates/jmap/src/sync/`
+  tests under `brokkr test -p bifrost-jmap`, since the `sync` feature is only
+  donated in the workspace selection; they run only in a full check.
+- **caldav: TEXT values pass control characters other than CR and LF.**
+  `escape_text` handles line breaks, so nothing injects, but a NUL or other
+  control character in a summary or description writes invalid iCalendar.
 
 ## Blocked on an unvalidated consumer contract
 

@@ -485,6 +485,139 @@ async fn a_surplus_esearch_for_a_finalized_search_is_dropped_not_published() {
     );
 }
 
+/// A SETMETADATA value that cannot be quoted (it opens with CRLF), `len` bytes
+/// long, filled with `fill`. Two of these force two classic literals.
+fn metadata_value(fill: u8, len: usize) -> Vec<u8> {
+    let mut v = b"\r\n".to_vec();
+    v.resize(len, fill);
+    v
+}
+
+/// A pipelined batch whose middle command is a two-literal SETMETADATA refused
+/// with a tagged `NO` at its SECOND marker (RFC 3502 permits the refusal of a
+/// later literal). The refused command's slot holds the `NO`, its neighbours
+/// complete, and none of its second body reaches the wire: the next command's
+/// line is the next thing the server reads.
+///
+/// `len` is the size of each value; the capability set decides whether the
+/// batch is sent through the segment path or the patched flat-buffer path.
+async fn a_pipelined_command_refused_at_its_second_marker_is_its_own_result(
+    caps: &str,
+    len: usize,
+) {
+    let (conn, mut server) = driver_pair(&preauth_greeting(caps)).await;
+    let first_value = metadata_value(b'a', len);
+    let second_value = metadata_value(b'b', len);
+    let marker = format!("{{{len}}}\r\n");
+
+    let task = tokio::spawn(async move {
+        conn.pipeline()
+            .my_rights(MailboxName::new("INBOX").unwrap())
+            .set_metadata(
+                MailboxName::new("INBOX").unwrap(),
+                vec![
+                    ("/private/a".to_owned(), Some(first_value)),
+                    ("/private/b".to_owned(), Some(second_value)),
+                ],
+            )
+            .get_acl(MailboxName::new("INBOX").unwrap())
+            .execute_dynamic()
+            .await
+    });
+
+    let myrights = read_line(&mut server).await;
+    let tag1 = tag_of(&myrights).to_owned();
+    let setmeta = read_line(&mut server).await;
+    assert!(
+        setmeta.contains("SETMETADATA"),
+        "not SETMETADATA: {setmeta:?}"
+    );
+    assert!(setmeta.ends_with(&marker), "first marker: {setmeta:?}");
+    let tag2 = tag_of(&setmeta).to_owned();
+    respond(&mut server, "+ go\r\n").await;
+
+    let body = read_exact(&mut server, len).await;
+    assert_eq!(body, metadata_value(b'a', len));
+    let second = read_line(&mut server).await;
+    assert!(
+        second.ends_with(&marker),
+        "the second marker must end the write: {second:?}"
+    );
+    respond(
+        &mut server,
+        &format!("{tag2} NO [OVERQUOTA] second refused\r\n"),
+    )
+    .await;
+
+    // The second value opens with CRLF, so had any of it been written this
+    // read would return a bare CRLF instead of the GETACL line.
+    let getacl = read_line(&mut server).await;
+    assert!(
+        getacl.contains("GETACL"),
+        "bytes of the refused literal reached the wire ahead of the next command: {getacl:?}"
+    );
+    let tag3 = tag_of(&getacl).to_owned();
+    respond(
+        &mut server,
+        &format!(
+            "* MYRIGHTS INBOX lr\r\n{tag1} OK myrights done\r\n\
+             * ACL INBOX me lrswipkxte\r\n{tag3} OK getacl done\r\n"
+        ),
+    )
+    .await;
+
+    let results = task.await.unwrap().expect("the batch must not abort");
+    assert_eq!(results.len(), 3);
+    let err = results[1]
+        .as_ref()
+        .expect_err("the refused command's NO is its own result");
+    assert!(
+        matches!(err, crate::error::Error::No { .. }),
+        "wrong error: {err:?}"
+    );
+    assert!(!err.is_connection_fatal());
+    assert!(
+        format!("{err}").contains("second refused"),
+        "wrong error routed to the refused command: {err}"
+    );
+    let rights = results[0]
+        .as_ref()
+        .expect("the earlier command still completes")
+        .downcast_ref::<String>()
+        .unwrap();
+    assert_eq!(rights, "lr");
+    assert!(
+        results[2].is_ok(),
+        "the later command must complete after the refusal: {:?}",
+        results[2].as_ref().err()
+    );
+}
+
+/// The pipelined segment path (`send_encoded_segments` with routing).
+///
+/// Writing the next segment before the wait fails the GETACL-line assertion;
+/// answering the own-tag `NO` as a batch error fails the results assertions.
+#[tokio::test]
+async fn a_pipelined_segmented_command_refused_at_its_second_marker_is_its_own_result() {
+    a_pipelined_command_refused_at_its_second_marker_is_its_own_result("IMAP4rev1 ACL METADATA", 6)
+        .await;
+}
+
+/// The pipelined flat-buffer path (`send_with_literal_sync` with routing),
+/// reached under `LITERAL-` with literals over 4096 bytes.
+///
+/// Writing past the second marker before the wait fails the GETACL-line
+/// assertion; answering the own-tag `NO` as a batch error fails the results
+/// assertions.
+#[tokio::test]
+async fn a_pipelined_flat_command_refused_at_its_second_marker_is_its_own_result() {
+    a_pipelined_command_refused_at_its_second_marker_is_its_own_result(
+        "IMAP4rev1 ACL METADATA LITERAL-",
+        4097,
+    )
+    .await;
+}
+
 /// The tag the generator will produce after `tag`.
 ///
 /// `TagGenerator` emits `{prefix:08x}{counter:08x}` from a per-connection
