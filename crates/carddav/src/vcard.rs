@@ -102,6 +102,20 @@ fn param_value(field: &'static str, value: &str) -> Result<String, VCardWriteErr
     Ok(escape_param(value))
 }
 
+/// A URI value, written verbatim: RFC 6350 section 3.4 escapes TEXT only, so a
+/// comma or semicolon in a URL goes on the wire bare. A URI has no escape form
+/// at all, so every control character is refused, CR and LF included, since a
+/// line break would start a new content line.
+fn uri_value<'a>(field: &'static str, value: &'a str) -> Result<&'a str, VCardWriteError> {
+    if value.chars().any(|ch| ch.is_ascii_control()) {
+        return Err(VCardWriteError {
+            field,
+            reason: CONTROL_CHARACTER,
+        });
+    }
+    Ok(value)
+}
+
 pub(crate) fn vcard_from_create(
     contact: &ContactCreate,
     uid: &str,
@@ -413,7 +427,7 @@ fn append_photo(lines: &mut Vec<String>, photo_url: Option<&str>) -> Result<(), 
     if let Some(photo_url) = photo_url {
         lines.push(format!(
             "PHOTO;VALUE=URI:{}",
-            text_value("photo url", photo_url)?
+            uri_value("photo url", photo_url)?
         ));
     }
     Ok(())
@@ -1068,6 +1082,10 @@ fn photo_url(value: &str, params: &[(String, Vec<String>)]) -> Option<String> {
     let is_uri_value = params.iter().any(|(key, values)| {
         key == "VALUE" && values.iter().any(|v| v.eq_ignore_ascii_case("uri"))
     });
+    // A URI value is not TEXT and carries no escapes, but cards written with
+    // TEXT escaping (this crate's own writer once did it) are still in the
+    // wild. Unescaping is lossless for a valid URI: a literal backslash is not
+    // a URI character and must appear percent-encoded.
     let unescaped = unescape_text(value);
     if unescaped.starts_with("data:") {
         return None;
@@ -1491,6 +1509,28 @@ mod tests {
 
         assert_eq!(contact.photo_url.as_deref(), Some("content://photos/1"));
         assert!(contact.photo.is_none());
+    }
+
+    /// A PHOTO URI is a URI value, not TEXT: commas and semicolons go on the
+    /// wire bare, and a line break, which a URI cannot escape, is refused
+    /// rather than starting a content line. Reverting `append_photo` to
+    /// `text_value` writes `\,` and `\;` and accepts the line break.
+    #[test]
+    fn photo_uri_is_written_unescaped_and_refuses_line_breaks() {
+        let url = "https://x.test/p;v=1,2?a=b,c";
+        let mut lines = Vec::new();
+        append_photo(&mut lines, Some(url)).expect("writable");
+        assert_eq!(lines, vec![format!("PHOTO;VALUE=URI:{url}")]);
+
+        let card = format!("BEGIN:VCARD\r\nFN:Ada\r\n{}\r\nEND:VCARD\r\n", lines[0]);
+        let contact = parse_contact("/ab/1.vcf".to_string(), None, None, &card);
+        assert_eq!(contact.photo_url.as_deref(), Some(url));
+
+        let mut lines = Vec::new();
+        let error = append_photo(&mut lines, Some("https://x.test/a\r\nX-EVIL:1"))
+            .expect_err("a line break in a URI is refused");
+        assert_eq!(error.field, "photo url");
+        assert!(lines.is_empty());
     }
 
     #[test]

@@ -69,7 +69,7 @@ pub(crate) fn events_in_range<T: HttpTransport>(
             range.page_cursor.clone(),
             AccountOperation::EventsInRange,
         )?;
-        let filter = range_filter(&range);
+        let filter = range_filter(&range)?;
         let query = crate::calendar_event::CalendarEventQuery::new()
             .filter(filter)
             .limit(limit(range.limit))
@@ -122,12 +122,17 @@ pub(crate) fn events_in_range<T: HttpTransport>(
     })
 }
 
-fn range_filter(range: &EventRange) -> QueryFilter<EventFilter> {
-    QueryFilter::and(vec![
+fn range_filter(range: &EventRange) -> Result<QueryFilter<EventFilter>, AccountError> {
+    Ok(QueryFilter::and(vec![
         QueryFilter::from(EventFilter::in_calendar(range.calendar_id.0.clone())),
-        QueryFilter::from(EventFilter::after(jmap_utc_filter_time(&range.start))),
-        QueryFilter::from(EventFilter::before(jmap_utc_filter_time(&range.end))),
-    ])
+        QueryFilter::from(EventFilter::after(jmap_utc_filter_time(
+            &range.start,
+            "start",
+        )?)),
+        QueryFilter::from(EventFilter::before(jmap_utc_filter_time(
+            &range.end, "end",
+        )?)),
+    ]))
 }
 
 pub(crate) fn get<T: HttpTransport>(
@@ -752,12 +757,12 @@ fn jmap_patch_from_event_patch(
         (Some(start), Some(end)) => {
             let all_day = context.is_all_day;
             let value = event_duration(start, end, all_day, operation)?;
-            out.start(jmap_time_from_shared(start, all_day));
+            out.start(jmap_time_from_shared(start, all_day, operation)?);
             out.time_zone(start.timezone.clone());
             out.duration(value);
         }
         (Some(start), None) if end_is_blank => {
-            out.start(jmap_time_from_shared(start, context.is_all_day));
+            out.start(jmap_time_from_shared(start, context.is_all_day, operation)?);
             out.time_zone(start.timezone.clone());
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -972,7 +977,11 @@ fn write_event_create(
             "JMAP cannot create an event with no end: JSCalendar derives the end from start + duration, so an empty end would be stored as a zero-length event; a create needs an explicit end",
         ));
     }
-    target.start(jmap_time_from_shared(&event.start, event.is_all_day));
+    target.start(jmap_time_from_shared(
+        &event.start,
+        event.is_all_day,
+        operation,
+    )?);
     target.time_zone(event.start.timezone.clone());
     target.duration(event_duration(
         &event.start,
@@ -1757,52 +1766,55 @@ fn shared_time_from_jmap(value: &str, is_all_day: bool) -> String {
     value.to_string()
 }
 
-fn jmap_time_from_shared(time: &EventTime, is_all_day: bool) -> String {
-    if is_all_day || time.value.len() == 10 {
+/// The JSCalendar `start` LocalDateTime for a shared event time.
+///
+/// The value is parsed here rather than trusted to a prior `validate_start`,
+/// so no caller can put raw, unparsed text on the wire: an empty or
+/// unparseable time is `Request(Malformed)` naming `start`.
+fn jmap_time_from_shared(
+    time: &EventTime,
+    is_all_day: bool,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    let wall = match parse_time(time, "start", is_all_day, operation)? {
         // JSCalendar has no DATE type: RFC 8984 `start` is always a
         // LocalDateTime, and an all-day event is midnight on its date with
         // `showWithoutTime` carrying the all-day sense. Writing the shared
         // bare DATE straight through emits a value no conforming server
         // accepts, and only reads back because our own read path truncates
         // the same way.
-        return if time.value.len() == 10 {
-            format!("{}T00:00:00", time.value)
-        } else {
-            time.value.clone()
-        };
-    }
-    // Rendered in the value's own offset, not normalized to UTC: the
-    // JSCalendar `timeZone` property carries the zone separately, so the
-    // wall clock is what belongs in the LocalDateTime.
-    // A numeric offset yields the wall clock directly. A `Z` suffix is
-    // rejected by the civil parser (Temporal reads it as an unknown
-    // offset), so route that through the instant and read it back at UTC.
-    let wall = time
-        .value
-        .parse::<civil::DateTime>()
-        .ok()
-        .or_else(|| Some(Offset::UTC.to_datetime(time.value.parse::<Timestamp>().ok()?)));
-    if let Some(wall) = wall {
-        return wall.strftime("%Y-%m-%dT%H:%M:%S").to_string();
-    }
-    time.value.clone()
+        Moment::Date(date) => date.to_datetime(civil::Time::MIN),
+        Moment::Local(datetime) => datetime,
+        // Rendered in the value's own offset, not normalized to UTC: the
+        // JSCalendar `timeZone` property carries the zone separately, so the
+        // wall clock is what belongs in the LocalDateTime.
+        // A numeric offset yields the wall clock directly. A `Z` suffix is
+        // rejected by the civil parser (Temporal reads it as an unknown
+        // offset), so route that through the instant and read it back at UTC.
+        Moment::Instant(instant) => time
+            .value
+            .parse::<civil::DateTime>()
+            .unwrap_or_else(|_| Offset::UTC.to_datetime(instant)),
+    };
+    Ok(wall.strftime("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
 // The JSCalendar event-query `after`/`before` filter conditions are
 // LocalDateTime values (draft-ietf-jmap-calendars-26 section 5.11.1): a bare
 // wall-clock string with no zone and no trailing `Z`, interpreted in the
-// query's `timeZone` argument, which defaults to Etc/UTC. A range boundary is
-// always a timed instant, so an offset-bearing RFC 3339 input is normalized to
-// UTC and rendered bare, matching that Etc/UTC default. Date-only or
-// unparseable values pass through untouched.
-fn jmap_utc_filter_time(time: &EventTime) -> String {
-    if let Ok(parsed) = time.value.parse::<Timestamp>() {
-        return Offset::UTC
-            .to_datetime(parsed)
-            .strftime("%Y-%m-%dT%H:%M:%S")
-            .to_string();
-    }
-    time.value.clone()
+// query's `timeZone` argument, which defaults to Etc/UTC. An offset-bearing
+// RFC 3339 input is normalized to UTC and rendered bare, matching that
+// Etc/UTC default; a bare date is midnight on that date, and a zoneless
+// date-time is already a LocalDateTime. An empty or unparseable bound is
+// `Request(Malformed)` naming `field`, refused before any request as the
+// google and caldav range reads refuse theirs, never sent to the server raw.
+fn jmap_utc_filter_time(time: &EventTime, field: &'static str) -> Result<String, AccountError> {
+    let wall = match parse_time(time, field, false, AccountOperation::EventsInRange)? {
+        Moment::Date(date) => date.to_datetime(civil::Time::MIN),
+        Moment::Local(datetime) => datetime,
+        Moment::Instant(instant) => Offset::UTC.to_datetime(instant),
+    };
+    Ok(wall.strftime("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
 fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> bool {
@@ -2493,20 +2505,71 @@ mod tests {
                     timezone: Some("Europe/Oslo".to_string()),
                 },
                 false,
-            ),
+                AccountOperation::EventCreate,
+            )
+            .expect("writable"),
             "2026-06-02T12:00:00"
         );
+    }
+
+    /// No unparsed text reaches the wire as a `start`: an empty or
+    /// unparseable time is refused as `Request(Malformed)` naming `start`,
+    /// whichever caller reached the writer. Restoring the raw fallback
+    /// returns the input string instead.
+    #[test]
+    fn an_unparseable_start_is_refused_not_written_raw() {
+        for value in ["", "next tuesday", "2026-13-40"] {
+            for is_all_day in [false, true] {
+                let error =
+                    jmap_time_from_shared(&time(value), is_all_day, AccountOperation::EventUpdate)
+                        .expect_err("an unparseable start is refused");
+                assert_malformed_field(&error, "start");
+                assert_eq!(error.operation(), Some(AccountOperation::EventUpdate));
+            }
+        }
     }
 
     #[test]
     fn filter_time_normalizes_offset_to_bare_utc_local_datetime() {
         assert_eq!(
-            jmap_utc_filter_time(&EventTime {
-                value: "2026-06-02T12:00:00+02:00".to_string(),
-                timezone: Some("Europe/Oslo".to_string()),
-            }),
+            jmap_utc_filter_time(
+                &EventTime {
+                    value: "2026-06-02T12:00:00+02:00".to_string(),
+                    timezone: Some("Europe/Oslo".to_string()),
+                },
+                "start",
+            )
+            .expect("parseable"),
             "2026-06-02T10:00:00"
         );
+    }
+
+    /// Every range bound reaches the server as a LocalDateTime: a bare date is
+    /// midnight, a zoneless date-time passes as itself, and an empty or
+    /// unparseable bound is refused before any request instead of being sent
+    /// raw. Restoring the pass-through sends `2026-06-02` and `soon` as-is.
+    #[test]
+    fn range_bounds_are_local_datetimes_or_refused() {
+        assert_eq!(
+            jmap_utc_filter_time(&time("2026-06-02"), "start").expect("date"),
+            "2026-06-02T00:00:00"
+        );
+        assert_eq!(
+            jmap_utc_filter_time(&time("2026-06-02T08:30:00"), "end").expect("local"),
+            "2026-06-02T08:30:00"
+        );
+        for value in ["", "soon", "2026-06-02T25:00:00"] {
+            let error = range_filter(&EventRange {
+                calendar_id: CalendarId("cal".to_string()),
+                start: time("2026-06-02T00:00:00Z"),
+                end: time(value),
+                page_cursor: None,
+                limit: None,
+            })
+            .expect_err("an unparseable bound is refused");
+            assert_malformed_field(&error, "end");
+            assert_eq!(error.operation(), Some(AccountOperation::EventsInRange));
+        }
     }
 
     #[test]
@@ -2545,13 +2608,16 @@ mod tests {
 
     #[test]
     fn range_query_filter_includes_calendar_and_time_bounds() {
-        let value = serde_json::to_value(range_filter(&EventRange {
-            calendar_id: CalendarId("cal".to_string()),
-            start: time("2026-06-02T00:00:00Z"),
-            end: time("2026-06-03T00:00:00Z"),
-            page_cursor: None,
-            limit: None,
-        }))
+        let value = serde_json::to_value(
+            range_filter(&EventRange {
+                calendar_id: CalendarId("cal".to_string()),
+                start: time("2026-06-02T00:00:00Z"),
+                end: time("2026-06-03T00:00:00Z"),
+                page_cursor: None,
+                limit: None,
+            })
+            .expect("parseable bounds"),
+        )
         .expect("filter json");
 
         assert_eq!(value["operator"].as_str(), Some("AND"));
@@ -3354,7 +3420,8 @@ mod tests {
         // Absolute wire values, not a round trip: both directions previously
         // shared a bare-DATE assumption, so a round trip proved nothing.
         assert_eq!(
-            jmap_time_from_shared(&time("2026-06-02"), true),
+            jmap_time_from_shared(&time("2026-06-02"), true, AccountOperation::EventCreate)
+                .expect("writable"),
             "2026-06-02T00:00:00"
         );
         // And a conformant server's midnight LocalDateTime reads back as the

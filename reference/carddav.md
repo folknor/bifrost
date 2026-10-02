@@ -205,13 +205,17 @@ narrowed the predicate.
 
   **The writers refuse what they cannot write; they never strip.** Every value
   the writers emit goes through one of three treatments. TEXT (FN, N, UID, EMAIL,
-  TEL, ORG, TITLE, ADR components, NOTE, PHOTO URI) is escaped by `escape_text`
+  TEL, ORG, TITLE, ADR components, NOTE) is escaped by `escape_text`
   behind `text_value`: CR and LF become the `\n` line break, so nothing injects a
   content line. TYPE parameter values (and the 3.0 PHOTO TYPE hint) are RFC 6868
   caret-encoded by `escape_param` behind `param_value`, which carries CR, LF and
-  DQUOTE. The 4.0 inline PHOTO media type sits unescaped inside a `data:` URI,
-  which has no escape form, so it refuses every ASCII control character, line
-  breaks included. Tab is legal in TEXT and parameters. Any other ASCII control
+  DQUOTE. URI values are not TEXT and have no escape form: the PHOTO URI goes out
+  verbatim through `uri_value` (a comma or semicolon in a URL stays bare, as
+  RFC 6350 requires), and the 4.0 inline PHOTO media type sits unescaped inside
+  a `data:` URI; both refuse every ASCII control character, line breaks
+  included. The reader still unescapes a PHOTO URI, so cards an older writer
+  TEXT-escaped read correctly; that is lossless because a valid URI carries a
+  backslash only percent-encoded. Tab is legal in TEXT and parameters. Any other ASCII control
   character (NUL included) has no escape form in TEXT or a parameter and is
   refused: `vcard_from_create` and `vcard_from_patch` return a `VCardWriteError`
   naming the field, which `write_error` in `account.rs` maps to a local

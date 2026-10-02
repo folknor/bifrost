@@ -179,15 +179,6 @@ against the code before working any of them.
   lifecycle scope parked under a pause survives the folder being deleted
   during that pause and is established after resume for a folder that no
   longer exists, ending in the retry-budget terminal event.
-- **jmap: two raw pass-throughs remain.** `jmap_utc_filter_time` sends an
-  unparseable `events_in_range` bound to the server unchanged, and
-  `jmap_time_from_shared` keeps a raw fallback that is unreachable for writes
-  now but would put raw text on the wire for a caller that skips
-  `validate_start`.
-- **carddav: a PHOTO URI is written with TEXT escaping.** RFC 6350 URI values
-  are not escaped, so commas and semicolons in the URL reach other clients as
-  `\,` and `\;`; this crate's reader unescapes them, so it round-trips here
-  only.
 
 ## Blocked on an unvalidated consumer contract
 
