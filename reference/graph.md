@@ -387,10 +387,12 @@ has no Windows name for, so it is `Unsupported`; a slash-free multi-word
 value passes through as a Windows id, and anything else that is neither
 (`"foo"`, `""`) is `Request(Malformed)` naming its field (`start.timezone` /
 `end.timezone`). The read projection
-yields an EMPTY `EventTime` for "Graph did not say" (a delta tombstone with no
-`start` / `end`, or a null `dateTime`), and a read-modify-write consumer echoes
+yields an EMPTY `start` for "Graph did not say" (a delta tombstone with no
+`start`, or a null `dateTime`), and a read-modify-write consumer echoes
 it back; unguarded it reached the wire as `dateTime: ""` under a defaulted UTC
-zone. `reject_unusable_write_times` runs first in `create` and `update` (before
+zone. A missing or valueless `end` projects as `CalendarEvent.end` `None`,
+which echoes into a patch as no end change, but a caller may still pass an
+empty end explicitly. `reject_unusable_write_times` runs first in `create` and `update` (before
 the timezone checks, the fetch and the calendar-move refusal): an empty or
 whitespace `start` is `Request(Malformed)` naming `start` on both, and an empty
 `end` on a create is `Unsupported` (no end is invented). An empty `end` on a

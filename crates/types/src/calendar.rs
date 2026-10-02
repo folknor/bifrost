@@ -205,7 +205,12 @@ pub struct CalendarEvent {
     pub description: Option<String>,
     pub location: Option<String>,
     pub start: EventTime,
-    pub end: EventTime,
+    /// `None` when the provider gave no end: Google's
+    /// `endTimeUnspecified`, an iCalendar VEVENT with neither DTEND nor a
+    /// resolvable DURATION, a JSCalendar event with no `start` to measure a
+    /// duration from, or a tombstone. Echoing it into `EventPatch::end`
+    /// leaves the stored end alone.
+    pub end: Option<EventTime>,
     pub is_all_day: bool,
     pub status: EventStatus,
     pub availability: EventAvailability,

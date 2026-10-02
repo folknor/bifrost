@@ -354,15 +354,17 @@ included), `a_probe_naming_the_principal_ends_the_walk`,
   resource. An empty TZID (`TZID=` projects as `Some("")`) is no zone and
   writes no parameter.
 
-  **Empty event times.** A provider projects an empty `EventTime` for "did not
-  say" and this crate's own projection does too (no `DTSTART`, no `DTEND` and
-  no resolvable `DURATION`), and a consumer's read-modify-write echoes it back.
+  **Empty event times.** A provider projects an empty `start` for "did not
+  say" and this crate's own projection does too (no `DTSTART`), and a
+  consumer's read-modify-write echoes it back. No `DTEND` and no resolvable
+  `DURATION` projects `CalendarEvent.end` as `None`, which a patch echoes as no
+  end change; an empty end a caller passes explicitly means the same.
   An empty start is refused as malformed (`DTSTART:` is invalid and there is no
   honest reading of an event with no position); a patch that only flips
   `is_all_day` over a stored event with no DTSTART leaves it alone. An empty end
   has an honest meaning here, unlike Google, because RFC 5545 allows neither
   DTEND nor DURATION: on create it writes no DTEND (zero-length for a DATE-TIME
-  start, one day for a DATE start), which reads back as an empty end again, and
+  start, one day for a DATE start), which reads back as no end, and
   it is not refused. On a patch it leaves the stored DTEND and DURATION untouched,
   since the empty value may stand for a DURATION the projection could not
   resolve and deleting it would destroy data. A patch cannot clear an end.

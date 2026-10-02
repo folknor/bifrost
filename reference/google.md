@@ -540,12 +540,13 @@ boundary and clipping any loose provider page. `events_in_range` requests
 `showDeleted=true` alongside `singleEvents=true`, so cancelled recurring
 instances remain visible as `EventStatus::Cancelled` instead of disappearing
 from a range reread. Google may return such tombstones with only
-`originalStartTime`; the projection uses that value for both required time
-fields so the stable instance id and cancelled status can cross the shared
+`originalStartTime`; the projection uses that value for both time fields so
+the stable instance id and cancelled status can cross the shared
 `CalendarEvent` surface. A cancelled STANDALONE event is a different shape
 again - a bare stub carrying an id and `status: "cancelled"` and no `start`,
 `end` or `originalStartTime` at all - and it projects with an empty-valued
-`EventTime` on both bounds rather than being refused: a deletion notice is
+`start` and an `end` of `None` rather than being refused (a cancelled event
+with a start and no end likewise has no end, not a copy of its start): a deletion notice is
 not a malformed event, and it is the notice `showDeleted=true` was asked
 for. The tolerance is gated on the cancelled status. A LIVE event the
 provider sends without times is still a projection error
@@ -554,15 +555,13 @@ no end: Google documents that an end is provided even when the event's end
 is unspecified (`endTimeUnspecified: true`), so projecting a missing one as
 zero-length would invent a duration the provider promised to state. The one
 exception is `endTimeUnspecified: true`: there the provided `end` is a
-placeholder, not a real end. `CalendarEvent.end` is not optional, so the
-projection discards the placeholder and emits the same empty-valued `EventTime`
-the tombstone stub uses ("the provider did not say"), and a missing `end` on
-such an event is not refused. Consumers must treat an empty `end.value` on a
-live event as "no end", not parse it. `endTimeUnspecified` is not a writable
-Events property, so "no end" cannot be written, and an empty (or
-whitespace-only) `end` is never sent as `dateTime: ""`. A patch that echoes it
-omits `end`, leaving the stored end untouched, so a read-modify-write of such
-an event neither fails nor fabricates an end. That holds when the patch also
+placeholder, not a real end, so the projection discards it and
+`CalendarEvent.end` is `None`, and a missing `end` on such an event is not
+refused. A read-modify-write that echoes `None` into `EventPatch.end` sends no
+end at all. `endTimeUnspecified` is not a writable Events property, so "no
+end" cannot be written, and an empty (or whitespace-only) `end` a caller passes
+is never sent as `dateTime: ""`. A patch carrying one omits `end`, leaving the
+stored end untouched, so a write neither fails nor fabricates an end. That holds when the patch also
 carries `start`: an echoed unchanged start cannot be told from a move without
 fetching the event, and a real move past Google's stored placeholder end is
 refused by Google itself. A create with an empty `end` is refused as

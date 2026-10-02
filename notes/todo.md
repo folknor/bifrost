@@ -155,14 +155,6 @@ type's shape are not listed: the owner ruled those need no ruling (see
 Found while recovering and auditing the laterals work; none is ruled. Verify
 against the code before working any of them.
 
-- **types: `CalendarEvent.end` should be optional.** `endTimeUnspecified`
-  in google projects the empty `EventTime` tombstones already use, because
-  `end` cannot be absent, so consumers that assumed only tombstones carry an
-  empty end now see it on live events, and every calendar crate has to read an
-  echoed empty end on a write as "no end". An `Option` end is the honest
-  shape; it was blocked on a published-surface ruling, which the owner's
-  2026-09-30 ruling on shape changes now covers, so it is buildable across
-  `bifrost-types` and all four calendar crates.
 - **graph: a push handle names the subscriptions of its subscribe time.** A
   webhook handle now carries its Graph subscription ids, so an orphan torn
   down on a later instance deletes them. A subscription the renewal worker

@@ -619,19 +619,17 @@ fn event_from_google(
     //
     // `endTimeUnspecified: true` is the one case where that provided end is
     // NOT a real end: Google fills `end` with a placeholder (typically the
-    // start) only because its API cannot omit the field. `CalendarEvent.end`
-    // is not optional on the shared surface, so absence cannot be expressed.
-    // The most honest value the existing surface allows is the empty
-    // `EventTime` that `unknown_event_time` already defines as "the provider
-    // did not say" (the tombstone convention above). Forwarding the
-    // placeholder would tell the consumer a fabricated end is real, and
-    // substituting the start would invent a zero-length duration. The
-    // placeholder is discarded even when `end` is absent, so an unspecified
-    // end never trips the missing-end refusal below.
+    // start) only because its API cannot omit the field. It projects as no
+    // end at all. Forwarding the placeholder would tell the consumer a
+    // fabricated end is real, and substituting the start would invent a
+    // zero-length duration. The placeholder is discarded even when `end` is
+    // absent, so an unspecified end never trips the missing-end refusal
+    // below. A tombstone with no end has none either, rather than a copy of
+    // its start.
     let end = match event.end.or(cancelled_instance_time).map(event_time) {
-        _ if event.end_time_unspecified == Some(true) => unknown_event_time(),
-        Some(end) => end,
-        None if is_cancelled => start.clone(),
+        _ if event.end_time_unspecified == Some(true) => None,
+        Some(end) => Some(end),
+        None if is_cancelled => None,
         None => {
             return Err(local_error_with_field(
                 operation,
@@ -831,9 +829,10 @@ fn is_blank_time(time: &EventTime) -> bool {
 // of `dateTime: ""`, so an empty start is malformed caller input:
 // `Request(Malformed)` naming `start`.
 //
-// An empty `end` is the projection's "no end" for an event whose resource
-// says `endTimeUnspecified: true` (documented in `reference/google.md`), so a
-// consumer that reads an event and writes it back carries exactly that value.
+// An empty `end` is how a caller says "no end". The read side projects an
+// `endTimeUnspecified: true` event with `CalendarEvent::end` `None`
+// (documented in `reference/google.md`), which echoes into a patch as no end
+// change at all; an empty `EventTime` is the same statement made explicitly.
 // `endTimeUnspecified` is not a writable Events property, so "no end" cannot
 // be written; forwarding the empty value would send `dateTime: ""`, and
 // substituting the start would fabricate a zero-length end. What an empty end
@@ -1654,7 +1653,10 @@ mod tests {
         let event = &page.items[0];
         assert_eq!(event.status, EventStatus::Cancelled);
         assert_eq!(event.start.value, "2026-06-02");
-        assert_eq!(event.end.value, "2026-06-02");
+        assert_eq!(
+            event.end.as_ref().map(|end| end.value.as_str()),
+            Some("2026-06-02")
+        );
         assert!(
             event.is_all_day,
             "a date-valued tombstone must project as an all-day instance",
@@ -1699,17 +1701,16 @@ mod tests {
         assert_eq!(event.id.0, "primary::deleted-standalone");
         assert_eq!(event.status, EventStatus::Cancelled);
         assert_eq!(event.start.value, "");
-        assert_eq!(event.end.value, "");
+        assert_eq!(event.end, None);
         assert!(
             !event.is_all_day,
             "a stub with no times says nothing about all-day-ness",
         );
     }
 
-    /// `endTimeUnspecified: true` means Google's `end` is a placeholder.
-    /// The shared `end` is not optional, so it projects as the empty
-    /// "provider did not say" time rather than the fabricated value. Fails
-    /// if the `end_time_unspecified` arm of the `end` match is removed.
+    /// `endTimeUnspecified: true` means Google's `end` is a placeholder, so
+    /// it projects as no end rather than the fabricated value. Fails if the
+    /// `end_time_unspecified` arm of the `end` match is removed.
     #[test]
     fn an_unspecified_end_does_not_project_the_placeholder() {
         let event = event_from_google(
@@ -1727,8 +1728,7 @@ mod tests {
         .expect("an unspecified end is a valid event");
 
         assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
-        assert_eq!(event.end.value, "");
-        assert_eq!(event.end.timezone, None);
+        assert_eq!(event.end, None);
         assert!(!event.is_all_day);
     }
 
@@ -1751,7 +1751,7 @@ mod tests {
         )
         .expect("no end plus endTimeUnspecified is valid");
 
-        assert_eq!(event.end.value, "");
+        assert_eq!(event.end, None);
         assert!(event.is_all_day);
     }
 
@@ -1774,7 +1774,7 @@ mod tests {
         )
         .expect("valid event");
 
-        assert_eq!(event.end.value, "2026-06-02T13:00:00Z");
+        assert_eq!(event.end.expect("end").value, "2026-06-02T13:00:00Z");
     }
 
     /// The tolerance is gated on the cancelled status, not on the mere
@@ -1888,7 +1888,10 @@ mod tests {
         // for both bounds, which is what makes the stub case a widening
         // rather than a replacement.
         assert_eq!(page.items[0].start.value, "2026-06-02T12:00:00Z");
-        assert_eq!(page.items[0].end.value, "2026-06-02T12:00:00Z");
+        assert_eq!(
+            page.items[0].end.as_ref().map(|end| end.value.as_str()),
+            Some("2026-06-02T12:00:00Z")
+        );
         assert_eq!(page.failed_ids, vec!["primary::broken".to_string()]);
         assert_eq!(page.next_cursor.as_deref(), Some(b"page-2".as_slice()));
     }
@@ -2875,9 +2878,9 @@ mod tests {
     }
 
     /// End to end: the read-modify-write of an unspecified-end event. Read
-    /// projects the empty end, and the echoed patch goes out without an end
-    /// at all, so the stored one is untouched. Fails if the `end` mapping in
-    /// `google_event_from_patch` is reverted.
+    /// projects no end, and the echoed patch goes out without an end at all,
+    /// so the stored one is untouched. Fails if the read side projects the
+    /// placeholder again, which the echo would then write back as a real end.
     #[tokio::test]
     async fn round_tripping_an_unspecified_end_event_neither_fails_nor_invents_an_end() {
         let read = event_from_google(
@@ -2892,7 +2895,7 @@ mod tests {
             AccountOperation::EventGet,
         )
         .expect("unspecified end projects");
-        assert!(read.end.value.is_empty());
+        assert_eq!(read.end, None);
 
         let (client, script) = scripted_client(vec![canned_json(StatusCode::OK, json!({}))]);
         update(
@@ -2900,7 +2903,7 @@ mod tests {
             EventId("primary::e1".to_string()),
             EventPatch {
                 title: Some(Some("Renamed".to_string())),
-                end: Some(read.end),
+                end: read.end,
                 ..EventPatch::default()
             },
         )

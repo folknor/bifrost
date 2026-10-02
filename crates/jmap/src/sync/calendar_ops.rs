@@ -524,10 +524,13 @@ fn event_from_jmap(
         value: shared_time_from_jmap(raw_start, is_all_day),
         timezone: timezone.clone(),
     };
-    let end = EventTime {
+    // An absent `duration` is RFC 8984's `PT0S`, a real zero-length end; only
+    // an event with no `start` to measure from has no end at all.
+    let end = Some(EventTime {
         value: shared_time_from_jmap(&raw_end, is_all_day),
         timezone: timezone.clone(),
-    };
+    })
+    .filter(|end| !end.value.is_empty());
     let (rdate, mut exdate) = recurrence_dates_from_overrides(event.recurrence_overrides())
         .map_err(|message| unsupported(operation, message))?;
     if let Some(dates) = event.excluded_dates() {
@@ -1821,10 +1824,11 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
     if start.value.is_empty() || end.value.is_empty() {
         return true;
     }
-    let Some((range_start, range_end)) = time_interval(start, end, false) else {
+    let Some((range_start, range_end)) = time_interval(start, Some(end), false) else {
         return true;
     };
-    let Some((event_start, event_end)) = time_interval(&event.start, &event.end, event.is_all_day)
+    let Some((event_start, event_end)) =
+        time_interval(&event.start, event.end.as_ref(), event.is_all_day)
     else {
         return true;
     };
@@ -1836,11 +1840,13 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
 
 fn time_interval(
     start: &EventTime,
-    end: &EventTime,
+    end: Option<&EventTime>,
     is_all_day: bool,
 ) -> Option<(Timestamp, Timestamp)> {
     let start = comparable_time(start, is_all_day)?;
-    let end = comparable_time(end, is_all_day).unwrap_or(start);
+    let end = end
+        .and_then(|end| comparable_time(end, is_all_day))
+        .unwrap_or(start);
     Some((start, end))
 }
 
@@ -2326,7 +2332,7 @@ mod tests {
             description: None,
             location: None,
             start: time(start),
-            end: time(end),
+            end: Some(time(end)).filter(|end| !end.value.is_empty()),
             is_all_day,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
@@ -3119,11 +3125,11 @@ mod tests {
     }
 
     /// The read path itself can hand a consumer an empty time: a server that
-    /// omits the mandatory `start` projects an empty start AND an empty end.
-    /// This pins that the empty-time write handling below is reachable from
-    /// this crate's own output, not just from other providers.
+    /// omits the mandatory `start` projects an empty start and no end. This
+    /// pins that the empty-start write handling below is reachable from this
+    /// crate's own output, not just from other providers.
     #[test]
-    fn a_server_event_without_start_projects_empty_times() {
+    fn a_server_event_without_start_projects_an_empty_start_and_no_end() {
         let raw: JmapCalendarEvent = serde_json::from_value(json!({
             "id": "e1",
             "calendarIds": {"c1": true},
@@ -3132,7 +3138,7 @@ mod tests {
         .expect("event parses");
         let event = event_from_jmap(raw, AccountOperation::EventGet).expect("projects");
         assert!(event.start.value.is_empty());
-        assert!(event.end.value.is_empty());
+        assert_eq!(event.end, None);
     }
 
     /// Fails if `validate_start` is removed from `write_event_create`:

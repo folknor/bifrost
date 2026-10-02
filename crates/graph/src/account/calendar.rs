@@ -200,11 +200,12 @@ fn is_blank_time(time: &EventTime) -> bool {
 
 /// Write-side guard for event times, run before any request.
 ///
-/// The read projection yields an empty `EventTime` for "Graph did not say"
-/// (a delta tombstone with no `start` / `end`, or a `dateTime` that is null),
-/// and a consumer doing read-modify-write echoes it back. Written as is it
-/// reaches the wire as `dateTime: ""` under a defaulted UTC zone, which Graph
-/// refuses or, worse, reads as an unintended value. So:
+/// The read projection yields an empty `start` for "Graph did not say" (a
+/// delta tombstone with no `start`, or a `dateTime` that is null), and a
+/// consumer doing read-modify-write echoes it back; an unsaid end reads as
+/// `None`, but a caller may still pass an empty one. Written as is an empty
+/// time reaches the wire as `dateTime: ""` under a defaulted UTC zone, which
+/// Graph refuses or, worse, reads as an unintended value. So:
 ///
 /// - an empty `start` is `Request(Malformed)` on create and patch: there is
 ///   no start to write and none this client may invent;
@@ -608,10 +609,11 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
             .start
             .map(|time| event_time(time, event.is_all_day.unwrap_or(false)))
             .unwrap_or_else(empty_time),
+        // A missing or valueless `end` is no end, not an empty time.
         end: event
             .end
             .map(|time| event_time(time, event.is_all_day.unwrap_or(false)))
-            .unwrap_or_else(empty_time),
+            .filter(|time| !time.value.is_empty()),
         status: if event.is_cancelled.unwrap_or(false) {
             EventStatus::Cancelled
         } else {
@@ -816,10 +818,9 @@ fn graph_event_from_patch(
     // `dateTime` (the all-day shape) while `isAllDay` stays unset, Graph
     // keeps a previously-timed event timed at midnight instead of
     // converting it to all-day.
-    // An empty `end` is the projection's "no end" (see
-    // `reject_unusable_write_times`): echoing it back leaves the stored end
-    // alone, so it is dropped here before it can drive the all-day inference
-    // or be sent as `dateTime: ""`.
+    // An empty `end` says "no end" (see `reject_unusable_write_times`): on a
+    // patch it leaves the stored end alone, so it is dropped here before it
+    // can drive the all-day inference or be sent as `dateTime: ""`.
     let end = patch.end.as_ref().filter(|time| !is_blank_time(time));
     let effective_all_day = patch.is_all_day.unwrap_or_else(|| {
         patch
@@ -2883,7 +2884,33 @@ mod tests {
 
         assert!(event.is_all_day);
         assert_eq!(event.start.value, "2026-06-02");
-        assert_eq!(event.end.value, "2026-06-03");
+        assert_eq!(
+            event.end.as_ref().map(|end| end.value.as_str()),
+            Some("2026-06-03")
+        );
+    }
+
+    /// A delta tombstone carries no `end`, and a null `dateTime` is no end
+    /// either: both project as `None`, never as an empty time a consumer
+    /// would have to recognize. Fails if the empty-value filter on the `end`
+    /// projection is removed.
+    #[test]
+    fn a_missing_or_valueless_end_projects_as_no_end() {
+        for end in [
+            None,
+            Some(GraphDateTime {
+                date_time: None,
+                time_zone: Some("UTC".to_string()),
+            }),
+        ] {
+            let event = event_from_graph(
+                "calendar".to_string(),
+                serde_json::from_value::<GraphEvent>(json!({"id": "e1"}))
+                    .map(|event| GraphEvent { end, ..event })
+                    .expect("fixture deserializes"),
+            );
+            assert_eq!(event.end, None);
+        }
     }
 
     #[test]
@@ -3426,8 +3453,7 @@ mod tests {
         assert!(script.requests().is_empty());
     }
 
-    /// A read-modify-write echo carries the projection's empty end. The start
-    /// goes out, the end is omitted so the stored one is untouched, and no
+    /// A patch carrying an empty end alongside its start. The start goes out, the end is omitted so the stored one is untouched, and no
     /// `dateTime: ""` reaches the wire. Fails if the blank-end filter in
     /// `graph_event_from_patch` is removed.
     #[tokio::test]

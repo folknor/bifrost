@@ -151,7 +151,7 @@ fn project_event(
                 .first("DURATION")
                 .and_then(|duration| event_end_from_duration(&start, duration))
         })
-        .unwrap_or_else(default_time);
+        .filter(|end| !end.value.is_empty());
     let is_all_day =
         dtstart.is_some_and(Prop::value_type_date) || dtend.is_some_and(Prop::value_type_date);
     let organizer = props
@@ -435,9 +435,10 @@ pub(crate) fn patch_to_ical(
     }
     if patch.end.is_some() || patch.is_all_day.is_some() {
         // An empty end is "not stated", and it leaves the stored DTEND and
-        // DURATION exactly as they are: the projection yields an empty end for
-        // a body with no DTEND and no DURATION, and ALSO for a DURATION it
-        // cannot resolve, so an echoed empty end must never delete either.
+        // DURATION exactly as they are: the projection yields no end for a
+        // body with no DTEND and no DURATION, and ALSO for a DURATION it
+        // cannot resolve, so neither an echoed `None` (merged here as the
+        // empty time) nor an explicit empty end may delete either.
         if !merged.end.value.is_empty() {
             push_end(&mut replacements, &merged.end, merged.is_all_day)?;
             replace_names.extend(["DTEND", "DURATION"]);
@@ -499,7 +500,13 @@ pub(crate) fn patch_event(current: &CalendarEvent, patch: &EventPatch) -> EventC
             .clone()
             .unwrap_or_else(|| current.location.clone()),
         start: patch.start.clone().unwrap_or_else(|| current.start.clone()),
-        end: patch.end.clone().unwrap_or_else(|| current.end.clone()),
+        // An `EventCreate` end is not optional, so no end merges as the empty
+        // time, which every writer here reads as "write no DTEND".
+        end: patch
+            .end
+            .clone()
+            .or_else(|| current.end.clone())
+            .unwrap_or_else(default_time),
         is_all_day: patch.is_all_day.unwrap_or(current.is_all_day),
         status: patch.status.unwrap_or(current.status),
         availability: patch.availability.unwrap_or(current.availability),
@@ -583,7 +590,9 @@ pub(crate) fn rsvp_reply_ical(
         ),
     ];
     push_start(&mut lines, &current.start, current.is_all_day)?;
-    push_end(&mut lines, &current.end, current.is_all_day)?;
+    if let Some(end) = &current.end {
+        push_end(&mut lines, end, current.is_all_day)?;
+    }
     lines.push(organizer_to_line(organizer)?);
     lines.push(attendee_to_line(&attendee)?);
     lines.push("END:VEVENT".to_string());
@@ -1886,12 +1895,15 @@ mod tests {
 
         // 01:00 + 10 exact hours over the 02:00 -> 03:00 jump is 12:00, where
         // DST-blind civil addition answers 11:00.
-        let exact = event("PT10H");
-        assert_eq!(exact.end.value, "2026-03-29T12:00:00");
-        assert_eq!(exact.end.timezone.as_deref(), Some("Europe/Oslo"));
+        let exact = event("PT10H").end.expect("resolved end");
+        assert_eq!(exact.value, "2026-03-29T12:00:00");
+        assert_eq!(exact.timezone.as_deref(), Some("Europe/Oslo"));
 
         // A nominal day keeps the wall clock across the same transition.
-        assert_eq!(event("P1D").end.value, "2026-03-30T01:00:00");
+        assert_eq!(
+            event("P1D").end.expect("resolved end").value,
+            "2026-03-30T01:00:00"
+        );
     }
 
     #[test]
@@ -1904,7 +1916,7 @@ mod tests {
         );
 
         assert_eq!(event.start.value, "2026-06-02T12:00:00+02:00");
-        assert_eq!(event.end.value, "2026-06-02T13:00:00+02:00");
+        assert_eq!(event.end.expect("end").value, "2026-06-02T13:00:00+02:00");
     }
 
     #[test]
@@ -1922,8 +1934,9 @@ mod tests {
         assert_eq!(event.start.value, "2026-06-02T12:00:00");
         assert!(!event.start.value.ends_with('Z'));
         assert_eq!(event.start.timezone.as_deref(), Some("Europe/Oslo"));
-        assert_eq!(event.end.value, "2026-06-02T13:00:00");
-        assert_eq!(event.end.timezone.as_deref(), Some("Europe/Oslo"));
+        let end = event.end.expect("end");
+        assert_eq!(end.value, "2026-06-02T13:00:00");
+        assert_eq!(end.timezone.as_deref(), Some("Europe/Oslo"));
     }
 
     #[test]
@@ -2082,7 +2095,7 @@ mod tests {
             &body,
         );
         assert_eq!(event.start.value, "2026-06-02");
-        assert_eq!(event.end.value, "2026-06-03");
+        assert_eq!(event.end.expect("end").value, "2026-06-03");
     }
 
     #[test]
@@ -2097,7 +2110,7 @@ mod tests {
         );
 
         assert!(event.is_all_day);
-        assert_eq!(event.end.value, "2026-06-03");
+        assert_eq!(event.end.expect("end").value, "2026-06-03");
     }
 
     #[test]
@@ -3147,7 +3160,7 @@ mod tests {
         );
 
         assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
-        assert_eq!(event.end.value, "2026-06-02T13:00:00Z");
+        assert_eq!(event.end.expect("end").value, "2026-06-02T13:00:00Z");
     }
 
     #[test]
@@ -3793,7 +3806,7 @@ mod tests {
 
     /// An empty end means "no end stated", which iCalendar allows (neither
     /// DTEND nor DURATION): create omits the line, and the stored event reads
-    /// back with an empty end again.
+    /// back with no end.
     #[test]
     fn an_empty_end_on_create_writes_no_dtend() {
         let mut event = writable_create();
@@ -3815,14 +3828,14 @@ mod tests {
             None,
         )
         .expect("reads back");
-        assert_eq!(projected.end.value, "");
+        assert_eq!(projected.end, None);
         assert_eq!(projected.start.value, "2026-06-02T12:00:00Z");
     }
 
     /// An empty end on a patch leaves the stored DTEND, and a stored DURATION
-    /// the projection could not resolve, untouched: the empty value is the
-    /// projection's "did not say", and an echo must not delete what it could
-    /// not read.
+    /// the projection could not resolve, untouched: the empty value says "no
+    /// end stated", and a patch must not delete what the projection could not
+    /// read.
     #[test]
     fn an_empty_end_on_a_patch_leaves_the_stored_end_untouched() {
         let empty_end = EventPatch {
@@ -3843,7 +3856,7 @@ mod tests {
             None,
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDURATION:garbage\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
-        assert_eq!(with_duration.end.value, "", "the duration did not resolve");
+        assert_eq!(with_duration.end, None, "the duration did not resolve");
         let body = patch_to_ical(&with_duration, &empty_end).expect("splices");
         assert!(body.contains("DURATION:garbage\r\n"), "{body}");
         assert!(!body.contains("DTEND"), "{body}");

@@ -2061,10 +2061,11 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
     if start.value.is_empty() || end.value.is_empty() || event.start.value.is_empty() {
         return true;
     }
-    let Some((range_start, range_end)) = time_interval(start, end, false) else {
+    let Some((range_start, range_end)) = time_interval(start, Some(end), false) else {
         return true;
     };
-    let Some((event_start, event_end)) = time_interval(&event.start, &event.end, event.is_all_day)
+    let Some((event_start, event_end)) =
+        time_interval(&event.start, event.end.as_ref(), event.is_all_day)
     else {
         return true;
     };
@@ -2130,11 +2131,13 @@ fn parse_ical_instant(value: &str) -> Option<Timestamp> {
 
 fn time_interval(
     start: &EventTime,
-    end: &EventTime,
+    end: Option<&EventTime>,
     is_all_day: bool,
 ) -> Option<(Timestamp, Timestamp)> {
     let start = comparable_time(start, is_all_day)?;
-    let end = comparable_time(end, is_all_day).unwrap_or(start);
+    let end = end
+        .and_then(|end| comparable_time(end, is_all_day))
+        .unwrap_or(start);
     Some((start, end))
 }
 
@@ -3255,7 +3258,7 @@ mod tests {
             description: None,
             location: None,
             start: time(start),
-            end: time(end),
+            end: Some(time(end)).filter(|end| !end.value.is_empty()),
             is_all_day,
             status: EventStatus::Confirmed,
             availability: EventAvailability::Busy,
