@@ -303,6 +303,9 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
             finish(builder, &ctx)
         }
         EwsError::Internal(message) => internal_invariant(message, &ctx),
+        EwsError::LimitExceeded(message) => {
+            internal(InternalErrorKind::LimitExceeded, message, &ctx)
+        }
         // An unusable configured Outlook origin: nothing was sent, and the
         // fix is the consumer's configuration.
         EwsError::Configuration(message) => finish(

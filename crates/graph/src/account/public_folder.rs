@@ -31,8 +31,9 @@
 //!   never advances its offset / `IncludesLastItemInRange` stays false)
 //!   or hit `PUBLIC_FOLDER_PAGE_CAP` before the last page. A partial set
 //!   must never advance the watermark, never diff deletions, never update
-//!   the baseline, and never checkpoint. Both streams treat an incomplete
-//!   walk as a retryable transient and re-poll next cycle (condition e).
+//!   the baseline, and never checkpoint. Both streams terminate on an
+//!   incomplete walk (condition e): a stalled offset as a retryable
+//!   transient, the page cap as `Internal(LimitExceeded)`.
 //! - **Deletion diffing needs the FULL baseline vs. the FULL scan.**
 //!   Diffing a complete baseline against a partial scan would falsely
 //!   emit the unvisited tail as `Destroyed`; diffing a degraded (empty)
@@ -91,9 +92,12 @@
 //!   `IncludesLastItemInRange`): the collected set is PARTIAL. The walk
 //!   returns `complete = false`; the caller emits NO `Added`/`Destroyed`
 //!   off it, does NOT advance the watermark or baseline, and does NOT
-//!   checkpoint - it terminates retryably so the engine re-polls next
-//!   cycle. This prevents permanently skipping later pages and prevents
-//!   diffing the full baseline against a partial scan.
+//!   checkpoint. A stalled offset terminates retryably so the engine
+//!   re-polls next cycle. The page cap terminates as the crate's own
+//!   `Internal(LimitExceeded)`: a folder that outgrew it reaches it again on
+//!   every poll, so retrying it as a network fault would loop forever. This
+//!   prevents permanently skipping later pages and prevents diffing the full
+//!   baseline against a partial scan.
 //!
 //! Out of scope (NOT blessed away by this contract): `DateTimeReceived`
 //! is not a change watermark, so an in-place edit that bumps the
@@ -331,11 +335,15 @@ pub(crate) enum PageStep {
     Complete,
     /// The walk cannot make progress - the server never advances its
     /// offset (`IncludesLastItemInRange` stays false and the reported /
-    /// derived offset does not move), or the page cap was reached before
-    /// the last page. The collected set is PARTIAL: the caller must not
-    /// advance the watermark, diff deletions, update the baseline, or
-    /// checkpoint off it.
+    /// derived offset does not move). The collected set is PARTIAL: the
+    /// caller must not advance the watermark, diff deletions, update the
+    /// baseline, or checkpoint off it.
     Incomplete,
+    /// `PUBLIC_FOLDER_PAGE_CAP` was reached before the last page. PARTIAL on
+    /// the same terms as `Incomplete`, but not a transient: a folder that
+    /// outgrew the cap hits it again on every poll, so it is reported as the
+    /// crate's own limit rather than retried as a network fault.
+    CapReached,
 }
 
 /// Decide the next step of a `FindItem` page walk. Completes when the
@@ -351,8 +359,9 @@ pub(crate) enum PageStep {
 /// reports `IncludesLastItemInRange=false` forever (or saturates the
 /// offset) has more pages we cannot reach, so treating it as done would
 /// permanently skip the tail (and, on a full scan, falsely emit that tail
-/// as `Destroyed`). The page cap reached before the last page is the same:
-/// `Incomplete`, retry next cycle.
+/// as `Destroyed`). The page cap reached before the last page is partial on
+/// the same terms but is its own step, `CapReached`, since it recurs every
+/// cycle rather than healing on a retry.
 pub(crate) fn page_walk_step(
     includes_last: bool,
     next_offset: Option<u32>,
@@ -369,7 +378,7 @@ pub(crate) fn page_walk_step(
         return PageStep::Incomplete;
     }
     if pages_walked >= page_cap {
-        return PageStep::Incomplete;
+        return PageStep::CapReached;
     }
     PageStep::Continue(candidate)
 }
@@ -720,6 +729,24 @@ struct ItemWalk {
     /// the watermark, deletion diff, baseline, or checkpoint. See the
     /// module-level emission/paging contract, condition (e).
     complete: bool,
+    /// Whether an incomplete walk stopped at `PUBLIC_FOLDER_PAGE_CAP` rather
+    /// than on a stalled offset. Picks the error the caller reports.
+    capped: bool,
+}
+
+impl ItemWalk {
+    /// The error an incomplete walk is reported as.
+    fn incomplete_error(&self, folder_id: &str) -> EwsError {
+        if self.capped {
+            EwsError::LimitExceeded(format!(
+                "public folder {folder_id} has more than {PUBLIC_FOLDER_PAGE_CAP} pages of \
+                 {PUBLIC_FOLDER_PAGE_SIZE} items; the walk stops at that cap and would \
+                 reach it again on every poll"
+            ))
+        } else {
+            incomplete_walk_error(folder_id)
+        }
+    }
 }
 
 /// Walk every `FindItem` page for a folder, optionally restricted to
@@ -769,16 +796,18 @@ async fn fetch_all_items(
                     items: all,
                     unhandled_classes: unhandled,
                     complete: true,
+                    capped: false,
                 });
             }
-            PageStep::Incomplete => {
+            step @ (PageStep::Incomplete | PageStep::CapReached) => {
                 // Stalled offset or page cap before the last page. Report
                 // the partial set as INCOMPLETE; the caller refuses to
-                // advance state off it and retries next cycle.
+                // advance state off it.
                 return Ok(ItemWalk {
                     items: all,
                     unhandled_classes: unhandled,
                     complete: false,
+                    capped: matches!(step, PageStep::CapReached),
                 });
             }
             PageStep::Continue(next) => offset = next,
@@ -786,16 +815,17 @@ async fn fetch_all_items(
     }
 }
 
-/// A page walk that could not complete (stalled offset or page cap before
-/// the last page). Surfaced as a retryable transient (`Transport(Unsent)`)
-/// so the engine re-polls next cycle rather than checkpointing partial
-/// state - the walk advanced nothing, so nothing is lost by retrying. Not
-/// a wire error: the server answered, we just could not reach the tail.
+/// A page walk whose offset stalled before the last page. Surfaced as a
+/// retryable transient (`Transport(Unsent)`) so the engine re-polls next
+/// cycle rather than checkpointing partial state - the walk advanced
+/// nothing, so nothing is lost by retrying. Not a wire error: the server
+/// answered, we just could not reach the tail. The page cap is NOT this: see
+/// `ItemWalk::incomplete_error`.
 fn incomplete_walk_error(folder_id: &str) -> EwsError {
     EwsError::Transport(bifrost_net::Error::Network {
         message: format!(
-            "public folder {folder_id} page walk incomplete (offset stalled or \
-             page cap reached before the last page); retrying next poll"
+            "public folder {folder_id} page walk incomplete (offset stalled before \
+             the last page); retrying next poll"
         ),
         transmission_state: bifrost_types::TransmissionState::Unsent,
         source: None,
@@ -1110,7 +1140,7 @@ pub(crate) fn public_folder_inventory_stream(
             let ctx = GraphErrorContext::ews(AccountOperation::SyncInventory)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield bifrost_types::InventoryEvent::Terminated(ews_shared_scope_error(
-                incomplete_walk_error(&folder.0), &scope, Some(&owner), ctx));
+                walk.incomplete_error(&folder.0), &scope, Some(&owner), ctx));
             return;
         }
         let ItemWalk { items, unhandled_classes: unhandled, .. } = walk;
@@ -1519,8 +1549,14 @@ pub(crate) fn public_folder_changes_stream(
                 // cycle (the folder id is stable across the moved cursor).
                 let ctx = GraphErrorContext::ews(AccountOperation::SyncChanges)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
+                // Whichever walk fell short names the error: a capped folder
+                // is the crate's limit, a stalled offset is a transient.
+                let incomplete = match &scan {
+                    Some(scan) if poll.complete => scan.incomplete_error(&folder.0),
+                    _ => poll.incomplete_error(&folder.0),
+                };
                 yield SyncEvent::Terminated(ews_shared_scope_error(
-                    incomplete_walk_error(&folder.0), &scope, Some(&owner), ctx));
+                    incomplete, &scope, Some(&owner), ctx));
                 yield SyncEvent::Done(None);
                 return;
             }
@@ -1884,11 +1920,13 @@ mod tests {
             items: Vec::new(),
             unhandled_classes: Vec::new(),
             complete: true,
+            capped: false,
         };
         let scan = ItemWalk {
             items: vec![item("same", Some("2026-01-01T00:00:00Z"), true)],
             unhandled_classes: Vec::new(),
             complete: true,
+            capped: false,
         };
         let PollOutcome::Apply {
             changes, cursor, ..
@@ -1956,16 +1994,47 @@ mod tests {
             page_walk_step(false, Some(50), 100, 100, 1, 1_000),
             PageStep::Incomplete
         );
-        // Page cap reached before the last page -> INCOMPLETE, even though
-        // the offset would otherwise advance.
+        // Page cap reached before the last page -> its own step, even though
+        // the offset would otherwise advance: partial like a stall, but it
+        // recurs every poll rather than healing on a retry.
         assert_eq!(
             page_walk_step(false, Some(1_000), 900, 100, 3, 3),
-            PageStep::Incomplete
+            PageStep::CapReached
         );
         // Last page on the final allowed page -> COMPLETE (cap not a stall).
         assert_eq!(
             page_walk_step(true, None, 900, 100, 3, 3),
             PageStep::Complete
+        );
+    }
+
+    /// A capped walk and a stalled walk are both partial, but they recover
+    /// differently. A stalled offset is a transient worth re-polling; a
+    /// folder past the page cap reaches it on every poll, so it reports the
+    /// crate's own limit instead of retrying as a network fault forever.
+    #[test]
+    fn a_capped_walk_is_the_crates_limit_and_a_stalled_walk_is_a_transient() {
+        let classify = |capped: bool| {
+            let walk = ItemWalk {
+                items: Vec::new(),
+                unhandled_classes: Vec::new(),
+                complete: false,
+                capped,
+            };
+            super::super::graph_error::ews_error_to_account_error(
+                walk.incomplete_error("big-folder"),
+                GraphErrorContext::ews(AccountOperation::SyncChanges),
+            )
+        };
+        assert_eq!(
+            classify(true).kind(),
+            &bifrost_types::AccountErrorKind::Internal(
+                bifrost_types::InternalErrorKind::LimitExceeded
+            )
+        );
+        assert_eq!(
+            classify(false).kind(),
+            &bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network)
         );
     }
 
@@ -2009,6 +2078,7 @@ mod tests {
             items,
             unhandled_classes: unhandled.iter().map(|s| (*s).to_string()).collect(),
             complete,
+            capped: false,
         }
     }
 

@@ -323,10 +323,29 @@ pub(crate) fn subscribe<T: PushTransport>(
         let mut prospective = subscriptions_guard.clone();
         prospective.insert(handle.clone(), data_types.clone());
         let union = union_data_types(&prospective);
-        client
+        match client
             .set_push_data_types(&union, push_state_guard.clone())
             .await
-            .map_err(push_set_error)?;
+        {
+            Ok(()) => {}
+            // No connection yet: the sink is unset only before the reader's
+            // first handshake and is never cleared, and the capability check
+            // above already refused a server without WebSocket support. So
+            // this is the reader not having connected YET, not a refusal.
+            // Commit the desired set as a deferred success: the reader
+            // applies the committed `enabled` union and `push_state` on every
+            // connect, and it reads them only after installing its sink -
+            // behind the guards this call holds until the commit - so it
+            // cannot apply the set from before this subscribe.
+            //
+            // Reporting it as a terminal `Unsupported` cost whole accounts:
+            // the engine's reopen aborts on any error from the replacement's
+            // subscribe, so a WebSocket endpoint slow to answer during reopen
+            // could exhaust `restart_account`'s attempts and pause the
+            // account, HTTP sync included.
+            Err(crate::Error::WebSocketNotConnected) => {}
+            Err(err) => return Err(push_set_error(err)),
+        }
         subscriptions_guard.insert(handle.clone(), data_types);
         commit_push_set(&mut enabled_guard, &mut push_state_guard, union);
         Ok((handle, accepted))
@@ -387,7 +406,11 @@ pub(crate) fn unsubscribe<T: PushTransport>(
             // marked `teardown_unconfirmed` - which the next attempt
             // carries but never recreates, so the consumer's subscription
             // silently stopped existing on the replacement.
-            Err(crate::Error::WebSocketSend(_)) => {}
+            //
+            // No connection yet is the same answer, for a simpler reason:
+            // before the first handshake no subscription exists anywhere, so
+            // there is nothing to narrow. See `subscribe`.
+            Err(crate::Error::WebSocketSend(_) | crate::Error::WebSocketNotConnected) => {}
             Err(err) => return Err(push_set_error(err)),
         }
         subscriptions_guard.remove(&handle);
@@ -483,22 +506,18 @@ async fn apply_push_set(
 /// the same state as applying it once. Without the override an in-flight
 /// sink failure derives `Reconcile(TransportDropAfterSend, [CheckTarget])`,
 /// which asks the consumer to read back a target that does not exist.
+///
+/// `WebSocketNotConnected` never reaches here: both callers absorb it as a
+/// deferred success.
 fn push_set_error(err: crate::Error) -> AccountError {
-    match err {
-        crate::Error::WebSocketNotConnected => super::error::unsupported_error(
-            AccountOperation::PushSubscribe,
-            None,
-            "JMAP push: WebSocket not connected",
-        ),
-        err => super::error::into_account_error(
-            err,
-            super::error::JmapErrorContext::new(AccountOperation::PushSubscribe),
-        )
-        .into_builder()
-        .idempotency_override(true)
-        .try_build()
-        .expect("valid account error classification"),
-    }
+    super::error::into_account_error(
+        err,
+        super::error::JmapErrorContext::new(AccountOperation::PushSubscribe),
+    )
+    .into_builder()
+    .idempotency_override(true)
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// How one connect-read pass of the reader ended.
@@ -1120,8 +1139,10 @@ mod tests {
                 .lock()
                 .expect("apply log")
                 .push((data_types.clone(), push_state));
+            // A genuine failure. `WebSocketNotConnected` is not one: subscribe
+            // and unsubscribe absorb it as a deferred success.
             if self.fail {
-                Err(crate::Error::WebSocketNotConnected)
+                Err(unrelated_failure())
             } else {
                 Ok(())
             }
@@ -1296,10 +1317,8 @@ mod tests {
         }
     }
 
-    /// The absorption is for a finished connection only. Any other failure
-    /// is still reported, and still commits nothing. (`WebSocketNotConnected`
-    /// is deliberately not the example: its treatment is a separate open
-    /// question, and this test is about the sink-write arm's reach.)
+    /// The absorption is for a finished or not-yet-made connection only. Any
+    /// other failure is still reported, and still commits nothing.
     #[tokio::test]
     async fn an_unsubscribe_that_fails_otherwise_still_fails_and_commits_nothing() {
         let handle = SubscriptionHandle("only".to_string());
@@ -1347,6 +1366,69 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+        assert!(subscriptions.lock().await.is_empty());
+        assert!(enabled.lock().await.is_empty());
+    }
+
+    /// Subscribing before the reader's first handshake is not a refusal: the
+    /// sink is simply not installed yet. It used to be a terminal
+    /// `Unsupported`, and the engine's reopen aborts on any error from the
+    /// replacement's subscribe, so a slow WebSocket endpoint during reopen
+    /// could pause the whole account. It now commits the desired set, and the
+    /// first connection's re-enable applies it.
+    #[tokio::test]
+    async fn a_subscribe_before_the_first_connect_is_a_deferred_success() {
+        let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let enabled = Arc::new(Mutex::new(HashSet::new()));
+        let push_state = Arc::new(Mutex::new(None));
+        let handle = SubscriptionHandle("early".to_string());
+        let (returned, accepted) = subscribe(
+            FailingPushSetTransport {
+                error: || crate::Error::WebSocketNotConnected,
+            },
+            PushCapability::InProcess,
+            handle.clone(),
+            vec![CursorScope::Type(ObjectType::Email)],
+            Arc::clone(&subscriptions),
+            Arc::clone(&enabled),
+            Arc::clone(&push_state),
+        )
+        .await
+        .expect("no connection yet is a deferred success, not a refusal");
+        assert_eq!(returned, handle);
+        assert_eq!(accepted, vec![true]);
+        assert!(subscriptions.lock().await.contains_key(&handle));
+
+        let applied = Arc::new(StdMutex::new(Vec::new()));
+        reenable_current_push_set(
+            &RecordingPushTransport {
+                fail: false,
+                applied: Arc::clone(&applied),
+            },
+            &enabled,
+            &push_state,
+        )
+        .await
+        .expect("re-enable succeeds");
+        assert_eq!(
+            applied.lock().expect("apply log").clone(),
+            vec![([DataType::Email].into_iter().collect::<DataTypeSet>(), None)],
+            "the first connection applies the set committed before it existed"
+        );
+
+        // And the matching teardown before any connection completes too:
+        // nothing exists server-side to narrow.
+        unsubscribe(
+            FailingPushSetTransport {
+                error: || crate::Error::WebSocketNotConnected,
+            },
+            handle.clone(),
+            Arc::clone(&subscriptions),
+            Arc::clone(&enabled),
+            Arc::clone(&push_state),
+        )
+        .await
+        .expect("no connection yet has nothing to tear down");
         assert!(subscriptions.lock().await.is_empty());
         assert!(enabled.lock().await.is_empty());
     }

@@ -50,25 +50,15 @@ item is what stops that.
 
 - **errors: findings from the local-refusal audit (part c) still open.**
   Filed 2026-09-29; the rest of the audit's findings landed 2026-09-30.
-  - JMAP `WebSocketNotConnected` (`sync/push.rs push_set_error`) still derives
-    terminal `Unsupported(PushSubscribe)` for a transient race. The sink is
-    `None` only before the first handshake and is never cleared, so the error
-    means "the reader has not connected yet". The engine does NOT read its
-    kind: during a reopen (`engine/reattach.rs`) any error from the
-    replacement's `push_subscribe` aborts the attempt, so a slow or down
-    WebSocket endpoint during reopen can exhaust `restart_account`'s three
-    attempts and pause the whole account, HTTP sync included. Recommendation:
-    treat it as deferred success (commit the desired set and return `Ok`; the
-    reader re-applies `enabled` and `push_state` on every connect, and
-    `close()` already treats the error as `Ok`). `subscribe` on a DEAD sink
-    has the same effect on reopen, since only `unsubscribe` absorbs
-    `WebSocketSend`. Wants a ruling. The dead-sink classification and the
-    `teardown_unconfirmed` knock-on landed 2026-09-30; unverified is their
-    premise that every `tokio_websockets` send error leaves the stream closed
-    for good, on which `unsubscribe` absorbing `WebSocketSend` rests.
-  - Graph public-folder `incomplete_walk_error` (`public_folder.rs`) is a
-    `Transport(Network)` retried next poll by design (a page cap or stalled
-    offset); whether the cap arm is `Internal(LimitExceeded)` is unexamined.
+  - JMAP push `subscribe` on a DEAD sink (`WebSocketSend`) still fails, and
+    the engine's reopen aborts on any error from the replacement's
+    `push_subscribe`, so a WebSocket that dies during reopen has the same
+    account-pausing effect `WebSocketNotConnected` had before it became a
+    deferred success (2026-10-03). Committing on a dead sink, as `unsubscribe`
+    already does, rests on the premise that every `tokio_websockets` send
+    error leaves the stream closed for good so the reader reconnects and
+    re-applies; that premise is unverified, and if it is false a committed
+    subscribe would silently never apply. Verify the premise, then rule.
 
 ## Landed 2026-09-30 without a ruling
 

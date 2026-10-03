@@ -157,6 +157,11 @@ pub(crate) enum EwsError {
     /// A state this crate believes impossible (no attached `AccountNet` to
     /// send on), so no request was sent. `Internal(InvariantViolated)`.
     Internal(String),
+
+    /// A walk ran into one of this crate's own safety caps before the
+    /// server's last page. Not a provider fault and not a bug: the same
+    /// `Internal(LimitExceeded)` Graph's pagination budget raises.
+    LimitExceeded(String),
 }
 
 impl std::fmt::Display for EwsError {
@@ -170,6 +175,7 @@ impl std::fmt::Display for EwsError {
             Self::MalformedXml(detail) => write!(f, "EWS malformed XML: {}", detail.as_str()),
             Self::Configuration(message) => write!(f, "EWS not configured: {message}"),
             Self::Internal(message) => write!(f, "EWS internal error: {message}"),
+            Self::LimitExceeded(message) => write!(f, "EWS walk limit exceeded: {message}"),
         }
     }
 }
