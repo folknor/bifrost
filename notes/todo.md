@@ -66,20 +66,9 @@ item is what stops that.
     `teardown_unconfirmed` knock-on landed 2026-09-30; unverified is their
     premise that every `tokio_websockets` send error leaves the stream closed
     for good, on which `unsubscribe` absorbing `WebSocketSend` rests.
-  - SMTP `starttls` on a server without STARTTLS is `Request(Malformed)`,
-    while IMAP's `StartTlsUnavailable` is `Authorization(PolicyBlocked)`: a
-    parity question with a security-policy flavour, left alone.
   - Graph public-folder `incomplete_walk_error` (`public_folder.rs`) is a
     `Transport(Network)` retried next poll by design (a page cap or stalled
     offset); whether the cap arm is `Internal(LimitExceeded)` is unexamined.
-  - Graph OneDrive upload shutdown mid-PUT is conservatively `InFlight`
-    (`cloud.rs upload_chunks`), including when the cancellation lands while
-    bifrost-net is still waiting for rate-limit admission and nothing was
-    dispatched: the dropped future loses its stage. The cost is an unneeded
-    read-back, never a blind replay. Exact classification needs bifrost-net to
-    take a cancellation signal into the request and report the stage it
-    stopped at, a transport feature; sparred and accepted as conservative on
-    2026-09-29, raised again by the cold review.
 
 ## Landed 2026-09-30 without a ruling
 
@@ -90,7 +79,9 @@ further rounds the same day. The items below change a recovery class or
 observable behaviour, and nobody ruled on them. Each is in the code now; the
 owner accepts it, or it is reverted as its own change. Changes to a published
 type's shape are not listed: the owner ruled those need no ruling (see
-`AGENTS.md`).
+`AGENTS.md`). The owner accepted the new-behaviour, calendar-write,
+control-character, caldav-override and push-handle-format items on
+2026-10-03; the three below are still unruled.
 
 - **Recovery-class moves.** imap: SELECT without UIDVALIDITY at the PIM and
   search sites, `Request(Malformed)` to `Protocol(MissingField)`; hydrating an
@@ -109,42 +100,12 @@ type's shape are not listed: the owner ruled those need no ruling (see
   path. imap: an early tagged OK before a literal continuation inside a
   pipeline, from a fatal `Protocol` to that command's non-fatal
   `ProtocolMissing`, the batch continuing.
-- **New behaviour.** graph Autodiscover follows POX redirects, and a POX
-  `Error` fails delegate discovery where it used to read as no delegates. EWS
-  strict parsing turns an unknown entity into `MalformedXml`. A 3xx on a
-  OneDrive or Drive chunk PUT is a non-retryable `ContractViolation`. jmap
-  refuses a relative `apiUrl`. jmap `unsubscribe` on a dead sink returns `Ok`.
-  google coordinates the Gmail watch across instances through a process-wide
-  static keyed by the lowercased address; an alias or differently-cased
-  address gets no coordination.
-- **Calendar writes refuse what they used to send.** An empty `start` is
-  `Request(Malformed)` in google, graph, caldav and jmap. An empty `end` on a
-  patch leaves the stored end alone in all four; on a create google, graph and
-  jmap refuse it as `Unsupported` while caldav writes no DTEND. google refuses
-  a malformed non-empty time locally, before a calendar move can half-apply;
-  jmap refuses an unparseable time, an end before its start and a mixed-shape
-  pair, and zoneless date-time pairs now get their real duration instead of
-  `PT0S`. graph refuses an RRULE, RDATE or EXDATE Graph cannot hold, and an
-  absolute day some visited month lacks.
-- **iCalendar and vCard writers refuse control characters.** caldav refuses
-  a control character in RECUR, DATE-TIME, CAL-ADDRESS and TEXT values and in
-  parameters, and carddav in TEXT, TYPE parameters and the PHOTO data-URI
-  media type, as `Request(Malformed)`; nothing is stripped.
-- **caldav override addressing.** A recurrence-qualified event id now reads
-  and updates the override it names, so updating an override is allowed where
-  every instance id used to be refused; a bare resource id over several
-  overrides with no master is refused as ambiguous, where it used to answer
-  with the first override.
 - **sync detach and reopen.** A `subscribe_push` that registers after detach
   took the registry deletes the subscription it just created and returns
   `AccountNotAttached`; a reattach whose install lands after detach tears the
   replacement's subscriptions down and still returns `Ok`, the swap having
   committed. A scope repair or schema recovery reaching a paused account
   declines and leaves every cursor in place.
-- **Push handle formats.** A Graph webhook handle is now `graph1:` followed by
-  a token and its Graph subscription ids, an EWS one `ews1:` and a token;
-  handles persisted in the old format cannot tear down on a later
-  connection.
 - **Published items with changed behaviour.** On the UID MOVE fallback,
   imap's `MoveResult::code` is now the UID EXPUNGE's tagged code, falling back
   to the COPY's. dav-core's public `send_raw_request` debug-asserts where it
@@ -171,30 +132,6 @@ against the code before working any of them.
   lifecycle scope parked under a pause survives the folder being deleted
   during that pause and is established after resume for a folder that no
   longer exists, ending in the retry-budget terminal event.
-
-## Blocked on an unvalidated consumer contract
-
-Recorded 2026-09-07, while working the open rulings serially. Several items in
-this file are not engineering questions at all: they ask what a CONSUMER should
-get from a surface no consumer uses. `ratatoskr` is the intended consumer of
-every one of them, it has not wired them, and what it needs is open. Deciding
-them now means guessing on the consumer's behalf and then defending the guess.
-
-Known members of the class: the backfill `subsumed` history (see below),
-**types-B1** (the rewrite half), **types-B2**, **sync-B6**. The tell is that the
-remedy is a default, a shape, or a policy that only the caller can evaluate.
-
-**google-B13 LEFT this class** by taking the first way out below: all three
-calendar backends can honour an `include_cancelled` field truthfully, so the
-surface stops deciding instead of guessing a default. It was ruled on
-2026-09-29 and is listed above.
-
-Two ways out, both better than ruling blind. Where the surface can simply STOP
-deciding - google-B13 is the clean case, an additive `include_cancelled` request
-field defaulting to today's behaviour - take that, subject to every backend on
-the shared trait being able to honour it, since a field two of three
-implementations ignore is worse than no field. Otherwise leave the item parked
-and say so, as the `subsumed` entry now does.
 
 ## bifrost-sync
 
@@ -310,16 +247,6 @@ confirm against the code before working any of them.
   last `std::env::var` read in the workspace and the last place a bifrost crate
   names a downstream consumer. Coordinate with those two repos; there is nothing
   to do here until they are ready.
-- **sync-B6. Repair is caller-driven, with no scheduler.** [C4]
-  `SyncEngine::repair_debt(account, max_requests)` runs exactly one pass when a
-  consumer asks. Nothing schedules it, so debt sits until someone calls. That is
-  deliberate for now - repair is remote work against an account that may be
-  throttled, paused or degraded, and the consumer knows better than the engine
-  when to spend that budget - but a consumer that never calls it gets the
-  pre-repair behaviour, which is the state this whole arc set out to leave. If
-  it becomes a scheduled lane it needs the throttle-deadline and pause checks
-  the backfill partition runner already does, and it should respect
-  `OperatorBlocked` without re-arming it on a timer.
 
 ### Cross-crate shaping questions
 
@@ -355,36 +282,6 @@ confirm against the code before working any of them.
 
 The deferred tail of the August 2026 arcs. The same category labels and the
 PUBLISHED SURFACE fence apply.
-
-- **types-B1. `PimMethodSupport` is a hand-maintained mirror of the trait
-  surface.** [C3, PUBLISHED SURFACE] `crates/types/src/capabilities.rs`. Sixty
-  bools with no mechanical link to the 94-method `Account` trait. Six protocol
-  crates x sixty bools is ~360 hand-maintained facts that can each be wrong in
-  a way no test catches, and consumers must consult the mirror AND handle
-  `Unsupported` anyway.
-
-  The keep-it half LANDED 2026-08-29: `capability_contract_tests.rs` in all six
-  protocol crates drives every gated entry point and asserts the flag agrees.
-  It paid for itself immediately - three IMAP flags
-  (`remove_from_container`, `draft_discard`, `thread_hydrate`) turned out not to
-  gate their methods at all, while `search` / `draft_create` / `quota_get` in
-  the same module read theirs correctly. The methods were fixed to match the
-  flags, since each flag is derived from a server capability string and so was
-  the true half.
-  Coverage is FALSE-DIRECTION ONLY, by necessity rather than by choice - a
-  `true` flag means the method reaches the network, and the test proves no wire
-  contact by installing a seam that panics if reached (a never-called
-  `DavTransport`, an empty script, a dropped connection half). Each file says so
-  in its own doc comment. jmap is the hardest case and documents it: the
-  `MailAccount = Account<ReqwestTransport>` alias means no scripted seam exists
-  at the `Account` level at all (reasoned out at the alias itself, in
-  `crates/jmap/src/sync/account.rs`).
-
-  The REWRITE half is still fenced and still the owner's call: one runtime
-  `fn supports(&self, op: AccountOperation) -> bool` defaulted from a per-impl
-  `AccountOperation` set, so the capability answer and the error answer become
-  the same value read twice, and a new trait method defaults to unsupported
-  instead of needing a bool nobody sets. That DELETES a published struct.
 
 - **types-B2. `InventoryBatch::checkpoint` cannot express a withheld
   checkpoint.** [C2, PUBLISHED SURFACE] It is `Option<Checkpoint>`, with no way

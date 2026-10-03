@@ -375,7 +375,11 @@ impl SyncEngine {
     /// Deliberately caller-driven rather than scheduled. Repair is remote work
     /// against an account that may be throttled, paused, or degraded, and the
     /// consumer is better placed than the engine to decide when to spend that
-    /// budget.
+    /// budget. The cost: a consumer that never calls this keeps its debt
+    /// forever. Ruled 2026-10-03 to stay caller-driven until a consumer wires
+    /// it. A scheduled lane would need the throttle-deadline and pause checks
+    /// the backfill partition runner does, and must respect `OperatorBlocked`
+    /// without re-arming it on a timer.
     pub async fn repair_debt(
         &self,
         account_id: &AccountId,

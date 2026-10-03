@@ -149,25 +149,26 @@ pub enum QuotaSignal {
 /// unsupported. New flags are added with `false` defaults so growing
 /// the trait surface stays additive.
 ///
-/// Structural weakness, known and recorded rather than open: this is a
-/// hand-maintained MIRROR of the trait surface with no mechanical link to it.
-/// Nothing checks that a `false` flag implies the method returns `Unsupported`,
-/// or that a `true` flag implies it does not, and the mirror is already
+/// Structural weakness, known and accepted: this is a hand-maintained MIRROR
+/// of the trait surface with no mechanical link to it, and consumers must
+/// consult it AND handle `Unsupported` regardless. The mirror is also
 /// incomplete - `send_raw_message`, `repair_inventory`, `bulk_move_from` and
 /// `open_blob_range` have documented gating with no flag here, or a flag on a
-/// different struct. Across six protocol crates that is several hundred
-/// hand-maintained facts, each able to be wrong in a way no test catches, and
-/// consumers must consult this AND handle `Unsupported` regardless.
+/// different struct.
 ///
-/// Two remedies, and the choice between them is open. The structural one
-/// replaces the struct with a runtime `supports(&self, op: AccountOperation)`
-/// query defaulted from a per-impl operation set, so the capability answer and
-/// the error answer become one value read twice and a new trait method defaults
-/// to unsupported instead of needing a bool nobody remembers to set - but that
-/// DELETES a published struct, so it is the repository owner's call and must
-/// not be actioned without one. The cheap one needs no ruling: a test in each
-/// protocol crate driving every gated method and asserting the flag agrees with
-/// the result.
+/// What holds it honest is `capability_contract_tests.rs` in each protocol
+/// crate, which drives every gated entry point and asserts the flag agrees.
+/// That coverage is false-direction only: a `false` flag is proven to refuse
+/// without wire contact, while a `true` flag reaching the network is not
+/// asserted, since proving it would need a live seam each crate lacks.
+///
+/// Ruled 2026-10-03: the struct stays. The rejected alternative replaced it
+/// with a runtime `supports(&self, op: AccountOperation)` query defaulted from
+/// a per-impl operation set, so the capability answer and the error answer
+/// would be one value read twice and a new trait method would default to
+/// unsupported. That deletes a published struct, and the contract tests
+/// already catch the drift it targets. Re-raise only if those tests stop
+/// being able to catch it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PimMethodSupport {
     /// Read Outlook master category definitions.

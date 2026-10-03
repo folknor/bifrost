@@ -56,6 +56,13 @@ const MIN_RENEW_DELAY: Duration = RENEW_RETRY_AFTER;
 /// using another topic - errs toward skipping the stop. Instances in OTHER
 /// processes are invisible here; `users.stop` gives no way to scope to a
 /// watch, so that residual cannot be closed on this side.
+///
+/// The key is the account's configured address, ASCII-lowercased. Two
+/// instances that name the same mailbox by different addresses (an alias, a
+/// googlemail.com spelling) get separate entries and no coordination; closing
+/// that would need the canonical address from Gmail's profile, and the bias
+/// above keeps the cost of a miss to a stopped watch only when both instances
+/// are live, as before this coordination existed.
 #[derive(Default)]
 struct MailboxWatch {
     exchange: tokio::sync::Mutex<()>,

@@ -439,6 +439,15 @@ async fn upload_chunks(
         // replay of this non-idempotent upload could make a second file). A
         // PUT result that is already ready wins over the shutdown, since it
         // is the known outcome.
+        //
+        // Accepted limit (owner ruling, 2026-10-03): this is `InFlight` even
+        // when the cancellation lands while bifrost-net is still waiting for
+        // rate-limit admission and nothing was dispatched, because dropping
+        // the future loses the stage it had reached. The cost is an unneeded
+        // read-back, never a blind replay. Exact classification would need
+        // bifrost-net to take a cancellation signal into the request and
+        // report the stage it stopped at; re-raise only with that transport
+        // feature in hand.
         let response = tokio::select! {
             biased;
             response = put => response?,

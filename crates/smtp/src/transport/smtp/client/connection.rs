@@ -877,9 +877,10 @@ impl SmtpConnection {
             self.hello_name = hello_name.clone();
             Ok(())
         } else {
-            Err(error::invalid_input(
-                "STARTTLS is not supported on this server",
-            ))
+            // A client policy refusal, not caller input: the configuration
+            // demanded TLS and this server cannot provide it. Same class as
+            // IMAP's `StartTlsUnavailable`, `Authorization(PolicyBlocked)`.
+            Err(error::policy("STARTTLS is not supported on this server"))
         }
     }
 
@@ -2942,6 +2943,7 @@ mod transcript_tests {
             error.to_string().contains("STARTTLS is not supported"),
             "expected a capability refusal, got: {error}"
         );
+        assert!(error.is_policy(), "expected a policy refusal, got: {error}");
 
         // The refusal happened before any byte hit the wire: the very next
         // scripted step is NOOP, so a stray STARTTLS write would be rejected.
