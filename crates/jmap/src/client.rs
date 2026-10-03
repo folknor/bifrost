@@ -1117,8 +1117,13 @@ impl<T: HttpTransport> Client<T> {
         let session: Session = serde_json::from_slice(&bytes)?;
         let limit = advertised_api_concurrency(&session);
         let state = Arc::new(SessionState::derive(session)?);
-        *self.inner.state.lock().expect("session mutex poisoned") = state;
+        // The limit is applied under the same lock as the state it came from,
+        // so two overlapping refreshes cannot leave one session's state beside
+        // the other's limit. `set_api_concurrency` is synchronous.
+        let mut installed = self.inner.state.lock().expect("session mutex poisoned");
+        *installed = state;
         self.inner.transport.set_api_concurrency(limit);
+        drop(installed);
         self.inner.session_updated.store(true, Ordering::Release);
         Ok(())
     }

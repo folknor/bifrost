@@ -509,6 +509,7 @@ impl SyncEngine {
             backfill_capacity: self.config.backfill.lane_capacity,
             reopen_tx: reopen_tx.clone(),
             deferred_repairs: Arc::new(DeferredScopeRepairs::new()),
+            scope_tokens: Arc::clone(&scope_tokens),
         };
 
         let backfill_wiring = BackfillWiring {
@@ -560,6 +561,27 @@ impl SyncEngine {
                                     reopen_ctx.recover(scope, error).await;
                                 }
                                 ReopenRequest::ScopeDeleted { scope } => {
+                                    // A repair parked for this scope under a
+                                    // pause must not establish it after resume:
+                                    // the folder it was for is gone.
+                                    reopen_ctx.deferred_repairs.unpark(&scope);
+                                    // A cursor here was established after the
+                                    // deletion was raised: a `Created` whose
+                                    // repair was still queued ahead of this
+                                    // request on this same channel. Retire it
+                                    // exactly as the multiplexer retires a
+                                    // registered scope - registry first, then
+                                    // the poll token - before purging its rows,
+                                    // or the rows would be deleted out from
+                                    // under a live cursor for a folder that no
+                                    // longer exists.
+                                    if reopen_ctx.cursors.snapshot(&scope).is_some() {
+                                        reopen_ctx.cursors.delete(&scope);
+                                        crate::multiplexer::cancel_scope_token(
+                                            &reopen_ctx.scope_tokens,
+                                            &scope,
+                                        );
+                                    }
                                     // A provider-deleted folder retires its
                                     // durable rows in full: change cursor and
                                     // backfill rows, completion marker

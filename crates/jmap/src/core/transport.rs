@@ -254,6 +254,10 @@ pub(crate) trait HttpTransport: Send + Sync + 'static {
     /// RFC 8620 limits the API endpoint only - uploads and downloads have
     /// their own limits - so only `api_request` traffic is gated. Defaulted
     /// to a no-op for transports with nothing to bound.
+    ///
+    /// Called while the client holds its session lock, so the limit and the
+    /// session it came from are installed together. An implementation must
+    /// not read the client's session from here.
     fn set_api_concurrency(&self, _max_concurrent_requests: Option<usize>) {}
 }
 

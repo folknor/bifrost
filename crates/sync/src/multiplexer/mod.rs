@@ -1197,7 +1197,7 @@ pub fn scope_is_parked(tokens: &ScopeTokens, scope: &CursorScope) -> bool {
         .is_some_and(|entry| entry.parked)
 }
 
-fn cancel_scope_token(tokens: &ScopeTokens, scope: &CursorScope) {
+pub(crate) fn cancel_scope_token(tokens: &ScopeTokens, scope: &CursorScope) {
     let current = tokens.lock().expect("poisoned").get(scope).cloned();
     if let Some(entry) = current {
         entry.token.cancel();
@@ -1676,7 +1676,24 @@ async fn apply_lifecycle_transition(
         reopen_tx: &mpsc::Sender<ReopenRequest>,
         membership: &bifrost_types::MembershipScope,
     ) {
-        for scope in cursors.scopes_for_membership(membership) {
+        // The scopes a `Created` for this membership would have asked the
+        // engine to establish, read BEFORE any registered scope is deleted
+        // below (the mapping reads the registered topology). Every one the
+        // membership index does not already name below is routed to the
+        // listener too, cursor or not:
+        // - with no cursor, its repair may be parked under a pause or still
+        //   queued on the listener's channel ahead of this request; the
+        //   listener's `ScopeDeleted` arm unparks the one and retires the
+        //   cursor the other establishes, both before purging;
+        // - with a cursor missing from the membership index (a membership
+        //   refresh after its establishment failed), the arm retires it too,
+        //   where the index loop below would never find it.
+        let indexed = cursors.scopes_for_membership(membership);
+        let unindexed: Vec<CursorScope> = membership_to_cursor_scopes(cursors, membership)
+            .into_iter()
+            .filter(|scope| !indexed.contains(scope))
+            .collect();
+        for scope in indexed {
             // Registry first. `delete` cancels the scope's liveness token as
             // it drops the cursor, under one write lock, so there is no
             // instant where the scope looks drivable to a producer that has
@@ -1686,6 +1703,9 @@ async fn apply_lifecycle_transition(
             // about to be deleted.
             cursors.delete(&scope);
             cancel_scope_token(tokens, &scope);
+            let _ = reopen_tx.send(ReopenRequest::ScopeDeleted { scope }).await;
+        }
+        for scope in unindexed {
             let _ = reopen_tx.send(ReopenRequest::ScopeDeleted { scope }).await;
         }
     }

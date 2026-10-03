@@ -58,6 +58,9 @@ pub(super) struct SlotContext {
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
     /// Scope repairs declined under a pause that nothing else will raise again.
     pub deferred_repairs: Arc<DeferredScopeRepairs>,
+    /// The multiplexer's per-scope poll tokens, for retiring a scope the
+    /// reopen listener learns was deleted after it established it.
+    pub scope_tokens: crate::multiplexer::ScopeTokens,
 }
 
 impl SlotContext {

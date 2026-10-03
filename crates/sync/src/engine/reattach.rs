@@ -376,14 +376,20 @@ impl DeferredScopeRepairs {
         tokio::spawn(async move {
             let runs = control.wait_until_running(&shutdown).await;
             // Unparked BEFORE the send, so a repair the listener declines again
-            // (a second pause) can park the scope afresh.
-            parked
+            // (a second pause) can park the scope afresh. The removal is also
+            // the check: a scope `unpark` already removed - its folder was
+            // deleted during the pause - is not re-raised, or it would be
+            // established after resume for a folder that no longer exists and
+            // end in the retry-budget terminal event. Deleted and then created
+            // again during one pause, it is parked afresh and exactly one of
+            // the two tasks finds it.
+            let still_parked = parked
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&scope);
             // Something else established it while it waited (a second `Created`,
             // a reattach): restarting a live cursor would reset healthy state.
-            if !runs || cursors.snapshot(&scope).is_some() {
+            if !runs || !still_parked || cursors.snapshot(&scope).is_some() {
                 return;
             }
             let error = crate::recovery::restart_scope_error(
@@ -398,6 +404,15 @@ impl DeferredScopeRepairs {
                 }) => {}
             }
         });
+    }
+
+    /// Forget a parked scope whose folder was deleted, so its task re-raises
+    /// nothing when the account runs again. A no-op if it is not parked.
+    pub(crate) fn unpark(&self, scope: &CursorScope) {
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(scope);
     }
 }
 

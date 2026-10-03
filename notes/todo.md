@@ -114,11 +114,6 @@ against the code before working any of them.
   handle to its account landed 2026-10-03; unbound `graph1:` handles keep the
   old reach.) Handles persisted before the id-carrying format keep the old
   no-op teardown.
-- **sync: a parked lifecycle scope outlives its folder.** A lifecycle scope
-  parked under a pause survives the folder being deleted during that pause and
-  is established after resume for a folder that no longer exists, ending in the
-  retry-budget terminal event. (Its sibling, detach racing a reattach's swap,
-  landed 2026-10-03: detach now takes the reopen lock around its close.)
 - **sync: a fixed partition that ends with no completion still completes the
   scope.** Filed 2026-10-03 by the cold review of the PageCheckpoint and
   PartitionEnd change; pre-existing. `run_partition` returns `complete: true`
@@ -128,12 +123,6 @@ against the code before working any of them.
   completion sentinel over ground nothing proved. The open-pages walk already
   treats `None` as "end without completing"; the same rule for fixed plans
   wants a ruling, since it changes when a scope is marked complete.
-- **sync: the backfill runner's new contract checks have no test.** The
-  `Done` arm's `completion.validate()` and the batch arm's disagreement check
-  terminate the partition, but only `InventoryFusion` has a test driving a
-  disagreeing `PageCheckpoint`; removing the runner's checks leaves every test
-  green. Wants a StubAccount-driven pin like
-  `a_checkpoint_disagreeing_with_its_coverage_terminates_the_walk`.
 - **graph: inventory error exits declare `PartitionEnd::Exhausted`.** Every
   `Terminated` + `Done` pair in `account/inventory.rs` passes `Exhausted`.
   Harmless while the engine stops on `Terminated` first, but it records
@@ -264,12 +253,10 @@ confirm against the code before working any of them.
   `buffer_unordered(HYDRATE_BATCH_SIZE)` fanouts and the caldav/carddav client
   fanouts, and no in-tree code sets `AccountSpec::concurrency_limit`. Those
   providers advertise no limit of their own, so wiring them means choosing a
-  bound, which is a product decision per provider. Two smaller JMAP residuals
-  from the cold review: `refresh_session` installs the session state and then
-  sets the limit outside the session lock, so two overlapping refreshes can
-  briefly pair one session's state with the other's limit; and
-  `api_request_concurrency` reads an unadvertised `maxConcurrentRequests` as 1
-  while the transport reads it as ungated - two readings of one field.
+  bound, which is a product decision per provider. A smaller JMAP residual
+  from the cold review: `api_request_concurrency` reads an unadvertised
+  `maxConcurrentRequests` as 1 while the transport reads it as ungated - two
+  readings of one field.
 
 ## Open items folded in from the third bug-hunt wave (2026-09-04)
 

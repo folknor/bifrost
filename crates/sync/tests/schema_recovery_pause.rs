@@ -341,6 +341,167 @@ async fn a_created_scope_declined_under_a_pause_is_established_after_resume() {
     engine.detach(&id).await.expect("detach");
 }
 
+async fn delete_folder(tx: &tokio::sync::mpsc::Sender<ScopeLifecycleEvent>) {
+    tx.send(ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Deleted(
+        MembershipScope::Folder(new_folder()),
+    )))
+    .await
+    .expect("the lifecycle stream accepts the event");
+}
+
+/// A parked scope does not outlive its folder. Created and then deleted while
+/// the account is paused, it must not be established after resume: the folder
+/// is gone, and establishing it would end in the retry-budget terminal event.
+///
+/// The deletion reaches nothing through the registry - a parked scope has no
+/// cursor - so it has to be routed to the parked set explicitly.
+///
+/// Ablation: dropping the unpark (or routing only registered scopes to
+/// `ScopeDeleted`) establishes the deleted folder after resume.
+#[tokio::test(start_paused = true)]
+async fn a_parked_scope_whose_folder_is_deleted_during_the_pause_is_not_established() {
+    let id = AccountId("created-deleted-pause".to_owned());
+    let (account, lifecycle) = lifecycle_account();
+    let factory: Arc<dyn AccountFactory> = Arc::new(StubFactory::queue(vec![Arc::clone(&account)]));
+    let store = Arc::new(InMemoryCheckpointStore::default());
+    let engine = engine_over(&store);
+    let control = engine
+        .attach(id.clone(), factory)
+        .await
+        .expect("attach succeeds");
+
+    control.pause().await.expect("an idle account pauses");
+    create_folder(&lifecycle).await;
+    delete_folder(&lifecycle).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    control.resume();
+    tokio::time::sleep(POLL_CADENCE_PASSED).await;
+    assert_eq!(
+        times_established(&account, &created_scope()),
+        0,
+        "a folder deleted during the pause must not be established after resume"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}
+
+/// Deleted and created AGAIN during one pause, the folder exists after resume
+/// and is established exactly once: the second `Created` parks it afresh, and
+/// only one of the two parked tasks finds it still parked.
+#[tokio::test(start_paused = true)]
+async fn a_folder_deleted_and_recreated_during_a_pause_is_established_once() {
+    let id = AccountId("created-deleted-created-pause".to_owned());
+    let (account, lifecycle) = lifecycle_account();
+    let factory: Arc<dyn AccountFactory> = Arc::new(StubFactory::queue(vec![Arc::clone(&account)]));
+    let store = Arc::new(InMemoryCheckpointStore::default());
+    let engine = engine_over(&store);
+    let control = engine
+        .attach(id.clone(), factory)
+        .await
+        .expect("attach succeeds");
+
+    control.pause().await.expect("an idle account pauses");
+    create_folder(&lifecycle).await;
+    delete_folder(&lifecycle).await;
+    create_folder(&lifecycle).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    control.resume();
+    tokio::time::sleep(POLL_CADENCE_PASSED).await;
+    assert_eq!(
+        times_established(&account, &created_scope()),
+        1,
+        "the recreated folder is established once after resume"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}
+
+/// On a RUNNING account, a folder deleted while its `Created` repair is still
+/// queued on the reopen listener is established by that repair, and the
+/// deletion that follows on the same channel must retire the cursor, not only
+/// purge its rows. Purging alone left a live cursor for a deleted folder, its
+/// durable rows deleted out from under it.
+///
+/// Staged with the reopen lock: a parked `subscribe_push` holds it, so the
+/// `Created` repair queues behind it and the `Deleted` queues behind that.
+///
+/// Ablation: dropping the arm's cursor retirement leaves the deleted folder's
+/// cursor polling after the deletion was handled.
+#[tokio::test(start_paused = true)]
+async fn a_folder_deleted_while_its_repair_is_queued_leaves_no_live_cursor() {
+    let id = AccountId("created-deleted-queued".to_owned());
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    let mut account = StubAccount::new(vec![CursorScope::Folder(FolderId("inbox".to_owned()))]);
+    account.lifecycle_rx = std::sync::Mutex::new(Some(rx));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let hook_polls = Arc::clone(&polls);
+    account.changes_hook = Some(Arc::new(move |cursor: &ChangeCursor| {
+        if cursor.scope == created_scope() {
+            hook_polls.fetch_add(1, Ordering::SeqCst);
+        }
+        Vec::<SyncEvent<Change>>::new()
+    }));
+    let park = Arc::new(tokio::sync::Notify::new());
+    *account
+        .push_subscribe_park
+        .lock()
+        .expect("subscribe park lock") = Some((0, Arc::clone(&park)));
+    let push_log = Arc::clone(&account.push_log);
+    let account = Arc::new(account);
+    let factory: Arc<dyn AccountFactory> = Arc::new(StubFactory::queue(vec![Arc::clone(&account)]));
+    let store = Arc::new(InMemoryCheckpointStore::default());
+    let engine = engine_over(&store);
+    engine
+        .attach(id.clone(), factory)
+        .await
+        .expect("attach succeeds");
+
+    let subscribing = {
+        let engine = Arc::clone(&engine);
+        let id = id.clone();
+        let inbox = CursorScope::Folder(FolderId("inbox".to_owned()));
+        tokio::spawn(async move { engine.subscribe_push(&id, &[inbox]).await })
+    };
+    tokio::time::timeout(BOUND, async {
+        while push_log.subscribed().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the subscription never reached the account");
+
+    create_folder(&tx).await;
+    delete_folder(&tx).await;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    park.notify_one();
+    subscribing
+        .await
+        .expect("subscribe task")
+        .expect("subscribe succeeds once released");
+
+    tokio::time::sleep(POLL_CADENCE_PASSED).await;
+    assert_eq!(
+        times_established(&account, &created_scope()),
+        1,
+        "the queued repair established the folder, or the race was never staged"
+    );
+    let settled = polls.load(Ordering::SeqCst);
+    tokio::time::sleep(POLL_CADENCE_PASSED).await;
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        settled,
+        "a deleted folder's cursor must not keep polling"
+    );
+    assert!(
+        !durable_cursor_exists(&store, &id, &created_scope()).await,
+        "the deleted folder's durable cursor is purged"
+    );
+
+    engine.detach(&id).await.expect("detach");
+}
+
 /// A parked scope does not outlive the account: detach while it waits ends the
 /// wait and nothing is established.
 #[tokio::test(start_paused = true)]
