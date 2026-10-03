@@ -343,6 +343,30 @@ whether the account DEPENDS on the block:
   `Error::MalformedSessionUrl` naming the websocket capability's `url`, also
   `Protocol(ContractViolation)`, raised before any connection is attempted.
 
+### `maxConcurrentRequests` holds across the whole client
+
+`api_request_concurrency` bounds the WIDTH of one fan-out, but the limit
+RFC 8620 advertises is on the server's view of the account's concurrent API
+requests, and several call sites - a sync engine running inventory, hydration
+and mutation at once, plus the fan-outs themselves - overlap. So the HTTP
+transport also holds one `bifrost_net::ConcurrencyLimit` sized to the session's
+`maxConcurrentRequests`: `HttpTransport::set_api_concurrency` is called with
+every session the client installs (`connect`, `with_transport`,
+`refresh_session`), and `ReqwestTransport` gates every `api_request` by it. Only
+the API endpoint is gated - uploads and downloads have their own RFC limits -
+and a session advertising none leaves API requests ungated. An API request is a
+buffered `send`, so it never holds its slot past its own return.
+
+The cost is a new failure mode on a busy account: time queued for a slot counts
+against the request's total timeout, so against a server advertising a small
+limit, a few slow calls holding every slot can make queued API requests expire
+as `Timeout { Unsent }` without ever reaching the wire. `Unsent` is the honest
+evidence - nothing was sent, so any method may be replayed - and the recovery
+mapping treats it as such. Requests sent
+over the RFC 8887 WebSocket do not go through `bifrost-net` and are not gated.
+`the_session_limit_gates_api_requests_and_not_downloads` and
+`every_installed_session_bounds_the_transports_api_concurrency` pin both halves.
+
 ### `maxConcurrentUpload` is parsed and deliberately unread
 
 `CoreCapabilities::max_concurrent_upload` has no reader, and that is the

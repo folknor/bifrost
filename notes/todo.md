@@ -270,25 +270,19 @@ confirm against the code before working any of them.
 
 ### Cross-crate shaping questions
 
-- **No concurrency governor in `bifrost-net`.** Nothing bounds the number of
-  simultaneously in-flight requests, per account or globally. JMAP's foreign
-  probing at open solves it locally: `api_request_concurrency` (bound to a local
-  `probe_concurrency` in `crates/jmap/src/sync/factory.rs`) bounds a
-  `buffer_unordered` by the server's `maxConcurrentRequests` clamped to `[1, 8]`,
-  serial when the core capability is unreadable, with results sorted by
-  `accountId` before installation so topology and skip ordering stay
-  deterministic. This is a new permit-pool feature with its own API and
-  test-bite obligations, not a defect - it stays a recorded deferral until
-  someone wants the feature.
-
-  CORRECTED 2026-09-15 on two counts, and the correction strengthens the case.
-  The symbol was named `foreign_probe_concurrency` here and does not exist. More
-  importantly, the claim that the JMAP probe is the workspace's ONLY overlapping
-  -request site is false: there are now at least four more - two google inventory
-  fanouts (`buffer_unordered(HYDRATE_BATCH_SIZE)`), the jmap `filters::list`
-  fanout that jmap-C4 itself describes, and the caldav/carddav client fanouts.
-  So "any new concurrent call site has to solve it again from scratch" is not a
-  prediction, it has already happened four times without anyone recording it.
+- **Concurrency limit: only JMAP is wired.** `bifrost_net::ConcurrencyLimit`
+  landed 2026-10-03 and JMAP gates its API requests by the session's
+  `maxConcurrentRequests`. The other overlapping-request sites still bound
+  only their own fan-out width: the two google inventory
+  `buffer_unordered(HYDRATE_BATCH_SIZE)` fanouts and the caldav/carddav client
+  fanouts, and no in-tree code sets `AccountSpec::concurrency_limit`. Those
+  providers advertise no limit of their own, so wiring them means choosing a
+  bound, which is a product decision per provider. Two smaller JMAP residuals
+  from the cold review: `refresh_session` installs the session state and then
+  sets the limit outside the session lock, so two overlapping refreshes can
+  briefly pair one session's state with the other's limit; and
+  `api_request_concurrency` reads an unadvertised `maxConcurrentRequests` as 1
+  while the transport reads it as ungated - two readings of one field.
 
 ## Open items folded in from the third bug-hunt wave (2026-09-04)
 

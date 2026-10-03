@@ -21,6 +21,7 @@ use reqwest::{
 use serde::Serialize;
 
 use crate::auth::AccessToken;
+use crate::concurrency::{ConcurrencyLimit, ConcurrencyPermit};
 use crate::error::{
     Error, FinalResponse, STATUS_BODY_CAP, STATUS_BODY_CONNECTION_MARKER,
     STATUS_BODY_TIMEOUT_MARKER,
@@ -311,6 +312,9 @@ struct RequestBuilderInner {
     /// only on the success path, but the bytes came off the wire either
     /// way.
     bytes_in: Option<RequestByteCounter>,
+    /// Concurrency bound this request holds a slot of. `None` uses the
+    /// account's `AccountSpec::concurrency_limit`.
+    concurrency: Option<ConcurrencyLimit>,
 }
 
 impl RequestBuilder {
@@ -334,8 +338,24 @@ impl RequestBuilder {
                 bearer_auth: true,
                 pending_error: None,
                 bytes_in: None,
+                concurrency: None,
             },
         }
+    }
+
+    /// Hold a slot of `limit` while this request is in flight, in place of
+    /// the account's `AccountSpec::concurrency_limit`.
+    ///
+    /// The slot is taken before the first wire attempt and held across
+    /// retries and redirect hops until the response body ends. For
+    /// `send_streaming` that is when the body stream ends, fails or is
+    /// dropped; see [`ConcurrencyLimit`] for the deadlock that follows from
+    /// holding a streamed body open while awaiting another request on the
+    /// same limit.
+    #[must_use]
+    pub fn concurrency_limit(mut self, limit: ConcurrencyLimit) -> Self {
+        self.inner.concurrency = Some(limit);
+        self
     }
 
     /// Record this request's inbound body bytes into a caller-owned
@@ -532,6 +552,9 @@ impl RequestBuilder {
     pub async fn send(self) -> Result<Response, Error> {
         let limit = self.inner.account.max_buffered_response();
         let internal = send_streaming_inner(self).await?;
+        // Held until the body is drained: this function returning, by any
+        // path, is the end of the request.
+        let _permit = internal.permit;
         // Drain the body into a single `Bytes`. The retry loop has
         // already validated status; everything from here is a
         // straight body read. Apply the bandwidth meter to the read
@@ -583,7 +606,7 @@ impl RequestBuilder {
         Ok(StreamingResponse {
             status: internal.status,
             headers: internal.headers,
-            body: metered,
+            body: hold_permit(metered, internal.permit),
             bytes_in: internal.bytes_in,
             bytes_out: internal.bytes_out,
         })
@@ -718,6 +741,40 @@ pub(crate) struct InternalStreaming {
     pub(crate) deadline: RequestDeadline,
     pub(crate) bytes_out: u64,
     pub(crate) bytes_in: RequestByteCounter,
+    /// The request's concurrency slot, if it is gated. Whoever exposes the
+    /// body owns releasing it at the body's end.
+    pub(crate) permit: Option<ConcurrencyPermit>,
+}
+
+/// Tie a concurrency slot to a body stream: released when the stream ends or
+/// yields an error, or when it is dropped unfinished. Releasing at the end
+/// rather than only on drop matters because a caller may keep a drained
+/// stream alive.
+pub(crate) fn hold_permit(body: ByteStream, permit: Option<ConcurrencyPermit>) -> ByteStream {
+    if permit.is_none() {
+        return body;
+    }
+    Box::pin(PermitStream { body, permit })
+}
+
+struct PermitStream {
+    body: ByteStream,
+    permit: Option<ConcurrencyPermit>,
+}
+
+impl futures::Stream for PermitStream {
+    type Item = Result<Bytes, Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let polled = self.body.as_mut().poll_next(cx);
+        if matches!(polled, std::task::Poll::Ready(None | Some(Err(_)))) {
+            self.permit = None;
+        }
+        polled
+    }
 }
 
 /// Drive a request to a streamable response, running the retry loop
@@ -759,6 +816,7 @@ pub(crate) async fn send_streaming_inner(
         bearer_auth,
         pending_error,
         bytes_in: caller_bytes_in,
+        concurrency,
     } = builder.inner;
 
     // Surface any deferred error from a fluent setter (e.g. `json()`
@@ -774,6 +832,14 @@ pub(crate) async fn send_streaming_inner(
     let redirect_policy = redirect_override.unwrap_or_else(|| account.follow_redirects().clone());
     let deadline =
         RequestDeadline::from_timeout(timeout.unwrap_or_else(|| account.request_timeout()));
+    // One slot for the whole logical request, taken before the first attempt
+    // and bounded by the same total deadline as every other wait, so an
+    // expiry here is `Timeout { Unsent }`. Held across retries and redirect
+    // hops: see `ConcurrencyLimit`.
+    let permit = match concurrency.as_ref().or(account.concurrency_limit()) {
+        Some(limit) => Some(deadline.bound(limit.acquire()).await?),
+        None => None,
+    };
     if !headers.contains_key(reqwest::header::USER_AGENT) {
         let value = reqwest::header::HeaderValue::from_str(account.user_agent()).map_err(|e| {
             Error::InvalidRequest {
@@ -1021,6 +1087,7 @@ pub(crate) async fn send_streaming_inner(
                 deadline,
                 bytes_out,
                 bytes_in,
+                permit,
             });
         }
 
@@ -1050,6 +1117,7 @@ pub(crate) async fn send_streaming_inner(
                         deadline,
                         bytes_out,
                         bytes_in,
+                        permit,
                     });
                 }
                 Some(policy) => {
@@ -1085,6 +1153,7 @@ pub(crate) async fn send_streaming_inner(
                                 deadline,
                                 bytes_out,
                                 bytes_in,
+                                permit,
                             });
                         }
                         RedirectAction::Follow(step) => {

@@ -19,6 +19,7 @@ use reqwest::header::RANGE;
 
 use crate::auth::{DEFAULT_TOKEN_MAX_AGE, OAuthRefresher, TokenSource};
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
+use crate::concurrency::ConcurrencyLimit;
 use crate::config::NetConfig;
 use crate::error::{Error, RangeFailureKind};
 use crate::rate::{RateKey, RateLimit, RateLimitGovernor};
@@ -272,6 +273,7 @@ impl Net {
                 response_headers_timeout: spec.response_headers_timeout.or(spec.connect_timeout),
                 read_timeout: spec.read_timeout,
                 max_buffered_response: spec.max_buffered_response,
+                concurrency_limit: spec.concurrency_limit,
                 user_agent: spec.user_agent,
                 follow_redirects: spec.follow_redirects,
                 priority: AtomicU8::new(Priority::Foreground as u8),
@@ -400,6 +402,9 @@ pub(crate) struct AccountNetInner {
     pub(crate) read_timeout: Option<Duration>,
     /// Buffered response ceiling for this account.
     pub(crate) max_buffered_response: Option<usize>,
+    /// Concurrency bound every request of this account holds a slot of,
+    /// unless the request names its own.
+    pub(crate) concurrency_limit: Option<ConcurrencyLimit>,
     /// User-Agent header inserted unless the request supplied one.
     pub(crate) user_agent: String,
     /// Account-scoped redirect policy and trusted-host allowlist.
@@ -544,6 +549,7 @@ impl AccountNet {
             deadline,
             bytes_out: _,
             bytes_in,
+            permit,
         } = send_streaming_inner(builder).await?;
 
         // Ranged-download safety: if the caller asked for a specific
@@ -579,7 +585,7 @@ impl AccountNet {
 
         // Wrap the body in a metering + bandwidth-cap adapter.
         let metered = wrap_metered(body, self.clone(), deadline, bytes_in);
-        Ok(metered)
+        Ok(crate::request::hold_permit(metered, permit))
     }
 
     /// Per-account meter handle.
@@ -686,6 +692,10 @@ impl AccountNet {
         self.inner.max_buffered_response
     }
 
+    pub(crate) fn concurrency_limit(&self) -> Option<&ConcurrencyLimit> {
+        self.inner.concurrency_limit.as_ref()
+    }
+
     pub(crate) fn user_agent(&self) -> &str {
         &self.inner.user_agent
     }
@@ -787,6 +797,7 @@ impl AccountNet {
                 response_headers_timeout: self.inner.response_headers_timeout,
                 read_timeout: self.inner.read_timeout,
                 max_buffered_response: self.inner.max_buffered_response,
+                concurrency_limit: self.inner.concurrency_limit.clone(),
                 user_agent: self.inner.user_agent.clone(),
                 follow_redirects: self.inner.follow_redirects.clone(),
                 priority: AtomicU8::new(self.inner.priority.load(Ordering::Relaxed)),
@@ -824,6 +835,11 @@ pub struct AccountSpec {
     pub read_timeout: Option<Duration>,
     /// Ceiling for buffered response bodies. `None` disables it.
     pub max_buffered_response: Option<usize>,
+    /// Bound on this account's simultaneously in-flight requests. `None`
+    /// leaves them unbounded. Pass the same handle to several accounts to
+    /// bound them together; a request can name a different one with
+    /// `RequestBuilder::concurrency_limit`.
+    pub concurrency_limit: Option<ConcurrencyLimit>,
     /// User-Agent header used for requests from this account.
     pub user_agent: String,
     /// Method-aware redirect policy, including the account's trusted hosts.
@@ -847,6 +863,7 @@ impl AccountSpec {
             response_headers_timeout: None,
             read_timeout: Some(Duration::from_secs(30)),
             max_buffered_response: Some(DEFAULT_MAX_BUFFERED_RESPONSE),
+            concurrency_limit: None,
             user_agent: format!("bifrost-net/{}", env!("CARGO_PKG_VERSION")),
             follow_redirects: FollowRedirects::default(),
             token_max_age: DEFAULT_TOKEN_MAX_AGE,

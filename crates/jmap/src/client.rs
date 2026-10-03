@@ -447,6 +447,7 @@ impl ClientBuilder {
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&session_bytes)?;
+        transport.set_api_concurrency(advertised_api_concurrency(&session));
 
         Ok(Client {
             tally: None,
@@ -471,6 +472,15 @@ impl ClientBuilder {
             }),
         })
     }
+}
+
+/// The session's `maxConcurrentRequests`, which every installed session hands
+/// to the transport so the server's limit holds across all of this client's
+/// concurrent API work, not only within one call site's fan-out.
+fn advertised_api_concurrency(session: &Session) -> Option<usize> {
+    session
+        .core_capabilities()
+        .and_then(crate::core::session::CoreCapabilities::max_concurrent_requests)
 }
 
 /// Decision note: the well-known path is appended to WHATEVER the caller
@@ -814,6 +824,80 @@ mod session_state_tests {
         }
     }
 
+    /// Records every API concurrency bound the client hands it, and serves a
+    /// refreshed session advertising a different one.
+    struct LimitRecordingTransport {
+        limits: Arc<Mutex<Vec<Option<usize>>>>,
+    }
+
+    fn session_with_limit(limit: usize, state: &str) -> String {
+        let mut session: serde_json::Value =
+            serde_json::from_str(&session_json("limit", "A1", state)).expect("fixture parses");
+        session["capabilities"]["urn:ietf:params:jmap:core"] = json!({
+            "maxSizeUpload": 1000,
+            "maxConcurrentUpload": 2,
+            "maxSizeRequest": 100_000,
+            "maxConcurrentRequests": limit,
+            "maxCallsInRequest": 8,
+            "maxObjectsInGet": 256,
+            "maxObjectsInSet": 256,
+            "collationAlgorithms": []
+        });
+        session.to_string()
+    }
+
+    impl HttpTransport for LimitRecordingTransport {
+        async fn api_request(&self, _url: &str, _body: Vec<u8>) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("stub transport returns no response"))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("stub transport does not upload"))
+        }
+
+        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Err(TransportError::new("stub transport does not download"))
+        }
+
+        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
+            Ok(Bytes::from(session_with_limit(5, "session-2")))
+        }
+
+        fn set_api_concurrency(&self, max_concurrent_requests: Option<usize>) {
+            self.limits
+                .lock()
+                .expect("limit lock")
+                .push(max_concurrent_requests);
+        }
+    }
+
+    /// Every session the client installs hands its `maxConcurrentRequests`
+    /// to the transport: the one it is built with, and each refresh, since
+    /// RFC 8620 lets any session property change.
+    #[tokio::test]
+    async fn every_installed_session_bounds_the_transports_api_concurrency() {
+        let limits = Arc::new(Mutex::new(Vec::new()));
+        let session: Session =
+            serde_json::from_str(&session_with_limit(3, "session-1")).expect("session parses");
+        let client = Client::with_transport(
+            LimitRecordingTransport {
+                limits: Arc::clone(&limits),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        assert_eq!(*limits.lock().expect("limit lock"), vec![Some(3)]);
+
+        client.refresh_session().await.expect("refresh succeeds");
+        assert_eq!(*limits.lock().expect("limit lock"), vec![Some(3), Some(5)]);
+    }
+
     /// RFC 8620 §2 lets any Session property change. A refresh that only
     /// replaced the `Session` left `apiUrl`, the blob / EventSource
     /// templates and the default account frozen at the values of the
@@ -907,6 +991,7 @@ impl<T: HttpTransport> Client<T> {
                 "a custom transport client needs a session URL".to_string(),
             ));
         }
+        transport.set_api_concurrency(advertised_api_concurrency(&session));
         Ok(Client {
             tally: None,
             inner: Arc::new(ClientInner {
@@ -1030,8 +1115,10 @@ impl<T: HttpTransport> Client<T> {
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&bytes)?;
+        let limit = advertised_api_concurrency(&session);
         let state = Arc::new(SessionState::derive(session)?);
         *self.inner.state.lock().expect("session mutex poisoned") = state;
+        self.inner.transport.set_api_concurrency(limit);
         self.inner.session_updated.store(true, Ordering::Release);
         Ok(())
     }

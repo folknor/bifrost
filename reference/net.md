@@ -571,6 +571,44 @@ dropped: the governor logs a `tracing::warn!` and keeps the
 existing bucket. Per-host attach counts are incremented on every
 `register` so `detach_account` can decrement symmetrically.
 
+## Concurrency limit (`ConcurrencyLimit`)
+
+The rate-limit governor meters request RATE; nothing else bounds how many
+requests are in flight at once. A fan-out call site in a protocol crate caps
+only its own `buffer_unordered` width, with no view of the account's other
+traffic - those per-site caps remain, and this is the shared bound they cannot
+provide. A server-advertised limit is a property of the account's whole
+traffic and needs one shared count. `ConcurrencyLimit` is that count: a
+cloneable handle, so its scope is the caller's. `AccountSpec::concurrency_limit`
+gates every request of an account, the same handle in several specs bounds them
+together (a process-wide bound is one handle everywhere), and
+`RequestBuilder::concurrency_limit` gates one request with a limit of its own,
+in place of the account's.
+
+A gated request takes ONE slot for the whole logical request: before its first
+wire attempt, held across retries and redirect hops, released when its response
+body ends. Holding through a retry sleep can only keep the count below the
+server's view of open requests, never above it. The wait is bounded by the
+request's total deadline like every other wait, and expires as
+`Timeout { Unsent }`. `send` releases on return; `send_streaming` and
+`download_stream` tie the slot to the body, released when the stream ends,
+yields an error, or is dropped unfinished - so a caller holding a streamed body
+open while awaiting another request on the same limit deadlocks once the limit
+is reached. Admission is FIFO (tokio's semaphore is fair).
+
+`set_limit` resizes in flight. Growing admits waiters at once; shrinking never
+revokes a held slot - the excess becomes debt that finishing requests pay
+instead of returning their permit, so the count converges to the new bound.
+Debt is also paid by any permit that reaches an acquirer while it is owed,
+because a permit tokio granted to a waiter cancelled before its first poll
+returns to the semaphore without passing through the release path. A
+limit of zero is raised to one with a warning, since it would park every gated
+request until its deadline.
+
+JMAP is the in-tree consumer: `ReqwestTransport` gates its API POSTs (and only
+those - RFC 8620 limits uploads and downloads separately) by the session's
+`maxConcurrentRequests`, set from every session the client installs.
+
 ## Bandwidth meter
 
 `BandwidthMeter` holds one `AccountCounters` per account; each

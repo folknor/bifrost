@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_net::{
-    AccountId, AccountNet, AccountSpec, FollowRedirects, Net, Priority, RedirectPolicy,
+    AccountId, AccountNet, AccountSpec, ConcurrencyLimit, FollowRedirects, Net, Priority,
+    RedirectPolicy,
 };
 use bytes::Bytes;
 use reqwest::header;
@@ -21,6 +22,10 @@ pub(crate) struct ReqwestTransport {
     headers: header::HeaderMap,
     authorization: Authorization,
     timeout: Duration,
+    /// The session's `maxConcurrentRequests`, applied to API requests
+    /// only. `None` until a session advertising one is installed; the
+    /// session GET that precedes it is not an API request.
+    api_limit: std::sync::Mutex<Option<ConcurrencyLimit>>,
 }
 
 impl ReqwestTransport {
@@ -53,7 +58,15 @@ impl ReqwestTransport {
             headers,
             authorization,
             timeout,
+            api_limit: std::sync::Mutex::new(None),
         })
+    }
+
+    fn api_limit(&self) -> Option<ConcurrencyLimit> {
+        self.api_limit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_priority(&self, priority: Priority) {
@@ -71,7 +84,10 @@ impl ReqwestTransport {
         body: Option<Bytes>,
         content_type: Option<&str>,
     ) -> Result<Bytes, TransportError> {
-        Ok(self.send_measured(method, url, body, content_type).await?.0)
+        Ok(self
+            .send_measured(method, url, body, content_type, None)
+            .await?
+            .0)
     }
 
     /// `send`, also reporting bifrost-net's request-local inbound byte
@@ -84,8 +100,11 @@ impl ReqwestTransport {
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
+        limit: Option<ConcurrencyLimit>,
     ) -> Result<(Bytes, u64), TransportError> {
-        let response = self.send_once(method, url, body, content_type).await?;
+        let response = self
+            .send_once(method, url, body, content_type, limit)
+            .await?;
         let bytes_in = response.bytes_in();
         Ok((
             Self::handle_response(response.status, response.body)?,
@@ -99,6 +118,7 @@ impl ReqwestTransport {
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
+        limit: Option<ConcurrencyLimit>,
     ) -> Result<bifrost_net::Response, TransportError> {
         let mut request = match method {
             "GET" => self.net.get(url),
@@ -142,6 +162,9 @@ impl ReqwestTransport {
         if let Some(body) = body {
             request = request.body(body);
         }
+        if let Some(limit) = limit {
+            request = request.concurrency_limit(limit);
+        }
         request.send().await.map_err(transport_error_from_net)
     }
 
@@ -167,13 +190,7 @@ impl ReqwestTransport {
 
 impl HttpTransport for ReqwestTransport {
     async fn api_request(&self, url: &str, body: Vec<u8>) -> Result<bytes::Bytes, TransportError> {
-        self.send(
-            "POST",
-            url,
-            Some(Bytes::from(body)),
-            Some("application/json"),
-        )
-        .await
+        Ok(self.api_request_measured(url, body).await?.0)
     }
 
     async fn api_request_measured(
@@ -186,8 +203,28 @@ impl HttpTransport for ReqwestTransport {
             url,
             Some(Bytes::from(body)),
             Some("application/json"),
+            self.api_limit(),
         )
         .await
+    }
+
+    fn set_api_concurrency(&self, max_concurrent_requests: Option<usize>) {
+        let mut slot = self
+            .api_limit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (max_concurrent_requests, slot.as_ref()) {
+            // Resized in place, so requests already holding a slot keep
+            // counting against the new bound.
+            (Some(limit), Some(existing)) => existing.set_limit(limit),
+            (Some(limit), None) => *slot = Some(ConcurrencyLimit::new(limit)),
+            // A session that stops advertising one is effectively unbounded,
+            // but the handle is kept rather than dropped: a later session that
+            // advertises a limit again must still count the requests holding
+            // slots of this one.
+            (None, Some(existing)) => existing.set_limit(usize::MAX),
+            (None, None) => {}
+        }
     }
 
     async fn upload(
@@ -205,7 +242,7 @@ impl HttpTransport for ReqwestTransport {
     }
 
     async fn download_measured(&self, url: &str) -> Result<(bytes::Bytes, u64), TransportError> {
-        self.send_measured("GET", url, None, None).await
+        self.send_measured("GET", url, None, None, None).await
     }
 
     async fn get_session(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
@@ -382,6 +419,52 @@ mod tests {
         assert!(first.net.shares_transport_with(&second.net));
     }
 
+    fn scripted_transport(script: &Arc<ScriptedDispatch>) -> ReqwestTransport {
+        let spec = AccountSpec::new(Some(Arc::new(StaticTokenSource::new("token", None))));
+        let account = scripted_net(script, bifrost_net::NetConfig::default())
+            .attach_account(AccountId("api-limit".to_owned()), spec);
+        ReqwestTransport {
+            net: account,
+            headers: header::HeaderMap::new(),
+            authorization: Authorization::from_credentials_for_test(Credentials::basic(
+                "user", "secret",
+            )),
+            timeout: Duration::from_secs(30),
+            api_limit: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The session's `maxConcurrentRequests` bounds API requests across
+    /// every caller of the transport, and only API requests: RFC 8620 gives
+    /// uploads and downloads limits of their own. The dispatcher yields
+    /// before answering, so an ungated burst is genuinely concurrent.
+    #[tokio::test]
+    async fn the_session_limit_gates_api_requests_and_not_downloads() {
+        let ok = || bifrost_net::test_support::canned(reqwest::StatusCode::OK, b"{}");
+
+        let api_script = ScriptedDispatch::yielding((0..4).map(|_| ok()));
+        let api = scripted_transport(&api_script);
+        api.set_api_concurrency(Some(2));
+        let calls = (0..4).map(|_| api.api_request("https://jmap.test/api", b"{}".to_vec()));
+        for result in futures::future::join_all(calls).await {
+            result.expect("api request");
+        }
+        assert_eq!(api_script.peak_in_flight(), 2);
+
+        let blob_script = ScriptedDispatch::yielding((0..4).map(|_| ok()));
+        let blobs = scripted_transport(&blob_script);
+        blobs.set_api_concurrency(Some(2));
+        let downloads = (0..4).map(|_| blobs.download("https://jmap.test/blob"));
+        for result in futures::future::join_all(downloads).await {
+            result.expect("download");
+        }
+        assert_eq!(
+            blob_script.peak_in_flight(),
+            4,
+            "downloads are not API requests and are not gated by the API limit"
+        );
+    }
+
     #[tokio::test]
     async fn event_source_suppresses_the_ordinary_request_deadline() {
         let script = ScriptedDispatch::new([Canned::Stream {
@@ -400,6 +483,7 @@ mod tests {
                 "user", "secret",
             )),
             timeout: Duration::from_secs(30),
+            api_limit: std::sync::Mutex::new(None),
         };
 
         transport
@@ -436,6 +520,7 @@ mod tests {
                 "user", "secret",
             )),
             timeout: Duration::from_secs(30),
+            api_limit: std::sync::Mutex::new(None),
         };
 
         let err = match transport.open_sse("https://push.test/events", None).await {

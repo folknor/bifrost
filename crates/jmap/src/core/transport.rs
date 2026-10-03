@@ -246,6 +246,15 @@ pub(crate) trait HttpTransport: Send + Sync + 'static {
 
     /// Fetch the session resource (GET, returns JSON).
     fn get_session(&self, url: &str) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
+
+    /// Bound the API requests this transport has in flight at once to the
+    /// session's `maxConcurrentRequests`. Called with every session the
+    /// client installs; `None` means the session did not advertise one.
+    ///
+    /// RFC 8620 limits the API endpoint only - uploads and downloads have
+    /// their own limits - so only `api_request` traffic is gated. Defaulted
+    /// to a no-op for transports with nothing to bound.
+    fn set_api_concurrency(&self, _max_concurrent_requests: Option<usize>) {}
 }
 
 /// Streaming transport for Server-Sent Events (EventSource).

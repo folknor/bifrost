@@ -25,6 +25,7 @@
 pub mod account_error;
 pub mod auth;
 pub mod bandwidth;
+pub mod concurrency;
 pub mod config;
 pub mod error;
 pub mod net;
@@ -57,6 +58,7 @@ pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 // configurations where some other feature happened to pull the spelling in,
 // which is a feature-graph accident rather than a contract.
 pub use bifrost_types::{AccountFuture, AccountId, ByteRange, Priority, TransmissionState};
+pub use concurrency::ConcurrencyLimit;
 pub use config::{DEFAULT_MAX_BUFFERED_RESPONSE, NetConfig};
 pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, STATUS_BODY_CAP};
 pub use http::Method;
