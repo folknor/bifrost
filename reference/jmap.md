@@ -353,9 +353,13 @@ transport also holds one `bifrost_net::ConcurrencyLimit` sized to the session's
 `maxConcurrentRequests`: `HttpTransport::set_api_concurrency` is called with
 every session the client installs (`connect`, `with_transport`,
 `refresh_session`), and `ReqwestTransport` gates every `api_request` by it. Only
-the API endpoint is gated - uploads and downloads have their own RFC limits -
-and a session advertising none leaves API requests ungated. An API request is a
-buffered `send`, so it never holds its slot past its own return.
+the API endpoint is gated - uploads and downloads have their own RFC limits.
+Both the gate and `api_request_concurrency` read the field through
+`Session::api_request_concurrency`, which reads an omitted or zero
+`maxConcurrentRequests` as one, so a non-conformant session that leaves it out
+gets serial API traffic rather than an ungated transport beside serial
+fan-outs. An API request is a buffered `send`, so it never holds its slot past
+its own return.
 
 The cost is a new failure mode on a busy account: time queued for a slot counts
 against the request's total timeout, so against a server advertising a small

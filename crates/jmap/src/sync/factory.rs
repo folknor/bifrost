@@ -387,14 +387,12 @@ async fn validate_and_seed<Tr: HttpTransport>(
     })
 }
 
-/// How many API requests this crate may put on the wire at once.
+/// How wide one fan-out of API requests may go.
 ///
-/// The server's advertised `maxConcurrentRequests` is the ceiling. A
-/// session that omits the core capability, or advertises zero, is treated
-/// as one: serial work is slower but always legal, whereas guessing a
-/// number above the server's earns a request-level `limit` error. The
-/// upper clamp keeps a server advertising an absurd number from having a
-/// fan-out go that wide.
+/// `Session::api_request_concurrency` is the ceiling - the same reading the
+/// transport's client-wide gate uses, so an omitted or zero
+/// `maxConcurrentRequests` is one here too. The upper clamp keeps a server
+/// advertising an absurd number from having a fan-out go that wide.
 ///
 /// Every concurrent lane in the crate shares this one reading - the
 /// open-time foreign-account probes and the `filters_list` script-blob
@@ -402,11 +400,7 @@ async fn validate_and_seed<Tr: HttpTransport>(
 /// per call site that could drift from the session.
 pub(super) fn api_request_concurrency(session: &crate::core::session::Session) -> usize {
     const MAX_PROBE_CONCURRENCY: usize = 8;
-    session
-        .core_capabilities()
-        .and_then(crate::core::session::CoreCapabilities::max_concurrent_requests)
-        .unwrap_or(1)
-        .clamp(1, MAX_PROBE_CONCURRENCY)
+    session.api_request_concurrency().min(MAX_PROBE_CONCURRENCY)
 }
 
 /// The `maxObjectsInGet` a session advertises, for the doors that hold a

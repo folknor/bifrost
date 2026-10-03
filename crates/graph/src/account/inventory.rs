@@ -68,7 +68,6 @@ fn inventory_stream_from(
                     super::cursor::routing_error(error),
                     sync_ctx,
                 ));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
         };
@@ -85,7 +84,6 @@ fn inventory_stream_from(
                         super::cursor::CursorError::SchemaIncompatible,
                         sync_ctx,
                     ));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                     return;
                 }
             },
@@ -94,7 +92,6 @@ fn inventory_stream_from(
                     Ok(url) => Ok((url, window_end)),
                     Err(error) => {
                         yield bifrost_types::InventoryEvent::Terminated(super::graph_error::into_account_error(error, sync_ctx));
-                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                         return;
                     }
                 },
@@ -105,7 +102,6 @@ fn inventory_stream_from(
             Ok(start) => start,
             Err(error) => {
                 yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
         };
@@ -122,7 +118,6 @@ fn inventory_stream_from(
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
         };
@@ -133,7 +128,6 @@ fn inventory_stream_from(
                 yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
                     error, &scope, owner.as_ref(), sync_ctx.clone(),
                 ));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
             let page: ODataCollection<Value> = match fetch_page(&client, &current_url).await {
@@ -151,7 +145,6 @@ fn inventory_stream_from(
                         owner.as_ref(),
                         ctx,
                     ));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                     return;
                 }
             };
@@ -167,7 +160,6 @@ fn inventory_stream_from(
                     yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
                         error, &scope, owner.as_ref(), sync_ctx.clone(),
                     ));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                     return;
                 }
             };
@@ -261,7 +253,6 @@ fn inventory_stream_from(
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
                         yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                         return;
                     }
                 };
@@ -278,7 +269,6 @@ fn inventory_stream_from(
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
                         yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                         return;
                     }
                 };
@@ -296,7 +286,6 @@ fn inventory_stream_from(
                     Some(ErrorScope::Cursor(scope.clone())),
                     "Graph delta page had neither @odata.nextLink nor @odata.deltaLink",
                 ));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
         }
@@ -732,11 +721,7 @@ mod tests {
             )) => assert_eq!(scope, &stale),
             other => panic!("expected DisableScope, got {other:?}"),
         }
-        assert!(matches!(
-            stream.next().await,
-            Some(bifrost_types::InventoryEvent::Done(_))
-        ));
-        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none(), "Terminated ends the walk");
     }
 
     #[tokio::test]
@@ -778,10 +763,7 @@ mod tests {
                 bifrost_types::ProtocolErrorKind::ContractViolation
             )
         ));
-        assert!(matches!(
-            stream.next().await,
-            Some(bifrost_types::InventoryEvent::Done(_))
-        ));
+        assert!(stream.next().await.is_none(), "Terminated ends the walk");
         let requests = client.take_rest_requests();
         assert_eq!(requests.len(), 2);
         assert!(
@@ -845,11 +827,7 @@ mod tests {
                 bifrost_types::ProtocolErrorKind::ContractViolation
             )
         ));
-        assert!(matches!(
-            stream.next().await,
-            Some(bifrost_types::InventoryEvent::Done(_))
-        ));
-        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none(), "Terminated ends the walk");
         let requests = client.take_rest_requests();
         assert_eq!(
             requests.len(),
@@ -1151,9 +1129,7 @@ mod tests {
             first,
             bifrost_types::InventoryEvent::Terminated(_)
         ));
-        let second = stream.next().await.expect("done event");
-        assert!(matches!(second, bifrost_types::InventoryEvent::Done(_)));
-        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none(), "Terminated ends the walk");
     }
 
     #[tokio::test]
@@ -1166,8 +1142,7 @@ mod tests {
             first,
             bifrost_types::InventoryEvent::Terminated(_)
         ));
-        let second = stream.next().await.expect("done event");
-        assert!(matches!(second, bifrost_types::InventoryEvent::Done(_)));
+        assert!(stream.next().await.is_none(), "Terminated ends the walk");
     }
 
     #[tokio::test]

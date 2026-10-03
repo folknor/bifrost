@@ -23,8 +23,8 @@ pub(crate) struct ReqwestTransport {
     authorization: Authorization,
     timeout: Duration,
     /// The session's `maxConcurrentRequests`, applied to API requests
-    /// only. `None` until a session advertising one is installed; the
-    /// session GET that precedes it is not an API request.
+    /// only. `None` until the first session is installed; the session GET
+    /// that precedes it is not an API request.
     api_limit: std::sync::Mutex<Option<ConcurrencyLimit>>,
 }
 
@@ -208,22 +208,16 @@ impl HttpTransport for ReqwestTransport {
         .await
     }
 
-    fn set_api_concurrency(&self, max_concurrent_requests: Option<usize>) {
+    fn set_api_concurrency(&self, max_concurrent_requests: usize) {
         let mut slot = self
             .api_limit
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match (max_concurrent_requests, slot.as_ref()) {
+        match slot.as_ref() {
             // Resized in place, so requests already holding a slot keep
             // counting against the new bound.
-            (Some(limit), Some(existing)) => existing.set_limit(limit),
-            (Some(limit), None) => *slot = Some(ConcurrencyLimit::new(limit)),
-            // A session that stops advertising one is effectively unbounded,
-            // but the handle is kept rather than dropped: a later session that
-            // advertises a limit again must still count the requests holding
-            // slots of this one.
-            (None, Some(existing)) => existing.set_limit(usize::MAX),
-            (None, None) => {}
+            Some(existing) => existing.set_limit(max_concurrent_requests),
+            None => *slot = Some(ConcurrencyLimit::new(max_concurrent_requests)),
         }
     }
 
@@ -444,7 +438,7 @@ mod tests {
 
         let api_script = ScriptedDispatch::yielding((0..4).map(|_| ok()));
         let api = scripted_transport(&api_script);
-        api.set_api_concurrency(Some(2));
+        api.set_api_concurrency(2);
         let calls = (0..4).map(|_| api.api_request("https://jmap.test/api", b"{}".to_vec()));
         for result in futures::future::join_all(calls).await {
             result.expect("api request");
@@ -453,7 +447,7 @@ mod tests {
 
         let blob_script = ScriptedDispatch::yielding((0..4).map(|_| ok()));
         let blobs = scripted_transport(&blob_script);
-        blobs.set_api_concurrency(Some(2));
+        blobs.set_api_concurrency(2);
         let downloads = (0..4).map(|_| blobs.download("https://jmap.test/blob"));
         for result in futures::future::join_all(downloads).await {
             result.expect("download");

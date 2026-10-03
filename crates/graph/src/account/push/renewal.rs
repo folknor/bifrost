@@ -19,7 +19,9 @@ use crate::webhooks::{
 use super::common::{
     PushEndpoint, announce_push_recovered, mark_push_disconnected, mark_push_reconnected,
 };
-use super::webhook::{GraphSubscriptionGroup, GraphSubscriptionState, remove_subscription_state};
+use super::webhook::{
+    GraphSubscriptionGroup, GraphSubscriptionState, recreated_ids, remove_subscription_state,
+};
 
 pub(super) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub(super) const RENEWAL_THRESHOLD_MINUTES: i64 = 30;
@@ -381,6 +383,18 @@ async fn create_and_install_replacement(
     // resting on the walk's ordering.
     let installed = !account.shutdown.is_cancelled()
         && install_replacement(&mut groups, &handle, &stale_server_id, replacement);
+    if installed {
+        // The handle string cannot name the new id, so record it where an
+        // orphan teardown on a reopened instance will look; see
+        // `RecreatedSubscriptionIds`. Under the same write lock as the
+        // install, so a teardown snapshot never sees one without the other.
+        record_recreated_id(
+            &mut recreated_ids(account),
+            &handle,
+            &stale_server_id,
+            &created_id,
+        );
+    }
     drop(groups);
     if installed {
         return Ok(Replacement::Installed);
@@ -404,6 +418,21 @@ async fn create_and_install_replacement(
         );
     }
     Ok(Replacement::HandleUnsubscribed)
+}
+
+/// Note `created_id` as recreated under `handle`, in place of
+/// `stale_server_id` when that was itself an earlier recreate. A stale id the
+/// handle names stays named there; its DELETE answers 404, which teardown
+/// counts as already gone.
+pub(super) fn record_recreated_id(
+    ledger: &mut HashMap<SubscriptionHandle, Vec<String>>,
+    handle: &SubscriptionHandle,
+    stale_server_id: &str,
+    created_id: &str,
+) {
+    let ids = ledger.entry(handle.clone()).or_default();
+    ids.retain(|id| id != stale_server_id);
+    ids.push(created_id.to_string());
 }
 
 /// Swap `replacement` in for `stale_server_id` under `handle`.

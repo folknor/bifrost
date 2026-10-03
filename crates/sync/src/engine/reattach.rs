@@ -1464,12 +1464,14 @@ pub(super) async fn reattach_account(
             // that minted the handle. The handle belongs to the same account id
             // and credentials, and no provider in this workspace rejects a
             // handle it does not know, so the retry clears the orphan rather
-            // than failing forever. It does not promise a deletion: Graph, IMAP
-            // and JMAP hold a handle's server state in the account instance, so
-            // a retry that reaches a newer connection is a no-op and the
-            // provider-side subscription then lives until it expires (Graph's
-            // webhook rows are also deleted by the owning account's `close()`).
-            // `unsubscribe_push` retries on the same terms.
+            // than failing forever. It does not promise a deletion: IMAP and
+            // JMAP hold a handle's server state in the account instance, so a
+            // retry that reaches a newer connection is a no-op and the
+            // provider-side subscription then lives until it expires. Graph's
+            // webhook handles carry their subscription ids, so a retry there
+            // does delete (and its rows are also deleted by the owning
+            // account's `close()`). `unsubscribe_push` retries on the same
+            // terms.
             let teardown = previous.push_unsubscribe(record.handle.clone()).await;
             match teardown {
                 Ok(()) => {

@@ -22,6 +22,41 @@ use super::common::{
 use super::dispatch::{ArmOutcome, finalize_push_outcomes};
 use super::renewal::run_graph_subscription_worker;
 
+/// Server ids the renewal worker recreated under a handle, which the handle
+/// string itself cannot name.
+///
+/// A handle carries the ids of its subscribe time (`common::graph_handle`),
+/// and the engine stores that string unchanged. When the renewal worker
+/// replaces a vanished subscription, the replacement's id lives only in the
+/// instance's group - so if that instance's teardown fails and the engine
+/// retries the handle as an orphan on a reopened instance, the replacement
+/// would be out of reach and live until Graph expired it. The engine reopens
+/// through the same factory, and the factory hands every account it opens
+/// this one ledger, so the orphan path on the new instance finds them here.
+///
+/// Process-local, like the engine's own subscription registry: nothing
+/// retries a handle across a process restart, and a handle that outlives the
+/// process reaches only the ids it was minted with.
+///
+/// An id enters when a recreate installs it and leaves only when a DELETE of
+/// it succeeds (or a whole orphan teardown does) - never when a terminal
+/// renewal failure drops its group row, since that deletes nothing. Every
+/// write and the teardown snapshot happen under the `graph_subscriptions`
+/// write lock, so the two never disagree. Never held across an await.
+pub(crate) type RecreatedSubscriptionIds =
+    std::sync::Arc<std::sync::Mutex<HashMap<SubscriptionHandle, Vec<String>>>>;
+
+/// Lock the recreated-id ledger, tolerating poison: every write leaves the
+/// map consistent, so a panic elsewhere does not invalidate it.
+pub(super) fn recreated_ids(
+    account: &GraphAccount,
+) -> std::sync::MutexGuard<'_, HashMap<SubscriptionHandle, Vec<String>>> {
+    account
+        .recreated_subscription_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GraphSubscriptionGroup {
     pub(crate) subscriptions: Vec<GraphSubscriptionState>,
@@ -394,13 +429,21 @@ async fn roll_back_created(account: &GraphAccount, subscriptions: &[GraphSubscri
 ///   subscription this instance still renews. The registered handle is the
 ///   only door to those.
 ///
+/// Besides the ids the handle names, it deletes the ones the renewal worker
+/// recreated under it on an earlier instance (`RecreatedSubscriptionIds`),
+/// and forgets those once every DELETE has succeeded.
+///
 /// Every id is attempted even when an earlier one fails, and the first
 /// failure is returned: the handle is the engine's only record, and a retry
 /// simply re-deletes (idempotent).
 async fn unsubscribe_orphan(
     account: &GraphAccount,
-    server_ids: Vec<String>,
+    handle: &SubscriptionHandle,
+    mut server_ids: Vec<String>,
 ) -> Result<(), AccountError> {
+    if let Some(recreated) = recreated_ids(account).get(handle) {
+        server_ids.extend(recreated.iter().cloned());
+    }
     let owned: std::collections::HashSet<String> = account
         .graph_subscriptions
         .read()
@@ -427,7 +470,13 @@ async fn unsubscribe_orphan(
             });
         }
     }
-    first_error.map_or(Ok(()), Err)
+    match first_error {
+        Some(error) => Err(error),
+        None => {
+            recreated_ids(account).remove(handle);
+            Ok(())
+        }
+    }
 }
 
 /// The account binding this instance mints into and checks against handles:
@@ -467,7 +516,7 @@ pub(super) async fn unsubscribe_graph(
                 );
                 Ok(())
             }
-            DecodedHandle::Graph { ids, .. } => unsubscribe_orphan(&account, ids).await,
+            DecodedHandle::Graph { ids, .. } => unsubscribe_orphan(&account, &handle, ids).await,
             DecodedHandle::Ews | DecodedHandle::Unrecognized => Ok(()),
         };
     };
@@ -480,7 +529,7 @@ pub(super) async fn unsubscribe_graph(
                     GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
                 )
             })?;
-        remove_subscription_state(&account, &handle, &server_id).await;
+        forget_deleted_subscription(&account, &handle, &server_id).await;
     }
     // "No groups left" and "stop the worker" must be one atomic step against
     // a concurrent `push_subscribe`, which inserts its live group under the
@@ -536,7 +585,7 @@ pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
         };
         for server_id in server_ids {
             match delete_subscription(&account.client, &server_id).await {
-                Ok(()) => remove_subscription_state(account, &handle, &server_id).await,
+                Ok(()) => forget_deleted_subscription(account, &handle, &server_id).await,
                 Err(error) => {
                     let error = into_account_error(
                         error,
@@ -560,7 +609,18 @@ async fn begin_graph_teardown(
     handle: &SubscriptionHandle,
 ) -> Option<Vec<String>> {
     let mut groups = account.graph_subscriptions.write().await;
-    mark_group_tearing_down(&mut groups, handle)
+    let mut server_ids = mark_group_tearing_down(&mut groups, handle)?;
+    // A recreated id the group no longer holds - its row dropped by a
+    // terminal renewal failure, which deletes nothing - is still the
+    // handle's to delete. Read under the same write lock as the snapshot.
+    if let Some(recreated) = recreated_ids(account).get(handle) {
+        for id in recreated {
+            if !server_ids.contains(id) {
+                server_ids.push(id.clone());
+            }
+        }
+    }
+    Some(server_ids)
 }
 
 /// Condemn one handle's group and snapshot the server ids teardown must
@@ -609,6 +669,38 @@ pub(super) async fn remove_subscription_state(
 ) {
     let mut groups = account.graph_subscriptions.write().await;
     remove_subscription_from_groups(&mut groups, handle, server_id);
+}
+
+/// Forget one server subscription whose DELETE has succeeded: its group
+/// state and its entry in the recreated-id ledger.
+///
+/// The ledger is cleared only here, never by `remove_subscription_state`,
+/// because that one is also the renewal worker's terminal-failure path,
+/// which drops the local row without deleting anything. An id the ledger
+/// forgot there would be out of every later teardown's reach while Graph
+/// still held it.
+async fn forget_deleted_subscription(
+    account: &GraphAccount,
+    handle: &SubscriptionHandle,
+    server_id: &str,
+) {
+    let mut groups = account.graph_subscriptions.write().await;
+    remove_subscription_from_groups(&mut groups, handle, server_id);
+    forget_recreated_id(&mut recreated_ids(account), handle, server_id);
+}
+
+/// Drop `server_id` from `handle`'s ledger entry, and the entry once empty.
+pub(super) fn forget_recreated_id(
+    ledger: &mut HashMap<SubscriptionHandle, Vec<String>>,
+    handle: &SubscriptionHandle,
+    server_id: &str,
+) {
+    if let Some(ids) = ledger.get_mut(handle) {
+        ids.retain(|id| id != server_id);
+        if ids.is_empty() {
+            ledger.remove(handle);
+        }
+    }
 }
 
 /// Forget one server subscription only after its DELETE has succeeded.

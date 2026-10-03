@@ -368,6 +368,22 @@ impl Session {
         serde_json::from_value(value).ok()
     }
 
+    /// How many API requests this session admits at once: the advertised
+    /// `maxConcurrentRequests`, with an omitted or zero value read as one.
+    ///
+    /// RFC 8620 s2 requires the field, so a session without it has told us
+    /// nothing, and the only number that cannot earn a request-level `limit`
+    /// error is one: serial work is slower but always legal. This is the
+    /// crate's single reading of the field. The transport's client-wide gate
+    /// and every fan-out width derive from it, so they cannot disagree about
+    /// a session that leaves it out.
+    pub(crate) fn api_request_concurrency(&self) -> usize {
+        self.core_capabilities()
+            .and_then(CoreCapabilities::max_concurrent_requests)
+            .unwrap_or(1)
+            .max(1)
+    }
+
     session_cap_accessor!(
         websocket_capabilities,
         websocket_capability_state,

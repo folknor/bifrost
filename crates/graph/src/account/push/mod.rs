@@ -21,4 +21,6 @@ pub(crate) use ews::{EwsSubscriptionScope, EwsSubscriptionState};
 /// code outside `push` reaches every one of them through the group.
 #[cfg(test)]
 pub(crate) use webhook::GraphSubscriptionState;
-pub(crate) use webhook::{GraphSubscriptionGroup, retire_all_graph_subscriptions};
+pub(crate) use webhook::{
+    GraphSubscriptionGroup, RecreatedSubscriptionIds, retire_all_graph_subscriptions,
+};

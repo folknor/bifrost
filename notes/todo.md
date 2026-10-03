@@ -106,14 +106,18 @@ control-character, caldav-override and push-handle-format items on
 Found while recovering and auditing the laterals work; none is ruled. Verify
 against the code before working any of them.
 
-- **graph: a push handle names the subscriptions of its subscribe time.** A
-  webhook handle now carries its Graph subscription ids, so an orphan torn
-  down on a later instance deletes them. A subscription the renewal worker
-  later recreated under a new id is not named, and lives until Graph expires
-  it; fixing that needs the engine to accept an updated handle. (Binding a
-  handle to its account landed 2026-10-03; unbound `graph1:` handles keep the
-  old reach.) Handles persisted before the id-carrying format keep the old
-  no-op teardown.
+- **graph: `close()` does not delete a subscription a terminal renewal
+  failure dropped.** Filed 2026-10-04 by the cold review of the
+  recreated-id ledger; pre-existing for every subscription, recreated or
+  not. The renewal worker's terminal path removes the row without a DELETE,
+  and `retire_all_graph_subscriptions` walks only registered groups, so if
+  that was the group's last row `close()` never reaches it. The handle's own
+  teardown still does (its ids, plus recreated ones via the ledger). Walking
+  the ledger from `close()` is NOT the fix: the ledger is shared by every
+  instance of one factory, so an old instance closing during a reopen would
+  delete subscriptions the new instance recreated under its live handles.
+  Needs per-instance attribution, or a ruling that terminal failures are
+  left to the handle's teardown and Graph's expiry.
 - **sync: a fixed partition that ends with no completion still completes the
   scope.** Filed 2026-10-03 by the cold review of the PageCheckpoint and
   PartitionEnd change; pre-existing. `run_partition` returns `complete: true`
@@ -123,11 +127,6 @@ against the code before working any of them.
   completion sentinel over ground nothing proved. The open-pages walk already
   treats `None` as "end without completing"; the same rule for fixed plans
   wants a ruling, since it changes when a scope is marked complete.
-- **graph: inventory error exits declare `PartitionEnd::Exhausted`.** Every
-  `Terminated` + `Done` pair in `account/inventory.rs` passes `Exhausted`.
-  Harmless while the engine stops on `Terminated` first, but it records
-  "the listing ran dry" on a failed walk; and the trailing `Done` itself
-  contradicts the `InventoryEvent` contract that `Terminated` ends the walk.
 
 ## bifrost-sync
 
@@ -253,10 +252,7 @@ confirm against the code before working any of them.
   `buffer_unordered(HYDRATE_BATCH_SIZE)` fanouts and the caldav/carddav client
   fanouts, and no in-tree code sets `AccountSpec::concurrency_limit`. Those
   providers advertise no limit of their own, so wiring them means choosing a
-  bound, which is a product decision per provider. A smaller JMAP residual
-  from the cold review: `api_request_concurrency` reads an unadvertised
-  `maxConcurrentRequests` as 1 while the transport reads it as ungated - two
-  readings of one field.
+  bound, which is a product decision per provider.
 
 ## Open items folded in from the third bug-hunt wave (2026-09-04)
 

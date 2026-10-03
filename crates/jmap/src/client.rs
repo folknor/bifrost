@@ -447,7 +447,10 @@ impl ClientBuilder {
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&session_bytes)?;
-        transport.set_api_concurrency(advertised_api_concurrency(&session));
+        // Every installed session hands its limit to the transport, so the
+        // server's bound holds across all of this client's concurrent API
+        // work, not only within one call site's fan-out.
+        transport.set_api_concurrency(session.api_request_concurrency());
 
         Ok(Client {
             tally: None,
@@ -472,15 +475,6 @@ impl ClientBuilder {
             }),
         })
     }
-}
-
-/// The session's `maxConcurrentRequests`, which every installed session hands
-/// to the transport so the server's limit holds across all of this client's
-/// concurrent API work, not only within one call site's fan-out.
-fn advertised_api_concurrency(session: &Session) -> Option<usize> {
-    session
-        .core_capabilities()
-        .and_then(crate::core::session::CoreCapabilities::max_concurrent_requests)
 }
 
 /// Decision note: the well-known path is appended to WHATEVER the caller
@@ -827,7 +821,7 @@ mod session_state_tests {
     /// Records every API concurrency bound the client hands it, and serves a
     /// refreshed session advertising a different one.
     struct LimitRecordingTransport {
-        limits: Arc<Mutex<Vec<Option<usize>>>>,
+        limits: Arc<Mutex<Vec<usize>>>,
     }
 
     fn session_with_limit(limit: usize, state: &str) -> String {
@@ -868,7 +862,7 @@ mod session_state_tests {
             Ok(Bytes::from(session_with_limit(5, "session-2")))
         }
 
-        fn set_api_concurrency(&self, max_concurrent_requests: Option<usize>) {
+        fn set_api_concurrency(&self, max_concurrent_requests: usize) {
             self.limits
                 .lock()
                 .expect("limit lock")
@@ -892,10 +886,35 @@ mod session_state_tests {
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
-        assert_eq!(*limits.lock().expect("limit lock"), vec![Some(3)]);
+        assert_eq!(*limits.lock().expect("limit lock"), vec![3]);
 
         client.refresh_session().await.expect("refresh succeeds");
-        assert_eq!(*limits.lock().expect("limit lock"), vec![Some(3), Some(5)]);
+        assert_eq!(*limits.lock().expect("limit lock"), vec![3, 5]);
+    }
+
+    /// A session that omits `maxConcurrentRequests` gates the transport at
+    /// one, the same reading the fan-outs take. The transport used to read
+    /// an omission as ungated while every fan-out read it as serial.
+    #[test]
+    fn an_unadvertised_limit_gates_the_transport_at_one() {
+        let limits = Arc::new(Mutex::new(Vec::new()));
+        let mut session: serde_json::Value =
+            serde_json::from_str(&session_with_limit(3, "session-1")).expect("fixture parses");
+        session["capabilities"]["urn:ietf:params:jmap:core"]
+            .as_object_mut()
+            .expect("core capability object")
+            .remove("maxConcurrentRequests");
+        let session: Session = serde_json::from_value(session).expect("session parses");
+        assert_eq!(session.api_request_concurrency(), 1);
+        Client::with_transport(
+            LimitRecordingTransport {
+                limits: Arc::clone(&limits),
+            },
+            session,
+            "https://example.test/.well-known/jmap",
+        )
+        .expect("client builds");
+        assert_eq!(*limits.lock().expect("limit lock"), vec![1]);
     }
 
     /// RFC 8620 §2 lets any Session property change. A refresh that only
@@ -991,7 +1010,7 @@ impl<T: HttpTransport> Client<T> {
                 "a custom transport client needs a session URL".to_string(),
             ));
         }
-        transport.set_api_concurrency(advertised_api_concurrency(&session));
+        transport.set_api_concurrency(session.api_request_concurrency());
         Ok(Client {
             tally: None,
             inner: Arc::new(ClientInner {
@@ -1115,7 +1134,7 @@ impl<T: HttpTransport> Client<T> {
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&bytes)?;
-        let limit = advertised_api_concurrency(&session);
+        let limit = session.api_request_concurrency();
         let state = Arc::new(SessionState::derive(session)?);
         // The limit is applied under the same lock as the state it came from,
         // so two overlapping refreshes cannot leave one session's state beside

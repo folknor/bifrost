@@ -13,9 +13,11 @@ use crate::account::push::common::{
     DecodedHandle, account_binding, decode_handle, ews_handle, graph_handle,
 };
 use crate::account::push::dispatch::{push_subscribe, push_unsubscribe};
+use crate::account::push::renewal::{Replacement, record_recreated_id, replace_gone_subscription};
 use crate::account::push::webhook::{
-    GraphSubscriptionGroup, mark_group_tearing_down, remove_subscription_from_groups,
-    resource_for_scope, retire_all_graph_subscriptions, unsubscribe_graph,
+    GraphSubscriptionGroup, mark_group_tearing_down, recreated_ids,
+    remove_subscription_from_groups, remove_subscription_state, resource_for_scope,
+    retire_all_graph_subscriptions, unsubscribe_graph,
 };
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
@@ -795,6 +797,110 @@ async fn an_orphan_never_deletes_what_this_instance_owns() {
             .contains_key(&own),
         "the live group is untouched"
     );
+}
+
+/// The renewal worker replaced a vanished subscription under a handle, the
+/// old instance's teardown never landed, and the engine retries the handle on
+/// a reopened instance of the same factory. The handle string names only the
+/// subscribe-time id; the replacement is reached through the factory-shared
+/// ledger, and forgotten once deleted.
+#[tokio::test]
+async fn an_orphan_teardown_reaches_a_subscription_recreated_on_the_old_instance() {
+    let old_client = GraphClient::new("token");
+    old_client.script_rest([created("recreated")]);
+    let old = webhook_account(&old_client);
+    let handle = graph_handle("ab12", None, ["original"]);
+    old.graph_subscriptions.write().await.insert(
+        handle.clone(),
+        GraphSubscriptionGroup::live(vec![state("original", "/me/events")]),
+    );
+    let endpoint = old.push_endpoint.clone().expect("webhook endpoint");
+    let outcome = replace_gone_subscription(
+        &old,
+        &endpoint,
+        &handle,
+        "original",
+        "/me/events",
+        &[email_scope("/me/events")],
+    )
+    .await
+    .expect("the replacement is created");
+    assert_eq!(outcome, Replacement::Installed);
+
+    let new_client = GraphClient::new("token");
+    new_client.script_rest([deleted(), deleted()]);
+    let mut fresh = GraphAccount::new_for_tests(new_client.clone(), PushMode::GraphSubscriptions);
+    // What `GraphAccountFactory::open` does for every account it opens.
+    fresh.recreated_subscription_ids = std::sync::Arc::clone(&old.recreated_subscription_ids);
+
+    push_unsubscribe(fresh.clone(), handle.clone())
+        .await
+        .expect("orphan teardown succeeds");
+    let requests = urls(&new_client);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].1.ends_with("/subscriptions/original"));
+    assert!(
+        requests[1].1.ends_with("/subscriptions/recreated"),
+        "the recreated subscription is deleted too: {requests:?}"
+    );
+    assert!(
+        recreated_ids(&fresh).is_empty(),
+        "a completed teardown forgets what it deleted"
+    );
+}
+
+/// A recreate of a recreate replaces the ledger's entry rather than growing
+/// it, and a group whose last subscription is deleted takes its entry along.
+#[tokio::test]
+async fn the_recreated_id_ledger_follows_the_group() {
+    let mut ledger = HashMap::new();
+    let handle = graph_handle("ab12", None, ["original"]);
+    record_recreated_id(&mut ledger, &handle, "original", "first");
+    record_recreated_id(&mut ledger, &handle, "first", "second");
+    assert_eq!(ledger.get(&handle), Some(&vec!["second".to_string()]));
+
+    let client = GraphClient::new("token");
+    client.script_rest([deleted()]);
+    let account = webhook_account(&client);
+    account.graph_subscriptions.write().await.insert(
+        handle.clone(),
+        GraphSubscriptionGroup::live(vec![state("second", "/me/events")]),
+    );
+    *recreated_ids(&account) = ledger;
+    unsubscribe_graph(account.clone(), handle.clone())
+        .await
+        .expect("teardown succeeds");
+    assert!(recreated_ids(&account).is_empty());
+}
+
+/// A terminal renewal failure drops a recreated subscription's row without
+/// deleting anything. The id stays in the ledger, so the handle's teardown -
+/// on this instance, while the group lives - still deletes it.
+#[tokio::test]
+async fn a_recreated_id_dropped_by_a_terminal_renewal_failure_is_still_torn_down() {
+    let client = GraphClient::new("token");
+    client.script_rest([deleted(), deleted()]);
+    let account = webhook_account(&client);
+    let handle = graph_handle("ab12", None, ["other"]);
+    account.graph_subscriptions.write().await.insert(
+        handle.clone(),
+        GraphSubscriptionGroup::live(vec![
+            state("other", "/me/events"),
+            state("recreated", "/me/contacts"),
+        ]),
+    );
+    record_recreated_id(&mut recreated_ids(&account), &handle, "gone", "recreated");
+    // The renewal worker's terminal-failure path.
+    remove_subscription_state(&account, &handle, "recreated").await;
+
+    unsubscribe_graph(account.clone(), handle)
+        .await
+        .expect("teardown succeeds");
+    let requests = urls(&client);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].1.ends_with("/subscriptions/other"));
+    assert!(requests[1].1.ends_with("/subscriptions/recreated"));
+    assert!(recreated_ids(&account).is_empty());
 }
 
 /// A handle that is not a well-formed webhook handle chooses nothing to

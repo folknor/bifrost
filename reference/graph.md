@@ -1308,19 +1308,29 @@ unknown EWS handle is correctly a no-op. `push_unsubscribe` routes by the
 decoded handle, not the instance's push mode (a reopen may switch modes), and
 falls back to the mode for a handle of neither shape. For a handle this
 instance knows, `unsubscribe_graph` keeps the registered-group path above. For
-one it does not, `unsubscribe_orphan` DELETEs exactly the ids decoded from
-that handle (404/410 count as gone), attempts every id even after a failure,
-and returns the first failure so the engine keeps the orphan. Two safeguards:
+one it does not, `unsubscribe_orphan` DELETEs the ids decoded from that handle
+plus the ids the renewal worker recreated under it on an earlier instance (404/410
+count as gone), attempts every id even after a failure, and returns the first
+failure so the engine keeps the orphan. The recreated ids live in
+`RecreatedSubscriptionIds`, a ledger keyed by handle that `GraphAccountFactory`
+hands to every account it opens, so it survives the reopens the engine retries
+across: a recreate records its new id there under the same write lock as the
+install, and an id leaves only when its DELETE succeeds (or a whole orphan
+teardown does). A terminal renewal failure drops the id's group row without
+deleting anything, so it stays in the ledger, and `begin_graph_teardown` adds
+ledger ids to its snapshot: an in-instance teardown reaches them too. Two
+safeguards:
 ids this instance currently has registered are skipped (a stale or forged
 handle cannot tear down what this instance still renews), and decoding is
 all-or-nothing with an id allowlist (alphanumerics, `-`, `_`), so a malformed
 handle deletes nothing and cannot inject path or query text into the DELETE
 URL. An old instance's orphan retried on a new one therefore deletes the old
-ids only. Known limits: the handle embeds the ids present at subscribe time,
-so a subscription the renewal worker later recreated under a new id is not
-named by an orphan's handle and lives until Graph expires it; and an unbound
-`graph1:` handle keeps the old reach, deleting its ids on any account it is
-handed to.
+ids only. Known limits: the ledger is process-local, like the engine's own
+subscription registry, so a handle that outlives the process (or reaches an
+account built outside the factory) reaches only the ids it was minted with,
+and a recreated subscription it does not name lives until Graph expires it;
+and an unbound `graph1:` handle keeps the old reach, deleting its ids on any
+account it is handed to.
 
 The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the

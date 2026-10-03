@@ -100,6 +100,11 @@ pub(crate) struct GraphAccount {
     pub(crate) graph_subscriptions:
         Arc<RwLock<HashMap<SubscriptionHandle, GraphSubscriptionGroup>>>,
     pub(crate) graph_worker: worker_slot::WorkerSlot,
+    /// Subscription ids recreated under a handle the handle cannot name.
+    /// Unlike the rest of the push state this is NOT fresh per instance: the
+    /// factory hands every account it opens the same ledger, so an orphan
+    /// retried on a reopened instance still reaches them.
+    pub(crate) recreated_subscription_ids: push::RecreatedSubscriptionIds,
     /// Whether push is currently believed to be DOWN, so `Reconnected` can be
     /// edge-triggered off it rather than published on every successful
     /// subscribe.
@@ -354,6 +359,7 @@ impl GraphAccount {
             folder_tree: Arc::new(RwLock::new(FolderTree::default())),
             graph_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             graph_worker: worker_slot::worker_slot(),
+            recreated_subscription_ids: Arc::default(),
             push_disconnected: Arc::new(AtomicBool::new(false)),
             ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             ews_worker: worker_slot::worker_slot(),
@@ -629,6 +635,9 @@ pub struct GraphAccountFactory {
     shared_mailboxes: Vec<String>,
     public_folders: Option<PublicFolderScope>,
     delegate_discovery: bool,
+    /// Handed to every account this factory opens; see
+    /// `GraphAccount::recreated_subscription_ids`.
+    recreated_subscription_ids: push::RecreatedSubscriptionIds,
 }
 
 impl GraphAccountFactory {
@@ -641,6 +650,7 @@ impl GraphAccountFactory {
             shared_mailboxes: Vec::new(),
             public_folders: None,
             delegate_discovery: false,
+            recreated_subscription_ids: Arc::default(),
         }
     }
 
@@ -738,6 +748,7 @@ impl AccountFactory for GraphAccountFactory {
         let shared_mailboxes = self.shared_mailboxes.clone();
         let public_folders = self.public_folders.clone();
         let delegate_discovery = self.delegate_discovery;
+        let recreated_subscription_ids = Arc::clone(&self.recreated_subscription_ids);
         Box::pin(async move {
             client.attach_account(account_id);
             let profile = client.get_profile().await.map_err(|e| {
@@ -757,6 +768,7 @@ impl AccountFactory for GraphAccountFactory {
                 public_folders,
                 user_email.clone(),
             );
+            account.recreated_subscription_ids = recreated_subscription_ids;
 
             // Opt-in delegate enumeration: additive to config-supplied
             // shared mailboxes, deduped by routing key. Autodiscover is a
