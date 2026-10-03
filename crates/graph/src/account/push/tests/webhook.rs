@@ -15,9 +15,9 @@ use crate::account::push::common::{
 use crate::account::push::dispatch::{push_subscribe, push_unsubscribe};
 use crate::account::push::renewal::{Replacement, record_recreated_id, replace_gone_subscription};
 use crate::account::push::webhook::{
-    GraphSubscriptionGroup, mark_group_tearing_down, recreated_ids,
-    remove_subscription_from_groups, remove_subscription_state, resource_for_scope,
-    retire_all_graph_subscriptions, unsubscribe_graph,
+    GraphSubscriptionGroup, mark_group_tearing_down, mark_subscription_terminated, recreated_ids,
+    remove_subscription_from_groups, resource_for_scope, retire_all_graph_subscriptions,
+    unsubscribe_graph,
 };
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
@@ -873,11 +873,11 @@ async fn the_recreated_id_ledger_follows_the_group() {
     assert!(recreated_ids(&account).is_empty());
 }
 
-/// A terminal renewal failure drops a recreated subscription's row without
-/// deleting anything. The id stays in the ledger, so the handle's teardown -
-/// on this instance, while the group lives - still deletes it.
+/// A terminal renewal failure flags a recreated subscription instead of
+/// dropping its row, so the handle's teardown still deletes it and the ledger
+/// forgets it only then.
 #[tokio::test]
-async fn a_recreated_id_dropped_by_a_terminal_renewal_failure_is_still_torn_down() {
+async fn a_recreated_id_flagged_by_a_terminal_renewal_failure_is_still_torn_down() {
     let client = GraphClient::new("token");
     client.script_rest([deleted(), deleted()]);
     let account = webhook_account(&client);
@@ -891,7 +891,12 @@ async fn a_recreated_id_dropped_by_a_terminal_renewal_failure_is_still_torn_down
     );
     record_recreated_id(&mut recreated_ids(&account), &handle, "gone", "recreated");
     // The renewal worker's terminal-failure path.
-    remove_subscription_state(&account, &handle, "recreated").await;
+    mark_subscription_terminated(&account, &handle, "recreated").await;
+    assert_eq!(
+        recreated_ids(&account).get(&handle),
+        Some(&vec!["recreated".to_string()]),
+        "flagging deletes nothing, so the ledger keeps the id"
+    );
 
     unsubscribe_graph(account.clone(), handle)
         .await
@@ -901,6 +906,30 @@ async fn a_recreated_id_dropped_by_a_terminal_renewal_failure_is_still_torn_down
     assert!(requests[0].1.ends_with("/subscriptions/other"));
     assert!(requests[1].1.ends_with("/subscriptions/recreated"));
     assert!(recreated_ids(&account).is_empty());
+}
+
+/// When the terminated subscription is its group's ONLY one, the group must
+/// survive for `close()` to reach it. Removing the row used to remove the
+/// group, and `close()` - which walks registered groups - never sent the
+/// DELETE while Graph kept delivering until expiry.
+#[tokio::test]
+async fn close_deletes_a_subscription_whose_renewal_failed_terminally() {
+    let client = GraphClient::new("token");
+    client.script_rest([deleted()]);
+    let account = webhook_account(&client);
+    let handle = graph_handle("ab12", None, ["only"]);
+    account.graph_subscriptions.write().await.insert(
+        handle.clone(),
+        GraphSubscriptionGroup::live(vec![state("only", "/me/events")]),
+    );
+    mark_subscription_terminated(&account, &handle, "only").await;
+
+    retire_all_graph_subscriptions(&account).await;
+    let requests = urls(&client);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].0, "DELETE");
+    assert!(requests[0].1.ends_with("/subscriptions/only"));
+    assert!(account.graph_subscriptions.read().await.is_empty());
 }
 
 /// A handle that is not a well-formed webhook handle chooses nothing to

@@ -1714,6 +1714,7 @@ mod tests {
                         ty: ObjectType::Email,
                     }],
                     warned_unparseable_expiry: false,
+                    terminated: false,
                 },
                 push::GraphSubscriptionState {
                     server_id: "two".to_string(),
@@ -1724,6 +1725,7 @@ mod tests {
                         ty: ObjectType::Event,
                     }],
                     warned_unparseable_expiry: false,
+                    terminated: false,
                 },
             ]),
         );

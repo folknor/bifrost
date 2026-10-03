@@ -106,6 +106,14 @@ pub(crate) struct GraphSubscriptionState {
     /// `expires_at` for this subscription, so the warning fires once per
     /// subscription rather than once per renewal tick.
     pub(crate) warned_unparseable_expiry: bool,
+    /// A renewal of this subscription failed terminally (auth lost,
+    /// permission revoked and the like), so the renewal worker no longer
+    /// renews or recreates it. The row stays registered: a subscription we
+    /// stopped renewing is not one that stopped existing, and `close()` and
+    /// `push_unsubscribe` still DELETE it. Removing the row instead took a
+    /// group's last subscription out of `close()`'s reach while Graph still
+    /// held it (ruled 2026-10-04).
+    pub(crate) terminated: bool,
 }
 
 /// The webhook arm of `push_subscribe`: create one server subscription per
@@ -324,6 +332,7 @@ async fn create_and_register(
                     resource,
                     scopes: covered.into_iter().map(|(_, scope)| scope).collect(),
                     warned_unparseable_expiry: false,
+                    terminated: false,
                 });
             }
             Err(error) => {
@@ -609,18 +618,7 @@ async fn begin_graph_teardown(
     handle: &SubscriptionHandle,
 ) -> Option<Vec<String>> {
     let mut groups = account.graph_subscriptions.write().await;
-    let mut server_ids = mark_group_tearing_down(&mut groups, handle)?;
-    // A recreated id the group no longer holds - its row dropped by a
-    // terminal renewal failure, which deletes nothing - is still the
-    // handle's to delete. Read under the same write lock as the snapshot.
-    if let Some(recreated) = recreated_ids(account).get(handle) {
-        for id in recreated {
-            if !server_ids.contains(id) {
-                server_ids.push(id.clone());
-            }
-        }
-    }
-    Some(server_ids)
+    mark_group_tearing_down(&mut groups, handle)
 }
 
 /// Condemn one handle's group and snapshot the server ids teardown must
@@ -662,23 +660,33 @@ pub(super) async fn ensure_graph_worker(account: GraphAccount) {
     .await;
 }
 
-pub(super) async fn remove_subscription_state(
+/// Stop renewing one subscription whose renewal failed terminally, keeping
+/// its row so teardown can still DELETE it (see
+/// `GraphSubscriptionState::terminated`).
+pub(super) async fn mark_subscription_terminated(
     account: &GraphAccount,
     handle: &SubscriptionHandle,
     server_id: &str,
 ) {
     let mut groups = account.graph_subscriptions.write().await;
-    remove_subscription_from_groups(&mut groups, handle, server_id);
+    if let Some(state) = groups.get_mut(handle).and_then(|group| {
+        group
+            .subscriptions
+            .iter_mut()
+            .find(|state| state.server_id == server_id)
+    }) {
+        state.terminated = true;
+    }
 }
 
 /// Forget one server subscription whose DELETE has succeeded: its group
 /// state and its entry in the recreated-id ledger.
 ///
-/// The ledger is cleared only here, never by `remove_subscription_state`,
-/// because that one is also the renewal worker's terminal-failure path,
-/// which drops the local row without deleting anything. An id the ledger
-/// forgot there would be out of every later teardown's reach while Graph
-/// still held it.
+/// Teardown's only way of forgetting a subscription, so on that path a row is
+/// never dropped without the DELETE that makes forgetting it honest. The other
+/// exits are not teardown: a recreate swaps a vanished row (and its ledger
+/// id) for its replacement, and a fully successful orphan teardown clears the
+/// handle's ledger entry, having deleted everything in it.
 async fn forget_deleted_subscription(
     account: &GraphAccount,
     handle: &SubscriptionHandle,

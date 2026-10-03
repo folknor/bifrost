@@ -20,7 +20,7 @@ use super::common::{
     PushEndpoint, announce_push_recovered, mark_push_disconnected, mark_push_reconnected,
 };
 use super::webhook::{
-    GraphSubscriptionGroup, GraphSubscriptionState, recreated_ids, remove_subscription_state,
+    GraphSubscriptionGroup, GraphSubscriptionState, mark_subscription_terminated, recreated_ids,
 };
 
 pub(super) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -178,7 +178,9 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
                         );
                     }
                     if account_error.recovery().is_terminal() {
-                        remove_subscription_state(&account, &handle, &server_id).await;
+                        // Flagged, not removed: renewing stops, but teardown
+                        // must still be able to DELETE it.
+                        mark_subscription_terminated(&account, &handle, &server_id).await;
                         let _ = account.push_tx.send(WatchEvent::Terminated(account_error));
                     }
                     had_error = true;
@@ -202,10 +204,15 @@ pub(super) async fn run_graph_subscription_worker(account: GraphAccount) {
     }
 }
 
+/// Whether any registered subscription still needs renewing. A condemned
+/// group and a `terminated` row both stay registered for teardown's sake and
+/// both need nothing from the worker, so neither keeps it alive.
 pub(super) fn has_live_graph_subscription_group(
     groups: &HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
 ) -> bool {
-    groups.values().any(|group| !group.tearing_down)
+    groups.values().any(|group| {
+        !group.tearing_down && group.subscriptions.iter().any(|state| !state.terminated)
+    })
 }
 
 /// Clear the worker slot on the way out of `run_graph_subscription_worker`,
@@ -243,6 +250,11 @@ pub(super) fn due_renewals(
             continue;
         }
         for state in &mut group.subscriptions {
+            // Its renewal failed terminally; renewing or recreating it again
+            // would repeat the failure every tick. It waits for teardown.
+            if state.terminated {
+                continue;
+            }
             match check_expiry(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
                 ExpiryCheck::Live => continue,
                 ExpiryCheck::ExpiringSoon => {}
@@ -369,6 +381,7 @@ async fn create_and_install_replacement(
         resource,
         scopes,
         warned_unparseable_expiry: false,
+        terminated: false,
     };
     let created_id = replacement.server_id.clone();
 

@@ -101,30 +101,6 @@ control-character, caldav-override and push-handle-format items on
   nothing because the request had already gone out; and the first hop is
   never gated before sending, only redirect hops are.
 
-## Found 2026-09-30, not fixed
-
-Found while recovering and auditing the laterals work; none is ruled. Verify
-against the code before working any of them.
-
-- **graph: `close()` does not delete a subscription a terminal renewal
-  failure dropped.** Filed 2026-10-04 by the cold review of the
-  recreated-id ledger; pre-existing for every subscription, recreated or
-  not. The renewal worker's terminal path removes the row without a DELETE,
-  and `retire_all_graph_subscriptions` walks only registered groups, so if
-  that was the group's last row `close()` never reaches it. The handle's own
-  teardown still does (its ids, plus recreated ones via the ledger). Walking
-  the ledger from `close()` is NOT the fix: the ledger is shared by every
-  instance of one factory, so an old instance closing during a reopen would
-  delete subscriptions the new instance recreated under its live handles.
-  Needs per-instance attribution, or a ruling that terminal failures are
-  left to the handle's teardown and Graph's expiry.
-  RULED 2026-10-04, not yet built: keep the row and flag it. A terminal
-  renewal failure sets a `terminated` flag on `GraphSubscriptionState`
-  instead of removing the row; the renewal worker skips flagged rows, while
-  `unsubscribe_push` and `close()` still DELETE them. The worker's "anything
-  left to renew" check ignores flagged rows so it still retires. The id never
-  leaves its group, so the ledger problem goes with it. The owner expects the
-  flag to be useful elsewhere later.
 
 ## bifrost-sync
 

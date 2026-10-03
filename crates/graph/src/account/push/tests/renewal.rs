@@ -99,9 +99,10 @@ fn a_replacement_never_resurrects_an_unsubscribed_handle() {
     assert_eq!(groups[&other].subscriptions.len(), 1);
 }
 
-/// A group that lost its stale row some other way (a terminal renewal
-/// on the same tick) still takes the replacement: the handle is live,
-/// so the resource needs coverage.
+/// A group that no longer holds the stale row still takes the replacement:
+/// the handle is live, so the resource needs coverage. A terminal renewal
+/// used to be one way to lose the row; it now flags the row instead, but the
+/// install must not depend on the row still being there.
 #[test]
 fn a_replacement_installs_into_a_live_group_that_lost_the_stale_row() {
     let handle = SubscriptionHandle("h".to_string());
@@ -554,15 +555,15 @@ async fn a_terminal_renewal_failure_names_the_scope_that_lost_coverage() {
     );
 
     ensure_graph_worker(account.clone()).await;
-    // A terminal failure retires the local state, so the group emptying
-    // is the signal the tick has run.
+    // A terminal failure flags the row (it stays registered for teardown),
+    // so the flag is the signal the tick has run.
     for _ in 0..64 {
         let retired = account
             .graph_subscriptions
             .read()
             .await
             .values()
-            .all(|group| group.subscriptions.is_empty());
+            .all(|group| group.subscriptions.iter().all(|state| state.terminated));
         if retired {
             break;
         }
@@ -581,8 +582,41 @@ async fn a_terminal_renewal_failure_names_the_scope_that_lost_coverage() {
     }
     let terminated = terminated.expect("a terminal failure is reported");
     assert_eq!(terminated.scope(), Some(&ErrorScope::Cursor(scope)));
+    let groups = account.graph_subscriptions.read().await;
+    let rows: Vec<_> = groups
+        .values()
+        .flat_map(|group| &group.subscriptions)
+        .collect();
+    assert_eq!(rows.len(), 1, "the row stays registered for teardown");
+    assert!(rows[0].terminated);
+    drop(groups);
 
     account.shutdown.cancel();
+}
+
+/// A terminated row needs nothing from the renewal worker: it is never due,
+/// and a group holding only terminated rows does not keep the worker alive.
+#[test]
+fn a_terminated_row_is_never_due_and_keeps_no_worker_alive() {
+    let handle = SubscriptionHandle("h".to_string());
+    let mut terminated = expiring("dead", "/me/events");
+    terminated.terminated = true;
+    let mut groups = HashMap::from([(
+        handle.clone(),
+        GraphSubscriptionGroup::live(vec![terminated]),
+    )]);
+    assert!(due_renewals(&mut groups).is_empty());
+    assert!(!has_live_graph_subscription_group(&groups));
+
+    groups
+        .get_mut(&handle)
+        .expect("group")
+        .subscriptions
+        .push(expiring("alive", "/me/contacts"));
+    let due = due_renewals(&mut groups);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].server_id, "alive");
+    assert!(has_live_graph_subscription_group(&groups));
 }
 
 /// The recovery edge of the same loop: a retryable renewal failure

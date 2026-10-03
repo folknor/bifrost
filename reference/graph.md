@@ -1315,11 +1315,19 @@ failure so the engine keeps the orphan. The recreated ids live in
 `RecreatedSubscriptionIds`, a ledger keyed by handle that `GraphAccountFactory`
 hands to every account it opens, so it survives the reopens the engine retries
 across: a recreate records its new id there under the same write lock as the
-install, and an id leaves only when its DELETE succeeds (or a whole orphan
-teardown does). A terminal renewal failure drops the id's group row without
-deleting anything, so it stays in the ledger, and `begin_graph_teardown` adds
-ledger ids to its snapshot: an in-instance teardown reaches them too. Two
-safeguards:
+install, and on teardown an id leaves only when its DELETE succeeds, at the
+same point (`forget_deleted_subscription`) where its row leaves its group. The
+other exits are not teardown: a later recreate swaps the id for its own, and a
+fully successful orphan teardown clears the handle's entry.
+
+A terminal renewal failure (auth lost, permission revoked and the like) does
+not remove the row: it sets `GraphSubscriptionState::terminated`. The renewal
+worker skips a flagged row (`due_renewals`) and a group holding only flagged
+rows does not keep the worker alive (`has_live_graph_subscription_group`), but
+`push_unsubscribe` and `close()` still DELETE it. Removing the row instead
+took a group's last subscription out of `close()`'s reach - only an explicit
+teardown of the handle could still find it - and Graph kept delivering until
+expiry (ruled 2026-10-04). Two safeguards:
 ids this instance currently has registered are skipped (a stale or forged
 handle cannot tear down what this instance still renews), and decoding is
 all-or-nothing with an id allowlist (alphanumerics, `-`, `_`), so a malformed

@@ -28,6 +28,7 @@ pub(super) fn state(server_id: &str, resource: &str) -> GraphSubscriptionState {
             ty: ObjectType::Email,
         }],
         warned_unparseable_expiry: false,
+        terminated: false,
     }
 }
 
@@ -43,6 +44,7 @@ pub(super) fn expiring(server_id: &str, resource: &str) -> GraphSubscriptionStat
             ty: ObjectType::Email,
         }],
         warned_unparseable_expiry: false,
+        terminated: false,
     }
 }
 
