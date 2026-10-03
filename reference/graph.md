@@ -1293,9 +1293,16 @@ Handles are self-describing so a teardown retried on a newer account instance
 still works. The engine keeps a handle whose teardown failed and retries
 `push_unsubscribe` on whatever instance is current; after a reopen that
 instance's `graph_subscriptions` map has never seen it. A webhook handle is the
-opaque string `graph1:<hex token>:<id>,<id>,...` carrying the Graph
-subscription ids (server-global per tenant; the account's credentials can
-delete them). An EWS handle is `ews1:<hex token>` and carries nothing: the
+opaque string `graph2:<hex token>:<hex account>:<id>,<id>,...` carrying the
+Graph subscription ids (server-global per tenant; the account's credentials can
+delete them) and the hex-encoded engine `AccountId` that minted it. An orphan
+whose account does not match this instance's is left alone, so a handle from
+another account in the same tenant cannot delete that account's subscriptions;
+the engine reopens an account under the same `AccountId`, so a genuine orphan
+always matches. The unbound `graph1:<hex token>:<id>,...` shape, minted before
+the binding (or when no `AccountNet` is attached), still decodes and tears
+down, carrying no binding to check. An EWS handle is `ews1:<hex token>` and
+carries nothing: the
 streaming subscription is the worker's connection and dies with it, so an
 unknown EWS handle is correctly a no-op. `push_unsubscribe` routes by the
 decoded handle, not the instance's push mode (a reopen may switch modes), and
@@ -1311,9 +1318,9 @@ handle deletes nothing and cannot inject path or query text into the DELETE
 URL. An old instance's orphan retried on a new one therefore deletes the old
 ids only. Known limits: the handle embeds the ids present at subscribe time,
 so a subscription the renewal worker later recreated under a new id is not
-named by an orphan's handle and lives until Graph expires it; a handle is not
-bound to an account, so a webhook handle from another account in the same
-tenant would delete its ids if given to this one.
+named by an orphan's handle and lives until Graph expires it; and an unbound
+`graph1:` handle keeps the old reach, deleting its ids on any account it is
+handed to.
 
 The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the

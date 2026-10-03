@@ -58,7 +58,12 @@ async fn settle(mut done: impl FnMut() -> bool) {
 /// Ablation: restoring through the bare, unchecked write (as the unwind did)
 /// leaves the replacement's handle registered under the id, and the second
 /// incarnation's `unsubscribe_push` hands it to `later`.
-#[tokio::test]
+///
+/// Detach now waits for the reopen lock this parked reattach holds, so the
+/// interleaving is reachable only through that wait's timeout, after which
+/// detach proceeds without the lock. Paused time makes the timeout immediate;
+/// the seal this pins is what still holds on that fallback path.
+#[tokio::test(start_paused = true)]
 async fn an_orphan_restored_after_detachs_take_is_not_inherited_by_the_next_attach() {
     let id = AccountId("detach-orphan-race".into());
     let log = Arc::new(PushLog::default());

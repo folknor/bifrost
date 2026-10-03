@@ -337,6 +337,7 @@ async fn create_and_register(
     // inherits it as an orphan can still DELETE them.
     let handle = graph_handle(
         &token,
+        own_binding(account).as_deref(),
         subscriptions.iter().map(|state| state.server_id.as_str()),
     );
     groups.insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
@@ -429,6 +430,18 @@ async fn unsubscribe_orphan(
     first_error.map_or(Ok(()), Err)
 }
 
+/// The account binding this instance mints into and checks against handles:
+/// its engine `AccountId`, when an `AccountNet` is attached (always, in
+/// production). With none attached, a bound `graph2:` orphan matches nothing
+/// and is left alone - the fail-safe direction, since this instance cannot
+/// prove the handle is its own.
+fn own_binding(account: &GraphAccount) -> Option<String> {
+    account
+        .client
+        .account_net()
+        .map(|net| super::common::account_binding(net.account()))
+}
+
 pub(super) async fn unsubscribe_graph(
     account: GraphAccount,
     handle: SubscriptionHandle,
@@ -438,7 +451,23 @@ pub(super) async fn unsubscribe_graph(
         // a handle already torn down here). The handle itself says what to
         // delete.
         return match decode_handle(&handle) {
-            DecodedHandle::Graph(server_ids) => unsubscribe_orphan(&account, server_ids).await,
+            DecodedHandle::Graph {
+                account: Some(bound),
+                ..
+            } if own_binding(&account).as_deref() != Some(bound.as_str()) => {
+                // Minted by another account. Its ids are reachable with this
+                // account's credentials when both sit in one tenant, so
+                // deleting them would tear down a subscription this account
+                // never owned. Left alone, like an unrecognized handle: this
+                // instance has nothing of its own to retire.
+                tracing::warn!(
+                    target: "bifrost_graph::push",
+                    "push_unsubscribe was handed a webhook handle minted by another account; \
+                     nothing deleted"
+                );
+                Ok(())
+            }
+            DecodedHandle::Graph { ids, .. } => unsubscribe_orphan(&account, ids).await,
             DecodedHandle::Ews | DecodedHandle::Unrecognized => Ok(()),
         };
     };

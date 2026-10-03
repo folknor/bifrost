@@ -4,12 +4,14 @@
 use std::collections::HashMap;
 
 use bifrost_types::{
-    AccountErrorKind, AccountOperation, CursorScope, FolderId, ObjectType, SubscriptionHandle,
-    WatchEvent,
+    AccountErrorKind, AccountId, AccountOperation, CursorScope, FolderId, ObjectType,
+    SubscriptionHandle, WatchEvent,
 };
 
 use crate::account::push::common::PushEndpoint;
-use crate::account::push::common::{DecodedHandle, decode_handle, ews_handle, graph_handle};
+use crate::account::push::common::{
+    DecodedHandle, account_binding, decode_handle, ews_handle, graph_handle,
+};
 use crate::account::push::dispatch::{push_subscribe, push_unsubscribe};
 use crate::account::push::webhook::{
     GraphSubscriptionGroup, mark_group_tearing_down, remove_subscription_from_groups,
@@ -672,8 +674,9 @@ fn urls(client: &GraphClient) -> Vec<(String, String)> {
 /// The handle `push_subscribe` returns must name the server ids, or a reopened
 /// instance has nothing to delete by.
 #[tokio::test]
-async fn a_subscribed_handle_embeds_the_created_server_ids() {
+async fn a_subscribed_handle_embeds_its_account_and_the_created_server_ids() {
     let client = GraphClient::new("token");
+    client.attach_account(AccountId("acct-a".to_string()));
     client.script_rest([created("sub-a")]);
     let account = webhook_account(&client);
     let subscription = push_subscribe(account.clone(), vec![email_scope("inbox")])
@@ -682,7 +685,10 @@ async fn a_subscribed_handle_embeds_the_created_server_ids() {
     let handle = subscription.handle.expect("a handle");
     assert_eq!(
         decode_handle(&handle),
-        DecodedHandle::Graph(vec!["sub-a".to_string()])
+        DecodedHandle::Graph {
+            account: Some(account_binding(&AccountId("acct-a".to_string()))),
+            ids: vec!["sub-a".to_string()],
+        }
     );
     assert!(
         account
@@ -701,7 +707,7 @@ async fn an_orphan_handle_is_torn_down_by_a_fresh_instance() {
     let client = GraphClient::new("token");
     client.script_rest([deleted(), deleted()]);
     let fresh = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    let orphan = graph_handle("ab12", ["old-one", "old-two"]);
+    let orphan = graph_handle("ab12", None, ["old-one", "old-two"]);
 
     push_unsubscribe(fresh, orphan)
         .await
@@ -730,7 +736,7 @@ async fn an_orphan_teardown_treats_404_and_410_as_done() {
         deleted(),
     ]);
     let fresh = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    push_unsubscribe(fresh, graph_handle("ab12", ["a", "b", "c"]))
+    push_unsubscribe(fresh, graph_handle("ab12", None, ["a", "b", "c"]))
         .await
         .expect("already-gone rows are not failures");
     assert_eq!(client.take_rest_requests().len(), 3);
@@ -749,7 +755,7 @@ async fn an_orphan_teardown_attempts_every_id_and_reports_a_failure() {
         deleted(),
     ]);
     let fresh = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    push_unsubscribe(fresh, graph_handle("ab12", ["a", "b"]))
+    push_unsubscribe(fresh, graph_handle("ab12", None, ["a", "b"]))
         .await
         .expect_err("the failed DELETE is reported");
     assert_eq!(client.take_rest_requests().len(), 2);
@@ -764,7 +770,7 @@ async fn an_orphan_never_deletes_what_this_instance_owns() {
     let client = GraphClient::new("token");
     client.script_rest([deleted()]);
     let new_instance = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    let own = graph_handle("cd34", ["new-sub"]);
+    let own = graph_handle("cd34", None, ["new-sub"]);
     new_instance.graph_subscriptions.write().await.insert(
         own.clone(),
         GraphSubscriptionGroup::live(vec![state("new-sub", "/me/events")]),
@@ -773,7 +779,7 @@ async fn an_orphan_never_deletes_what_this_instance_owns() {
     // A stale or forged handle that names both the old id and the live one.
     push_unsubscribe(
         new_instance.clone(),
-        graph_handle("ab12", ["old-sub", "new-sub"]),
+        graph_handle("ab12", None, ["old-sub", "new-sub"]),
     )
     .await
     .expect("orphan teardown");
@@ -810,6 +816,38 @@ async fn a_forged_handle_issues_no_requests() {
     assert!(client.take_rest_requests().is_empty());
 }
 
+/// A handle names the account that minted it. Handed to an instance of a
+/// DIFFERENT account - reachable with this account's credentials when both
+/// sit in one tenant - it deletes nothing; handed to an instance of the same
+/// account, as a reopen does, it tears its orphan down.
+#[tokio::test]
+async fn an_orphan_bound_to_another_account_deletes_nothing() {
+    let client = GraphClient::new("token");
+    client.attach_account(AccountId("acct-a".to_string()));
+    client.script_rest([deleted()]);
+    let instance = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+
+    let foreign = account_binding(&AccountId("acct-b".to_string()));
+    push_unsubscribe(
+        instance.clone(),
+        graph_handle("ab12", Some(&foreign), ["their-sub"]),
+    )
+    .await
+    .expect("another account's handle is not this instance's to retire");
+    assert!(
+        client.take_rest_requests().is_empty(),
+        "another account's subscription must not be deleted"
+    );
+
+    let own = account_binding(&AccountId("acct-a".to_string()));
+    push_unsubscribe(instance, graph_handle("ab12", Some(&own), ["my-old-sub"]))
+        .await
+        .expect("the same account's orphan tears down");
+    let requests = urls(&client);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(requests[0].1.ends_with("/subscriptions/my-old-sub"));
+}
+
 /// A reopen can switch the push mode. The handle decides, not the mode: a
 /// webhook orphan on an EWS instance still deletes, and an EWS handle on a
 /// webhook instance touches nothing (EWS state dies with the connection).
@@ -818,7 +856,7 @@ async fn orphan_routing_follows_the_handle_not_the_instance_mode() {
     let client = GraphClient::new("token");
     client.script_rest([deleted()]);
     let ews = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
-    push_unsubscribe(ews, graph_handle("ab12", ["old"]))
+    push_unsubscribe(ews, graph_handle("ab12", None, ["old"]))
         .await
         .expect("teardown");
     assert_eq!(client.take_rest_requests().len(), 1);

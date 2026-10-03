@@ -489,15 +489,16 @@ impl SyncEngine {
     }
 
     /// Explicitly shutdown the engine. Cancels the engine root token FIRST,
-    /// then detaches every attached account in turn, each on its own three
-    /// `EngineConfig::detach_timeout` budgets. Strongly preferred over relying
-    /// on `Drop`, which can only fire a best-effort cancel.
+    /// then detaches every attached account in turn, each on its own per-phase
+    /// `EngineConfig::detach_timeout` budgets (see [`Self::detach`]). Strongly
+    /// preferred over relying on `Drop`, which can only fire a best-effort
+    /// cancel.
     ///
     /// Cancel-first REQUESTS cancellation for every account before any cleanup
     /// begins. It does not establish quiescence, and must not be read as one:
     /// see the comment on the cancel below for what does and does not respond
-    /// promptly. The bound is unchanged at `3 * N * detach_timeout` plus
-    /// overhead for `N` accounts.
+    /// promptly. The bound is `N` worst-case detaches plus overhead for `N`
+    /// accounts.
     pub async fn shutdown(self) -> Result<(), Error> {
         // Cancel the engine root BEFORE the sequential cleanup, not after it.
         //
@@ -505,7 +506,7 @@ impl SyncEngine {
         // so this trips the same token `detach_inner` cancels per account - only
         // earlier, and for all accounts at once. Cancelling afterwards meant the
         // LAST account of N was still fully operational (polling, publishing,
-        // writing) for up to `3 * (N - 1) * detach_timeout` after the consumer
+        // writing) for up to `N - 1` worst-case detaches after the consumer
         // called `shutdown`: a caller that believes it has stopped the engine
         // has in fact only started a queue whose tail is still working.
         //
@@ -580,12 +581,13 @@ impl SyncEngine {
 
     /// Detach an account. Publishes `Stop`, cancels the slot, drains or
     /// aborts workers within `detach_timeout`, drains the ack writer within a
-    /// further `detach_timeout`, closes the live account within a third, and
-    /// removes engine registrations. Each phase is separately clamped rather
-    /// than sharing one deadline, so a wedged worker cannot zero the budget of
-    /// the phase behind it; the worst case is therefore
-    /// `3 * detach_timeout` (15s at the default), and only when a worker, the
-    /// checkpoint store and the provider's close all hang. It does not wait for a
+    /// further `detach_timeout`, waits up to a third for an in-flight
+    /// `reattach` to release the reopen lock, closes the live account within a
+    /// fourth, and removes engine registrations. Each phase is separately
+    /// clamped rather than sharing one deadline, so a wedged worker cannot zero
+    /// the budget of the phase behind it; the worst case is therefore
+    /// `4 * detach_timeout` (20s at the default), and only when a worker, the
+    /// checkpoint store, a reattach and the provider's close all hang. It does not wait for a
     /// consumer-acked safe boundary and does not destroy server-side
     /// push subscriptions; call [`Self::unsubscribe_push`] first for that,
     /// or [`Self::detach_with_teardown`] to do both in one step.
@@ -736,11 +738,12 @@ impl SyncEngine {
         // and `take_ack_writer` exist to prevent, reached by a different route.
         // A straggler worker must not be able to spend the drain's budget.
         //
-        // WORST CASE. `detach` is now bounded by three sequential budgets, each
-        // one `detach_timeout`: the worker awaits, this writer phase, and
-        // `Account::close()`. So at most 3 * `detach_timeout` (15s by default),
-        // and only when all three of a wedged worker, a wedged store and a wedged
-        // provider close coincide. Recorded in `reference/sync.md`, because a
+        // WORST CASE. `detach` is now bounded by four sequential budgets, each
+        // one `detach_timeout`: the worker awaits, this writer phase, the wait
+        // for an in-flight reattach's reopen lock, and `Account::close()`. So at
+        // most 4 * `detach_timeout` (20s by default), and only when a wedged
+        // worker, a wedged store, a wedged reattach and a wedged provider close
+        // all coincide. Recorded in `reference/sync.md`, because a
         // consumer calling `detach` on the way out of a process is bounding its
         // own shutdown by that number.
         //
@@ -819,6 +822,47 @@ impl SyncEngine {
             await_ack_writer_until(writer_deadline, worker, account_id).await;
         }
 
+        // Serialize against a consumer-driven `reattach`. It is not a worker,
+        // and the shutdown cancel above only stops it at its next check. The
+        // writer phase already waited for it incidentally - an in-flight
+        // reattach holds a clone of the writer's sender, so the writer cannot
+        // drain until it returns or the writer phase times out - but only for
+        // that one budget; a reattach outlasting it raced the close below.
+        // Reattach holds this lock from its
+        // open through the swap and the close of the account it replaced, so
+        // taken here, around the load and the close, the two orderings are
+        // both whole. A reattach already in flight finishes first, closing the
+        // old account itself, and `current` is then its replacement, which this
+        // closes. One that has not opened yet waits on the lock and then sees
+        // the cancelled shutdown token and opens nothing. Loading `current`
+        // without the lock let detach close the old account while a reattach
+        // swapped in a replacement nobody would ever close, and then the
+        // reattach closed the old account a second time.
+        //
+        // Clamped like every other await here, on a FRESH `detach_timeout`: a
+        // reattach parked inside a provider open or establish must not hang
+        // detach. On expiry the close proceeds without the lock - the race is
+        // open again, but only for a reattach that already overran a full
+        // timeout - and the log says so.
+        let _reopen_guard = match tokio::time::timeout(
+            self.config.detach_timeout,
+            Arc::clone(&slot.reopen_lock).lock_owned(),
+        )
+        .await
+        {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                tracing::warn!(
+                    target: "bifrost.sync.reopen",
+                    account = ?account_id,
+                    timeout = ?self.config.detach_timeout,
+                    "a reattach held the reopen lock past the detach timeout; closing the \
+                     current account without waiting for it, so a replacement it installs \
+                     may be left unclosed"
+                );
+                None
+            }
+        };
         let current = slot.current.load_full();
         // Clamped, like every other await in this teardown: a provider whose
         // `close()` never returns must not hang `detach` itself, which is the

@@ -140,7 +140,7 @@ pub(crate) async fn push_unsubscribe(
     // instance would otherwise be dropped with its Graph subscription alive.
     // A handle of neither shape falls back to the mode.
     match (decode_handle(&handle), account.push_mode) {
-        (DecodedHandle::Graph(_), _)
+        (DecodedHandle::Graph { .. }, _)
         | (DecodedHandle::Unrecognized, PushMode::GraphSubscriptions) => {
             unsubscribe_graph(account, handle).await
         }

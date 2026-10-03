@@ -70,7 +70,12 @@ fn unsubscribed_on(log: &PushLog, label: &str) -> usize {
 /// handle under the id, and the second incarnation's `unsubscribe_push` hands it
 /// to `later`. Ablation, teardown: dropping the refused handle without deleting
 /// it leaves `first` with no unsubscribe.
-#[tokio::test]
+///
+/// `subscribe_push` holds the reopen lock across its provider call, and detach
+/// now waits for that lock before its registry take, so the interleaving is
+/// reachable only through that wait's timeout. Paused time makes the timeout
+/// immediate; the seal this pins is what holds on that fallback path.
+#[tokio::test(start_paused = true)]
 async fn a_subscription_registered_after_detachs_take_is_torn_down_not_inherited() {
     let id = AccountId("detach-record-race".into());
     let log = Arc::new(PushLog::default());
@@ -135,7 +140,12 @@ async fn a_subscription_registered_after_detachs_take_is_torn_down_not_inherited
 /// `unsubscribe_push` hands it to `later`. Ablation, teardown: dropping the
 /// refused records without deleting them leaves `replacement` with no
 /// unsubscribe.
-#[tokio::test]
+///
+/// Detach now waits for the reopen lock this parked reattach holds, so the
+/// interleaving is reachable only through that wait's timeout. Paused time
+/// makes the timeout immediate; the seal this pins is what holds on that
+/// fallback path.
+#[tokio::test(start_paused = true)]
 async fn a_reattach_commit_after_detachs_take_tears_down_what_it_could_not_register() {
     let id = AccountId("detach-replace-race".into());
     let log = Arc::new(PushLog::default());

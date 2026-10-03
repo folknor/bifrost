@@ -172,7 +172,9 @@ pub(super) fn account_closed_error() -> AccountError {
     )
 }
 
-/// Prefix of a webhook handle: `graph1:<token>:<id>,<id>,...`.
+/// Prefix of a bound webhook handle:
+/// `graph2:<token>:<account>:<id>,<id>,...`, where `<account>` is the
+/// hex-encoded engine `AccountId` that minted it.
 ///
 /// The handle is opaque to the engine but is the ONLY record of the
 /// subscription that survives a reopen. The engine keeps a handle whose
@@ -181,7 +183,20 @@ pub(super) fn account_closed_error() -> AccountError {
 /// subscription map has never heard of it. So the handle carries the Graph
 /// subscription ids themselves; Graph ids are server-global per tenant and any
 /// instance holding the account's credentials can DELETE them.
-const GRAPH_HANDLE_PREFIX: &str = "graph1:";
+///
+/// That reach is why the handle also names its account. A handle from another
+/// account in the same tenant, handed to this instance, would otherwise
+/// DELETE that account's subscriptions; an orphan whose account does not
+/// match this instance's is left alone. The engine reopens an account under
+/// the same `AccountId`, so a genuine orphan always matches. Hex rather than a
+/// hash because a handle outlives the process, and `std`'s hasher is not
+/// stable across releases.
+const GRAPH_HANDLE_PREFIX: &str = "graph2:";
+/// Prefix of an UNBOUND webhook handle, `graph1:<token>:<id>,...`: the shape
+/// minted before handles named their account, and still minted when no
+/// account identity is attached. Decoded so a handle persisted in that shape
+/// can still tear down its orphan; it carries no binding to check.
+const UNBOUND_GRAPH_HANDLE_PREFIX: &str = "graph1:";
 /// Prefix of an EWS handle: `ews1:<token>`. An EWS streaming subscription is
 /// bound to the worker's connection and dies with it, so the handle needs no
 /// server state; the prefix only lets any instance recognise it as such.
@@ -191,7 +206,12 @@ const EWS_HANDLE_PREFIX: &str = "ews1:";
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum DecodedHandle {
     /// A webhook handle and the Graph subscription ids it was minted over.
-    Graph(Vec<String>),
+    /// `account` is the hex-encoded `AccountId` that minted it, or `None` for
+    /// an unbound `graph1:` handle.
+    Graph {
+        account: Option<String>,
+        ids: Vec<String>,
+    },
     /// An EWS handle: no server state outlives the connection.
     Ews,
     /// Not a handle this crate mints in a shape it can act on (including
@@ -209,11 +229,31 @@ fn is_embeddable_subscription_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-/// Build the webhook handle for a registered group. An id that cannot be
-/// embedded is left out (and logged): this instance still tears it down
-/// through its own map, but no other instance could.
+/// The binding a handle carries for `account`: its `AccountId` bytes, hex.
+pub(super) fn account_binding(account: &bifrost_types::AccountId) -> String {
+    hex(account.0.as_bytes())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn is_hex(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Build the webhook handle for a registered group, bound to `account` when
+/// one is known (see `GRAPH_HANDLE_PREFIX`). An id that cannot be embedded is
+/// left out (and logged): this instance still tears it down through its own
+/// map, but no other instance could.
 pub(super) fn graph_handle<'a>(
     token: &str,
+    account: Option<&str>,
     server_ids: impl IntoIterator<Item = &'a str>,
 ) -> SubscriptionHandle {
     let mut ids = Vec::new();
@@ -227,7 +267,13 @@ pub(super) fn graph_handle<'a>(
             );
         }
     }
-    SubscriptionHandle(format!("{GRAPH_HANDLE_PREFIX}{token}:{}", ids.join(",")))
+    let ids = ids.join(",");
+    match account {
+        Some(account) => {
+            SubscriptionHandle(format!("{GRAPH_HANDLE_PREFIX}{token}:{account}:{ids}"))
+        }
+        None => SubscriptionHandle(format!("{UNBOUND_GRAPH_HANDLE_PREFIX}{token}:{ids}")),
+    }
 }
 
 pub(super) fn ews_handle(token: &str) -> SubscriptionHandle {
@@ -242,18 +288,30 @@ pub(super) fn decode_handle(handle: &SubscriptionHandle) -> DecodedHandle {
     if raw.starts_with(EWS_HANDLE_PREFIX) {
         return DecodedHandle::Ews;
     }
-    let Some(rest) = raw.strip_prefix(GRAPH_HANDLE_PREFIX) else {
+    let (token, account, ids) = if let Some(rest) = raw.strip_prefix(GRAPH_HANDLE_PREFIX) {
+        let mut parts = rest.splitn(3, ':');
+        let (Some(token), Some(account), Some(ids)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return DecodedHandle::Unrecognized;
+        };
+        if !is_hex(account) {
+            return DecodedHandle::Unrecognized;
+        }
+        (token, Some(account.to_string()), ids)
+    } else if let Some(rest) = raw.strip_prefix(UNBOUND_GRAPH_HANDLE_PREFIX) {
+        let Some((token, ids)) = rest.split_once(':') else {
+            return DecodedHandle::Unrecognized;
+        };
+        (token, None, ids)
+    } else {
         return DecodedHandle::Unrecognized;
     };
-    let Some((token, ids)) = rest.split_once(':') else {
-        return DecodedHandle::Unrecognized;
-    };
-    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !is_hex(token) {
         return DecodedHandle::Unrecognized;
     }
     let ids: Vec<String> = ids.split(',').map(str::to_string).collect();
     if ids.iter().all(|id| is_embeddable_subscription_id(id)) {
-        DecodedHandle::Graph(ids)
+        DecodedHandle::Graph { account, ids }
     } else {
         DecodedHandle::Unrecognized
     }
@@ -289,25 +347,42 @@ fn token_from_entropy<E: std::fmt::Display>(
             GraphErrorContext::graph(AccountOperation::PushSubscribe),
         )
     })?;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    Ok(out)
+    Ok(hex(&bytes))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodedHandle, decode_handle, ews_handle, graph_handle, token_from_entropy};
+    use super::{
+        DecodedHandle, account_binding, decode_handle, ews_handle, graph_handle, token_from_entropy,
+    };
     use bifrost_types::{AccountErrorKind, InternalErrorKind, RecoveryClass, SubscriptionHandle};
 
     #[test]
-    fn a_graph_handle_round_trips_its_server_ids() {
-        let handle = graph_handle("ab12", ["id-1", "ID_2"]);
+    fn a_graph_handle_round_trips_its_account_and_server_ids() {
+        let binding = account_binding(&bifrost_types::AccountId("work:alice".to_string()));
+        let handle = graph_handle("ab12", Some(&binding), ["id-1", "ID_2"]);
+        assert!(handle.0.starts_with("graph2:"));
         assert_eq!(
             decode_handle(&handle),
-            DecodedHandle::Graph(vec!["id-1".to_string(), "ID_2".to_string()])
+            DecodedHandle::Graph {
+                account: Some(binding),
+                ids: vec!["id-1".to_string(), "ID_2".to_string()],
+            }
+        );
+    }
+
+    /// A handle minted before bindings, or with no account attached, still
+    /// decodes, so an orphan persisted in that shape can be torn down.
+    #[test]
+    fn an_unbound_graph_handle_still_decodes() {
+        let handle = graph_handle("ab12", None, ["id-1"]);
+        assert_eq!(handle.0, "graph1:ab12:id-1");
+        assert_eq!(
+            decode_handle(&handle),
+            DecodedHandle::Graph {
+                account: None,
+                ids: vec!["id-1".to_string()],
+            }
         );
     }
 
@@ -330,6 +405,11 @@ mod tests {
             "graph1:ab12:../me/messages",
             "graph1:ab12:a?b=c",
             "graph1:ab12:ok,a/b",
+            "graph2:ab12:id",
+            "graph2:ab12::id",
+            "graph2:ab12:not-hex:id",
+            "graph2:zz:6869:id",
+            "graph2:ab12:6869:../me",
         ] {
             assert_eq!(
                 decode_handle(&SubscriptionHandle(raw.to_string())),

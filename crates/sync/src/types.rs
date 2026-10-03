@@ -29,13 +29,14 @@ pub struct EngineConfig {
     pub push: PushConfig,
     pub mutation: MutationConfig,
     /// Per-PHASE detach / drop timeout (see `H1`). This is not the cost of a
-    /// detach: teardown runs three phases, each with its own fresh budget -
-    /// awaiting the stream workers, draining the ack writer, then
-    /// `Account::close()` - so a worst-case detach costs `3 * detach_timeout`
-    /// (15s at the default), and only when all three phases wedge.
+    /// detach: teardown runs four phases, each with its own fresh budget -
+    /// awaiting the stream workers, draining the ack writer, waiting for an
+    /// in-flight reattach to release the reopen lock, then `Account::close()` -
+    /// so a worst-case detach costs `4 * detach_timeout` (20s at the default),
+    /// and only when all four phases wedge.
     ///
     /// `SyncEngine::shutdown()` detaches attached accounts SEQUENTIALLY, so
-    /// worst-case engine shutdown is `3 * detach_timeout * n_accounts` plus
+    /// worst-case engine shutdown is `4 * detach_timeout * n_accounts` plus
     /// overhead. Size this knob against that product, not against one phase.
     pub detach_timeout: Duration,
     /// Per-lane cap on the scheduler's `VecDeque`. On overflow the

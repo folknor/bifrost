@@ -110,18 +110,15 @@ against the code before working any of them.
   webhook handle now carries its Graph subscription ids, so an orphan torn
   down on a later instance deletes them. A subscription the renewal worker
   later recreated under a new id is not named, and lives until Graph expires
-  it; fixing that needs the engine to accept an updated handle. A handle is
-  not bound to its account, so a handle from another account in the same
-  tenant would delete that account's ids if handed to this instance. Handles
-  persisted before the id-carrying format keep the old no-op teardown.
-- **sync: detach can close the old account after a reattach opened its
-  replacement.** Detach does not wait for a consumer-driven reattach, so if it
-  loads and closes `current` before the swap, the replacement is never closed
-  and the old account is closed twice. Needs `close()` idempotence confirmed
-  across providers, or detach to exclude an in-flight swap. Separately, a
-  lifecycle scope parked under a pause survives the folder being deleted
-  during that pause and is established after resume for a folder that no
-  longer exists, ending in the retry-budget terminal event.
+  it; fixing that needs the engine to accept an updated handle. (Binding a
+  handle to its account landed 2026-10-03; unbound `graph1:` handles keep the
+  old reach.) Handles persisted before the id-carrying format keep the old
+  no-op teardown.
+- **sync: a parked lifecycle scope outlives its folder.** A lifecycle scope
+  parked under a pause survives the folder being deleted during that pause and
+  is established after resume for a folder that no longer exists, ending in the
+  retry-budget terminal event. (Its sibling, detach racing a reattach's swap,
+  landed 2026-10-03: detach now takes the reopen lock around its close.)
 - **sync: a fixed partition that ends with no completion still completes the
   scope.** Filed 2026-10-03 by the cold review of the PageCheckpoint and
   PartitionEnd change; pre-existing. `run_partition` returns `complete: true`

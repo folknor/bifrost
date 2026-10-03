@@ -141,13 +141,28 @@ teardown order that any reordering of the spawn block would have broken
 silently.
 
 Each teardown PHASE carries its own fresh `detach_timeout`; they do not share one
-deadline. There are three: the worker awaits, then the writer phase (the teardown
+deadline. There are four: the worker awaits, then the writer phase (the teardown
 discard drain and the ack writer's final drain, which run while the writer is the
-last worker alive), then `Account::close()`. So the worst-case `detach` is
-`3 * detach_timeout` - 15s at the default - and only when a wedged worker, a
-checkpoint store that stops answering, and a provider close that never returns all
-coincide. A consumer calling `detach` on the way out of a process is bounding its
-own shutdown by that number.
+last worker alive), then the wait for the slot's reopen lock, then
+`Account::close()`. So the worst-case `detach` is `4 * detach_timeout` - 20s at
+the default - and only when a wedged worker, a checkpoint store that stops
+answering, a reattach wedged inside a provider call, and a provider close that
+never returns all coincide. A consumer calling `detach` on the way out of a
+process is bounding its own shutdown by that number.
+
+The reopen-lock wait is what makes detach and a consumer-driven `reattach`
+exclusive. A reattach is not a worker, so nothing else orders the two: the
+writer phase waits for it only incidentally (an in-flight reattach holds a clone
+of the writer's sender, so the writer cannot drain until it returns) and only
+for that one budget. A reattach outlasting it used to race the close: detach
+closed the old account while the reattach swapped in a replacement nobody would
+ever close, and the reattach then closed the old account a second time. Reattach
+holds the lock from its open through the swap and the close of what it replaced,
+so detach takes it around its load and close: an in-flight reattach finishes
+first and detach then closes its replacement, and one that has not opened yet
+waits, sees the cancelled shutdown token, and opens nothing. On a lock-wait
+timeout the close proceeds without the lock, with a warning, so the race reopens
+only for a reattach that has overrun both the writer phase and the lock wait.
 
 The per-phase budget is not a nicety. A shared deadline silently zeroes whichever
 phase runs last, so a provider stream that neither yields nor ends - on any
@@ -194,8 +209,8 @@ The whole teardown runs under the same `lifecycle_inflight` guard
 acquisition. The slot leaves `engine.accounts` at the top while the
 registry cleanup (invalidation sink, budget gate, backfill registry,
 throttle memberships, bandwidth meter) happens at the very bottom,
-after up to three `detach_timeout` budgets of worker awaits, writer drain and
-`Account::close()`.
+after up to four `detach_timeout` budgets of worker awaits, writer drain, the
+reopen-lock wait and `Account::close()`.
 Without the guard an attach landing in that window saw no slot, no
 in-flight entry, succeeded, and then had its brand-new registrations
 unregistered by the detach's tail - leaving an account that reported
@@ -216,7 +231,7 @@ Cancel-first is load-bearing. Every slot's shutdown token is a child of the root
 per account, only earlier and for all accounts at once. Cancelling AFTER the
 sequential loop - which is what it did - left the last of `N` accounts fully
 operational (polling, publishing, writing) for up to
-`3 * (N - 1) * detach_timeout` after the consumer called `shutdown`: a caller
+`(N - 1)` worst-case detaches after the consumer called `shutdown`: a caller
 that believed it had stopped the engine had only started a queue whose tail was
 still working.
 
@@ -293,7 +308,7 @@ Detach stays SEQUENTIAL. Cancel-first already lets the cooperative workers
 across all accounts wind down concurrently; sequential cleanup then limits the
 overlap of discard processing and provider closes without changing failure
 attribution, and a dying process is the wrong place to introduce fan-out. The
-conservative total is therefore still `3 * N * detach_timeout` plus overhead -
+conservative total is therefore still `4 * N * detach_timeout` plus overhead -
 typical joins get faster, but an unresponsive provider operation or a slow store
 still justifies the bound.
 
