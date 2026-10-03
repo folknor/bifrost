@@ -74,6 +74,7 @@ mod backfill;
 mod bulk;
 mod context;
 pub mod lane;
+mod orphan_teardown;
 mod passthrough;
 mod reattach;
 #[cfg(test)]

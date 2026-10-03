@@ -199,6 +199,30 @@ impl SubscriptionRegistry {
         }
     }
 
+    /// The handles of the account's pure orphans: records nobody wants any
+    /// more whose server-side teardown is still unconfirmed.
+    #[must_use]
+    pub(crate) fn orphans(&self, account: &AccountId) -> Vec<SubscriptionHandle> {
+        self.inner
+            .get(account)
+            .map(|records| {
+                records
+                    .iter()
+                    .filter(|record| !record.desired && record.teardown_unconfirmed)
+                    .map(|record| record.handle.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drop a pure orphan whose teardown has now succeeded. A `desired`
+    /// record under the same handle is left alone.
+    pub(crate) fn remove_orphan(&self, account: &AccountId, handle: &SubscriptionHandle) {
+        if let Some(mut records) = self.inner.get_mut(account) {
+            records.retain(|record| record.desired || &record.handle != handle);
+        }
+    }
+
     #[must_use]
     pub(crate) fn snapshot(&self, account: &AccountId) -> Vec<RegisteredSubscription> {
         self.inner

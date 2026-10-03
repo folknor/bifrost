@@ -195,27 +195,6 @@ container projection itself.
   (`parse_get_item_response_contact`). Whether non-mail public-folder items
   should project onto a contact/event type at all is a product decision, not
   a defect - hence filed rather than built.
-## Cross-crate items from the bug-hunt loop (2026-07-29)
-
-Surfaced while working the per-crate bug-hunt ledgers of that wave (since
-deleted) crate by crate. Each of
-these was found from inside one crate but cannot be resolved there: the fix,
-or the decision, belongs to a shared contract or to a second crate's API.
-They are collected here rather than in the per-crate sections above so they
-can be adjudicated together, from a higher vantage point, later. None is
-blocking; each is a real defect or a real decision, not a cleanup.
-
-- **xc-1 (graph + sync)** The push-teardown retry lane has no *scheduled*
-  retrier. The engine side landed (2026-07 close pass):
-  `SyncEngine::unsubscribe_push` retains a failed handle's registry record
-  as `teardown_unconfirmed` and returns the error, reopen carries
-  unconfirmed records across swaps and retries them, and `bifrost-graph`
-  (G-15) keeps server subscription ids under the handle so those retries
-  can land. What remains is that nothing retries *on its own*: an
-  unconfirmed teardown waits for the next reopen or `unsubscribe_push`
-  call, so an account that never reopens keeps its orphan until the
-  provider expires it (24h for Graph). If that window matters, add a
-  bounded engine-side retry timer for unconfirmed records.
 
 ## Open items folded in from the bug-hunt ledgers (2026-08-23)
 

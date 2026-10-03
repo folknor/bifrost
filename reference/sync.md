@@ -421,8 +421,9 @@ the registry as an orphan (`teardown_unconfirmed`, not `desired`).
 `close()` does not delete server-side subscriptions, so a handle the
 engine forgets is an orphan that keeps delivering until the provider
 expires it; an orphan is therefore never recreated against a replacement,
-is carried across swaps, and is retried by the next reopen or
-`unsubscribe_push`.
+is carried across swaps, and is retried by the next reopen,
+`unsubscribe_push`, or the account's orphan-teardown timer
+(`PushConfig::orphan_teardown_retry_interval`).
 Two independent flags sit on each registry record, and they answer
 different questions. `teardown_unconfirmed` says a server-side teardown
 of the handle was attempted and failed, so it may still be live and its
@@ -2098,10 +2099,24 @@ that routes each item to the matching sender, dropping items
 addressed to unattached accounts.
 
 `MutationConfig` (`fanout_buffer = 256`, `retry_queue_cap =
-4096`) lives on `EngineConfig::mutation`. `PushConfig` is
-currently empty (reserved for future push-only knobs; the
-per-account `WatchEvent` mpsc capacity lives on
-`MultiplexerConfig::watch_capacity`).
+4096`) lives on `EngineConfig::mutation`. `PushConfig` holds
+push-only knobs (the per-account `WatchEvent` mpsc capacity lives
+on `MultiplexerConfig::watch_capacity`): today
+`orphan_teardown_retry_interval`, default 15 minutes, `None` to
+disable. Each attached account runs an `OrphanTeardownRetrier`
+worker that, on that interval, retries `push_unsubscribe` for
+every pure orphan in the subscription registry
+(`teardown_unconfirmed` and not `desired`) and drops the record on
+success. It does not take the slot's reopen lock: it never takes
+records out of the registry, so racing a reopen or
+`unsubscribe_push` costs at most one redundant, idempotent retry,
+whereas holding the lock let a stalled provider call block every
+reattach and consumer push call on the account. A paused account
+skips its passes until resumed. A `desired` record is never
+touched, even when its teardown is unconfirmed: that is an
+aborted reopen's live handle. Without the timer, an orphan on an
+account that never reopens waited for the consumer's next
+`unsubscribe_push` or the provider's expiry.
 
 ## Hydration passthrough
 

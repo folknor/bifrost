@@ -200,10 +200,33 @@ impl Default for BackfillConfig {
 /// Push reconciler config.
 ///
 /// Capacity for the per-account `WatchEvent` mpsc lives on
-/// `MultiplexerConfig::watch_capacity`; this struct is reserved for
-/// future push-only knobs.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PushConfig {}
+/// `MultiplexerConfig::watch_capacity`; push-only knobs live here.
+#[derive(Debug, Clone, Copy)]
+pub struct PushConfig {
+    /// How often each attached account retries the teardown of push
+    /// subscriptions whose `push_unsubscribe` the provider refused and that
+    /// nobody wants any more. `None` disables the timer, leaving the retry
+    /// to the next reopen or `unsubscribe_push`, which is how such an orphan
+    /// was handled before the timer existed: one on an account that never
+    /// reopens keeps delivering until the provider expires it.
+    ///
+    /// Each pass costs nothing when there are no orphans, and one
+    /// `push_unsubscribe` per orphan otherwise; a provider that does not
+    /// know a handle accepts the call, so an orphan the provider has already
+    /// expired clears on the first pass. The pass runs beside reopens and
+    /// consumer calls rather than holding the account's reopen lock, so a
+    /// stalled provider delays only the retry itself. An interval below one
+    /// second is raised to one. Default 15 minutes.
+    pub orphan_teardown_retry_interval: Option<Duration>,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            orphan_teardown_retry_interval: Some(Duration::from_secs(15 * 60)),
+        }
+    }
+}
 
 /// Mutation pipeline config.
 #[derive(Debug, Clone, Copy)]
@@ -348,4 +371,6 @@ pub(crate) enum WorkerRole {
     ReopenListener,
     /// Polls the bandwidth meter into the control's observed-bps atomic.
     BandwidthFeed,
+    /// Retries the teardown of orphaned push subscriptions on a timer.
+    OrphanTeardownRetrier,
 }

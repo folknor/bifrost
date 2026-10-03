@@ -608,6 +608,17 @@ impl SyncEngine {
             }),
         );
 
+        if let Some(interval) = self.config.push.orphan_teardown_retry_interval {
+            let retrier_ctx = ctx.clone();
+            spawn(
+                crate::types::WorkerRole::OrphanTeardownRetrier,
+                tokio::spawn(super::orphan_teardown::run_orphan_teardown_retrier(
+                    retrier_ctx,
+                    interval,
+                )),
+            );
+        }
+
         // Bandwidth feed: optional periodic task that polls
         // `BandwidthMeter::account(id).observed_bps()` into the
         // control's atomic.
