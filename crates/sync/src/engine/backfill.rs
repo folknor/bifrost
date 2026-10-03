@@ -268,21 +268,12 @@ pub(super) async fn run_backfill_orchestrator(ctx: SlotContext, wiring: Backfill
             // hands out no further partition. There is no flag here to
             // forget to check.
             //
-            // For the page walk that also means terminating only on a
-            // genuinely empty page, never on a merely short one. A
-            // partition stream whose server caps a page below the
-            // requested `chunk` (e.g. a JMAP Email/query cap below the
-            // window width) returns fewer entries than asked for; treating
-            // that as exhaustion silently drops every later page. So the
-            // Page partition stream owes us a stronger guarantee than "it
-            // filled the window": it must yield zero entries ONLY when the
-            // scope has no more results past `from`. A window whose ids all
-            // vanished between listing and hydration is NOT
-            // end-of-inventory, and a stream that stopped there would
-            // truncate the backfill; implementations are required to keep
-            // walking past the window until they produce an entry or the
-            // listing runs dry. Given that, `seen == 0` is unambiguous
-            // here, and the driver applies it.
+            // For the page walk that also means terminating only where a
+            // partition's completion declares `PartitionEnd::Exhausted`.
+            // The entry count is not a declaration: a server capping a page
+            // below the requested `chunk` returns a short page with more
+            // behind it, and a window whose ids all vanished between listing
+            // and hydration is empty with more behind it.
             while let Some(partition) = driver.next_partition() {
                 if shutdown.is_cancelled() {
                     return;
@@ -906,14 +897,14 @@ pub(super) fn backfill_complete_recorded(checkpoint: Option<&BackfillCheckpoint>
 /// - The completion sentinel means a prior run reached exhaustion and the
 ///   consumer acked it: skip entirely.
 /// - Any other `page:F:T` resumes at `T`. A SHORT page (`items_done <
-///   T - F`) is deliberately NOT read as exhaustion: the partition
-///   contract is that zero entries means end-of-inventory, but a
-///   partition may legitimately emit fewer entries than its window width
-///   while the scope still has results - ids that vanished between
-///   listing and hydration, or objects dropped for arriving without an
-///   id. Only the completion marker proves exhaustion; a short page
-///   without one costs a single empty probe query on re-attach, whereas
-///   skipping on it would silently drop every message past the window.
+///   T - F`) is deliberately NOT read as exhaustion: only a partition's
+///   declared `PartitionEnd::Exhausted` ends a walk, and a partition may
+///   legitimately emit fewer entries than its window width while the
+///   scope still has results - ids that vanished between listing and
+///   hydration, or objects dropped for arriving without an id. Only the
+///   completion marker proves exhaustion; a final page without one costs
+///   a single probe window on re-attach, whereas skipping on it would
+///   silently drop every message past the window.
 /// - No checkpoint, or an unrecognised partition kind, starts fresh at 0.
 ///
 /// Resume never skips a window the consumer has not durably persisted,

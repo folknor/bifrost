@@ -160,6 +160,7 @@ pub fn establishing_inventory() -> InventoryHook {
                     scope,
                     b"inventory-established",
                 ))),
+                bifrost_types::PartitionEnd::Exhausted,
             ),
         )]
     })

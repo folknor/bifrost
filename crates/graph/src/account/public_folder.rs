@@ -1186,6 +1186,7 @@ pub(crate) fn public_folder_inventory_stream(
         yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(
             bifrost_types::CoverageDomain::full(scope.clone()),
             Some(checkpoint),
+            bifrost_types::PartitionEnd::Exhausted,
         ));
     })
 }

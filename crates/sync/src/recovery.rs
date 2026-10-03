@@ -259,16 +259,12 @@ pub(crate) fn cursor_decode_failure(operation: AccountOperation) -> AccountError
 /// tag of its own the error says `Protocol::Unknown` rather than guessing.
 #[must_use]
 pub(crate) fn batch_boundary_violation(
+    violation: bifrost_types::BatchBoundaryError,
     checkpoint: Option<&bifrost_types::Checkpoint>,
     operation: AccountOperation,
     scope: &CursorScope,
 ) -> AccountError {
-    contract_violation(
-        checkpoint,
-        operation,
-        scope,
-        "a PageBoundary::Partial batch carried a checkpoint",
-    )
+    contract_violation(checkpoint, operation, scope, violation.detail())
 }
 
 /// A live batch carrying a BACKFILL checkpoint. The same classification and the
@@ -613,12 +609,32 @@ mod tests {
     /// reported as "a PageBoundary::Partial batch carried a checkpoint", sending
     /// whoever read the log after the wrong thing entirely. The boundary was fine;
     /// the checkpoint belonged to a lane that stream does not publish on.
+    ///
+    /// The same holds for the inventory checkpoint whose withheld state
+    /// disagrees with its coverage: it rides the boundary helper but is not a
+    /// partial-boundary fault, and must not read as one.
     #[test]
-    fn the_two_contract_violations_do_not_share_a_message() {
+    fn the_contract_violations_do_not_share_a_message() {
         let scope = CursorScope::Account;
         let boundary = format!(
             "{:?}",
-            batch_boundary_violation(None, AccountOperation::SyncChanges, &scope).chain()
+            batch_boundary_violation(
+                bifrost_types::BatchBoundaryError::PartialCarriesCheckpoint,
+                None,
+                AccountOperation::SyncChanges,
+                &scope
+            )
+            .chain()
+        );
+        let disagreement = format!(
+            "{:?}",
+            batch_boundary_violation(
+                bifrost_types::BatchBoundaryError::CheckpointDisagreesWithCoverage,
+                None,
+                AccountOperation::SyncInventory,
+                &scope
+            )
+            .chain()
         );
         let backfill = format!(
             "{:?}",
@@ -629,9 +645,14 @@ mod tests {
             "an operator has to be able to tell a bad boundary from a checkpoint on the \
              wrong lane"
         );
+        assert_ne!(boundary, disagreement);
         assert!(
             backfill.contains("backfill checkpoint"),
             "and the message must name what actually happened: {backfill}"
+        );
+        assert!(
+            disagreement.contains("withheld"),
+            "and the message must name what actually happened: {disagreement}"
         );
     }
 
@@ -653,7 +674,12 @@ mod tests {
             envelope_version: bifrost_types::CHANGE_CURSOR_ENVELOPE_VERSION,
         });
         for error in [
-            batch_boundary_violation(Some(&checkpoint), AccountOperation::SyncChanges, &scope),
+            batch_boundary_violation(
+                bifrost_types::BatchBoundaryError::PartialCarriesCheckpoint,
+                Some(&checkpoint),
+                AccountOperation::SyncChanges,
+                &scope,
+            ),
             backfill_checkpoint_on_changes(
                 Some(&checkpoint),
                 AccountOperation::SyncChanges,

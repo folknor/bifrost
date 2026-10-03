@@ -135,6 +135,7 @@ impl Account for RecorderAccount {
             InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(
                 bifrost_types::CoverageDomain::full(scope),
                 None,
+                bifrost_types::PartitionEnd::Exhausted,
             ))
         }))
     }
@@ -985,7 +986,8 @@ async fn default_partition_stream_serves_full_and_rejects_the_rest() {
         .await;
     assert!(matches!(
         events.as_slice(),
-        [InventoryEvent::Done(completion)] if completion.checkpoint.is_none()
+        [InventoryEvent::Done(completion)]
+            if completion.checkpoint == bifrost_types::PageCheckpoint::None
     ));
     assert_eq!(account.calls(), vec!["inventory_stream".to_string()]);
 

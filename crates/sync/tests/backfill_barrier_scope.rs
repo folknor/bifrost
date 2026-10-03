@@ -22,7 +22,7 @@ use bifrost_types::{
     AccountErrorBuilder, AccountErrorKind, AccountFactory, AccountId, Cause, Checkpoint,
     CoverageDomain, CursorScope, DiagnosticText, Fingerprint, InventoryBatch, InventoryCompletion,
     InventoryCoverageReport, InventoryEntry, InventoryEvent, InventoryObligation,
-    InventoryPartition, InventoryPartitioning, ObjectId, ObligationKey, PageBoundary,
+    InventoryPartition, InventoryPartitioning, ObjectId, ObligationKey, PageBoundary, PartitionEnd,
     RegionRecovery, RequestCause, RequestErrorKind, ServerVersion, SyncEvent,
 };
 
@@ -107,6 +107,7 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
                 InventoryEvent::Done(InventoryCompletion::complete(
                     CoverageDomain::full(scope.clone()),
                     None,
+                    PartitionEnd::MoreBeyond,
                 )),
             ],
             // The second partition delivers three real entries and then
@@ -120,6 +121,7 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
             _ => vec![InventoryEvent::Done(InventoryCompletion::complete(
                 CoverageDomain::full(scope.clone()),
                 None,
+                PartitionEnd::Exhausted,
             ))],
         }
     }));

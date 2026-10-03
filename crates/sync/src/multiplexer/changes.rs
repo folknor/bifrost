@@ -140,9 +140,10 @@ pub async fn drive_changes_stream(
         // account contradicting its own stream contract, and there is no
         // reason to trust its items more than its boundary.
         if let SyncEvent::Batch(batch) = &event
-            && batch.validate_boundary().is_err()
+            && let Err(violation) = batch.validate_boundary()
         {
             let error = crate::recovery::batch_boundary_violation(
+                violation,
                 batch.checkpoint.as_ref(),
                 bifrost_types::AccountOperation::SyncChanges,
                 &scope,

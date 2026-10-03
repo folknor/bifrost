@@ -35,7 +35,7 @@ use bifrost_types::{
     AccountFactory, AccountId, Checkpoint, Control, CoverageDomain, CursorScope, Fingerprint,
     FolderId, InventoryBatch, InventoryCompletion, InventoryCoverageReport, InventoryEntry,
     InventoryEvent, InventoryPartition, InventoryPartitioning, MembershipScope, ObjectId,
-    PageBoundary, ScopeLifecycle, ScopeLifecycleEvent, ServerVersion,
+    PageBoundary, PartitionEnd, ScopeLifecycle, ScopeLifecycleEvent, ServerVersion,
 };
 
 const PAGE: u32 = 2;
@@ -106,6 +106,7 @@ fn endless_stub(
             InventoryEvent::Done(InventoryCompletion::complete(
                 CoverageDomain::full(scope.clone()),
                 None,
+                PartitionEnd::MoreBeyond,
             )),
         ]
     }));

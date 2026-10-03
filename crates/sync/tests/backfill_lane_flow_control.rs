@@ -36,8 +36,8 @@ use bifrost_sync::{
 use bifrost_types::{
     AccountFactory, AccountId, Batch, Change, Checkpoint, CoverageDomain, CursorScope, Fingerprint,
     InventoryBatch, InventoryCompletion, InventoryCoverageReport, InventoryEntry, InventoryEvent,
-    InventoryPartition, InventoryPartitioning, ObjectId, PageBoundary, ServerVersion, SyncEvent,
-    WarningKind,
+    InventoryPartition, InventoryPartitioning, ObjectId, PageBoundary, PartitionEnd, ServerVersion,
+    SyncEvent, WarningKind,
 };
 
 /// Page width of every backfill partition in these tests, and how many of them
@@ -114,9 +114,11 @@ fn paged_stub(scope: &CursorScope) -> common::StubAccount {
                 )
                 .expect("a Final page with no checkpoint is boundary-valid"),
             ),
+            // A fixed plan walks every window whatever this says.
             InventoryEvent::Done(InventoryCompletion::complete(
                 CoverageDomain::full(scope.clone()),
                 None,
+                PartitionEnd::MoreBeyond,
             )),
         ]
     }));
@@ -142,9 +144,11 @@ fn open_pages_stub(scope: &CursorScope) -> common::StubAccount {
             InventoryPartition::Page { from, .. } => *from,
             other => panic!("the PageCount plan yields page partitions only: {other:?}"),
         };
-        // Past the end of the inventory the window comes back genuinely empty,
-        // which is the only thing an open-ended walk may terminate on.
-        let items: Vec<InventoryEntry> = if from >= PARTITIONS * PAGE {
+        // Past the end of the inventory the window comes back empty and
+        // declares the listing dry, which is the only thing an open-ended walk
+        // may terminate on.
+        let past_the_end = from >= PARTITIONS * PAGE;
+        let items: Vec<InventoryEntry> = if past_the_end {
             Vec::new()
         } else {
             (0..PAGE).map(|n| entry(&format!("o{from}-{n}"))).collect()
@@ -164,6 +168,11 @@ fn open_pages_stub(scope: &CursorScope) -> common::StubAccount {
             InventoryEvent::Done(InventoryCompletion::complete(
                 CoverageDomain::full(scope.clone()),
                 None,
+                if past_the_end {
+                    PartitionEnd::Exhausted
+                } else {
+                    PartitionEnd::MoreBeyond
+                },
             )),
         ]
     }));
@@ -2181,6 +2190,11 @@ fn short_open_pages_stub(scope: &CursorScope, windows: u32) -> common::StubAccou
         } else {
             (0..PAGE).map(|n| entry(&format!("s{from}-{n}"))).collect()
         };
+        let declared = if from >= end {
+            PartitionEnd::Exhausted
+        } else {
+            PartitionEnd::MoreBeyond
+        };
         vec![
             InventoryEvent::Batch(
                 InventoryBatch::try_new(
@@ -2196,6 +2210,7 @@ fn short_open_pages_stub(scope: &CursorScope, windows: u32) -> common::StubAccou
             InventoryEvent::Done(InventoryCompletion::complete(
                 CoverageDomain::full(scope.clone()),
                 None,
+                declared,
             )),
         ]
     }));

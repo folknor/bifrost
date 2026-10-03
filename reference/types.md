@@ -182,16 +182,31 @@ an optional checkpoint. The item set and checkpoint are one consumer
 transaction. A checkpoint must not be persisted unless the matching
 items were persisted. `PageBoundary::Partial` carrying a checkpoint is the
 one combination that cannot describe such a transaction, and `try_new` /
-`validate_boundary` name it on both `Batch` and `InventoryBatch`.
+`validate_boundary` name it on both `Batch` and `InventoryBatch`
+(`BatchBoundaryError::PartialCarriesCheckpoint`).
+
+An inventory page or completion carries a `PageCheckpoint` rather than an
+`Option<Checkpoint>`: `None`, `Advance(checkpoint)`, or `Withheld(Option<..>)`.
+The variant is a function of the coverage beside it - `Withheld` exactly when
+that coverage holds a checkpoint barrier - so a barrier page cannot be read as
+an ordinary advancing one, which an `Option` could not prevent: it could not
+tell "no checkpoint" from "a checkpoint the barrier forbids". `PageCheckpoint::new`,
+`InventoryBatch::try_new` and `InventoryCompletion::new` derive the variant; a
+literal that disagrees is `BatchBoundaryError::CheckpointDisagreesWithCoverage`
+from `InventoryBatch::validate_boundary` or `InventoryCompletion::validate`. The
+only way to take a position is `accepted(barriers_waived)`, which makes the
+caller state whether an operator waived the barriers; `offered()` ignores the
+barrier and is for diagnostics only.
 
 `try_new` is a convenience, NOT a gate. `Batch`'s fields are public and stay
 public - every protocol crate constructs one literally, and making them
 private would delete published fields - so an implementor can always build
 the nonsense shape without touching the constructor. The invariant is
-therefore enforced where it can be: `bifrost-sync` validates every batch it
-receives at the account boundary and, on a violation, terminates the scope
-with a classified `Protocol(ContractViolation)` whose recovery is
-`ProviderContractViolation`. That class is terminal, so the engine stops the
+therefore enforced where it can be: `bifrost-sync` validates every batch and
+inventory completion it receives at the account boundary and, on a violation,
+terminates the scope with a classified `Internal(AccountContract)` whose
+recovery is `InternalFailure` - the `Account` implementation minted the shape,
+so the provider is not blamed. That class is terminal, so the engine stops the
 scope and publishes `SyncEvent::Terminated` instead of re-polling the
 unchanged cursor forever. A guard that only refuses the batch would trade a
 nonsense state for a silent non-progressing scope.
@@ -225,6 +240,14 @@ window of it. `unsupported_inventory_stream` accordingly emits only
 `CoverageOutcome::Degraded` carries `NonEmptyInventoryObligations`, so an empty
 ledger is represented only as `Complete`; `InventoryCoverageReport::degraded`
 funnels through the same rule.
+
+An `InventoryCompletion` also DECLARES whether the enumeration continues past
+its partition: `PartitionEnd::Exhausted` or `MoreBeyond`. An open-ended page
+walk stops on the declaration and never on an entry count, so a short or empty
+window says nothing by itself. A whole-scope walk is `Exhausted` by definition.
+`lift_complete_walk`, for producers whose `SyncEvent` stream cannot declare, is
+the one place that infers it: `Exhausted` for a whole-scope domain, and for a
+partition domain exactly when the stream yielded no entry at all.
 
 `Fingerprint::flags_hash` is produced by `canonical_flags_hash` and by nothing
 else. Producers with no flag set pass an empty iterator (the empty set has a

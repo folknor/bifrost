@@ -24,8 +24,8 @@ use super::runner::{BackfillPartitionOutcome, BackfillScopeWalk, ScopeWalkStep};
 enum PartitionSource {
     /// A known, finite set. Exhaustion is running out of them.
     Fixed(std::vec::IntoIter<InventoryPartition>),
-    /// An open-ended page walk. Exhaustion is a genuinely empty window; see
-    /// the orchestrator's note on why a merely SHORT page is not exhaustion.
+    /// An open-ended page walk. Exhaustion is a partition whose completion
+    /// declares `PartitionEnd::Exhausted`.
     OpenPages { from: u32, chunk: u32 },
 }
 
@@ -102,17 +102,27 @@ impl ScopeWalkDriver {
             return step;
         }
         if let PartitionSource::OpenPages { from, .. } = &mut self.source {
-            if outcome.seen == 0 {
-                // Terminate only on a genuinely EMPTY page, never on a merely
-                // short one. A partition stream whose server caps a page below
-                // the requested window returns fewer entries than asked for;
-                // treating that as exhaustion silently drops every later page.
-                // The partition contract is correspondingly stronger: a stream
-                // yields zero entries only when the scope has no more results
-                // past `from`.
-                self.exhausted = true;
-            } else if let Some(to) = self.pending_to.take() {
-                *from = to;
+            // The walk ends where the producer DECLARES its listing ran dry,
+            // and the entry count is never read as that declaration: a server
+            // capping a page below the window returns a short page with more
+            // behind it, and a window whose ids all vanished before hydration
+            // is empty with more behind it.
+            match outcome.end {
+                Some(bifrost_types::PartitionEnd::Exhausted) => self.exhausted = true,
+                Some(_) => {
+                    if let Some(to) = self.pending_to.take() {
+                        *from = to;
+                    }
+                }
+                // No completion at all: the stream ended without saying
+                // where the enumeration stands. Walking on could ask for
+                // windows forever, and completing would write a sentinel over
+                // ground nothing proved, so the walk ends with the scope
+                // still Pending.
+                None => {
+                    self.completed = false;
+                    self.exhausted = true;
+                }
             }
         }
         step
@@ -147,12 +157,22 @@ impl ScopeWalkDriver {
 mod tests {
     use super::*;
 
+    use bifrost_types::PartitionEnd;
+
     fn clean(seen: u64) -> BackfillPartitionOutcome {
         BackfillPartitionOutcome {
             seen,
             kept: seen,
             complete: true,
             scope_walk: ScopeWalkStep::RequestNextPartition,
+            end: Some(PartitionEnd::MoreBeyond),
+        }
+    }
+
+    fn exhausted(seen: u64) -> BackfillPartitionOutcome {
+        BackfillPartitionOutcome {
+            end: Some(PartitionEnd::Exhausted),
+            ..clean(seen)
         }
     }
 
@@ -162,6 +182,7 @@ mod tests {
             kept: seen,
             complete: false,
             scope_walk: ScopeWalkStep::StopScopeWalk,
+            end: None,
         }
     }
 
@@ -171,6 +192,7 @@ mod tests {
             kept: seen,
             complete: false,
             scope_walk: ScopeWalkStep::RequestNextPartition,
+            end: Some(PartitionEnd::MoreBeyond),
         }
     }
 
@@ -243,9 +265,12 @@ mod tests {
         assert!(!driver.completed());
     }
 
-    /// A short page is not exhaustion; only an empty one is.
+    /// The walk stops where the producer declares exhaustion, and the entry
+    /// count is never read as a declaration in either direction: a short or
+    /// empty window that says `MoreBeyond` continues, and a non-empty window
+    /// that says `Exhausted` ends the walk cleanly.
     #[test]
-    fn open_pages_stop_only_on_an_empty_window() {
+    fn open_pages_stop_only_on_a_declared_exhaustion() {
         let mut driver = ScopeWalkDriver::open_pages(0, 50);
         driver.next_partition().expect("first window");
         let _ = driver.fold(&clean(7));
@@ -255,9 +280,33 @@ mod tests {
             "a short page must not be read as end-of-inventory"
         );
         let _ = driver.fold(&clean(0));
+        assert_eq!(
+            driver.next_partition(),
+            Some(InventoryPartition::Page { from: 100, to: 150 }),
+            "an empty window that declares more beyond must not end the walk"
+        );
+        let _ = driver.fold(&exhausted(3));
         assert!(driver.next_partition().is_none());
-        assert!(driver.completed(), "an empty window is a clean exhaustion");
-        assert_eq!(driver.total_seen(), 7);
+        assert!(driver.completed(), "a declared exhaustion is a clean end");
+        assert_eq!(driver.total_seen(), 10);
+    }
+
+    /// A partition stream that ended without any completion declared nothing.
+    /// The walk must neither ask for windows forever nor complete the scope.
+    #[test]
+    fn open_pages_end_without_completing_when_nothing_was_declared() {
+        let mut driver = ScopeWalkDriver::open_pages(0, 50);
+        driver.next_partition().expect("first window");
+        let _ = driver.fold(&BackfillPartitionOutcome {
+            end: None,
+            ..clean(0)
+        });
+        assert!(driver.next_partition().is_none());
+        assert!(
+            !driver.completed(),
+            "an undeclared end must not write the completion sentinel"
+        );
+        assert!(!driver.stopped_at_barrier());
     }
 
     /// Once stopped, always stopped: a later clean outcome cannot re-open a

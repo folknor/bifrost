@@ -2175,8 +2175,8 @@ delta enumeration, so the honest answer is that the cursor must not cross the
 page at all.
 
 The engine consequence, per `reference/sync.md`: the batch's items are still
-delivered, its checkpoint is stripped, the walk stops, and a `BarrierIncident` is
-persisted. Earlier checkpoints from the same walk stand, because each certifies a
+delivered, its checkpoint travels as `PageCheckpoint::Withheld` and is not taken,
+the walk stops, and a `BarrierIncident` is persisted. Earlier checkpoints from the same walk stand, because each certifies a
 prefix ending before the failing page begins - the previous page's checkpoint
 holds the `nextLink` that BECAME this page's URL, so accepting it does not cross
 the malformed value. The scope then cannot advance until an operator waives that

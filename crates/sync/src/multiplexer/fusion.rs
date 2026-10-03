@@ -163,6 +163,26 @@ impl InventoryFusion {
             let Some(event) = next else { break };
             match event {
                 bifrost_types::InventoryEvent::Done(completion) => {
+                    // Same contract check as every page: a withheld state that
+                    // contradicts the coverage beside it is an account breaking
+                    // its stream contract, terminated as a classified violation.
+                    if let Err(violation) = completion.validate() {
+                        let error = crate::recovery::batch_boundary_violation(
+                            violation,
+                            completion.checkpoint.offered(),
+                            bifrost_types::AccountOperation::SyncInventory,
+                            &scope,
+                        );
+                        if let Some(tx) = &changes_tx {
+                            let _ = tx.sender().send(MultiplexerEvent {
+                                scope: scope.clone(),
+                                event: Arc::new(SyncEvent::Terminated(error.clone())),
+                                checkpoint: None,
+                                publication: None,
+                            });
+                        }
+                        return Ok(FusionOutcome::Terminated(error));
+                    }
                     let crossed = if completion.coverage.has_barrier() {
                         crate::inventory_walk::cross_waived_barriers(
                             self.writer_tx.as_ref(),
@@ -189,12 +209,14 @@ impl InventoryFusion {
                         Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
                         return Ok(FusionOutcome::NoCursor);
                     }
-                    validate_checkpoint_envelope(completion.checkpoint.as_ref())?;
+                    // Past the stop, a barrier can only stand here if the
+                    // operator waived it, which is what `crossed` says.
+                    let checkpoint = completion.checkpoint.accepted(crossed).cloned();
+                    validate_checkpoint_envelope(checkpoint.as_ref())?;
                     let degraded = !completion.coverage.is_complete();
                     if degraded {
                         Self::warn_degraded(&changes_tx, &scope, &completion.coverage);
                     }
-                    let checkpoint = completion.checkpoint;
                     if let (Some(tx), Some(cp)) = (&changes_tx, checkpoint.clone()) {
                         // Register the claim BEFORE publishing: a fast consumer
                         // can acknowledge between the send and a later
@@ -245,9 +267,10 @@ impl InventoryFusion {
                     // unchanged position with nothing on the stream to tell
                     // a consumer the walk stopped. Terminate the walk with a
                     // classified provider-contract violation instead.
-                    if batch.validate_boundary().is_err() {
+                    if let Err(violation) = batch.validate_boundary() {
                         let error = crate::recovery::batch_boundary_violation(
-                            batch.checkpoint.as_ref(),
+                            violation,
+                            batch.checkpoint.offered(),
                             bifrost_types::AccountOperation::SyncInventory,
                             &scope,
                         );
@@ -265,10 +288,10 @@ impl InventoryFusion {
                     // checkpoint is not enough: the next page's checkpoint, or
                     // the terminal delta link, would simply leap over the same
                     // region. So the batch's items are still delivered - they
-                    // were really seen - but the checkpoint is stripped and the
-                    // walk stops here. Checkpoints already accepted earlier in
-                    // this walk stand: each of them certifies a prefix that
-                    // ends before this region begins.
+                    // were really seen - but its withheld checkpoint is not
+                    // taken and the walk stops here. Checkpoints already
+                    // accepted earlier in this walk stand: each of them
+                    // certifies a prefix that ends before this region begins.
                     let crossed = if batch.coverage.has_barrier() {
                         crate::inventory_walk::cross_waived_barriers(
                             self.writer_tx.as_ref(),
@@ -286,17 +309,16 @@ impl InventoryFusion {
                         self.record_barriers(&scope, &batch.coverage, resume_from)
                             .await?;
                         if let Some(tx) = &changes_tx {
-                            let mut stripped = batch;
-                            stripped.checkpoint = None;
-                            self.forward_inventory_batch(tx, &scope, &stripped);
-                            Self::warn_degraded(&changes_tx, &scope, &stripped.coverage);
+                            self.forward_inventory_batch(tx, &scope, &batch, None);
+                            Self::warn_degraded(&changes_tx, &scope, &batch.coverage);
                         }
                         return Ok(FusionOutcome::NoCursor);
                     }
-                    validate_checkpoint_envelope(batch.checkpoint.as_ref())?;
-                    walk.accept(batch.checkpoint.clone());
+                    let checkpoint = batch.checkpoint.accepted(crossed).cloned();
+                    validate_checkpoint_envelope(checkpoint.as_ref())?;
+                    walk.accept(checkpoint.clone());
                     if let Some(tx) = &changes_tx {
-                        self.forward_inventory_batch(tx, &scope, &batch);
+                        self.forward_inventory_batch(tx, &scope, &batch, checkpoint);
                     }
                 }
                 // A producer-emitted warning is forwarded, not absorbed. Graph
@@ -423,11 +445,17 @@ impl InventoryFusion {
         });
     }
 
+    /// Forward a page's entries, publishing `checkpoint` with them.
+    ///
+    /// `checkpoint` is the position the caller ACCEPTED, passed separately from
+    /// the batch so nothing here can read the batch's own `PageCheckpoint` and
+    /// take a withheld position.
     fn forward_inventory_batch(
         &self,
         tx: &ChangeDelivery,
         scope: &CursorScope,
         batch: &bifrost_types::InventoryBatch,
+        checkpoint: Option<Checkpoint>,
     ) {
         // Inventory entries describe object existence; surface them as
         // `Created` changes so consumers handle inventory the same way
@@ -447,13 +475,13 @@ impl InventoryFusion {
             page_boundary: batch.page_boundary,
             server_latency: batch.server_latency,
             bytes_in: batch.bytes_in,
-            checkpoint: batch.checkpoint.clone(),
+            checkpoint: checkpoint.clone(),
         };
         // A checkpoint-bearing batch declares the coverage it advances across,
         // not just the terminal completion: Graph checkpoints per page, so
         // waiting for `Done` would let a page checkpoint become durable across
         // a gap it never declared.
-        let publication = match (&self.control, &batch.checkpoint) {
+        let publication = match (&self.control, &checkpoint) {
             (Some(control), Some(checkpoint)) => Some(control.publish_checkpoint(
                 checkpoint.clone(),
                 crate::cursor::CoverageClaim::new(batch.coverage.clone(), self.generation),
@@ -463,7 +491,7 @@ impl InventoryFusion {
         let me = MultiplexerEvent {
             scope: scope.clone(),
             event: Arc::new(SyncEvent::Batch(synthetic)),
-            checkpoint: batch.checkpoint.clone(),
+            checkpoint,
             publication: publication.clone(),
         };
         if !tx.publish_acknowledgeable(me) {
@@ -711,12 +739,11 @@ mod tests {
         let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
             Box::pin(futures::stream::iter(vec![
                 bifrost_types::InventoryEvent::Warning(warning),
-                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
-                    checkpoint: None,
-                    coverage: bifrost_types::InventoryCoverageReport::complete(
-                        bifrost_types::CoverageDomain::full(CursorScope::Account),
-                    ),
-                }),
+                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::complete(
+                    bifrost_types::CoverageDomain::full(CursorScope::Account),
+                    None,
+                    bifrost_types::PartitionEnd::Exhausted,
+                )),
             ]));
         let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
 
@@ -758,10 +785,11 @@ mod tests {
         let fusion = fusion_with_writer(tx);
         let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
             Box::pin(futures::stream::iter(vec![
-                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
-                    checkpoint: None,
-                    coverage: barrier_coverage(),
-                }),
+                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(
+                    None,
+                    barrier_coverage(),
+                    bifrost_types::PartitionEnd::Exhausted,
+                )),
             ]));
         let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
 
@@ -793,10 +821,11 @@ mod tests {
         let fusion = fusion_with_writer(tx);
         let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
             Box::pin(futures::stream::iter(vec![
-                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
-                    checkpoint: None,
-                    coverage: barrier_coverage(),
-                }),
+                bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(
+                    None,
+                    barrier_coverage(),
+                    bifrost_types::PartitionEnd::Exhausted,
+                )),
             ]));
 
         let outcome = fusion
@@ -804,5 +833,58 @@ mod tests {
             .await
             .expect("a departed writer is not a store failure");
         assert!(matches!(outcome, FusionOutcome::NoCursor));
+    }
+
+    /// A page claiming `Advance` over coverage that holds a barrier is the
+    /// account contradicting its own stream contract, on either half of the
+    /// walk. It terminates as a classified contract violation rather than
+    /// being read as an ordinary barrier stop: a producer that mislabels its
+    /// checkpoint has told the engine nothing it can trust.
+    #[tokio::test]
+    async fn a_checkpoint_disagreeing_with_its_coverage_terminates_the_walk() {
+        let cursor = Checkpoint::Change(bifrost_types::ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: vec![1],
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        });
+        let page = bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
+            items: Vec::new(),
+            page_boundary: bifrost_types::PageBoundary::Page,
+            server_latency: std::time::Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: bifrost_types::PageCheckpoint::Advance(cursor.clone()),
+            coverage: barrier_coverage(),
+        });
+        let completion = bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
+            checkpoint: bifrost_types::PageCheckpoint::Advance(cursor),
+            coverage: barrier_coverage(),
+            end: bifrost_types::PartitionEnd::Exhausted,
+        });
+        for event in [page, completion] {
+            // A departed writer, so a walk that skipped the check would stop at
+            // the barrier and answer `NoCursor` rather than hang on the writer.
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            drop(rx);
+            let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
+                Box::pin(futures::stream::iter(vec![event]));
+            let outcome = fusion_with_writer(tx)
+                .run_stream(CursorScope::Account, stream, None)
+                .await
+                .expect("a contract violation is an outcome, not an engine error");
+            let FusionOutcome::Terminated(error) = outcome else {
+                panic!("a mislabelled checkpoint must terminate the walk: {outcome:?}");
+            };
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Internal(
+                    bifrost_types::InternalErrorKind::AccountContract
+                )
+            );
+        }
     }
 }

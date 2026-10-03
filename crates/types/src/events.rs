@@ -174,12 +174,15 @@ pub enum InventoryPartitioning {
     UidRange { max_uid: Option<u32> },
     /// Account can honor `InventoryPartition::Page` ranges. `total`
     /// is optional; when absent, the engine walks page windows until a
-    /// genuinely EMPTY one is observed - a merely short window is not
-    /// exhaustion, so a partition stream must fill its window (paging
-    /// internally past any server-side page cap) and yield zero entries
-    /// only when the scope has no more results. `page_size` lets the
-    /// account cap engine requests at a protocol-advertised per-page
-    /// maximum.
+    /// partition's completion declares [`PartitionEnd::Exhausted`]. A short
+    /// or even empty window that declares `MoreBeyond` does not end the
+    /// walk, and a partition stream that ends without any completion ends
+    /// it without completing the scope. A producer built on
+    /// [`lift_complete_walk`] cannot declare, and gets `Exhausted` exactly
+    /// when its window yielded no entry, so it must keep paging past a
+    /// window whose ids all vanished rather than return it empty.
+    /// `page_size` lets the account cap engine requests at a
+    /// protocol-advertised per-page maximum.
     PageCount {
         total: Option<u32>,
         page_size: Option<u32>,
@@ -261,19 +264,42 @@ impl<T> Batch<T> {
     /// durable transaction. Consumers must call this at the account boundary.
     pub fn validate_boundary(&self) -> Result<(), BatchBoundaryError> {
         if matches!(self.page_boundary, PageBoundary::Partial) && self.checkpoint.is_some() {
-            Err(BatchBoundaryError)
+            Err(BatchBoundaryError::PartialCarriesCheckpoint)
         } else {
             Ok(())
         }
     }
 }
 
+/// A batch or inventory completion whose checkpoint cannot describe a durable
+/// transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BatchBoundaryError;
+#[non_exhaustive]
+pub enum BatchBoundaryError {
+    /// A `PageBoundary::Partial` batch carried a checkpoint.
+    PartialCarriesCheckpoint,
+    /// An inventory checkpoint's [`PageCheckpoint`] variant disagrees with its
+    /// coverage: `Withheld` without a barrier, or a barrier with no
+    /// `Withheld`.
+    CheckpointDisagreesWithCoverage,
+}
+
+impl BatchBoundaryError {
+    /// The violation in words, for the classified contract error.
+    #[must_use]
+    pub fn detail(&self) -> &'static str {
+        match self {
+            Self::PartialCarriesCheckpoint => "a PageBoundary::Partial batch carried a checkpoint",
+            Self::CheckpointDisagreesWithCoverage => {
+                "an inventory checkpoint's withheld state disagreed with its coverage barriers"
+            }
+        }
+    }
+}
 
 impl std::fmt::Display for BatchBoundaryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a partial page boundary cannot carry a checkpoint")
+        f.write_str(self.detail())
     }
 }
 
@@ -292,29 +318,25 @@ impl std::error::Error for BatchBoundaryError {}
 /// per page - waiting for `Done` would let a page checkpoint become durable
 /// across a gap it never declared.
 ///
-/// Known shape weakness, recorded so it is understood rather than
-/// rediscovered: `checkpoint` is `Option<Checkpoint>`, so it cannot
-/// distinguish "this page has no checkpoint" from "this checkpoint was
-/// STRIPPED because of a barrier". The barrier signal rides only in
-/// `coverage`, which is exactly why a consumer once read a barrier page as
-/// ordinary and advanced past it. The fix that would make the omission a
-/// compile error is a dedicated `PageCheckpoint::{Advance(..), Withheld}`;
-/// that reshapes a published field, so it is the repository owner's call and
-/// has not been ruled on. Until then, both `bifrost-sync`
-/// inventory front ends read `coverage` through one shared module so they
-/// cannot diverge - but nothing in the type system stops a third front end
-/// from ignoring it.
+/// `checkpoint` is a [`PageCheckpoint`], not an `Option<Checkpoint>`, so a page
+/// whose coverage holds a barrier cannot be read as an ordinary advancing page:
+/// an `Option` could not tell "no checkpoint" from "a checkpoint the barrier
+/// forbids", and a consumer once advanced past a barrier for exactly that
+/// reason. The fields are public, so the agreement between the variant and
+/// `coverage` is checked by [`Self::validate_boundary`], which `bifrost-sync`
+/// runs on every page it receives.
 #[derive(Debug, Clone)]
 pub struct InventoryBatch {
     pub items: Vec<InventoryEntry>,
     pub page_boundary: PageBoundary,
     pub server_latency: Duration,
     pub bytes_in: u64,
-    pub checkpoint: Option<Checkpoint>,
+    pub checkpoint: PageCheckpoint,
     pub coverage: InventoryCoverageReport,
 }
 
 impl InventoryBatch {
+    /// Build a page, deriving the [`PageCheckpoint`] variant from `coverage`.
     pub fn try_new(
         items: Vec<InventoryEntry>,
         page_boundary: PageBoundary,
@@ -328,20 +350,122 @@ impl InventoryBatch {
             page_boundary,
             server_latency,
             bytes_in,
-            checkpoint,
+            checkpoint: PageCheckpoint::new(checkpoint, &coverage),
             coverage,
         };
         batch.validate_boundary()?;
         Ok(batch)
     }
 
+    /// Reject a partial page carrying a checkpoint, and a checkpoint whose
+    /// variant disagrees with `coverage`. Consumers must call this at the
+    /// account boundary.
     pub fn validate_boundary(&self) -> Result<(), BatchBoundaryError> {
-        if matches!(self.page_boundary, PageBoundary::Partial) && self.checkpoint.is_some() {
-            Err(BatchBoundaryError)
+        if matches!(self.page_boundary, PageBoundary::Partial)
+            && self.checkpoint.offered().is_some()
+        {
+            Err(BatchBoundaryError::PartialCarriesCheckpoint)
+        } else if !self.checkpoint.agrees_with(&self.coverage) {
+            Err(BatchBoundaryError::CheckpointDisagreesWithCoverage)
         } else {
             Ok(())
         }
     }
+}
+
+/// The position an inventory page or completion offers, and whether the walk's
+/// coverage lets it be taken.
+///
+/// The variant is a function of the coverage it travels with: `Withheld`
+/// exactly when that coverage holds a checkpoint barrier
+/// ([`InventoryCoverageReport::has_barrier`]). [`Self::new`] derives it, and
+/// the batch and completion validators reject a literal that disagrees. A
+/// barrier taints the walk, so a cumulative coverage report keeps every page
+/// after it `Withheld` too.
+///
+/// The one way to take a position is [`Self::accepted`], which makes the
+/// caller say whether the barriers were waived. [`Self::offered`] ignores the
+/// barrier and exists for diagnostics and the partial-boundary check only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PageCheckpoint {
+    /// The page certifies no position.
+    None,
+    /// No barrier stands in the walk's coverage, so the position may be taken.
+    Advance(Checkpoint),
+    /// The walk's coverage holds a checkpoint barrier, so no position may be
+    /// taken unless an operator waived every barrier in it. Carries the
+    /// position the producer offered, if any, for that waived crossing.
+    Withheld(Option<Checkpoint>),
+}
+
+impl PageCheckpoint {
+    /// The variant `coverage` calls for, around the position the producer
+    /// offers.
+    #[must_use]
+    pub fn new(checkpoint: Option<Checkpoint>, coverage: &InventoryCoverageReport) -> Self {
+        if coverage.has_barrier() {
+            Self::Withheld(checkpoint)
+        } else {
+            checkpoint.map_or(Self::None, Self::Advance)
+        }
+    }
+
+    /// The position that may be taken: an `Advance` one, or a `Withheld` one
+    /// when `barriers_waived` says an operator waived every barrier.
+    #[must_use]
+    pub fn accepted(&self, barriers_waived: bool) -> Option<&Checkpoint> {
+        match self {
+            Self::None => None,
+            Self::Advance(checkpoint) => Some(checkpoint),
+            Self::Withheld(checkpoint) => checkpoint.as_ref().filter(|_| barriers_waived),
+        }
+    }
+
+    /// The position the producer offered, whatever the barrier says. Never an
+    /// advancement decision.
+    #[must_use]
+    pub fn offered(&self) -> Option<&Checkpoint> {
+        match self {
+            Self::None => None,
+            Self::Advance(checkpoint) => Some(checkpoint),
+            Self::Withheld(checkpoint) => checkpoint.as_ref(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_withheld(&self) -> bool {
+        matches!(self, Self::Withheld(_))
+    }
+
+    /// Whether this variant is the one `coverage` calls for.
+    #[must_use]
+    pub fn agrees_with(&self, coverage: &InventoryCoverageReport) -> bool {
+        self.is_withheld() == coverage.has_barrier()
+    }
+}
+
+/// Whether results exist past the end of an inventory partition, as the
+/// producer DECLARES it.
+///
+/// An open-ended page walk stops on this declaration. It used to infer the end
+/// from a page that yielded zero entries, which made every producer owe a
+/// stronger contract than the type showed (fill the window, page past any
+/// server cap, never yield an empty window early), and a short-page-means-done
+/// inference crept back into the resume path once. A declaration removes that
+/// class: the producer, which is the only party that knows its listing ran dry,
+/// says so.
+///
+/// A whole-scope walk that finished is `Exhausted` by definition. For a fixed
+/// partition set (time windows, UID ranges) the engine walks every partition
+/// regardless, so the value is informational there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PartitionEnd {
+    /// The enumeration has no results past this partition's end.
+    Exhausted,
+    /// Results may exist past this partition's end.
+    MoreBeyond,
 }
 
 /// How an inventory walk ended.
@@ -353,26 +477,56 @@ impl InventoryBatch {
 /// an empty one and gets its own carrier.
 #[derive(Debug, Clone)]
 pub struct InventoryCompletion {
-    pub checkpoint: Option<Checkpoint>,
+    /// The walk's final position, gated by `coverage` exactly as a page's is.
+    pub checkpoint: PageCheckpoint,
     /// Coverage for the walk as a whole. `Degraded` means the enumeration
     /// space was NOT exhausted cleanly, so a consumer must not read `Done` as
     /// proof of completeness and the engine must not write a backfill
     /// completion sentinel.
     pub coverage: InventoryCoverageReport,
+    /// Whether the enumeration continues past this partition.
+    pub end: PartitionEnd,
 }
 
 impl InventoryCompletion {
+    /// A completion, deriving the [`PageCheckpoint`] variant from `coverage`.
+    #[must_use]
+    pub fn new(
+        checkpoint: Option<Checkpoint>,
+        coverage: InventoryCoverageReport,
+        end: PartitionEnd,
+    ) -> Self {
+        Self {
+            checkpoint: PageCheckpoint::new(checkpoint, &coverage),
+            coverage,
+            end,
+        }
+    }
+
     /// A walk that exhausted `domain` with nothing left unaccounted for.
     ///
     /// Takes the domain because a completeness claim is only meaningful about a
     /// stated extent: "complete" is a fact about a region of one enumeration,
     /// not about a scope in the abstract, and a claim with no domain cannot be
-    /// checked against the debt it would discharge.
+    /// checked against the debt it would discharge. `end` says whether the
+    /// enumeration continues past the domain; a whole-scope walk is
+    /// `Exhausted`.
     #[must_use]
-    pub fn complete(domain: CoverageDomain, checkpoint: Option<Checkpoint>) -> Self {
-        Self {
-            checkpoint,
-            coverage: InventoryCoverageReport::complete(domain),
+    pub fn complete(
+        domain: CoverageDomain,
+        checkpoint: Option<Checkpoint>,
+        end: PartitionEnd,
+    ) -> Self {
+        Self::new(checkpoint, InventoryCoverageReport::complete(domain), end)
+    }
+
+    /// Reject a checkpoint whose variant disagrees with `coverage`. Consumers
+    /// must call this at the account boundary, as they do for each page.
+    pub fn validate(&self) -> Result<(), BatchBoundaryError> {
+        if self.checkpoint.agrees_with(&self.coverage) {
+            Ok(())
+        } else {
+            Err(BatchBoundaryError::CheckpointDisagreesWithCoverage)
         }
     }
 }
@@ -380,6 +534,41 @@ impl InventoryCompletion {
 #[cfg(test)]
 mod inventory_completion_tests {
     use super::*;
+    use crate::coverage::{InventoryObligation, ObligationKey, RegionRecovery};
+    use crate::error::{
+        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
+        RequestErrorKind,
+    };
+
+    fn checkpoint() -> Checkpoint {
+        Checkpoint::Backfill(BackfillCheckpoint {
+            scope: CursorScope::Account,
+            partition: Partition(b"page:0:10".to_vec()),
+            progress_marker: None,
+            progress: BackfillProgress::default(),
+            envelope_version: 1,
+        })
+    }
+
+    fn with_barrier() -> InventoryCoverageReport {
+        let error = AccountErrorBuilder::new(
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only("barrier"),
+            }),
+        )
+        .try_build()
+        .expect("valid error");
+        InventoryCoverageReport::degraded(
+            CoverageDomain::full(CursorScope::Account),
+            vec![InventoryObligation::Region {
+                key: ObligationKey(b"page".to_vec()),
+                failure_label: "unidentifiable".into(),
+                error,
+                recovery: RegionRecovery::barrier(),
+            }],
+        )
+    }
 
     #[test]
     fn complete_preserves_the_exact_partition_domain() {
@@ -388,9 +577,79 @@ mod inventory_completion_tests {
             &InventoryPartition::Page { from: 10, to: 20 },
             0,
         );
-        let completion = InventoryCompletion::complete(domain.clone(), None);
+        let completion =
+            InventoryCompletion::complete(domain.clone(), None, PartitionEnd::MoreBeyond);
         assert_eq!(completion.coverage.domain, domain);
         assert!(completion.coverage.is_complete());
+        assert_eq!(completion.end, PartitionEnd::MoreBeyond);
+    }
+
+    /// A barrier withholds the position: it is not taken unless the barriers
+    /// were waived, and the producer's offer survives for that crossing.
+    #[test]
+    fn a_barrier_withholds_the_checkpoint_until_waived() {
+        let page = PageCheckpoint::new(Some(checkpoint()), &with_barrier());
+        assert_eq!(page, PageCheckpoint::Withheld(Some(checkpoint())));
+        assert_eq!(page.accepted(false), None);
+        assert_eq!(page.accepted(true), Some(&checkpoint()));
+        assert_eq!(page.offered(), Some(&checkpoint()));
+
+        let clean = InventoryCoverageReport::complete(CoverageDomain::full(CursorScope::Account));
+        let page = PageCheckpoint::new(Some(checkpoint()), &clean);
+        assert_eq!(page.accepted(false), Some(&checkpoint()));
+        assert_eq!(PageCheckpoint::new(None, &clean), PageCheckpoint::None);
+    }
+
+    /// The public fields let a producer write a variant its coverage does not
+    /// call for. Both directions are refused at validation.
+    #[test]
+    fn a_checkpoint_that_disagrees_with_its_coverage_is_refused() {
+        let clean = InventoryCoverageReport::complete(CoverageDomain::full(CursorScope::Account));
+        let advance_over_barrier = InventoryBatch {
+            items: Vec::new(),
+            page_boundary: PageBoundary::Page,
+            server_latency: Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: PageCheckpoint::Advance(checkpoint()),
+            coverage: with_barrier(),
+        };
+        assert_eq!(
+            advance_over_barrier.validate_boundary(),
+            Err(BatchBoundaryError::CheckpointDisagreesWithCoverage)
+        );
+        let withheld_without_barrier = InventoryCompletion {
+            checkpoint: PageCheckpoint::Withheld(None),
+            coverage: clean.clone(),
+            end: PartitionEnd::Exhausted,
+        };
+        assert_eq!(
+            withheld_without_barrier.validate(),
+            Err(BatchBoundaryError::CheckpointDisagreesWithCoverage)
+        );
+        assert!(
+            InventoryBatch::try_new(
+                Vec::new(),
+                PageBoundary::Page,
+                Duration::ZERO,
+                0,
+                Some(checkpoint()),
+                with_barrier(),
+            )
+            .is_ok(),
+            "the constructor derives the variant, so it always agrees"
+        );
+        assert_eq!(
+            InventoryBatch::try_new(
+                Vec::new(),
+                PageBoundary::Partial,
+                Duration::ZERO,
+                0,
+                Some(checkpoint()),
+                clean,
+            )
+            .err(),
+            Some(BatchBoundaryError::PartialCarriesCheckpoint)
+        );
     }
 }
 
@@ -440,29 +699,50 @@ pub enum InventoryEvent {
 /// attached and no syntax at the call site to notice - the same shape as every
 /// other implicit-`Complete` path that let a durable record certify coverage it
 /// did not have.
+///
+/// The [`PartitionEnd`] a `SyncEvent` stream cannot declare is the one thing
+/// this adapter infers, and this is the only place in the workspace that does.
+/// A whole-scope domain is `Exhausted` by definition. A partition domain is
+/// `Exhausted` exactly when the stream yielded no entry at all, the contract
+/// open-ended page walks used to rely on everywhere: a lifted page stream must
+/// yield zero entries only when the scope has nothing past the window. A
+/// producer that can say where its listing ran dry should build
+/// `InventoryCompletion` itself and declare it.
 pub fn lift_complete_walk(
     domain: CoverageDomain,
 ) -> impl FnMut(SyncEvent<InventoryEntry>) -> InventoryEvent {
+    let whole_scope = matches!(domain.coordinate, crate::coverage::CoverageCoordinate::Full);
     let report = move || InventoryCoverageReport {
         domain: domain.clone(),
         outcome: CoverageOutcome::Complete,
     };
+    let mut seen_any = false;
     move |event| match event {
-        SyncEvent::Batch(batch) => InventoryEvent::Batch(InventoryBatch {
-            items: batch.items,
-            page_boundary: batch.page_boundary,
-            server_latency: batch.server_latency,
-            bytes_in: batch.bytes_in,
-            checkpoint: batch.checkpoint,
-            coverage: report(),
-        }),
+        SyncEvent::Batch(batch) => {
+            seen_any |= !batch.items.is_empty();
+            InventoryEvent::Batch(InventoryBatch {
+                items: batch.items,
+                page_boundary: batch.page_boundary,
+                server_latency: batch.server_latency,
+                bytes_in: batch.bytes_in,
+                checkpoint: batch
+                    .checkpoint
+                    .map_or(PageCheckpoint::None, PageCheckpoint::Advance),
+                coverage: report(),
+            })
+        }
         SyncEvent::Progress(progress) => InventoryEvent::Progress(progress),
         SyncEvent::Warning(warning) => InventoryEvent::Warning(warning),
         SyncEvent::Terminated(error) => InventoryEvent::Terminated(error),
-        SyncEvent::Done(checkpoint) => InventoryEvent::Done(InventoryCompletion {
+        SyncEvent::Done(checkpoint) => InventoryEvent::Done(InventoryCompletion::new(
             checkpoint,
-            coverage: report(),
-        }),
+            report(),
+            if whole_scope || !seen_any {
+                PartitionEnd::Exhausted
+            } else {
+                PartitionEnd::MoreBeyond
+            },
+        )),
     }
 }
 

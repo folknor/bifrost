@@ -385,29 +385,33 @@ pub(crate) fn inventory_stream_cancellable(
             }
 
             if final_page {
+                let coverage = coverage_of(&scope, &obligations);
                 yield bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
                     items,
                     page_boundary: PageBoundary::Final,
                     server_latency: started.elapsed(),
                     bytes_in: tally.take(),
-                    checkpoint: checkpoint.clone(),
-                    coverage: coverage_of(&scope, &obligations),
+                    checkpoint: bifrost_types::PageCheckpoint::new(checkpoint.clone(), &coverage),
+                    coverage: coverage.clone(),
                 });
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion {
+                // The listing ran dry: this is a whole-scope walk at its end.
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(
                     checkpoint,
-                    coverage: coverage_of(&scope, &obligations),
-                });
+                    coverage,
+                    bifrost_types::PartitionEnd::Exhausted,
+                ));
                 break;
             }
 
             if !items.is_empty() {
+                let coverage = coverage_of(&scope, &obligations);
                 yield bifrost_types::InventoryEvent::Batch(bifrost_types::InventoryBatch {
                     items,
                     page_boundary: PageBoundary::Page,
                     server_latency: started.elapsed(),
                     bytes_in: tally.take(),
-                    checkpoint: None,
-                    coverage: coverage_of(&scope, &obligations),
+                    checkpoint: bifrost_types::PageCheckpoint::new(None, &coverage),
+                    coverage,
                 });
             }
             page_token = page.next_page_token;
@@ -1410,7 +1414,7 @@ mod tests {
             panic!("the walk must finish, not stall: {events:?}");
         };
         assert!(
-            completion.checkpoint.is_some(),
+            completion.checkpoint.accepted(false).is_some(),
             "the scope must converge rather than re-walking forever"
         );
         assert!(
@@ -1481,7 +1485,7 @@ mod tests {
         assert!(
             events.iter().all(|event| match event {
                 bifrost_types::InventoryEvent::Batch(batch) => {
-                    batch.checkpoint.is_none()
+                    batch.checkpoint.offered().is_none()
                         && !matches!(batch.page_boundary, PageBoundary::Final)
                 }
                 _ => true,
@@ -1522,7 +1526,8 @@ mod tests {
         assert_eq!(batch.items[0].id, ObjectId("live".to_string()));
         assert!(matches!(
             &events[1],
-            bifrost_types::InventoryEvent::Done(completion) if completion.checkpoint.is_some()
+            bifrost_types::InventoryEvent::Done(completion)
+                if completion.checkpoint.accepted(false).is_some()
         ));
     }
 
@@ -1550,10 +1555,11 @@ mod tests {
         };
         assert!(batch.items.is_empty());
         assert!(matches!(batch.page_boundary, PageBoundary::Final));
-        assert!(batch.checkpoint.is_some());
+        assert!(batch.checkpoint.accepted(false).is_some());
         assert!(matches!(
             &events[1],
-            bifrost_types::InventoryEvent::Done(completion) if completion.checkpoint.is_some()
+            bifrost_types::InventoryEvent::Done(completion)
+                if completion.checkpoint.accepted(false).is_some()
         ));
     }
 

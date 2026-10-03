@@ -316,6 +316,11 @@ pub struct BackfillPartitionOutcome {
     /// of this scope may even be requested, because its checkpoint would
     /// certify a prefix that crosses a region nothing can replay.
     pub scope_walk: ScopeWalkStep,
+    /// What the partition's completion declared about results past its end,
+    /// or `None` when the stream ended without a completion at all. An
+    /// open-ended page walk stops on `Exhausted` and nowhere else: the entry
+    /// count is never read as a declaration.
+    pub end: Option<bifrost_types::PartitionEnd>,
 }
 
 impl Default for BackfillPartitionOutcome {
@@ -328,6 +333,7 @@ impl Default for BackfillPartitionOutcome {
             kept: 0,
             complete: false,
             scope_walk: ScopeWalkStep::StopScopeWalk,
+            end: None,
         }
     }
 }
@@ -367,6 +373,7 @@ impl BackfillRunner {
         let mut kept_total: u64 = 0;
         let mut complete = true;
         let mut scope_walk = ScopeWalkStep::RequestNextPartition;
+        let mut end = None;
         let mut walk = InventoryWalk::default();
         // The incarnation this PASS belongs to, snapshotted before its first
         // page. Read once and not per page: a reset that closes between page k's
@@ -415,9 +422,10 @@ impl BackfillRunner {
             let Some(event) = next else { break };
             match event {
                 bifrost_types::InventoryEvent::Batch(batch) => {
-                    if batch.validate_boundary().is_err() {
+                    if let Err(violation) = batch.validate_boundary() {
                         let error = crate::recovery::batch_boundary_violation(
-                            batch.checkpoint.as_ref(),
+                            violation,
+                            batch.checkpoint.offered(),
                             bifrost_types::AccountOperation::SyncInventory,
                             &scope,
                         );
@@ -482,6 +490,7 @@ impl BackfillRunner {
                             kept: kept_total,
                             complete: false,
                             scope_walk: ScopeWalkStep::StopScopeWalk,
+                            end: None,
                         });
                     }
 
@@ -638,6 +647,28 @@ impl BackfillRunner {
                     }
                 }
                 bifrost_types::InventoryEvent::Done(completion) => {
+                    // The same contract check every page gets. The runner mints
+                    // its own positional checkpoint and never takes the
+                    // account's, but a completion whose withheld state
+                    // contradicts its coverage is an account breaking its
+                    // stream contract, and its `end` declaration is no more
+                    // trustworthy than its checkpoint.
+                    if let Err(violation) = completion.validate() {
+                        let error = crate::recovery::batch_boundary_violation(
+                            violation,
+                            completion.checkpoint.offered(),
+                            bifrost_types::AccountOperation::SyncInventory,
+                            &scope,
+                        );
+                        if let Some(tx) = &changes_tx {
+                            let _ = tx.send(MultiplexerEvent::unacked(
+                                scope.clone(),
+                                Arc::new(SyncEvent::Terminated(error.clone())),
+                            ));
+                        }
+                        return Err(Error::Account(error));
+                    }
+                    end = Some(completion.end);
                     let crossed = if completion.coverage.has_barrier() {
                         cross_waived_barriers(writer_tx, &completion.coverage, generation).await?
                     } else {
@@ -722,6 +753,7 @@ impl BackfillRunner {
             kept: kept_total,
             complete,
             scope_walk,
+            end,
         })
     }
 }

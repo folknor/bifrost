@@ -1057,14 +1057,17 @@ rescan can never plan a walk for a scope the registry has dropped.
 
 Open-ended `PageCount` (`total: None`) drives `BackfillPlan::OpenPages`:
 the orchestrator walks `Page { from, to }` windows of width `chunk`,
-advancing `from = to` each pass, and terminates only when a pass returns
-a genuinely empty page (`outcome.seen == 0`), never on a merely short
-one. The contract this rests on: an `OpenPages` partition stream MUST
-fill its window (paging internally past any server-side page cap below
-the window width) so that a short window is unambiguously the final
-partial page and the next pass comes back empty. Terminating on a short
-page instead would let a server whose query cap sits below `chunk`
-truncate cold-start hydration after one page.
+advancing `from = to` each pass, and terminates only when a partition's
+completion DECLARES `PartitionEnd::Exhausted` (carried on
+`BackfillPartitionOutcome::end`). The entry count is never read as that
+declaration: a server whose query cap sits below `chunk` returns a short
+page with more behind it, and a window whose ids all vanished before
+hydration is empty with more behind it. A partition stream that ends
+without any completion declared nothing, so the walk ends there without
+completing the scope - neither asking for windows forever nor writing a
+sentinel over ground nothing proved. Producers that emit `SyncEvent`
+streams get the declaration from `lift_complete_walk`, the one place that
+still infers it (see `reference/types.md`).
 
 Resume: the `BackfillRegistry` (`BackfillState::Pending/Running/Completed`)
 is an engine-wide observability index keyed by `(AccountId, CursorScope)`.
@@ -1100,8 +1103,8 @@ is whether positional resume is also possible:
   between the listing call and the hydration call, id-less objects
   dropped), so
   only the completion marker proves exhaustion. Resuming at `T` after a
-  genuinely final short page costs one empty probe query, which then
-  lands the marker.
+  final page whose marker had not yet landed costs one probe window,
+  whose declared `Exhausted` then lands the marker.
 - **`Fixed`** (`Full` / `TimeWindowed` / `UidRange`): the partition list is
   a known finite set with no positional "resume from here", so the signal
   is binary - the completion marker is present (`backfill_complete_recorded`
@@ -2443,8 +2446,12 @@ yet" as permission to advance.
 
 **A barrier taints the walk.** Refusing one checkpoint is not enough - the next
 page's checkpoint or the terminal delta link would leap the same region. So the
-batch's items are still delivered, its checkpoint is stripped, and the walk
-stops. Checkpoints accepted EARLIER in that walk stand: each certifies a prefix
+batch's items are still delivered, its `PageCheckpoint::Withheld` position is
+not taken, and the walk stops. A front end takes a position only through
+`PageCheckpoint::accepted(crossed)`, where `crossed` is the writer's answer to
+whether an operator waived every barrier, and it terminates a page or
+completion whose variant disagrees with its coverage as an `Account` contract
+violation. Checkpoints accepted EARLIER in that walk stand: each certifies a prefix
 ending before the barrier region begins. Barriers do not become ledger debt (no
 cursor advanced past them, so there is nothing durable to hang debt off); they
 are recorded as `BarrierIncident`, which is what gives a restart its memory and

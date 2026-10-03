@@ -132,6 +132,26 @@ against the code before working any of them.
   lifecycle scope parked under a pause survives the folder being deleted
   during that pause and is established after resume for a folder that no
   longer exists, ending in the retry-budget terminal event.
+- **sync: a fixed partition that ends with no completion still completes the
+  scope.** Filed 2026-10-03 by the cold review of the PageCheckpoint and
+  PartitionEnd change; pre-existing. `run_partition` returns `complete: true`
+  for a partition stream that ends with neither `Done` nor `Terminated`, and
+  `ScopeWalkDriver::fold` reads `end: None` only for `OpenPages`, so a fixed
+  plan (Full, time windows, UID ranges) whose stream ends silently writes the
+  completion sentinel over ground nothing proved. The open-pages walk already
+  treats `None` as "end without completing"; the same rule for fixed plans
+  wants a ruling, since it changes when a scope is marked complete.
+- **sync: the backfill runner's new contract checks have no test.** The
+  `Done` arm's `completion.validate()` and the batch arm's disagreement check
+  terminate the partition, but only `InventoryFusion` has a test driving a
+  disagreeing `PageCheckpoint`; removing the runner's checks leaves every test
+  green. Wants a StubAccount-driven pin like
+  `a_checkpoint_disagreeing_with_its_coverage_terminates_the_walk`.
+- **graph: inventory error exits declare `PartitionEnd::Exhausted`.** Every
+  `Terminated` + `Done` pair in `account/inventory.rs` passes `Exhausted`.
+  Harmless while the engine stops on `Terminated` first, but it records
+  "the listing ran dry" on a failed walk; and the trailing `Done` itself
+  contradicts the `InventoryEvent` contract that `Terminated` ends the walk.
 
 ## bifrost-sync
 
@@ -269,31 +289,6 @@ confirm against the code before working any of them.
   fanout that jmap-C4 itself describes, and the caldav/carddav client fanouts.
   So "any new concurrent call site has to solve it again from scratch" is not a
   prediction, it has already happened four times without anyone recording it.
-- **Inventory exhaustion is an inferred count, not a declared flag.** The email
-  inventory contract on both sides of the JMAP/sync boundary rests on "a
-  partition yields zero entries only when the scope has no results past `from`".
-  The live `OpenPages` walker stops only on `seen == 0` and `open_pages_resume`
-  treats only the completion marker as exhaustion. It works, but the signal is
-  inferred rather than declared, and a short-page-means-done inference has been
-  reintroduced on the resume half once already. A declared exhaustion flag would
-  remove the whole class - it reshapes a published stream contract.
-
-## Open items folded in from the second bug-hunt wave (2026-08-29)
-
-The deferred tail of the August 2026 arcs. The same category labels and the
-PUBLISHED SURFACE fence apply.
-
-- **types-B2. `InventoryBatch::checkpoint` cannot express a withheld
-  checkpoint.** [C2, PUBLISHED SURFACE] It is `Option<Checkpoint>`, with no way
-  to distinguish "this page has no checkpoint" from "I stripped this
-  checkpoint because of a barrier". The barrier signal rides only in
-  `coverage`, which is precisely why the A2 divergence was easy to miss. A
-  dedicated `PageCheckpoint::{Advance(..), Withheld}` would make the omission
-  a compile error. The shared `InventoryWalk` makes both CURRENT front ends
-  read `coverage` the same way, but nothing in the type system stops a third
-  from ignoring it - which is the same risk sync-F3 records, one layer down
-  and closable by a type. Carried out of the sync arc; `bifrost-types` was not
-  touched there.
 
 ## Open items folded in from the third bug-hunt wave (2026-09-04)
 

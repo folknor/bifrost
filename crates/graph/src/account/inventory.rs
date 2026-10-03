@@ -68,7 +68,7 @@ fn inventory_stream_from(
                     super::cursor::routing_error(error),
                     sync_ctx,
                 ));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
         };
@@ -85,7 +85,7 @@ fn inventory_stream_from(
                         super::cursor::CursorError::SchemaIncompatible,
                         sync_ctx,
                     ));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                     return;
                 }
             },
@@ -94,7 +94,7 @@ fn inventory_stream_from(
                     Ok(url) => Ok((url, window_end)),
                     Err(error) => {
                         yield bifrost_types::InventoryEvent::Terminated(super::graph_error::into_account_error(error, sync_ctx));
-                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                         return;
                     }
                 },
@@ -105,7 +105,7 @@ fn inventory_stream_from(
             Ok(start) => start,
             Err(error) => {
                 yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
         };
@@ -122,7 +122,7 @@ fn inventory_stream_from(
                 let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                     .with_scope(ErrorScope::Cursor(scope.clone()));
                 yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
         };
@@ -133,7 +133,7 @@ fn inventory_stream_from(
                 yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
                     error, &scope, owner.as_ref(), sync_ctx.clone(),
                 ));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
             let page: ODataCollection<Value> = match fetch_page(&client, &current_url).await {
@@ -151,7 +151,7 @@ fn inventory_stream_from(
                         owner.as_ref(),
                         ctx,
                     ));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                     return;
                 }
             };
@@ -167,7 +167,7 @@ fn inventory_stream_from(
                     yield bifrost_types::InventoryEvent::Terminated(super::graph_error::graph_shared_scope_error(
                         error, &scope, owner.as_ref(), sync_ctx.clone(),
                     ));
-                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                    yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                     return;
                 }
             };
@@ -261,7 +261,7 @@ fn inventory_stream_from(
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
                         yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                         return;
                     }
                 };
@@ -278,13 +278,13 @@ fn inventory_stream_from(
                         let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                             .with_scope(ErrorScope::Cursor(scope.clone()));
                         yield bifrost_types::InventoryEvent::Terminated(cursor_error_to_account_error(error, ctx));
-                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                        yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                         return;
                     }
                 };
                 let checkpoint = Checkpoint::Change(cursor.clone());
                 yield inventory_batch(entries, PageBoundary::Final, Some(cursor), coverage_of(&scope, &obligations), tally.take());
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: Some(checkpoint), coverage: coverage_of(&scope, &obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(Some(checkpoint), coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             } else {
                 // A delta page must advance with either a next link or a
@@ -296,7 +296,7 @@ fn inventory_stream_from(
                     Some(ErrorScope::Cursor(scope.clone())),
                     "Graph delta page had neither @odata.nextLink nor @odata.deltaLink",
                 ));
-                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion { checkpoint: None, coverage: coverage_of(&scope, &obligations) });
+                yield bifrost_types::InventoryEvent::Done(bifrost_types::InventoryCompletion::new(None, coverage_of(&scope, &obligations), bifrost_types::PartitionEnd::Exhausted));
                 return;
             }
         }
@@ -511,7 +511,7 @@ pub(crate) fn inventory_batch(
         page_boundary,
         server_latency: Duration::default(),
         bytes_in,
-        checkpoint: cursor.map(Checkpoint::Change),
+        checkpoint: bifrost_types::PageCheckpoint::new(cursor.map(Checkpoint::Change), &coverage),
         coverage,
     })
 }
@@ -878,7 +878,8 @@ mod tests {
         else {
             panic!("expected first inventory batch");
         };
-        let Some(Checkpoint::Change(cursor)) = batch.checkpoint else {
+        let bifrost_types::PageCheckpoint::Advance(Checkpoint::Change(cursor)) = batch.checkpoint
+        else {
             panic!("mid-inventory page must checkpoint");
         };
 
