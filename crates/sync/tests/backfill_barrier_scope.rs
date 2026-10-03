@@ -111,10 +111,18 @@ async fn a_barrier_stops_the_whole_scope_walk_through_the_real_orchestrator() {
                 )),
             ],
             // The second partition delivers three real entries and then
-            // reports ground it cannot represent and cannot replay.
-            InventoryPartition::Page { from: 10, .. } => {
-                vec![batch(entries("torn", 3), barrier_report(scope))]
-            }
+            // reports ground it cannot represent and cannot replay. It ends in
+            // a `Done` carrying the same coverage, as every walk must: a
+            // stream that just stops is now read as incomplete, so the waived
+            // retry below would never reach the completion sentinel.
+            InventoryPartition::Page { from: 10, .. } => vec![
+                batch(entries("torn", 3), barrier_report(scope)),
+                InventoryEvent::Done(InventoryCompletion::new(
+                    None,
+                    barrier_report(scope),
+                    PartitionEnd::MoreBeyond,
+                )),
+            ],
             // The third partition must never be requested; answering
             // emptily keeps the failure observable in `walked` below
             // rather than crashing a detached engine task.

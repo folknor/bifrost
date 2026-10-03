@@ -748,6 +748,23 @@ impl BackfillRunner {
                 _ => {}
             }
         }
+        // Every completion sets `end` before its `break`, so `None` here means
+        // the stream ended with neither `Done` nor `Terminated`. Nothing proved
+        // how far the enumeration got, so the partition is incomplete whatever
+        // the plan: a fixed plan used to read this as complete and write the
+        // scope's completion marker over ground nothing covered, which made the
+        // next attach skip the walk for good.
+        if end.is_none() {
+            complete = false;
+            if let Some(tx) = &changes_tx {
+                let _ = tx.send(MultiplexerEvent::unacked(
+                    scope.clone(),
+                    Arc::new(SyncEvent::Warning(
+                        crate::inventory_walk::unannounced_end_warning(),
+                    )),
+                ));
+            }
+        }
         Ok(BackfillPartitionOutcome {
             seen: seen_total,
             kept: kept_total,

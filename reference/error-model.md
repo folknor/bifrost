@@ -538,11 +538,15 @@ error model: it is advisory, never aborts a stream, carries no
 `RecoveryClass`, and never converts to `AccountError`.
 `WarningKind::{StrategyDowngraded, OperatorAttentionNeeded, Throttled,
 ClockSkew, BlobNotByteStream, ReadbackSkipped, ChangeStreamLagged,
-Other}`. The sync engine emits warnings alongside (not instead of)
-errors; see `reference/sync.md`. `ChangeStreamLagged` is structural on
-purpose - the multiplexer's `ChangesReceiver` mints it (and only it)
-when broadcast ring overflow destroys batches, and a consumer's
-detach/reconcile recovery keys on the kind rather than on message text.
+InventoryEndedUnannounced, Other}`. The sync engine emits warnings
+alongside (not instead of) errors; see `reference/sync.md`.
+`ChangeStreamLagged` is structural on purpose - the multiplexer's
+`ChangesReceiver` mints it (and only it) when broadcast ring overflow
+destroys batches, and a consumer's detach/reconcile recovery keys on the
+kind rather than on message text. `InventoryEndedUnannounced` is structural
+for the same reason: both engine inventory front ends mint it when a
+provider's inventory stream ends with neither `Done` nor `Terminated`, and
+the scope it names is not treated as complete.
 
 ## File map
 

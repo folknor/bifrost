@@ -59,6 +59,19 @@ item is what stops that.
     error leaves the stream closed for good so the reader reconnects and
     re-applies; that premise is unverified, and if it is false a committed
     subscribe would silently never apply. Verify the premise, then rule.
+    PREMISE VERIFIED 2026-10-04 against tokio-websockets 0.13.3
+    (`src/proto/stream.rs`): `start_send` fails only with `AlreadyClosed`
+    when the state is not `Active`; `poll_flush` fails only on an I/O error
+    or a zero-length write, both setting `CloseAcknowledged`; `poll_ready`
+    fails only through `poll_flush`; nothing ever sets the state back to
+    `Active`. The writer's failure does not wake the reader, but the
+    reader's keepalive ping (120s default) then fails with `AlreadyClosed`
+    and it reconnects, re-applying the committed `enabled` set, read behind
+    the guards `subscribe` holds until its commit. Proposed: `subscribe`
+    treats `WebSocketSend` as a deferred success like
+    `WebSocketNotConnected`; worst-case cost, push for the new subscription
+    starts up to one keepalive late. Ruling DEFERRED 2026-10-04; the premise
+    needs no re-verification on re-raise unless tokio-websockets is bumped.
 
 ## Landed 2026-09-30 without a ruling
 
@@ -71,35 +84,22 @@ owner accepts it, or it is reverted as its own change. Changes to a published
 type's shape are not listed: the owner ruled those need no ruling (see
 `AGENTS.md`). The owner accepted the new-behaviour, calendar-write,
 control-character, caldav-override and push-handle-format items on
-2026-10-03; the three below are still unruled.
-
-- **Recovery-class moves.** imap: SELECT without UIDVALIDITY at the PIM and
-  search sites, `Request(Malformed)` to `Protocol(MissingField)`; hydrating an
-  expunged UID, `Request(Malformed)` to `NotFound(Message)`. graph
-  Autodiscover in-body codes from `Request(Malformed)` to `NotFound`,
-  `RateLimited`, `Unavailable`, `ProviderRefused`, `MissingField`,
-  `ContractViolation` and `Internal(LimitExceeded)` by code. google:
-  `account_domain` to `ParseFailed`, `start_history_id` to
-  `Internal(InvariantViolated)`, `historyId` parse to `ParseFailed`,
-  `missing_field` gains `Acknowledged`. caldav: `NoSpliceableVevent` and
-  `MissingSourceBody` from `Unsupported` to `Internal(InvariantViolated)`.
-  jmap: a dead-sink send from `Protocol(PartialResponse)` to
-  `Transport(Network)`, with an idempotency override. smtp: a blocking
-  implicit-TLS or STARTTLS handshake that hits the socket timeout, and a
-  timed-out address resolution, from `Tls` to `Timeout`, matching the async
-  path. imap: an early tagged OK before a literal continuation inside a
-  pipeline, from a fatal `Protocol` to that command's non-fatal
-  `ProtocolMissing`, the batch continuing.
-- **sync detach and reopen.** A `subscribe_push` that registers after detach
-  took the registry deletes the subscription it just created and returns
-  `AccountNotAttached`; a reattach whose install lands after detach tears the
-  replacement's subscriptions down and still returns `Ok`, the swap having
-  committed. A scope repair or schema recovery reaching a paused account
-  declines and leaves every cursor in place.
+2026-10-03, and the recovery-class moves and sync detach / reopen races on
+2026-10-04; the one below is still unruled.
 - **Published items with changed behaviour.** On the UID MOVE fallback,
   imap's `MoveResult::code` is now the UID EXPUNGE's tagged code, falling back
   to the COPY's. dav-core's public `send_raw_request` debug-asserts where it
   used to return an error for an untrusted final origin.
+  DEFERRED 2026-10-04 (both halves). Carry into a re-raise: `MoveResult` was
+  presented as accept - it mirrors the native path, where `code` is the
+  MOVE's tagged code, and the COPYUID survives in `copy_uid`. For
+  `send_raw_request`, a fix was proposed and NOT accepted: refuse an
+  untrusted FIRST hop locally before anything is sent. The facts behind it:
+  `bifrost-dav-core` is published and `DavRequest::new` is public, so an
+  external caller can reach the assert (panicking a downstream debug build,
+  silently returning in release); the old post-response error protected
+  nothing because the request had already gone out; and the first hop is
+  never gated before sending, only redirect hops are.
 
 ## Found 2026-09-30, not fixed
 
@@ -118,15 +118,13 @@ against the code before working any of them.
   delete subscriptions the new instance recreated under its live handles.
   Needs per-instance attribution, or a ruling that terminal failures are
   left to the handle's teardown and Graph's expiry.
-- **sync: a fixed partition that ends with no completion still completes the
-  scope.** Filed 2026-10-03 by the cold review of the PageCheckpoint and
-  PartitionEnd change; pre-existing. `run_partition` returns `complete: true`
-  for a partition stream that ends with neither `Done` nor `Terminated`, and
-  `ScopeWalkDriver::fold` reads `end: None` only for `OpenPages`, so a fixed
-  plan (Full, time windows, UID ranges) whose stream ends silently writes the
-  completion sentinel over ground nothing proved. The open-pages walk already
-  treats `None` as "end without completing"; the same rule for fixed plans
-  wants a ruling, since it changes when a scope is marked complete.
+  RULED 2026-10-04, not yet built: keep the row and flag it. A terminal
+  renewal failure sets a `terminated` flag on `GraphSubscriptionState`
+  instead of removing the row; the renewal worker skips flagged rows, while
+  `unsubscribe_push` and `close()` still DELETE them. The worker's "anything
+  left to renew" check ignores flagged rows so it still retires. The id never
+  leaves its group, so the ledger problem goes with it. The owner expects the
+  flag to be useful elsewhere later.
 
 ## bifrost-sync
 

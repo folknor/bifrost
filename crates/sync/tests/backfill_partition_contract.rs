@@ -81,6 +81,93 @@ async fn run(
     .await
 }
 
+/// Run one `Full` partition with a change stream attached, returning the
+/// outcome and every warning the runner published.
+async fn run_observed(
+    events: Vec<InventoryEvent>,
+) -> (
+    bifrost_sync::backfill::BackfillPartitionOutcome,
+    Vec<bifrost_types::Warning>,
+) {
+    let scope = CursorScope::Account;
+    let mut stub = StubAccount::new(vec![scope.clone()]);
+    let events = Arc::new(std::sync::Mutex::new(Some(events)));
+    stub.partition_hook = Some(Arc::new(move |_, _| {
+        events
+            .lock()
+            .expect("events lock")
+            .take()
+            .expect("one partition")
+    }));
+    let account: Arc<dyn Account> = Arc::new(stub);
+    let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+    let delivery = ChangeDelivery::new(tx.clone());
+    let live = LiveSupersedes::new();
+    let outcome = BackfillRunner::run_partition(
+        account.as_ref(),
+        scope,
+        InventoryPartition::Full,
+        &live,
+        Some(tx),
+        1,
+        None,
+        None,
+        None,
+        0,
+        None,
+        &delivery,
+    )
+    .await
+    .expect("the partition runs");
+    let mut warnings = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let bifrost_types::SyncEvent::Warning(warning) = event.event.as_ref() {
+            warnings.push(warning.clone());
+        }
+    }
+    (outcome, warnings)
+}
+
+/// A fixed-plan partition whose stream ends with neither `Done` nor
+/// `Terminated` proved nothing about how far the enumeration got. It must not
+/// read as complete - that wrote the scope's completion marker over ground
+/// nothing covered, and the next attach skipped the walk for good - and the
+/// reason is surfaced as a typed warning.
+#[tokio::test]
+async fn a_fixed_partition_that_ends_silently_is_incomplete_and_says_so() {
+    let (outcome, warnings) = run_observed(Vec::new()).await;
+    assert!(
+        !outcome.complete,
+        "a silent end must not complete the partition"
+    );
+    assert_eq!(outcome.end, None);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.kind == bifrost_types::WarningKind::InventoryEndedUnannounced),
+        "{warnings:?}"
+    );
+}
+
+/// The control: a partition that ends in `Done` completes, and says nothing.
+#[tokio::test]
+async fn a_fixed_partition_that_ends_in_done_completes_without_the_warning() {
+    let scope = CursorScope::Account;
+    let done = InventoryEvent::Done(InventoryCompletion::complete(
+        CoverageDomain::full(scope),
+        None,
+        PartitionEnd::Exhausted,
+    ));
+    let (outcome, warnings) = run_observed(vec![done]).await;
+    assert!(outcome.complete);
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w.kind != bifrost_types::WarningKind::InventoryEndedUnannounced),
+        "{warnings:?}"
+    );
+}
+
 fn assert_contract_violation(
     outcome: Result<bifrost_sync::backfill::BackfillPartitionOutcome, Error>,
     what: &str,

@@ -70,5 +70,13 @@ pub enum WarningKind {
     /// signed. Minted exclusively by the multiplexer's `ChangesReceiver`
     /// when it converts `RecvError::Lagged` into an observable event.
     ChangeStreamLagged,
+    /// An inventory walk ended without the `Done` or `Terminated` every walk
+    /// must end in, so nothing proved how far the enumeration got, and the walk
+    /// is not treated as complete: backfill withholds the scope's completion
+    /// marker, and the inventory fusion walk establishes no cursor. Pages
+    /// acknowledged earlier in the walk still stand. A producer defect, not
+    /// something the user can fix, but the user sees a scope that never
+    /// finishes and this says why. Minted by both engine inventory front ends.
+    InventoryEndedUnannounced,
     Other,
 }

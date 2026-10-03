@@ -60,6 +60,26 @@ impl InventoryWalk {
     }
 }
 
+/// The warning both front ends emit when an inventory stream ends with neither
+/// `Done` nor `Terminated`.
+///
+/// Every walk must end in one of the two, so a silent end is a producer
+/// breaking its stream contract, and nothing says how far the enumeration got.
+/// Neither front end treats the walk as complete: backfill leaves the scope
+/// pending instead of writing its completion marker, and fusion establishes no
+/// cursor. Pages acknowledged earlier in the walk still stand; it is the walk
+/// as a whole that proved nothing. The user sees a scope that never finishes,
+/// so the reason travels on
+/// the change stream as a typed warning rather than a log line (ruled
+/// 2026-10-04).
+pub(crate) fn unannounced_end_warning() -> bifrost_types::Warning {
+    bifrost_types::Warning::user_safe(
+        bifrost_types::WarningKind::InventoryEndedUnannounced,
+        "inventory for this scope ended without reporting completion, so the scope is \
+         not treated as fully synced",
+    )
+}
+
 pub(crate) fn barrier_incidents(
     coverage: &InventoryCoverageReport,
     generation: u64,

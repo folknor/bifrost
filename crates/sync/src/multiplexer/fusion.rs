@@ -345,6 +345,19 @@ impl InventoryFusion {
                 _ => {}
             }
         }
+        // The stream ended with neither `Done` nor `Terminated`: a producer
+        // breaking its contract. No cursor is established, and the reason is
+        // surfaced, the same way the backfill runner surfaces it.
+        if let Some(tx) = &changes_tx {
+            let _ = tx.sender().send(MultiplexerEvent {
+                scope: scope.clone(),
+                event: Arc::new(SyncEvent::Warning(
+                    crate::inventory_walk::unannounced_end_warning(),
+                )),
+                checkpoint: None,
+                publication: None,
+            });
+        }
         Ok(FusionOutcome::NoCursor)
     }
 
@@ -763,6 +776,35 @@ mod tests {
             matches!(announced.event.as_ref(), SyncEvent::Warning(w)
                 if w.kind == bifrost_types::WarningKind::StrategyDowngraded),
             "the forwarded event must be the producer's own warning, got {:?}",
+            announced.event
+        );
+    }
+
+    /// A stream that ends with neither `Done` nor `Terminated` establishes no
+    /// cursor, and says why on the change stream - the same warning the
+    /// backfill runner emits for the same producer defect.
+    #[tokio::test]
+    async fn a_walk_that_ends_silently_warns_and_establishes_nothing() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(4);
+        let fusion = fusion_with_writer(writer_tx);
+        let stream: bifrost_types::AccountStream<bifrost_types::InventoryEvent> =
+            Box::pin(futures::stream::empty());
+        let (changes_tx, mut changes_rx) = tokio::sync::broadcast::channel(8);
+
+        let outcome = fusion
+            .run_stream(
+                CursorScope::Account,
+                stream,
+                Some(Arc::new(ChangeDelivery::new(changes_tx))),
+            )
+            .await
+            .expect("a silent end is not an engine error");
+        assert!(matches!(outcome, FusionOutcome::NoCursor), "{outcome:?}");
+        let announced = changes_rx.try_recv().expect("the silent end is surfaced");
+        assert!(
+            matches!(announced.event.as_ref(), SyncEvent::Warning(w)
+                if w.kind == bifrost_types::WarningKind::InventoryEndedUnannounced),
+            "{:?}",
             announced.event
         );
     }

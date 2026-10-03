@@ -1556,6 +1556,15 @@ pub(super) async fn reattach_account(
         // the end, after every step that publishes the cutover. The carried
         // orphans name the PREVIOUS connection's handles and are dropped as detach
         // drops stranded records, which its own take logs.
+        //
+        // Accepted inconsistency (ruled 2026-10-04): plain detach deliberately
+        // leaves server-side subscriptions alive for queue-for-later delivery,
+        // and this race deletes the consumer's. It differs only for a provider
+        // whose subscription outlives `Account::close()` (Graph's close deletes
+        // its webhook rows, JMAP and IMAP push die with the connection), and
+        // the alternative is live subscriptions no handle anywhere names: the
+        // old handles were already torn down above. The reattach still returns
+        // `Ok`, since the swap committed before detach ended the account.
         let mut refused_install = 0_usize;
         if let Err(refused) = ctx.subscriptions.replace(
             ctx.account_id.clone(),

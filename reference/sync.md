@@ -561,14 +561,17 @@ the caller's retry budget after a change that cannot be undone. Pinned by
 Orphans are retried against whichever account is current at that time, not the
 replacement that created them, which is why the cleanup task tries the
 replacement itself first. That is an accepted limit and it is benign in this
-workspace: no provider rejects a handle it does not know (IMAP, JMAP and Graph
-answer `Ok` without touching the wire; Google re-derives the mailbox's watch
-state), so a retry on a later connection clears the orphan and cannot fail
-forever. It does not always delete anything: Graph, IMAP and JMAP keep the
-handle's server state in the account instance, so a retry that reaches a newer
+workspace: no provider rejects a handle it does not know (IMAP and JMAP answer
+`Ok` without touching the wire; Graph deletes the ids the handle reaches,
+counting already-gone ones as done; Google re-derives the mailbox's watch
+state), so a retry on a later connection clears the orphan rather than failing
+forever on an unknown handle. It does not always delete anything: IMAP and JMAP keep the handle's
+server state in the account instance, so a retry that reaches a newer
 connection is a no-op and the provider-side subscription then lives until it
-expires (Graph's webhook rows are also deleted by the owning account's
-`close()`, which the guard runs).
+expires. Graph's webhook handles carry their subscription ids, and its factory
+shares the ids its renewal worker recreated, so a Graph retry on a newer
+connection does delete (and the owning account's `close()`, which the guard
+runs, deletes its webhook rows too).
 Known residue: a drop parked inside `push_subscribe` itself may leave a
 provider-side subscription whose handle the engine never received (the account
 implementation's cancellation contract).
@@ -1081,7 +1084,16 @@ page with more behind it, and a window whose ids all vanished before
 hydration is empty with more behind it. A partition stream that ends
 without any completion declared nothing, so the walk ends there without
 completing the scope - neither asking for windows forever nor writing a
-sentinel over ground nothing proved. Producers that emit `SyncEvent`
+sentinel over ground nothing proved. The same holds for every plan, not only
+`OpenPages`: `run_partition` reports a silently ended stream as
+`complete: false`, so a fixed plan (Full, time windows, UID ranges) no longer
+writes its completion sentinel over it, and the scope stays Pending. Both
+inventory front ends surface the silent end as a typed `SyncEvent::Warning`
+of kind `WarningKind::InventoryEndedUnannounced`
+(`inventory_walk::unannounced_end_warning`); the fusion walk establishes no
+cursor. A silent end is a producer breaking the `InventoryEvent` contract,
+and the user sees a scope that never finishes, so the reason travels on the
+change stream rather than in a log (ruled 2026-10-04). Producers that emit `SyncEvent`
 streams get the declaration from `lift_complete_walk`, the one place that
 still infers it (see `reference/types.md`).
 
@@ -1912,10 +1924,10 @@ calls the trait method once per record. An application holds an engine,
 not an `Account`, so an application calls the second.
 
 `detach` drops the detaching incarnation's registry records. The handles
-in the registry are connection-local on Graph and IMAP, so carrying them
-across a detach would let a later attach of the same `AccountId` inherit
-handles minted by a dead connection and present them to the provider as
-live. Dropping loses nothing retryable: after detach, `unsubscribe_push`
+in the registry belong to that incarnation (on IMAP and JMAP they are
+connection-local outright), so carrying them across a detach would let a
+later attach of the same `AccountId` inherit handles minted by a dead
+connection and present them to the provider as live. Dropping loses nothing retryable: after detach, `unsubscribe_push`
 rejects with `AccountNotAttached` and reopen only runs on an attached
 slot, so nothing could have reached those records anyway.
 
@@ -1942,6 +1954,25 @@ and the teardown error is returned unless the detach itself failed. Pinned by
 `detach_with_teardown_tears_push_subscriptions_down_before_detaching`, beside
 `detach_drops_push_records_so_a_reattach_cannot_reuse_dead_handles`, which
 pins that plain `detach` still does not tear down.
+
+Two races with detach DO tear down, because what they would otherwise leave is
+a live subscription no handle anywhere names (ruled 2026-10-04):
+
+- A `subscribe_push` whose registration lands after detach took the registry
+  deletes the subscription it just created and returns `AccountNotAttached`.
+  The caller is told the call failed and never holds the handle, so this is
+  not the queue-for-later pattern, which is a consumer's deliberate keep of a
+  subscription it knowingly made.
+- A reattach whose registry install lands after detach's take tears the
+  replacement's subscriptions down and still returns `Ok`: the swap committed
+  before detach ended the account. Accepted inconsistency: for a provider whose
+  subscription outlives `Account::close()`, a clean detach would have kept the
+  consumer's subscriptions alive for queue-for-later delivery, and this race
+  deletes them. Graph's `close()` deletes its webhook rows anyway and JMAP and
+  IMAP push die with the connection, so the two paths differ only for such a
+  provider, and only when the race hits. The old handles were already torn
+  down earlier in the same reattach, so keeping the replacements would have
+  meant live subscriptions with no handle anywhere.
 
 ## Mutation pipeline
 
