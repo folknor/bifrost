@@ -1,15 +1,16 @@
 //! IMAP command encoder.
 //!
-//! Serializes [`Command`] values into bytes suitable for sending to the server.
-//! Each command is prefixed with a unique tag (e.g. `A001`, `A002`, ...).
+//! Serializes [`Command`](crate::types::Command) values into a
+//! [`WireCommand`] ready for the wire. Each command is prefixed with a unique
+//! tag (e.g. `A001`, `A002`, ...).
 //!
 //! Command syntax is defined in RFC 3501 Section 6 / RFC 9051 Section 6.
-//! String encoding (quoted vs literal) follows RFC 3501 Section 9 / RFC 9051 Section 9.
+//! String encoding (quoted vs literal) follows RFC 3501 Section 9 / RFC 9051
+//! Section 9, and is decided in one place, [`CommandWriter`].
 
 mod commands;
 mod core;
 mod dispatch;
-mod string_helpers;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -17,28 +18,23 @@ mod string_helpers;
 mod tests;
 
 use base64::Engine as _;
-use bytes::BytesMut;
 
 #[cfg(test)]
 use crate::types::Command;
 use crate::types::QresyncParams;
 
-// Re-export sub-module items that are part of this module's public API.
-pub(crate) use commands::encode_append;
-pub(crate) use dispatch::encode_command;
-pub(crate) use string_helpers::{encode_quoted_or_literal, encode_quoted_or_literal_utf8};
-
-// Make sub-module items available within this module for dispatch.
 pub(crate) use commands::list_status_return_option_items;
 #[cfg(test)]
-use commands::{encode_getmetadata, encode_login, encode_select_or_examine, encode_simple};
-pub(crate) use core::{
-    ChunkedCommand, EncodeError, EncodeOptions, EncodedCommand, LITERAL_MINUS_MAX, LiteralMode,
+use commands::{
+    encode_getmetadata, encode_login, encode_metadata_value, encode_select_or_examine,
+    encode_simple,
 };
+pub(crate) use core::{
+    CommandWriter, EncodeOptions, LITERAL_MINUS_MAX, LiteralForm, LiteralMode, WireCommand,
+};
+pub(crate) use dispatch::encode_command;
 #[cfg(test)]
 use dispatch::encode_command_to_buf;
-#[cfg(test)]
-use string_helpers::encode_metadata_value;
 
 // ---------------------------------------------------------------------------
 // Validation helpers
@@ -165,6 +161,64 @@ fn validate_search_criteria_crlf(
     Ok(())
 }
 
+/// Write caller-supplied SEARCH-family criteria, re-emitting every counted
+/// literal the caller wrote through the writer.
+///
+/// Must run AFTER [`validate_search_criteria_crlf`] has accepted `criteria`,
+/// which judged the caller's ORIGINAL markers (a `{n+}` the connection cannot
+/// take is a capability refusal there, and is never silently rewritten here).
+/// Every byte that is not a literal marker is copied verbatim, and every
+/// literal payload is copied verbatim, skipped by its declared length so
+/// marker-shaped bytes inside it stay payload. Only the marker itself is
+/// re-emitted, by [`CommandWriter::literal`], which is what records the
+/// segment boundary a synchronizing literal needs and applies the one `+`
+/// rule. Two spellings can therefore differ from what the caller wrote: a
+/// count with leading zeros is written canonically (`{0001}` becomes `{1}`),
+/// and a literal8 `~{n+}` the connection may not send non-synchronizing loses
+/// its `+`, because sending it would have the server expect octets the client
+/// then writes without a grant.
+///
+/// Works on bytes, never on `str` slices: the walk advances by octet offsets
+/// that need not be UTF-8 boundaries.
+fn write_criteria(w: &mut CommandWriter, criteria: &str) {
+    use crate::connection::literals::{LiteralMarker, literal_marker_at};
+
+    let bytes = criteria.as_bytes();
+    let mut i = 0usize;
+    let mut text_start = 0usize;
+    while i < bytes.len() {
+        let LiteralMarker::Counted {
+            data_start, size, ..
+        } = literal_marker_at(bytes, i)
+        else {
+            i += 1;
+            continue;
+        };
+        // The validator has already proven the payload is inside `criteria`.
+        let Some(data_end) = usize::try_from(size)
+            .ok()
+            .and_then(|size| data_start.checked_add(size))
+            .filter(|&end| end <= bytes.len())
+        else {
+            i += 1;
+            continue;
+        };
+        // A literal8 marker owns the tilde before its brace (RFC 4466
+        // Section 2.1); leaving the tilde as text would let the writer emit a
+        // classic marker after it and get the literal8 sync rule wrong.
+        let (marker_start, form) = if i > text_start && bytes[i - 1] == b'~' {
+            (i - 1, LiteralForm::Literal8)
+        } else {
+            (i, LiteralForm::Classic)
+        };
+        w.raw(&bytes[text_start..marker_start]);
+        w.literal(&bytes[data_start..data_end], form);
+        i = data_end;
+        text_start = data_end;
+    }
+    w.raw(&bytes[text_start..]);
+}
+
 /// Detect whether SEARCH criteria begin with a CHARSET specification.
 ///
 /// RFC 3501 Section 6.4.4 places the optional `CHARSET <astring>` prefix at
@@ -285,19 +339,19 @@ fn validate_mod_sequence_valzer(val: u64, context: &str) -> Result<(), crate::Er
 /// Validates that `modseq` satisfies the `mod-sequence-value` production
 /// (>= 1, <= `i64::MAX`).
 fn encode_changedsince_modifier(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     modseq: u64,
     vanished: bool,
 ) -> Result<(), crate::Error> {
     validate_mod_sequence_value(modseq, "CHANGEDSINCE")?;
-    buf.extend_from_slice(b" (CHANGEDSINCE ");
-    buf.extend_from_slice(modseq.to_string().as_bytes());
+    w.raw(b" (CHANGEDSINCE ");
+    w.raw(modseq.to_string().as_bytes());
     // RFC 7162 Section 3.2.6: VANISHED modifier appended in the same
     // parenthesized fetch modifier list as CHANGEDSINCE.
     if vanished {
-        buf.extend_from_slice(b" VANISHED");
+        w.raw(b" VANISHED");
     }
-    buf.extend_from_slice(b")");
+    w.raw(b")");
     Ok(())
 }
 
@@ -308,25 +362,25 @@ fn encode_changedsince_modifier(
 /// where each capability is an `atom` per RFC 3501 Section 9.
 /// The capability list must be non-empty.
 fn encode_enable(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     capabilities: &[String],
-) -> Result<(), EncodeError> {
+) -> Result<(), crate::Error> {
     if capabilities.is_empty() {
-        return Err(EncodeError::Validation(
+        return Err(crate::Error::InvalidInput(
             "ENABLE requires at least one capability (RFC 5161 Section 3.1)".into(),
         ));
     }
     for cap in capabilities {
         validate_atom(cap, "ENABLE capability")?;
     }
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" ENABLE");
+    w.raw(tag.as_bytes());
+    w.raw(b" ENABLE");
     for cap in capabilities {
-        buf.extend_from_slice(b" ");
-        buf.extend_from_slice(cap.as_bytes());
+        w.raw(b" ");
+        w.raw(cap.as_bytes());
     }
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b"\r\n");
     Ok(())
 }
 

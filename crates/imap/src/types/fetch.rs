@@ -361,7 +361,7 @@ pub struct StoreResult {
 /// Multiple `AppendMessage` values are sent in a single APPEND command per
 /// RFC 3502 Section 3.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AppendMessage {
     /// Flags to set on the appended message (RFC 3501 Section 6.3.11).
     pub flags: Vec<Flag>,
@@ -386,6 +386,19 @@ impl AppendMessage {
             date: None,
             data: data.into(),
         }
+    }
+}
+
+/// Prints the body's length, never its content. APPEND is an ordinary
+/// `Command`, and the driver traces commands with `?cmd`: a derived `Debug`
+/// would put whole messages into logs.
+impl std::fmt::Debug for AppendMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppendMessage")
+            .field("flags", &self.flags)
+            .field("date", &self.date)
+            .field("data_len", &self.data.len())
+            .finish()
     }
 }
 

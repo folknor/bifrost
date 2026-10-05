@@ -1,15 +1,14 @@
-use bytes::BytesMut;
+use bifrost_types::TransmissionState;
 use tracing::trace;
 
 use crate::codec::classification::{self, ClassificationContext, SolicitationRule};
-use crate::codec::encode::{LiteralMode, encode_command};
+use crate::codec::encode::encode_command;
 use crate::error::Error;
 use crate::types::Command;
-use crate::types::response::Capability;
 use crate::types::validated::MailboxName;
 
 use super::event_sink;
-use super::wire_send::{send_encoded_segments, send_with_literal_sync};
+use super::wire_send::{send_wire_command, write_failure_evidence};
 use super::{ConsumerErased, PipelineResults};
 
 /// A sub-batch entry: `(original_index, command, consumer)`.
@@ -136,8 +135,9 @@ pub(super) enum Routed {
 /// the drift shape this crate has paid for before.
 ///
 /// Design note: the other state-changing commands (ENABLE, SELECT, CLOSE,
-/// UNSELECT) are excluded from pipeline execution by API design - no pipeline
-/// methods exist for them - which is why there is no `set_in_close` here.
+/// UNSELECT, ...) cannot reach a batch - `run_pipeline` refuses any command
+/// whose `CommandKind::pipelinable` is false before a byte is written - which
+/// is why there is no `set_in_close` here.
 fn apply_pipeline_pre_effects(
     state: &mut super::super::state::ProtocolState,
     routing: &PipelineRouting<'_>,
@@ -499,6 +499,37 @@ pub(super) async fn run_pipeline(
         return Ok(Vec::new());
     }
 
+    // Admission, over the WHOLE original vector before any grouping or any
+    // byte: a sub-batch cannot be refused after an earlier one has run.
+    //
+    // A command that may not ride a batch at all is a crate bug - the
+    // `Pipeline` builder has no method for one - so it is `Internal`. A
+    // command the live session does not permit is the same head-of-queue
+    // refusal a single command gets (`live_state_refusal`); the handle
+    // checked every command at execution, so reaching here means the session
+    // moved while the batch was queued. The batch is encoded and admitted
+    // against one session state, which holds because no pipelinable command
+    // changes it (a BYE mid-batch is fatal instead).
+    if let Some(cmd) = commands.iter().find(|cmd| !cmd.kind().pipelinable()) {
+        return Err(Error::Internal(format!(
+            "{:?} cannot be pipelined (CommandKind::pipelinable)",
+            cmd.kind()
+        )));
+    }
+    for cmd in &commands {
+        if let Some(refusal) = super::live_state_refusal(state.session_state(), cmd.kind()) {
+            return Err(refusal);
+        }
+    }
+
+    // Transmission evidence is relative to the WHOLE pipeline, not to a
+    // sub-batch: the socket counter is read once here and carried through
+    // every sub-batch. Read per sub-batch, a second sub-batch whose first
+    // write reached nothing would be stamped `Unsent` after the first
+    // sub-batch had already executed - and the error replaces its results -
+    // inviting a retry that repeats a mutation the server performed.
+    let baseline = wire_reader.written();
+
     // Check whether all commands have unique kinds. If so, skip the
     // grouping overhead and delegate directly to run_pipeline_batch.
     let has_duplicates = {
@@ -508,8 +539,16 @@ pub(super) async fn run_pipeline(
 
     if !has_duplicates {
         // Fast path: all kinds unique, single batch is safe.
-        return run_pipeline_batch(wire_reader, state, tag_gen, event_sink, commands, consumers)
-            .await;
+        return run_pipeline_batch(
+            wire_reader,
+            state,
+            tag_gen,
+            event_sink,
+            commands,
+            consumers,
+            baseline,
+        )
+        .await;
     }
 
     let sub_batches = group_into_sub_batches(commands, consumers);
@@ -539,6 +578,7 @@ pub(super) async fn run_pipeline(
             event_sink,
             batch_cmds,
             batch_consumers,
+            baseline,
         )
         .await?;
 
@@ -570,7 +610,11 @@ pub(super) async fn run_pipeline(
 /// 1. Snapshots encode options (C7 fix: capability state at batch start).
 /// 2. Encodes all commands before sending any bytes, and builds the routing
 ///    tables. Any encode failure aborts the entire batch.
-/// 3. Sends all commands on the wire (batch write for LITERAL+ mode).
+/// 3. Sends all commands on the wire. The write pattern follows each
+///    command's encoded segments, never the negotiated literal mode: when no
+///    command has a synchronizing literal the whole batch is one coalesced
+///    write, otherwise each command goes through the shared sender, which
+///    stops at every synchronizing marker until it is granted.
 /// 4. Reads responses, routing each to the correct consumer by tag.
 ///    Untagged responses are classified against the head (first
 ///    non-finalized) consumer's command kind. Once a consumer is
@@ -579,17 +623,25 @@ pub(super) async fn run_pipeline(
 ///
 /// The routing tables are built BEFORE step 3 rather than after it because
 /// the send phase reads from the socket too. Whenever a synchronizing literal
-/// forces a continuation wait (no LITERAL+, or a LITERAL- literal too large to
-/// patch), commands already on the wire have tags still pending, and their
-/// responses arrive during that wait. Routing them needs the same tables step
-/// 4 uses, so both loops share one router and the send phase is not a
-/// consumerless loop.
+/// forces a continuation wait, commands already on the wire have tags still
+/// pending, and their responses arrive during that wait. Routing them needs
+/// the same tables step 4 uses, so both loops share one router and the send
+/// phase is not a consumerless loop.
 ///
-/// Continuations (`+`) are errors in the step 4 loop. Pipelinable commands do
-/// not produce continuations of their own (the `Pipelinable` sealed trait
-/// enforces this at the type level); a `+` during the send phase is the
-/// literal grant and belongs to the sender.
-#[allow(clippy::too_many_lines)]
+/// Transmission evidence is relative to the whole PIPELINE, not to this
+/// sub-batch or the command being written: `baseline` is the socket counter
+/// `run_pipeline` read once before the first sub-batch, so a failure once any
+/// byte of the pipeline has been accepted is `InFlight` - earlier commands, in
+/// this sub-batch or an earlier one, may already have executed. A batch-level
+/// error still cannot say WHICH commands ran; that is a limit of the
+/// all-or-error result shape.
+///
+/// Continuations (`+`) are errors in the step 4 loop. A pipelinable command
+/// does not take continuations of its own (`CommandKind::pipelinable`
+/// excludes AUTHENTICATE and IDLE, and `run_pipeline` refuses a batch holding
+/// one); a `+` during the send phase is the literal grant and belongs to the
+/// sender.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_pipeline_batch(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
@@ -597,6 +649,7 @@ async fn run_pipeline_batch(
     event_sink: &mut event_sink::DriverEventSink,
     commands: Vec<Command>,
     consumers: Vec<Box<dyn ConsumerErased>>,
+    baseline: u64,
 ) -> Result<PipelineResults, Error> {
     let count = commands.len();
     if count == 0 {
@@ -607,8 +660,6 @@ async fn run_pipeline_batch(
     // All commands in the batch are encoded against the same capability
     // state, preventing mid-pipeline staleness.
     let opts = super::build_encode_options(state);
-    let allow_literal8 =
-        state.capabilities().contains(&Capability::Binary) && !super::is_rev2(state);
 
     // 2. Encode all commands. Any encode failure aborts the whole batch
     //    before any bytes go on the wire.
@@ -642,82 +693,50 @@ async fn run_pipeline_batch(
 
     trace!(count, "driver: sending pipelined batch");
 
-    // 3. Send all commands on the wire. For LITERAL+ mode, batch all
-    //    into a single buffer for a single-write send. For other modes,
-    //    send each command individually with literal synchronization as
-    //    needed (RFC 3501 Section4.3).
-    match opts.literal_mode {
-        LiteralMode::LiteralPlus => {
-            // RFC 7888 Section4: all literals are non-synchronizing. Batch
-            // everything into a single write.
-            let bufs: Vec<BytesMut> = encoded_commands
-                .into_iter()
-                .map(|e| {
-                    let flat = e.into_buf();
-                    super::super::patch_literals_to_plus_with_binary(&flat, allow_literal8)
-                })
-                .collect();
-            let total: usize = bufs.iter().map(BytesMut::len).sum();
-            let mut batch = BytesMut::with_capacity(total);
-            for buf in bufs {
-                batch.extend_from_slice(&buf);
-            }
-            wire_reader.write_all(&batch).await?;
+    // 3. Send all commands on the wire. Every write failure below is judged
+    //    against `baseline`, the counter at the start of the whole pipeline.
+    if encoded_commands
+        .iter()
+        .all(|encoded| encoded.segments().len() == 1)
+    {
+        // No synchronizing literal anywhere in the batch (RFC 7888 literals
+        // are all `+`, or there are none): the whole batch is one write,
+        // flushed once.
+        let chunks: Vec<&bytes::Bytes> = encoded_commands
+            .iter()
+            .flat_map(|encoded| encoded.segments().iter().flatten())
+            .collect();
+        if let Err(e) = wire_reader.write_chunks(&chunks).await {
+            let evidence = write_failure_evidence(wire_reader, baseline);
+            return Err(e.with_attempt(evidence));
         }
-        LiteralMode::LiteralMinus => {
-            // RFC 7888 Section5: small literals (<=4096) are non-synchronizing;
-            // larger ones need sync. Send each command with patching.
-            for (i, encoded) in encoded_commands.into_iter().enumerate() {
-                let flat = encoded.into_buf();
-                let patched =
-                    super::super::patch_small_literals_to_plus_with_binary(&flat, allow_literal8);
-                let mut routing = PipelineRouting {
-                    sending: Some(i),
-                    tag_to_idx: &tag_to_idx,
-                    commands: &commands,
-                    kinds: &kinds,
-                    targets: &targets,
-                    tags: &tags,
-                    consumers: &mut consumers,
-                    results: &mut results,
-                    completed: &mut completed,
-                };
-                send_with_literal_sync(
-                    wire_reader,
-                    state,
-                    event_sink,
-                    &patched,
-                    &tags[i],
-                    Some(&mut routing),
-                )
-                .await?;
-            }
-        }
-        LiteralMode::Synchronizing => {
-            // RFC 3501 Section4.3: all literals are synchronizing. Send each
-            // command's segments with literal sync.
-            for (i, encoded) in encoded_commands.into_iter().enumerate() {
-                let mut routing = PipelineRouting {
-                    sending: Some(i),
-                    tag_to_idx: &tag_to_idx,
-                    commands: &commands,
-                    kinds: &kinds,
-                    targets: &targets,
-                    tags: &tags,
-                    consumers: &mut consumers,
-                    results: &mut results,
-                    completed: &mut completed,
-                };
-                send_encoded_segments(
-                    wire_reader,
-                    state,
-                    event_sink,
-                    encoded.segments(),
-                    &tags[i],
-                    Some(&mut routing),
-                )
-                .await?;
-            }
+    } else {
+        // At least one synchronizing literal: send command by command, each
+        // stopping at its markers until granted (RFC 3501 Section 4.3), with
+        // the batch's routing so earlier commands' responses read during a
+        // continuation wait reach their own consumers.
+        for (i, encoded) in encoded_commands.iter().enumerate() {
+            let mut routing = PipelineRouting {
+                sending: Some(i),
+                tag_to_idx: &tag_to_idx,
+                commands: &commands,
+                kinds: &kinds,
+                targets: &targets,
+                tags: &tags,
+                consumers: &mut consumers,
+                results: &mut results,
+                completed: &mut completed,
+            };
+            send_wire_command(
+                wire_reader,
+                state,
+                event_sink,
+                encoded,
+                &tags[i],
+                baseline,
+                Some(&mut routing),
+            )
+            .await?;
         }
     }
 
@@ -729,7 +748,11 @@ async fn run_pipeline_batch(
     // after it.
     while completed < count {
         let utf8 = super::utf8_mode(state);
-        let resp = wire_reader.read_one(utf8).await?;
+        // The batch is on the wire: a transport failure here is InFlight.
+        let resp = wire_reader
+            .read_one(utf8)
+            .await
+            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
         let mut routing = PipelineRouting {
             sending: None,
             tag_to_idx: &tag_to_idx,
@@ -743,8 +766,8 @@ async fn run_pipeline_batch(
         };
         match route_pipeline_response(state, event_sink, &mut routing, resp)? {
             Routed::Continuation => {
-                // Pipelinable commands do not produce continuations
-                // (enforced by the Pipelinable sealed trait).
+                // Pipelinable commands do not take continuations
+                // (`CommandKind::pipelinable`, checked in `run_pipeline`).
                 // An unexpected + is a protocol error (RFC 3501 Section7.5).
                 return Err(Error::Protocol(
                     "unexpected continuation in pipeline response loop".into(),

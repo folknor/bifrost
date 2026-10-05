@@ -291,18 +291,6 @@ impl From<crate::types::ValidationError> for Error {
     }
 }
 
-impl From<crate::codec::encode::EncodeError> for Error {
-    fn from(e: crate::codec::encode::EncodeError) -> Self {
-        match e {
-            crate::codec::encode::EncodeError::MissingCapability { cmd, cap } => {
-                Self::MissingCapability(format!("{cmd} requires {cap}"))
-            }
-            crate::codec::encode::EncodeError::CapabilityText(msg) => Self::MissingCapability(msg),
-            crate::codec::encode::EncodeError::Validation(msg) => Self::InvalidInput(msg),
-        }
-    }
-}
-
 /// Equality across variants. `Io` compares by `std::io::ErrorKind` only
 /// (the underlying error is not `PartialEq`).
 impl PartialEq for Error {

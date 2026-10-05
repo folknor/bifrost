@@ -691,7 +691,18 @@ impl<T> Pipeline<'_, T> {
     }
 
     /// Internal: send the pipeline to the driver and await the results.
+    ///
+    /// Admission happens HERE, at execution, not as commands are added: a
+    /// pipeline is built before it runs, and only the state at execution says
+    /// whether its commands may be sent. A command the session does not permit
+    /// is caller sequencing (`InvalidState`), refused before anything is
+    /// submitted; the driver checks again at the head of its queue.
     async fn execute_raw(self) -> Result<Vec<Result<Box<dyn Any + Send>, Error>>, PipelineError> {
+        for cmd in &self.commands {
+            self.conn
+                .require_state(cmd.kind())
+                .map_err(PipelineError::Driver)?;
+        }
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let dcmd = super::driver::DriverCommand::Pipeline {
             commands: self.commands,
@@ -734,8 +745,9 @@ impl super::ImapConnection {
     ///
     /// Only commands that are safe to pipeline have methods on
     /// `Pipeline`. State-changing commands (SELECT, STARTTLS, IDLE,
-    /// LOGOUT, AUTHENTICATE, etc.) are intentionally absent  -  the
-    /// sealed `Pipelinable` trait enforces this at compile time.
+    /// LOGOUT, AUTHENTICATE, APPEND, etc.) are intentionally absent; the
+    /// driver also refuses, before writing a byte, any batch holding a
+    /// command whose `CommandKind::pipelinable` is false.
     pub fn pipeline(&self) -> Pipeline<'_, ()> {
         Pipeline::new(self)
     }

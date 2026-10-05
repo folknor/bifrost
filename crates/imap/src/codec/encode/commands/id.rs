@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use super::{BytesMut, LiteralMode, encode_quoted_or_literal_utf8};
+use super::CommandWriter;
 
 /// Encode ID command (RFC 2971 Section 3.1).
 ///
@@ -17,11 +17,10 @@ use super::{BytesMut, LiteralMode, encode_quoted_or_literal_utf8};
 /// - Field strings MUST NOT exceed 30 octets.
 /// - Value strings MUST NOT exceed 1024 octets.
 pub(in crate::codec::encode) fn encode_id(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     params: &[(String, Option<String>)],
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     // RFC 2971 Section 3.3: "Implementations MUST NOT send more than 30
     // field-value pairs."
@@ -69,26 +68,26 @@ pub(in crate::codec::encode) fn encode_id(
         }
     }
 
-    buf.extend_from_slice(tag.as_bytes());
+    w.raw(tag.as_bytes());
     if params.is_empty() {
         // RFC 2971 Section 3.1: NIL means "no data to send".
-        buf.extend_from_slice(b" ID NIL\r\n");
+        w.raw(b" ID NIL\r\n");
     } else {
-        buf.extend_from_slice(b" ID (");
+        w.raw(b" ID (");
         for (i, (key, value)) in params.iter().enumerate() {
             if i > 0 {
-                buf.extend_from_slice(b" ");
+                w.raw(b" ");
             }
             // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-            encode_quoted_or_literal_utf8(buf, key.as_bytes(), utf8, literal_mode);
-            buf.extend_from_slice(b" ");
+            w.string(key.as_bytes(), utf8);
+            w.raw(b" ");
             // RFC 2971 Section 3.1: values are nstring. None encodes as NIL.
             match value {
-                Some(v) => encode_quoted_or_literal_utf8(buf, v.as_bytes(), utf8, literal_mode),
-                None => buf.extend_from_slice(b"NIL"),
+                Some(v) => w.string(v.as_bytes(), utf8),
+                None => w.raw(b"NIL"),
             }
         }
-        buf.extend_from_slice(b")\r\n");
+        w.raw(b")\r\n");
     }
     Ok(())
 }

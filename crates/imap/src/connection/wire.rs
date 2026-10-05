@@ -118,14 +118,45 @@ impl WireReader {
         }
     }
 
-    /// Write raw bytes to the wire. Used by command encoders.
+    /// Write raw bytes to the wire and flush.
     /// Does not read. Does not parse. Does not mutate buf.
+    ///
+    /// Errors carry no transmission evidence: only the caller knows where
+    /// its command began, so it compares [`written`](Self::written) readings
+    /// to stamp them.
     pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.metering.throttle_out(bytes.len()).await;
-        self.stream.write_all(bytes).await?;
+        self.write_chunks(std::slice::from_ref(&bytes)).await
+    }
+
+    /// Write every chunk in order, then flush once.
+    ///
+    /// One segment of an encoded command is written this way: its chunks are
+    /// the caller's own allocations (a message body is never copied into a
+    /// command buffer), and the single flush ends the segment. Errors carry
+    /// no transmission evidence, as for [`write_all`](Self::write_all).
+    pub(crate) async fn write_chunks<B: AsRef<[u8]>>(&mut self, chunks: &[B]) -> Result<(), Error> {
+        for chunk in chunks {
+            let chunk = chunk.as_ref();
+            // An empty literal is legal and has nothing to write.
+            if chunk.is_empty() {
+                continue;
+            }
+            self.metering.throttle_out(chunk.len()).await;
+            self.stream.write_all(chunk).await?;
+            self.metering.record_out(chunk.len());
+        }
         self.stream.flush().await?;
-        self.metering.record_out(bytes.len());
         Ok(())
+    }
+
+    /// Octets the socket beneath this reader has accepted since the
+    /// connection opened, saturating at `u64::MAX`.
+    ///
+    /// The transmission-evidence reading: a command whose sender sees this
+    /// unchanged since the command began wrote nothing the peer can have
+    /// received. See `stream::Tracked`.
+    pub(crate) fn written(&self) -> u64 {
+        self.stream.written()
     }
 
     /// Whether the internal parse buffer is empty.

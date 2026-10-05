@@ -24,7 +24,7 @@ impl ImapConnection {
     ///  -  handled entirely by the driver task.
     pub async fn compress(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 4978 Section 4: COMPRESS is valid in Authenticated and Selected states.
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Compress)?;
 
         // Check COMPRESS=DEFLATE capability from the snapshot.
         {
@@ -70,7 +70,7 @@ impl ImapConnection {
     ) -> Result<(), Error> {
         // RFC 5465 Section 3: NOTIFY is a `command-auth` extension, valid
         // in Authenticated or Selected state.
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::NotifySet)?;
         self.require_notify()?;
 
         // RFC 6855 Section 6: UTF8=ONLY servers reject commands that might
@@ -126,7 +126,7 @@ impl ImapConnection {
     ///   ([`Error::Closed`] once the session is in Logout).
     pub async fn notify_none(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 5465 Section 3: NOTIFY is a `command-auth` extension.
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::NotifyNone)?;
         self.require_notify()?;
 
         let cmd = Command::NotifyNone;
@@ -199,7 +199,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<Vec<String>, Error> {
         // RFC 5161 Section 2: ENABLE is only valid in Authenticated state.
-        self.require_state(&[SessionState::Authenticated])?;
+        self.require_state(crate::types::CommandKind::Enable)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Enable) {
@@ -228,7 +228,7 @@ impl ImapConnection {
     /// Requires the `NAMESPACE` capability or an `IMAP4rev2` connection
     /// (RFC 9051 folds NAMESPACE into the base protocol).
     pub async fn namespace(&self, timeout: Duration) -> Result<NamespaceResponse, Error> {
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Namespace)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Namespace) {
@@ -309,7 +309,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<MetadataResult, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::GetMetadata)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Metadata)
@@ -346,7 +346,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::SetMetadata)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Metadata)
@@ -386,7 +386,7 @@ impl ImapConnection {
         root: &str,
         timeout: Duration,
     ) -> Result<Vec<QuotaResource>, Error> {
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::GetQuota)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Quota) {
@@ -415,7 +415,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<QuotaRootResponse, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::GetQuotaRoot)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Quota) {
@@ -445,7 +445,7 @@ impl ImapConnection {
         resources: &[(&str, u64)],
         timeout: Duration,
     ) -> Result<Vec<QuotaResource>, Error> {
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::SetQuota)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::QuotaSet) {
@@ -485,7 +485,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::SetAcl)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
@@ -519,7 +519,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<(), Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::DeleteAcl)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
@@ -547,7 +547,7 @@ impl ImapConnection {
     /// Requires the `ACL` capability (RFC 4314 Section 1).
     pub async fn get_acl(&self, mailbox: &str, timeout: Duration) -> Result<Vec<AclEntry>, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::GetAcl)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
@@ -578,7 +578,7 @@ impl ImapConnection {
         timeout: Duration,
     ) -> Result<ListRightsResponse, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::ListRights)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Acl) {
@@ -607,7 +607,7 @@ impl ImapConnection {
     /// Requires the `ACL` capability (RFC 4314 Section 1).
     pub async fn my_rights(&self, mailbox: &str, timeout: Duration) -> Result<String, Error> {
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::MyRights)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Acl) {

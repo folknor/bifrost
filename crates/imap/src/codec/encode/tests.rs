@@ -1,3 +1,5 @@
+use bytes::BytesMut;
+
 use super::*;
 use crate::types::response::Capability;
 use crate::types::validated::{MailboxName, SequenceSet};
@@ -43,6 +45,129 @@ fn default_opts() -> EncodeOptions {
     opts(LiteralMode::Synchronizing, false)
 }
 
+// --- Fragment helpers ---
+//
+// The encoder pieces write through a `CommandWriter`; these run one piece
+// against a fresh writer and append everything it produced, as the server
+// would receive it, to `buf`.
+
+/// Each segment of `cmd` as one byte string: what the sender writes between
+/// two continuation waits.
+fn segment_bytes(cmd: &WireCommand) -> Vec<Vec<u8>> {
+    cmd.segments()
+        .iter()
+        .map(|segment| {
+            segment
+                .iter()
+                .flat_map(|chunk| chunk.iter().copied())
+                .collect()
+        })
+        .collect()
+}
+
+/// Run `write` against a writer for `opts` and return its segments.
+fn written_segments(opts: &EncodeOptions, write: impl FnOnce(&mut CommandWriter)) -> Vec<Vec<u8>> {
+    let mut w = CommandWriter::new(opts);
+    write(&mut w);
+    segment_bytes(&w.finish())
+}
+
+/// `A001 X` followed by each payload as a classic literal, then CRLF: the
+/// smallest command that exercises the writer's segmentation.
+fn x_command(mode: LiteralMode, literals: &[&[u8]]) -> WireCommand {
+    let mut w = CommandWriter::new(&opts(mode, false));
+    w.raw(b"A001 X");
+    for literal in literals {
+        w.raw(b" ");
+        w.literal(literal, LiteralForm::Classic);
+    }
+    w.raw(b"\r\n");
+    w.finish()
+}
+
+/// Run `write` against a writer for `mode` and return every byte it wrote.
+fn fragment(mode: LiteralMode, write: impl FnOnce(&mut CommandWriter)) -> Vec<u8> {
+    let mut w = CommandWriter::new(&opts(mode, false));
+    write(&mut w);
+    w.finish().to_vec()
+}
+
+/// As [`fragment`], for a piece that can refuse.
+fn try_fragment(
+    mode: LiteralMode,
+    write: impl FnOnce(&mut CommandWriter) -> Result<(), crate::Error>,
+) -> Result<Vec<u8>, crate::Error> {
+    let mut w = CommandWriter::new(&opts(mode, false));
+    write(&mut w)?;
+    Ok(w.finish().to_vec())
+}
+
+fn push_quoted_or_literal(buf: &mut BytesMut, data: &[u8], mode: LiteralMode) {
+    buf.extend_from_slice(&fragment(mode, |w| w.string(data, false)));
+}
+
+fn push_quoted_or_literal_utf8(buf: &mut BytesMut, data: &[u8], utf8: bool, mode: LiteralMode) {
+    buf.extend_from_slice(&fragment(mode, |w| w.string(data, utf8)));
+}
+
+fn push_metadata_value(buf: &mut BytesMut, data: &[u8], mode: LiteralMode) {
+    buf.extend_from_slice(&fragment(mode, |w| encode_metadata_value(w, data)));
+}
+
+fn push_simple(buf: &mut BytesMut, tag: &str, command: &str) {
+    buf.extend_from_slice(&fragment(LiteralMode::Synchronizing, |w| {
+        encode_simple(w, tag, command);
+    }));
+}
+
+fn push_login(
+    buf: &mut BytesMut,
+    tag: &str,
+    user: &str,
+    pass: &str,
+    utf8: bool,
+    mode: LiteralMode,
+) -> Result<(), crate::Error> {
+    buf.extend_from_slice(&try_fragment(mode, |w| {
+        encode_login(w, tag, user, pass, utf8)
+    })?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_select_or_examine(
+    buf: &mut BytesMut,
+    tag: &str,
+    cmd: &str,
+    mailbox: &str,
+    condstore: bool,
+    qresync: Option<&QresyncParams>,
+    utf8: bool,
+    mode: LiteralMode,
+) -> Result<(), crate::Error> {
+    buf.extend_from_slice(&try_fragment(mode, |w| {
+        encode_select_or_examine(w, tag, cmd, mailbox, condstore, qresync, utf8)
+    })?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_getmetadata(
+    buf: &mut BytesMut,
+    tag: &str,
+    mailbox: &str,
+    entries: &[String],
+    max_size: Option<u64>,
+    depth: Option<&str>,
+    utf8: bool,
+    mode: LiteralMode,
+) -> Result<(), crate::Error> {
+    buf.extend_from_slice(&try_fragment(mode, |w| {
+        encode_getmetadata(w, tag, mailbox, entries, max_size, depth, utf8)
+    })?);
+    Ok(())
+}
+
 // --- APPEND / MULTIAPPEND helpers ---
 //
 // These drive the PRODUCTION entry point, `encode_append`, the same function
@@ -59,6 +184,28 @@ fn append_opts(literal_mode: LiteralMode, utf8: bool) -> EncodeOptions {
         o.enabled.push("UTF8=ACCEPT".to_owned());
     }
     o
+}
+
+/// Encode APPEND (`multi == false`) or MULTIAPPEND as the driver does: a
+/// `Command::Append` through `encode_command`. The messages are cloned into
+/// the command, which shares each body's allocation, so `is_body_chunk` still
+/// recognises them in the output.
+fn append_command(
+    tag: &str,
+    mailbox: &str,
+    messages: &[crate::types::AppendMessage],
+    multi: bool,
+    opts: &EncodeOptions,
+) -> Result<WireCommand, crate::Error> {
+    encode_command(
+        tag,
+        &Command::Append {
+            mailbox: mailbox.to_owned(),
+            messages: messages.to_vec(),
+            multi,
+        },
+        opts,
+    )
 }
 
 /// A message with `len` bytes of `x` filler.
@@ -86,7 +233,7 @@ fn is_body_chunk(chunk: &bytes::Bytes, messages: &[crate::types::AppendMessage])
 }
 
 /// Render each segment as text, with a body chunk shown as `<len>`.
-fn append_segments(cmd: &ChunkedCommand, messages: &[crate::types::AppendMessage]) -> Vec<String> {
+fn append_segments(cmd: &WireCommand, messages: &[crate::types::AppendMessage]) -> Vec<String> {
     cmd.segments()
         .iter()
         .map(|segment| {
@@ -105,9 +252,9 @@ fn append_segments(cmd: &ChunkedCommand, messages: &[crate::types::AppendMessage
 }
 
 /// Encode a plain APPEND carrying `date`, for the date-validation tests.
-fn append_with_date(date: &str) -> Result<ChunkedCommand, crate::Error> {
+fn append_with_date(date: &str) -> Result<WireCommand, crate::Error> {
     let msgs = [append_msg(&[], Some(date), 100)];
-    encode_append(
+    append_command(
         "A001",
         "INBOX",
         &msgs,
@@ -125,7 +272,7 @@ fn append_wire(
     multi: bool,
     opts: &EncodeOptions,
 ) -> String {
-    let cmd = encode_append(tag, mailbox, messages, multi, opts).unwrap();
+    let cmd = append_command(tag, mailbox, messages, multi, opts).unwrap();
     append_segments(&cmd, messages).concat()
 }
 
@@ -141,7 +288,7 @@ fn encode_enable_uses_imap4rev2_base_capability() {
         capabilities: vec!["QRESYNC".to_owned()],
     };
     let encoded = encode_command("A001", &cmd, &opts).unwrap();
-    assert_eq!(&encoded.into_buf()[..], b"A001 ENABLE QRESYNC\r\n");
+    assert_eq!(&encoded.to_vec()[..], b"A001 ENABLE QRESYNC\r\n");
 }
 
 #[test]
@@ -197,14 +344,14 @@ fn encode_options_capability_answers_match_the_authority() {
 #[test]
 fn encode_simple_command() {
     let mut buf = BytesMut::new();
-    encode_simple(&mut buf, "A001", "NOOP");
+    push_simple(&mut buf, "A001", "NOOP");
     assert_eq!(&buf[..], b"A001 NOOP\r\n");
 }
 
 #[test]
 fn encode_login_simple() {
     let mut buf = BytesMut::new();
-    encode_login(
+    push_login(
         &mut buf,
         "A001",
         "user",
@@ -219,7 +366,7 @@ fn encode_login_simple() {
 #[test]
 fn encode_login_special_chars() {
     let mut buf = BytesMut::new();
-    encode_login(
+    push_login(
         &mut buf,
         "A001",
         "user",
@@ -234,14 +381,14 @@ fn encode_login_special_chars() {
 #[test]
 fn encode_quoted_string() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, b"hello world", LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, b"hello world", LiteralMode::Synchronizing);
     assert_eq!(&buf[..], b"\"hello world\"");
 }
 
 #[test]
 fn encode_literal_for_binary() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, b"line1\r\nline2", LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, b"line1\r\nline2", LiteralMode::Synchronizing);
     // Should use literal form because of CRLF.
     assert_eq!(&buf[..], b"{12}\r\nline1\r\nline2");
 }
@@ -635,7 +782,7 @@ fn encode_list_extended_rejects_empty_pattern_list() {
 
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        matches!(result, Err(EncodeError::Validation(ref msg)) if msg.contains("RFC 5258 Section 3")),
+        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("RFC 5258 Section 3")),
         "empty LIST-EXTENDED patterns must be rejected per RFC 5258 Section 3 / RFC 9051 Section 6.3.9: {result:?}"
     );
 }
@@ -675,7 +822,7 @@ fn encode_list_extended_rejects_recursivematch_without_base_option() {
 
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        matches!(result, Err(EncodeError::Validation(ref msg)) if msg.contains("RECURSIVEMATCH")),
+        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("RECURSIVEMATCH")),
         "LIST-EXTENDED must reject bare RECURSIVEMATCH per RFC 5258 Section 3 / RFC 9051 Section 6.3.9: {result:?}"
     );
 }
@@ -694,7 +841,7 @@ fn encode_list_extended_rejects_bare_status_return_option() {
 
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        matches!(result, Err(EncodeError::Validation(ref msg)) if msg.contains("STATUS (") || msg.contains("STATUS (<items>)")),
+        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("STATUS (") || msg.contains("STATUS (<items>)")),
         "LIST-EXTENDED must reject bare STATUS return option per RFC 5819 Section 4 / RFC 9051 Section 7: {result:?}"
     );
 }
@@ -847,7 +994,7 @@ fn encode_uid_store_move_fallback_uses_silent() {
 fn encode_quoted_with_nul_strips_nul_and_quotes() {
     // RFC 3501 Section 9: NUL (%x00) is stripped; remaining "hasnul" is quotable.
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, b"has\0nul", LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, b"has\0nul", LiteralMode::Synchronizing);
     assert_eq!(&buf[..], b"\"hasnul\"");
 }
 
@@ -856,7 +1003,7 @@ fn encode_non_ascii_falls_back_to_literal() {
     // Per RFC 3501 Section 9, quoted-string characters must be in %x01-7F
     // (all ASCII) minus CR, LF, and NUL. Non-ASCII bytes (>0x7F) must use literal form.
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, "café".as_bytes(), LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, "café".as_bytes(), LiteralMode::Synchronizing);
     // "café" is 5 bytes in UTF-8: 63 61 66 c3 a9
     assert_eq!(&buf[..], b"{5}\r\ncaf\xc3\xa9");
 }
@@ -1065,7 +1212,7 @@ fn encode_search_return_rejects_embedded_whitespace_in_option() {
         .expect_err("SEARCH RETURN option with embedded whitespace must be rejected");
 
     assert!(
-        matches!(err, EncodeError::Validation(ref message) if message.contains("SEARCH RETURN option")),
+        matches!(err, crate::Error::InvalidInput(ref message) if message.contains("SEARCH RETURN option")),
         "expected Protocol error mentioning SEARCH RETURN option, got {err:?}"
     );
 }
@@ -1430,7 +1577,7 @@ fn encode_setmetadata_high_bytes_use_standard_literal() {
 #[test]
 fn metadata_value_escapes_backslash_and_quote() {
     let mut buf = BytesMut::new();
-    encode_metadata_value(&mut buf, b"a\\b\"c", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"a\\b\"c", LiteralMode::Synchronizing);
     assert_eq!(&buf[..], b"\"a\\\\b\\\"c\"");
 }
 
@@ -1438,7 +1585,7 @@ fn metadata_value_escapes_backslash_and_quote() {
 #[test]
 fn metadata_value_ascii_uses_quoted() {
     let mut buf = BytesMut::new();
-    encode_metadata_value(&mut buf, b"hello", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"hello", LiteralMode::Synchronizing);
     assert_eq!(&buf[..], b"\"hello\"");
 }
 
@@ -1447,7 +1594,7 @@ fn metadata_value_ascii_uses_quoted() {
 #[test]
 fn metadata_value_crlf_uses_standard_literal() {
     let mut buf = BytesMut::new();
-    encode_metadata_value(&mut buf, b"line1\r\nline2", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"line1\r\nline2", LiteralMode::Synchronizing);
     assert_eq!(&buf[..], b"{12}\r\nline1\r\nline2");
 }
 
@@ -1456,7 +1603,7 @@ fn metadata_value_crlf_uses_standard_literal() {
 #[test]
 fn metadata_value_nul_uses_literal8() {
     let mut buf = BytesMut::new();
-    encode_metadata_value(&mut buf, b"\x00data", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"\x00data", LiteralMode::Synchronizing);
     // NUL preserved; literal8 form.
     assert_eq!(&buf[..], b"~{5}\r\n\x00data");
 }
@@ -1465,7 +1612,7 @@ fn metadata_value_nul_uses_literal8() {
 #[test]
 fn metadata_value_empty() {
     let mut buf = BytesMut::new();
-    encode_metadata_value(&mut buf, b"", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"", LiteralMode::Synchronizing);
     assert_eq!(&buf[..], b"\"\"");
 }
 
@@ -1474,7 +1621,7 @@ fn metadata_value_empty() {
 #[test]
 fn metadata_value_high_bytes_uses_standard_literal() {
     let mut buf = BytesMut::new();
-    encode_metadata_value(&mut buf, b"\x80\xff", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"\x80\xff", LiteralMode::Synchronizing);
     assert_eq!(&buf[..], b"{2}\r\n\x80\xff");
 }
 
@@ -1484,7 +1631,7 @@ fn metadata_value_high_bytes_uses_standard_literal() {
 #[test]
 fn metadata_value_del_byte_uses_standard_literal() {
     let mut buf = BytesMut::new();
-    encode_metadata_value(&mut buf, b"hello\x7Fworld", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"hello\x7Fworld", LiteralMode::Synchronizing);
     assert!(
         buf.starts_with(b"{"),
         "DEL byte (0x7F) must trigger classic literal encoding per RFC 3501/9051 literal CHAR8 rules, got: {:?}",
@@ -1498,7 +1645,7 @@ fn metadata_value_del_byte_uses_standard_literal() {
 fn metadata_value_control_char_uses_standard_literal() {
     // TAB (0x09) is a control character that must NOT be quoted.
     let mut buf = BytesMut::new();
-    encode_metadata_value(&mut buf, b"hello\tworld", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"hello\tworld", LiteralMode::Synchronizing);
     assert!(
         buf.starts_with(b"{"),
         "TAB (0x09) must trigger classic literal encoding, got: {:?}",
@@ -1507,7 +1654,7 @@ fn metadata_value_control_char_uses_standard_literal() {
 
     // Printable ASCII (0x20-0x7E) should use quoted form.
     buf.clear();
-    encode_metadata_value(&mut buf, b"hello world", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"hello world", LiteralMode::Synchronizing);
     assert!(
         buf.starts_with(b"\""),
         "Printable ASCII should use quoted encoding, got: {:?}",
@@ -1516,7 +1663,7 @@ fn metadata_value_control_char_uses_standard_literal() {
 
     // NUL (0x00) must trigger literal8.
     buf.clear();
-    encode_metadata_value(&mut buf, b"\x00", LiteralMode::Synchronizing);
+    push_metadata_value(&mut buf, b"\x00", LiteralMode::Synchronizing);
     assert!(
         buf.starts_with(b"~{"),
         "NUL (0x00) must trigger literal8 encoding, got: {:?}",
@@ -1855,7 +2002,7 @@ fn encode_multi_append_two_messages_mixed_flags() {
         ),
         append_msg(&[], None, 30),
     ];
-    let cmd = encode_append(
+    let cmd = append_command(
         "A010",
         "INBOX",
         &msgs,
@@ -1883,7 +2030,7 @@ fn encode_multi_append_three_messages_literal_plus() {
         append_msg(&[], Some(" 1-Jan-2025 00:00:00 +0000"), 200),
         append_msg(&[crate::types::Flag::Flagged], None, 300),
     ];
-    let cmd = encode_append(
+    let cmd = append_command(
         "A020",
         "Archive",
         &msgs,
@@ -1944,7 +2091,7 @@ fn encode_multi_append_special_mailbox() {
 fn encode_append_bodies_are_carried_by_reference() {
     let msgs = [append_msg(&[], None, 8192), append_msg(&[], None, 4)];
     for mode in [LiteralMode::Synchronizing, LiteralMode::LiteralPlus] {
-        let cmd = encode_append("A001", "INBOX", &msgs, true, &append_opts(mode, false)).unwrap();
+        let cmd = append_command("A001", "INBOX", &msgs, true, &append_opts(mode, false)).unwrap();
         let carried: Vec<&bytes::Bytes> = cmd
             .segments()
             .iter()
@@ -1972,7 +2119,7 @@ fn encode_append_bodies_are_carried_by_reference() {
 #[test]
 fn encode_append_splits_at_a_synchronizing_mailbox_literal() {
     let msgs = [append_msg(&[], None, 6)];
-    let cmd = encode_append(
+    let cmd = append_command(
         "A001",
         "a\r\nb",
         &msgs,
@@ -1989,7 +2136,7 @@ fn encode_append_splits_at_a_synchronizing_mailbox_literal() {
         ]
     );
 
-    let cmd = encode_append(
+    let cmd = append_command(
         "A001",
         "a\r\nb",
         &msgs,
@@ -2012,7 +2159,7 @@ fn encode_append_splits_at_a_synchronizing_mailbox_literal() {
 #[test]
 fn encode_append_zero_length_body_is_still_a_segment() {
     let msgs = [crate::types::AppendMessage::new(bytes::Bytes::new())];
-    let cmd = encode_append(
+    let cmd = append_command(
         "A001",
         "INBOX",
         &msgs,
@@ -2030,7 +2177,7 @@ fn encode_append_zero_length_body_is_still_a_segment() {
 #[test]
 fn encode_data_with_nul_byte_strips_nul() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, b"hello\x00world", LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, b"hello\x00world", LiteralMode::Synchronizing);
     // NUL is stripped; "helloworld" is quotable ASCII.
     assert_eq!(&buf[..], b"\"helloworld\"");
     assert!(!buf.contains(&0x00), "output must not contain NUL bytes");
@@ -2040,7 +2187,7 @@ fn encode_data_with_nul_byte_strips_nul() {
 #[test]
 fn encode_data_with_non_ascii_uses_literal() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, "café".as_bytes(), LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, "café".as_bytes(), LiteralMode::Synchronizing);
     // Non-ASCII (0x80+) is not quotable
     assert!(buf.starts_with(b"{5}\r\n"));
 }
@@ -2049,7 +2196,7 @@ fn encode_data_with_non_ascii_uses_literal() {
 #[test]
 fn encode_empty_data_quoted() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, b"", LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, b"", LiteralMode::Synchronizing);
     assert_eq!(&buf[..], b"\"\"");
 }
 
@@ -2077,7 +2224,7 @@ fn encode_select_mailbox_with_spaces() {
 fn encode_login_crlf_credential_stays_inside_its_literal() {
     let pass = "pass\r\nword A002 DELETE INBOX\r\n";
     let mut buf = BytesMut::new();
-    encode_login(
+    push_login(
         &mut buf,
         "A001",
         "user",
@@ -2108,7 +2255,7 @@ fn encode_login_crlf_credential_stays_inside_its_literal() {
 fn encode_long_quotable_string() {
     let mut buf = BytesMut::new();
     let data = "a".repeat(10_000);
-    encode_quoted_or_literal(&mut buf, data.as_bytes(), LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, data.as_bytes(), LiteralMode::Synchronizing);
     // Should still be quoted since all chars are safe
     assert!(buf.starts_with(b"\""));
     assert!(buf.ends_with(b"\""));
@@ -2126,7 +2273,7 @@ fn del_byte_triggers_literal_encoding() {
     // to be compatible with both IMAP4rev1 and IMAP4rev2.
     let mut buf = BytesMut::new();
     let data_with_del = b"hello\x7Fworld";
-    encode_quoted_or_literal(&mut buf, data_with_del, LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, data_with_del, LiteralMode::Synchronizing);
     let result = std::str::from_utf8(&buf).unwrap();
     // Must be a literal (starts with {), not a quoted string (starts with ")
     assert!(
@@ -2150,7 +2297,7 @@ fn control_char_triggers_literal_encoding() {
         let data = [
             b'h', b'e', b'l', b'l', b'o', byte, b'w', b'o', b'r', b'l', b'd',
         ];
-        encode_quoted_or_literal(&mut buf, &data, LiteralMode::Synchronizing);
+        push_quoted_or_literal(&mut buf, &data, LiteralMode::Synchronizing);
         let result = std::str::from_utf8(&buf).unwrap();
         assert!(
             result.starts_with('{'),
@@ -2481,7 +2628,7 @@ fn encode_setquota_empty_resources() {
 #[test]
 fn spec_audit_m4_nul_bytes_in_literal() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, b"has\0nul", LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, b"has\0nul", LiteralMode::Synchronizing);
     // RFC 3501 Section 9: NUL (%x00) MUST NOT appear in the output.
     // The output must not contain a NUL byte, regardless of encoding form.
     assert!(
@@ -2614,7 +2761,7 @@ fn audit_finding6_append_header_uses_literal8_for_binary_append() {
 #[test]
 fn append_nul_body_without_binary_is_refused() {
     let msgs = [append_nul_msg(3)];
-    let err = encode_append(
+    let err = append_command(
         "A001",
         "INBOX",
         &msgs,
@@ -2634,7 +2781,7 @@ fn append_nul_body_without_binary_is_refused() {
 fn multiappend_nul_body_without_binary_is_refused_in_any_position() {
     let msgs = [append_msg(&[], None, 3), append_nul_msg(3)];
     assert!(
-        encode_append(
+        append_command(
             "A001",
             "INBOX",
             &msgs,
@@ -2733,7 +2880,7 @@ fn rev2_does_not_imply_binary_for_append() {
         capabilities: vec![Capability::Imap4Rev2],
         enabled: Vec::new(),
     };
-    let err = encode_append("A", "INBOX", &[append_nul_msg(100)], false, &rev2)
+    let err = append_command("A", "INBOX", &[append_nul_msg(100)], false, &rev2)
         .expect_err("pure rev2 without BINARY cannot carry a NUL body");
     assert!(
         matches!(err, crate::Error::MissingCapability(ref m) if m.contains("requires BINARY literal8 support")),
@@ -2762,7 +2909,7 @@ fn audit_finding3_qresync_rejects_seq_match_without_known_uids() {
     };
     let mut buf = BytesMut::new();
     // Must return Err because seq_match_data is present without known_uids.
-    let result = encode_select_or_examine(
+    let result = push_select_or_examine(
         &mut buf,
         "A001",
         "SELECT",
@@ -2790,7 +2937,7 @@ fn audit_finding3_qresync_valid_known_uids_with_seq_match() {
         seq_match_data: Some(("1:100".into(), "1:100".into())),
     };
     let mut buf = BytesMut::new();
-    encode_select_or_examine(
+    push_select_or_examine(
         &mut buf,
         "A001",
         "SELECT",
@@ -2830,7 +2977,7 @@ fn audit_finding3_qresync_known_uids_without_seq_match() {
         seq_match_data: None,
     };
     let mut buf = BytesMut::new();
-    encode_select_or_examine(
+    push_select_or_examine(
         &mut buf,
         "A001",
         "SELECT",
@@ -2859,7 +3006,7 @@ fn audit_finding3_qresync_known_uids_without_seq_match() {
 #[test]
 fn audit_finding7_getmetadata_without_options() {
     let mut buf = BytesMut::new();
-    encode_getmetadata(
+    push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -2881,7 +3028,7 @@ fn audit_finding7_getmetadata_without_options() {
 #[test]
 fn audit_finding7_getmetadata_with_maxsize_and_depth() {
     let mut buf = BytesMut::new();
-    encode_getmetadata(
+    push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -2903,7 +3050,7 @@ fn audit_finding7_getmetadata_with_maxsize_and_depth() {
 #[test]
 fn audit_finding7_getmetadata_with_maxsize_only() {
     let mut buf = BytesMut::new();
-    encode_getmetadata(
+    push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -2925,7 +3072,7 @@ fn audit_finding7_getmetadata_with_maxsize_only() {
 #[test]
 fn audit_finding7_getmetadata_with_depth_only() {
     let mut buf = BytesMut::new();
-    encode_getmetadata(
+    push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -2948,7 +3095,7 @@ fn audit_finding7_getmetadata_with_depth_only() {
 #[test]
 fn audit_getmetadata_options_before_mailbox_per_verified_errata() {
     let mut buf = BytesMut::new();
-    encode_getmetadata(
+    push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -3843,7 +3990,7 @@ fn append_rejects_invalid_custom_flag() {
         None,
         10,
     )];
-    let result = encode_append(
+    let result = append_command(
         "A001",
         "INBOX",
         &msgs,
@@ -3863,17 +4010,17 @@ fn append_shape_and_capability_validation() {
     let without_cap = opts(LiteralMode::Synchronizing, false);
 
     assert!(matches!(
-        encode_append("A", "INBOX", &one, true, &without_cap),
+        append_command("A", "INBOX", &one, true, &without_cap),
         Err(crate::Error::MissingCapability(ref m)) if m == "MULTIAPPEND"
     ));
     // A plain APPEND never needs it.
-    assert!(encode_append("A", "INBOX", &one, false, &without_cap).is_ok());
+    assert!(append_command("A", "INBOX", &one, false, &without_cap).is_ok());
     assert!(matches!(
-        encode_append("A", "INBOX", &[], true, &with_cap),
+        append_command("A", "INBOX", &[], true, &with_cap),
         Err(crate::Error::InvalidInput(_))
     ));
     assert!(matches!(
-        encode_append("A", "INBOX", &two, false, &with_cap),
+        append_command("A", "INBOX", &two, false, &with_cap),
         Err(crate::Error::InvalidInput(_))
     ));
 }
@@ -3942,7 +4089,7 @@ fn encode_uid_fetch_changedsince_minimum_valid() {
 #[test]
 fn spec_audit_utf8_mode_ascii_produces_quoted() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(&mut buf, b"Brouillons", true, LiteralMode::Synchronizing);
+    push_quoted_or_literal_utf8(&mut buf, b"Brouillons", true, LiteralMode::Synchronizing);
     assert_eq!(
         &buf[..],
         b"\"Brouillons\"",
@@ -3956,7 +4103,7 @@ fn spec_audit_utf8_mode_ascii_produces_quoted() {
 fn spec_audit_utf8_mode_non_ascii_produces_quoted() {
     let mut buf = BytesMut::new();
     // "日本語" = 9 bytes in UTF-8: e6 97 a5 e6 9c ac e8 aa 9e
-    encode_quoted_or_literal_utf8(
+    push_quoted_or_literal_utf8(
         &mut buf,
         "日本語".as_bytes(),
         true,
@@ -3981,7 +4128,7 @@ fn spec_audit_utf8_mode_non_ascii_produces_quoted() {
 fn spec_audit_no_utf8_mode_non_ascii_produces_literal() {
     let mut buf = BytesMut::new();
     // "日本語" = 9 bytes in UTF-8
-    encode_quoted_or_literal_utf8(
+    push_quoted_or_literal_utf8(
         &mut buf,
         "日本語".as_bytes(),
         false,
@@ -4004,7 +4151,7 @@ fn spec_audit_no_utf8_mode_non_ascii_produces_literal() {
 #[test]
 fn spec_audit_utf8_mode_crlf_produces_literal() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(
+    push_quoted_or_literal_utf8(
         &mut buf,
         b"line1\r\nline2",
         true,
@@ -4029,7 +4176,7 @@ fn spec_audit_utf8_mode_invalid_utf8_produces_literal() {
     let mut buf = BytesMut::new();
     // Invalid UTF-8: lone continuation byte
     let invalid = &[0x80, 0x81, 0x82];
-    encode_quoted_or_literal_utf8(&mut buf, invalid, true, LiteralMode::Synchronizing);
+    push_quoted_or_literal_utf8(&mut buf, invalid, true, LiteralMode::Synchronizing);
     assert!(
         buf.starts_with(b"{"),
         "Invalid UTF-8 must use literal form even when UTF8=ACCEPT is active \
@@ -4043,7 +4190,7 @@ fn spec_audit_utf8_mode_invalid_utf8_produces_literal() {
 #[test]
 fn spec_audit_utf8_mode_del_byte_produces_literal() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(
+    push_quoted_or_literal_utf8(
         &mut buf,
         b"hello\x7Fworld",
         true,
@@ -4057,26 +4204,26 @@ fn spec_audit_utf8_mode_del_byte_produces_literal() {
     );
 }
 
-// --- encode_quoted_or_literal: backslash and double-quote escaping ---
+// --- CommandWriter::string: backslash and double-quote escaping ---
 
 /// RFC 3501 Section 9: quoted-specials = DQUOTE / "\"
 /// Both backslash and double-quote must be escaped in quoted strings.
 #[test]
 fn encode_quoted_escapes_backslash_and_dquote() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal(&mut buf, b"a\\b\"c", LiteralMode::Synchronizing);
+    push_quoted_or_literal(&mut buf, b"a\\b\"c", LiteralMode::Synchronizing);
     // Expected: "a\\b\"c"
     assert_eq!(&buf[..], b"\"a\\\\b\\\"c\"");
 }
 
-// --- encode_quoted_or_literal_utf8: NUL stripping in UTF-8 mode ---
+// --- CommandWriter::string in UTF-8 mode: NUL stripping ---
 
 /// RFC 3501 Section 9: NUL (%x00) is forbidden and must be stripped
 /// even when UTF8=ACCEPT is active (RFC 6855 Section 3).
 #[test]
 fn encode_utf8_mode_strips_nul_bytes() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(
+    push_quoted_or_literal_utf8(
         &mut buf,
         b"hello\x00world",
         true,
@@ -4095,7 +4242,7 @@ fn encode_utf8_mode_strips_nul_bytes() {
 #[test]
 fn encode_utf8_mode_escapes_backslash_and_dquote() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(&mut buf, b"a\\b\"c", true, LiteralMode::Synchronizing);
+    push_quoted_or_literal_utf8(&mut buf, b"a\\b\"c", true, LiteralMode::Synchronizing);
     assert_eq!(
         &buf[..],
         b"\"a\\\\b\\\"c\"",
@@ -4155,8 +4302,8 @@ fn test_append_rejects_invalid_month() {
 }
 
 /// completely malformed date string must be rejected, with the
-/// `InvalidAppendDate` variant the account layer maps (the encoder returns
-/// `crate::Error`, not `EncodeError`, precisely so it survives).
+/// `InvalidAppendDate` variant the account layer maps: the encoder returns
+/// the crate's own error, so the variant survives to the driver unchanged.
 #[test]
 fn test_append_rejects_garbage_date() {
     let result = append_with_date("not-a-date");
@@ -4494,7 +4641,7 @@ fn known_sequence_set_rejects_invalid() {
 #[test]
 fn getmetadata_maxsize_zero_accepted() {
     let mut buf = BytesMut::new();
-    let result = encode_getmetadata(
+    let result = push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -4511,7 +4658,7 @@ fn getmetadata_maxsize_zero_accepted() {
 #[test]
 fn getmetadata_maxsize_u32_max_accepted() {
     let mut buf = BytesMut::new();
-    let result = encode_getmetadata(
+    let result = push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -4533,7 +4680,7 @@ fn getmetadata_maxsize_u32_max_accepted() {
 #[test]
 fn getmetadata_maxsize_u32_max_plus_one_rejected() {
     let mut buf = BytesMut::new();
-    let result = encode_getmetadata(
+    let result = push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -4553,7 +4700,7 @@ fn getmetadata_maxsize_u32_max_plus_one_rejected() {
 #[test]
 fn getmetadata_maxsize_u64_max_rejected() {
     let mut buf = BytesMut::new();
-    let result = encode_getmetadata(
+    let result = push_getmetadata(
         &mut buf,
         "A001",
         "INBOX",
@@ -5379,8 +5526,8 @@ fn encode_command_login_synchronizing_literal() {
 /// invalid LOGIN credential as the literal source.
 #[test]
 fn synchronizing_literal_splits_into_segments() {
-    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {10}\r\npass\r\nword\r\n");
-    let segments = encoded.segments();
+    let encoded = x_command(LiteralMode::Synchronizing, &[b"pass\r\nword"]);
+    let segments = segment_bytes(&encoded);
 
     // Must have exactly 2 segments: header+marker, then literal body+CRLF.
     assert_eq!(
@@ -5415,8 +5562,9 @@ fn synchronizing_literal_splits_into_segments() {
 /// continuation pause (RFC 7888 Section 4).
 #[test]
 fn literal_plus_marker_stays_in_one_segment() {
-    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {10+}\r\npass\r\nword\r\n");
-    let segments = encoded.segments();
+    let encoded = x_command(LiteralMode::LiteralPlus, &[b"pass\r\nword"]);
+    assert_eq!(encoded.to_vec(), b"A001 X {10+}\r\npass\r\nword\r\n");
+    let segments = segment_bytes(&encoded);
 
     assert_eq!(
         segments.len(),
@@ -5431,9 +5579,8 @@ fn literal_plus_marker_stays_in_one_segment() {
 /// continuation exchange.
 #[test]
 fn two_synchronizing_literals_produce_three_segments() {
-    let encoded =
-        EncodedCommand::from_flat_buffer(b"A001 X {6}\r\nus\r\ner {10}\r\npass\r\nword\r\n");
-    let segments = encoded.segments();
+    let encoded = x_command(LiteralMode::Synchronizing, &[b"us\r\ner", b"pass\r\nword"]);
+    let segments = segment_bytes(&encoded);
 
     assert_eq!(
         segments.len(),
@@ -5478,19 +5625,15 @@ fn two_synchronizing_literals_produce_three_segments() {
     );
 }
 
-/// SETMETADATA with a binary value produces literal8 (`~{N}\r\n`), which
-/// is always synchronizing per RFC 9051 Section 9. When `literal_plus` is
-/// `false`, `CommandSegments::from_flat_buffer` must split at the literal8
-/// boundary so that `send_encoded_segments` waits for `+` continuation
-/// before sending the literal body.
+/// SETMETADATA with a binary value produces literal8 (`~{N}\r\n`). Without a
+/// literal extension it is synchronizing, so the command must split at the
+/// literal8 marker and the sender wait for `+` before the body.
 ///
 /// RFC 3516 Section 4 / RFC 9051 Section 9:
 ///   `literal8 = "~{" number64 "}" CRLF *OCTET`
-///  -  no `["+"]` modifier, so literal8 is unconditionally synchronizing.
 ///
-/// Bug: `find_sync_literal_boundary` was skipping `~{N}\r\n` markers,
-/// causing the entire command to be sent as one segment without waiting
-/// for server continuation (protocol desynchronization).
+/// Regression: a send-side scanner once skipped `~{N}\r\n` markers, sending
+/// the whole command as one segment without waiting for the continuation.
 #[test]
 fn regression_setmetadata_literal8_produces_two_segments_without_literal_plus() {
     let cmd = Command::SetMetadata {
@@ -5499,7 +5642,7 @@ fn regression_setmetadata_literal8_produces_two_segments_without_literal_plus() 
     };
     // literal_plus=false: literal8 must be synchronizing.
     let encoded = encode_command("A001", &cmd, &default_opts()).unwrap();
-    let segments = encoded.segments();
+    let segments = segment_bytes(&encoded);
 
     assert_eq!(
         segments.len(),
@@ -5545,47 +5688,235 @@ fn encode_command_no_literal_single_segment() {
         "command without literals should be a single segment"
     );
     assert_eq!(
-        &encoded.into_buf()[..],
+        &encoded.to_vec()[..],
         b"A001 LOGIN \"alice\" \"secret\"\r\n"
     );
 }
 
-/// `EncodedCommand::into_buf` must reconstruct the original flat encoding
-/// by concatenating all segments.
-#[test]
-fn encoded_command_into_buf_round_trips() {
-    let flat = b"A001 X {10}\r\npass\r\nword\r\n";
-    let encoded = EncodedCommand::from_flat_buffer(flat);
-    let concatenated = encoded.into_buf();
+// -----------------------------------------------------------------------
+// CommandWriter: the one place literal framing is decided
+//
+// Ported from the tests of the deleted send-path patchers
+// (`patch_literals_to_plus_with_binary`, `patch_small_literals_to_plus_with_binary`,
+// `find_literal_boundary`): the same rules, now pinned where they live.
+// -----------------------------------------------------------------------
 
+/// Marker-shaped bytes inside a literal payload are payload. The writer
+/// records the boundary of the literal it writes and never scans anything, so
+/// a synchronizing payload holding `{3}\r\n` still yields exactly one split.
+#[test]
+fn writer_payload_holding_a_marker_is_not_framing() {
+    let segments = segment_bytes(&x_command(LiteralMode::Synchronizing, &[b"abc{3}\r\ndef"]));
     assert_eq!(
-        &concatenated[..],
-        flat,
-        "into_buf() must produce the same bytes as the flat encoder"
+        segments,
+        vec![b"A001 X {11}\r\n".to_vec(), b"abc{3}\r\ndef\r\n".to_vec()]
     );
 }
 
+/// RFC 7888 Section 4: LITERAL+ makes every classic literal non-synchronizing.
 #[test]
-#[should_panic(expected = "EncodedCommand requires a non-empty command buffer")]
-fn encoded_command_rejects_an_empty_buffer() {
-    let _ = EncodedCommand::from_flat_buffer(b"");
+fn writer_literal_plus_marks_every_classic_literal() {
+    let encoded = x_command(LiteralMode::LiteralPlus, &[b"alice\r\n", b"bob\r\n"]);
+    assert_eq!(encoded.segments().len(), 1);
+    assert_eq!(
+        encoded.to_vec(),
+        b"A001 X {7+}\r\nalice\r\n {5+}\r\nbob\r\n\r\n"
+    );
 }
 
+/// RFC 7888 Section 5: LITERAL- is non-synchronizing up to 4096 octets and
+/// synchronizing above.
 #[test]
-fn literal_marker_scanner_uses_the_shared_number64_parser() {
-    // 2^63 parses as a `u64` but is above the RFC 9051 `number64` ceiling, so
-    // it is the interval a `u64`-only parser silently accepts. It is not a
-    // marker on the send path: the scanner must continue and find the
-    // following valid body boundary.
-    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {9223372036854775808}\r\n{1}\r\nx\r\n");
-    assert_eq!(encoded.segments().len(), 2);
-    assert!(encoded.segments()[0].ends_with(b"{1}\r\n"));
+fn writer_literal_minus_boundary_is_4096_octets() {
+    let at = vec![b'x'; 4096];
+    let encoded = x_command(LiteralMode::LiteralMinus, &[&at]);
+    assert_eq!(encoded.segments().len(), 1);
+    assert!(encoded.to_vec().starts_with(b"A001 X {4096+}\r\n"));
 
-    // A digit run too long for `u64` is likewise not a marker.
-    let encoded =
-        EncodedCommand::from_flat_buffer(b"A001 X {18446744073709551616}\r\n{1}\r\nx\r\n");
-    assert_eq!(encoded.segments().len(), 2);
-    assert!(encoded.segments()[0].ends_with(b"{1}\r\n"));
+    let over = vec![b'x'; 4097];
+    let segments = segment_bytes(&x_command(LiteralMode::LiteralMinus, &[&over]));
+    assert_eq!(segments.len(), 2);
+    assert_eq!(segments[0], b"A001 X {4097}\r\n");
+}
+
+/// RFC 7888 Section 6 / RFC 9051 Section 9: a `~{n}` literal8 may take `+`
+/// only with an advertised BINARY on a non-rev2 connection, and only where the
+/// literal mode would allow it for a classic literal.
+#[test]
+fn writer_literal8_non_synchronizing_needs_binary_and_rev1() {
+    let literal8 = |opts: &EncodeOptions| {
+        written_segments(opts, |w| {
+            w.raw(b"A001 X ");
+            w.literal(b"abc", LiteralForm::Literal8);
+            w.raw(b"\r\n");
+        })
+    };
+
+    // LITERAL+ without BINARY: synchronizing, split at the marker.
+    let no_binary = opts(LiteralMode::LiteralPlus, false);
+    assert!(!no_binary.capabilities.contains(&Capability::Binary));
+    assert_eq!(
+        literal8(&no_binary),
+        vec![b"A001 X ~{3}\r\n".to_vec(), b"abc\r\n".to_vec()]
+    );
+
+    // LITERAL+ with BINARY on rev1: non-synchronizing.
+    let mut binary = opts(LiteralMode::LiteralPlus, false);
+    binary.capabilities.push(Capability::Binary);
+    assert_eq!(literal8(&binary), vec![b"A001 X ~{3+}\r\nabc\r\n".to_vec()]);
+
+    // LITERAL- with BINARY: small literal8 is non-synchronizing too.
+    let mut minus_binary = opts(LiteralMode::LiteralMinus, false);
+    minus_binary.capabilities.push(Capability::Binary);
+    assert_eq!(
+        literal8(&minus_binary),
+        vec![b"A001 X ~{3+}\r\nabc\r\n".to_vec()]
+    );
+
+    // BINARY on an active rev2 connection: rev2 literal8 has no `+` form.
+    let rev2 = EncodeOptions {
+        utf8_mode: true,
+        literal_mode: LiteralMode::LiteralPlus,
+        capabilities: vec![Capability::Imap4Rev2, Capability::Binary],
+        enabled: Vec::new(),
+    };
+    assert_eq!(
+        literal8(&rev2),
+        vec![b"A001 X ~{3}\r\n".to_vec(), b"abc\r\n".to_vec()]
+    );
+}
+
+/// A zero-length synchronizing literal still ends its segment on the marker.
+#[test]
+fn writer_zero_length_literal_is_its_own_boundary() {
+    let segments = segment_bytes(&x_command(LiteralMode::Synchronizing, &[b""]));
+    assert_eq!(segments, vec![b"A001 X {0}\r\n".to_vec(), b"\r\n".to_vec()]);
+}
+
+/// A payload handed over as `Bytes` is carried by reference: the chunk in the
+/// encoded command is the caller's own allocation.
+#[test]
+fn writer_literal_bytes_carries_the_payload_by_reference() {
+    let body = bytes::Bytes::from(vec![b'm'; 64]);
+    let mut w = CommandWriter::new(&opts(LiteralMode::LiteralPlus, false));
+    w.raw(b"A001 X ");
+    w.literal_bytes(body.clone(), LiteralForm::Classic);
+    w.raw(b"\r\n");
+    let encoded = w.finish();
+    assert!(
+        encoded
+            .segments()
+            .iter()
+            .flatten()
+            .any(|chunk| chunk.as_ptr() == body.as_ptr() && chunk.len() == body.len()),
+        "the body must be the caller's allocation, not a copy"
+    );
+}
+
+/// `WireCommand`'s Debug prints the shape only: a command can carry a message
+/// body or a credential literal, and the driver traces commands.
+#[test]
+fn wire_command_debug_never_prints_payload() {
+    let encoded = x_command(LiteralMode::LiteralPlus, &[b"hunter2"]);
+    let debug = format!("{encoded:?}");
+    assert!(!debug.contains("hunter2"), "{debug}");
+}
+
+// -----------------------------------------------------------------------
+// Caller-written literals in SEARCH-family criteria
+// -----------------------------------------------------------------------
+
+fn uid_search(criteria: &str, opts: &EncodeOptions) -> Result<WireCommand, crate::Error> {
+    encode_command(
+        "A001",
+        &Command::UidSearch {
+            criteria: criteria.to_owned(),
+        },
+        opts,
+    )
+}
+
+/// A caller's synchronizing literal is re-emitted through the writer: under
+/// LITERAL+ it takes the `+` form and needs no continuation, as the patcher
+/// used to make it.
+#[test]
+fn criteria_literal_takes_the_live_marker_form() {
+    let encoded = uid_search(
+        "SUBJECT {5}\r\nhello",
+        &opts(LiteralMode::LiteralPlus, false),
+    )
+    .unwrap();
+    assert_eq!(encoded.segments().len(), 1);
+    assert_eq!(
+        encoded.to_vec(),
+        b"A001 UID SEARCH SUBJECT {5+}\r\nhello\r\n"
+    );
+}
+
+/// Without a literal extension the caller's literal is a real segment
+/// boundary: the sender waits for `+` before its payload.
+#[test]
+fn criteria_literal_is_a_segment_boundary_when_synchronizing() {
+    let encoded = uid_search("SUBJECT {5}\r\nhello", &default_opts()).unwrap();
+    assert_eq!(
+        segment_bytes(&encoded),
+        vec![
+            b"A001 UID SEARCH SUBJECT {5}\r\n".to_vec(),
+            b"hello\r\n".to_vec()
+        ]
+    );
+}
+
+/// Marker-shaped bytes inside a caller literal's payload stay payload: the
+/// walk skips the payload by its declared length.
+#[test]
+fn criteria_literal_payload_holding_a_marker_is_not_framing() {
+    let encoded = uid_search("SUBJECT {7}\r\n{9}\r\nab", &default_opts()).unwrap();
+    assert_eq!(
+        segment_bytes(&encoded),
+        vec![
+            b"A001 UID SEARCH SUBJECT {7}\r\n".to_vec(),
+            b"{9}\r\nab\r\n".to_vec()
+        ]
+    );
+}
+
+/// A caller literal8 is re-emitted as literal8, so the writer applies the
+/// literal8 rule: `~{1+}` the connection may not send non-synchronizing
+/// loses its `+` and becomes a real boundary, rather than being written with
+/// no grant.
+#[test]
+fn criteria_literal8_follows_the_literal8_rule() {
+    let no_binary = opts(LiteralMode::LiteralPlus, false);
+    let encoded = uid_search("BODY ~{1+}\r\nx", &no_binary).unwrap();
+    assert_eq!(
+        segment_bytes(&encoded),
+        vec![b"A001 UID SEARCH BODY ~{1}\r\n".to_vec(), b"x\r\n".to_vec()]
+    );
+
+    let mut binary = opts(LiteralMode::LiteralPlus, false);
+    binary.capabilities.push(Capability::Binary);
+    let encoded = uid_search("BODY ~{1}\r\nx", &binary).unwrap();
+    assert_eq!(encoded.to_vec(), b"A001 UID SEARCH BODY ~{1+}\r\nx\r\n");
+}
+
+/// A count written with leading zeros is re-emitted canonically.
+#[test]
+fn criteria_literal_count_is_written_canonically() {
+    let encoded = uid_search(
+        "SUBJECT {0001}\r\nx",
+        &opts(LiteralMode::LiteralPlus, false),
+    )
+    .unwrap();
+    assert_eq!(encoded.to_vec(), b"A001 UID SEARCH SUBJECT {1+}\r\nx\r\n");
+}
+
+/// The validator judges the caller's ORIGINAL marker: a `{n+}` the connection
+/// cannot take is refused, never silently rewritten to `{n}`.
+#[test]
+fn criteria_non_synchronizing_literal_without_an_extension_is_refused() {
+    let err = uid_search("SUBJECT {5+}\r\nhello", &default_opts()).unwrap_err();
+    assert!(matches!(err, crate::Error::MissingCapability(_)), "{err:?}");
 }
 
 #[test]
@@ -5612,15 +5943,6 @@ fn out_of_range_literal_count_is_not_a_marker_for_the_shared_parser() {
     ));
 }
 
-#[test]
-fn number64_marker_has_the_same_boundary_on_every_pointer_width() {
-    // This count fits RFC 9051 `number64`, but not a 32-bit usize. It is a
-    // valid marker on both targets, so the following marker is inside its
-    // declared opaque body rather than a second synchronization boundary.
-    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {4294967296}\r\n{1}\r\nx\r\n");
-    assert_eq!(encoded.segments().len(), 1);
-}
-
 // --- UTF-8 mode: RFC 6855 Section 3 / RFC 9051 Section 9 ---
 
 /// When UTF8=ACCEPT is enabled (RFC 6855 Section 3), non-ASCII UTF-8
@@ -5635,7 +5957,7 @@ fn encode_select_utf8_mailbox_quoted_when_utf8_enabled() {
         qresync: None,
     };
     let encoded = encode_command("A001", &cmd, &opts(LiteralMode::Synchronizing, true)).unwrap();
-    let wire = encoded.into_buf();
+    let wire = encoded.to_vec();
     let wire_str = std::str::from_utf8(&wire).unwrap();
 
     // With utf8=true, encode_mailbox_name passes the name as raw UTF-8.
@@ -5657,7 +5979,7 @@ fn encode_select_utf8_mailbox_literal_when_utf8_disabled() {
         qresync: None,
     };
     let encoded = encode_command("A001", &cmd, &default_opts()).unwrap();
-    let wire = encoded.into_buf();
+    let wire = encoded.to_vec();
     let wire_str = std::str::from_utf8(&wire).unwrap();
 
     // Without utf8 mode, encode_mailbox_name converts to modified UTF-7:
@@ -5683,7 +6005,7 @@ fn encode_login_rejects_utf8_credentials_even_when_utf8_enabled() {
     let result = encode_command("A001", &cmd, &opts(LiteralMode::Synchronizing, true));
 
     assert!(
-        matches!(result, Err(EncodeError::Validation(ref msg)) if msg.contains("RFC 6855 Section 5")),
+        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("RFC 6855 Section 5")),
         "LOGIN with non-ASCII credentials must be rejected even when UTF8=ACCEPT is active \
          (RFC 6855 Section 5); got: {result:?}"
     );
@@ -5714,7 +6036,7 @@ fn encode_mailbox_cmds_utf8_quoted() {
             _ => unreachable!(),
         };
         let encoded = encode_command("T1", &cmd, &opts(LiteralMode::Synchronizing, true)).unwrap();
-        let buf = encoded.into_buf();
+        let buf = encoded.to_vec();
         let wire = std::str::from_utf8(&buf).unwrap();
         assert_eq!(
             wire,
@@ -5738,7 +6060,7 @@ fn encode_mailbox_cmds_utf8_quoted() {
 fn literal_minus_large_literal_uses_synchronizing_form() {
     let large_data = format!("data\r\n{}", "x".repeat(4100));
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(
+    push_quoted_or_literal_utf8(
         &mut buf,
         large_data.as_bytes(),
         false,
@@ -5764,7 +6086,7 @@ fn literal_minus_large_literal_uses_synchronizing_form() {
 #[test]
 fn literal_minus_small_literal_uses_non_synchronizing_form() {
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(&mut buf, b"pass\r\nword", false, LiteralMode::LiteralMinus);
+    push_quoted_or_literal_utf8(&mut buf, b"pass\r\nword", false, LiteralMode::LiteralMinus);
     let output = std::str::from_utf8(&buf).unwrap();
     // RFC 7888 Section 5: literal <= 4096 bytes uses non-synchronizing form.
     assert!(
@@ -5781,7 +6103,7 @@ fn literal_minus_boundary_4096_uses_non_synchronizing() {
     let data = format!("x\r\n{}", "a".repeat(4093));
     assert_eq!(data.len(), 4096);
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(&mut buf, data.as_bytes(), false, LiteralMode::LiteralMinus);
+    push_quoted_or_literal_utf8(&mut buf, data.as_bytes(), false, LiteralMode::LiteralMinus);
     let output = std::str::from_utf8(&buf).unwrap();
     assert!(
         output.contains("{4096+}\r\n"),
@@ -5797,7 +6119,7 @@ fn literal_minus_boundary_4097_uses_synchronizing() {
     let data = format!("x\r\n{}", "a".repeat(4094));
     assert_eq!(data.len(), 4097);
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(&mut buf, data.as_bytes(), false, LiteralMode::LiteralMinus);
+    push_quoted_or_literal_utf8(&mut buf, data.as_bytes(), false, LiteralMode::LiteralMinus);
     let output = std::str::from_utf8(&buf).unwrap();
     assert!(
         output.contains("{4097}\r\n"),
@@ -5817,7 +6139,7 @@ fn literal_minus_boundary_4097_uses_synchronizing() {
 fn literal_plus_large_literal_uses_non_synchronizing() {
     let large_data = format!("data\r\n{}", "x".repeat(10_000));
     let mut buf = BytesMut::new();
-    encode_quoted_or_literal_utf8(
+    push_quoted_or_literal_utf8(
         &mut buf,
         large_data.as_bytes(),
         false,
@@ -5837,9 +6159,8 @@ fn literal_plus_large_literal_uses_non_synchronizing() {
 #[test]
 fn literal_minus_large_literal_produces_segments() {
     let data = format!("data\r\n{}", "x".repeat(5000));
-    let wire = format!("A001 X {{{}}}\r\n{data}\r\n", data.len());
-    let encoded = EncodedCommand::from_flat_buffer(wire.as_bytes());
-    let segments = encoded.segments();
+    let encoded = x_command(LiteralMode::LiteralMinus, &[data.as_bytes()]);
+    let segments = segment_bytes(&encoded);
     // The large literal must produce a synchronizing boundary, resulting
     // in multiple segments (RFC 3501 Section 4.3).
     assert!(
@@ -5854,8 +6175,9 @@ fn literal_minus_large_literal_produces_segments() {
 /// segment (no synchronizing boundary needed).
 #[test]
 fn literal_minus_small_literal_produces_single_segment() {
-    let encoded = EncodedCommand::from_flat_buffer(b"A001 X {10+}\r\npass\r\nword\r\n");
-    let segments = encoded.segments();
+    let encoded = x_command(LiteralMode::LiteralMinus, &[b"pass\r\nword"]);
+    assert_eq!(encoded.to_vec(), b"A001 X {10+}\r\npass\r\nword\r\n");
+    let segments = segment_bytes(&encoded);
     assert_eq!(
         segments.len(),
         1,
@@ -6123,37 +6445,57 @@ fn search_rejects_non_synchronizing_literal_without_extension() {
     };
     let mut buf = BytesMut::new();
     let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
-    let err = crate::Error::from(result.expect_err(
+    let err = result.expect_err(
         "SEARCH must reject non-synchronizing literals without negotiated \
          LITERAL+/LITERAL- support (RFC 7888 Section 3)",
-    ));
-    // Through the `EncodeError` bridge the live driver path uses: the refusal
-    // must arrive as a capability gap, not be flattened into malformed input.
+    );
+    // The refusal must arrive as a capability gap, not be flattened into
+    // malformed input.
     assert!(
         matches!(err, crate::Error::MissingCapability(_)),
         "got {err:?}"
     );
 }
 
-/// The `EncodeError` bridge keeps a validation refusal `InvalidInput` and
-/// keeps its message as the encoder wrote it, not prefixed with another
-/// variant's display text.
+/// A validation refusal arrives as `InvalidInput` with its message as the
+/// encoder wrote it, not prefixed with another variant's display text.
 #[test]
 fn an_encoder_validation_refusal_arrives_as_invalid_input() {
     let cmd = Command::Search {
         criteria: String::new(),
     };
     let mut buf = BytesMut::new();
-    let err = crate::Error::from(
-        encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts())
-            .expect_err("empty SEARCH criteria are refused"),
-    );
+    let err = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts())
+        .expect_err("empty SEARCH criteria are refused");
     let crate::Error::InvalidInput(message) = err else {
         panic!("expected InvalidInput, got {err:?}");
     };
     assert!(
         message.contains("at least one search criterion"),
         "got {message:?}"
+    );
+}
+
+/// A command whose prerequisite capability is not usable is refused as
+/// `MissingCapability`, worded `<cmd> requires <cap>` for every command.
+#[test]
+fn an_encoder_capability_refusal_names_the_command_and_the_capability() {
+    let cmd = Command::UidFetch {
+        sequence_set: SequenceSet::new("1:*").unwrap(),
+        items: "FLAGS".into(),
+        changed_since: Some(5),
+        vanished: false,
+    };
+    let no_condstore = EncodeOptions {
+        utf8_mode: false,
+        literal_mode: LiteralMode::Synchronizing,
+        capabilities: vec![Capability::Imap4Rev1],
+        enabled: Vec::new(),
+    };
+    let err = encode_command("A001", &cmd, &no_condstore).unwrap_err();
+    assert_eq!(
+        err,
+        crate::Error::MissingCapability("UID FETCH (CHANGEDSINCE) requires CONDSTORE".into())
     );
 }
 
@@ -6310,10 +6652,10 @@ fn thread_rejects_oversized_non_synchronizing_literal_in_literal_minus_mode() {
         &cmd,
         &opts(LiteralMode::LiteralMinus, false),
     );
-    let err = crate::Error::from(result.expect_err(
+    let err = result.expect_err(
         "THREAD must reject non-synchronizing literals larger than 4096 octets \
          in LITERAL- mode (RFC 7888 Section 5 / RFC 9051 Section 4.3)",
-    ));
+    );
     assert!(
         matches!(err, crate::Error::MissingCapability(_)),
         "LITERAL- without LITERAL+ is a capability gap; got {err:?}"
@@ -6514,7 +6856,7 @@ fn encode_search_rejects_charset_when_utf8_enabled() {
     let result = encode_command("A001", &cmd, &opts(LiteralMode::Synchronizing, true));
 
     assert!(
-        matches!(result, Err(EncodeError::Validation(ref msg)) if msg.contains("RFC 6855 Section 3")),
+        matches!(result, Err(crate::Error::InvalidInput(ref msg)) if msg.contains("RFC 6855 Section 3")),
         "SEARCH with CHARSET must be rejected when UTF8=ACCEPT is active \
          (RFC 6855 Section 3); got: {result:?}"
     );
@@ -6530,7 +6872,7 @@ fn encode_authenticate_accepts_empty_initial_response_marker() {
     let result = encode_command("A001", &cmd, &default_opts());
     assert!(result.is_ok());
     let encoded = result.unwrap();
-    let s = String::from_utf8(encoded.into_buf().to_vec()).unwrap();
+    let s = String::from_utf8(encoded.to_vec()).unwrap();
     assert!(
         s.contains(" =\r\n"),
         "Empty initial response should encode as '='"
@@ -6646,7 +6988,7 @@ mod prop_roundtrip {
         ) {
             let result = encode_command(&tag, &cmd, &default_opts());
             if let Ok(encoded) = result {
-                let buf = encoded.into_buf();
+                let buf = encoded.to_vec();
                 let bytes = &buf[..];
 
                 // Must end with CRLF
@@ -6699,7 +7041,7 @@ mod prop_roundtrip {
             };
             let encoded = encode_command("T1", &cmd, &opts(LiteralMode::LiteralPlus, false))
                 .expect("SELECT encoding must succeed");
-            let s = String::from_utf8(encoded.into_buf().to_vec())
+            let s = String::from_utf8(encoded.to_vec())
                 .expect("SELECT must produce valid UTF-8");
 
             prop_assert!(
@@ -6723,7 +7065,7 @@ mod prop_roundtrip {
             };
             let encoded = encode_command("T1", &cmd, &opts(LiteralMode::LiteralPlus, false))
                 .expect("FETCH encoding must succeed");
-            let s = String::from_utf8(encoded.into_buf().to_vec())
+            let s = String::from_utf8(encoded.to_vec())
                 .expect("FETCH must produce valid UTF-8");
 
             prop_assert!(
@@ -7737,7 +8079,7 @@ fn literal_plus_body_containing_sync_marker_stays_in_one_segment() {
         entries: vec![("/private/x".into(), Some(b"a{5}\r\nbbbbb".to_vec()))],
     };
     let encoded = encode_command("A001", &cmd, &opts(LiteralMode::LiteralPlus, false)).unwrap();
-    let segments = encoded.segments();
+    let segments = segment_bytes(&encoded);
 
     assert_eq!(
         segments.len(),
@@ -7782,7 +8124,7 @@ fn sync_literal_body_containing_sync_marker_is_skipped() {
         entries: vec![("/private/x".into(), Some(b"a{5}\r\nbbbbb".to_vec()))],
     };
     let encoded = encode_command("A001", &cmd, &default_opts()).unwrap();
-    let segments = encoded.segments();
+    let segments = segment_bytes(&encoded);
 
     assert_eq!(
         segments.len(),
@@ -7802,16 +8144,15 @@ fn sync_literal_body_containing_sync_marker_is_skipped() {
     assert_eq!(
         &segments[1][..],
         b"a{5}\r\nbbbbb)\r\n",
-        "the whole payload plus the command tail is one segment because \
-         `from_flat_buffer` advanced past the declared 11 octets"
+        "the whole payload plus the command tail is one segment: the writer \
+         records only the boundary of the literal it wrote"
     );
 }
 
-/// `find_sync_literal_boundary` requires `}` to abut the CRLF, so a
-/// `{digits}` group that is *not* at end-of-line is not mistaken for a
-/// literal marker. The response-side framing scanner in `connection/wire.rs`
-/// lacks this check; this pins that
-/// the encoder does not share that defect.
+/// A `{digits}` group inside a payload that is *not* followed by CRLF is
+/// payload, and the command stays one segment. The encoder never scans its
+/// own output, so this pins that a value shaped like a marker cannot create a
+/// boundary.
 #[test]
 fn brace_digits_not_abutting_crlf_is_not_a_literal_marker() {
     let cmd = Command::SetMetadata {
@@ -7860,7 +8201,7 @@ fn list_status_return_option_rejects_unbalanced_leading_paren() {
     assert!(
         matches!(
             encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()),
-            Err(EncodeError::Validation(_))
+            Err(crate::Error::InvalidInput(_))
         ),
         "an unbalanced STATUS list must not be emitted"
     );

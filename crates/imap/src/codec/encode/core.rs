@@ -84,6 +84,10 @@ impl EncodeOptions {
     /// extension apply (the literal-extension half is the caller's
     /// [`LiteralMode`]). RFC 9051 Section 9 redefines `literal8` for pure
     /// `IMAP4rev2` with no `+` modifier, so it is never eligible there.
+    ///
+    /// Deliberately the ADVERTISED token, not `supports(Binary)`: rev2 folds
+    /// in only BINARY's FETCH side, and a rev2 connection is excluded here
+    /// anyway.
     pub(super) fn literal8_non_sync_allowed(&self) -> bool {
         self.capabilities.contains(&Capability::Binary) && !self.imap4rev2_active()
     }
@@ -96,250 +100,248 @@ impl EncodeOptions {
     }
 }
 
-/// Error produced when the encoder cannot produce a valid wire command.
-///
-/// Separate from [`crate::Error`] so codec-level callers can distinguish
-/// encoding failures from I/O and protocol errors. The connection layer
-/// converts this to [`crate::Error`] at the call site.
-#[derive(Debug, Clone, thiserror::Error)]
-pub(crate) enum EncodeError {
-    /// The command requires a capability that the server has not advertised
-    /// or the client has not `ENABLE`d (RFC 3501 Section 6.1.1).
-    #[error("command {cmd} requires capability {cap} which is not available")]
-    MissingCapability {
-        /// The command that requires the capability.
-        cmd: &'static str,
-        /// The wire name of the missing capability.
-        cap: String,
-    },
-    /// A capability refusal raised by a per-command encoder that reports it
-    /// as free text (a caller's non-synchronizing literal without LITERAL+, a
-    /// NUL body without BINARY) rather than as a command/capability pair.
-    /// Converts back to `crate::Error::MissingCapability`, so it stays
-    /// `Unsupported` at the account boundary.
-    #[error("encode capability error: {0}")]
-    CapabilityText(String),
-    /// A protocol-level validation failure detected during encoding
-    /// (e.g., CRLF in a parameter, invalid atom, etc.).
-    #[error("encode validation error: {0}")]
-    Validation(String),
-}
-
-impl From<crate::Error> for EncodeError {
-    /// Bridge per-command encoders that return `crate::Error` into the
-    /// `EncodeError` return path, PRESERVING the classification: a
-    /// capability refusal stays a capability refusal. Collapsing every
-    /// variant into `Validation` used to turn a missing LITERAL+ into a
-    /// malformed-request client bug on the live driver path while the
-    /// encoder's own tests, which call the inner encoders directly, still saw
-    /// `MissingCapability`.
-    fn from(e: crate::Error) -> Self {
-        match e {
-            crate::Error::MissingCapability(msg) => Self::CapabilityText(msg),
-            crate::Error::InvalidInput(msg) => Self::Validation(msg),
-            other => Self::Validation(other.to_string()),
-        }
-    }
-}
-
 /// RFC 7888 Section 5: maximum non-synchronizing literal size for LITERAL-.
 pub(crate) const LITERAL_MINUS_MAX: usize = 4096;
 
-/// Encoded IMAP command split into segments at synchronizing literal boundaries.
-///
-/// RFC 3501 Section 4.3: when a command contains a synchronizing literal
-/// (`{N}\r\n`), the client must send the bytes up to and including the literal
-/// marker, then wait for a `+` continuation response before sending the literal
-/// body. This struct represents that split so callers can implement the
-/// send-wait-send cycle without rescanning the wire bytes.
-///
-/// - When `literal_mode` is [`LiteralMode::LiteralPlus`] (RFC 7888 Section 4) or
-///   the command contains no literals, `segments` has exactly one element.
-/// - When `literal_mode` is [`LiteralMode::Synchronizing`] and the command
-///   contains synchronizing literals, `segments` has N+1 elements (one for each
-///   literal boundary plus the trailing data). Between consecutive segments the
-///   caller must wait for a server `+` continuation response.
-/// - When `literal_mode` is [`LiteralMode::LiteralMinus`] (RFC 7888 Section 5),
-///   literals <= 4096 bytes are non-synchronizing; only literals > 4096 bytes
-///   produce segment splits.
-#[derive(Debug, Clone)]
-pub(crate) struct EncodedCommand {
-    /// Sequential wire segments. The caller sends `segments[0]`, waits for `+`,
-    /// sends `segments[1]`, waits for `+`, ..., sends `segments[N]` (no wait
-    /// after the last segment). Each segment is never empty.
-    segments: Vec<BytesMut>,
+/// Which literal syntax carries a payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiteralForm {
+    /// Classic `{n}` literal (RFC 3501 Section 4.3, RFC 9051 Section 4.3).
+    Classic,
+    /// `~{n}` literal8 (RFC 3516 Section 4.2, RFC 4466 Section 2.1): may carry
+    /// NUL. Its non-synchronizing form has the extra eligibility rule of
+    /// [`EncodeOptions::literal8_non_sync_allowed`].
+    Literal8,
 }
 
-impl EncodedCommand {
-    /// Return the wire segments. Between consecutive segments, the connection
-    /// must wait for a `+` continuation response (RFC 3501 Section 4.3).
-    pub(crate) fn segments(&self) -> &[BytesMut] {
-        &self.segments
-    }
-
-    /// Consume the command and hand over its segments without copying.
-    pub(super) fn into_segments(self) -> Vec<BytesMut> {
-        self.segments
-    }
-
-    /// Concatenate all segments into a single buffer.
-    ///
-    /// Useful for non-synchronizing paths (LITERAL+) where the entire command
-    /// can be sent in one shot, or for tests that verify total wire output.
-    pub(crate) fn into_buf(mut self) -> BytesMut {
-        if self.segments.len() == 1 {
-            // Single-segment fast path  -  avoid reallocation.
-            return self.segments.swap_remove(0);
-        }
-        let total: usize = self.segments.iter().map(BytesMut::len).sum();
-        let mut buf = BytesMut::with_capacity(total);
-        for seg in &self.segments {
-            buf.extend_from_slice(seg);
-        }
-        buf
-    }
-
-    /// Build an `EncodedCommand` from a flat buffer by scanning literal
-    /// markers and splitting at synchronizing boundaries.
-    ///
-    /// A synchronizing literal marker is `{digits}\r\n` where digits parse as
-    /// a valid RFC 9051 `number64` (counts above `i64::MAX` are text, not
-    /// framing), fit in this process's `usize`, and there
-    /// is no `+` before `}`. The buffer is split so
-    /// that the marker ends the current segment and the literal body begins
-    /// the next segment. The caller sends each segment and waits for a `+`
-    /// continuation response between consecutive segments.
-    ///
-    /// RFC 3501 Section 4.3: "The client MUST wait for a continuation request
-    /// before sending the octets of a synchronizing literal."
-    pub(super) fn from_flat_buffer(buf: &[u8]) -> Self {
-        // Every caller has first encoded a complete tagged command. Keeping
-        // this as a release assertion makes the non-empty segment contract
-        // structural instead of merely documenting a property of current
-        // command encoders.
-        assert!(
-            !buf.is_empty(),
-            "EncodedCommand requires a non-empty command buffer"
-        );
-        let mut segments = Vec::new();
-        let mut seg_start = 0;
-        // `scan_pos` tracks our scanning position; it may jump ahead past
-        // literal bodies to avoid matching `{N}\r\n` patterns inside literal
-        // data.
-        let mut scan_pos = 0;
-
-        while scan_pos < buf.len() {
-            let Some((marker_end_rel, literal_size, synchronizing)) =
-                find_literal_marker(&buf[scan_pos..])
-            else {
-                break;
-            };
-            // Absolute offset of the byte just past `{N}\r\n` or
-            // `{N+}\r\n`.
-            let abs_marker_end = scan_pos + marker_end_rel;
-            // A malformed marker cannot delimit a literal body. In particular,
-            // do not allow an attacker-controlled size to wrap scan_pos or make
-            // us rescan bytes that a valid preceding literal owns.
-            let Some(payload_end) = u64::try_from(abs_marker_end)
-                .ok()
-                .and_then(|marker_end| marker_end.checked_add(literal_size))
-                .and_then(|payload_end| usize::try_from(payload_end).ok())
-                .filter(|&end| end <= buf.len())
-            else {
-                break;
-            };
-            if synchronizing {
-                // Current segment: from seg_start through the marker (inclusive
-                // of `{N}\r\n`).
-                segments.push(BytesMut::from(&buf[seg_start..abs_marker_end]));
-                // Next segment begins at the literal body.
-                seg_start = abs_marker_end;
-            }
-            // Skip every literal body, including LITERAL+ / small LITERAL-
-            // bodies. Their contents are opaque and may look like framing.
-            scan_pos = payload_end;
-        }
-
-        // Remaining bytes (literal body + any trailing command text) form the
-        // final segment.
-        if seg_start < buf.len() {
-            segments.push(BytesMut::from(&buf[seg_start..]));
-        }
-
-        // If no synchronizing literals were found, the whole buffer is one
-        // segment (already pushed above when seg_start == 0).
-        Self { segments }
-    }
-}
-
-/// An encoded command whose literal bodies are held by reference, not copied.
+/// One encoded IMAP command, ready for the wire.
 ///
-/// [`EncodedCommand`] is one flat buffer per segment, which is the right shape
-/// for commands whose literals are short strings. APPEND carries whole
-/// messages, so building it that way would copy each body into the command
-/// buffer and then again when splitting at literal boundaries. This type keeps
-/// each body as the caller's own [`Bytes`] (a reference-count bump) and only
-/// allocates for the small command syntax around it.
+/// The single encoded form every command takes. Each segment is a list of
+/// chunks; the sender writes every chunk of a segment in order, then waits for
+/// a server `+` continuation before the next segment (RFC 3501 Section 4.3),
+/// with no wait after the last. A segment ends exactly on a synchronizing
+/// literal marker, so N synchronizing literals give N+1 segments, and no
+/// segment is ever empty.
 ///
-/// The segmentation contract is [`EncodedCommand`]'s: the caller writes every
-/// chunk of `segments()[0]` in order, waits for a server `+` continuation,
-/// writes `segments()[1]`, and so on, with no wait after the last segment.
-/// Segments are never empty; a synchronizing literal ends its segment on the
-/// marker and the next segment begins with the body. A segment may hold several
-/// chunks (marker text, a non-synchronizing body, the next message's syntax).
-#[derive(Debug, Clone)]
-pub(crate) struct ChunkedCommand {
+/// The boundaries are STRUCTURAL: [`CommandWriter`] records them as it emits
+/// each marker. Nothing ever rescans encoded bytes to rediscover where a
+/// literal begins, which is what keeps marker-shaped bytes inside a literal
+/// payload from being mistaken for framing - there is no scanner to mistake
+/// them.
+///
+/// Chunks are `Bytes`. Command syntax is coalesced into few chunks; a payload
+/// handed over as `Bytes` (an APPEND message body) is carried by reference,
+/// never copied into a command buffer.
+#[derive(Clone)]
+pub(crate) struct WireCommand {
     segments: Vec<Vec<Bytes>>,
 }
 
-impl ChunkedCommand {
-    pub(super) fn new(segments: Vec<Vec<Bytes>>) -> Self {
-        debug_assert!(
-            segments.iter().all(|segment| !segment.is_empty()),
-            "ChunkedCommand segments must not be empty"
-        );
-        Self { segments }
-    }
-
+impl WireCommand {
     /// The wire segments. Between consecutive segments the connection must
     /// wait for a `+` continuation response (RFC 3501 Section 4.3).
     pub(crate) fn segments(&self) -> &[Vec<Bytes>] {
         &self.segments
     }
+
+    /// The whole command as one byte string, as the server receives it.
+    #[cfg(test)]
+    pub(crate) fn to_vec(&self) -> Vec<u8> {
+        self.segments
+            .iter()
+            .flatten()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect()
+    }
 }
 
-/// Find the first literal marker in `buf`.
-///
-/// Returns `(marker_end, literal_size, synchronizing)` where `marker_end` is the offset
-/// past the `\r\n` of the marker, and `literal_size` is the parsed digit
-/// count (the number of octets in the literal body).
-///
-/// Matches synchronizing literals (`{N}\r\n`), non-synchronizing literals
-/// (`{N+}\r\n`), and literal8
-/// markers (`~{N}\r\n`). RFC 9051 Section 9 defines
-/// `literal8 = "~{" number64 "}" CRLF *OCTET` with no `["+"]` modifier,
-/// so literal8 is unconditionally synchronizing (RFC 3516 Section 4).
-fn find_literal_marker(buf: &[u8]) -> Option<(usize, u64, bool)> {
-    use crate::connection::literals::{LiteralMarker, literal_marker_at};
+/// Deliberately prints only the shape: a command can carry a whole message
+/// body or a credential literal, and `?cmd`-style tracing must never put
+/// either in a log.
+impl std::fmt::Debug for WireCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let octets: usize = self.segments.iter().flatten().map(Bytes::len).sum();
+        f.debug_struct("WireCommand")
+            .field("segments", &self.segments.len())
+            .field("octets", &octets)
+            .finish()
+    }
+}
 
-    let mut i = 0;
-    while i < buf.len() {
-        match literal_marker_at(buf, i) {
-            LiteralMarker::Counted {
-                data_start,
-                size,
-                synchronizing,
-            } => {
-                // A legal number64 is a marker even on a narrow target;
-                // `from_flat_buffer` then rejects it as an unavailable body
-                // boundary uniformly on every pointer width.
-                return Some((data_start, size, synchronizing));
-            }
-            // Above the RFC 9051 ceiling this cannot be a literal we emitted,
-            // so on the send path it is ordinary text: keep scanning for the
-            // real boundary instead of stopping at a private parse failure.
-            LiteralMarker::CountOutOfRange { .. } | LiteralMarker::NotAMarker => i += 1,
+/// The one place literal framing is decided.
+///
+/// Encoders write command syntax through [`raw`](Self::raw), strings through
+/// [`string`](Self::string), and payloads through [`literal`](Self::literal) /
+/// [`literal_bytes`](Self::literal_bytes). The writer chooses each marker's
+/// `+` modifier ONCE, from the [`EncodeOptions`] the driver built from live
+/// state, and records the segment boundary at every synchronizing marker as it
+/// writes it. What a command may carry at all (APPEND's BINARY requirement for
+/// a NUL body, METADATA's literal8 values) stays with that command's encoder;
+/// the writer owns marker choice and boundaries and nothing else.
+pub(crate) struct CommandWriter {
+    literal_mode: LiteralMode,
+    literal8_non_sync: bool,
+    segments: Vec<Vec<Bytes>>,
+    current: Vec<Bytes>,
+    buf: BytesMut,
+}
+
+impl CommandWriter {
+    pub(crate) fn new(opts: &EncodeOptions) -> Self {
+        Self {
+            literal_mode: opts.literal_mode,
+            literal8_non_sync: opts.literal8_non_sync_allowed(),
+            segments: Vec::new(),
+            current: Vec::new(),
+            buf: BytesMut::new(),
         }
     }
-    None
+
+    /// The negotiated literal mode, for validators that judge caller-written
+    /// literal markers against it.
+    pub(crate) const fn literal_mode(&self) -> LiteralMode {
+        self.literal_mode
+    }
+
+    /// Append command syntax verbatim.
+    pub(crate) fn raw(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Encode a byte string as a quoted string or a literal, depending on
+    /// content (RFC 3501 Section 9 / RFC 9051 Section 9).
+    ///
+    /// NUL bytes (%x00) are stripped first: RFC 3501 Section 9 rule (3) says
+    /// "The ASCII NUL character, %x00, MUST NOT be used at any time", and a
+    /// `tracing::warn!` makes a caller passing them visible.
+    ///
+    /// Without `utf8`, only printable ASCII (`0x20..0x7F`) is quoted. DEL is
+    /// excluded because RFC 9051 Section 9 drops it from CHAR, and control
+    /// characters other than CR/LF, though valid CHAR under RFC 3501, are
+    /// rejected in quoted strings by many servers, so "be conservative in what
+    /// you send" sends them as a literal. With `utf8` (UTF8=ACCEPT per RFC 6855
+    /// Section 3, or active rev2 per RFC 9051 Section 9) valid UTF-8 is also
+    /// quotable, under the same control-character and DEL exclusions.
+    pub(crate) fn string(&mut self, data: &[u8], utf8: bool) {
+        let data = strip_nul_bytes(data);
+        let quotable = if utf8 {
+            std::str::from_utf8(&data).is_ok()
+                && data.iter().all(|&b| (b >= 0x20 && b != 0x7F) || b >= 0x80)
+        } else {
+            data.iter().all(|&b| (0x20..0x7F).contains(&b))
+        };
+        if quotable {
+            self.quoted(&data);
+        } else {
+            self.literal(&data, LiteralForm::Classic);
+        }
+    }
+
+    /// Write `data` as a quoted string, escaping `\` and `"`.
+    ///
+    /// RFC 3501 Section 9: `quoted = DQUOTE *QUOTED-CHAR DQUOTE`, where
+    /// quoted-specials (backslash and double-quote) are escaped with
+    /// backslash. The caller must have established that `data` is quotable.
+    fn quoted(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(b"\"");
+        for &byte in data {
+            if byte == b'\\' || byte == b'"' {
+                self.buf.extend_from_slice(b"\\");
+            }
+            self.buf.extend_from_slice(&[byte]);
+        }
+        self.buf.extend_from_slice(b"\"");
+    }
+
+    /// Write a literal whose payload is copied into the command buffer. For
+    /// short payloads; a large one should use [`literal_bytes`](Self::literal_bytes).
+    pub(crate) fn literal(&mut self, data: &[u8], form: LiteralForm) {
+        if self.marker(data.len(), form) {
+            self.end_segment();
+        }
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Write a literal whose payload is carried by reference: the `Bytes` is
+    /// cloned into the command (a reference-count bump), never copied.
+    pub(crate) fn literal_bytes(&mut self, data: Bytes, form: LiteralForm) {
+        if self.marker(data.len(), form) {
+            self.end_segment();
+        } else {
+            self.flush_buf();
+        }
+        self.current.push(data);
+    }
+
+    /// Write `{n}` / `{n+}` (or the `~` literal8 forms) and CRLF, returning
+    /// whether the marker is synchronizing.
+    ///
+    /// RFC 7888 Section 4: LITERAL+ is non-synchronizing for any size.
+    /// RFC 7888 Section 5 / RFC 9051 Section 4.3: LITERAL- (and rev2) only up
+    /// to 4096 octets. RFC 3501 Section 4.3: no extension, always
+    /// synchronizing. RFC 7888 Section 6 / RFC 9051 Section 9: literal8
+    /// additionally needs BINARY on a non-rev2 connection.
+    fn marker(&mut self, len: usize, form: LiteralForm) -> bool {
+        let non_sync_by_mode = match self.literal_mode {
+            LiteralMode::LiteralPlus => true,
+            LiteralMode::LiteralMinus => len <= LITERAL_MINUS_MAX,
+            LiteralMode::Synchronizing => false,
+        };
+        let non_sync = non_sync_by_mode
+            && match form {
+                LiteralForm::Classic => true,
+                LiteralForm::Literal8 => self.literal8_non_sync,
+            };
+        self.buf.extend_from_slice(match form {
+            LiteralForm::Classic => b"{".as_slice(),
+            LiteralForm::Literal8 => b"~{".as_slice(),
+        });
+        self.buf.extend_from_slice(len.to_string().as_bytes());
+        self.buf
+            .extend_from_slice(if non_sync { b"+}\r\n" } else { b"}\r\n" });
+        !non_sync
+    }
+
+    /// Move buffered syntax into the current segment as one chunk.
+    fn flush_buf(&mut self) {
+        if !self.buf.is_empty() {
+            self.current.push(self.buf.split().freeze());
+        }
+    }
+
+    /// End the current segment on the synchronizing marker just written: the
+    /// sender waits for `+` before writing what follows.
+    fn end_segment(&mut self) {
+        self.flush_buf();
+        self.segments.push(std::mem::take(&mut self.current));
+    }
+
+    /// The finished command. Every command ends with its CRLF, written by the
+    /// encoder, so the last segment is never empty.
+    pub(crate) fn finish(mut self) -> WireCommand {
+        self.flush_buf();
+        debug_assert!(
+            !self.current.is_empty(),
+            "a command always ends with syntax after its last literal"
+        );
+        self.segments.push(self.current);
+        WireCommand {
+            segments: self.segments,
+        }
+    }
+}
+
+/// Defensively strip NUL bytes from IMAP string data.
+///
+/// RFC 3501 Section 9: CHAR8 = %x01-ff  -  NUL (%x00) is forbidden.
+/// Returns a `Cow` to avoid allocation when no NUL bytes are present.
+fn strip_nul_bytes(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if data.contains(&0x00) {
+        tracing::warn!(
+            "Stripped NUL bytes from IMAP string data  -  RFC 3501 Section 9 forbids %x00"
+        );
+        std::borrow::Cow::Owned(data.iter().copied().filter(|&b| b != 0x00).collect())
+    } else {
+        std::borrow::Cow::Borrowed(data)
+    }
 }

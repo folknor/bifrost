@@ -45,7 +45,7 @@ async fn make_driver_test_pair() -> (ImapConnection, tokio::io::DuplexStream) {
     server.flush().await.unwrap();
 
     // --- Pre-driver phase: mirror connect_with_tls_config's init ---
-    let mut wire_reader = wire::WireReader::new(ImapStream::Memory(client));
+    let mut wire_reader = wire::WireReader::new(ImapStream::Memory(stream::Tracked::new(client)));
     let mut proto_state = state::ProtocolState::new();
     let tag_gen = tag::TagGenerator::new();
 
@@ -2042,4 +2042,282 @@ async fn idle_done_handshake_is_bounded_when_the_server_never_completes() {
         .expect_err("an unanswered DONE must not park the caller");
     assert!(matches!(err, crate::Error::Timeout { .. }), "got {err:?}");
     script.abort();
+}
+
+// ===========================================================================
+// One command path: live session legality, pending effects, write evidence
+// ===========================================================================
+
+/// Live session legality is a property of every command, not an APPEND
+/// special case: a NAMESPACE queued behind an UNAUTHENTICATE that completes
+/// first is refused at the head of the queue, before a byte is written, and
+/// the refusal says the state moved rather than blaming the caller.
+#[tokio::test(start_paused = true)]
+async fn a_queued_command_is_refused_when_the_session_left_its_legal_states() {
+    let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
+        "IMAP4rev1 UNAUTHENTICATE NAMESPACE",
+    ))
+    .await;
+    let conn = std::sync::Arc::new(conn);
+    let (unauth_seen_tx, unauth_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let script = tokio::spawn(async move {
+        let unauth = read_line(&mut server).await;
+        assert!(unauth.ends_with(" UNAUTHENTICATE\r\n"), "{unauth:?}");
+        let tag = tag_of(&unauth).to_owned();
+        unauth_seen_tx.send(()).expect("test is waiting");
+        release_rx.await.expect("test releases the reply");
+        respond(&mut server, &format!("{tag} OK Unauthenticated\r\n")).await;
+
+        // The capability refresh `unauthenticate` issues is next. The queued
+        // NAMESPACE sat ahead of it, so had it been written it would be here.
+        let next = read_line(&mut server).await;
+        assert!(
+            next.ends_with(" CAPABILITY\r\n"),
+            "the queued NAMESPACE must not have been written; got {next:?}"
+        );
+        let tag = tag_of(&next).to_owned();
+        respond(
+            &mut server,
+            &format!("* CAPABILITY IMAP4rev1 NAMESPACE\r\n{tag} OK done\r\n"),
+        )
+        .await;
+        let mut rest = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut server, &mut rest)
+            .await
+            .expect("duplex read");
+        let rest = String::from_utf8_lossy(&rest);
+        assert!(
+            !rest.contains("NAMESPACE"),
+            "NAMESPACE was written: {rest:?}"
+        );
+    });
+
+    let first = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        async move { conn.unauthenticate(Duration::from_secs(5)).await }
+    });
+    unauth_seen_rx.await.expect("server saw UNAUTHENTICATE");
+    let namespace = tokio::spawn({
+        let conn = std::sync::Arc::clone(&conn);
+        async move { conn.namespace(Duration::from_secs(5)).await }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    release_tx.send(()).expect("server is waiting");
+
+    first
+        .await
+        .expect("unauthenticate task")
+        .expect("UNAUTHENTICATE completes");
+    let err = namespace
+        .await
+        .expect("namespace task")
+        .expect_err("the session is no longer legal for NAMESPACE");
+    assert!(
+        matches!(err, Error::StateChangedBeforeSend(_)),
+        "got {err:?}"
+    );
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent)
+    );
+    drop(conn);
+    script.await.expect("transcript");
+}
+
+/// A SELECT refused before the first byte arms nothing. The pending-selection
+/// flag used to be set before encoding, so an encoder refusal left it behind
+/// and the NEXT command's tagged OK completed a selection the server never
+/// made, flipping the session to Selected.
+#[tokio::test(start_paused = true)]
+async fn a_refused_select_leaves_no_pending_selection_behind() {
+    let (conn, mut server) = crate::connection::test_support::driver_pair(&preauth_greeting(
+        "IMAP4rev1 CONDSTORE QRESYNC",
+    ))
+    .await;
+    let script = tokio::spawn(async move {
+        let next = read_line(&mut server).await;
+        assert!(
+            next.ends_with(" NOOP\r\n"),
+            "the refused SELECT must not reach the wire; got {next:?}"
+        );
+        let tag = tag_of(&next).to_owned();
+        respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+        server
+    });
+
+    // RFC 3501 Section 9: a QRESYNC uidvalidity is nz-number, so the encoder
+    // refuses 0 before writing anything.
+    let refused = conn
+        .submit_regular(
+            Command::Select {
+                mailbox: MailboxName::new("INBOX").unwrap(),
+                condstore: false,
+                qresync: Some(QresyncParams {
+                    uid_validity: 0,
+                    mod_seq: 1,
+                    known_uids: None,
+                    seq_match_data: None,
+                }),
+            },
+            super::dispatch::TaggedOkConsumer::default(),
+        )
+        .await
+        .expect_err("a zero uidvalidity is refused");
+    assert!(matches!(refused, Error::InvalidInput(_)), "{refused:?}");
+
+    conn.noop(Duration::from_secs(5)).await.expect("NOOP");
+    assert_eq!(
+        conn.session_state(),
+        SessionState::Authenticated,
+        "a refused SELECT must not leave a selection for the next OK to complete"
+    );
+    let _server = script.await.expect("NOOP transcript");
+}
+
+/// Transmission evidence comes from socket progress, not from which write
+/// failed. Here the APPEND is one segment (LITERAL+), its first write is
+/// accepted, and the peer vanishes while the body is still going out: bytes of
+/// the command are on the wire, so the failure is `InFlight` and a
+/// non-idempotent APPEND goes to reconcile. Stamping by segment position
+/// called this `Unsent` and invited a blind retry that could duplicate it.
+#[tokio::test(start_paused = true)]
+async fn a_write_that_reached_the_socket_before_failing_is_in_flight() {
+    let (conn, mut server) = crate::connection::test_support::driver_pair_with_capacity(
+        &preauth_greeting("IMAP4rev1 LITERAL+"),
+        64,
+    )
+    .await;
+    let script = tokio::spawn(async move {
+        // Take the command line, then vanish with the body still unsent.
+        let line = read_line(&mut server).await;
+        assert!(line.contains(" APPEND "), "{line:?}");
+        drop(server);
+    });
+
+    let err = conn
+        .append("INBOX", &[], None, &[b'x'; 4096], Duration::from_secs(5))
+        .await
+        .expect_err("the peer is gone mid-body");
+    script.await.expect("transcript");
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::InFlight),
+        "bytes of the APPEND reached the socket; got {err:?}"
+    );
+}
+
+/// The other half of the same rule: a write that fails with no octet of the
+/// command accepted by the socket is `Unsent`, so recovery may simply retry.
+/// A peer that closed before the command is the stale-pool case.
+#[tokio::test(start_paused = true)]
+async fn a_write_that_reached_nothing_is_unsent() {
+    let (conn, server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 LITERAL+")).await;
+    drop(server);
+
+    let err = conn
+        .append("INBOX", &[], None, b"HELLO", Duration::from_secs(5))
+        .await
+        .expect_err("the peer is gone");
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent),
+        "no octet reached the socket; got {err:?}"
+    );
+}
+
+/// The driver refuses a batch holding a command that may not be pipelined,
+/// before writing a byte of the batch, and the connection stays usable. Only
+/// a crate bug can build such a batch, so it is reached here directly.
+#[tokio::test(start_paused = true)]
+async fn the_driver_refuses_a_batch_holding_a_command_that_cannot_be_pipelined() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let script = tokio::spawn(async move {
+        let next = read_line(&mut server).await;
+        assert!(
+            next.ends_with(" NOOP\r\n"),
+            "no byte of the refused batch may reach the wire; got {next:?}"
+        );
+        let tag = tag_of(&next).to_owned();
+        respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+        server
+    });
+
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    conn.cmd_tx
+        .send(driver::DriverCommand::Pipeline {
+            commands: vec![
+                Command::Noop,
+                Command::Append {
+                    mailbox: "INBOX".to_owned(),
+                    messages: vec![AppendMessage::new(b"HELLO".to_vec())],
+                    multi: false,
+                },
+            ],
+            consumers: vec![
+                Box::new(super::dispatch::TaggedOkConsumer::default()),
+                Box::new(super::dispatch::AppendConsumer::default()),
+            ],
+            result_tx,
+        })
+        .await
+        .expect("driver is running");
+    let Err(err) = result_rx.await.expect("driver answers") else {
+        panic!("the batch must be refused");
+    };
+    assert!(matches!(err, Error::Internal(_)), "got {err:?}");
+
+    conn.noop(Duration::from_secs(5))
+        .await
+        .expect("the connection survives the refusal");
+    let _server = script.await.expect("NOOP transcript");
+}
+
+/// A pipeline is admitted when it executes: a Selected-only command in an
+/// Authenticated session is caller sequencing, refused before anything is
+/// submitted.
+#[tokio::test]
+async fn a_pipeline_is_admitted_against_the_session_state_at_execution() {
+    let conn = crate::connection::test_support::detached(
+        SessionState::Authenticated,
+        vec![Capability::Imap4Rev1],
+        &[],
+    );
+    let err = conn
+        .pipeline()
+        .noop()
+        .uid_search("ALL".to_owned())
+        .execute_dynamic()
+        .await
+        .expect_err("UID SEARCH needs a selected mailbox");
+    assert!(
+        matches!(
+            err,
+            super::pipeline::PipelineError::Driver(Error::InvalidState(_))
+        ),
+        "got {err:?}"
+    );
+}
+
+/// IDLE is admitted on the handle like every other command: outside
+/// Authenticated/Selected it is caller sequencing, refused before submission.
+#[tokio::test]
+async fn idle_is_admitted_against_the_session_state() {
+    let conn = crate::connection::test_support::detached(
+        SessionState::NotAuthenticated,
+        vec![Capability::Imap4Rev1, Capability::Idle],
+        &[],
+    );
+    let err = conn
+        .idle(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("IDLE is not legal before authentication");
+    assert!(matches!(err, Error::InvalidState(_)), "got {err:?}");
 }

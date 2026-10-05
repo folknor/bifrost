@@ -25,7 +25,7 @@ impl ImapConnection {
     ) -> Result<SearchResult, Error> {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Sort)?;
         self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
@@ -61,7 +61,7 @@ impl ImapConnection {
     ) -> Result<SearchResult, Error> {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Sort)?;
         self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
@@ -104,7 +104,7 @@ impl ImapConnection {
     ) -> Result<Vec<ThreadNode>, Error> {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Thread)?;
         self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();
@@ -148,7 +148,7 @@ impl ImapConnection {
     ) -> Result<Vec<ThreadNode>, Error> {
         let criteria = criteria.as_ref();
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Thread)?;
         self.validate_search_criteria_capabilities(criteria)?;
         {
             let snap = self.state_rx.borrow();

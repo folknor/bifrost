@@ -1,6 +1,6 @@
 //! QUOTA and ACL command encoders.
 
-use super::{BytesMut, LiteralMode, encode_quoted_or_literal_utf8, validate_atom};
+use super::{CommandWriter, validate_atom};
 
 /// Encode SETQUOTA command (RFC 2087 Section 4.1).
 ///
@@ -13,12 +13,11 @@ use super::{BytesMut, LiteralMode, encode_quoted_or_literal_utf8, validate_atom}
 /// `number` is defined as `1*DIGIT` in RFC 3501 Section 9, constrained to u32.
 /// Returns an error if any resource name is not a valid atom or any limit exceeds `u32::MAX`.
 pub(in crate::codec::encode) fn encode_set_quota(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     root: &str,
     resources: &[(String, u64)],
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     // RFC 2087 Section 4.1: setquota_resource = atom SP number
     // RFC 3501 Section 9: number = 1*DIGIT (u32 range)
@@ -32,20 +31,20 @@ pub(in crate::codec::encode) fn encode_set_quota(
             )));
         }
     }
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" SETQUOTA ");
+    w.raw(tag.as_bytes());
+    w.raw(b" SETQUOTA ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, root.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" (");
+    w.string(root.as_bytes(), utf8);
+    w.raw(b" (");
     for (i, (resource, limit)) in resources.iter().enumerate() {
         if i > 0 {
-            buf.extend_from_slice(b" ");
+            w.raw(b" ");
         }
-        buf.extend_from_slice(resource.as_bytes());
-        buf.extend_from_slice(b" ");
-        buf.extend_from_slice(limit.to_string().as_bytes());
+        w.raw(resource.as_bytes());
+        w.raw(b" ");
+        w.raw(limit.to_string().as_bytes());
     }
-    buf.extend_from_slice(b")\r\n");
+    w.raw(b")\r\n");
     Ok(())
 }
 
@@ -53,21 +52,20 @@ pub(in crate::codec::encode) fn encode_set_quota(
 ///
 /// Format: `SETACL <mailbox> <identifier> <rights>`.
 pub(in crate::codec::encode) fn encode_set_acl(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     mailbox: &str,
     identifier: &str,
     rights: &str,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) {
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" SETACL ");
+    w.raw(tag.as_bytes());
+    w.raw(b" SETACL ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, mailbox.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" ");
-    encode_quoted_or_literal_utf8(buf, identifier.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" ");
-    encode_quoted_or_literal_utf8(buf, rights.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b"\r\n");
+    w.string(mailbox.as_bytes(), utf8);
+    w.raw(b" ");
+    w.string(identifier.as_bytes(), utf8);
+    w.raw(b" ");
+    w.string(rights.as_bytes(), utf8);
+    w.raw(b"\r\n");
 }

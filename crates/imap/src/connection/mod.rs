@@ -48,10 +48,6 @@ pub(super) mod wire;
 // pub: ImapConfig is re-exported at the crate root for direct connections.
 pub use config::ImapConfig;
 pub(crate) use dispatch::FetchStreamItem;
-use literals::{
-    find_literal_boundary, patch_literals_to_plus_with_binary,
-    patch_small_literals_to_plus_with_binary,
-};
 use stream::{CompressedStream, ImapStream, InnerStream};
 
 #[cfg(test)]

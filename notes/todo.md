@@ -35,19 +35,6 @@ Several items had been ruled in earlier sessions without the ruling reaching
 this file, so they were presented again as open; recording the ruling at the
 item is what stops that.
 
-- **imap: whether APPEND should also be a `Command`.** DEFERRED 2026-09-29:
-  the owner judged the implications underpresented. The driver-built APPEND
-  lives on the driver's `DriverCommandPayload::Append` (executed by
-  `prepare_append` then `run_append_command`) rather than on `Command`, which
-  the original ruling named. Behaviourally that ruling holds. Two facts to
-  carry into any re-raise: `Command` is NOT published - `types` is a private
-  module, and so is `AppendMessage`, contrary to how this item was first
-  framed - so this is an internal-design question, not a published-surface
-  one; and a re-raise must bring the full analysis first: how every
-  `Command`-accepting path, the pipeline in particular (literal
-  continuations interleaving with other commands), would treat APPEND, and
-  what submits raw `Command`s at all.
-
 - **errors: findings from the local-refusal audit (part c) still open.**
   Filed 2026-09-29; the rest of the audit's findings landed 2026-09-30.
   - JMAP push `subscribe` on a DEAD sink (`WebSocketSend`) still fails, and
@@ -101,6 +88,50 @@ control-character, caldav-override and push-handle-format items on
   nothing because the request had already gone out; and the first hop is
   never gated before sending, only redirect hops are.
 
+
+## imap: filed while making APPEND a `Command` (2026-10-05)
+
+Found by the codex spar on the one-command-path change and left outside its
+scope fence: none of them is touched by that change, and each is a defect or a
+decision of its own. Verify against the code before working any.
+
+- **Pipeline batch failure contract.** `DriverCommand::Pipeline` answers
+  all-or-error. `run_pipeline` runs sub-batches with `.await?`, so a later
+  sub-batch's error (an encode refusal, say) discards the results of earlier
+  sub-batches that already executed, and the batch reports a local refusal
+  beside an acknowledged mutation. Within a batch the error cannot say which
+  commands ran; transmission evidence is now batch-relative (`InFlight` once
+  any byte reached the socket), which is honest but coarse. A real fix is a
+  result shape with completed, outstanding and unsent lanes. Latent today: the
+  `Pipeline` builder has no production caller.
+- **Pipeline untagged ownership is not disjoint across kinds.**
+  `group_into_sub_batches` separates equal `CommandKind`s, but GETQUOTA,
+  GETQUOTAROOT and SETQUOTA all classify `* QUOTA` as `OnlySolicited`, and a
+  tagless `* SEARCH` is solicited by Search, SearchReturn and SearchSave alike,
+  so two such commands can share a sub-batch and the head consumer takes the
+  other's answer. Latent for the same reason.
+- **MULTIAPPEND APPENDUID expansion is unbounded.**
+  `MultiAppendConsumer::finalize` expands every UID range of the code into a
+  vector without knowing how many messages were submitted, so a response like
+  `[APPENDUID 7 1:4294967295]` allocates billions of pairs. Give the consumer
+  the submitted count and refuse ranges whose cardinality disagrees.
+  `multi_append` has no production caller.
+- **An early own-tag OK still completes pending effects.** In the
+  single-command `wait_for_continuation`, `apply_side_effects` runs before the
+  own-tag `OK` is recognised as the non-fatal `ProtocolMissing`, so a LOGIN
+  whose credential literal is answered by its own tagged OK before the `+`
+  moves the session to Authenticated, and SELECT and NOTIFY have the same
+  shape. The pipeline router already suppresses pre-effects for an early own
+  OK; the single-command wait does not. A NO/BAD must keep its effects (a
+  refused SELECT legitimately deselects). The one-command-path change fixed
+  only the encoding-refusal leak.
+- **ENABLE after SELECT.** RFC 5161 Section 3.1 forbids ENABLE once any
+  mailbox has been selected in the session, even after UNSELECT returns it to
+  Authenticated. `CommandKind::legal_states` is a state table and does not
+  model that history, and `enable()` does not enforce it.
+- **`send_raw_message` copies a message it already owns.** It holds the raw
+  message as `Bytes` and passes `&raw` to `append`, which copies it into a new
+  `Bytes`; `append_message` would carry the same allocation to the socket.
 
 ## bifrost-sync
 

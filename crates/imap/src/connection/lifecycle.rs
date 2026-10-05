@@ -75,6 +75,10 @@ impl ImapConnection {
                 source: std::sync::Arc::new(e),
                 attempt: Some(unsent),
             })?;
+        // Wrapped before anything is layered on it, so every octet the socket
+        // accepts - TLS handshake included - is counted for transmission
+        // evidence (`stream::Tracked`).
+        let tcp = stream::Tracked::new(tcp);
 
         let stream = if tls_mode.uses_implicit_tls() {
             validate_tls_server_name(host)?;
@@ -358,7 +362,7 @@ impl ImapConnection {
                 "STARTTLS requires an unencrypted connection".into(),
             ));
         }
-        self.require_state(&[SessionState::NotAuthenticated])?;
+        self.require_state(crate::types::CommandKind::StartTls)?;
 
         // A direct upgrade from a plaintext connection follows the same
         // capability rule as connection-time STARTTLS. An empty snapshot is

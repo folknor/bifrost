@@ -5,6 +5,7 @@
 //!
 //! Client commands are defined in RFC 3501 Section 6 / RFC 9051 Section 6.
 
+use super::fetch::AppendMessage;
 use super::flag::Flag;
 use super::mailbox::MailboxAttribute;
 use super::secret::SecretString;
@@ -108,6 +109,23 @@ pub(crate) enum Command {
     Unsubscribe { mailbox: MailboxName },
     /// LSUB command (RFC 3501 Section 6.3.9).
     Lsub { reference: String, pattern: String },
+    /// APPEND (`multi == false`, exactly one message, RFC 3501 Section 6.3.11)
+    /// or MULTIAPPEND (`multi == true`, RFC 3502).
+    ///
+    /// An ordinary command: the driver encodes it from live state at the head
+    /// of the queue like every other, so nothing about its wire form (mailbox
+    /// encoding, the RFC 6855 `UTF8 (` wrapper, RFC 7888 markers, literal8
+    /// eligibility) is decided before it is sent. The bodies are `Bytes` and
+    /// travel to the socket by reference; [`AppendMessage`]'s `Debug` prints
+    /// their length, never their content.
+    Append {
+        /// Destination mailbox, as the caller named it (decoded form).
+        mailbox: String,
+        /// The messages to append; exactly one unless `multi`.
+        messages: Vec<AppendMessage>,
+        /// Whether this is MULTIAPPEND (requires the capability).
+        multi: bool,
+    },
     /// CLOSE command (RFC 3501 Section 6.4.2).
     Close,
     /// UNSELECT command (RFC 3691 Section 3).
@@ -454,6 +472,132 @@ pub(crate) enum CommandKind {
     MyRights,
 }
 
+use crate::connection::SessionState;
+
+/// Every live session state (RFC 3501 Section 3). Logout is not live: the
+/// connection is closing, and no command is legal there.
+const ANY_LIVE: &[SessionState] = &[
+    SessionState::NotAuthenticated,
+    SessionState::Authenticated,
+    SessionState::Selected,
+];
+const NOT_AUTHENTICATED: &[SessionState] = &[SessionState::NotAuthenticated];
+const AUTHENTICATED: &[SessionState] = &[SessionState::Authenticated];
+const AUTHENTICATED_OR_SELECTED: &[SessionState] =
+    &[SessionState::Authenticated, SessionState::Selected];
+const SELECTED: &[SessionState] = &[SessionState::Selected];
+
+impl CommandKind {
+    /// The session states in which this command may be sent (RFC 3501
+    /// Section 6 / RFC 9051 Section 6, and each extension's own section).
+    ///
+    /// THE one table. The handle reads it to refuse a command its caller
+    /// should not have issued (`InvalidState`), and the driver reads it again
+    /// at the head of the queue, before arming any pending effect, to refuse a
+    /// command whose session moved while it waited (`StateChangedBeforeSend`).
+    /// Logout is in no row; both sites report it as `Closed`.
+    ///
+    /// A state table is not a complete legality predicate. RFC 5161 Section
+    /// 3.1 also forbids ENABLE once any mailbox has been selected in the
+    /// session, even after UNSELECT returns it to Authenticated; that history
+    /// is not modelled here.
+    pub(crate) const fn legal_states(self) -> &'static [SessionState] {
+        match self {
+            // RFC 3501 Section 6.1: any state. ID is likewise valid in every
+            // state (RFC 2971 Section 3.1).
+            Self::Capability | Self::Noop | Self::Logout | Self::Id => ANY_LIVE,
+            // RFC 3501 Section 6.2.
+            Self::Login | Self::Authenticate | Self::StartTls => NOT_AUTHENTICATED,
+            // RFC 5161 Section 3.1 / RFC 9051 Section 6.3.1.
+            Self::Enable => AUTHENTICATED,
+            // RFC 3501 Section 6.3 and the extensions that join it.
+            Self::Select
+            | Self::Examine
+            | Self::Create
+            | Self::Delete
+            | Self::Rename
+            | Self::Subscribe
+            | Self::Unsubscribe
+            | Self::List
+            | Self::ListStatus
+            | Self::Lsub
+            | Self::Status
+            | Self::Namespace
+            | Self::Append
+            | Self::Idle
+            | Self::GetMetadata
+            | Self::SetMetadata
+            | Self::NotifySet
+            | Self::NotifyNone
+            | Self::Compress
+            | Self::Unauthenticate
+            | Self::GetQuota
+            | Self::GetQuotaRoot
+            | Self::SetQuota
+            | Self::SetAcl
+            | Self::DeleteAcl
+            | Self::GetAcl
+            | Self::ListRights
+            | Self::MyRights => AUTHENTICATED_OR_SELECTED,
+            // RFC 3501 Section 6.4, RFC 3691, RFC 5256, RFC 6851.
+            Self::Check
+            | Self::Close
+            | Self::Unselect
+            | Self::Expunge
+            | Self::Search
+            | Self::SearchReturn
+            | Self::SearchSave
+            | Self::Fetch
+            | Self::Store
+            | Self::Copy
+            | Self::Move
+            | Self::Thread
+            | Self::Sort => SELECTED,
+        }
+    }
+
+    /// Whether a command of this kind may ride a pipelined batch
+    /// (`DriverCommand::Pipeline`).
+    ///
+    /// The batch encodes every command against one state snapshot and routes
+    /// responses through head-consumer classification, so a command that
+    /// changes session state, swaps the transport, enters a continuation
+    /// exchange, or needs per-command preparation the batch does not do is
+    /// excluded:
+    ///
+    /// * SELECT, EXAMINE, CLOSE, UNSELECT, LOGIN, AUTHENTICATE, LOGOUT and
+    ///   UNAUTHENTICATE move the session state the rest of the batch was
+    ///   encoded and admitted against.
+    /// * STARTTLS and COMPRESS swap the stream and must run as upgrades.
+    /// * IDLE has its own DONE lifecycle.
+    /// * ENABLE changes the encode options mid-batch.
+    /// * APPEND needs its APPENDLIMIT preflight, and the batch router does not
+    ///   give its consumer an untagged `* OK [APPENDUID ...]` that a head
+    ///   consumer claims first.
+    ///
+    /// The driver refuses a batch containing any of these before a byte is
+    /// written. Only a crate bug can build one: the `Pipeline` builder has no
+    /// method for them.
+    pub(crate) const fn pipelinable(self) -> bool {
+        !matches!(
+            self,
+            Self::Select
+                | Self::Examine
+                | Self::Close
+                | Self::Unselect
+                | Self::Login
+                | Self::Authenticate
+                | Self::Logout
+                | Self::Unauthenticate
+                | Self::StartTls
+                | Self::Compress
+                | Self::Idle
+                | Self::Enable
+                | Self::Append
+        )
+    }
+}
+
 impl Command {
     /// Return the mailbox target of this command, if applicable.
     ///
@@ -519,6 +663,7 @@ impl Command {
             Self::Lsub { .. } => CommandKind::Lsub,
             Self::Status { .. } => CommandKind::Status,
             Self::Namespace => CommandKind::Namespace,
+            Self::Append { .. } => CommandKind::Append,
 
             // Selected (RFC 3501 Section6.4)
             Self::Check => CommandKind::Check,

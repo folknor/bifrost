@@ -15,9 +15,10 @@ pub enum PipelineError {
     /// owned it and died before answering, so a batch that may have been
     /// written is not reported as one that certainly was not.
     Disconnected(Error),
-    /// The driver returned a pipeline-level error (e.g., encoding
-    /// failure that aborted the entire batch before any bytes were
-    /// written to the wire).
+    /// A pipeline-level error: a local refusal of the whole batch before
+    /// anything was submitted or written (a command the session state does
+    /// not permit, an encoding failure), or a driver failure that ended the
+    /// batch.
     Driver(Error),
     /// Internal error: a consumer returned a type that does not match
     /// the expected downcast target. This indicates a bug in the

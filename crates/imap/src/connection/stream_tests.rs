@@ -2,7 +2,7 @@ use bytes::BytesMut;
 use flate2::{Decompress, FlushDecompress, Status};
 use tokio::io::AsyncReadExt;
 
-use super::{CompressedStream, InnerStream, ensure_deflate_progress};
+use super::{CompressedStream, InnerStream, Tracked, ensure_deflate_progress};
 
 #[test]
 fn deflate_no_progress_is_a_write_zero_error() {
@@ -13,7 +13,7 @@ fn deflate_no_progress_is_a_write_zero_error() {
 #[tokio::test]
 async fn compressed_stream_writes_a_raw_deflate_byte_stream() {
     let (client, mut server) = tokio::io::duplex(1024);
-    let mut stream = CompressedStream::new(InnerStream::Memory(client));
+    let mut stream = CompressedStream::new(InnerStream::Memory(Tracked::new(client)));
     let plaintext = b"P001 NOOP\r\n";
 
     stream.write_all(plaintext).await.expect("compressed write");

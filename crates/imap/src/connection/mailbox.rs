@@ -19,7 +19,7 @@ impl ImapConnection {
         use super::dispatch::ListConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::List)?;
         let cmd = Command::List {
             reference: reference.to_owned(),
             pattern: pattern.to_owned(),
@@ -60,7 +60,7 @@ impl ImapConnection {
         use super::dispatch::ListExtendedConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::List)?;
         self.validate_list_extended_request(patterns, selection_options, return_options)?;
 
         if selection_options.is_empty() && return_options.is_empty() && patterns.len() == 1 {
@@ -116,7 +116,7 @@ impl ImapConnection {
         use super::dispatch::ListStatusConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::ListStatus)?;
         // RFC 5819 Section 2 extends the LIST command syntax from RFC 5258
         // Section 3, so IMAP4rev1 needs both LIST-STATUS and LIST-EXTENDED.
         // RFC 9051 Section 6.3.9 folds LIST-STATUS into the IMAP4rev2 base.
@@ -230,7 +230,8 @@ impl ImapConnection {
         use super::dispatch::SelectConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        // SELECT and EXAMINE share one row of the table.
+        self.require_state(crate::types::CommandKind::Select)?;
         if condstore {
             self.require_condstore()?;
         }
@@ -321,7 +322,7 @@ impl ImapConnection {
         use super::dispatch::CreateConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Create)?;
         let cmd = Command::Create {
             mailbox: MailboxName::new(mailbox)?,
         };
@@ -365,7 +366,7 @@ impl ImapConnection {
         self.check_utf8_only_enforced()?;
         // RFC 6154 Section 3: CREATE is a `command-auth`  -  valid only in
         // Authenticated or Selected state.
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Create)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::CreateSpecialUse) {
@@ -396,7 +397,7 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Delete)?;
         let cmd = Command::Delete {
             mailbox: MailboxName::new(mailbox)?,
         };
@@ -418,7 +419,7 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Rename)?;
         let cmd = Command::Rename {
             mailbox: MailboxName::new(mailbox)?,
             new_name: MailboxName::new(new_name)?,
@@ -439,7 +440,7 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Subscribe)?;
         let cmd = Command::Subscribe {
             mailbox: MailboxName::new(mailbox)?,
         };
@@ -456,7 +457,7 @@ impl ImapConnection {
         use super::dispatch::TaggedOkConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Unsubscribe)?;
         let cmd = Command::Unsubscribe {
             mailbox: MailboxName::new(mailbox)?,
         };
@@ -481,7 +482,7 @@ impl ImapConnection {
         use super::dispatch::LsubConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Lsub)?;
 
         // RFC 9051 Appendix F item 19: LSUB was deprecated in IMAP4rev2.
         // Use LIST with \Subscribed return option instead.
@@ -513,7 +514,7 @@ impl ImapConnection {
     pub async fn close(&self, timeout: Duration) -> Result<(), Error> {
         use super::dispatch::TaggedOkConsumer;
 
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Close)?;
         tokio::time::timeout(
             timeout,
             self.submit_regular(Command::Close, TaggedOkConsumer::default()),
@@ -541,7 +542,7 @@ impl ImapConnection {
     /// The state snapshot transitions to `Authenticated` only after the
     /// tagged OK is received and processed by the driver.
     pub async fn unselect(&self, timeout: Duration) -> Result<(), Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Unselect)?;
         {
             let snap = self.state_rx.borrow();
             if !super::auth::snapshot_supports(&snap, &Capability::Unselect) {
@@ -578,7 +579,7 @@ impl ImapConnection {
         use super::dispatch::StatusConsumer;
 
         self.check_utf8_only_enforced()?;
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Status)?;
         self.validate_requested_status_items(items)?;
         let cmd = Command::Status {
             mailbox: MailboxName::new(mailbox)?,

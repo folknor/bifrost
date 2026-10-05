@@ -302,10 +302,15 @@ fn dual_mode_rev2_requires_explicit_enable() {
 
 #[test]
 fn require_state_gates_on_session_state() {
+    use crate::types::CommandKind;
+
     let c = detached(SessionState::Authenticated, vec![], &[]);
-    assert!(c.require_state(&[SessionState::Authenticated]).is_ok());
+    assert!(c.require_state(CommandKind::Enable).is_ok());
     assert!(
-        c.require_state(&[SessionState::Selected]).is_err(),
+        matches!(
+            c.require_state(CommandKind::Fetch),
+            Err(Error::InvalidState(_))
+        ),
         "Authenticated must not satisfy a Selected-only command"
     );
 }

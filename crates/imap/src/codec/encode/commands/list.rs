@@ -1,9 +1,6 @@
 //! LIST-family command encoders.
 
-use super::{
-    BytesMut, LiteralMode, encode_mailbox_str, encode_quoted_or_literal_utf8,
-    normalize_status_items_body, validate_no_crlf,
-};
+use super::{CommandWriter, encode_mailbox_str, normalize_status_items_body, validate_no_crlf};
 use crate::types::MailboxAttribute;
 
 /// Encode LIST with STATUS return option (RFC 5819 Section 2).
@@ -11,13 +8,12 @@ use crate::types::MailboxAttribute;
 /// Format: `LIST <reference> <pattern> RETURN (STATUS (<items>))`.
 /// The server returns interleaved LIST and STATUS untagged responses.
 pub(in crate::codec::encode) fn encode_list_status(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     reference: &str,
     pattern: &str,
     status_items: &str,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     // Reject CRLF in status items to prevent command injection (RFC 3501 Section 2.2).
     validate_no_crlf(status_items, "LIST-STATUS status items")?;
@@ -26,15 +22,15 @@ pub(in crate::codec::encode) fn encode_list_status(
     // pattern with INBOX normalization and MUTF-7 when not in UTF-8 mode.
     let wire_ref = encode_mailbox_str(reference, utf8);
     let wire_pat = encode_mailbox_str(pattern, utf8);
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" LIST ");
+    w.raw(tag.as_bytes());
+    w.raw(b" LIST ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, wire_ref.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" ");
-    encode_quoted_or_literal_utf8(buf, wire_pat.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" RETURN (STATUS (");
-    buf.extend_from_slice(status_items.as_bytes());
-    buf.extend_from_slice(b"))\r\n");
+    w.string(wire_ref.as_bytes(), utf8);
+    w.raw(b" ");
+    w.string(wire_pat.as_bytes(), utf8);
+    w.raw(b" RETURN (STATUS (");
+    w.raw(status_items.as_bytes());
+    w.raw(b"))\r\n");
     Ok(())
 }
 
@@ -49,14 +45,13 @@ pub(in crate::codec::encode) fn encode_list_status(
 /// form from RFC 5258 Section 3.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::codec::encode) fn encode_list_extended(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     selection_options: &[String],
     reference: &str,
     patterns: &[String],
     return_options: &[String],
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     if patterns.is_empty() {
         return Err(crate::Error::InvalidInput(
@@ -74,54 +69,54 @@ pub(in crate::codec::encode) fn encode_list_extended(
     }
     validate_list_extended_option_syntax(selection_options, return_options)?;
 
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" LIST");
+    w.raw(tag.as_bytes());
+    w.raw(b" LIST");
 
     if !selection_options.is_empty() {
-        buf.extend_from_slice(b" (");
+        w.raw(b" (");
         for (index, option) in selection_options.iter().enumerate() {
             if index > 0 {
-                buf.extend_from_slice(b" ");
+                w.raw(b" ");
             }
-            buf.extend_from_slice(option.trim().as_bytes());
+            w.raw(option.trim().as_bytes());
         }
-        buf.extend_from_slice(b")");
+        w.raw(b")");
     }
 
     // RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1: encode reference and
     // patterns with INBOX normalization and MUTF-7 when not in UTF-8 mode.
     let wire_ref = encode_mailbox_str(reference, utf8);
-    buf.extend_from_slice(b" ");
-    encode_quoted_or_literal_utf8(buf, wire_ref.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" ");
+    w.raw(b" ");
+    w.string(wire_ref.as_bytes(), utf8);
+    w.raw(b" ");
 
     if patterns.len() == 1 {
         let wire_pat = encode_mailbox_str(&patterns[0], utf8);
-        encode_quoted_or_literal_utf8(buf, wire_pat.as_bytes(), utf8, literal_mode);
+        w.string(wire_pat.as_bytes(), utf8);
     } else {
-        buf.extend_from_slice(b"(");
+        w.raw(b"(");
         for (index, pattern) in patterns.iter().enumerate() {
             if index > 0 {
-                buf.extend_from_slice(b" ");
+                w.raw(b" ");
             }
             let wire_pat = encode_mailbox_str(pattern, utf8);
-            encode_quoted_or_literal_utf8(buf, wire_pat.as_bytes(), utf8, literal_mode);
+            w.string(wire_pat.as_bytes(), utf8);
         }
-        buf.extend_from_slice(b")");
+        w.raw(b")");
     }
 
     if !return_options.is_empty() {
-        buf.extend_from_slice(b" RETURN (");
+        w.raw(b" RETURN (");
         for (index, option) in return_options.iter().enumerate() {
             if index > 0 {
-                buf.extend_from_slice(b" ");
+                w.raw(b" ");
             }
-            buf.extend_from_slice(option.trim().as_bytes());
+            w.raw(option.trim().as_bytes());
         }
-        buf.extend_from_slice(b")");
+        w.raw(b")");
     }
 
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -236,23 +231,22 @@ pub(crate) fn list_status_return_option_items(option: &str) -> Option<Result<&st
 ///
 /// Wire format: `tag CREATE mailbox (USE (\Attr1 \Attr2))\r\n`
 pub(in crate::codec::encode) fn encode_create_special_use(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     mailbox: &str,
     special_use: &[MailboxAttribute],
     utf8: bool,
-    literal_mode: LiteralMode,
 ) {
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" CREATE ");
+    w.raw(tag.as_bytes());
+    w.raw(b" CREATE ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, mailbox.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" (USE (");
+    w.string(mailbox.as_bytes(), utf8);
+    w.raw(b" (USE (");
     for (i, attr) in special_use.iter().enumerate() {
         if i > 0 {
-            buf.extend_from_slice(b" ");
+            w.raw(b" ");
         }
-        buf.extend_from_slice(attr.as_imap_str().as_bytes());
+        w.raw(attr.as_imap_str().as_bytes());
     }
-    buf.extend_from_slice(b"))\r\n");
+    w.raw(b"))\r\n");
 }

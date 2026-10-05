@@ -775,7 +775,7 @@ impl ImapConnection {
     /// - [`Error::InvalidState`] if called in Not Authenticated state.
     pub async fn unauthenticate(&self, timeout: Duration) -> Result<(), Error> {
         // RFC 8437 Section2: valid in Authenticated or Selected state.
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Unauthenticate)?;
 
         // Connection-level capability check.
         {
@@ -854,7 +854,7 @@ impl ImapConnection {
     {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let dcmd = driver::DriverCommand::Run {
-            payload: driver::DriverCommandPayload::Standard(cmd),
+            command: cmd,
             consumer: driver::DriverConsumer::Regular(
                 Box::new(consumer) as Box<dyn driver::ConsumerErased>
             ),
@@ -891,7 +891,7 @@ impl ImapConnection {
     {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let dcmd = driver::DriverCommand::Run {
-            payload: driver::DriverCommandPayload::Standard(cmd),
+            command: cmd,
             consumer: driver::DriverConsumer::StreamingRegular(
                 Box::new(consumer) as Box<dyn driver::StreamingConsumerErased>
             ),
@@ -933,57 +933,9 @@ impl ImapConnection {
     {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let dcmd = driver::DriverCommand::Run {
-            payload: driver::DriverCommandPayload::Standard(cmd),
+            command: cmd,
             consumer: driver::DriverConsumer::WithContinuations(
                 Box::new(consumer) as Box<dyn driver::ContinuationConsumerErased>
-            ),
-            result_tx,
-        };
-        let guard = self.in_flight();
-        if self.cmd_tx.send(dcmd).await.is_err() {
-            guard.completed();
-            return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
-        }
-        let received = result_rx.await;
-        guard.completed();
-        let result = match received {
-            Ok(inner) => inner?,
-            Err(_) => {
-                return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
-            }
-        };
-        let output = *result
-            .downcast::<C::Output>()
-            .map_err(|_| Error::Internal("type mismatch in driver result".into()))?;
-        Ok(output)
-    }
-
-    /// Submit APPEND (`multi == false`) or MULTIAPPEND (`multi == true`) to
-    /// the driver task.
-    ///
-    /// The handle sends the mailbox and the messages and nothing else: the
-    /// driver validates and encodes them from live protocol state when the
-    /// command is executed, so no wire decision is made (and none can go
-    /// stale) while the command waits in the queue.
-    pub(super) async fn submit_append<C: super::dispatch::Consumer + 'static>(
-        &self,
-        mailbox: String,
-        messages: Vec<AppendMessage>,
-        multi: bool,
-        consumer: C,
-    ) -> Result<C::Output, Error>
-    where
-        C::Output: 'static,
-    {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let dcmd = driver::DriverCommand::Run {
-            payload: driver::DriverCommandPayload::Append {
-                mailbox,
-                messages,
-                multi,
-            },
-            consumer: driver::DriverConsumer::Regular(
-                Box::new(consumer) as Box<dyn driver::ConsumerErased>
             ),
             result_tx,
         };

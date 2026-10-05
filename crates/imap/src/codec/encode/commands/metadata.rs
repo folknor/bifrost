@@ -1,7 +1,8 @@
 //! METADATA command encoders (RFC 5464).
 
-use super::super::{string_helpers::encode_metadata_value, validate_metadata_entry_name};
-use super::{BytesMut, LiteralMode, encode_quoted_or_literal_utf8};
+use super::super::validate_metadata_entry_name;
+use super::CommandWriter;
+use crate::codec::encode::LiteralForm;
 
 /// Encode GETMETADATA command (RFC 5464 Section 4.2).
 ///
@@ -9,16 +10,14 @@ use super::{BytesMut, LiteralMode, encode_quoted_or_literal_utf8};
 /// Multiple entries: `GETMETADATA [options] "<mailbox>" (<entry1> <entry2> ...)`
 ///
 /// Returns an error if `entries` is empty or if `depth` is not a valid value.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::codec::encode) fn encode_getmetadata(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     mailbox: &str,
     entries: &[String],
     max_size: Option<u64>,
     depth: Option<&str>,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     // RFC 5464 Section 5: `maxsize-opt = "MAXSIZE" SP number`
     // RFC 3501 Section 9: `number = 1*DIGIT`, unsigned 32-bit integer.
@@ -53,50 +52,50 @@ pub(in crate::codec::encode) fn encode_getmetadata(
         )));
     }
 
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" GETMETADATA");
+    w.raw(tag.as_bytes());
+    w.raw(b" GETMETADATA");
 
     // RFC 5464 Section 5 ABNF:
     // getmetadata = "GETMETADATA" [SP getmetadata-options] SP mailbox SP entries
     // Verified errata 2785 / 2786 correct the examples in Sections 4.2.1-4.2.2.
     if max_size.is_some() || depth.is_some() {
-        buf.extend_from_slice(b" (");
+        w.raw(b" (");
         let first_opt = if let Some(n) = max_size {
-            buf.extend_from_slice(b"MAXSIZE ");
-            buf.extend_from_slice(n.to_string().as_bytes());
+            w.raw(b"MAXSIZE ");
+            w.raw(n.to_string().as_bytes());
             false
         } else {
             true
         };
         if let Some(d) = depth {
             if !first_opt {
-                buf.extend_from_slice(b" ");
+                w.raw(b" ");
             }
-            buf.extend_from_slice(b"DEPTH ");
-            buf.extend_from_slice(d.as_bytes());
+            w.raw(b"DEPTH ");
+            w.raw(d.as_bytes());
         }
-        buf.extend_from_slice(b")");
+        w.raw(b")");
     }
 
-    buf.extend_from_slice(b" ");
+    w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, mailbox.as_bytes(), utf8, literal_mode);
+    w.string(mailbox.as_bytes(), utf8);
 
-    buf.extend_from_slice(b" ");
+    w.raw(b" ");
     if entries.len() == 1 {
         // Single entry uses no parentheses per RFC 5464 Section 4.2.
-        encode_quoted_or_literal_utf8(buf, entries[0].as_bytes(), utf8, literal_mode);
+        w.string(entries[0].as_bytes(), utf8);
     } else {
-        buf.extend_from_slice(b"(");
+        w.raw(b"(");
         for (i, entry) in entries.iter().enumerate() {
             if i > 0 {
-                buf.extend_from_slice(b" ");
+                w.raw(b" ");
             }
-            encode_quoted_or_literal_utf8(buf, entry.as_bytes(), utf8, literal_mode);
+            w.string(entry.as_bytes(), utf8);
         }
-        buf.extend_from_slice(b")");
+        w.raw(b")");
     }
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -106,12 +105,11 @@ pub(in crate::codec::encode) fn encode_getmetadata(
 /// A `None` value is encoded as `NIL` to delete the entry.
 /// RFC 5464 Section 5: `value = nstring / literal8`; values are raw bytes.
 pub(in crate::codec::encode) fn encode_setmetadata(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     mailbox: &str,
     entries: &[(String, Option<Vec<u8>>)],
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     // RFC 5464 Section 5 ABNF: `entry-values = "(" entry *(SP entry) ")"`.
     if entries.is_empty() {
@@ -124,25 +122,48 @@ pub(in crate::codec::encode) fn encode_setmetadata(
         validate_metadata_entry_name(name, "SETMETADATA entry name")?;
     }
 
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" SETMETADATA ");
+    w.raw(tag.as_bytes());
+    w.raw(b" SETMETADATA ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, mailbox.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" (");
+    w.string(mailbox.as_bytes(), utf8);
+    w.raw(b" (");
     for (i, (name, value)) in entries.iter().enumerate() {
         if i > 0 {
-            buf.extend_from_slice(b" ");
+            w.raw(b" ");
         }
-        encode_quoted_or_literal_utf8(buf, name.as_bytes(), utf8, literal_mode);
-        buf.extend_from_slice(b" ");
+        w.string(name.as_bytes(), utf8);
+        w.raw(b" ");
         match value {
             // RFC 5464 Section 5: value = nstring / literal8. `nstring`
             // includes classic literals via `string`, so only NUL-bearing data
             // requires literal8.
-            Some(v) => encode_metadata_value(buf, v, literal_mode),
-            None => buf.extend_from_slice(b"NIL"),
+            Some(v) => encode_metadata_value(w, v),
+            None => w.raw(b"NIL"),
         }
     }
-    buf.extend_from_slice(b")\r\n");
+    w.raw(b")\r\n");
     Ok(())
+}
+
+/// Encode a METADATA value as quoted string, classic literal, or literal8.
+///
+/// RFC 5464 Section 5 defines `value = nstring / literal8`. `nstring`
+/// expands to `string / nil` (RFC 3501 Section 9 / RFC 9051 Section 9), and
+/// `string` includes classic IMAP literals carrying `*CHAR8`, where
+/// `CHAR8 = %x01-ff`. As a result:
+/// - printable ASCII can use quoted form;
+/// - any non-NUL non-quotable octets can use classic literal form; and
+/// - only NUL (`%x00`) requires literal8 (`*OCTET`).
+///
+/// The quoting judgement is ASCII-only even on a UTF-8 connection: a value is
+/// an opaque octet string, not a name, so high bytes travel as a literal.
+/// METADATA's own grammar admits literal8 values, so a NUL value needs no
+/// BINARY advertisement; whether its marker may be non-synchronizing is still
+/// the writer's literal8 rule.
+pub(in crate::codec::encode) fn encode_metadata_value(w: &mut CommandWriter, data: &[u8]) {
+    if data.contains(&0) {
+        w.literal(data, LiteralForm::Literal8);
+    } else {
+        w.string(data, false);
+    }
 }

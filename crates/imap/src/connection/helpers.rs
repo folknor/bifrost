@@ -83,16 +83,21 @@ impl ImapConnection {
         Ok(())
     }
 
-    /// Ensure the session is in one of the allowed states (RFC 3501 Section 6).
+    /// Ensure the session is in a state `kind` may be sent in (RFC 3501
+    /// Section 6), per the one table, `CommandKind::legal_states`.
     ///
     /// Refused before submission, so nothing is sent. A session in Logout is
     /// a connection that is gone, reported as `Closed` with `Unsent`
     /// evidence; any other mismatch is caller sequencing, `InvalidState`.
-    pub(super) fn require_state(&self, allowed: &[SessionState]) -> Result<(), Error> {
+    /// The driver reads the same table again when the command reaches the
+    /// head of its queue and reports a mismatch there as
+    /// `StateChangedBeforeSend`: the two errors differ because the facts
+    /// differ, the table does not.
+    pub(super) fn require_state(&self, kind: crate::types::CommandKind) -> Result<(), Error> {
         let snap = self.state_rx.borrow();
         let session_state = snap.session_state;
         drop(snap);
-        state_refusal(session_state, allowed).map_or(Ok(()), Err)
+        state_refusal(session_state, kind.legal_states()).map_or(Ok(()), Err)
     }
 
     /// Verify that the server supports CONDSTORE (RFC 7162 Section 3.1).
@@ -538,7 +543,7 @@ impl ImapConnection {
     /// `IMAP4rev2`. On a pure rev2 connection, use [`noop`](Self::noop)
     /// instead  -  this method returns [`Error::MissingCapability`].
     pub async fn check(&self, timeout: Duration) -> Result<(), Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Check)?;
         // RFC 9051 removed CHECK; reject when rev2 behavior is active.
         // `is_rev2_from_snapshot` already handles dual-mode servers: it
         // returns true only after `ENABLE IMAP4rev2` (or on pure-rev2

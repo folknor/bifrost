@@ -8,7 +8,7 @@ use crate::types::response::StatusKind;
 
 use super::IdleTermination;
 use super::event_sink;
-use super::wire_send::send_command_on_wire;
+use super::wire_send::{SendOutcome, send_wire_command};
 
 /// Enter IDLE mode, read and publish events, exit on DONE or server
 /// termination (RFC 2177 Sections 2-4).
@@ -29,8 +29,22 @@ pub(super) async fn run_idle(
     event_sink: &mut event_sink::DriverEventSink,
     done_rx: oneshot::Receiver<()>,
 ) -> Result<IdleTermination, Error> {
-    // 1. Send IDLE command (RFC 2177 Section 2).
-    let tag = send_command_on_wire(wire_reader, state, tag_gen, event_sink, &Command::Idle).await?;
+    // 1. Send IDLE command (RFC 2177 Section 2), checked against live state
+    //    like every other command: a session that left Authenticated/Selected
+    //    while IDLE was queued is refused before a byte is written.
+    let super::PreparedCommand { tag, wire } =
+        super::prepare_command(state, tag_gen, &Command::Idle)?;
+    let baseline = wire_reader.written();
+    // IDLE has no literal, so there is no continuation wait in the send and
+    // the outcome is always `Sent`.
+    let SendOutcome::Sent =
+        send_wire_command(wire_reader, state, event_sink, &wire, &tag, baseline, None).await?
+    else {
+        return Err(Error::internal_mid_exchange(
+            "IDLE reported a refused literal it does not have",
+            TransmissionState::InFlight,
+        ));
+    };
 
     // 2. Wait for `+` continuation (RFC 2177 Section 3).
     wait_for_idle_grant(wire_reader, state, event_sink, &tag).await?;

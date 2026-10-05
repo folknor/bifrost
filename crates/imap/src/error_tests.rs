@@ -243,23 +243,6 @@ fn from_validation_error_maps_to_invalid_input() {
     assert!(matches!(err, Error::InvalidInput(_)));
 }
 
-#[test]
-fn from_encode_error_validation_maps_to_invalid_input() {
-    let encode = crate::codec::encode::EncodeError::Validation("bad".into());
-    let err: Error = encode.into();
-    assert!(matches!(err, Error::InvalidInput(_)));
-}
-
-#[test]
-fn from_encode_error_missing_cap_maps_to_missing_capability() {
-    let encode = crate::codec::encode::EncodeError::MissingCapability {
-        cmd: "FETCH",
-        cap: "BINARY".to_string(),
-    };
-    let err: Error = encode.into();
-    assert!(matches!(err, Error::MissingCapability(_)));
-}
-
 // --- Response code preservation on status variants ---
 
 #[test]

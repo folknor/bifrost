@@ -270,7 +270,12 @@ fn framing_addressable_literal_size_is_merely_incomplete() {
 
 fn memory_reader() -> (WireReader, tokio::io::DuplexStream) {
     let (client, server) = tokio::io::duplex(1 << 16);
-    (WireReader::new(ImapStream::Memory(client)), server)
+    (
+        WireReader::new(ImapStream::Memory(super::super::stream::Tracked::new(
+            client,
+        ))),
+        server,
+    )
 }
 
 #[tokio::test]

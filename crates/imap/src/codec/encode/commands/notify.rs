@@ -1,8 +1,7 @@
 //! NOTIFY command encoder (RFC 5465).
 
 use super::{
-    BytesMut, LiteralMode, encode_mailbox_str, encode_quoted_or_literal_utf8, validate_atom,
-    validate_no_crlf, validate_single_fetch_att,
+    CommandWriter, encode_mailbox_str, validate_atom, validate_no_crlf, validate_single_fetch_att,
 };
 use crate::types::notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
 
@@ -16,11 +15,10 @@ use crate::types::notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifyS
 /// event-group  = "(" filter-mailboxes SP events ")"
 /// ```
 pub(in crate::codec::encode) fn encode_notify_set(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     params: &NotifySetParams,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     // RFC 5465 Section 8: event-groups = event-group *(SP event-group)
     // requires at least one event-group.
@@ -54,23 +52,23 @@ pub(in crate::codec::encode) fn encode_notify_set(
         validate_notify_event_group(group)?;
     }
 
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" NOTIFY SET");
+    w.raw(tag.as_bytes());
+    w.raw(b" NOTIFY SET");
 
     // RFC 5465 Section 4: optional STATUS indicator.
     if params.status {
-        buf.extend_from_slice(b" STATUS");
+        w.raw(b" STATUS");
     }
 
     for group in &params.event_groups {
-        buf.extend_from_slice(b" (");
-        encode_mailbox_filter(buf, &group.filter, utf8, literal_mode)?;
-        buf.extend_from_slice(b" ");
-        encode_events(buf, &group.events)?;
-        buf.extend_from_slice(b")");
+        w.raw(b" (");
+        encode_mailbox_filter(w, &group.filter, utf8)?;
+        w.raw(b" ");
+        encode_events(w, &group.events)?;
+        w.raw(b")");
     }
 
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -205,17 +203,16 @@ fn is_message_event(event: &NotifyEvent) -> bool {
 /// many-mailboxes            = "(" mailbox *(SP mailbox) ")"
 /// ```
 fn encode_mailbox_filter(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     filter: &MailboxFilter,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     match filter {
-        MailboxFilter::Selected => buf.extend_from_slice(b"selected"),
-        MailboxFilter::SelectedDelayed => buf.extend_from_slice(b"selected-delayed"),
-        MailboxFilter::Inboxes => buf.extend_from_slice(b"inboxes"),
-        MailboxFilter::Personal => buf.extend_from_slice(b"personal"),
-        MailboxFilter::Subscribed => buf.extend_from_slice(b"subscribed"),
+        MailboxFilter::Selected => w.raw(b"selected"),
+        MailboxFilter::SelectedDelayed => w.raw(b"selected-delayed"),
+        MailboxFilter::Inboxes => w.raw(b"inboxes"),
+        MailboxFilter::Personal => w.raw(b"personal"),
+        MailboxFilter::Subscribed => w.raw(b"subscribed"),
         MailboxFilter::Subtree(mailboxes) => {
             // RFC 5465 Section 8: one-or-more-mailbox requires at least one.
             if mailboxes.is_empty() {
@@ -223,8 +220,8 @@ fn encode_mailbox_filter(
                     "subtree filter requires at least one mailbox (RFC 5465 Section 8)".into(),
                 ));
             }
-            buf.extend_from_slice(b"subtree");
-            encode_one_or_more_mailbox(buf, mailboxes, utf8, literal_mode);
+            w.raw(b"subtree");
+            encode_one_or_more_mailbox(w, mailboxes, utf8);
         }
         MailboxFilter::Mailboxes(mailboxes) => {
             // RFC 5465 Section 8: one-or-more-mailbox requires at least one.
@@ -233,8 +230,8 @@ fn encode_mailbox_filter(
                     "mailboxes filter requires at least one mailbox (RFC 5465 Section 8)".into(),
                 ));
             }
-            buf.extend_from_slice(b"mailboxes");
-            encode_one_or_more_mailbox(buf, mailboxes, utf8, literal_mode);
+            w.raw(b"mailboxes");
+            encode_one_or_more_mailbox(w, mailboxes, utf8);
         }
     }
     Ok(())
@@ -249,30 +246,25 @@ fn encode_mailbox_filter(
 /// ```
 ///
 /// A single mailbox is encoded bare; two or more are parenthesized.
-fn encode_one_or_more_mailbox(
-    buf: &mut BytesMut,
-    mailboxes: &[String],
-    utf8: bool,
-    literal_mode: LiteralMode,
-) {
+fn encode_one_or_more_mailbox(w: &mut CommandWriter, mailboxes: &[String], utf8: bool) {
     if mailboxes.len() == 1 {
         // RFC 5465 Section 8: one-or-more-mailbox = mailbox
         // RFC 3501 Section 5.1.3: encode with INBOX normalization and MUTF-7.
         let wire = encode_mailbox_str(&mailboxes[0], utf8);
-        buf.extend_from_slice(b" ");
-        encode_quoted_or_literal_utf8(buf, wire.as_bytes(), utf8, literal_mode);
+        w.raw(b" ");
+        w.string(wire.as_bytes(), utf8);
     } else {
         // RFC 5465 Section 8: many-mailboxes = "(" mailbox *(SP mailbox) ")"
-        buf.extend_from_slice(b" (");
+        w.raw(b" (");
         for (i, mbox) in mailboxes.iter().enumerate() {
             if i > 0 {
-                buf.extend_from_slice(b" ");
+                w.raw(b" ");
             }
             // RFC 3501 Section 5.1.3: encode with INBOX normalization and MUTF-7.
             let wire = encode_mailbox_str(mbox, utf8);
-            encode_quoted_or_literal_utf8(buf, wire.as_bytes(), utf8, literal_mode);
+            w.string(wire.as_bytes(), utf8);
         }
-        buf.extend_from_slice(b")");
+        w.raw(b")");
     }
 }
 
@@ -282,20 +274,20 @@ fn encode_one_or_more_mailbox(
 /// ```text
 /// events = ("(" event *(SP event) ")") / "NONE"
 /// ```
-fn encode_events(buf: &mut BytesMut, events: &[NotifyEvent]) -> Result<(), crate::Error> {
+fn encode_events(w: &mut CommandWriter, events: &[NotifyEvent]) -> Result<(), crate::Error> {
     if events.is_empty() {
         // RFC 5465 Section 8: events = "NONE"
-        buf.extend_from_slice(b"NONE");
+        w.raw(b"NONE");
         return Ok(());
     }
-    buf.extend_from_slice(b"(");
+    w.raw(b"(");
     for (i, event) in events.iter().enumerate() {
         if i > 0 {
-            buf.extend_from_slice(b" ");
+            w.raw(b" ");
         }
-        encode_single_event(buf, event)?;
+        encode_single_event(w, event)?;
     }
-    buf.extend_from_slice(b")");
+    w.raw(b")");
     Ok(())
 }
 
@@ -306,17 +298,17 @@ fn encode_events(buf: &mut BytesMut, events: &[NotifyEvent]) -> Result<(), crate
 /// message-event = ("MessageNew" [SP "(" fetch-att *(SP fetch-att) ")"])
 ///               / "MessageExpunge" / "FlagChange" / "AnnotationChange"
 /// ```
-fn encode_single_event(buf: &mut BytesMut, event: &NotifyEvent) -> Result<(), crate::Error> {
+fn encode_single_event(w: &mut CommandWriter, event: &NotifyEvent) -> Result<(), crate::Error> {
     match event {
         NotifyEvent::MessageNew { fetch_attrs } => {
-            buf.extend_from_slice(b"MessageNew");
+            w.raw(b"MessageNew");
             if !fetch_attrs.is_empty() {
                 // RFC 5465 Section 5.2: optional fetch attributes for
                 // selected/selected-delayed (per Section 8 ABNF).
-                buf.extend_from_slice(b" (");
+                w.raw(b" (");
                 for (i, attr) in fetch_attrs.iter().enumerate() {
                     if i > 0 {
-                        buf.extend_from_slice(b" ");
+                        w.raw(b" ");
                     }
                     // Reject CRLF in fetch attributes to prevent command injection
                     // (RFC 3501 Section 2.2).
@@ -324,22 +316,22 @@ fn encode_single_event(buf: &mut BytesMut, event: &NotifyEvent) -> Result<(), cr
                     // Reject empty attrs and unbalanced delimiters because they
                     // produce malformed wire output.
                     validate_single_fetch_att(attr)?;
-                    buf.extend_from_slice(attr.as_bytes());
+                    w.raw(attr.as_bytes());
                 }
-                buf.extend_from_slice(b")");
+                w.raw(b")");
             }
         }
-        NotifyEvent::MessageExpunge => buf.extend_from_slice(b"MessageExpunge"),
-        NotifyEvent::FlagChange => buf.extend_from_slice(b"FlagChange"),
-        NotifyEvent::AnnotationChange => buf.extend_from_slice(b"AnnotationChange"),
-        NotifyEvent::MailboxName => buf.extend_from_slice(b"MailboxName"),
-        NotifyEvent::SubscriptionChange => buf.extend_from_slice(b"SubscriptionChange"),
-        NotifyEvent::MailboxMetadataChange => buf.extend_from_slice(b"MailboxMetadataChange"),
-        NotifyEvent::ServerMetadataChange => buf.extend_from_slice(b"ServerMetadataChange"),
+        NotifyEvent::MessageExpunge => w.raw(b"MessageExpunge"),
+        NotifyEvent::FlagChange => w.raw(b"FlagChange"),
+        NotifyEvent::AnnotationChange => w.raw(b"AnnotationChange"),
+        NotifyEvent::MailboxName => w.raw(b"MailboxName"),
+        NotifyEvent::SubscriptionChange => w.raw(b"SubscriptionChange"),
+        NotifyEvent::MailboxMetadataChange => w.raw(b"MailboxMetadataChange"),
+        NotifyEvent::ServerMetadataChange => w.raw(b"ServerMetadataChange"),
         NotifyEvent::Other(name) => {
             // RFC 5465 Section 8: event-ext = atom.
             validate_atom(name, "NOTIFY event-ext")?;
-            buf.extend_from_slice(name.as_bytes());
+            w.raw(name.as_bytes());
         }
     }
     Ok(())

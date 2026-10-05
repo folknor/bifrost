@@ -13,7 +13,7 @@ use tracing::trace;
 use bifrost_types::TransmissionState;
 
 use crate::codec::classification::{self, ClassificationContext, SolicitationRule};
-use crate::codec::encode::{EncodeOptions, LiteralMode};
+use crate::codec::encode::{EncodeOptions, LiteralMode, WireCommand, encode_command};
 use crate::error::Error;
 use crate::types::Command;
 use crate::types::response::{Capability, UntaggedResponse, UntaggedStatus};
@@ -39,7 +39,7 @@ use idle::run_idle;
 use pipeline::group_into_sub_batches;
 use pipeline::run_pipeline;
 use upgrade::{logout_best_effort, run_upgrade};
-use wire_send::{send_chunked_segments, send_command_on_wire};
+use wire_send::{SendOutcome, send_wire_command};
 
 pub(in crate::connection) use upgrade::run_starttls_upgrade;
 
@@ -56,10 +56,11 @@ pub(super) type PipelineResults = Vec<Result<Box<dyn std::any::Any + Send>, Erro
 /// response routing) or a stream upgrade (STARTTLS / COMPRESS) that
 /// the driver handles atomically without a consumer.
 pub(super) enum DriverCommand {
-    /// Regular command  -  the driver encodes/sends it and routes responses
-    /// to the consumer via the classification-based dispatcher.
+    /// Regular command  -  the driver checks, encodes and sends it from live
+    /// state when it reaches the head of the queue, and routes responses to
+    /// the consumer via the classification-based dispatcher.
     Run {
-        payload: DriverCommandPayload,
+        command: Command,
         consumer: DriverConsumer,
         result_tx: oneshot::Sender<Result<Box<dyn std::any::Any + Send>, Error>>,
     },
@@ -112,40 +113,6 @@ pub(super) enum IdleTermination {
     ClientDone,
     /// Server sent tagged OK (server-terminated IDLE).
     ServerTerminated,
-}
-
-/// Payload for a [`DriverCommand::Run`].
-///
-/// Standard commands are encoded by the driver via [`encode_command`].
-/// APPEND and MULTIAPPEND carry whole messages, so they have their own payload
-/// and their own encoder, but the same rule holds: the DRIVER encodes and
-/// validates them, at execution, from the state it owns.
-pub(super) enum DriverCommandPayload {
-    /// Standard IMAP command  -  encoded and sent by the driver.
-    Standard(Command),
-    /// APPEND (`multi == false`, one message) or MULTIAPPEND (`multi == true`,
-    /// RFC 3502).
-    ///
-    /// Nothing about the wire form is decided handle-side. The driver runs
-    /// [`encode_append`](crate::codec::encode::encode_append) against LIVE
-    /// state when the command reaches the head of the queue, so the mailbox
-    /// encoding, the RFC 6855 `UTF8 (` wrapper, RFC 7888 `+` markers, literal8
-    /// eligibility, session legality, the MULTIAPPEND capability and the
-    /// BINARY requirement for NUL-bearing bodies all reflect the connection
-    /// as it is at send time. Bytes prebuilt handle-side froze those decisions
-    /// while the command sat queued behind another, which is how a queued
-    /// APPEND could be written under a protocol revision it was not encoded
-    /// for.
-    ///
-    /// The bodies are [`bytes::Bytes`] and travel to the socket by reference.
-    Append {
-        /// Destination mailbox, as the caller named it (decoded form).
-        mailbox: String,
-        /// The messages to append; exactly one unless `multi`.
-        messages: Vec<crate::types::AppendMessage>,
-        /// Whether this is MULTIAPPEND (requires the capability).
-        multi: bool,
-    },
 }
 
 /// Payload for a [`DriverCommand::Upgrade`].
@@ -419,45 +386,26 @@ pub(super) async fn driver_task(
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
-                    DriverCommand::Run { payload, consumer, result_tx } => {
+                    DriverCommand::Run { command, consumer, result_tx } => {
                         // Whether a failure can have touched the wire. A
                         // refusal made before the first byte leaves the
                         // framing intact, so it must not retire the
                         // connection whatever its error variant.
                         let mut refused_before_send = false;
-                        let result = match payload {
-                            DriverCommandPayload::Standard(command) => {
-                                run_one_command(
+                        let result = match prepare_command(&state, &mut tag_gen, &command) {
+                            Ok(prepared) => {
+                                run_prepared_command(
                                     &mut wire_reader,
                                     &mut state,
-                                    &mut tag_gen,
                                     &mut event_sink,
-                                    command,
+                                    &command,
+                                    prepared,
                                     consumer,
                                 ).await
                             }
-                            DriverCommandPayload::Append { mailbox, messages, multi } => {
-                                match prepare_append(
-                                    &state,
-                                    &mut tag_gen,
-                                    &mailbox,
-                                    &messages,
-                                    multi,
-                                ) {
-                                    Ok(prepared) => {
-                                        run_append_command(
-                                            &mut wire_reader,
-                                            &mut state,
-                                            &mut event_sink,
-                                            prepared,
-                                            consumer,
-                                        ).await
-                                    }
-                                    Err(refusal) => {
-                                        refused_before_send = true;
-                                        Err(refusal)
-                                    }
-                                }
+                            Err(refusal) => {
+                                refused_before_send = true;
+                                Err(refusal)
                             }
                         };
                         if !refused_before_send
@@ -583,15 +531,15 @@ const LOGOUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 // Command execution
 // ---------------------------------------------------------------------------
 
-/// Execute a single command through the classification-based dispatcher.
+/// Execute a single command through the classification-based dispatcher:
+/// [`prepare_command`], then [`run_prepared_command`].
 ///
-/// Encodes and sends the command (handling literal synchronization
-/// per RFC 3501 Section4.3),
-/// reads responses in a loop, classifies each untagged response via
-/// [`classify`](crate::codec::classification::classify), and routes it
-/// to either the consumer (solicited / ambiguous) or the event sink
-/// (unsolicited / impossible). Errors on unexpected continuations
-/// (RFC 3501 Section7.5).
+/// For the driver's own internal commands (connection setup's CAPABILITY, the
+/// STARTTLS and COMPRESS upgrades and their post-upgrade CAPABILITY). Their
+/// admission follows from state this task owns rather than from a handle-side
+/// check: setup runs on the greeting's session state, and an upgrade payload
+/// was admitted by its handle. The legality check in `prepare_command` still
+/// runs for them, uniformly; a refusal there means that invariant broke.
 pub(in crate::connection) async fn run_one_command(
     wire_reader: &mut super::wire::WireReader,
     state: &mut super::state::ProtocolState,
@@ -600,6 +548,91 @@ pub(in crate::connection) async fn run_one_command(
     cmd: Command,
     consumer: DriverConsumer,
 ) -> Result<Box<dyn std::any::Any + Send>, Error> {
+    let prepared = prepare_command(state, tag_gen, &cmd)?;
+    run_prepared_command(wire_reader, state, event_sink, &cmd, prepared, consumer).await
+}
+
+/// A command checked and encoded against live state, not yet written.
+pub(in crate::connection) struct PreparedCommand {
+    pub(super) tag: String,
+    pub(super) wire: WireCommand,
+}
+
+/// The refusal for a command whose session state is not one it may be sent
+/// in, judged against LIVE state at the head of the queue - or `None` when
+/// `state` permits it.
+///
+/// The handle refused anything it could see was illegal (`InvalidState`), so a
+/// refusal here means the session moved while the command waited:
+/// `StateChangedBeforeSend`, which the caller may re-issue after a state
+/// refresh. A session that reached Logout is gone, and the honest answer is
+/// `Closed` with `Unsent` evidence. Both leave the framing intact.
+pub(in crate::connection) fn live_state_refusal(
+    session: super::SessionState,
+    kind: crate::types::CommandKind,
+) -> Option<Error> {
+    let legal = kind.legal_states();
+    if legal.contains(&session) {
+        return None;
+    }
+    if session == super::SessionState::Logout {
+        return Some(Error::closed().with_attempt(TransmissionState::Unsent));
+    }
+    Some(Error::StateChangedBeforeSend(format!(
+        "session moved to {session:?}, out of {legal:?}, before {kind:?} could be sent"
+    )))
+}
+
+/// Check and encode `cmd` from the state this task owns, writing nothing and
+/// arming nothing.
+///
+/// Every decision the wire bytes depend on is made here, at the moment the
+/// command reaches the head of the queue: session legality (the
+/// `CommandKind::legal_states` table), capability gates, literal markers and
+/// literal8 eligibility, the mailbox encoding, and for APPEND the RFC 6855
+/// wrapper and the BINARY requirement. That is what a handle-side encoding
+/// lacked: decisions frozen on the handle went stale while the command waited
+/// behind another, and the handle's snapshot is republished only when a
+/// command COMPLETES.
+///
+/// Every `Err` is a refusal before the first byte, so the framing is intact
+/// and the connection stays usable; the driver loop does not apply
+/// `is_connection_fatal` to them. Local refusals carry no transmission
+/// evidence of their own (`MissingCapability`, `InvalidInput` and their kin
+/// read as `Unsent`), and `StateChangedBeforeSend` reports `Unsent` by
+/// construction. No pending state effect is armed until this has succeeded,
+/// so a refused SELECT or LOGIN cannot leave `in_select` / `in_auth` behind
+/// for the next command's tagged OK to complete.
+pub(in crate::connection) fn prepare_command(
+    state: &super::state::ProtocolState,
+    tag_gen: &mut super::tag::TagGenerator,
+    cmd: &Command,
+) -> Result<PreparedCommand, Error> {
+    if let Some(refusal) = live_state_refusal(state.session_state(), cmd.kind()) {
+        return Err(refusal);
+    }
+    let tag = tag_gen.next();
+    // `Command`'s Debug never prints a message body or a credential.
+    trace!(tag, ?cmd, "driver: encoding IMAP command from live state");
+    let wire = encode_command(&tag, cmd, &build_encode_options(state))?;
+    Ok(PreparedCommand { tag, wire })
+}
+
+/// Arm the command's pending state effects, send it, and run the
+/// classification-based response loop: each untagged response is classified
+/// via [`classify`](crate::codec::classification::classify) and routed to the
+/// consumer (solicited / ambiguous) or the event sink (unsolicited /
+/// impossible). An unexpected continuation is an error unless the consumer
+/// takes continuations (RFC 3501 Section 7.5).
+pub(in crate::connection) async fn run_prepared_command(
+    wire_reader: &mut super::wire::WireReader,
+    state: &mut super::state::ProtocolState,
+    event_sink: &mut event_sink::DriverEventSink,
+    cmd: &Command,
+    prepared: PreparedCommand,
+    consumer: DriverConsumer,
+) -> Result<Box<dyn std::any::Any + Send>, Error> {
+    let PreparedCommand { tag, wire } = prepared;
     let cmd_kind = cmd.kind();
     let cmd_target: Option<MailboxName> = cmd.mailbox_target().cloned();
 
@@ -638,7 +671,7 @@ pub(in crate::connection) async fn run_one_command(
     // RFC 5465 Section3: tell apply_tagged to update NOTIFY per-type flags
     // on tagged OK. NOTIFY SET computes flags from the registration
     // params; NOTIFY NONE resets to default (no notifications).
-    if let Command::NotifySet(ref params) = cmd {
+    if let Command::NotifySet(params) = cmd {
         let (list, status, metadata) = super::extensions::compute_notify_flags(params);
         state.set_in_notify_set(Some(super::NotifyFlags {
             list,
@@ -650,11 +683,20 @@ pub(in crate::connection) async fn run_one_command(
         state.set_in_notify_set(Some(super::NotifyFlags::default()));
     }
 
-    // Encode, tag, and send the command (handles literal sync).
-    // Encoding / send errors: the command bytes may not have reached the
-    // server, so these are Unsent. The `?` propagates without further
-    // decoration; send_command_on_wire owns the pre-send phase.
-    let tag = send_command_on_wire(wire_reader, state, tag_gen, event_sink, &cmd).await?;
+    // Send. Exactly one command is on the wire, so the continuation wait has
+    // no routing context; a refused literal comes back as that command's own
+    // error. Write failures are stamped from socket progress since here.
+    let baseline = wire_reader.written();
+    match send_wire_command(wire_reader, state, event_sink, &wire, &tag, baseline, None).await? {
+        SendOutcome::Sent => {}
+        SendOutcome::Rejected => {
+            // `send_wire_command` reports `Rejected` only with routing.
+            return Err(Error::internal_mid_exchange(
+                "literal continuation refused outside a pipeline",
+                TransmissionState::Acknowledged,
+            ));
+        }
+    }
 
     dispatch_response_loop(
         wire_reader,
@@ -664,18 +706,10 @@ pub(in crate::connection) async fn run_one_command(
         cmd_kind,
         cmd_target,
         consumer,
-        ContinuationPolicy::Consumer,
     )
     .await
 }
 
-#[derive(Clone, Copy)]
-enum ContinuationPolicy {
-    Consumer,
-    RejectAfterSend,
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn dispatch_response_loop(
     wire_reader: &mut super::wire::WireReader,
     state: &mut super::state::ProtocolState,
@@ -684,7 +718,6 @@ async fn dispatch_response_loop(
     cmd_kind: crate::types::CommandKind,
     cmd_target: Option<MailboxName>,
     mut consumer: DriverConsumer,
-    continuation: ContinuationPolicy,
 ) -> Result<Box<dyn std::any::Any + Send>, Error> {
     // After a successful send, any transport failure is InFlight: the
     // command bytes crossed the side-effect boundary.
@@ -764,134 +797,25 @@ async fn dispatch_response_loop(
                     }
                 }
             }
-            crate::types::Response::Continuation(c) => match continuation {
-                ContinuationPolicy::Consumer => {
-                    let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
-                    let ContinuationReply::Write(bytes) = consumer.on_continuation(c, &ctx)?;
-                    wire_reader
-                        .write_all(&bytes)
-                        .await
-                        .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-                }
-                ContinuationPolicy::RejectAfterSend => {
-                    return Err(Error::Protocol(
-                        "unexpected continuation after pre-built command fully sent".into(),
-                    ));
-                }
-            },
+            crate::types::Response::Continuation(c) => {
+                // A regular or streaming consumer refuses a continuation as a
+                // protocol error; only a continuation consumer (AUTHENTICATE)
+                // answers one.
+                let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
+                let ContinuationReply::Write(bytes) = consumer.on_continuation(c, &ctx)?;
+                // The command is already on the wire and in an exchange, so a
+                // failed reply is InFlight whatever the socket counter says:
+                // this is not a new command's first byte.
+                wire_reader
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
+            }
             crate::types::Response::Greeting(_) => {
                 return Err(Error::Protocol("unexpected greeting mid-command".into()));
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// APPEND / MULTIAPPEND execution
-// ---------------------------------------------------------------------------
-
-/// Execute APPEND or MULTIAPPEND: validate, encode and send against LIVE state,
-/// then run the same classification-based response loop as
-/// [`run_one_command`].
-///
-/// Every decision the wire bytes depend on is made here, from the state this
-/// task owns, at the moment the command reaches the head of the queue. That is
-/// the property the prebuilt path lacked: it froze those decisions on the
-/// handle while the command waited behind another, and the snapshot they were
-/// read from is only republished when a command COMPLETES.
-///
-/// Split in two so the driver loop can tell the two kinds of failure apart:
-/// [`prepare_append`] refuses BEFORE a byte is written, and its refusals leave
-/// the connection's framing intact whatever their error variant; only a
-/// failure from here on can have desynchronized the stream. The loop applies
-/// `is_connection_fatal` to the second kind alone, so a refusal made before
-/// the first byte never retires the connection whatever its variant. (The
-/// Logout refusal is `Closed`, a fatal variant, but there the session is
-/// already over and the loop exits on Logout regardless.)
-pub(in crate::connection) async fn run_append_command(
-    wire_reader: &mut super::wire::WireReader,
-    state: &mut super::state::ProtocolState,
-    event_sink: &mut event_sink::DriverEventSink,
-    prepared: PreparedAppend,
-    consumer: DriverConsumer,
-) -> Result<Box<dyn std::any::Any + Send>, Error> {
-    let PreparedAppend { tag, encoded } = prepared;
-    let cmd_kind = crate::types::CommandKind::Append;
-
-    // No routing: an APPEND is dispatched alone, so its own tagged response is
-    // the only one that can arrive during the send. Errors before a tagged
-    // response are Unsent or InFlight depending on where in the send they
-    // occur; the sender stamps them. After the send, responses are InFlight.
-    send_chunked_segments(wire_reader, state, event_sink, encoded.segments(), &tag).await?;
-
-    dispatch_response_loop(
-        wire_reader,
-        state,
-        event_sink,
-        &tag,
-        cmd_kind,
-        None,
-        consumer,
-        ContinuationPolicy::RejectAfterSend,
-    )
-    .await
-}
-
-/// An APPEND encoded against live state and ready for the wire.
-pub(in crate::connection) struct PreparedAppend {
-    tag: String,
-    encoded: crate::codec::encode::ChunkedCommand,
-}
-
-/// Validate and encode an APPEND from the state this task owns, writing
-/// nothing. Every `Err` here is a refusal before the first byte, so the caller
-/// may safely re-issue against the new state and the connection stays usable.
-/// (`MissingCapability` and `InvalidInput` carry no transmission evidence, so
-/// there is nothing to stamp: `with_attempt` leaves those variants unchanged;
-/// `StateChangedBeforeSend` reports `Unsent` by construction.)
-pub(in crate::connection) fn prepare_append(
-    state: &super::state::ProtocolState,
-    tag_gen: &mut super::tag::TagGenerator,
-    mailbox: &str,
-    messages: &[crate::types::AppendMessage],
-    multi: bool,
-) -> Result<PreparedAppend, Error> {
-    let cmd_kind = crate::types::CommandKind::Append;
-
-    // Session legality (RFC 3501 Section 6.3.11, RFC 3502 Section 3): valid in
-    // Authenticated and Selected. The handle checks this too as a cheap early
-    // refusal, but only THIS check is authoritative: a LOGOUT or a BYE
-    // completing ahead of a queued APPEND moves the session out from under
-    // any handle-side read. That is state moving under a queued command,
-    // `StateChangedBeforeSend`, which the caller may re-issue after a state
-    // refresh - except Logout, where the connection itself is gone and the
-    // honest answer is `Closed` with `Unsent` evidence.
-    match state.session_state() {
-        super::SessionState::Authenticated | super::SessionState::Selected => {}
-        super::SessionState::Logout => {
-            return Err(Error::closed().with_attempt(TransmissionState::Unsent));
-        }
-        other => {
-            return Err(Error::StateChangedBeforeSend(format!(
-                "session moved to {other:?}, out of the Authenticated/Selected \
-                 states, before {cmd_kind:?} could be sent"
-            )));
-        }
-    }
-
-    let tag = tag_gen.next();
-    trace!(
-        tag,
-        ?cmd_kind,
-        multi,
-        "driver: encoding APPEND from live state"
-    );
-    // Capability, BINARY, flag and date validation live in the encoder, so
-    // they see the same live options the markers are chosen from.
-    let opts = build_encode_options(state);
-    let encoded = crate::codec::encode::encode_append(&tag, mailbox, messages, multi, &opts)
-        .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
-    Ok(PreparedAppend { tag, encoded })
 }
 
 /// Publish the state snapshot before waking the command caller.

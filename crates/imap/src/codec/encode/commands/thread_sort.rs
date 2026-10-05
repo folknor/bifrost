@@ -1,8 +1,8 @@
 //! THREAD and SORT command encoder (RFC 5256).
 
 use super::{
-    BytesMut, LiteralMode, validate_atom, validate_non_empty_search_criteria,
-    validate_search_criteria_crlf, validate_sort_thread_charset,
+    CommandWriter, validate_atom, validate_non_empty_search_criteria,
+    validate_search_criteria_crlf, validate_sort_thread_charset, write_criteria,
 };
 
 /// Encode a THREAD or SORT command (RFC 5256 Sections 2-3).
@@ -11,16 +11,14 @@ use super::{
 /// THREAD format: `<cmd> <algorithm> <charset> <criteria>`.
 /// SORT format:   `<cmd> (<algorithm>) <charset> <criteria>`.
 /// `parenthesize_algo` controls whether the algorithm is wrapped in `()`.
-#[allow(clippy::too_many_arguments)]
 pub(in crate::codec::encode) fn encode_thread_or_sort_cmd(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
     algorithm: &str,
     charset: &str,
     criteria: &str,
     parenthesize_algo: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     if parenthesize_algo {
         // RFC 5256 Section 2: sort-criteria = "(" sort-key *(SP sort-key) ")"
@@ -34,26 +32,26 @@ pub(in crate::codec::encode) fn encode_thread_or_sort_cmd(
     }
     // RFC 5256 Section 5: charset = atom / quoted.
     validate_sort_thread_charset(charset)?;
-    validate_search_criteria_crlf(criteria, &format!("{cmd} criteria"), literal_mode)?;
+    validate_search_criteria_crlf(criteria, &format!("{cmd} criteria"), w.literal_mode())?;
     validate_non_empty_search_criteria(criteria, cmd)?;
 
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(cmd.as_bytes());
+    w.raw(tag.as_bytes());
+    w.raw(b" ");
+    w.raw(cmd.as_bytes());
     if parenthesize_algo {
         // RFC 5256 Section 2: sort-criteria = "(" sort-key *(SP sort-key) ")"
-        buf.extend_from_slice(b" (");
-        buf.extend_from_slice(algorithm.as_bytes());
-        buf.extend_from_slice(b") ");
+        w.raw(b" (");
+        w.raw(algorithm.as_bytes());
+        w.raw(b") ");
     } else {
         // RFC 5256 Section 3: thread-alg is unparenthesized
-        buf.extend_from_slice(b" ");
-        buf.extend_from_slice(algorithm.as_bytes());
-        buf.extend_from_slice(b" ");
+        w.raw(b" ");
+        w.raw(algorithm.as_bytes());
+        w.raw(b" ");
     }
-    buf.extend_from_slice(charset.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(criteria.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    w.raw(charset.as_bytes());
+    w.raw(b" ");
+    write_criteria(w, criteria);
+    w.raw(b"\r\n");
     Ok(())
 }

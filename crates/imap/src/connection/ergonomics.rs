@@ -164,7 +164,7 @@ impl ImapConnection {
         max_estimated_bytes: usize,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Fetch)?;
         self.validate_requested_fetch_items(attrs)?;
         if uids.as_sequence_set().as_str().contains('$') {
             self.require_searchres()?;

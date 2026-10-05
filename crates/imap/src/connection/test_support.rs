@@ -68,12 +68,21 @@ pub(crate) fn detached(
 /// the session directly in the Authenticated state (RFC 3501 Section 3.2),
 /// which is what most command-level transcripts need.
 pub(crate) async fn driver_pair(greeting: &[u8]) -> (ImapConnection, tokio::io::DuplexStream) {
-    let (client, mut server) = tokio::io::duplex(1 << 16);
+    driver_pair_with_capacity(greeting, 1 << 16).await
+}
+
+/// [`driver_pair`] over a duplex that buffers at most `capacity` octets in
+/// each direction, so a transcript can make a client write stall part-way.
+pub(crate) async fn driver_pair_with_capacity(
+    greeting: &[u8],
+    capacity: usize,
+) -> (ImapConnection, tokio::io::DuplexStream) {
+    let (client, mut server) = tokio::io::duplex(capacity);
 
     server.write_all(greeting).await.unwrap();
     server.flush().await.unwrap();
 
-    let mut wire_reader = wire::WireReader::new(ImapStream::Memory(client));
+    let mut wire_reader = wire::WireReader::new(ImapStream::Memory(stream::Tracked::new(client)));
     let mut proto_state = state::ProtocolState::new();
     let tag_gen = tag::TagGenerator::new();
 
@@ -107,6 +116,28 @@ pub(crate) async fn driver_pair(greeting: &[u8]) -> (ImapConnection, tokio::io::
     };
 
     (conn, server)
+}
+
+/// Move a [`driver_pair`] session into the Selected state with a real
+/// `SELECT INBOX` exchange, so a transcript can issue Selected-only commands
+/// (RFC 3501 Section 6.4) that the handle and the driver would otherwise
+/// refuse as illegal for the session.
+pub(crate) async fn select_inbox(conn: &ImapConnection, server: &mut tokio::io::DuplexStream) {
+    let select = conn.select("INBOX", std::time::Duration::from_secs(5));
+    let script = async {
+        let line = read_line(server).await;
+        let tag = tag_of(&line).to_owned();
+        respond(
+            server,
+            &format!(
+                "* FLAGS (\\Seen)\r\n* 0 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] valid\r\n\
+                 {tag} OK [READ-WRITE] selected\r\n"
+            ),
+        )
+        .await;
+    };
+    let (selected, ()) = tokio::join!(select, script);
+    selected.unwrap();
 }
 
 /// A `* PREAUTH` greeting advertising the given capability atoms.

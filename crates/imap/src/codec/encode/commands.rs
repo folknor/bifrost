@@ -1,17 +1,17 @@
 //! Individual IMAP command encoders.
 //!
-//! Each function encodes a specific IMAP command into wire bytes. These are
-//! called from the main dispatch in [`super::encode_command_to_buf`].
+//! Each function encodes a specific IMAP command through a
+//! [`CommandWriter`]. These are called from the main dispatch in
+//! [`super::encode_command`].
 //!
 //! Command syntax is defined in RFC 3501 Section 6 / RFC 9051 Section 6.
 
 use super::{
-    BytesMut, LITERAL_MINUS_MAX, LiteralMode, QresyncParams, encode_changedsince_modifier,
-    encode_quoted_or_literal, encode_quoted_or_literal_utf8, search_criteria_starts_with_charset,
-    validate_and_filter_flags, validate_append_datetime, validate_atom,
-    validate_login_credential_ascii, validate_mod_sequence_value, validate_mod_sequence_valzer,
-    validate_no_crlf, validate_sasl_initial_response, validate_search_criteria_crlf,
-    validate_sort_thread_charset,
+    CommandWriter, QresyncParams, encode_changedsince_modifier,
+    search_criteria_starts_with_charset, validate_and_filter_flags, validate_append_datetime,
+    validate_atom, validate_login_credential_ascii, validate_mod_sequence_value,
+    validate_mod_sequence_valzer, validate_no_crlf, validate_sasl_initial_response,
+    validate_search_criteria_crlf, validate_sort_thread_charset, write_criteria,
 };
 use crate::types::validated::MailboxName;
 
@@ -23,10 +23,12 @@ mod notify;
 mod quota_acl;
 mod thread_sort;
 
-pub(crate) use self::append::encode_append;
+pub(super) use self::append::encode_append;
 pub(super) use self::id::encode_id;
 pub(crate) use self::list::list_status_return_option_items;
 pub(super) use self::list::{encode_create_special_use, encode_list_extended, encode_list_status};
+#[cfg(test)]
+pub(super) use self::metadata::encode_metadata_value;
 pub(super) use self::metadata::{encode_getmetadata, encode_setmetadata};
 pub(super) use self::notify::encode_notify_set;
 pub(super) use self::quota_acl::{encode_set_acl, encode_set_quota};
@@ -40,11 +42,11 @@ pub(super) use self::thread_sort::encode_thread_or_sort_cmd;
 ///
 /// Used for commands whose ABNF is just the command name followed by CRLF
 /// (RFC 3501 Section 6 / RFC 9051 Section 6).
-pub(super) fn encode_simple(buf: &mut BytesMut, tag: &str, command: &str) {
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(command.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+pub(super) fn encode_simple(w: &mut CommandWriter, tag: &str, command: &str) {
+    w.raw(tag.as_bytes());
+    w.raw(b" ");
+    w.raw(command.as_bytes());
+    w.raw(b"\r\n");
 }
 
 /// Encode LOGIN command (RFC 3501 Section 6.2.3 / RFC 9051 Section 6.2.3).
@@ -52,22 +54,21 @@ pub(super) fn encode_simple(buf: &mut BytesMut, tag: &str, command: &str) {
 /// RFC 6855 Section 5 does not extend `LOGIN` to permit UTF-8 credentials.
 /// Clients needing non-ASCII usernames or passwords MUST use `AUTHENTICATE`.
 pub(super) fn encode_login(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     user: &str,
     pass: &str,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     validate_login_credential_ascii(user, "user")?;
     validate_login_credential_ascii(pass, "password")?;
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" LOGIN ");
+    w.raw(tag.as_bytes());
+    w.raw(b" LOGIN ");
     // RFC 3501 Section 6.2.3 / RFC 9051 Section 6.2.3: LOGIN arguments are strings.
-    encode_quoted_or_literal_utf8(buf, user.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" ");
-    encode_quoted_or_literal_utf8(buf, pass.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b"\r\n");
+    w.string(user.as_bytes(), utf8);
+    w.raw(b" ");
+    w.string(pass.as_bytes(), utf8);
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -77,49 +78,48 @@ pub(super) fn encode_login(
 /// validated to contain only base64 characters (`[A-Za-z0-9+/=]`) and no
 /// CRLF bytes (RFC 3501 Section 2.2) before being written to the buffer.
 pub(super) fn encode_authenticate(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     mechanism: &str,
     initial_response: Option<&str>,
 ) -> Result<(), crate::Error> {
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" AUTHENTICATE ");
-    buf.extend_from_slice(mechanism.as_bytes());
+    w.raw(tag.as_bytes());
+    w.raw(b" AUTHENTICATE ");
+    w.raw(mechanism.as_bytes());
     if let Some(ir) = initial_response {
         // Validate before writing (RFC 4959 Section 3, RFC 3501 Section 2.2).
         validate_sasl_initial_response(ir)?;
         // SASL-IR (RFC 4959): send initial response on the same line.
         // RFC 4959 Section 3: empty initial response MUST be sent as `=`.
         if ir.is_empty() {
-            buf.extend_from_slice(b" =");
+            w.raw(b" =");
         } else {
-            buf.extend_from_slice(b" ");
-            buf.extend_from_slice(ir.as_bytes());
+            w.raw(b" ");
+            w.raw(ir.as_bytes());
         }
     }
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b"\r\n");
     Ok(())
 }
 
 /// Encode STATUS command (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11).
 pub(super) fn encode_status(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     mailbox: &str,
     items: &str,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     // Reject CRLF in status items to prevent command injection (RFC 3501 Section 2.2).
     validate_no_crlf(items, "STATUS items")?;
     let status_items = normalize_status_items(items, "STATUS items")?;
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" STATUS ");
+    w.raw(tag.as_bytes());
+    w.raw(b" STATUS ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, mailbox.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(status_items.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    w.string(mailbox.as_bytes(), utf8);
+    w.raw(b" ");
+    w.raw(status_items.as_bytes());
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -131,15 +131,14 @@ pub(super) fn encode_status(
 /// When `return_opts` is `Some`, emits `RETURN (<opts>)` between the command
 /// and criteria (RFC 4731 Section 3.2 / Section 4 ABNF).
 pub(super) fn encode_search(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
     criteria: &str,
     return_opts: Option<&[String]>,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
-    validate_search_criteria_crlf(criteria, "SEARCH criteria", literal_mode)?;
+    validate_search_criteria_crlf(criteria, "SEARCH criteria", w.literal_mode())?;
     validate_non_empty_search_criteria(criteria, cmd)?;
     // RFC 6855 Section 3: after ENABLE UTF8=ACCEPT, clients MUST NOT issue a
     // SEARCH command that contains a charset specification.
@@ -149,9 +148,9 @@ pub(super) fn encode_search(
              (RFC 6855 Section 3)"
         )));
     }
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(cmd.as_bytes());
+    w.raw(tag.as_bytes());
+    w.raw(b" ");
+    w.raw(cmd.as_bytes());
     if let Some(opts) = return_opts {
         // RFC 4731 Section 3.2: RETURN (opt1 opt2 ...)
         for opt in opts {
@@ -165,18 +164,18 @@ pub(super) fn encode_search(
             // rejected rather than serialized.
             validate_atom(opt.trim(), "SEARCH RETURN option")?;
         }
-        buf.extend_from_slice(b" RETURN (");
+        w.raw(b" RETURN (");
         for (i, opt) in opts.iter().enumerate() {
             if i > 0 {
-                buf.extend_from_slice(b" ");
+                w.raw(b" ");
             }
-            buf.extend_from_slice(opt.trim().as_bytes());
+            w.raw(opt.trim().as_bytes());
         }
-        buf.extend_from_slice(b")");
+        w.raw(b")");
     }
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(criteria.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b" ");
+    write_criteria(w, criteria);
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -186,7 +185,7 @@ pub(super) fn encode_search(
 /// per RFC 7162 Section 3.1.4.1:
 /// `"FETCH" SP sequence-set SP fetch-att SP "(CHANGEDSINCE" SP mod-sequence-value ")"`
 pub(super) fn encode_fetch(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     sequence_set: &str,
     items: &str,
@@ -196,21 +195,21 @@ pub(super) fn encode_fetch(
     validate_no_crlf(sequence_set, "FETCH sequence set")?;
     validate_no_crlf(items, "FETCH items")?;
     validate_non_empty_fetch_items(items, "FETCH items")?;
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" FETCH ");
-    buf.extend_from_slice(sequence_set.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(items.as_bytes());
+    w.raw(tag.as_bytes());
+    w.raw(b" FETCH ");
+    w.raw(sequence_set.as_bytes());
+    w.raw(b" ");
+    w.raw(items.as_bytes());
     if let Some(modseq) = changed_since {
-        encode_changedsince_modifier(buf, modseq, false)?;
+        encode_changedsince_modifier(w, modseq, false)?;
     }
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b"\r\n");
     Ok(())
 }
 
 /// Encode STORE / UID STORE command (RFC 3501 Section 6.4.6 / RFC 9051 Section 6.4.6).
 pub(super) fn encode_store(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     uid: bool,
     sequence_set: &str,
@@ -220,23 +219,23 @@ pub(super) fn encode_store(
 ) -> Result<(), crate::Error> {
     // Reject CRLF in sequence set to prevent command injection (RFC 3501 Section 2.2).
     validate_no_crlf(sequence_set, "STORE sequence set")?;
-    buf.extend_from_slice(tag.as_bytes());
+    w.raw(tag.as_bytes());
     if uid {
-        buf.extend_from_slice(b" UID STORE ");
+        w.raw(b" UID STORE ");
     } else {
-        buf.extend_from_slice(b" STORE ");
+        w.raw(b" STORE ");
     }
-    buf.extend_from_slice(sequence_set.as_bytes());
+    w.raw(sequence_set.as_bytes());
 
     // CONDSTORE modifier (RFC 7162 Section 3.1.3): UNCHANGEDSINCE uses mod-sequence-valzer
     if let Some(modseq) = unchanged_since {
         validate_mod_sequence_valzer(modseq, "UNCHANGEDSINCE")?;
-        buf.extend_from_slice(b" (UNCHANGEDSINCE ");
-        buf.extend_from_slice(modseq.to_string().as_bytes());
-        buf.extend_from_slice(b")");
+        w.raw(b" (UNCHANGEDSINCE ");
+        w.raw(modseq.to_string().as_bytes());
+        w.raw(b")");
     }
 
-    encode_store_flags(buf, operation, flags)
+    encode_store_flags(w, operation, flags)
 }
 
 /// Encode a command with two arguments: one atom and one quoted-or-literal string.
@@ -246,31 +245,30 @@ pub(super) fn encode_store(
 /// and MOVE / UID MOVE (RFC 6851 Section 3 / RFC 9051 Section 6.4.8).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_two_arg(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     uid: bool,
     cmd: &str,
     arg1: &str,
     arg2: &str,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
     // Reject CRLF in the unquoted first argument (typically a sequence set)
     // to prevent command injection (RFC 3501 Section 2.2).
     validate_no_crlf(arg1, &format!("{cmd} sequence set"))?;
-    buf.extend_from_slice(tag.as_bytes());
+    w.raw(tag.as_bytes());
     if uid {
-        buf.extend_from_slice(b" UID ");
+        w.raw(b" UID ");
     } else {
-        buf.extend_from_slice(b" ");
+        w.raw(b" ");
     }
-    buf.extend_from_slice(cmd.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(arg1.as_bytes());
-    buf.extend_from_slice(b" ");
+    w.raw(cmd.as_bytes());
+    w.raw(b" ");
+    w.raw(arg1.as_bytes());
+    w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, arg2.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b"\r\n");
+    w.string(arg2.as_bytes(), utf8);
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -280,23 +278,22 @@ pub(super) fn encode_two_arg(
 /// Used by LIST (RFC 3501 Section 6.3.8), LSUB (RFC 3501 Section 6.3.9),
 /// and RENAME (RFC 3501 Section 6.3.5).
 pub(super) fn encode_two_quoted_args(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
     arg1: &str,
     arg2: &str,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) {
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(cmd.as_bytes());
-    buf.extend_from_slice(b" ");
+    w.raw(tag.as_bytes());
+    w.raw(b" ");
+    w.raw(cmd.as_bytes());
+    w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, arg1.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b" ");
-    encode_quoted_or_literal_utf8(buf, arg2.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b"\r\n");
+    w.string(arg1.as_bytes(), utf8);
+    w.raw(b" ");
+    w.string(arg2.as_bytes(), utf8);
+    w.raw(b"\r\n");
 }
 
 /// Normalize STATUS data items to the on-wire `(<items>)` form.
@@ -567,20 +564,19 @@ pub(super) fn encode_mailbox_name(name: &MailboxName, utf8: bool) -> String {
 /// Used for SELECT, EXAMINE, CREATE, DELETE, SUBSCRIBE, UNSUBSCRIBE
 /// (RFC 3501 Sections 6.3.1-6.3.7 / RFC 9051 Sections 6.3.1-6.3.7).
 pub(super) fn encode_mailbox_cmd(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
     mailbox: &str,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) {
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(cmd.as_bytes());
-    buf.extend_from_slice(b" ");
+    w.raw(tag.as_bytes());
+    w.raw(b" ");
+    w.raw(cmd.as_bytes());
+    w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, mailbox.as_bytes(), utf8, literal_mode);
-    buf.extend_from_slice(b"\r\n");
+    w.string(mailbox.as_bytes(), utf8);
+    w.raw(b"\r\n");
 }
 
 // Known-sequence-set validation has moved to `SequenceSet::new_known()` in
@@ -594,25 +590,24 @@ pub(super) fn encode_mailbox_cmd(
 /// (RFC 7162 Section 3.2.5.2).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_select_or_examine(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     cmd: &str,
     mailbox: &str,
     condstore: bool,
     qresync: Option<&QresyncParams>,
     utf8: bool,
-    literal_mode: LiteralMode,
 ) -> Result<(), crate::Error> {
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(cmd.as_bytes());
-    buf.extend_from_slice(b" ");
+    w.raw(tag.as_bytes());
+    w.raw(b" ");
+    w.raw(cmd.as_bytes());
+    w.raw(b" ");
     // RFC 6855 Section 3: UTF-8 in quoted strings when UTF8=ACCEPT is active.
-    encode_quoted_or_literal_utf8(buf, mailbox.as_bytes(), utf8, literal_mode);
+    w.string(mailbox.as_bytes(), utf8);
 
     if condstore && qresync.is_none() {
         // RFC 7162 Section 3.1.1: SELECT mailbox (CONDSTORE)
-        buf.extend_from_slice(b" (CONDSTORE)");
+        w.raw(b" (CONDSTORE)");
     }
 
     if let Some(params) = qresync {
@@ -627,18 +622,18 @@ pub(super) fn encode_select_or_examine(
         }
         // mod_seq is mod-sequence-value per RFC 7162 Section 7 (>= 1, <= i64::MAX)
         validate_mod_sequence_value(params.mod_seq, "QRESYNC mod_seq")?;
-        buf.extend_from_slice(b" (QRESYNC (");
-        buf.extend_from_slice(params.uid_validity.to_string().as_bytes());
-        buf.extend_from_slice(b" ");
-        buf.extend_from_slice(params.mod_seq.to_string().as_bytes());
+        w.raw(b" (QRESYNC (");
+        w.raw(params.uid_validity.to_string().as_bytes());
+        w.raw(b" ");
+        w.raw(params.mod_seq.to_string().as_bytes());
         if let Some(known_uids) = &params.known_uids {
             // Reject CRLF to prevent command injection (RFC 3501 Section 2.2).
             validate_no_crlf(known_uids, "QRESYNC known-uids")?;
             // RFC 7162 Section 3.2.5.2: "*" and "$" are not allowed in known-uids.
             // Validate via SequenceSet::new_known() which enforces this.
             crate::types::SequenceSet::new_known(known_uids.as_str())?;
-            buf.extend_from_slice(b" ");
-            buf.extend_from_slice(known_uids.as_bytes());
+            w.raw(b" ");
+            w.raw(known_uids.as_bytes());
         }
         if let Some((seq_set, uid_set)) = &params.seq_match_data {
             // RFC 7162 Section 7: The ABNF places [SP known-uids] and
@@ -657,16 +652,16 @@ pub(super) fn encode_select_or_examine(
             // known-sequence-set or known-uid-set.
             crate::types::SequenceSet::new_known(seq_set.as_str())?;
             crate::types::SequenceSet::new_known(uid_set.as_str())?;
-            buf.extend_from_slice(b" (");
-            buf.extend_from_slice(seq_set.as_bytes());
-            buf.extend_from_slice(b" ");
-            buf.extend_from_slice(uid_set.as_bytes());
-            buf.extend_from_slice(b")");
+            w.raw(b" (");
+            w.raw(seq_set.as_bytes());
+            w.raw(b" ");
+            w.raw(uid_set.as_bytes());
+            w.raw(b")");
         }
-        buf.extend_from_slice(b"))");
+        w.raw(b"))");
     }
 
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -679,7 +674,7 @@ pub(super) fn encode_select_or_examine(
 /// fetch modifier list per RFC 7162 Section 3.2.6.  VANISHED requires
 /// `changed_since` to be set (the modifier list must include CHANGEDSINCE).
 pub(super) fn encode_uid_fetch(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     sequence_set: &str,
     items: &str,
@@ -697,15 +692,15 @@ pub(super) fn encode_uid_fetch(
     validate_no_crlf(sequence_set, "UID FETCH sequence set")?;
     validate_no_crlf(items, "UID FETCH items")?;
     validate_non_empty_fetch_items(items, "UID FETCH items")?;
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" UID FETCH ");
-    buf.extend_from_slice(sequence_set.as_bytes());
-    buf.extend_from_slice(b" ");
-    buf.extend_from_slice(items.as_bytes());
+    w.raw(tag.as_bytes());
+    w.raw(b" UID FETCH ");
+    w.raw(sequence_set.as_bytes());
+    w.raw(b" ");
+    w.raw(items.as_bytes());
     if let Some(modseq) = changed_since {
-        encode_changedsince_modifier(buf, modseq, vanished)?;
+        encode_changedsince_modifier(w, modseq, vanished)?;
     }
-    buf.extend_from_slice(b"\r\n");
+    w.raw(b"\r\n");
     Ok(())
 }
 
@@ -718,18 +713,18 @@ pub(super) fn encode_uid_fetch(
 /// `\Recent` (read-only, server-set) and `\*` (permanent-flag wildcard,
 /// only valid in PERMANENTFLAGS responses).
 fn encode_store_flags(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     operation: crate::types::StoreOperation,
     flags: &[crate::types::Flag],
 ) -> Result<(), crate::Error> {
-    buf.extend_from_slice(b" ");
+    w.raw(b" ");
     match operation {
-        crate::types::StoreOperation::Add => buf.extend_from_slice(b"+FLAGS"),
-        crate::types::StoreOperation::Remove => buf.extend_from_slice(b"-FLAGS"),
-        crate::types::StoreOperation::Replace => buf.extend_from_slice(b"FLAGS"),
-        crate::types::StoreOperation::AddSilent => buf.extend_from_slice(b"+FLAGS.SILENT"),
-        crate::types::StoreOperation::RemoveSilent => buf.extend_from_slice(b"-FLAGS.SILENT"),
-        crate::types::StoreOperation::ReplaceSilent => buf.extend_from_slice(b"FLAGS.SILENT"),
+        crate::types::StoreOperation::Add => w.raw(b"+FLAGS"),
+        crate::types::StoreOperation::Remove => w.raw(b"-FLAGS"),
+        crate::types::StoreOperation::Replace => w.raw(b"FLAGS"),
+        crate::types::StoreOperation::AddSilent => w.raw(b"+FLAGS.SILENT"),
+        crate::types::StoreOperation::RemoveSilent => w.raw(b"-FLAGS.SILENT"),
+        crate::types::StoreOperation::ReplaceSilent => w.raw(b"FLAGS.SILENT"),
     }
     let valid_flags = validate_and_filter_flags(flags, "STORE")?;
     // RFC 3501 Section 9 / RFC 9051 Section 9: `flag-list = "(" [flag *(SP flag)] ")"`.
@@ -751,28 +746,28 @@ fn encode_store_flags(
             }
         }
     }
-    buf.extend_from_slice(b" (");
+    w.raw(b" (");
     for (i, flag) in valid_flags.iter().enumerate() {
         if i > 0 {
-            buf.extend_from_slice(b" ");
+            w.raw(b" ");
         }
-        buf.extend_from_slice(flag.as_imap_str().as_bytes());
+        w.raw(flag.as_imap_str().as_bytes());
     }
-    buf.extend_from_slice(b")\r\n");
+    w.raw(b")\r\n");
     Ok(())
 }
 
 /// Encode UID EXPUNGE command (RFC 4315 UIDPLUS Section 2.1).
 pub(super) fn encode_uid_expunge(
-    buf: &mut BytesMut,
+    w: &mut CommandWriter,
     tag: &str,
     sequence_set: &str,
 ) -> Result<(), crate::Error> {
     // Reject CRLF in sequence set to prevent command injection (RFC 3501 Section 2.2).
     validate_no_crlf(sequence_set, "UID EXPUNGE sequence set")?;
-    buf.extend_from_slice(tag.as_bytes());
-    buf.extend_from_slice(b" UID EXPUNGE ");
-    buf.extend_from_slice(sequence_set.as_bytes());
-    buf.extend_from_slice(b"\r\n");
+    w.raw(tag.as_bytes());
+    w.raw(b" UID EXPUNGE ");
+    w.raw(sequence_set.as_bytes());
+    w.raw(b"\r\n");
     Ok(())
 }

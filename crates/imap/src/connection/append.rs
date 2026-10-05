@@ -31,11 +31,11 @@ impl ImapConnection {
 
     /// APPEND a message to a mailbox (RFC 3501 Section 6.3.11).
     ///
-    /// The handle only carries the request to the driver; the driver encodes
-    /// it from live protocol state when it executes (literal synchronization,
-    /// LITERAL+/LITERAL- markers, `literal8` for NUL bodies, the RFC 6855
-    /// `UTF8 (` wrapper, mailbox encoding). See
-    /// [`encode_append`](crate::codec::encode::encode_append).
+    /// The handle only carries the request to the driver as a
+    /// `Command::Append`; the driver checks and encodes it from live protocol
+    /// state when it executes, like every other command (literal
+    /// synchronization, LITERAL+/LITERAL- markers, `literal8` for NUL bodies,
+    /// the RFC 6855 `UTF8 (` wrapper, mailbox encoding).
     ///
     /// `message` is borrowed, so it is copied once into a shared buffer to
     /// cross the driver channel. A caller that already holds the body as
@@ -75,7 +75,7 @@ impl ImapConnection {
         // RFC 3501 Section 6.3.11: APPEND is valid in Authenticated and Selected
         // states. Only an early refusal - the driver re-checks against live
         // state when it executes the command.
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Append)?;
 
         let deadline = tokio::time::Instant::now() + timeout;
         if let Some(limit) = self.append_limit_for_mailbox(mailbox, timeout).await? {
@@ -84,10 +84,12 @@ impl ImapConnection {
 
         tokio::time::timeout(
             remaining_timeout(deadline)?,
-            self.submit_append(
-                mailbox.to_owned(),
-                vec![message],
-                false,
+            self.submit_regular(
+                Command::Append {
+                    mailbox: mailbox.to_owned(),
+                    messages: vec![message],
+                    multi: false,
+                },
                 AppendConsumer::default(),
             ),
         )
@@ -123,7 +125,7 @@ impl ImapConnection {
         // RFC 3502 Section 3: MULTIAPPEND is valid in Authenticated and Selected
         // states. Only an early refusal - the driver re-checks against live
         // state when it executes the command.
-        self.require_state(&[SessionState::Authenticated, SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Append)?;
 
         if messages.is_empty() {
             return Err(Error::InvalidInput(
@@ -151,10 +153,12 @@ impl ImapConnection {
 
         tokio::time::timeout(
             remaining_timeout(deadline)?,
-            self.submit_append(
-                mailbox.to_owned(),
-                messages.to_vec(),
-                true,
+            self.submit_regular(
+                Command::Append {
+                    mailbox: mailbox.to_owned(),
+                    messages: messages.to_vec(),
+                    multi: true,
+                },
                 MultiAppendConsumer::default(),
             ),
         )
@@ -264,7 +268,7 @@ fn unsent_preflight(error: Error) -> Error {
 
 /// Time left before the caller's deadline.
 ///
-/// Expiry here is still before `submit_append`, so it is `Unsent`: no APPEND
+/// Expiry here is still before the APPEND is submitted, so it is `Unsent`: no APPEND
 /// octet has reached the driver.
 fn remaining_timeout(deadline: tokio::time::Instant) -> Result<Duration, Error> {
     deadline

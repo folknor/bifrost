@@ -109,7 +109,7 @@ async fn a_foreign_tag_before_the_continuation_is_fatal() {
 /// the synchronizing marker, so the server has read everything the client sent
 /// when it answers. Reverting `wait_for_continuation` to treat an own-tag `NO`
 /// after a granted literal as fatal fails the `is_alive` and fatality
-/// assertions. Making `send_chunked_segments` write past the marker before the
+/// assertions. Making `send_wire_command` write past the marker before the
 /// wait (for example the next segment's leading chunk) fails the NOOP-line
 /// assertion, because those bytes would arrive ahead of the NOOP.
 #[tokio::test]
@@ -236,26 +236,27 @@ async fn refused_second_metadata_literal_leaves_the_wire_in_sync(caps: &str, len
     let _server = script.await.unwrap();
 }
 
-/// The pre-split segment path (`send_encoded_segments`, no literal extension):
-/// a later literal of a non-APPEND command refused at its marker is that
-/// command's ordinary non-fatal refusal, and the second body is never written.
+/// No literal extension: a later literal of a non-APPEND command refused at its
+/// marker is that command's ordinary non-fatal refusal, and the second body is
+/// never written.
 ///
-/// Making `send_encoded_segments` write the next segment before the wait fails
-/// the NOOP-line assertion; treating the own-tag `NO` after a granted literal
-/// as fatal fails the `is_alive` assertion.
+/// Making `send_wire_command` write the next segment before the wait fails the
+/// NOOP-line assertion; treating the own-tag `NO` after a granted literal as
+/// fatal fails the `is_alive` assertion.
 #[tokio::test]
-async fn a_later_literal_of_a_segmented_command_refused_at_its_marker_leaves_the_wire_in_sync() {
+async fn a_later_literal_refused_at_its_marker_leaves_the_wire_in_sync() {
     refused_second_metadata_literal_leaves_the_wire_in_sync("IMAP4rev1 METADATA", 6).await;
 }
 
-/// The flat-buffer path (`send_with_literal_sync`): under `LITERAL-` a literal
-/// over 4096 bytes stays synchronizing, so two such values run the same
-/// marker-by-marker send over the patched buffer.
+/// Under `LITERAL-` a literal over 4096 octets stays synchronizing, so the
+/// writer ends a segment on each of the two markers even though the
+/// connection has a literal extension.
 ///
 /// Writing past the second marker before the wait fails the NOOP-line
 /// assertion; a fatal classification fails the `is_alive` assertion.
 #[tokio::test]
-async fn a_later_literal_of_a_flat_command_refused_at_its_marker_leaves_the_wire_in_sync() {
+async fn a_later_literal_over_the_literal_minus_limit_refused_at_its_marker_leaves_the_wire_in_sync()
+ {
     refused_second_metadata_literal_leaves_the_wire_in_sync("IMAP4rev1 METADATA LITERAL-", 4097)
         .await;
 }

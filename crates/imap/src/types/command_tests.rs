@@ -853,3 +853,224 @@ fn command_debug() {
     assert!(debug.contains("Select"));
     assert!(debug.contains("INBOX"));
 }
+
+// --- APPEND ---
+
+#[test]
+fn command_append_kind_and_target() {
+    let cmd = Command::Append {
+        mailbox: "Drafts".into(),
+        messages: vec![super::super::AppendMessage::new(b"hi".to_vec())],
+        multi: false,
+    };
+    assert_eq!(cmd.kind(), CommandKind::Append);
+    assert!(cmd.mailbox_target().is_none());
+}
+
+/// The driver traces every command with `?cmd`; an APPEND's Debug must name
+/// the body's length and never its content.
+#[test]
+fn command_append_debug_never_prints_the_body() {
+    let cmd = Command::Append {
+        mailbox: "Drafts".into(),
+        messages: vec![super::super::AppendMessage::new(
+            b"Subject: secret plans".to_vec(),
+        )],
+        multi: false,
+    };
+    let debug = format!("{cmd:?}");
+    assert!(!debug.contains("secret plans"), "{debug}");
+    assert!(debug.contains("data_len: 21"), "{debug}");
+}
+
+// --- Session legality and pipeline admission ---
+
+/// Spot rows of the one legality table against RFC 3501 Section 6 and the
+/// extension sections, including the rows that are easy to get wrong.
+#[test]
+fn legal_states_follow_the_rfc_rows() {
+    use crate::connection::SessionState::{Authenticated, NotAuthenticated, Selected};
+
+    assert_eq!(
+        CommandKind::Noop.legal_states(),
+        &[NotAuthenticated, Authenticated, Selected]
+    );
+    assert_eq!(
+        CommandKind::Id.legal_states(),
+        &[NotAuthenticated, Authenticated, Selected]
+    );
+    assert_eq!(CommandKind::Login.legal_states(), &[NotAuthenticated]);
+    assert_eq!(CommandKind::StartTls.legal_states(), &[NotAuthenticated]);
+    // RFC 5161 Section 3.1: ENABLE is Authenticated only.
+    assert_eq!(CommandKind::Enable.legal_states(), &[Authenticated]);
+    assert_eq!(
+        CommandKind::Append.legal_states(),
+        &[Authenticated, Selected]
+    );
+    // IDLE is an Authenticated-state command too, not Selected-only.
+    assert_eq!(CommandKind::Idle.legal_states(), &[Authenticated, Selected]);
+    assert_eq!(CommandKind::Fetch.legal_states(), &[Selected]);
+    assert_eq!(CommandKind::Close.legal_states(), &[Selected]);
+}
+
+/// No command is legal in Logout, and every command is legal somewhere.
+#[test]
+fn no_command_is_legal_in_logout() {
+    use crate::connection::SessionState;
+
+    let every_kind = every_command_kind();
+    for kind in every_kind {
+        let legal = kind.legal_states();
+        assert!(!legal.is_empty(), "{kind:?} has no legal state");
+        assert!(
+            !legal.contains(&SessionState::Logout),
+            "{kind:?} is legal in Logout"
+        );
+    }
+}
+
+/// The batch excludes exactly the commands that change session state, swap
+/// the transport, take continuations, or need preparation of their own.
+#[test]
+fn pipelinable_excludes_state_changers_and_append() {
+    for kind in [
+        CommandKind::Select,
+        CommandKind::Examine,
+        CommandKind::Close,
+        CommandKind::Unselect,
+        CommandKind::Login,
+        CommandKind::Authenticate,
+        CommandKind::Logout,
+        CommandKind::Unauthenticate,
+        CommandKind::StartTls,
+        CommandKind::Compress,
+        CommandKind::Idle,
+        CommandKind::Enable,
+        CommandKind::Append,
+    ] {
+        assert!(!kind.pipelinable(), "{kind:?} must not be pipelinable");
+    }
+    for kind in [
+        CommandKind::Noop,
+        CommandKind::Fetch,
+        CommandKind::Store,
+        CommandKind::Search,
+        CommandKind::Status,
+        CommandKind::NotifySet,
+        CommandKind::MyRights,
+    ] {
+        assert!(kind.pipelinable(), "{kind:?} must be pipelinable");
+    }
+}
+
+/// Every `CommandKind`, by an exhaustive match: a new kind does not compile
+/// until it is listed here and so reaches the table checks above.
+fn every_command_kind() -> Vec<CommandKind> {
+    use CommandKind as K;
+    let all = vec![
+        K::Capability,
+        K::Noop,
+        K::Logout,
+        K::Login,
+        K::Authenticate,
+        K::StartTls,
+        K::Enable,
+        K::Select,
+        K::Examine,
+        K::Create,
+        K::Delete,
+        K::Rename,
+        K::Subscribe,
+        K::Unsubscribe,
+        K::List,
+        K::ListStatus,
+        K::Lsub,
+        K::Status,
+        K::Namespace,
+        K::Append,
+        K::Check,
+        K::Close,
+        K::Unselect,
+        K::Expunge,
+        K::Search,
+        K::SearchReturn,
+        K::SearchSave,
+        K::Fetch,
+        K::Store,
+        K::Copy,
+        K::Move,
+        K::Idle,
+        K::Id,
+        K::GetMetadata,
+        K::SetMetadata,
+        K::Thread,
+        K::Sort,
+        K::NotifySet,
+        K::NotifyNone,
+        K::Compress,
+        K::Unauthenticate,
+        K::GetQuota,
+        K::GetQuotaRoot,
+        K::SetQuota,
+        K::SetAcl,
+        K::DeleteAcl,
+        K::GetAcl,
+        K::ListRights,
+        K::MyRights,
+    ];
+    for kind in &all {
+        // Exhaustiveness guard: adding a variant breaks this match.
+        match kind {
+            K::Capability
+            | K::Noop
+            | K::Logout
+            | K::Login
+            | K::Authenticate
+            | K::StartTls
+            | K::Enable
+            | K::Select
+            | K::Examine
+            | K::Create
+            | K::Delete
+            | K::Rename
+            | K::Subscribe
+            | K::Unsubscribe
+            | K::List
+            | K::ListStatus
+            | K::Lsub
+            | K::Status
+            | K::Namespace
+            | K::Append
+            | K::Check
+            | K::Close
+            | K::Unselect
+            | K::Expunge
+            | K::Search
+            | K::SearchReturn
+            | K::SearchSave
+            | K::Fetch
+            | K::Store
+            | K::Copy
+            | K::Move
+            | K::Idle
+            | K::Id
+            | K::GetMetadata
+            | K::SetMetadata
+            | K::Thread
+            | K::Sort
+            | K::NotifySet
+            | K::NotifyNone
+            | K::Compress
+            | K::Unauthenticate
+            | K::GetQuota
+            | K::GetQuotaRoot
+            | K::SetQuota
+            | K::SetAcl
+            | K::DeleteAcl
+            | K::GetAcl
+            | K::ListRights
+            | K::MyRights => {}
+        }
+    }
+    all
+}

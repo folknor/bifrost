@@ -8,6 +8,89 @@ use crate::error::Error;
 
 use super::TcpKeepalive;
 
+/// A byte-stream adapter that counts the octets the transport beneath it has
+/// accepted.
+///
+/// This is the only reliable evidence of whether any byte of a command left
+/// this process. It wraps the SOCKET, below TLS and below COMPRESS, because
+/// neither layer above reports its own partial progress: OpenSSL can push part
+/// of an encrypted record to TCP before its `poll_write` returns `Pending`, and
+/// a later poll can then fail without ever having returned `Ok(n)`, so a count
+/// of successful plaintext writes would read zero while ciphertext of the
+/// command was already on the wire. Counting here also includes TLS handshake
+/// and control traffic, which can only overstate a command's progress - the
+/// conservative direction for transmission evidence.
+///
+/// The counter saturates rather than wraps, and [`Tracked::written`] is read
+/// by callers that treat a saturated counter as "progress made", so neither
+/// overflow behaviour can make unequal progress compare equal.
+pub(super) struct Tracked<S> {
+    inner: S,
+    written: u64,
+}
+
+impl<S> Tracked<S> {
+    pub(super) const fn new(inner: S) -> Self {
+        Self { inner, written: 0 }
+    }
+
+    /// Octets the wrapped transport has accepted since construction,
+    /// saturating at `u64::MAX`.
+    pub(super) const fn written(&self) -> u64 {
+        self.written
+    }
+
+    pub(super) const fn get_ref(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Tracked<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tracked<S> {
+    // `poll_write_vectored` is deliberately not overridden: the default
+    // implementation routes through `poll_write` below, so every accepted
+    // octet is counted whichever entry point the layer above uses.
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            let n = u64::try_from(n).unwrap_or(u64::MAX);
+            self.written = self.written.saturating_add(n);
+        }
+        polled
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// The socket every transport variant is built on, wrapped for progress
+/// counting.
+pub(super) type TrackedTcp = Tracked<TcpStream>;
+
 /// The inner transport stream: either plain TCP or TLS over TCP.
 ///
 /// Used as the underlying I/O transport for both uncompressed and compressed
@@ -15,16 +98,26 @@ use super::TcpKeepalive;
 /// rationale as `ImapStream` for not boxing.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum InnerStream {
-    Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Plain(TrackedTcp),
+    Tls(TlsStream<TrackedTcp>),
     /// In-memory byte stream used to test COMPRESS=DEFLATE without a socket.
     /// It has the same ordered byte-stream behavior as the production inner
     /// transports, unlike a mock that could invent impossible I/O results.
     #[cfg(test)]
-    Memory(tokio::io::DuplexStream),
+    Memory(Tracked<tokio::io::DuplexStream>),
 }
 
 impl InnerStream {
+    /// Octets the socket beneath this stream has accepted. See [`Tracked`].
+    fn written(&self) -> u64 {
+        match self {
+            Self::Plain(s) => s.written(),
+            Self::Tls(s) => s.get_ref().get_ref().get_ref().written(),
+            #[cfg(test)]
+            Self::Memory(s) => s.written(),
+        }
+    }
+
     async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
         match self {
             Self::Plain(s) => s.read_buf(buf).await,
@@ -248,8 +341,8 @@ fn ensure_deflate_progress(consumed: usize, produced: usize) -> std::io::Result<
 /// would add indirection on every I/O call, which is not worth it.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum ImapStream {
-    Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Plain(TrackedTcp),
+    Tls(TlsStream<TrackedTcp>),
     /// Compressed stream per RFC 4978 (COMPRESS=DEFLATE).
     Compressed(CompressedStream),
     /// Sentinel used during in-progress stream upgrades (STARTTLS,
@@ -265,10 +358,28 @@ pub(super) enum ImapStream {
     /// runners) can disallow `TcpListener::bind("127.0.0.1:0")`. Gated to
     /// `cfg(test)` so production builds carry zero overhead.
     #[cfg(test)]
-    Memory(tokio::io::DuplexStream),
+    Memory(Tracked<tokio::io::DuplexStream>),
 }
 
 impl ImapStream {
+    /// Octets the socket beneath this stream has accepted since it was
+    /// opened, saturating at `u64::MAX`. See [`Tracked`].
+    ///
+    /// The sender compares two readings to decide whether any byte of a
+    /// command can have reached the peer. `Poisoned` has no socket and reads
+    /// `u64::MAX`, which callers treat as progress: a stream mid-upgrade is
+    /// never evidence that nothing was sent.
+    pub(super) fn written(&self) -> u64 {
+        match self {
+            Self::Plain(s) => s.written(),
+            Self::Tls(s) => s.get_ref().get_ref().get_ref().written(),
+            Self::Compressed(s) => s.inner.written(),
+            Self::Poisoned => u64::MAX,
+            #[cfg(test)]
+            Self::Memory(s) => s.written(),
+        }
+    }
+
     pub(super) async fn read_buf(&mut self, buf: &mut BytesMut) -> std::io::Result<usize> {
         match self {
             Self::Plain(s) => s.read_buf(buf).await,
@@ -316,15 +427,13 @@ impl ImapStream {
             .with_interval(ka.interval);
 
         let result = match self {
-            Self::Plain(tcp) => SockRef::from(tcp).set_tcp_keepalive(&sock_ka),
-            Self::Tls(tls) => {
-                SockRef::from(tls.get_ref().get_ref().get_ref()).set_tcp_keepalive(&sock_ka)
-            }
+            Self::Plain(tcp) => SockRef::from(tcp.get_ref()).set_tcp_keepalive(&sock_ka),
+            Self::Tls(tls) => SockRef::from(tls.get_ref().get_ref().get_ref().get_ref())
+                .set_tcp_keepalive(&sock_ka),
             Self::Compressed(c) => match &c.inner {
-                InnerStream::Plain(tcp) => SockRef::from(tcp).set_tcp_keepalive(&sock_ka),
-                InnerStream::Tls(tls) => {
-                    SockRef::from(tls.get_ref().get_ref().get_ref()).set_tcp_keepalive(&sock_ka)
-                }
+                InnerStream::Plain(tcp) => SockRef::from(tcp.get_ref()).set_tcp_keepalive(&sock_ka),
+                InnerStream::Tls(tls) => SockRef::from(tls.get_ref().get_ref().get_ref().get_ref())
+                    .set_tcp_keepalive(&sock_ka),
                 #[cfg(test)]
                 InnerStream::Memory(_) => {
                     return Err(Error::Io {
@@ -388,8 +497,12 @@ impl ImapStream {
         })
     }
 
-    /// Extract the underlying `TcpStream` for STARTTLS upgrade.
-    pub(super) fn into_tcp(self) -> Option<TcpStream> {
+    /// Extract the underlying socket for STARTTLS upgrade.
+    ///
+    /// The socket keeps its [`Tracked`] wrapper so the TLS layer is built on
+    /// top of it: the progress count carries across the upgrade, and the
+    /// handshake's own writes are counted like any other.
+    pub(super) fn into_tcp(self) -> Option<TrackedTcp> {
         match self {
             Self::Plain(s) => Some(s),
             Self::Tls(_) | Self::Compressed(_) | Self::Poisoned => Option::None,

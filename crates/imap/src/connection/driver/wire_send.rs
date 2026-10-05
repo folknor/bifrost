@@ -1,11 +1,8 @@
 use bifrost_types::TransmissionState;
-use bytes::{Bytes, BytesMut};
-use tracing::trace;
 
-use crate::codec::encode::{LiteralMode, encode_command};
+use crate::codec::encode::WireCommand;
 use crate::error::Error;
-use crate::types::Command;
-use crate::types::response::{Capability, StatusKind};
+use crate::types::response::StatusKind;
 
 use super::event_sink;
 use super::pipeline::{PipelineRouting, Routed, route_pipeline_response};
@@ -31,177 +28,72 @@ pub(super) enum ContinuationOutcome {
     Rejected,
 }
 
-/// Encode and send a command over the wire, handling literal
-/// synchronization (RFC 3501 Section4.3).
+/// The transmission evidence for a write that failed, judged from the socket
+/// progress counter (`stream::Tracked`) against the reading taken when the
+/// command - or, for a coalesced pipeline batch, the batch - began.
 ///
-/// Returns the generated tag on success. Mirrors
-/// `ImapConnection::send_command` adapted for the driver's
-/// decomposed primitives.
-pub(super) async fn send_command_on_wire(
-    wire_reader: &mut super::super::wire::WireReader,
-    state: &mut super::super::state::ProtocolState,
-    tag_gen: &mut super::super::tag::TagGenerator,
-    event_sink: &mut event_sink::DriverEventSink,
-    cmd: &Command,
-) -> Result<String, Error> {
-    let tag = tag_gen.next();
-    trace!(tag, ?cmd, "driver: sending IMAP command");
-    let opts = super::build_encode_options(state);
-    let encoded = encode_command(&tag, cmd, &opts)?;
-
-    let allow_literal8 =
-        state.capabilities().contains(&Capability::Binary) && !super::is_rev2(state);
-
-    match opts.literal_mode {
-        LiteralMode::LiteralPlus => {
-            // LITERAL+ path (RFC 7888 Section4): patch all synchronizing
-            // markers to non-synchronizing and send in one shot.
-            let flat = encoded.into_buf();
-            let patched = super::super::patch_literals_to_plus_with_binary(&flat, allow_literal8);
-            send_with_literal_sync(wire_reader, state, event_sink, &patched, &tag, None).await?;
-        }
-        LiteralMode::LiteralMinus => {
-            // LITERAL- path (RFC 7888 Section5): patch small (<=4096 byte)
-            // literals to non-synchronizing; larger ones stay sync.
-            let flat = encoded.into_buf();
-            let patched =
-                super::super::patch_small_literals_to_plus_with_binary(&flat, allow_literal8);
-            send_with_literal_sync(wire_reader, state, event_sink, &patched, &tag, None).await?;
-        }
-        LiteralMode::Synchronizing => {
-            // No literal extension: all literals are synchronizing
-            // (RFC 3501 Section4.3). Use pre-split segments from the encoder.
-            send_encoded_segments(
-                wire_reader,
-                state,
-                event_sink,
-                encoded.segments(),
-                &tag,
-                None,
-            )
-            .await?;
-        }
+/// `Unsent` exactly when the counter has not moved: no octet of this command
+/// was accepted by the socket, so the peer cannot have received any of it, and
+/// the failure retires the connection so nothing buffered above the socket is
+/// ever sent later. Any movement is `InFlight`, whichever layer failed and
+/// whether the failure was a write or a flush: a partial write, ciphertext a
+/// TLS layer pushed before failing, or a flush failure after full delivery all
+/// leave the server able to have received the command. A saturated counter
+/// cannot tell movement from rest and reads as `InFlight`.
+///
+/// This is about progress, never chunk position. A rule keyed on "first
+/// segment" called a failure `Unsent` after part of the command had already
+/// reached the socket; one keyed on "any write attempted" would call a stale
+/// pooled connection's first-byte EPIPE `InFlight` and send a non-idempotent
+/// operation to reconcile when nothing landed.
+pub(super) fn write_failure_evidence(
+    wire_reader: &super::super::wire::WireReader,
+    baseline: u64,
+) -> TransmissionState {
+    let now = wire_reader.written();
+    if now == baseline && now != u64::MAX {
+        TransmissionState::Unsent
+    } else {
+        TransmissionState::InFlight
     }
-    Ok(tag)
 }
 
-/// Send bytes that may contain synchronizing literals, handling
-/// continuation requests at each literal boundary (RFC 3501 Section4.3).
+/// Send one encoded command, waiting for a `+` continuation between each
+/// pair of consecutive segments (RFC 3501 Section 4.3).
 ///
-/// The driver owns this send path outright. It was lifted out of the
-/// pre-driver connection layer, which retains no copy of it.
+/// The one sender. Every command - APPEND, a pipelined command, IDLE, the
+/// commands of a stream upgrade - reaches the socket through here, so the
+/// write pattern always follows the command's encoded segments: a segment
+/// boundary is exactly a synchronizing marker, and nothing past a marker is
+/// written before the server grants it. Each segment's chunks are written from
+/// their own allocations (a message body is never copied into a command
+/// buffer) and flushed once.
 ///
-/// `own_tag` is the tag of the command in `buf`; see [`wait_for_continuation`].
-pub(super) async fn send_with_literal_sync(
+/// `baseline` is the [`written`](super::super::wire::WireReader::written)
+/// reading when the command (or its batch) began; a write failure is stamped
+/// by [`write_failure_evidence`].
+///
+/// `routing` is `Some` only inside a pipelined batch; see
+/// [`wait_for_continuation`]. A refused literal there is the command's own
+/// result, already in its slot, and the sender answers `Rejected` after
+/// abandoning the rest of the command. Outside a pipeline the wait returns the
+/// refusal as an error instead, so `Rejected` is reported only with routing.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_wire_command(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
     event_sink: &mut event_sink::DriverEventSink,
-    buf: &[u8],
+    wire: &WireCommand,
     own_tag: &str,
+    baseline: u64,
     mut routing: Option<&mut PipelineRouting<'_>>,
 ) -> Result<SendOutcome, Error> {
-    // A buffer-shape invariant failure is the client's fault. Before the
-    // first byte the framing is intact and the connection reusable; once an
-    // earlier literal went out (after a server `+`) the command is half-sent,
-    // so the connection must retire and the command may have been seen.
-    let invariant = |pos: usize, message: &str| {
-        if pos == 0 {
-            Error::Internal(message.into())
-        } else {
-            Error::internal_mid_exchange(message, TransmissionState::InFlight)
-        }
-    };
-    let mut pos = 0;
-    while pos < buf.len() {
-        if let Some((marker_end, literal_size)) = super::super::find_literal_boundary(&buf[pos..]) {
-            // marker_end is the offset past `\r\n` within buf[pos..]
-            let Some(send_end) = pos.checked_add(marker_end) else {
-                return Err(invariant(
-                    pos,
-                    "synchronizing literal marker offset overflowed command buffer",
-                ));
-            };
-            let Some(body_end) = send_end
-                .checked_add(literal_size)
-                .filter(|&end| end <= buf.len())
-            else {
-                return Err(invariant(
-                    pos,
-                    "synchronizing literal marker exceeds command buffer",
-                ));
-            };
-            wire_reader
-                .write_all(&buf[pos..send_end])
-                .await
-                .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
-            if wait_for_continuation(
-                wire_reader,
-                state,
-                event_sink,
-                own_tag,
-                routing.as_deref_mut(),
-            )
-            .await?
-                == ContinuationOutcome::Rejected
-            {
-                // The server refused this literal. Its remaining bytes - the
-                // body and every trailing byte of command syntax after it -
-                // must not be written: the server has ended this command's
-                // parsing state and would read them as a new command line
-                // (RFC 3501 Section4.3).
-                return Ok(SendOutcome::Rejected);
-            }
-            // Send the literal body data (RFC 3501 Section4.3).
-            // After the continuation is received the server is expecting
-            // our literal bytes, so a send failure here is InFlight: the
-            // preceding pre-literal bytes were accepted.
-            wire_reader
-                .write_all(&buf[send_end..body_end])
-                .await
-                .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-            pos = body_end;
-        } else {
-            // No more literals; send the rest.
-            wire_reader
-                .write_all(&buf[pos..])
-                .await
-                .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
-            break;
-        }
-    }
-    Ok(SendOutcome::Sent)
-}
-
-/// Send pre-split [`EncodedCommand`](crate::codec::encode::EncodedCommand)
-/// segments, waiting for a `+` continuation response between each pair
-/// of consecutive segments (RFC 3501 Section4.3).
-///
-/// The driver owns this send path outright. It was lifted out of the
-/// pre-driver connection layer, which retains no copy of it.
-pub(super) async fn send_encoded_segments(
-    wire_reader: &mut super::super::wire::WireReader,
-    state: &mut super::super::state::ProtocolState,
-    event_sink: &mut event_sink::DriverEventSink,
-    segments: &[BytesMut],
-    own_tag: &str,
-    mut routing: Option<&mut PipelineRouting<'_>>,
-) -> Result<SendOutcome, Error> {
+    let segments = wire.segments();
     for (i, segment) in segments.iter().enumerate() {
-        // Whether this segment is Unsent or InFlight depends on whether a
-        // prior continuation was received. The first segment is always
-        // Unsent. Subsequent segments come after a server `+`, so their
-        // send failures are InFlight (the server already ACKed the prefix).
-        let state_for_segment = if i == 0 {
-            TransmissionState::Unsent
-        } else {
-            TransmissionState::InFlight
-        };
-        wire_reader
-            .write_all(segment)
-            .await
-            .map_err(|e| e.with_attempt(state_for_segment))?;
-        // After every segment except the last, wait for `+`
-        // (RFC 3501 Section4.3).
+        if let Err(e) = wire_reader.write_chunks(segment).await {
+            let evidence = write_failure_evidence(wire_reader, baseline);
+            return Err(e.with_attempt(evidence));
+        }
         if i + 1 < segments.len()
             && wait_for_continuation(
                 wire_reader,
@@ -213,71 +105,23 @@ pub(super) async fn send_encoded_segments(
             .await?
                 == ContinuationOutcome::Rejected
         {
-            // Refused: abandon every remaining segment of this command. See
-            // `send_with_literal_sync` for why the remainder must not go out.
+            // The server refused this literal. Its remaining bytes - the body
+            // and every trailing byte of command syntax after it - must not
+            // be written: the server has ended this command's parsing state
+            // and would read them as a new command line (RFC 3501 Section 4.3).
+            if routing.is_none() {
+                // Unreachable: without routing the wait raises the refusal as
+                // an error. Raised after the server answered part of the
+                // command, so the connection retires.
+                return Err(Error::internal_mid_exchange(
+                    "literal continuation refused outside a pipeline",
+                    TransmissionState::Acknowledged,
+                ));
+            }
             return Ok(SendOutcome::Rejected);
         }
     }
     Ok(SendOutcome::Sent)
-}
-
-/// Send the segments of a [`ChunkedCommand`](crate::codec::encode::ChunkedCommand),
-/// waiting for a `+` continuation between each pair of consecutive segments
-/// (RFC 3501 Section 4.3).
-///
-/// This is the send half of the ownership-preserving encoding: a message body
-/// is written straight from the caller's `Bytes`, never gathered into a
-/// command buffer. Each chunk is its own write, which is a flush per chunk, so
-/// the encoder keeps chunks few (command syntax is coalesced; a body is one
-/// chunk).
-///
-/// Transmission evidence follows [`send_encoded_segments`]: a failure in the
-/// first segment is `Unsent`, and any later segment comes after a server `+`
-/// and is `InFlight`. That is deliberately stricter for a non-synchronizing
-/// command than the flat-buffer path, which stamps its trailing write `Unsent`:
-/// APPEND is non-idempotent, and once a body has been offered to the socket,
-/// claiming "the server never saw it" is the unsafe direction.
-///
-/// Only reachable without pipeline routing, so a refused continuation is an
-/// ordinary error from [`wait_for_continuation`] and the `Rejected` outcome
-/// cannot occur; it is still handled rather than assumed.
-pub(super) async fn send_chunked_segments(
-    wire_reader: &mut super::super::wire::WireReader,
-    state: &mut super::super::state::ProtocolState,
-    event_sink: &mut event_sink::DriverEventSink,
-    segments: &[Vec<Bytes>],
-    own_tag: &str,
-) -> Result<(), Error> {
-    for (i, segment) in segments.iter().enumerate() {
-        let state_for_segment = if i == 0 {
-            TransmissionState::Unsent
-        } else {
-            TransmissionState::InFlight
-        };
-        for chunk in segment {
-            // An empty message body is a legal zero-length literal; there is
-            // nothing to write for it.
-            if chunk.is_empty() {
-                continue;
-            }
-            wire_reader
-                .write_all(chunk)
-                .await
-                .map_err(|e| e.with_attempt(state_for_segment))?;
-        }
-        if i + 1 < segments.len()
-            && wait_for_continuation(wire_reader, state, event_sink, own_tag, None).await?
-                == ContinuationOutcome::Rejected
-        {
-            // A state this path believes unreachable, raised after the
-            // server answered part of the command: the connection retires.
-            return Err(Error::internal_mid_exchange(
-                "literal continuation refused outside a pipeline",
-                TransmissionState::Acknowledged,
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// The error for a command whose own tagged `OK` arrived before the `+`
@@ -308,7 +152,7 @@ pub(super) fn early_ok_error() -> Error {
 /// This wait has two modes, and which one applies is decided entirely by
 /// whether the caller has other commands outstanding.
 ///
-/// With `routing: None` - single-command dispatch and APPEND - exactly one
+/// With `routing: None` - single-command dispatch - exactly one
 /// command is on the wire, `own_tag`, and any untagged response has no
 /// consumer to route to and becomes an event. A tagged response ends the
 /// wait:
@@ -327,9 +171,8 @@ pub(super) fn early_ok_error() -> Error {
 /// carries the same fact in `sending` and decides by its own rules.
 ///
 /// With `routing: Some(..)` the caller is `run_pipeline_batch`, which sends
-/// command by command whenever a literal is synchronizing (`literal_mode` is
-/// `Synchronizing`, or `LiteralMinus` with a literal too large for
-/// `patch_small_literals_to_plus_with_binary` to patch). Commands already on
+/// command by command whenever any command of the batch has a synchronizing
+/// literal (a segment boundary in its encoded form). Commands already on
 /// the wire then have tags still pending, and their responses arrive HERE. So
 /// this wait routes them through the pipeline's own router rather than
 /// answering them itself:
@@ -365,10 +208,10 @@ pub(super) async fn wait_for_continuation(
         let utf8 = super::utf8_mode(state);
         // Accepted limit: an own-tag reply here is classified non-fatal even
         // when an EARLIER literal of the same command was already granted, so
-        // the inter-literal text has been written. That holds because every
-        // caller (`send_with_literal_sync`, `send_encoded_segments`,
-        // `send_chunked_segments`) makes the synchronizing marker the last
-        // byte written before this wait, and a conforming server answers only
+        // the inter-literal text has been written. That holds because the one
+        // caller, `send_wire_command`, ends every segment on its synchronizing
+        // marker, so the marker is the last byte written before this wait, and
+        // a conforming server answers only
         // at a marker (RFC 3502 allows a `NO` there for a later MULTIAPPEND
         // message), so it has read everything sent and the wire is in sync,
         // exactly as for the first literal. A server that replied straight

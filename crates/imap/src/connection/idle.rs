@@ -79,6 +79,11 @@ impl ImapConnection {
         done_timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<IdleEvent, Error> {
+        // RFC 2177 / RFC 9051 Section 6.3.13: IDLE is valid in Authenticated
+        // and Selected states. Refused here as caller sequencing
+        // (`InvalidState`); the driver re-checks at the head of its queue.
+        self.require_state(crate::types::CommandKind::Idle)?;
+
         // Submit IDLE to the driver task.
         let (done_tx, done_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();

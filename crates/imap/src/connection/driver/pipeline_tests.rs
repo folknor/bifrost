@@ -23,7 +23,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::connection::test_support::{
-    driver_pair, preauth_greeting, read_exact, read_line, respond, tag_of,
+    driver_pair, preauth_greeting, read_exact, read_line, respond, select_inbox, tag_of,
 };
 use crate::types::validated::MailboxName;
 
@@ -371,6 +371,8 @@ async fn a_completion_for_an_unsent_command_is_a_protocol_error() {
 #[tokio::test]
 async fn a_tag_correlated_esearch_reaches_the_search_its_tag_names() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ESEARCH")).await;
+    // SEARCH is a Selected-state command (RFC 3501 Section 6.4.4).
+    select_inbox(&conn, &mut server).await;
 
     let task = tokio::spawn(async move {
         conn.pipeline()
@@ -425,6 +427,8 @@ async fn a_tag_correlated_esearch_reaches_the_search_its_tag_names() {
 #[tokio::test]
 async fn a_surplus_esearch_for_a_finalized_search_is_dropped_not_published() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ESEARCH")).await;
+    // SEARCH is a Selected-state command (RFC 3501 Section 6.4.4).
+    select_inbox(&conn, &mut server).await;
 
     let task = tokio::spawn(async move {
         let results = conn
@@ -593,29 +597,75 @@ async fn a_pipelined_command_refused_at_its_second_marker_is_its_own_result(
     );
 }
 
-/// The pipelined segment path (`send_encoded_segments` with routing).
+/// No literal extension: `send_wire_command` with the batch's routing.
 ///
 /// Writing the next segment before the wait fails the GETACL-line assertion;
 /// answering the own-tag `NO` as a batch error fails the results assertions.
 #[tokio::test]
-async fn a_pipelined_segmented_command_refused_at_its_second_marker_is_its_own_result() {
+async fn a_pipelined_command_refused_at_its_second_marker_is_its_own_result_without_a_literal_extension()
+ {
     a_pipelined_command_refused_at_its_second_marker_is_its_own_result("IMAP4rev1 ACL METADATA", 6)
         .await;
 }
 
-/// The pipelined flat-buffer path (`send_with_literal_sync` with routing),
-/// reached under `LITERAL-` with literals over 4096 bytes.
+/// Under `LITERAL-` with literals over 4096 octets: the batch has a segment
+/// boundary although the connection has a literal extension, so it is sent
+/// command by command with routing rather than as one coalesced write.
 ///
 /// Writing past the second marker before the wait fails the GETACL-line
 /// assertion; answering the own-tag `NO` as a batch error fails the results
 /// assertions.
 #[tokio::test]
-async fn a_pipelined_flat_command_refused_at_its_second_marker_is_its_own_result() {
+async fn a_pipelined_command_refused_at_its_second_marker_is_its_own_result_over_the_literal_minus_limit()
+ {
     a_pipelined_command_refused_at_its_second_marker_is_its_own_result(
         "IMAP4rev1 ACL METADATA LITERAL-",
         4097,
     )
     .await;
+}
+
+/// Transmission evidence is relative to the whole pipeline, not to a
+/// sub-batch. Two `UID COPY`s share a `CommandKind`, so they run as two
+/// sub-batches; the server executes the first and vanishes, and the second
+/// sub-batch's first write reaches nothing. The batch error replaces the first
+/// COPY's result, so it must not claim `Unsent`: a retry on that evidence
+/// would copy the first message set again.
+#[tokio::test(start_paused = true)]
+async fn a_later_sub_batch_failure_is_in_flight_after_an_earlier_sub_batch_ran() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
+    select_inbox(&conn, &mut server).await;
+
+    let script = tokio::spawn(async move {
+        let first = read_line(&mut server).await;
+        assert!(first.contains("UID COPY 1 "), "{first:?}");
+        let tag = tag_of(&first).to_owned();
+        respond(&mut server, &format!("{tag} OK copied\r\n")).await;
+        drop(server);
+    });
+
+    let err = conn
+        .pipeline()
+        .uid_copy(
+            crate::types::SequenceSet::new("1").unwrap(),
+            MailboxName::new("Archive").unwrap(),
+        )
+        .uid_copy(
+            crate::types::SequenceSet::new("2").unwrap(),
+            MailboxName::new("Archive").unwrap(),
+        )
+        .execute_dynamic()
+        .await
+        .expect_err("the second sub-batch cannot be written");
+    script.await.unwrap();
+    let crate::connection::pipeline::PipelineError::Driver(err) = err else {
+        panic!("expected a driver error, got {err:?}");
+    };
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::InFlight),
+        "an earlier sub-batch already executed; got {err:?}"
+    );
 }
 
 /// The tag the generator will produce after `tag`.

@@ -248,7 +248,7 @@ impl ImapConnection {
         cmd: Command,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(cmd.kind())?;
         // RFC 6855 Section 6: SEARCH RETURN (SAVE) remains part of the SEARCH
         // command family and must be rejected until UTF8=ACCEPT is enabled.
         self.check_utf8_only_enforced()?;
@@ -345,7 +345,7 @@ impl ImapConnection {
         mailbox: &str,
         timeout: Duration,
     ) -> Result<MoveResult, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Move)?;
         self.check_utf8_only_enforced()?;
         // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
         if sequence_set.as_str().contains('$') {

@@ -1,5 +1,3 @@
-use bytes::BytesMut;
-
 /// RFC 9051 Section 9 ceiling for `number64`: an unsigned 63-bit integer, so
 /// the largest legal literal count is `i64::MAX`.
 pub(crate) const NUMBER64_MAX: u64 = i64::MAX as u64;
@@ -9,9 +7,9 @@ pub(crate) const NUMBER64_MAX: u64 = i64::MAX as u64;
 /// "Not a marker" and "a marker naming octets that cannot legally exist" are
 /// different facts and the right reaction differs by call site: on the read
 /// path an out-of-range count is fatal framing (waiting for those octets would
-/// stall forever), while on the send path it is text in a buffer we built, so
-/// it simply is not a boundary we own. Collapsing the two into `None` is what
-/// let the ceiling go unenforced.
+/// stall forever), while in a caller-supplied SEARCH criteria string it is
+/// text the validator has already judged. Collapsing the two into `None` is
+/// what let the ceiling go unenforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LiteralMarker {
     /// Well-formed marker whose count is a legal RFC 9051 `number64`.
@@ -32,6 +30,11 @@ pub(crate) enum LiteralMarker {
 }
 
 /// Parse a literal marker at `pos`.
+///
+/// The one marker parser, shared by the read path's framing pre-check and the
+/// encoder's walk over caller-written SEARCH-family criteria. The encoder
+/// never scans its OWN output: the boundaries of the literals it emits are
+/// recorded structurally by `codec::encode::CommandWriter` as it writes them.
 ///
 /// The count is carried as `u64`, not `usize`: RFC 9051 Section 9 declares it
 /// as `number64`, so a marker can name a value that no `usize` on a 32-bit
@@ -94,146 +97,3 @@ pub(crate) fn literal_marker_at(buf: &[u8], pos: usize) -> LiteralMarker {
         synchronizing,
     }
 }
-
-/// [`literal_marker_at`] for callers that scan a buffer we built ourselves, so
-/// neither an out-of-range count nor one that no `usize` can hold can be a
-/// marker they own: both are ordinary text, exactly like a malformed marker.
-fn literal_marker_at_usize(buf: &[u8], pos: usize) -> Option<(usize, usize, bool)> {
-    match literal_marker_at(buf, pos) {
-        LiteralMarker::Counted {
-            data_start,
-            size,
-            synchronizing,
-        } => Some((data_start, usize::try_from(size).ok()?, synchronizing)),
-        LiteralMarker::CountOutOfRange { .. } | LiteralMarker::NotAMarker => None,
-    }
-}
-
-/// Find the next synchronizing literal boundary (`{digits}\r\n`) in `buf`.
-///
-/// Returns `Some((offset, size))` where `offset` is past the `\r\n` (i.e., the
-/// literal data starts at `buf[offset..]`), and `size` is the literal byte count.
-/// Returns `None` if no literal is found.
-///
-/// Only matches `{digits}\r\n` (synchronizing), NOT `{digits+}\r\n` (LITERAL+).
-pub(super) fn find_literal_boundary(buf: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while i < buf.len() {
-        if let Some((data_start, size, synchronizing)) = literal_marker_at_usize(buf, i) {
-            if synchronizing {
-                return Some((data_start, size));
-            }
-
-            // LITERAL+ has no continuation, but its counted payload is still
-            // opaque command data. Do not inspect marker-like bytes in it.
-            let data_end = data_start.checked_add(size)?;
-            if data_end > buf.len() {
-                return None;
-            }
-            i = data_end;
-            continue;
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Patch all synchronizing literal markers in `buf` to non-synchronizing (LITERAL+).
-///
-/// Replaces every `{digits}\r\n` with `{digits+}\r\n` (RFC 7888 Section 4).
-/// Length-aware: after patching a marker, skips the literal body so that
-/// `{digits}\r\n` patterns inside literal data are not modified.
-///
-/// Literal8 markers (`~{digits}\r\n`, RFC 3516) are only converted when the
-/// caller indicates that both BINARY and the relevant literal extension are
-/// active (RFC 7888 Section 6).
-pub(super) fn patch_literals_to_plus_with_binary(buf: &[u8], allow_literal8: bool) -> BytesMut {
-    let mut result = BytesMut::with_capacity(buf.len() + 16);
-    let mut i = 0;
-    while i < buf.len() {
-        if let Some((data_start, size, synchronizing)) = literal_marker_at_usize(buf, i) {
-            if synchronizing {
-                // RFC 7888 Section 6 / RFC 3516: literal8 markers (`~{N}\r\n`)
-                // may only use the non-synchronizing form when BINARY is also
-                // advertised alongside LITERAL+.
-                let is_literal8 = i > 0 && buf[i - 1] == b'~';
-                result.extend_from_slice(&buf[i..data_start - 3]);
-                if !is_literal8 || allow_literal8 {
-                    result.extend_from_slice(b"+}\r\n");
-                } else {
-                    result.extend_from_slice(b"}\r\n");
-                }
-            } else {
-                result.extend_from_slice(&buf[i..data_start]);
-            }
-
-            let body_end = data_start
-                .checked_add(size)
-                .map_or(buf.len(), |end| end.min(buf.len()));
-            result.extend_from_slice(&buf[data_start..body_end]);
-            i = body_end;
-            continue;
-        }
-        result.extend_from_slice(&buf[i..=i]);
-        i += 1;
-    }
-    result
-}
-
-/// Patch synchronizing literals up to 4096 bytes to non-synchronizing (LITERAL-).
-///
-/// Converts `{digits}\r\n` to `{digits+}\r\n` only when `digits` (the
-/// literal octet count) is <= 4096.
-/// Larger literals are left as synchronizing, per RFC 7888 Section 5.
-///
-/// Literal8 markers (`~{digits}\r\n`, RFC 3516) are only converted when the
-/// caller indicates that both BINARY and the relevant literal extension are
-/// active (RFC 7888 Section 6).
-///
-/// Length-aware: after patching (or skipping) a marker, skips the literal
-/// body so that `{digits}\r\n` patterns inside literal data are not modified
-/// (RFC 3501 Section 4.3).
-pub(super) fn patch_small_literals_to_plus_with_binary(
-    buf: &[u8],
-    allow_literal8: bool,
-) -> BytesMut {
-    /// RFC 7888 Section 5: LITERAL- limit.
-    const LITERAL_MINUS_MAX: usize = 4096;
-
-    let mut result = BytesMut::with_capacity(buf.len() + 16);
-    let mut i = 0;
-    while i < buf.len() {
-        if let Some((data_start, size, synchronizing)) = literal_marker_at_usize(buf, i) {
-            if synchronizing {
-                // RFC 7888 Section 6 / RFC 3516: literal8 markers (`~{N}\r\n`)
-                // may only use the non-synchronizing form when BINARY is also
-                // advertised alongside the literal extension.
-                let is_literal8 = i > 0 && buf[i - 1] == b'~';
-                result.extend_from_slice(&buf[i..data_start - 3]);
-                if size <= LITERAL_MINUS_MAX && (!is_literal8 || allow_literal8) {
-                    // RFC 7888 Section 5: small literal, upgrade to non-synchronizing.
-                    result.extend_from_slice(b"+}\r\n");
-                } else {
-                    // Large literal or literal8: leave as synchronizing.
-                    result.extend_from_slice(b"}\r\n");
-                }
-            } else {
-                result.extend_from_slice(&buf[i..data_start]);
-            }
-
-            let body_end = data_start
-                .checked_add(size)
-                .map_or(buf.len(), |end| end.min(buf.len()));
-            result.extend_from_slice(&buf[data_start..body_end]);
-            i = body_end;
-            continue;
-        }
-        result.extend_from_slice(&buf[i..=i]);
-        i += 1;
-    }
-    result
-}
-
-#[cfg(test)]
-#[path = "literals_tests.rs"]
-mod tests;

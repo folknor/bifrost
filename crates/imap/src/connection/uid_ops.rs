@@ -82,7 +82,7 @@ impl ImapConnection {
         ),
         Error,
     > {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Fetch)?;
         self.require_condstore()?;
         self.validate_requested_fetch_items(items)?;
         if sequence_set.as_str().contains('$') {
@@ -109,7 +109,7 @@ impl ImapConnection {
         changed_since: Option<u64>,
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(cmd.kind())?;
         if changed_since.is_some() {
             self.require_condstore()?;
         }
@@ -145,7 +145,7 @@ impl ImapConnection {
         mod_seq: u64,
         timeout: Duration,
     ) -> Result<(Vec<FetchResponse>, Vec<UidRange>), Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Fetch)?;
         self.validate_requested_fetch_items(items)?;
         // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
         if sequence_set.as_str().contains('$') {
@@ -202,7 +202,7 @@ impl ImapConnection {
         ),
         Error,
     > {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Fetch)?;
         self.validate_requested_fetch_items(items)?;
         if sequence_set.as_str().contains('$') {
             self.require_searchres()?;
@@ -334,7 +334,7 @@ impl ImapConnection {
         tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(cmd.kind())?;
         tokio::time::timeout(
             timeout,
             self.submit_streaming(cmd, dispatch::BoundedStreamingFetchConsumer::new(tx)),
@@ -379,7 +379,7 @@ impl ImapConnection {
         _label: &str,
         timeout: Duration,
     ) -> Result<SearchResult, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(cmd.kind())?;
         // RFC 6855 Section 6: SEARCH criteria are free-form strings, so a
         // UTF8=ONLY server requires ENABLE UTF8=ACCEPT before SEARCH.
         self.check_utf8_only_enforced()?;
@@ -433,7 +433,7 @@ impl ImapConnection {
         _label: &str,
         timeout: Duration,
     ) -> Result<EsearchResponse, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(cmd.kind())?;
         // RFC 6855 Section 6: ESEARCH is an extended SEARCH form and uses the
         // same free-form criteria strings, so it must honor UTF8=ONLY too.
         self.check_utf8_only_enforced()?;
@@ -506,7 +506,7 @@ impl ImapConnection {
         unchanged_since: Option<u64>,
         timeout: Duration,
     ) -> Result<StoreResult, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(cmd.kind())?;
         if unchanged_since.is_some() {
             self.require_condstore()?;
         }
@@ -541,7 +541,7 @@ impl ImapConnection {
         mailbox: &str,
         timeout: Duration,
     ) -> Result<MoveResult, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Move)?;
         self.check_utf8_only_enforced()?;
         // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
         if sequence_set.as_str().contains('$') {
@@ -661,7 +661,7 @@ impl ImapConnection {
         cmd: Command,
         timeout: Duration,
     ) -> Result<CopyResult, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(cmd.kind())?;
         self.check_utf8_only_enforced()?;
         tokio::time::timeout(
             timeout,
@@ -706,7 +706,7 @@ impl ImapConnection {
 
     /// The local admission checks for UID EXPUNGE, then the command.
     fn uid_expunge_command(&self, sequence_set: &SequenceSet) -> Result<Command, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Expunge)?;
         // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
         if sequence_set.as_str().contains('$') {
             self.require_searchres()?;
@@ -734,7 +734,7 @@ impl ImapConnection {
     /// `VANISHED` responses instead of `EXPUNGE`, and this method returns
     /// `ExpungeResult::Vanished` with UID ranges.
     pub async fn expunge(&self, timeout: Duration) -> Result<ExpungeResult, Error> {
-        self.require_state(&[SessionState::Selected])?;
+        self.require_state(crate::types::CommandKind::Expunge)?;
         tokio::time::timeout(
             timeout,
             self.submit_regular(Command::Expunge, dispatch::ExpungeConsumer::new()),
