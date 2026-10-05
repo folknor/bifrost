@@ -159,7 +159,7 @@ impl ImapConnection {
                     messages: messages.to_vec(),
                     multi: true,
                 },
-                MultiAppendConsumer::default(),
+                MultiAppendConsumer::new(messages.len()),
             ),
         )
         .await

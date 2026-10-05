@@ -5,8 +5,9 @@ use crate::error::Error;
 ///
 /// Distinguished from [`Error`] because pipeline execution has three
 /// failure classes: per-command errors (embedded in the result tuple as
-/// `Result<T, Error>`), pipeline-level driver errors (encoding failure
-/// that aborts the whole batch), and type-mismatch bugs (internal only).
+/// `Result<T, Error>`, including a failure that ended the batch after its
+/// first byte), pipeline-level refusals before any byte (the whole batch
+/// refused), and type-mismatch bugs (internal only).
 #[derive(Debug)]
 pub enum PipelineError {
     /// The driver task has exited  -  the command channel is closed. Carries
@@ -15,10 +16,10 @@ pub enum PipelineError {
     /// owned it and died before answering, so a batch that may have been
     /// written is not reported as one that certainly was not.
     Disconnected(Error),
-    /// A pipeline-level error: a local refusal of the whole batch before
-    /// anything was submitted or written (a command the session state does
-    /// not permit, an encoding failure), or a driver failure that ended the
-    /// batch.
+    /// A pipeline-level refusal of the whole batch before anything was
+    /// written (a command the session state does not permit, an encoding
+    /// failure). Nothing ran. A failure after the first byte is never this:
+    /// it is reported in each unanswered command's own result.
     Driver(Error),
     /// Internal error: a consumer returned a type that does not match
     /// the expected downcast target. This indicates a bug in the

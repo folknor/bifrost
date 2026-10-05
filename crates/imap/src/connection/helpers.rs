@@ -92,12 +92,24 @@ impl ImapConnection {
     /// The driver reads the same table again when the command reaches the
     /// head of its queue and reports a mismatch there as
     /// `StateChangedBeforeSend`: the two errors differ because the facts
-    /// differ, the table does not.
+    /// differ, the table does not. Session history is read the same way at
+    /// both sites: a command `CommandKind::refused_after_selection` (ENABLE)
+    /// is `InvalidState` once any mailbox has been selected in the session.
     pub(super) fn require_state(&self, kind: crate::types::CommandKind) -> Result<(), Error> {
         let snap = self.state_rx.borrow();
         let session_state = snap.session_state;
+        let mailbox_selected = snap.mailbox_selected;
         drop(snap);
-        state_refusal(session_state, kind.legal_states()).map_or(Ok(()), Err)
+        if let Some(refusal) = state_refusal(session_state, kind.legal_states()) {
+            return Err(refusal);
+        }
+        if kind.refused_after_selection() && mailbox_selected {
+            return Err(Error::InvalidState(format!(
+                "{kind:?} is not valid once a mailbox has been selected in the session \
+                 (RFC 5161 Section 3.1)"
+            )));
+        }
+        Ok(())
     }
 
     /// Verify that the server supports CONDSTORE (RFC 7162 Section 3.1).

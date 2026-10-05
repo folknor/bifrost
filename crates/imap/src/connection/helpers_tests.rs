@@ -258,6 +258,7 @@ fn snapshot_supports_matches_the_authority() {
             session_state: SessionState::Authenticated,
             capabilities: capabilities.clone(),
             enabled: enabled.clone(),
+            mailbox_selected: false,
         };
         for capability in every_capability() {
             assert_eq!(

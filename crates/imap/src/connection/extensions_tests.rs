@@ -189,6 +189,57 @@ async fn enable_is_authenticated_state_only() {
     ));
 }
 
+/// RFC 5161 Section 3.1: ENABLE is valid only "before any mailbox is
+/// selected", and a CLOSE that returns the session to Authenticated does not
+/// undo the selection. The handle refuses it from session history, before a
+/// byte is written: the next line on the wire is the NOOP.
+///
+/// Removing the history check from `require_state` fails this: the session
+/// is Authenticated, so the state table alone admits ENABLE, and its line
+/// reaches the wire ahead of the NOOP.
+#[tokio::test]
+async fn enable_is_refused_after_a_mailbox_was_selected_and_closed() {
+    use crate::connection::test_support::{
+        driver_pair, preauth_greeting, read_line, respond, select_inbox, tag_of,
+    };
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ENABLE QRESYNC")).await;
+    select_inbox(&conn, &mut server).await;
+
+    let close = conn.close(Duration::from_secs(5));
+    let script = async {
+        let line = read_line(&mut server).await;
+        assert!(line.contains("CLOSE"), "not CLOSE: {line:?}");
+        let tag = tag_of(&line).to_owned();
+        respond(&mut server, &format!("{tag} OK closed\r\n")).await;
+    };
+    let (closed, ()) = tokio::join!(close, script);
+    closed.unwrap();
+    assert_eq!(
+        conn.state_rx.borrow().session_state,
+        SessionState::Authenticated
+    );
+
+    let err = conn
+        .enable(&["QRESYNC"], Duration::from_secs(5))
+        .await
+        .expect_err("ENABLE after a selection is illegal");
+    assert!(matches!(err, Error::InvalidState(_)), "got {err:?}");
+
+    let noop = conn.noop(Duration::from_secs(5));
+    let script = async {
+        let line = read_line(&mut server).await;
+        assert!(
+            line.contains("NOOP"),
+            "the refused ENABLE reached the wire: {line:?}"
+        );
+        let tag = tag_of(&line).to_owned();
+        respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+    };
+    let (nooped, ()) = tokio::join!(noop, script);
+    nooped.unwrap();
+}
+
 #[tokio::test]
 async fn compress_is_rejected_before_authentication() {
     let not_auth = detached(

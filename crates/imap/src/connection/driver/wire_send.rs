@@ -238,13 +238,25 @@ pub(super) async fn wait_for_continuation(
             }
         }
 
+        // Our own tagged OK before the `+`: the command did not execute, so
+        // the effects armed for it (`in_auth`, `in_select`, the NOTIFY
+        // registration) must not complete on this OK. The pipeline router
+        // withholds them the same way; a NO/BAD keeps them.
+        if matches!(
+            resp,
+            crate::types::Response::Tagged(ref t)
+                if t.tag == own_tag && t.status == StatusKind::Ok
+        ) {
+            state.disarm_pending_effects();
+        }
         let digest = state.apply_side_effects(&resp);
         match resp {
             crate::types::Response::Continuation(_) => return Ok(ContinuationOutcome::Granted),
             crate::types::Response::Tagged(t) if t.tag == own_tag => {
                 // The server ended the command before the literal was sent.
                 // It processed the prefix, so this is Acknowledged. Side
-                // effects already applied (RFC 3501 Section4.3).
+                // effects already applied (RFC 3501 Section4.3), except an
+                // early OK's, disarmed above.
                 super::emit_tagged_response_code_events(&t, event_sink);
                 return match t.status {
                     // NO/BAD are tagged responses - inherently Acknowledged.

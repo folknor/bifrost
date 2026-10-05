@@ -256,15 +256,13 @@ pub(crate) fn draft_create(
         let raw = draft_patch_to_rfc5322(&patch)?;
         let err = op_err(AccountOperation::DraftCreate);
         let conn = account.pool.checkout_any().await.map_err(err)?;
+        // The rendered draft is owned: `append_message` carries it to the
+        // socket without the copy `append(&[u8])` would make.
+        let mut message = crate::types::AppendMessage::new(raw);
+        message.flags = vec![Flag::Draft];
         let appended = conn
             .connection()
-            .append(
-                folder.as_str(),
-                &[Flag::Draft],
-                None,
-                &raw,
-                account.command_timeout(),
-            )
+            .append_message(folder.as_str(), message, account.command_timeout())
             .await
             .map_err(err)?;
         let Some((uidvalidity, uid)) = appended else {
@@ -316,9 +314,10 @@ pub(crate) fn send_message(
         // who was blind copied); only the transmitted body strips it. The
         // assembler hands back a distinct Bcc-bearing body when a Bcc is
         // present, else the two are identical and we reuse `raw`.
-        let sent_body = rendered.sent_copy.as_deref().unwrap_or(&rendered.raw);
+        let sent_body = rendered.sent_copy.unwrap_or(rendered.raw);
         let object_id =
-            append_to_sent_or_fallback(&account, sent_body, save, &rendered.message_id).await;
+            append_to_sent_or_fallback(&account, sent_body.into(), save, &rendered.message_id)
+                .await;
         Ok(object_id)
     })
 }
@@ -348,7 +347,7 @@ pub(crate) fn send_raw_message(
         // verbatim caller bytes (Bcc header retained, the sender's record);
         // only `parsed.body` strips Bcc for the wire.
         let save = save_to_sent.unwrap_or_else(|| submission.save_to_sent_default());
-        let object_id = append_to_sent_or_fallback(&account, &raw, save, &parsed.message_id).await;
+        let object_id = append_to_sent_or_fallback(&account, raw, save, &parsed.message_id).await;
         Ok(object_id)
     })
 }
@@ -385,7 +384,7 @@ pub(crate) fn draft_send(
         // only `parsed.body` (the transmitted bytes) strips it.
         let object_id = append_to_sent_or_fallback(
             &account,
-            &raw,
+            raw.into(),
             submission.save_to_sent_default(),
             &parsed.message_id,
         )
@@ -413,9 +412,13 @@ pub(crate) fn draft_send(
 /// fallback `Message-ID` (controlled domain). A failed APPEND after a
 /// committed send is non-fatal: the send already succeeded, so we never
 /// re-drive SMTP; the uncertain Sent state is logged for reconcile.
+///
+/// Takes the message by value: `append_message` carries that allocation to the
+/// socket as it is, where `append(&[u8])` would copy the whole message once
+/// more just to cross the driver channel.
 async fn append_to_sent_or_fallback(
     account: &ImapAccount,
-    raw: &[u8],
+    raw: bytes::Bytes,
     save: bool,
     fallback_message_id: &str,
 ) -> ObjectId {
@@ -442,15 +445,11 @@ async fn append_to_sent_or_fallback(
             return fallback();
         }
     };
+    let mut message = crate::types::AppendMessage::new(raw);
+    message.flags = vec![Flag::Seen];
     match conn
         .connection()
-        .append(
-            sent.as_str(),
-            &[Flag::Seen],
-            None,
-            raw,
-            account.command_timeout(),
-        )
+        .append_message(sent.as_str(), message, account.command_timeout())
         .await
     {
         Ok(Some((uidvalidity, uid))) => encode_object_id(&sent, uidvalidity, uid),

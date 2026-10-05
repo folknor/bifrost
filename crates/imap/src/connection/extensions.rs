@@ -172,9 +172,10 @@ impl ImapConnection {
     ///
     /// # State requirement
     ///
-    /// RFC 5161 Section 2: ENABLE is valid only in the Authenticated state,
+    /// RFC 5161 Section 3.1: ENABLE is valid only in the Authenticated state,
     /// before any mailbox is selected. Attempting to ENABLE in the Selected
-    /// state returns [`Error::InvalidState`].
+    /// state, or after a mailbox was selected and then closed or unselected,
+    /// returns [`Error::InvalidState`].
     ///
     /// # Ordering constraint
     ///

@@ -2,7 +2,7 @@ use bifrost_types::TransmissionState;
 use tracing::trace;
 
 use crate::codec::classification::{self, ClassificationContext, SolicitationRule};
-use crate::codec::encode::encode_command;
+use crate::codec::encode::{WireCommand, encode_command};
 use crate::error::Error;
 use crate::types::Command;
 use crate::types::validated::MailboxName;
@@ -15,14 +15,16 @@ use super::{ConsumerErased, PipelineResults};
 pub(super) type SubBatchEntry = (usize, Command, Box<dyn ConsumerErased>);
 
 /// Group commands into sub-batches where each sub-batch contains at most
-/// one command per [`CommandKind`](crate::types::CommandKind).
+/// one command per untagged routing key
+/// ([`CommandKind::untagged_routing_key`](crate::types::CommandKind::untagged_routing_key)).
 ///
-/// RFC 3501 Section5.5: when multiple commands of the same kind are pipelined,
-/// their untagged responses may interleave and the head-consumer routing
-/// heuristic cannot disambiguate which consumer owns which response. By
-/// splitting duplicate kinds into separate sub-batches executed
-/// sequentially, each batch is guaranteed to have unique kinds and
-/// head-consumer routing is correct.
+/// RFC 3501 Section5.5: when multiple commands that solicit the same untagged
+/// response are pipelined, their responses may interleave and the
+/// head-consumer routing heuristic cannot disambiguate which consumer owns
+/// which response. That holds for two commands of one kind and equally for
+/// two kinds that solicit a common response (GETQUOTA and GETQUOTAROOT both
+/// own `* QUOTA`). Splitting them into separate sub-batches executed
+/// sequentially makes head-consumer routing correct within each.
 ///
 /// Each entry in the returned sub-batches carries its original index in
 /// the input `commands` vec for result reassembly.
@@ -41,7 +43,7 @@ pub(super) fn group_into_sub_batches(
     let mut max_batch: usize = 0;
 
     for (original_idx, (cmd, consumer)) in commands.into_iter().zip(consumers).enumerate() {
-        let kind = cmd.kind();
+        let kind = cmd.kind().untagged_routing_key();
         // Find the first sub-batch at or after max_batch that doesn't
         // already have this kind. The max_batch constraint ensures
         // commands are never placed in a batch before any preceding
@@ -342,14 +344,8 @@ pub(super) fn route_pipeline_response(
         }
         crate::types::Response::Untagged(u) => {
             // The prologue's BYE short-circuit stays AHEAD of any routing, so
-            // an untagged BYE during a pipelined literal send still aborts the
-            // batch and loses every result. That was considered and declined,
-            // not overlooked: a BYE means the connection is closing, and
-            // handing back partial results while tearing down is a more
-            // confusing contract than failing. Changing it means
-            // `run_pipeline_batch` returning `(PipelineResults, Option<Error>)`,
-            // which ripples into the sub-batch loop and the driver's fatal
-            // check; re-raise it only with that whole shape in hand.
+            // an untagged BYE ends the batch. Commands already answered keep
+            // their results (`PipelineEnd::Ran`); the rest carry the BYE.
             // The router runs only once some of the batch is on the wire, and
             // a BYE completes none of it: InFlight.
             let code_emitted = super::process_untagged_prefix(
@@ -472,20 +468,62 @@ pub(super) fn route_pipeline_response(
     }
 }
 
+/// How a pipelined batch ended.
+///
+/// The line between the two arms is the first byte. Before it, the whole batch
+/// is refused and the connection is untouched. After it, commands may have
+/// executed, so a failure never replaces the results the server already gave:
+/// every command gets its own slot, and the slots say which lane each command
+/// is in.
+pub(super) enum PipelineEnd {
+    /// Refused before any byte was written: a command the batch may not carry,
+    /// a command the live session does not permit, or an encoding refusal.
+    /// Nothing ran, the framing is intact, and the connection stays usable.
+    Refused(Error),
+    /// The batch went on the wire. `results` has one entry per command, in
+    /// submission order, in one of three lanes:
+    ///
+    /// * completed - the command's own result (its output, or the server's
+    ///   tagged `NO`/`BAD`);
+    /// * outstanding - the command may have reached the server but no answer
+    ///   was read: the ending failure stamped `InFlight`;
+    /// * unsent - no byte of the command was written: the ending failure
+    ///   stamped `Unsent`.
+    ///
+    /// `failure` is the error that ended the batch early, if one did. Such a
+    /// batch can leave commands on the wire whose responses nobody will read,
+    /// so the driver retires the connection whenever it is `Some`.
+    ///
+    /// The `InFlight` / `Unsent` stamps ride `Error::with_attempt`, which is a
+    /// no-op for variants without an attempt field (`Protocol`, `Parse`). Such
+    /// a slot reads as `Unsent` whichever lane it is in; both are
+    /// provider-contract violations whose recovery does not depend on it.
+    Ran {
+        results: PipelineResults,
+        failure: Option<Error>,
+    },
+}
+
 /// Execute a batch of pipelined commands, splitting into sub-batches
-/// when duplicate [`CommandKind`]s are present.
+/// when commands share an untagged routing key.
 ///
 /// RFC 3501 Section5.5: clients may send multiple commands without waiting for
 /// a response, but untagged responses may interleave and the head-consumer
-/// routing heuristic cannot disambiguate when two consumers share the same
-/// `CommandKind`. This function groups commands into sub-batches where each
-/// sub-batch contains at most one command per `CommandKind`, then executes
-/// each sub-batch via [`run_pipeline_batch`]. Results are reassembled in
-/// original command order.
+/// routing heuristic cannot disambiguate when two consumers can both claim a
+/// response. This function groups commands into sub-batches where no two
+/// commands of one sub-batch share a
+/// [`CommandKind::untagged_routing_key`](crate::types::CommandKind::untagged_routing_key),
+/// then executes each sub-batch via [`run_pipeline_batch`]. Results are
+/// reassembled in original command order.
 ///
-/// When all commands have unique kinds (the common case), only one
-/// sub-batch is created and the function delegates directly without
-/// grouping overhead.
+/// Everything that can refuse the batch happens before the first byte of the
+/// FIRST sub-batch: admission, and encoding of every command. A refusal after
+/// an earlier sub-batch had run would report a local refusal beside an
+/// acknowledged mutation, and discard that mutation's result. The whole batch
+/// is therefore encoded against one state snapshot, which holds because no
+/// pipelinable command changes the session state or the encode options; a
+/// capability change the server announces mid-batch applies from the next
+/// command after the batch.
 pub(super) async fn run_pipeline(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
@@ -493,10 +531,13 @@ pub(super) async fn run_pipeline(
     event_sink: &mut event_sink::DriverEventSink,
     commands: Vec<Command>,
     consumers: Vec<Box<dyn ConsumerErased>>,
-) -> Result<PipelineResults, Error> {
+) -> PipelineEnd {
     let count = commands.len();
     if count == 0 {
-        return Ok(Vec::new());
+        return PipelineEnd::Ran {
+            results: Vec::new(),
+            failure: None,
+        };
     }
 
     // Admission, over the WHOLE original vector before any grouping or any
@@ -507,215 +548,258 @@ pub(super) async fn run_pipeline(
     // command the live session does not permit is the same head-of-queue
     // refusal a single command gets (`live_state_refusal`); the handle
     // checked every command at execution, so reaching here means the session
-    // moved while the batch was queued. The batch is encoded and admitted
-    // against one session state, which holds because no pipelinable command
-    // changes it (a BYE mid-batch is fatal instead).
+    // moved while the batch was queued.
     if let Some(cmd) = commands.iter().find(|cmd| !cmd.kind().pipelinable()) {
-        return Err(Error::Internal(format!(
+        return PipelineEnd::Refused(Error::Internal(format!(
             "{:?} cannot be pipelined (CommandKind::pipelinable)",
             cmd.kind()
         )));
     }
     for cmd in &commands {
-        if let Some(refusal) = super::live_state_refusal(state.session_state(), cmd.kind()) {
-            return Err(refusal);
+        if let Some(refusal) = super::live_state_refusal(state, cmd.kind()) {
+            return PipelineEnd::Refused(refusal);
+        }
+    }
+
+    // Encode every command, of every sub-batch, before any byte. Tags are
+    // drawn in submission order, which is also wire order: grouping never
+    // moves a command ahead of one submitted before it.
+    let opts = super::build_encode_options(state);
+    let mut tags: Vec<String> = Vec::with_capacity(count);
+    let mut wires: Vec<Option<WireCommand>> = Vec::with_capacity(count);
+    for cmd in &commands {
+        let tag = tag_gen.next();
+        match encode_command(&tag, cmd, &opts) {
+            Ok(wire) => {
+                tags.push(tag);
+                wires.push(Some(wire));
+            }
+            Err(refusal) => return PipelineEnd::Refused(refusal),
         }
     }
 
     // Transmission evidence is relative to the WHOLE pipeline, not to a
     // sub-batch: the socket counter is read once here and carried through
-    // every sub-batch. Read per sub-batch, a second sub-batch whose first
-    // write reached nothing would be stamped `Unsent` after the first
-    // sub-batch had already executed - and the error replaces its results -
-    // inviting a retry that repeats a mutation the server performed.
+    // every sub-batch, so the error that ends the batch is `InFlight` once
+    // any byte of the pipeline reached the socket. The per-command lanes are
+    // judged separately, from where each command stood.
     let baseline = wire_reader.written();
 
-    // Check whether all commands have unique kinds. If so, skip the
-    // grouping overhead and delegate directly to run_pipeline_batch.
-    let has_duplicates = {
-        let mut seen = std::collections::HashSet::with_capacity(count);
-        commands.iter().any(|cmd| !seen.insert(cmd.kind()))
-    };
-
-    if !has_duplicates {
-        // Fast path: all kinds unique, single batch is safe.
-        return run_pipeline_batch(
-            wire_reader,
-            state,
-            tag_gen,
-            event_sink,
-            commands,
-            consumers,
-            baseline,
-        )
-        .await;
-    }
-
     let sub_batches = group_into_sub_batches(commands, consumers);
-
-    let num_batches = sub_batches.len();
     trace!(
         count,
-        num_batches, "driver: splitting pipeline into sub-batches"
+        num_batches = sub_batches.len(),
+        "driver: sending pipeline"
     );
 
-    // Pre-allocate results vec indexed by original command position.
     let mut all_results: Vec<Option<Result<Box<dyn std::any::Any + Send>, Error>>> =
         (0..count).map(|_| None).collect();
+    let mut failure: Option<Error> = None;
 
     // Execute each sub-batch sequentially.
     for entries in sub_batches {
         let original_indices: Vec<usize> = entries.iter().map(|(idx, _, _)| *idx).collect();
+        if let Some(error) = &failure {
+            // An earlier sub-batch ended the pipeline: nothing of this one
+            // was written.
+            for idx in original_indices {
+                all_results[idx] = Some(Err(error.clone().with_attempt(TransmissionState::Unsent)));
+            }
+            continue;
+        }
+
         let (batch_cmds, batch_consumers): (Vec<Command>, Vec<Box<dyn ConsumerErased>>) = entries
             .into_iter()
             .map(|(_, cmd, cons)| (cmd, cons))
             .unzip();
+        let batch_tags: Vec<String> = original_indices
+            .iter()
+            .map(|&idx| std::mem::take(&mut tags[idx]))
+            .collect();
+        let batch_wires: Vec<WireCommand> = original_indices
+            .iter()
+            .filter_map(|&idx| wires[idx].take())
+            .collect();
+        let mut batch_results: Vec<Option<Result<Box<dyn std::any::Any + Send>, Error>>> =
+            (0..original_indices.len()).map(|_| None).collect();
 
-        let batch_results = run_pipeline_batch(
+        let outcome = run_pipeline_batch(
             wire_reader,
             state,
-            tag_gen,
             event_sink,
-            batch_cmds,
-            batch_consumers,
+            SubBatch {
+                commands: batch_cmds,
+                consumers: batch_consumers,
+                tags: batch_tags,
+                wires: batch_wires,
+            },
+            &mut batch_results,
             baseline,
         )
-        .await?;
+        .await;
 
-        // Place batch results at their original indices.
-        for (batch_pos, result) in batch_results.into_iter().enumerate() {
-            all_results[original_indices[batch_pos]] = Some(result);
+        if let Err(BatchFailure { error, sent }) = outcome {
+            // The completed lane keeps its results. Of the rest, a command at
+            // a position below `sent` may have reached the server; the others
+            // were never written.
+            for (pos, slot) in batch_results.iter_mut().enumerate() {
+                if slot.is_none() {
+                    let phase = if pos < sent {
+                        TransmissionState::InFlight
+                    } else {
+                        TransmissionState::Unsent
+                    };
+                    *slot = Some(Err(error.clone().with_attempt(phase)));
+                }
+            }
+            failure = Some(error);
+        }
+
+        for (pos, result) in batch_results.into_iter().enumerate() {
+            all_results[original_indices[pos]] = result;
         }
     }
 
-    // Convert Option<Result> to Result. Every entry should be Some
-    // after executing all sub-batches.
-    Ok(all_results
-        .into_iter()
-        .map(|r| r.unwrap_or_else(|| Err(Error::Internal("missing pipeline result".into()))))
-        .collect())
+    PipelineEnd::Ran {
+        results: all_results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(Error::Internal("missing pipeline result".into()))))
+            .collect(),
+        failure,
+    }
+}
+
+/// One sub-batch's commands with everything prepared for them before the
+/// pipeline's first byte, parallel by position.
+struct SubBatch {
+    commands: Vec<Command>,
+    consumers: Vec<Box<dyn ConsumerErased>>,
+    tags: Vec<String>,
+    wires: Vec<WireCommand>,
+}
+
+/// Why a sub-batch stopped before every command was answered.
+struct BatchFailure {
+    /// The error that ended it, stamped against the pipeline's baseline.
+    error: Error,
+    /// How many of the sub-batch's commands, in order, may have reached the
+    /// server. The rest were never written.
+    sent: usize,
 }
 
 /// Execute a single sub-batch of pipelined commands through the
 /// classification-based dispatcher with tag-completion barrier.
 ///
-/// **Precondition**: all commands in the batch have unique
-/// [`CommandKind`]s. This is guaranteed by [`run_pipeline`] which splits
-/// duplicate kinds into separate sub-batches.
+/// **Precondition**: no two commands in the batch share an untagged routing
+/// key. This is guaranteed by [`run_pipeline`], which also admitted and
+/// encoded every command, against one state snapshot, before the pipeline's
+/// first byte.
 ///
 /// RFC 3501 Section5.5: clients may send multiple commands without waiting for
 /// a response. The server processes them in order, but responses may
 /// interleave. This function:
 ///
-/// 1. Snapshots encode options (C7 fix: capability state at batch start).
-/// 2. Encodes all commands before sending any bytes, and builds the routing
-///    tables. Any encode failure aborts the entire batch.
-/// 3. Sends all commands on the wire. The write pattern follows each
+/// 1. Builds the routing tables.
+/// 2. Sends all commands on the wire. The write pattern follows each
 ///    command's encoded segments, never the negotiated literal mode: when no
 ///    command has a synchronizing literal the whole batch is one coalesced
 ///    write, otherwise each command goes through the shared sender, which
 ///    stops at every synchronizing marker until it is granted.
-/// 4. Reads responses, routing each to the correct consumer by tag.
+/// 3. Reads responses, routing each to the correct consumer by tag.
 ///    Untagged responses are classified against the head (first
 ///    non-finalized) consumer's command kind. Once a consumer is
 ///    finalized (its tagged response arrived), it can no longer receive
 ///    untagged responses: the tag-completion barrier.
 ///
-/// The routing tables are built BEFORE step 3 rather than after it because
+/// The routing tables are built BEFORE step 2 rather than after it because
 /// the send phase reads from the socket too. Whenever a synchronizing literal
 /// forces a continuation wait, commands already on the wire have tags still
 /// pending, and their responses arrive during that wait. Routing them needs
-/// the same tables step 4 uses, so both loops share one router and the send
+/// the same tables step 3 uses, so both loops share one router and the send
 /// phase is not a consumerless loop.
 ///
-/// Transmission evidence is relative to the whole PIPELINE, not to this
-/// sub-batch or the command being written: `baseline` is the socket counter
-/// `run_pipeline` read once before the first sub-batch, so a failure once any
-/// byte of the pipeline has been accepted is `InFlight` - earlier commands, in
-/// this sub-batch or an earlier one, may already have executed. A batch-level
-/// error still cannot say WHICH commands ran; that is a limit of the
-/// all-or-error result shape.
+/// Every answer is written into `results` (parallel to the sub-batch) the
+/// moment it is read, so a failure part-way leaves the completed lane in
+/// place. The failure says how many commands may have reached the server
+/// (`BatchFailure::sent`); `run_pipeline` stamps the unanswered slots from
+/// it. The failure's own error is judged against `baseline`, the socket
+/// counter `run_pipeline` read once before the first sub-batch, so it is
+/// `InFlight` once any byte of the pipeline has been accepted.
 ///
-/// Continuations (`+`) are errors in the step 4 loop. A pipelinable command
+/// Continuations (`+`) are errors in the step 3 loop. A pipelinable command
 /// does not take continuations of its own (`CommandKind::pipelinable`
 /// excludes AUTHENTICATE and IDLE, and `run_pipeline` refuses a batch holding
 /// one); a `+` during the send phase is the literal grant and belongs to the
 /// sender.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn run_pipeline_batch(
     wire_reader: &mut super::super::wire::WireReader,
     state: &mut super::super::state::ProtocolState,
-    tag_gen: &mut super::super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
-    commands: Vec<Command>,
-    consumers: Vec<Box<dyn ConsumerErased>>,
+    batch: SubBatch,
+    results: &mut [Option<Result<Box<dyn std::any::Any + Send>, Error>>],
     baseline: u64,
-) -> Result<PipelineResults, Error> {
+) -> Result<(), BatchFailure> {
+    let SubBatch {
+        commands,
+        consumers,
+        tags,
+        wires,
+    } = batch;
     let count = commands.len();
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    // 1. Snapshot encode options at start-of-batch (C7 fix).
-    // All commands in the batch are encoded against the same capability
-    // state, preventing mid-pipeline staleness.
-    let opts = super::build_encode_options(state);
-
-    // 2. Encode all commands. Any encode failure aborts the whole batch
-    //    before any bytes go on the wire.
-    let mut tags: Vec<String> = Vec::with_capacity(count);
-    let mut kinds: Vec<crate::types::CommandKind> = Vec::with_capacity(count);
-    let mut targets: Vec<Option<MailboxName>> = Vec::with_capacity(count);
-    let mut encoded_commands = Vec::with_capacity(count);
-
-    for cmd in &commands {
-        let tag = tag_gen.next();
-        let kind = cmd.kind();
-        let target = cmd.mailbox_target().cloned();
-        let encoded = encode_command(&tag, cmd, &opts)?;
-        tags.push(tag);
-        kinds.push(kind);
-        targets.push(target);
-        encoded_commands.push(encoded);
-    }
-
-    // Routing tables, built before the send: see the doc comment.
-    let mut tag_to_idx: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::with_capacity(count);
-    for (i, tag) in tags.iter().enumerate() {
-        tag_to_idx.insert(tag.clone(), i);
-    }
+    // 1. Routing tables, built before the send: see the doc comment.
+    let kinds: Vec<crate::types::CommandKind> = commands.iter().map(Command::kind).collect();
+    let targets: Vec<Option<MailboxName>> = commands
+        .iter()
+        .map(|cmd| cmd.mailbox_target().cloned())
+        .collect();
+    let tag_to_idx: std::collections::HashMap<String, usize> = tags
+        .iter()
+        .enumerate()
+        .map(|(i, tag)| (tag.clone(), i))
+        .collect();
     let mut consumers: Vec<Option<Box<dyn ConsumerErased>>> =
         consumers.into_iter().map(Some).collect();
-    let mut results: Vec<Option<Result<Box<dyn std::any::Any + Send>, Error>>> =
-        (0..count).map(|_| None).collect();
     let mut completed = 0usize;
 
     trace!(count, "driver: sending pipelined batch");
 
-    // 3. Send all commands on the wire. Every write failure below is judged
-    //    against `baseline`, the counter at the start of the whole pipeline.
-    if encoded_commands
-        .iter()
-        .all(|encoded| encoded.segments().len() == 1)
-    {
+    // 2. Send all commands on the wire. Every write failure below is judged
+    //    against `baseline`, the counter at the start of the whole pipeline;
+    //    how many commands it may have carried is judged from where this
+    //    sub-batch, or the command being written, began.
+    if wires.iter().all(|wire| wire.segments().len() == 1) {
         // No synchronizing literal anywhere in the batch (RFC 7888 literals
         // are all `+`, or there are none): the whole batch is one write,
-        // flushed once.
-        let chunks: Vec<&bytes::Bytes> = encoded_commands
+        // flushed once. Which commands a partial write carried is unknown,
+        // so any socket progress counts every command as possibly sent.
+        let start = wire_reader.written();
+        let chunks: Vec<&bytes::Bytes> = wires
             .iter()
-            .flat_map(|encoded| encoded.segments().iter().flatten())
+            .flat_map(|wire| wire.segments().iter().flatten())
             .collect();
         if let Err(e) = wire_reader.write_chunks(&chunks).await {
+            let sent = match write_failure_evidence(wire_reader, start) {
+                TransmissionState::Unsent => 0,
+                _ => count,
+            };
             let evidence = write_failure_evidence(wire_reader, baseline);
-            return Err(e.with_attempt(evidence));
+            return Err(BatchFailure {
+                error: e.with_attempt(evidence),
+                sent,
+            });
         }
     } else {
         // At least one synchronizing literal: send command by command, each
         // stopping at its markers until granted (RFC 3501 Section 4.3), with
         // the batch's routing so earlier commands' responses read during a
         // continuation wait reach their own consumers.
-        for (i, encoded) in encoded_commands.iter().enumerate() {
+        for (i, wire) in wires.iter().enumerate() {
+            let start = wire_reader.written();
             let mut routing = PipelineRouting {
                 sending: Some(i),
                 tag_to_idx: &tag_to_idx,
@@ -724,35 +808,47 @@ async fn run_pipeline_batch(
                 targets: &targets,
                 tags: &tags,
                 consumers: &mut consumers,
-                results: &mut results,
+                results: &mut *results,
                 completed: &mut completed,
             };
-            send_wire_command(
+            if let Err(error) = send_wire_command(
                 wire_reader,
                 state,
                 event_sink,
-                encoded,
+                wire,
                 &tags[i],
                 baseline,
                 Some(&mut routing),
             )
-            .await?;
+            .await
+            {
+                // Every earlier command is fully written. This one may have
+                // reached the server exactly when the socket moved since it
+                // began; a failure while waiting for its `+` always has.
+                let sent = match write_failure_evidence(wire_reader, start) {
+                    TransmissionState::Unsent => i,
+                    _ => i + 1,
+                };
+                return Err(BatchFailure { error, sent });
+            }
         }
     }
 
-    // 4. Response loop with tag-completion barrier.
+    // 3. Response loop with tag-completion barrier. Every command is on the
+    //    wire, so any failure leaves them all possibly sent.
     //
     // The send phase may already have routed responses - and, when the last
     // command's literal was rejected, may already have finalized every
     // command - so the guard is checked before the first read rather than
     // after it.
+    let fail = |error: Error| BatchFailure { error, sent: count };
     while completed < count {
         let utf8 = super::utf8_mode(state);
         // The batch is on the wire: a transport failure here is InFlight.
         let resp = wire_reader
             .read_one(utf8)
             .await
-            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
+            .map_err(|e| fail(e.with_attempt(TransmissionState::InFlight)))?;
         let mut routing = PipelineRouting {
             sending: None,
             tag_to_idx: &tag_to_idx,
@@ -761,29 +857,24 @@ async fn run_pipeline_batch(
             targets: &targets,
             tags: &tags,
             consumers: &mut consumers,
-            results: &mut results,
+            results: &mut *results,
             completed: &mut completed,
         };
-        match route_pipeline_response(state, event_sink, &mut routing, resp)? {
+        match route_pipeline_response(state, event_sink, &mut routing, resp).map_err(fail)? {
             Routed::Continuation => {
                 // Pipelinable commands do not take continuations
                 // (`CommandKind::pipelinable`, checked in `run_pipeline`).
                 // An unexpected + is a protocol error (RFC 3501 Section7.5).
-                return Err(Error::Protocol(
+                return Err(fail(Error::Protocol(
                     "unexpected continuation in pipeline response loop".into(),
-                ));
+                )));
             }
             // Unreachable with `sending: None`: no tag is the own tag.
             Routed::OwnTagRejected | Routed::Continue => {}
         }
     }
 
-    // Collect results in command order. Every entry should be Some after
-    // the loop: the while guard ensures `completed == count`.
-    Ok(results
-        .into_iter()
-        .map(|r| r.unwrap_or_else(|| Err(Error::Internal("missing pipeline result".into()))))
-        .collect())
+    Ok(())
 }
 
 #[cfg(test)]

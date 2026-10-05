@@ -49,6 +49,12 @@ pub(crate) struct ProtocolState {
     notify: NotifyFlags,
     /// Currently selected mailbox, if any (RFC 3501 Section3.3).
     selected: Option<MailboxName>,
+    /// Whether any SELECT or EXAMINE has succeeded in this session, even
+    /// if CLOSE or UNSELECT has since returned it to Authenticated. Session
+    /// history, not session state: RFC 5161 Section 3.1 forbids ENABLE once
+    /// a mailbox has been selected. Reset only by UNAUTHENTICATE, which
+    /// starts a new session (RFC 8437 Section 2).
+    mailbox_selected: bool,
     /// Position-aware notify-flag snapshots. Each entry is the notify
     /// state at the moment a response was received, *before* side
     /// effects fired. See D3's notify snapshot.
@@ -91,6 +97,7 @@ impl ProtocolState {
             capabilities: Vec::new(),
             notify: NotifyFlags::default(),
             selected: None,
+            mailbox_selected: false,
             notify_history: VecDeque::new(),
             enabled: Vec::new(),
             in_logout: false,
@@ -124,6 +131,12 @@ impl ProtocolState {
         &self.enabled
     }
 
+    /// Whether any mailbox has been selected in this session (RFC 5161
+    /// Section 3.1). See the field.
+    pub(crate) fn mailbox_selected(&self) -> bool {
+        self.mailbox_selected
+    }
+
     /// Build a read-only snapshot for the `watch::Sender` channel.
     ///
     /// Called by the driver task after every command completes to publish
@@ -133,6 +146,7 @@ impl ProtocolState {
             session_state: self.state,
             capabilities: self.capabilities.clone(),
             enabled: self.enabled.clone(),
+            mailbox_selected: self.mailbox_selected,
         }
     }
 
@@ -259,6 +273,27 @@ impl ProtocolState {
     /// on tagged OK (RFC 8437 Section2).
     pub(crate) fn set_in_unauthenticate(&mut self, val: bool) {
         self.in_unauthenticate = val;
+    }
+
+    /// Disarm every pending command effect armed by the setters above.
+    ///
+    /// For a command the server completed WITHOUT executing it: its own
+    /// tagged `OK` arrived before the `+` its synchronizing literal was owed
+    /// (RFC 3501 Section 4.3), so the literal - a LOGIN credential, a SELECT
+    /// or NOTIFY mailbox name - never reached the server. Applying that `OK`
+    /// with the effects still armed would authenticate, select or register a
+    /// command that never ran. Called BEFORE `apply_side_effects` on that
+    /// response, so the response's own codes (CAPABILITY,
+    /// NOTIFICATIONOVERFLOW) still apply; only the command's transitions are
+    /// withheld. A `NO`/`BAD` must not take this path: a refused SELECT
+    /// legitimately deselects (RFC 3501 Section 6.3.1).
+    pub(in crate::connection) fn disarm_pending_effects(&mut self) {
+        self.in_logout = false;
+        self.in_auth = false;
+        self.in_select = None;
+        self.in_close = false;
+        self.in_notify_set = None;
+        self.in_unauthenticate = false;
     }
 
     /// The SINGLE mutator. Called exclusively from the wire-reading
@@ -405,6 +440,7 @@ impl ProtocolState {
                 // Success -> Selected state with the target mailbox.
                 self.state = SessionState::Selected;
                 self.selected = Some(mailbox);
+                self.mailbox_selected = true;
             } else if t.status == crate::types::response::StatusKind::No {
                 // RFC 3501 Section6.3.1: NO response deselects any currently
                 // selected mailbox.
@@ -431,6 +467,7 @@ impl ProtocolState {
         if self.in_unauthenticate && t.status == crate::types::response::StatusKind::Ok {
             self.state = SessionState::NotAuthenticated;
             self.selected = None;
+            self.mailbox_selected = false;
             self.notify = NotifyFlags::default();
             self.notify_history.clear();
             self.enabled.clear();

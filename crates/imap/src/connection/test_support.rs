@@ -36,6 +36,7 @@ pub(crate) fn detached(
         session_state,
         capabilities,
         enabled: enabled.iter().map(|e| (*e).to_owned()).collect(),
+        mailbox_selected: session_state == SessionState::Selected,
     };
 
     // Dropping the command receiver makes any accidental wire call fail

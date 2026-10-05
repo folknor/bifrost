@@ -12,9 +12,10 @@
 //! * the greeting must advertise neither `LITERAL+` nor `LITERAL-` nor
 //!   `IMAP4rev2`, or the literals are non-synchronizing and the whole batch
 //!   goes out in one write with no wait to interrupt;
-//! * the two commands must have DISTINCT `CommandKind`s, or
-//!   `group_into_sub_batches` splits them into sequential sub-batches and
-//!   there is never more than one tag outstanding;
+//! * the two commands must have DISTINCT untagged routing keys
+//!   (`CommandKind::untagged_routing_key`), or `group_into_sub_batches` splits
+//!   them into sequential sub-batches and there is never more than one tag
+//!   outstanding;
 //! * the SECOND command must carry a synchronizing literal. Most pipelinable
 //!   commands cannot produce one: mailbox names go through mUTF-7 and come
 //!   out ASCII-quotable. `LISTRIGHTS` can, because its identifier is passed
@@ -326,7 +327,8 @@ async fn a_completion_for_an_unsent_command_is_a_protocol_error() {
     let (conn, mut server) = driver_pair(&preauth_greeting(SYNC_LITERAL_CAPS)).await;
 
     let task = tokio::spawn(async move {
-        conn.pipeline()
+        let results = conn
+            .pipeline()
             .my_rights(MailboxName::new("INBOX").unwrap())
             .list_rights(
                 MailboxName::new("INBOX").unwrap(),
@@ -334,7 +336,8 @@ async fn a_completion_for_an_unsent_command_is_a_protocol_error() {
             )
             .get_acl(MailboxName::new("INBOX").unwrap())
             .execute_dynamic()
-            .await
+            .await;
+        (conn, results)
     });
 
     let _myrights = read_line(&mut server).await;
@@ -345,31 +348,37 @@ async fn a_completion_for_an_unsent_command_is_a_protocol_error() {
 
     respond(&mut server, &format!("{unsent_tag} OK impossible\r\n")).await;
 
-    let err = task
-        .await
-        .unwrap()
-        .expect_err("the server cannot complete a command it has not received");
+    // The batch was on the wire, so the failure is reported per command: no
+    // command was answered, and every slot carries the protocol error.
+    let (conn, results) = task.await.unwrap();
+    let results = results.expect("a failure after the first byte is reported per command");
+    for result in &results {
+        let err = result
+            .as_ref()
+            .expect_err("the server cannot complete a command it has not received");
+        assert!(
+            format!("{err}").contains("unsent pipelined command"),
+            "wrong error: {err}"
+        );
+    }
     assert!(
-        format!("{err}").contains("unsent pipelined command"),
-        "wrong error: {err}"
+        !conn.is_alive(),
+        "a desynchronized batch retires the connection"
     );
 }
 
-/// A tag-correlated ESEARCH for the SECOND pipelined search, arriving while
-/// the first search is still the head, reaches the command its tag names.
+/// Two pipelined searches never share a sub-batch, even of different kinds:
+/// a tagless `* SEARCH` is solicited by every search form, so head routing
+/// could hand one search's answer to the other. They run as sequential
+/// sub-batches, and the second search's line is not written until the first
+/// has completed.
 ///
-/// Head routing used to hand it to the first search's consumer, which
-/// buffers a foreign-tagged ESEARCH and surrenders it as an event, so the
-/// second search finalized on its tagged OK with no ESEARCH at all and failed
-/// with "SEARCH RETURN OK but no ESEARCH response" - for a server that did
-/// nothing but interleave two pipelined searches, which is exactly what the
-/// search-correlator exists to allow (RFC 4466, RFC 4731 Section 3.1).
-///
-/// The two searches have distinct `CommandKind`s (`Search`, `SearchReturn`),
-/// so `group_into_sub_batches` keeps them in one batch with both tags
-/// outstanding. No literal is involved; this is the step 4 response loop.
-#[tokio::test]
-async fn a_tag_correlated_esearch_reaches_the_search_its_tag_names() {
+/// Reverting `untagged_routing_key` to the plain kind puts both lines on the
+/// wire at once, and the script's check that the first search completes
+/// before the second line arrives fails. Time is paused, so the timeout fires
+/// only once every task is idle - no wall-clock wait is involved.
+#[tokio::test(start_paused = true)]
+async fn two_pipelined_searches_run_as_sequential_sub_batches() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ESEARCH")).await;
     // SEARCH is a Selected-state command (RFC 3501 Section 6.4.4).
     select_inbox(&conn, &mut server).await;
@@ -384,16 +393,27 @@ async fn a_tag_correlated_esearch_reaches_the_search_its_tag_names() {
 
     let search = read_line(&mut server).await;
     let tag1 = tag_of(&search).to_owned();
-    let search_return = read_line(&mut server).await;
-    let tag2 = tag_of(&search_return).to_owned();
-
-    // Command #2's ESEARCH comes FIRST, while command #1 is still the head.
+    // Nothing more may be on the wire until the first search completes.
+    let early = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        read_line(&mut server),
+    )
+    .await;
+    assert!(
+        early.is_err(),
+        "the second search was written while the first was outstanding: {early:?}"
+    );
     respond(
         &mut server,
-        &format!(
-            "* ESEARCH (TAG \"{tag2}\") UID ALL 7\r\n* SEARCH 3\r\n\
-             {tag1} OK search done\r\n{tag2} OK search return done\r\n"
-        ),
+        &format!("* SEARCH 3\r\n{tag1} OK search done\r\n"),
+    )
+    .await;
+
+    let search_return = read_line(&mut server).await;
+    let tag2 = tag_of(&search_return).to_owned();
+    respond(
+        &mut server,
+        &format!("* ESEARCH (TAG \"{tag2}\") UID ALL 7\r\n{tag2} OK search return done\r\n"),
     )
     .await;
 
@@ -417,13 +437,12 @@ async fn a_tag_correlated_esearch_reaches_the_search_its_tag_names() {
 /// finalized is surplus data for a completed command and is dropped, not
 /// published as an event.
 ///
-/// The router used to let it fall through to head routing, where the still
-/// active first search buffered it as a foreign-tagged ESEARCH and surrendered
-/// it on its tagged OK, so it surfaced as an event the classifier says cannot
-/// exist (ESEARCH is `OnlySolicited` inside a search, `Impossible` elsewhere).
-/// The EXISTS beside it is the control: an ordinary `Either` response still
-/// reaches the event queue through the same consumer, so an empty queue is
-/// not what the assertion rests on.
+/// Without the correlator arm the ESEARCH falls through to head routing: the
+/// still-active NOOP has no use for it (`classify` makes ESEARCH `Impossible`
+/// outside a search), so it is forwarded as an event the classifier says
+/// cannot exist. The EXISTS beside it is the control: an ordinary `Either`
+/// response still reaches the event queue through the same consumer, so an
+/// empty queue is not what the assertion rests on.
 #[tokio::test]
 async fn a_surplus_esearch_for_a_finalized_search_is_dropped_not_published() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ESEARCH")).await;
@@ -433,44 +452,39 @@ async fn a_surplus_esearch_for_a_finalized_search_is_dropped_not_published() {
     let task = tokio::spawn(async move {
         let results = conn
             .pipeline()
-            .uid_search("ALL".to_owned())
             .uid_search_return("ALL".to_owned(), vec!["ALL".to_owned()])
+            .noop()
             .execute_dynamic()
             .await;
         (conn, results)
     });
 
-    let search = read_line(&mut server).await;
-    let tag1 = tag_of(&search).to_owned();
     let search_return = read_line(&mut server).await;
-    let tag2 = tag_of(&search_return).to_owned();
+    let tag1 = tag_of(&search_return).to_owned();
+    let noop = read_line(&mut server).await;
+    let tag2 = tag_of(&noop).to_owned();
 
-    // Command #2 completes first; a second ESEARCH naming it then arrives
-    // while command #1 is still the head.
+    // The search completes; a second ESEARCH naming it then arrives while
+    // the NOOP is still the head.
     respond(
         &mut server,
         &format!(
-            "* ESEARCH (TAG \"{tag2}\") UID ALL 7\r\n{tag2} OK search return done\r\n\
-             * ESEARCH (TAG \"{tag2}\") UID ALL 9\r\n* 5 EXISTS\r\n* SEARCH 3\r\n\
-             {tag1} OK search done\r\n"
+            "* ESEARCH (TAG \"{tag1}\") UID ALL 7\r\n{tag1} OK search return done\r\n\
+             * ESEARCH (TAG \"{tag1}\") UID ALL 9\r\n* 5 EXISTS\r\n\
+             {tag2} OK noop done\r\n"
         ),
     )
     .await;
 
     let (conn, results) = task.await.unwrap();
     let results = results.expect("the batch must not abort");
-    let first = results[0]
+    let search = results[0]
         .as_ref()
-        .expect("command #1 completes normally")
-        .downcast_ref::<crate::connection::SearchResult>()
-        .expect("SEARCH output is a SearchResult");
-    assert_eq!(first.ids, vec![3]);
-    let second = results[1]
-        .as_ref()
-        .expect("command #2 completes normally")
+        .expect("the search completes normally")
         .downcast_ref::<crate::types::EsearchResponse>()
         .expect("SEARCH RETURN output is an EsearchResponse");
-    assert_eq!(second.all, vec![crate::types::UidRange::single(7)]);
+    assert_eq!(search.all, vec![crate::types::UidRange::single(7)]);
+    assert!(results[1].is_ok(), "the NOOP completes normally");
 
     let events = conn.drain_events().await;
     assert!(
@@ -625,14 +639,18 @@ async fn a_pipelined_command_refused_at_its_second_marker_is_its_own_result_over
     .await;
 }
 
-/// Transmission evidence is relative to the whole pipeline, not to a
-/// sub-batch. Two `UID COPY`s share a `CommandKind`, so they run as two
-/// sub-batches; the server executes the first and vanishes, and the second
-/// sub-batch's first write reaches nothing. The batch error replaces the first
-/// COPY's result, so it must not claim `Unsent`: a retry on that evidence
-/// would copy the first message set again.
+/// A failure in a later sub-batch does not replace the results of an earlier
+/// one. Two `UID COPY`s share a routing key, so they run as two sub-batches;
+/// the server executes the first and vanishes, and the second sub-batch's
+/// first write reaches nothing. The first COPY's acknowledged result is kept,
+/// the second is `Unsent` (no byte of it was written, so a retry is safe),
+/// and the connection retires.
+///
+/// Reverting `run_pipeline` to the all-or-error shape fails the first
+/// assertion: the batch comes back as one error and the first COPY's result
+/// is gone, beside a mutation the server performed.
 #[tokio::test(start_paused = true)]
-async fn a_later_sub_batch_failure_is_in_flight_after_an_earlier_sub_batch_ran() {
+async fn a_later_sub_batch_failure_keeps_the_earlier_sub_batch_results() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
     select_inbox(&conn, &mut server).await;
 
@@ -644,7 +662,7 @@ async fn a_later_sub_batch_failure_is_in_flight_after_an_earlier_sub_batch_ran()
         drop(server);
     });
 
-    let err = conn
+    let results = conn
         .pipeline()
         .uid_copy(
             crate::types::SequenceSet::new("1").unwrap(),
@@ -656,16 +674,124 @@ async fn a_later_sub_batch_failure_is_in_flight_after_an_earlier_sub_batch_ran()
         )
         .execute_dynamic()
         .await
-        .expect_err("the second sub-batch cannot be written");
+        .expect("a failure after the first byte is reported per command");
     script.await.unwrap();
-    let crate::connection::pipeline::PipelineError::Driver(err) = err else {
-        panic!("expected a driver error, got {err:?}");
-    };
+    assert!(
+        results[0].is_ok(),
+        "the first COPY was acknowledged; its result must survive: {:?}",
+        results[0].as_ref().err()
+    );
+    let err = results[1]
+        .as_ref()
+        .expect_err("the second sub-batch cannot be written");
+    assert_eq!(
+        err.attempt(),
+        Some(bifrost_types::TransmissionState::Unsent),
+        "no byte of the second COPY was written; got {err:?}"
+    );
+    assert!(
+        !conn.is_alive(),
+        "a batch that ended early retires the connection"
+    );
+}
+
+/// A command on the wire whose answer never arrived is `InFlight`, while the
+/// command the server did answer keeps its result. One coalesced write
+/// carries both; the server answers the first and vanishes.
+///
+/// Reverting `run_pipeline` to the all-or-error shape fails the `expect`:
+/// the read failure replaced every result.
+#[tokio::test]
+async fn an_unanswered_command_is_in_flight_and_the_answered_one_keeps_its_result() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 ACL")).await;
+
+    let script = tokio::spawn(async move {
+        let myrights = read_line(&mut server).await;
+        let tag1 = tag_of(&myrights).to_owned();
+        let _getacl = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!("* MYRIGHTS INBOX lr\r\n{tag1} OK myrights done\r\n"),
+        )
+        .await;
+        drop(server);
+    });
+
+    let results = conn
+        .pipeline()
+        .my_rights(MailboxName::new("INBOX").unwrap())
+        .get_acl(MailboxName::new("INBOX").unwrap())
+        .execute_dynamic()
+        .await
+        .expect("a failure after the first byte is reported per command");
+    script.await.unwrap();
+    let rights = results[0]
+        .as_ref()
+        .expect("the answered command keeps its result")
+        .downcast_ref::<String>()
+        .unwrap();
+    assert_eq!(rights, "lr");
+    let err = results[1]
+        .as_ref()
+        .expect_err("the server vanished before answering GETACL");
     assert_eq!(
         err.attempt(),
         Some(bifrost_types::TransmissionState::InFlight),
-        "an earlier sub-batch already executed; got {err:?}"
+        "GETACL was written and may have executed; got {err:?}"
     );
+    assert!(
+        !conn.is_alive(),
+        "a batch that ended early retires the connection"
+    );
+}
+
+/// An encoding refusal in a LATER sub-batch refuses the whole batch before any
+/// byte: the two CAPABILITYs share a routing key and so run as two
+/// sub-batches, and the UID MOVE in the second cannot be encoded without MOVE.
+/// The first thing the server reads afterwards is the NOOP issued next.
+///
+/// Encoding each sub-batch only when it runs (the old shape) fails the
+/// timeout: the first CAPABILITY is written and the batch waits for its
+/// answer instead of refusing. Time is paused, so the timeout fires as soon as
+/// every task is idle.
+#[tokio::test(start_paused = true)]
+async fn an_encoding_refusal_in_a_later_sub_batch_refuses_the_batch_before_any_byte() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    select_inbox(&conn, &mut server).await;
+
+    let refused = conn
+        .pipeline()
+        .capability()
+        .capability()
+        .uid_move_messages(
+            crate::types::SequenceSet::new("1").unwrap(),
+            MailboxName::new("Archive").unwrap(),
+        )
+        .execute_dynamic();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), refused)
+        .await
+        .expect("the batch went on the wire instead of being refused before its first byte")
+        .expect_err("UID MOVE cannot be encoded without MOVE");
+    let crate::connection::pipeline::PipelineError::Driver(err) = err else {
+        panic!("expected a driver refusal, got {err:?}");
+    };
+    assert!(
+        matches!(err, crate::error::Error::MissingCapability(_)),
+        "got {err:?}"
+    );
+
+    let noop = conn.noop(std::time::Duration::from_secs(5));
+    let script = async {
+        let line = read_line(&mut server).await;
+        assert!(
+            line.contains("NOOP"),
+            "part of the refused batch reached the wire: {line:?}"
+        );
+        let tag = tag_of(&line).to_owned();
+        respond(&mut server, &format!("{tag} OK NOOP completed\r\n")).await;
+    };
+    let (nooped, ()) = tokio::join!(noop, script);
+    nooped.expect("the connection must carry the next command");
 }
 
 /// The tag the generator will produce after `tag`.

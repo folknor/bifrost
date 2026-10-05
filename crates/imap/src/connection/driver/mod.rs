@@ -37,7 +37,7 @@ use events::{
 use idle::run_idle;
 #[cfg(test)]
 use pipeline::group_into_sub_batches;
-use pipeline::run_pipeline;
+use pipeline::{PipelineEnd, run_pipeline};
 use upgrade::{logout_best_effort, run_upgrade};
 use wire_send::{SendOutcome, send_wire_command};
 
@@ -341,6 +341,9 @@ pub(super) struct ConnectionStateSnapshot {
     pub capabilities: Vec<Capability>,
     /// Successfully `ENABLE`d extensions (RFC 5161 Section3.2).
     pub enabled: Vec<String>,
+    /// Whether any mailbox has been selected in this session, even if it
+    /// has since been closed (RFC 5161 Section 3.1).
+    pub mailbox_selected: bool,
 }
 
 impl Default for ConnectionStateSnapshot {
@@ -349,6 +352,7 @@ impl Default for ConnectionStateSnapshot {
             session_state: super::SessionState::NotAuthenticated,
             capabilities: Vec::new(),
             enabled: Vec::new(),
+            mailbox_selected: false,
         }
     }
 }
@@ -444,18 +448,32 @@ pub(super) async fn driver_task(
                         );
                     }
                     DriverCommand::Pipeline { commands, consumers, result_tx } => {
-                        let result = run_pipeline(
+                        let result = match run_pipeline(
                             &mut wire_reader,
                             &mut state,
                             &mut tag_gen,
                             &mut event_sink,
                             commands,
                             consumers,
-                        ).await;
-                        if result.as_ref().is_err_and(Error::is_connection_fatal) {
-                            state.apply_infrastructure_failure();
-                            cmd_rx.close();
-                        }
+                        ).await {
+                            // Refused before the first byte: the framing is
+                            // intact whatever the error, as for a single
+                            // command refused in `prepare_command`.
+                            PipelineEnd::Refused(refusal) => Err(refusal),
+                            PipelineEnd::Ran { results, failure } => {
+                                // A batch that ended early can leave commands
+                                // on the wire whose responses nobody will
+                                // read, so the connection retires whatever
+                                // the failure was. The per-command slots
+                                // carry it to the caller.
+                                if let Some(failure) = failure {
+                                    trace!(error = %failure, "driver: pipeline ended early");
+                                    state.apply_infrastructure_failure();
+                                    cmd_rx.close();
+                                }
+                                Ok(results)
+                            }
+                        };
                         publish_then_answer(
                             || {
                                 let _ = state_tx.send_replace(state.snapshot());
@@ -558,29 +576,37 @@ pub(in crate::connection) struct PreparedCommand {
     pub(super) wire: WireCommand,
 }
 
-/// The refusal for a command whose session state is not one it may be sent
-/// in, judged against LIVE state at the head of the queue - or `None` when
-/// `state` permits it.
+/// The refusal for a command the session may not carry, judged against LIVE
+/// state at the head of the queue - or `None` when `state` permits it.
 ///
+/// Two facts decide it: the session state (`CommandKind::legal_states`) and
+/// the session's selection history (`CommandKind::refused_after_selection`).
 /// The handle refused anything it could see was illegal (`InvalidState`), so a
 /// refusal here means the session moved while the command waited:
 /// `StateChangedBeforeSend`, which the caller may re-issue after a state
 /// refresh. A session that reached Logout is gone, and the honest answer is
 /// `Closed` with `Unsent` evidence. Both leave the framing intact.
 pub(in crate::connection) fn live_state_refusal(
-    session: super::SessionState,
+    state: &super::state::ProtocolState,
     kind: crate::types::CommandKind,
 ) -> Option<Error> {
+    let session = state.session_state();
     let legal = kind.legal_states();
-    if legal.contains(&session) {
-        return None;
+    if !legal.contains(&session) {
+        if session == super::SessionState::Logout {
+            return Some(Error::closed().with_attempt(TransmissionState::Unsent));
+        }
+        return Some(Error::StateChangedBeforeSend(format!(
+            "session moved to {session:?}, out of {legal:?}, before {kind:?} could be sent"
+        )));
     }
-    if session == super::SessionState::Logout {
-        return Some(Error::closed().with_attempt(TransmissionState::Unsent));
+    if kind.refused_after_selection() && state.mailbox_selected() {
+        return Some(Error::StateChangedBeforeSend(format!(
+            "a mailbox was selected in this session before {kind:?} could be sent \
+             (RFC 5161 Section 3.1)"
+        )));
     }
-    Some(Error::StateChangedBeforeSend(format!(
-        "session moved to {session:?}, out of {legal:?}, before {kind:?} could be sent"
-    )))
+    None
 }
 
 /// Check and encode `cmd` from the state this task owns, writing nothing and
@@ -608,7 +634,7 @@ pub(in crate::connection) fn prepare_command(
     tag_gen: &mut super::tag::TagGenerator,
     cmd: &Command,
 ) -> Result<PreparedCommand, Error> {
-    if let Some(refusal) = live_state_refusal(state.session_state(), cmd.kind()) {
+    if let Some(refusal) = live_state_refusal(state, cmd.kind()) {
         return Err(refusal);
     }
     let tag = tag_gen.next();

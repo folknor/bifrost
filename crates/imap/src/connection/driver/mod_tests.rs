@@ -206,6 +206,65 @@ fn group_searchres_pipeline_respects_save_ordering() {
     assert_eq!(batches[1][1].0, 2); // original index 2
 }
 
+/// Distinct kinds that solicit a common untagged response never share a
+/// sub-batch: GETQUOTA and GETQUOTAROOT both own `* QUOTA`, STATUS and
+/// LIST-STATUS both own `* STATUS`, SEARCH and SEARCH RETURN both own a
+/// tagless `* SEARCH`, and FETCH and EXPUNGE both own `* VANISHED (EARLIER)`.
+///
+/// Grouping on the plain `CommandKind` fails every pair: each lands in one
+/// sub-batch, where the head consumer takes the other's answer.
+#[test]
+fn group_splits_distinct_kinds_that_share_an_untagged_response() {
+    let inbox = || MailboxName::new("INBOX").unwrap();
+    let pairs = [
+        (
+            Command::GetQuota {
+                root: String::new(),
+            },
+            Command::GetQuotaRoot { mailbox: inbox() },
+        ),
+        (
+            Command::Status {
+                mailbox: inbox(),
+                items: "(MESSAGES)".into(),
+            },
+            Command::ListStatus {
+                reference: String::new(),
+                pattern: "*".into(),
+                status_items: "(MESSAGES)".into(),
+            },
+        ),
+        (
+            Command::UidSearch {
+                criteria: "ALL".into(),
+            },
+            Command::UidSearchReturn {
+                criteria: "ALL".into(),
+                return_opts: vec!["ALL".into()],
+            },
+        ),
+        (
+            Command::UidFetch {
+                sequence_set: SequenceSet::new("1:*").unwrap(),
+                items: "(FLAGS)".into(),
+                changed_since: Some(1),
+                vanished: true,
+            },
+            Command::UidExpunge {
+                sequence_set: SequenceSet::new("1").unwrap(),
+            },
+        ),
+    ];
+    for (first, second) in pairs {
+        let label = format!("{:?} + {:?}", first.kind(), second.kind());
+        let batches = group_into_sub_batches(
+            vec![first, second],
+            vec![dummy_consumer(), dummy_consumer()],
+        );
+        assert_eq!(batches.len(), 2, "{label} must not share a sub-batch");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Driver completion ordering
 // ---------------------------------------------------------------------------

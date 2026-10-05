@@ -662,11 +662,19 @@ impl<Accumulated: UnfoldTuple> Pipeline<'_, Accumulated> {
     /// (e.g., a server `NO` response) are captured per-element, not
     /// as a pipeline-level error.
     ///
+    /// So is a failure that ends the batch once it is on the wire (a lost
+    /// connection, a BYE, a desynchronized response): commands the server
+    /// already answered keep their results, and every other element carries
+    /// the failure, stamped `InFlight` when the command may have reached the
+    /// server and `Unsent` when no byte of it was written. The connection is
+    /// retired.
+    ///
     /// # Errors
     ///
     /// - [`PipelineError::Disconnected`]  -  the driver task has exited.
-    /// - [`PipelineError::Driver`]  -  the driver aborted the entire
-    ///   batch (e.g., encoding failure before any bytes were written).
+    /// - [`PipelineError::Driver`]  -  the batch was refused before any
+    ///   byte was written (a command the session does not permit, an
+    ///   encoding refusal); nothing ran.
     /// - [`PipelineError::TypeMismatch`]  -  internal bug in the
     ///   command-to-consumer mapping.
     pub async fn execute(self) -> Result<Accumulated::Output, PipelineError> {

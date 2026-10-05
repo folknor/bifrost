@@ -309,6 +309,77 @@ fn unauthenticate_ok_from_selected_clears_mailbox() {
 }
 
 // ---------------------------------------------------------------------------
+// Selection history  -  ENABLE after SELECT (RFC 5161 Section 3.1)
+// ---------------------------------------------------------------------------
+
+fn tagged(tag: &str, status: StatusKind) -> Response {
+    Response::Tagged(TaggedResponse {
+        tag: tag.into(),
+        status,
+        code: None,
+        text: "done".into(),
+    })
+}
+
+/// A successful selection is session history: UNSELECT returns the session
+/// to Authenticated, where `legal_states` alone admits ENABLE, but the driver
+/// still refuses it. A refused SELECT selects nothing and leaves ENABLE
+/// legal; UNAUTHENTICATE starts a new session and clears the history.
+///
+/// Removing the `refused_after_selection` check from `live_state_refusal`
+/// fails the post-UNSELECT assertion; never setting `mailbox_selected` on a
+/// successful SELECT fails it too; not clearing it on UNAUTHENTICATE fails the
+/// last assertion.
+#[test]
+fn enable_is_refused_once_a_mailbox_has_been_selected_in_the_session() {
+    use crate::connection::driver::live_state_refusal;
+    use crate::types::CommandKind;
+    use crate::types::validated::MailboxName;
+
+    let mut state = ProtocolState::new();
+    state
+        .apply_greeting(&GreetingResponse {
+            status: GreetingStatus::PreAuth,
+            code: None,
+            text: "ready".into(),
+        })
+        .unwrap();
+    assert!(live_state_refusal(&state, CommandKind::Enable).is_none());
+
+    state.set_in_select(Some(MailboxName::new("Missing").unwrap()));
+    let _ = state.apply_side_effects(&tagged("A1", StatusKind::No));
+    assert!(
+        !state.mailbox_selected(),
+        "a refused SELECT selects nothing"
+    );
+    assert!(live_state_refusal(&state, CommandKind::Enable).is_none());
+
+    state.set_in_select(Some(MailboxName::new("INBOX").unwrap()));
+    let _ = state.apply_side_effects(&tagged("A2", StatusKind::Ok));
+    state.set_in_close(true);
+    let _ = state.apply_side_effects(&tagged("A3", StatusKind::Ok));
+    assert_eq!(state.session_state(), SessionState::Authenticated);
+    assert!(
+        matches!(
+            live_state_refusal(&state, CommandKind::Enable),
+            Some(crate::error::Error::StateChangedBeforeSend(_))
+        ),
+        "ENABLE after a mailbox was selected must be refused at the head of the queue"
+    );
+    assert!(
+        live_state_refusal(&state, CommandKind::Noop).is_none(),
+        "the history gates ENABLE only"
+    );
+
+    state.set_in_unauthenticate(true);
+    let _ = state.apply_side_effects(&tagged("A4", StatusKind::Ok));
+    assert!(
+        !state.mailbox_selected(),
+        "UNAUTHENTICATE starts a new session (RFC 8437 Section 2)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // UNAUTHENTICATE  -  tagged NO preserves state (RFC 8437 Section2)
 // ---------------------------------------------------------------------------
 

@@ -293,6 +293,56 @@ fn invariant_i5_classify_exhaustive_extensions() {
     }
 }
 
+/// `CommandKind::untagged_routing_key` is a summary of this classifier: two
+/// pipelinable kinds with DISTINCT keys may share a pipelined sub-batch, so
+/// no untagged response may be `OnlySolicited` for both, under any NOTIFY
+/// registration. Otherwise head routing hands one command's answer to the
+/// other.
+///
+/// A new `OnlySolicited` row shared by two kinds fails this until the key
+/// groups them. Mapping every kind to itself fails it on QUOTA, SEARCH,
+/// ESEARCH, LIST, STATUS and VANISHED (EARLIER).
+#[test]
+fn distinct_routing_keys_never_share_a_solicited_response() {
+    let target = MailboxName::new("INBOX").unwrap();
+    let contexts = [
+        NotifyFlags::default(),
+        NotifyFlags {
+            list: true,
+            status: true,
+            metadata: true,
+        },
+    ];
+    let pipelinable: Vec<CK> = all_command_kinds()
+        .into_iter()
+        .filter(|kind| kind.pipelinable())
+        .collect();
+
+    for notify in contexts {
+        let ctx = ClassificationContext {
+            notify,
+            command_target: Some(&target),
+        };
+        for (i, &a) in pipelinable.iter().enumerate() {
+            for &b in &pipelinable[i + 1..] {
+                if a.untagged_routing_key() == b.untagged_routing_key() {
+                    continue;
+                }
+                for resp in all_untagged_variants() {
+                    let both = matches!(classify(a, &resp, &ctx), SolicitationRule::OnlySolicited)
+                        && matches!(classify(b, &resp, &ctx), SolicitationRule::OnlySolicited);
+                    assert!(
+                        !both,
+                        "{a:?} and {b:?} have distinct routing keys but both solicit {:?} \
+                         (notify={notify:?})",
+                        std::mem::discriminant(&resp)
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ---- NOTIFY classification correctness tests (RFC 5465) ----
 //
 // The exhaustiveness tests above verify that every (command, response)

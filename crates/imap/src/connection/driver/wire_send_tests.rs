@@ -66,6 +66,42 @@ async fn an_own_tag_ok_before_the_continuation_is_non_fatal_and_the_connection_s
     let _server = script.await.unwrap();
 }
 
+/// A LOGIN whose credential literal is answered by its own tagged `OK` before
+/// the `+` did not execute: the server never received the password. The
+/// session must stay NotAuthenticated, not move to Authenticated on that OK.
+///
+/// Removing the `disarm_pending_effects` call from `wait_for_continuation`
+/// fails the session-state assertion: `in_auth` is armed before the send, and
+/// `apply_side_effects` completes it on any tagged OK.
+#[tokio::test]
+async fn an_own_tag_ok_before_a_login_literal_does_not_authenticate() {
+    let (conn, mut server) = driver_pair(b"* OK [CAPABILITY IMAP4rev1] ready\r\n").await;
+
+    let script = tokio::spawn(async move {
+        let line = read_line(&mut server).await;
+        assert!(line.contains("LOGIN"), "not LOGIN: {line:?}");
+        assert!(
+            line.ends_with("{5}\r\n"),
+            "the DEL-bearing password must be a synchronizing literal: {line:?}"
+        );
+        let tag = tag_of(&line).to_owned();
+        respond(&mut server, &format!("{tag} OK not really\r\n")).await;
+        server
+    });
+
+    let err = conn
+        .login("user", "pa\u{7f}ss", Duration::from_secs(5))
+        .await
+        .expect_err("an OK without a continuation cannot authenticate");
+    assert!(matches!(err, Error::ProtocolMissing(_)), "got {err:?}");
+    assert_eq!(
+        conn.state_rx.borrow().session_state,
+        crate::connection::SessionState::NotAuthenticated,
+        "a LOGIN whose password never reached the server authenticated the session"
+    );
+    let _server = script.await.unwrap();
+}
+
 /// A tagged response for a tag that is not the command's own cannot belong to
 /// anything, since only one command is outstanding: `Protocol`, fatal, the
 /// driver retires.

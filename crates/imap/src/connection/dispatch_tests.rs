@@ -488,7 +488,7 @@ fn multi_append_consumer_expands_an_untagged_appenduid_and_surrenders_on_failure
     let notify = NotifyFlags::default();
     let untagged = untagged_appenduid_ok(5, vec![UidRange::range(10, 12), UidRange::single(20)]);
 
-    let mut consumer = MultiAppendConsumer::default();
+    let mut consumer = MultiAppendConsumer::new(4);
     consumer.on_response(untagged.clone(), notify, &ctx);
     let result = Box::new(consumer).finalize(tagged_ok(), &ctx);
     assert_eq!(
@@ -500,11 +500,51 @@ fn multi_append_consumer_expands_an_untagged_appenduid_and_surrenders_on_failure
         "the consumed untagged OK is the answer, not an event"
     );
 
-    let mut consumer = MultiAppendConsumer::default();
+    let mut consumer = MultiAppendConsumer::new(4);
     consumer.on_response(untagged.clone(), notify, &ctx);
     let result = Box::new(consumer).finalize(tagged_bad(), &ctx);
     assert!(result.output.is_err());
     assert_eq!(result.reclassified_as_events, vec![untagged]);
+}
+
+fn multi_append_answer(submitted: usize, uids: Vec<UidRange>) -> Vec<(u32, u32)> {
+    let consumer = MultiAppendConsumer::new(submitted);
+    let tagged = tagged_ok_with(ResponseCode::AppendUid {
+        uid_validity: 7,
+        uids,
+    });
+    Box::new(consumer)
+        .finalize(tagged, &default_ctx())
+        .output
+        .expect("tagged OK")
+}
+
+/// An APPENDUID naming far more UIDs than messages were submitted is refused
+/// by counting, before anything is expanded: the whole `u32` range for a
+/// two-message MULTIAPPEND yields no pairs and allocates none.
+///
+/// Reverting `appenduid_pairs` to expand first and check afterwards makes this
+/// test allocate four billion pairs; dropping the check returns them.
+#[test]
+fn multi_append_consumer_refuses_an_appenduid_whose_count_disagrees_without_expanding_it() {
+    assert!(
+        multi_append_answer(2, vec![UidRange::range(1, u32::MAX)]).is_empty(),
+        "a uid-set larger than the submission is not an answer"
+    );
+    assert!(
+        multi_append_answer(3, vec![UidRange::range(10, 11)]).is_empty(),
+        "a uid-set smaller than the submission is not an answer either"
+    );
+}
+
+/// RFC 3501 Section 9: `12:10` names the same UIDs as `10:12`. A backwards
+/// range used to expand to nothing, silently dropping its UIDs.
+#[test]
+fn multi_append_consumer_expands_a_backwards_range() {
+    assert_eq!(
+        multi_append_answer(3, vec![UidRange::range(12, 10)]),
+        vec![(7, 10), (7, 11), (7, 12)]
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -504,6 +504,50 @@ fn resolve_appenduid(
     }
 }
 
+/// The `(uid_validity, uid)` pairs an APPENDUID code assigns to the
+/// `submitted` messages of a MULTIAPPEND, or `None` when it is not an
+/// APPENDUID or its uid-set does not name exactly `submitted` UIDs.
+///
+/// The cardinality is counted BEFORE anything is expanded, so a server cannot
+/// make the client allocate per UID it claims: `[APPENDUID 7 1:4294967295]`
+/// for a two-message MULTIAPPEND costs one subtraction, not four billion
+/// pairs. A range is either direction (RFC 3501 Section 9: `4:2` and `2:4`
+/// name the same UIDs) and expands ascending, the order UIDs are assigned in.
+///
+/// A count that disagrees is a server contradicting its own completion. The
+/// messages WERE appended (the tagged OK says so), so this is not an error -
+/// an error on a non-idempotent APPEND invites a retry that duplicates them -
+/// but the code cannot say which UID went to which message, so it is
+/// discarded, exactly as if the server had no UIDPLUS.
+fn appenduid_pairs(code: Option<ResponseCode>, submitted: usize) -> Option<Vec<(u32, u32)>> {
+    let Some(ResponseCode::AppendUid { uid_validity, uids }) = code else {
+        return None;
+    };
+    let bounds = |range: &crate::types::response::UidRange| match range.end {
+        Some(end) => (range.start.min(end), range.start.max(end)),
+        None => (range.start, range.start),
+    };
+    let named = uids.iter().fold(0u64, |total, range| {
+        let (low, high) = bounds(range);
+        total.saturating_add(u64::from(high - low) + 1)
+    });
+    if u64::try_from(submitted).ok() != Some(named) {
+        tracing::warn!(
+            named,
+            submitted,
+            "APPENDUID names a different number of UIDs than messages were appended; \
+             discarding it (RFC 4315 Section 3)"
+        );
+        return None;
+    }
+    let mut pairs = Vec::with_capacity(submitted);
+    for range in &uids {
+        let (low, high) = bounds(range);
+        pairs.extend((low..=high).map(|uid| (uid_validity, uid)));
+    }
+    Some(pairs)
+}
+
 /// Consumer for APPEND (RFC 3501 Section6.3.11).
 ///
 /// APPEND has no solicited untagged responses of its own  -  all
@@ -563,7 +607,12 @@ impl Consumer for AppendConsumer {
         let code = resolve_appenduid(tagged.code, appenduid_at, &mut buffered);
         let append_uid = match code {
             Some(ResponseCode::AppendUid { uid_validity, uids }) => {
-                // Single APPEND  -  extract the first UID from the set.
+                // Single APPEND  -  extract the first UID from the set. Taking
+                // the first UID of an over-long set is deliberate and needs no
+                // cardinality check: nothing is expanded, so it costs nothing,
+                // and refusing it would turn an appended draft into
+                // `draft_create`'s `Unsupported`, inviting a retry that
+                // appends it again.
                 uids.first().map(|r| (uid_validity, r.start))
             }
             _ => None,
@@ -576,13 +625,28 @@ impl Consumer for AppendConsumer {
 ///
 /// Same as [`AppendConsumer`] but extracts multiple UIDs from the
 /// `[APPENDUID]` response code. Each UID range is expanded into
-/// individual `(uid_validity, uid)` pairs. Retains an untagged
-/// `* OK [APPENDUID ...]` whole, exactly as [`AppendConsumer`] does.
-#[derive(Default)]
+/// individual `(uid_validity, uid)` pairs, once the code is known to name
+/// exactly as many UIDs as messages were submitted (`appenduid_pairs`).
+/// Retains an untagged `* OK [APPENDUID ...]` whole, exactly as
+/// [`AppendConsumer`] does.
 pub(crate) struct MultiAppendConsumer {
     buffered: Vec<UntaggedResponse>,
     /// Index in `buffered` of the first untagged `OK [APPENDUID ...]`.
     appenduid_at: Option<usize>,
+    /// How many messages the MULTIAPPEND carries: the number of UIDs a
+    /// truthful APPENDUID names.
+    submitted: usize,
+}
+
+impl MultiAppendConsumer {
+    /// A consumer for a MULTIAPPEND of `submitted` messages.
+    pub(crate) fn new(submitted: usize) -> Self {
+        Self {
+            buffered: Vec::new(),
+            appenduid_at: None,
+            submitted,
+        }
+    }
 }
 
 impl Consumer for MultiAppendConsumer {
@@ -612,6 +676,7 @@ impl Consumer for MultiAppendConsumer {
         let Self {
             mut buffered,
             appenduid_at,
+            submitted,
         } = *self;
         let tagged = match tagged.require_ok() {
             Ok(t) => t,
@@ -619,20 +684,8 @@ impl Consumer for MultiAppendConsumer {
         };
         // RFC 4315 Section3: for MULTIAPPEND, the uid-set contains one
         // UID per appended message, possibly as ranges.
-        let mut results = Vec::new();
         let code = resolve_appenduid(tagged.code, appenduid_at, &mut buffered);
-        if let Some(ResponseCode::AppendUid { uid_validity, uids }) = code {
-            for range in &uids {
-                if let Some(end) = range.end {
-                    // Expand range into individual (uid_validity, uid) pairs.
-                    for uid in range.start..=end {
-                        results.push((uid_validity, uid));
-                    }
-                } else {
-                    results.push((uid_validity, range.start));
-                }
-            }
-        }
+        let results = appenduid_pairs(code, submitted).unwrap_or_default();
         Finalized::success(results, buffered)
     }
 }

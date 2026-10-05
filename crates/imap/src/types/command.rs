@@ -497,10 +497,11 @@ impl CommandKind {
     /// command whose session moved while it waited (`StateChangedBeforeSend`).
     /// Logout is in no row; both sites report it as `Closed`.
     ///
-    /// A state table is not a complete legality predicate. RFC 5161 Section
-    /// 3.1 also forbids ENABLE once any mailbox has been selected in the
-    /// session, even after UNSELECT returns it to Authenticated; that history
-    /// is not modelled here.
+    /// A state table is not a complete legality predicate: session HISTORY
+    /// matters too, and both sites read [`refused_after_selection`] beside
+    /// it.
+    ///
+    /// [`refused_after_selection`]: Self::refused_after_selection
     pub(crate) const fn legal_states(self) -> &'static [SessionState] {
         match self {
             // RFC 3501 Section 6.1: any state. ID is likewise valid in every
@@ -553,6 +554,47 @@ impl CommandKind {
             | Self::Move
             | Self::Thread
             | Self::Sort => SELECTED,
+        }
+    }
+
+    /// Whether this command is illegal once any mailbox has been selected in
+    /// the session, whatever the session state is now.
+    ///
+    /// Only ENABLE: RFC 5161 Section 3.1 allows it "only in the authenticated
+    /// state, before any mailbox is selected", so a CLOSE or UNSELECT that
+    /// returns the session to Authenticated does not make it legal again. The
+    /// history is `ProtocolState::mailbox_selected`; UNAUTHENTICATE starts a
+    /// new session and resets it (RFC 8437 Section 2).
+    pub(crate) const fn refused_after_selection(self) -> bool {
+        matches!(self, Self::Enable)
+    }
+
+    /// The key a pipelined batch splits on: two commands share a sub-batch
+    /// only when their keys differ.
+    ///
+    /// The batch hands an untagged response to the first still-active command
+    /// `classify` lets own it, which is only correct when no two commands of
+    /// one sub-batch can both claim the same response. Equal kinds obviously
+    /// can, but so can distinct kinds that solicit a common response type, and
+    /// those share a key here:
+    ///
+    /// * `QUOTA` is solicited by GETQUOTA, GETQUOTAROOT and SETQUOTA (RFC 9208
+    ///   Sections 4.2-4.4).
+    /// * `SEARCH` and `ESEARCH` by every search form, tagless `SEARCH` with no
+    ///   correlator at all (RFC 3501 Section 7.2.5, RFC 4731, RFC 5182).
+    /// * `LIST` by LIST and LIST-STATUS, and `STATUS` by LIST-STATUS and STATUS
+    ///   (RFC 5819 Section 2), so all three share one key.
+    /// * `VANISHED (EARLIER)` by FETCH and EXPUNGE (RFC 7162 Section 3.2.10).
+    ///
+    /// The classifier is the authority; this is a summary of it, and a test
+    /// checks every pair of pipelinable kinds with distinct keys against it.
+    pub(crate) const fn untagged_routing_key(self) -> Self {
+        match self {
+            Self::GetQuotaRoot | Self::SetQuota => Self::GetQuota,
+            Self::SearchReturn | Self::SearchSave => Self::Search,
+            Self::ListStatus | Self::Status => Self::List,
+            Self::Expunge => Self::Fetch,
+            other => other,
         }
     }
 
