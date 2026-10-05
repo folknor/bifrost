@@ -2044,6 +2044,85 @@ async fn idle_done_handshake_is_bounded_when_the_server_never_completes() {
     script.abort();
 }
 
+/// A DONE handshake that times out leaves the driver inside the IDLE
+/// exchange: the connection is abandoned, so it is not reusable, and dropping
+/// its last handle aborts the driver, releasing the socket. Without that, a
+/// driver blocked in the post-DONE drain against a silent peer would hold the
+/// transport for the life of the process.
+///
+/// Removing IDLE's in-flight guard fails the reusability assertion; removing
+/// `ImapConnection`'s `Drop` fails the EOF assertion (the server end never
+/// sees the client close).
+#[tokio::test(start_paused = true)]
+async fn an_idle_whose_done_times_out_is_abandoned_and_its_last_drop_releases_the_socket() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+
+    let script = async {
+        let _idle = read_line(&mut server).await;
+        respond(&mut server, "+ idling\r\n").await;
+        respond(&mut server, "* 3 EXISTS\r\n").await;
+        assert_eq!(read_line(&mut server).await, "DONE\r\n");
+        // No tagged completion.
+    };
+    let idle = conn.idle(
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let (result, ()) = tokio::join!(idle, script);
+    assert!(
+        matches!(result, Err(crate::Error::Timeout { .. })),
+        "got {result:?}"
+    );
+    assert!(
+        !conn.is_reusable(),
+        "the driver is still inside the IDLE exchange"
+    );
+
+    drop(conn);
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncReadExt::read_to_end(&mut server, &mut rest),
+    )
+    .await;
+    assert!(
+        matches!(closed, Ok(Ok(_))),
+        "the abandoned driver kept the socket open after its last handle dropped"
+    );
+}
+
+/// Ending IDLE through the cancel token with a completed DONE handshake is a
+/// completed exchange: the connection stays reusable, which push relies on to
+/// re-IDLE on the same session after a subscription change.
+#[tokio::test]
+async fn an_idle_cancelled_through_its_token_stays_reusable() {
+    let (conn, mut server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1 IDLE")).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let script = {
+        let cancel = cancel.clone();
+        async move {
+            let idle = read_line(&mut server).await;
+            let tag = tag_of(&idle).to_owned();
+            respond(&mut server, "+ idling\r\n").await;
+            cancel.cancel();
+            assert_eq!(read_line(&mut server).await, "DONE\r\n");
+            respond(&mut server, &format!("{tag} OK IDLE terminated\r\n")).await;
+            server
+        }
+    };
+    let idle = conn.idle(Duration::from_secs(5), Duration::from_secs(5), cancel);
+    let (event, _server) = tokio::join!(idle, script);
+    assert!(matches!(event, Ok(IdleEvent::Cancelled)), "got {event:?}");
+    assert!(
+        conn.is_reusable(),
+        "a completed DONE leaves the connection reusable"
+    );
+}
+
 // ===========================================================================
 // One command path: live session legality, pending effects, write evidence
 // ===========================================================================

@@ -472,11 +472,13 @@ async fn negotiate_qresync(
             ),
         });
     }
-    let enabled = conn.enable(&["QRESYNC"], cfg.imap.command_timeout).await?;
-    let confirmed = enabled
-        .iter()
-        .any(|item| item.eq_ignore_ascii_case("QRESYNC"))
-        || conn.server_profile().enabled("QRESYNC");
+    // The same initialization every pool dial runs, so the primed member and
+    // the dialed ones follow one rule. The account policy is seeded from this
+    // member's COMMITTED profile, not from ENABLE's return value: every member
+    // talks to the same server, and one that will not confirm QRESYNC on the
+    // first connection is reported once below and left on CONDSTORE.
+    super::pool::enable_qresync(conn, cfg.imap.command_timeout).await?;
+    let confirmed = conn.server_profile().enabled("QRESYNC");
     Ok(QresyncNegotiation {
         enabled: confirmed,
         warning: (!confirmed).then(|| {

@@ -1,9 +1,10 @@
 use crate::connection::{NotifyFlags, SearchResult};
 use crate::error::Error;
+use crate::types::response::Removal;
 use crate::types::response::{
     EsearchResponse, ResponseCode, TaggedResponse, UntaggedResponse, UntaggedStatus,
 };
-use crate::types::{CopyResult, ExpungeResult, MoveResult, UidRange};
+use crate::types::{CopyResult, ExpungeResult, MoveResult};
 
 use super::super::expand_uid_ranges;
 use super::{Consumer, ConsumerContext, Finalized};
@@ -424,9 +425,9 @@ fn resolve_copyuid(
 /// expunged sequence numbers or UID ranges.
 ///
 /// When QRESYNC is enabled the server sends VANISHED instead of
-/// EXPUNGE (RFC 7162 Section3.2.10). The consumer accumulates both
-/// variants and selects the appropriate [`ExpungeResult`] variant
-/// based on the QRESYNC enabled state in `finalize`.
+/// EXPUNGE for a mailbox with persistent mod-sequences (RFC 7162
+/// Section3.2.10). The consumer accumulates both forms and reports each as
+/// it arrived ([`ExpungeResult`]).
 pub(crate) struct MoveConsumer {
     /// `* N EXPUNGE` and `* VANISHED ...` responses, kept verbatim and in
     /// arrival order.
@@ -496,12 +497,12 @@ impl Consumer for MoveConsumer {
     fn finalize(
         self: Box<Self>,
         tagged: TaggedResponse,
-        ctx: &ConsumerContext,
+        _ctx: &ConsumerContext,
     ) -> Finalized<MoveResult> {
         let this = *self;
         match tagged.require_ok() {
             Ok(tagged) => {
-                let expunged = fold_mutations(this.mutations, qresync_enabled(ctx));
+                let expunged = fold_mutations(this.mutations);
                 let (code, copy_uid, events) =
                     resolve_copyuid(tagged.code, this.buffered, this.copyuid);
                 Finalized::success(
@@ -603,39 +604,22 @@ impl Consumer for ExpungeWithCodeConsumer {
     }
 }
 
-/// Whether QRESYNC was successfully `ENABLE`d (RFC 7162 Section3.2.10:
-/// the server then sends VANISHED instead of EXPUNGE).
+/// Fold accumulated EXPUNGE/VANISHED responses into the typed result, each in
+/// the form it arrived and in arrival order.
 ///
-/// The ENABLED echo is stored verbatim; the name is an atom (RFC 9051
-/// Section 9), so compare case-insensitively.
-fn qresync_enabled(ctx: &ConsumerContext) -> bool {
-    ctx.enabled()
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case("QRESYNC"))
-}
-
-/// Flatten accumulated EXPUNGE/VANISHED responses into the typed result.
-///
-/// Selects the variant by QRESYNC enabled state rather than by what actually
-/// arrived, matching the RFC 7162 Section3.2.10 contract.
-fn fold_mutations(mutations: Vec<UntaggedResponse>, qresync: bool) -> ExpungeResult {
-    if qresync {
-        let mut vanished: Vec<UidRange> = Vec::new();
-        for resp in mutations {
-            if let UntaggedResponse::Vanished { uids, .. } = resp {
-                vanished.extend(uids);
-            }
-        }
-        ExpungeResult::Vanished(vanished)
-    } else {
-        let mut expunged = Vec::new();
-        for resp in mutations {
-            if let UntaggedResponse::Expunge(n) = resp {
-                expunged.push(n);
-            }
-        }
-        ExpungeResult::Expunged(expunged)
-    }
+/// The form is NOT chosen from the connection's QRESYNC state: a QRESYNC
+/// connection still receives EXPUNGE for a `[NOMODSEQ]` mailbox (RFC 7162
+/// Section 3.2.10), and choosing by enablement silently dropped those.
+fn fold_mutations(mutations: Vec<UntaggedResponse>) -> ExpungeResult {
+    let removals = mutations
+        .into_iter()
+        .filter_map(|resp| match resp {
+            UntaggedResponse::Expunge(n) => Some(Removal::Seq(n)),
+            UntaggedResponse::Vanished { earlier, uids } => Some(Removal::Uids { earlier, uids }),
+            _ => None,
+        })
+        .collect();
+    ExpungeResult { removals }
 }
 
 impl Consumer for ExpungeConsumer {
@@ -661,13 +645,10 @@ impl Consumer for ExpungeConsumer {
     fn finalize(
         self: Box<Self>,
         tagged: TaggedResponse,
-        ctx: &ConsumerContext,
+        _ctx: &ConsumerContext,
     ) -> Finalized<ExpungeResult> {
         match tagged.require_ok() {
-            Ok(_) => Finalized::success(
-                fold_mutations(self.mutations, qresync_enabled(ctx)),
-                self.buffered,
-            ),
+            Ok(_) => Finalized::success(fold_mutations(self.mutations), self.buffered),
             Err(e) => {
                 // A failed EXPUNGE may still have expunged something: the
                 // server can report `* 1 EXPUNGE` and then fail the command
@@ -691,7 +672,12 @@ impl Consumer for ExpungeConsumer {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::types::UidRange;
     use crate::types::response::StatusKind;
+
+    fn removals(removals: Vec<Removal>) -> ExpungeResult {
+        ExpungeResult { removals }
+    }
 
     fn ctx() -> ConsumerContext<'static> {
         ConsumerContext {
@@ -937,7 +923,7 @@ mod tests {
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(copyuid(20)));
         assert_eq!(output.copy_uid, Some(copyuid(20)));
-        assert_eq!(output.expunged, ExpungeResult::Expunged(vec![1]));
+        assert_eq!(output.expunged, removals(vec![Removal::Seq(1)]));
         assert_eq!(
             result.reclassified_as_events,
             vec![UntaggedResponse::Exists(3)]
@@ -959,7 +945,7 @@ mod tests {
         let output = result.output.unwrap();
         assert_eq!(output.code, Some(copyuid(30)));
         assert_eq!(output.copy_uid, Some(copyuid(30)));
-        assert_eq!(output.expunged, ExpungeResult::Expunged(vec![1]));
+        assert_eq!(output.expunged, removals(vec![Removal::Seq(1)]));
         assert_eq!(
             result.reclassified_as_events,
             vec![
@@ -1005,11 +991,51 @@ mod tests {
         assert_eq!(output.copy_uid, Some(copyuid(20)));
         assert_eq!(
             output.expunged,
-            ExpungeResult::Vanished(vec![UidRange::single(1)])
+            removals(vec![Removal::Uids {
+                earlier: false,
+                uids: vec![UidRange::single(1)],
+            }])
         );
         assert_eq!(
             result.reclassified_as_events,
             vec![UntaggedResponse::Exists(3)]
+        );
+    }
+
+    /// A QRESYNC-enabled connection still receives `* n EXPUNGE` for a
+    /// `[NOMODSEQ]` mailbox (RFC 7162 Section 3.2.10), and RFC 6851 Section
+    /// 4.4 has a QRESYNC client handle both forms. Every removal is kept, in
+    /// the form and order it arrived.
+    ///
+    /// Choosing the form from the connection's QRESYNC state (the old fold)
+    /// fails this: the EXPUNGE is dropped and only the VANISHED survives.
+    #[test]
+    fn expunge_keeps_every_removal_in_the_form_it_arrived_on_a_qresync_connection() {
+        let qresync = ["QRESYNC".to_owned()];
+        let ctx = ConsumerContext {
+            capabilities: &[],
+            enabled: &qresync,
+            command_target: None,
+            command_tag: "A001",
+        };
+        let mut consumer = ExpungeConsumer::new();
+        let vanished = UntaggedResponse::Vanished {
+            earlier: false,
+            uids: vec![UidRange::single(42)],
+        };
+        consumer.on_response(UntaggedResponse::Expunge(3), NotifyFlags::default(), &ctx);
+        consumer.on_response(vanished, NotifyFlags::default(), &ctx);
+
+        let result = Box::new(consumer).finalize(tagged(StatusKind::Ok, None), &ctx);
+        assert_eq!(
+            result.output.unwrap(),
+            removals(vec![
+                Removal::Seq(3),
+                Removal::Uids {
+                    earlier: false,
+                    uids: vec![UidRange::single(42)],
+                },
+            ])
         );
     }
 

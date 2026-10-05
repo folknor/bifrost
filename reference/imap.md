@@ -72,7 +72,19 @@ Every submit helper holds an `InFlightGuard` that marks the connection
 and `PooledConn::drop` parks only a member that `is_reusable()` (alive AND
 not abandoned). Without this, the next checkout queues behind the still
 running command and times out in turn, so one slow command cascades into a
-run of spurious timeouts on the same connection.
+run of spurious timeouts on the same connection. IDLE is tracked the same
+way: a DONE handshake that times out, or an `idle()` future dropped once the
+command was submitted, leaves the connection abandoned, while token
+cancellation that completes DONE leaves it reusable (push re-IDLEs on it).
+
+An abandoned connection's LAST handle aborts its driver (`ImapConnection`'s
+`Drop`). The driver is still inside an exchange whose caller is gone; closing
+the command channel cannot reach a driver blocked in that exchange, so
+against a stalled peer it and its socket would otherwise outlive every
+handle, unreachable by `close()`. A connection that is not abandoned keeps
+the graceful path, the bounded best-effort LOGOUT. `abort` only requests
+cancellation; `terminate().await` remains the guarantee `Account::close()`
+relies on.
 
 The driver's terminal best-effort LOGOUT (run when the last handle drops
 and the command channel closes) is time-bounded (`LOGOUT_DRAIN_TIMEOUT`,
@@ -468,7 +480,7 @@ The public account module re-exports only `ImapAccountFactory`, `ImapAccountConf
 Submodules:
 
 - `factory.rs` - `ImapAccountConfig`, `AccountFactory::open(account_id)`, optional `BandwidthMeter`/`MeterSink` wiring, fail-soft CardDAV/CalDAV sub-account open (`DavAttach`), open-time construction of the `DavScopeIndex` from each attached DAV account's collection-folder cursor scopes, `ID` probe, QRESYNC negotiation, folder LIST, and A5c NAMESPACE/ACL shared-folder discovery (`discover_shared_folders`).
-- `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared bandwidth-cap atomic when configured.
+- `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared bandwidth-cap atomic when configured, and is brought to the account's QRESYNC policy (`enable_qresync`) before it is handed out; see "CONDSTORE / QRESYNC strategy".
 - `folder_registry.rs` - mailbox map plus per-folder cursor and MODSEQ caches (`record_modseq`, `modseq`, `clear_modseqs`), keyed by `(folder, uidvalidity, uid)`, storing LIST delimiter/attributes and the A5c `shared_owner` tag, clearing on UIDVALIDITY change, delete, or rename.
 - `envelope.rs` - `FolderCursor` (QResync/Condstore/Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
 - `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group. `mod.rs` holds `route_scope`/`ScopeHandler`; typed legacy DAV scopes dispatch by object type, while per-collection DAV folder scopes dispatch through `DavScopeIndex`. `FolderId` carries no protocol namespace and IMAP mailbox names are arbitrary strings, so the index is built once at open and made unambiguous there: a collection href equal to a known IMAP mailbox name is not indexed (the mailbox keeps its scope), and a href claimed by both sub-accounts is not indexed (the tie is never resolved silently in favour of contacts). Both exclusions are reported as open-time warnings on the degraded-DAV lane, so a dropped entry routes to IMAP or to `Unsupported` rather than syncing the wrong collection quietly. Push admission consults the same index: an indexed DAV collection scope is a syntactically valid mailbox name but names no mailbox, so it is refused per-item (the DAV sub-accounts have no push lane) instead of being reported as pushed and burning an IDLE budget slot on a folder no worker can SELECT. `scopes.rs` holds the discovery fan-in.
@@ -492,11 +504,18 @@ FETCH cannot checkpoint success.
 Negotiation in `factory.rs`:
 
 1. `ID` probe runs when advertised; failures are non-fatal. iCloud is preconfigured off via exact-match `name` checks (`"icloud"` / `"icloud imap"`); substring matches do not trip the downgrade.
-2. If `enable_qresync` and the server advertises QRESYNC, the factory runs `ENABLE QRESYNC`; the `ENABLED` reply must echo `QRESYNC` (or `ServerProfile::enabled` confirms it), else the session continues CONDSTORE-only with a one-shot `OperatorAttentionNeeded` warning. That warning is emitted by the INVENTORY walk, not the changes stream - the changes path reads the non-consuming `qresync_negotiation_reason()` and never spends the one-shot, because doing so could not change a byte of what it emitted while burning the warning out from under inventory. The one-shot is also RESTORED if the inventory task ends with its output channel already closed, which is the only case where the warning provably reached nobody; with a live receiver an mpsc keeps buffered items past sender drop, so delivery is not in doubt and the no-repeat property holds.
+2. If `enable_qresync` and the server advertises QRESYNC, the factory brings the primed connection to QRESYNC through `pool::enable_qresync`, the same initialization every pool dial runs. The account policy is seeded from that member's COMMITTED profile (`ServerProfile::enabled("QRESYNC")`), never from ENABLE's return value: a server that echoes `* ENABLED QRESYNC` and then refuses the command has still told us its wire behaviour changed. When the member is not enabled the session continues CONDSTORE-only with a one-shot `OperatorAttentionNeeded` warning; a server advertising QRESYNC without ENABLE, or refusing the ENABLE, lands there too rather than failing open. That warning is emitted by the INVENTORY walk, not the changes stream - the changes path reads the non-consuming `qresync_negotiation_reason()` and never spends the one-shot, because doing so could not change a byte of what it emitted while burning the warning out from under inventory. The one-shot is also RESTORED if the inventory task ends with its output channel already closed, which is the only case where the warning provably reached nobody; with a live receiver an mpsc keeps buffered items past sender drop, so delivery is not in doubt and the no-repeat property holds.
 3. The QRESYNC capability check is exact (not substring) to avoid false positives on capabilities with `QRESYNC` as a suffix.
+
+QRESYNC is a property a connection is BORN with, never acquired later. ENABLE is legal only before any mailbox has been selected in the session (RFC 5161 Section 3.1), and inventory and the PIM primitives select with no cursor, so checkout affinity routinely hands a QResync-cursor run a member that has already selected the folder. Hence:
+
+- The policy (`ImapAccount::qresync_enabled`, stored on the pool) is a strategy-admission flag only: it decides whether new work REQUESTS QRESYNC. Whether a connection does QRESYNC is its own committed profile, and wire interpretation reads that, or the form a response arrived in, never the policy. `disable_qresync_for_session` stops new requests and new dial-time ENABLEs; it cannot undo QRESYNC on members already enabled (RFC 7162 Section 3.2.3 gives no way back short of closing the connection), and nothing needs it to.
+- `Pool::dial` registers a new member and then, while the policy is set, runs `enable_qresync` before handing it out. That helper negotiates only when the profile supports both QRESYNC and ENABLE. A completed refusal on a reusable connection admits a healthy non-QRESYNC member; an ENABLE that times out (abandoned) or a dead connection retires it, terminated without LOGOUT. A pool closed during the dial also terminates without LOGOUT, since LOGOUT is unbounded.
+- `select_for_sync` never issues ENABLE. It sends QRESYNC parameters only when the options carry them AND the connection has QRESYNC enabled, and reports which happened as `QresyncOutcome` (`Used`, `NotRequested`, `NotEnabledOnConnection`), decided when the command was built rather than read back from the policy later.
 
 Runtime downgrades:
 
+- A QResync-cursor run whose SELECT did not use QRESYNC (`QresyncOutcome` other than `Used`) is validated as usual (UIDVALIDITY, NOMODSEQ, MODSEQ reset) and continues as CONDSTORE on the SAME checkout (`run_condstore_from_selected`), with one `StrategyDowngraded` warning naming the reason. The policy is not withdrawn for one member's shortfall. Every CONDSTORE run mints its next cursor through `cursor_from_select`, the policy-based rule inventory uses, so a member that could not do QRESYNC never demotes the folder for good: with the policy set and persistent MODSEQ, the checkpoint is a QResync cursor at the SELECT's HIGHESTMODSEQ over the complete UID SEARCH snapshot.
 - A QRESYNC SELECT response that fails to parse calls `disable_qresync_for_session()` (one-shot), discards the suspect pooled connection, and retries on CONDSTORE.
 - A legacy QRESYNC cursor lacking a complete UID baseline (`known_uids_complete == false`) cannot be diffed against consumer state. It terminates with `CursorInvalid`, deriving `RestartScope`, so bifrost-sync deletes the cursor and re-establishes exact membership through inventory. Current server membership is never substituted for the missing historical baseline.
 - A mailbox that answers a QRESYNC or CONDSTORE SELECT with `[NOMODSEQ]` finishes as Basic on the connection it already holds. That SELECT carried changed-message FETCH data, so the Basic run consumes it under the classification above rather than discarding the flag updates it describes.

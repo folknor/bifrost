@@ -40,12 +40,12 @@ impl ImapConnection {
     ///
     /// # Cancellation safety
     ///
-    /// Dropping the future returned by this method is safe  -  the driver
-    /// task owns the stream and will eventually detect that the handle
-    /// is gone (channel close). However, if the IDLE command was already
-    /// sent on the wire, the connection may be left in an inconsistent
-    /// state until the driver task exits. Prefer using the
-    /// `cancel` token instead of dropping the future.
+    /// Dropping the future returned by this method once the IDLE command
+    /// was submitted marks the connection abandoned, as does a DONE
+    /// handshake that times out: the driver may still be inside the IDLE
+    /// exchange, so the connection is not reusable, and dropping its last
+    /// handle aborts the driver. Use the `cancel` token to end IDLE and keep
+    /// the connection.
     ///
     /// # Filtered events
     ///
@@ -91,6 +91,16 @@ impl ImapConnection {
         if self.cmd_tx.send(dcmd).await.is_err() {
             return Err(self.observe_driver_panic(TransmissionState::Unsent).await);
         }
+        // The IDLE exchange is the driver's from here. Like every other
+        // submission, it marks the connection abandoned unless the driver's
+        // answer to the IDLE command is actually received: a DONE handshake
+        // that times out, an early return, or a dropped future leaves the
+        // driver inside an exchange nobody will finish, and the connection
+        // must neither be reused nor outlive its last handle with a live
+        // driver (`ImapConnection`'s `Drop` aborts an abandoned one). Token
+        // cancellation that completes DONE is a completed exchange and leaves
+        // the connection reusable, which push relies on to re-IDLE.
+        let guard = self.in_flight();
 
         // The driver is now in IDLE mode: it has sent "tag IDLE\r\n",
         // received the `+` continuation, and is reading events from
@@ -146,8 +156,14 @@ impl ImapConnection {
                             // a generic `DriverGone`. `try_recv`, not an
                             // await: nothing guarantees the answer exists.
                             return match result_rx.try_recv() {
-                                Ok(Ok(_)) => Ok(IdleEvent::ServerTerminated),
-                                Ok(Err(e)) => Err(e),
+                                Ok(Ok(_)) => {
+                                    guard.completed();
+                                    Ok(IdleEvent::ServerTerminated)
+                                }
+                                Ok(Err(e)) => {
+                                    guard.completed();
+                                    Err(e)
+                                }
                                 // No answer: the driver owned the IDLE
                                 // command when it died (the send above
                                 // succeeded), so it may have been written:
@@ -168,14 +184,19 @@ impl ImapConnection {
                 idle_result = &mut result_rx => {
                     return match idle_result {
                         Ok(Ok(IdleTermination::ServerTerminated)) => {
+                            guard.completed();
                             Ok(IdleEvent::ServerTerminated)
                         }
                         Ok(Ok(IdleTermination::ClientDone)) => {
                             // Shouldn't happen  -  we haven't sent DONE.
                             // Treat as server-terminated.
+                            guard.completed();
                             Ok(IdleEvent::ServerTerminated)
                         }
-                        Ok(Err(e)) => Err(e),
+                        Ok(Err(e)) => {
+                            guard.completed();
+                            Err(e)
+                        }
                         Err(_) => Err(self.observe_driver_panic(TransmissionState::InFlight).await),
                     };
                 }
@@ -194,8 +215,11 @@ impl ImapConnection {
         // account shutdown, and past `close()` (the IDLE connection is
         // dialed outside the pool, so the pool's drain never sees it).
         match tokio::time::timeout(done_timeout, result_rx).await {
-            Ok(Ok(Ok(_))) => {}
-            Ok(Ok(Err(e))) => return Err(e),
+            Ok(Ok(Ok(_))) => guard.completed(),
+            Ok(Ok(Err(e))) => {
+                guard.completed();
+                return Err(e);
+            }
             Ok(Err(_)) => {
                 return Err(self.observe_driver_panic(TransmissionState::InFlight).await);
             }

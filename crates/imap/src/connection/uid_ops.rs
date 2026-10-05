@@ -727,12 +727,11 @@ impl ImapConnection {
 
     /// EXPUNGE (RFC 3501 Section 6.4.3 / RFC 7162 Section 3.2.10).
     ///
-    /// Without QRESYNC, returns `ExpungeResult::Expunged` with the sequence
-    /// numbers of removed messages (`* n EXPUNGE`, RFC 3501 Section 7.4.1).
-    ///
-    /// After `ENABLE QRESYNC` (RFC 7162 Section 3.2.10), the server sends
-    /// `VANISHED` responses instead of `EXPUNGE`, and this method returns
-    /// `ExpungeResult::Vanished` with UID ranges.
+    /// Returns every removal the server reported, in arrival order and in
+    /// the form it arrived: sequence numbers (`* n EXPUNGE`, RFC 3501
+    /// Section 7.4.1), or UID ranges (`* VANISHED`, which a QRESYNC-enabled
+    /// connection receives for a mailbox with persistent mod-sequences, RFC
+    /// 7162 Section 3.2.10).
     pub async fn expunge(&self, timeout: Duration) -> Result<ExpungeResult, Error> {
         self.require_state(crate::types::CommandKind::Expunge)?;
         tokio::time::timeout(

@@ -1078,14 +1078,12 @@ fn downgrade_detail(from: SyncStrategy, to: SyncStrategy) -> String {
 async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
     let (conn, mut server) =
         driver_pair(&preauth_greeting("IMAP4rev1 ENABLE CONDSTORE QRESYNC")).await;
-    let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
-
-    let script = tokio::spawn(async move {
+    // The member is brought to QRESYNC when it is minted, as the factory does
+    // for the primed connection and the pool for every dial.
+    let enable = super::pool::enable_qresync(&conn, Duration::from_secs(5));
+    let answer = async {
         let enable = read_line(&mut server).await;
-        assert!(
-            enable.contains("ENABLE QRESYNC"),
-            "QRESYNC must be ENABLEd before the SELECT that uses it, got {enable}"
-        );
+        assert!(enable.contains("ENABLE QRESYNC"), "got {enable}");
         respond(
             &mut server,
             &format!(
@@ -1094,7 +1092,12 @@ async fn qresync_dedupes_vanished_against_fetch_and_checkpoints_the_live_set() {
             ),
         )
         .await;
+    };
+    let (enabled, ()) = tokio::join!(enable, answer);
+    enabled.unwrap();
+    let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
 
+    let script = tokio::spawn(async move {
         let select = read_line(&mut server).await;
         assert!(
             select.contains("EXAMINE") && select.contains("QRESYNC (5 100 1:3)"),
@@ -1378,27 +1381,31 @@ async fn condstore_changes_crossing_batch_limit_are_paged() {
     let _server = script.await.unwrap();
 }
 
-/// A server that advertises QRESYNC but not ENABLE fails the ENABLE leg of
-/// `select_for_sync` with `MissingCapability("ENABLE")` before writing a
-/// byte. That must downgrade to CONDSTORE, not terminate the stream, and
-/// the retry must not deadlock on the pool permit the failed QRESYNC
-/// attempt still holds: at `pool_cap = 1` this test hangs (and fails on
-/// `collect_changes`' timeout) if the checkout is not released before the
-/// retry re-enters `checkout_for_folder`.
+/// A QResync cursor run on a member that does not have QRESYNC enabled (here
+/// the server advertises QRESYNC without ENABLE, so no member can) selects
+/// with CONDSTORE instead - `select_for_sync` never issues ENABLE - and the
+/// run continues as CONDSTORE on the SAME checkout, with one downgrade
+/// warning. At `pool_cap = 1` a re-checkout would hang (and fail on
+/// `collect_changes`' timeout).
+///
+/// The checkpoint is minted by policy, not by this member's shortfall: the
+/// account policy allows QRESYNC, the mailbox has persistent mod-sequences
+/// and the UID baseline is a complete SEARCH snapshot, so it is a QResync
+/// cursor at the SELECT's HIGHESTMODSEQ. A Condstore checkpoint here would
+/// demote the folder for good because one member could not do QRESYNC.
 #[tokio::test]
-async fn qresync_without_enable_capability_downgrades_and_does_not_deadlock() {
+async fn a_qresync_run_on_a_member_without_qresync_continues_as_condstore_on_the_same_checkout() {
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 QRESYNC CONDSTORE")).await;
     let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
 
     let script = tokio::spawn(async move {
-        // The failed QRESYNC leg writes nothing: the first command on the
-        // wire is already the CONDSTORE retry's EXAMINE.
+        // No ENABLE: the first command on the wire is the CONDSTORE EXAMINE.
         let select = read_line(&mut server).await;
         assert!(
             select.contains("EXAMINE")
                 && select.contains("CONDSTORE")
                 && !select.contains("QRESYNC"),
-            "expected the CONDSTORE retry's EXAMINE as the first command, got {select}"
+            "expected a CONDSTORE EXAMINE as the first command, got {select}"
         );
         respond(
             &mut server,
@@ -1416,8 +1423,8 @@ async fn qresync_without_enable_capability_downgrades_and_does_not_deadlock() {
 
         let fetch = read_line(&mut server).await;
         assert!(
-            fetch.contains("CHANGEDSINCE 50"),
-            "the retry diffs against the QRESYNC cursor's modseq, got {fetch}"
+            fetch.contains("CHANGEDSINCE 50") && !fetch.contains("VANISHED"),
+            "the CONDSTORE continuation diffs against the QRESYNC cursor's modseq, got {fetch}"
         );
         respond(
             &mut server,
@@ -1475,16 +1482,115 @@ async fn qresync_without_enable_capability_downgrades_and_does_not_deadlock() {
         ]
     );
     match done_cursor(&events) {
-        FolderCursor::Condstore {
+        FolderCursor::QResync {
             uidvalidity,
             modseq,
             known_uids,
+            known_uids_complete,
         } => {
             assert_eq!((uidvalidity, modseq), (7, 60));
             assert_eq!(known_uids.to_uids(), vec![2, 3, 4]);
+            assert!(known_uids_complete);
         }
-        other => panic!("expected a CONDSTORE checkpoint, got {other:?}"),
+        other => panic!("expected a policy-minted QRESYNC checkpoint, got {other:?}"),
     }
+    let _server = script.await.unwrap();
+}
+
+/// The defect this pins: a pool member that has already selected a mailbox
+/// (inventory selects with no cursor) and does not have QRESYNC enabled is
+/// handed a QResync-cursor run, which checkout affinity makes likely. ENABLE
+/// is illegal there (RFC 5161 Section 3.1), and the run used to issue it
+/// lazily from `select_for_sync`, be refused, and fail. Now no ENABLE ever
+/// reaches the wire: the member selects with CONDSTORE and the run completes
+/// on it, checkpointing by policy.
+///
+/// Restoring the lazy ENABLE in `select_for_sync` fails this: the ENABLE is
+/// refused with `InvalidState` and the stream terminates instead of
+/// checkpointing.
+#[tokio::test]
+async fn a_qresync_run_on_a_member_that_already_selected_never_issues_enable() {
+    let (conn, mut server) =
+        driver_pair(&preauth_greeting("IMAP4rev1 ENABLE CONDSTORE QRESYNC")).await;
+    let account = scripted_sync_account(conn, 1, true, None, inbox_registry());
+
+    let script = tokio::spawn(async move {
+        let examine = |tag: &str| {
+            format!(
+                "{SELECT_PREAMBLE}\
+                 * 3 EXISTS\r\n\
+                 * OK [UIDVALIDITY 7] ok\r\n\
+                 * OK [UIDNEXT 12] ok\r\n\
+                 * OK [HIGHESTMODSEQ 60] ok\r\n\
+                 {tag} OK [READ-ONLY] EXAMINE done\r\n"
+            )
+        };
+        // The inventory-style selection, with no cursor.
+        let first = read_line(&mut server).await;
+        assert!(first.contains("EXAMINE"), "got {first}");
+        respond(&mut server, &examine(tag_of(&first))).await;
+
+        // The QResync-cursor run on the same, already-selected member.
+        let second = read_line(&mut server).await;
+        assert!(
+            second.contains("EXAMINE")
+                && second.contains("CONDSTORE")
+                && !second.contains("QRESYNC"),
+            "no ENABLE may precede the run's select, and it may not ask for \
+             QRESYNC on a member without it; got {second}"
+        );
+        respond(&mut server, &examine(tag_of(&second))).await;
+
+        let fetch = read_line(&mut server).await;
+        assert!(fetch.contains("CHANGEDSINCE 50"), "got {fetch}");
+        respond(
+            &mut server,
+            &format!("{} OK UID FETCH done\r\n", tag_of(&fetch)),
+        )
+        .await;
+
+        let search = read_line(&mut server).await;
+        assert!(search.contains("UID SEARCH ALL"), "got {search}");
+        respond(
+            &mut server,
+            &format!(
+                "* SEARCH 1 2 3\r\n{} OK UID SEARCH done\r\n",
+                tag_of(&search)
+            ),
+        )
+        .await;
+        server
+    });
+
+    {
+        let mut pooled = account.pool.checkout_for_folder(&inbox()).await.unwrap();
+        account
+            .select_folder(&mut pooled, &inbox(), None, true)
+            .await
+            .unwrap();
+    }
+
+    let events = collect_changes(
+        account,
+        cursor_for(&FolderCursor::QResync {
+            uidvalidity: 7,
+            modseq: 50,
+            known_uids: CompactUidSet::from_uids([1, 2, 3]),
+            known_uids_complete: true,
+        }),
+    )
+    .await;
+
+    let warnings = warnings_of(&events);
+    assert_eq!(warnings.len(), 1, "one downgrade warning: {warnings:?}");
+    assert_eq!(warnings[0].kind, WarningKind::StrategyDowngraded);
+    assert!(
+        matches!(
+            done_cursor(&events),
+            FolderCursor::QResync { modseq: 60, .. }
+        ),
+        "the run must checkpoint, by policy, at the SELECT's HIGHESTMODSEQ"
+    );
     let _server = script.await.unwrap();
 }
 

@@ -290,7 +290,7 @@ async fn uid_move_fallback_carries_the_expunge_tagged_code_and_the_copyuid() {
     use crate::connection::test_support::{
         driver_pair, preauth_greeting, read_line, respond, tag_of,
     };
-    use crate::types::response::ResponseCode;
+    use crate::types::response::{Removal, ResponseCode};
     use crate::types::{ExpungeResult, UidRange};
 
     let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
@@ -353,5 +353,10 @@ async fn uid_move_fallback_carries_the_expunge_tagged_code_and_the_copyuid() {
             dest_uids: vec![UidRange::single(20)],
         })
     );
-    assert_eq!(result.expunged, ExpungeResult::Expunged(vec![1]));
+    assert_eq!(
+        result.expunged,
+        ExpungeResult {
+            removals: vec![Removal::Seq(1)],
+        }
+    );
 }

@@ -40,9 +40,13 @@ where
 impl ImapConnection {
     /// SELECT or EXAMINE a mailbox using sync-oriented options.
     ///
-    /// If a complete QRESYNC cursor is provided and the server advertises
-    /// QRESYNC, this method enables QRESYNC before selecting the mailbox.
-    /// Otherwise it falls back to CONDSTORE when requested and available.
+    /// QRESYNC parameters are sent when the options carry a complete QRESYNC
+    /// cursor AND this connection has QRESYNC enabled. Otherwise it falls
+    /// back to CONDSTORE when requested and available. It never issues
+    /// `ENABLE`: on a connection that has selected a mailbox before, that is
+    /// illegal (RFC 5161 Section 3.1). Connections are brought to QRESYNC
+    /// when minted (`account::pool::enable_qresync`); the result's
+    /// `qresync` says what happened here.
     ///
     /// Direct API counterpart to Account cursor establishment and changes:
     /// callers keep native IMAP types and own cursor persistence.
@@ -52,14 +56,17 @@ impl ImapConnection {
         options: &crate::types::SyncSelectOptions,
         timeout: Duration,
     ) -> Result<crate::types::SyncSelectResult, Error> {
+        use crate::types::QresyncOutcome;
+
         let profile = self.server_profile();
         let qresync = options.qresync_params();
-        let qresync_used = qresync.is_some() && profile.supports_qresync();
+        let outcome = match qresync {
+            None => QresyncOutcome::NotRequested,
+            Some(_) if profile.enabled("QRESYNC") => QresyncOutcome::Used,
+            Some(_) => QresyncOutcome::NotEnabledOnConnection,
+        };
+        let qresync_used = outcome == QresyncOutcome::Used;
         let condstore_used = !qresync_used && options.condstore && profile.supports_condstore();
-
-        if qresync_used && !profile.enabled("QRESYNC") {
-            self.enable(&["QRESYNC"], timeout).await?;
-        }
 
         let select_options = if qresync_used {
             SelectOptions::qresync(qresync.expect("checked qresync"))
@@ -77,7 +84,7 @@ impl ImapConnection {
 
         Ok(crate::types::SyncSelectResult {
             mailbox,
-            qresync_used,
+            qresync: outcome,
             condstore_used,
         })
     }

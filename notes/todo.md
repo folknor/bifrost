@@ -88,27 +88,6 @@ control-character, caldav-override and push-handle-format items on
   nothing because the request had already gone out; and the first hop is
   never gated before sending, only redirect hops are.
 
-
-## imap: filed while fixing the APPEND-as-`Command` laterals (2026-10-05)
-
-- **A pooled connection can be asked to ENABLE QRESYNC after it has
-  selected.** Suspected live defect, not yet reproduced in a transcript.
-  Pooled connections never negotiate QRESYNC at dial (`pool.rs` `dial` only
-  connects and authenticates); `select_for_sync` (`connection/ergonomics.rs`)
-  issues `ENABLE QRESYNC` lazily, the first time it is handed a QRESYNC cursor
-  on a connection whose profile does not show it enabled. But inventory
-  selects with no cursor (`inventory.rs`, `select_folder(.., None, ..)`), and
-  the PIM primitives do the same, so a pooled member can already be Selected,
-  or Authenticated after an UNSELECT, without QRESYNC when a later `changes`
-  run with a `QResync` cursor checks it out. ENABLE is then illegal (RFC 5161
-  Section 3.1): the handle refuses it with `InvalidState`, and
-  `should_disable_qresync` (`changes.rs`) does not read that as a downgrade,
-  so the changes run fails rather than falling back to CONDSTORE. Before
-  2026-10-05 the post-UNSELECT case was sent to the server instead (which owes
-  it a BAD); the Selected case was refused locally already. Candidate fixes,
-  for a ruling: negotiate QRESYNC at pool dial when the account negotiated it
-  at open, or treat a refused lazy ENABLE as the CONDSTORE downgrade.
-
 ## bifrost-sync
 
 - **sync-F6.** (residuals of the closed F4+F5 throttle wiring) What

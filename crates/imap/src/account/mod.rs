@@ -91,7 +91,6 @@ pub(crate) struct ImapAccountInner {
     pub(crate) capabilities: bifrost_types::AccountCapabilities,
     pub(crate) pool: Arc<Pool>,
     pub(crate) folders: Arc<FolderRegistry>,
-    pub(crate) qresync_enabled: AtomicBool,
     pub(crate) qresync_negotiation_warning: Option<String>,
     pub(crate) qresync_negotiation_warning_sent: AtomicBool,
     pub(crate) supports_notify: bool,
@@ -134,13 +133,17 @@ pub(crate) struct ImapAccountParts {
 impl ImapAccount {
     pub(crate) fn new(parts: ImapAccountParts) -> Self {
         let push = push::PushState::new(parts.supports_notify, parts.config.idle_connection_budget);
+        // The QRESYNC policy lives on the pool, which reads it at every dial
+        // to bring a new member to the account's QRESYNC state. The pool
+        // dials nothing before the account exists, so seeding it here is
+        // seen by every dial.
+        parts.pool.set_qresync_policy(parts.qresync_enabled);
         Self {
             inner: Arc::new(ImapAccountInner {
                 config: parts.config,
                 capabilities: parts.capabilities,
                 pool: parts.pool,
                 folders: parts.folders,
-                qresync_enabled: AtomicBool::new(parts.qresync_enabled),
                 qresync_negotiation_warning: parts.qresync_negotiation_warning,
                 qresync_negotiation_warning_sent: AtomicBool::new(false),
                 supports_notify: parts.supports_notify,
@@ -298,15 +301,26 @@ impl ImapAccount {
         })
     }
 
+    /// The account's QRESYNC policy: whether new work may REQUEST QRESYNC
+    /// (SELECT parameters, the QRESYNC change strategy, QResync cursors, and
+    /// ENABLE on newly dialed members).
+    ///
+    /// A strategy-admission policy only. It says nothing about whether a
+    /// given connection has QRESYNC enabled - that is the connection's own
+    /// committed profile, which is what wire interpretation reads.
     pub(crate) fn qresync_enabled(&self) -> bool {
-        self.qresync_enabled.load(Ordering::Acquire)
+        self.pool.qresync_policy()
     }
 
     pub(crate) fn disable_qresync_for_session(&self) {
         // Other folder syncs may already have passed their QRESYNC gate
         // on this account. They are allowed to finish or independently
-        // downgrade; this one-way flag only prevents new QRESYNC work.
-        self.qresync_enabled.store(false, Ordering::Release);
+        // downgrade; this one-way flag only prevents new QRESYNC work. It
+        // does not undo QRESYNC on members already enabled: RFC 7162
+        // Section 3.2.3 gives no way back short of closing the connection,
+        // and every consumer reads the form a removal arrived in rather
+        // than this policy.
+        self.pool.set_qresync_policy(false);
     }
 
     pub(crate) fn take_qresync_negotiation_warning(&self) -> Option<String> {

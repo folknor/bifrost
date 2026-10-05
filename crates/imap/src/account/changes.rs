@@ -317,6 +317,36 @@ async fn run_qresync(
             .await;
     }
     validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
+    // The SELECT did not use QRESYNC: the account policy was withdrawn
+    // between the gate above and building the SELECT, or this member does
+    // not have QRESYNC enabled (its dial-time ENABLE was refused or not
+    // confirmed). The checkout is validated and selected either way, so the
+    // run continues as CONDSTORE on it. The policy is NOT withdrawn for a
+    // member's shortfall: the server can do QRESYNC on other members.
+    let reason = match selected.qresync {
+        crate::types::QresyncOutcome::Used => None,
+        crate::types::QresyncOutcome::NotRequested => {
+            Some("QRESYNC is disabled for this account session; continuing with CONDSTORE")
+        }
+        _ => Some("this connection does not have QRESYNC enabled; continuing with CONDSTORE"),
+    };
+    if let Some(reason) = reason {
+        send_strategy_downgrade(&tx, SyncStrategy::QResync, SyncStrategy::Condstore, reason)
+            .await?;
+        return run_condstore_from_selected(
+            account,
+            folder,
+            SelectedBaseline {
+                uidvalidity,
+                modseq,
+                known_uids,
+                selected: selected.mailbox,
+            },
+            conn,
+            tx,
+        )
+        .await;
+    }
     let mut live_uids = known_uids.clone();
     let fallback_known_uids = live_uids.clone();
     let mut fetch_change_seen = BTreeSet::new();
@@ -556,7 +586,59 @@ async fn run_condstore_with_baseline(
             .await;
     }
     validate_modseq_not_reset(&folder, modseq, selected.mailbox.highest_mod_seq)?;
+    run_condstore_from_selected(
+        account,
+        folder,
+        SelectedBaseline {
+            uidvalidity,
+            modseq,
+            known_uids,
+            selected: selected.mailbox,
+        },
+        conn,
+        tx,
+    )
+    .await
+}
 
+/// A SELECT already made and validated for an incremental run: UIDVALIDITY
+/// matched the cursor, the mailbox has persistent mod-sequences, and its
+/// HIGHESTMODSEQ did not go backwards.
+struct SelectedBaseline {
+    uidvalidity: u32,
+    modseq: u64,
+    known_uids: CompactUidSet,
+    selected: crate::types::SelectedMailbox,
+}
+
+/// The CONDSTORE diff on a checkout that has already selected and validated
+/// the folder: `CHANGEDSINCE` for updates, a UID SEARCH ALL snapshot diffed
+/// against the complete baseline for arrivals and expunges.
+///
+/// Takes the checkout instead of acquiring one, so a QRESYNC run whose own
+/// SELECT could not use QRESYNC continues on the member it already holds
+/// rather than re-entering the pool (which deadlocks at `data_cap == 1` and
+/// may land on a different member).
+///
+/// The next cursor is minted by `cursor_from_select`, the same policy-based
+/// rule inventory uses: QResync while the account's policy allows it, else
+/// Condstore. A CONDSTORE run therefore never demotes a folder for good; a
+/// member that could not do QRESYNC this time does not decide the strategy of
+/// the next run. The MODSEQ is the SELECT's HIGHESTMODSEQ, never a later
+/// value, so no flag change is skipped.
+async fn run_condstore_from_selected(
+    account: ImapAccount,
+    folder: MailboxName,
+    baseline: SelectedBaseline,
+    conn: super::PooledConn,
+    tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
+) -> Result<(), ChangeError> {
+    let SelectedBaseline {
+        uidvalidity,
+        modseq,
+        known_uids,
+        selected,
+    } = baseline;
     let all_uids = UidSet::all();
     let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_changed_since_stream(
         all_uids.as_sequence_set(),
@@ -599,7 +681,7 @@ async fn run_condstore_with_baseline(
         }
     }
     let live_set = CompactUidSet::from_uids(search_all(&account, conn.connection()).await?);
-    warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
+    warn_if_uid_count_mismatch(&tx, &folder, selected.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
     for uid in diff.added {
         changes.push(added_change(&folder, uidvalidity, uid));
@@ -610,11 +692,7 @@ async fn run_condstore_with_baseline(
         changes.push(removed_change(&folder, uidvalidity, uid));
         flush_page(&tx, &mut changes).await?;
     }
-    let next = FolderCursor::Condstore {
-        uidvalidity,
-        modseq: selected.mailbox.highest_mod_seq.unwrap_or(modseq),
-        known_uids: live_set,
-    };
+    let next = account.cursor_from_select(&selected, Some(live_set))?;
     finish_changes(account, folder, next, changes, tx).await
 }
 

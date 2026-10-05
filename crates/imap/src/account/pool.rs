@@ -25,6 +25,10 @@ struct PoolInner {
     meter: Option<bifrost_net::MeterSinkHandle>,
     bandwidth_cap: Arc<AtomicU64>,
     closed: std::sync::atomic::AtomicBool,
+    /// The account's QRESYNC policy (`ImapAccount::qresync_enabled`). Lives
+    /// here because `dial` reads it: a member dialed while it is set is
+    /// brought to QRESYNC before it is handed out.
+    qresync_policy: std::sync::atomic::AtomicBool,
     /// Every live session minted by this pool, including checked-out and
     /// push sessions. Weak entries do not extend their lifetime, but let
     /// close reach sessions which are outside the parked list.
@@ -59,9 +63,23 @@ impl Pool {
                 meter,
                 bandwidth_cap,
                 closed: std::sync::atomic::AtomicBool::new(false),
+                qresync_policy: std::sync::atomic::AtomicBool::new(false),
                 sessions: Mutex::new(vec![primed_weak]),
             }),
         }
+    }
+
+    /// The account's QRESYNC policy. See `ImapAccount::qresync_enabled`.
+    pub(crate) fn qresync_policy(&self) -> bool {
+        self.inner
+            .qresync_policy
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn set_qresync_policy(&self, enabled: bool) {
+        self.inner
+            .qresync_policy
+            .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) async fn checkout_for_folder(
@@ -187,12 +205,16 @@ impl PoolInner {
     }
 
     /// Dial and authenticate one fresh connection under the pool's meter and
-    /// bandwidth cap. The single place a pool connection is minted, so a
-    /// future change to how connections are metered or capped lands once.
+    /// bandwidth cap, then bring it to the account's QRESYNC state. The
+    /// single place a pool connection is minted, so a future change to how
+    /// connections are metered, capped or initialized lands once.
     ///
     /// A dial that started before `close` and completed after it is torn
     /// down here rather than handed out: `Account::close()` promises no
-    /// session of this account is still connected when it returns.
+    /// session of this account is still connected when it returns. The
+    /// connection is registered BEFORE initialization, so a `close` landing
+    /// mid-ENABLE reaches it; a dial cancelled mid-ENABLE leaves it
+    /// abandoned, and its last handle aborts the driver.
     async fn dial(&self) -> Result<Arc<ImapConnection>, Error> {
         if self.is_closed() {
             return Err(Error::closed());
@@ -209,9 +231,18 @@ impl PoolInner {
             .await?;
         let conn = Arc::new(conn);
         if !self.register(&conn) {
-            let _ = conn.logout().await;
+            // The pool is closed: no graceful LOGOUT, which is unbounded
+            // and would hold this dial (and the caller's permit) open.
             conn.terminate().await;
             return Err(Error::closed());
+        }
+        if self
+            .qresync_policy
+            .load(std::sync::atomic::Ordering::Acquire)
+            && let Err(error) = enable_qresync(&conn, self.config.imap.command_timeout).await
+        {
+            conn.terminate().await;
+            return Err(error);
         }
         Ok(conn)
     }
@@ -230,6 +261,38 @@ impl PoolInner {
         sessions.retain(|weak| weak.strong_count() > 0);
         sessions.push(Arc::downgrade(conn));
         true
+    }
+}
+
+/// Bring a freshly authenticated connection to QRESYNC, before it has run a
+/// single mailbox command - the one moment `ENABLE` is always legal (RFC 5161
+/// Section 3.1 forbids it once any mailbox has been selected).
+///
+/// The one initialization rule, for the factory's primed connection and every
+/// pool dial alike. Whether the connection DOES QRESYNC afterwards is its
+/// committed profile (`ServerProfile::enabled("QRESYNC")`), never this
+/// function's result: a server can echo `* ENABLED QRESYNC` and then refuse
+/// the command, and the echo is what tells us its wire behaviour changed.
+///
+/// `Ok` covers every outcome that leaves a healthy connection: a server
+/// that cannot negotiate QRESYNC (no QRESYNC or no ENABLE capability; the
+/// connection simply serves CONDSTORE), a completed ENABLE, and a completed
+/// refusal (`NO` / `BAD`) on a connection still reusable. `Err` means the
+/// connection must not be handed out: the exchange did not finish (a timeout
+/// leaves it abandoned, with the driver still inside the ENABLE) or the
+/// connection is dead. The caller retires it.
+pub(crate) async fn enable_qresync(
+    conn: &ImapConnection,
+    timeout: std::time::Duration,
+) -> Result<(), Error> {
+    let profile = conn.server_profile();
+    if !profile.supports_qresync() || !profile.supports(crate::types::Capability::Enable) {
+        return Ok(());
+    }
+    match conn.enable(&["QRESYNC"], timeout).await {
+        Ok(_) => Ok(()),
+        Err(Error::No { .. } | Error::Bad { .. }) if conn.is_reusable() => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

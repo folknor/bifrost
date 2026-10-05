@@ -52,7 +52,9 @@ pub(crate) use response::{
 };
 pub(crate) use search::SearchCriteria;
 pub(crate) use secret::SecretString;
-pub(crate) use sync::{SyncFetchRequest, SyncFetchResult, SyncSelectOptions, SyncSelectResult};
+pub(crate) use sync::{
+    QresyncOutcome, SyncFetchRequest, SyncFetchResult, SyncSelectOptions, SyncSelectResult,
+};
 pub(crate) use validated::{MailboxName, SequenceSet, ValidationError};
 
 // Re-export command types for internal use only.

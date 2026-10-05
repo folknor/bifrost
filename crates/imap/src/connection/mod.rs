@@ -334,6 +334,31 @@ impl ImapConnection {
     }
 }
 
+/// The last handle of an ABANDONED connection aborts its driver.
+///
+/// An abandoned connection's driver is still inside an exchange whose caller
+/// is gone (a timeout fired, or the future was dropped). Dropping the handle
+/// closes the command channel, but a driver blocked inside that exchange never
+/// returns to its loop to see it, so against a stalled peer it - and its
+/// socket - would live for the rest of the process, unreachable by `close()`
+/// once no strong handle remains. At last drop nobody can consume the result
+/// or reuse the session, so finishing the exchange buys nothing; aborting it
+/// does not change the transmission evidence the caller already received.
+///
+/// A connection that is not abandoned keeps the graceful path: the closed
+/// channel lets the driver run its bounded best-effort LOGOUT. `abort` only
+/// requests cancellation; `terminate().await` remains the guarantee that the
+/// transport is gone, which `Account::close()` relies on.
+impl Drop for ImapConnection {
+    fn drop(&mut self) {
+        if *self.abandoned.get_mut()
+            && let Some(handle) = self.driver_handle.get_mut().take()
+        {
+            handle.abort();
+        }
+    }
+}
+
 /// Guard around one submitted command. Marks the connection abandoned
 /// unless [`completed`](Self::completed) is called, which happens only on
 /// the path where the driver's result has actually been received.

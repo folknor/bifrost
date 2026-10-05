@@ -511,29 +511,32 @@ pub struct EsearchResponse {
     pub mod_seq: Option<u64>,
 }
 
-/// Result of an EXPUNGE command (RFC 3501 Section 7.4.1 / RFC 7162 Section 3.2.10).
+/// Removals an EXPUNGE, UID EXPUNGE or MOVE reported (RFC 3501 Section
+/// 7.4.1 / RFC 7162 Section 3.2.10), in the order the server sent them.
 ///
-/// When QRESYNC is enabled (RFC 7162 Section 3.2.3), the server sends
-/// `VANISHED` responses instead of `EXPUNGE`. This enum allows callers
-/// to handle both cases.
+/// The form of each removal is whatever ARRIVED, never inferred from the
+/// connection's QRESYNC state. After `ENABLE QRESYNC` a mailbox with
+/// persistent mod-sequences reports `VANISHED`, but a `[NOMODSEQ]` mailbox on
+/// the same connection still reports `EXPUNGE` (RFC 7162 Section 3.2.10), and
+/// RFC 6851 Section 4.4 tells a QRESYNC client to handle both during MOVE.
+/// Arrival order matters for the sequence-number form: each `* n EXPUNGE`
+/// renumbers the messages after it.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ExpungeResult {
-    /// Classic EXPUNGE  -  sequence numbers of removed messages (RFC 3501 Section 7.4.1).
-    ///
-    /// Returned when QRESYNC is NOT enabled.
-    Expunged(Vec<u32>),
-    /// VANISHED  -  UID ranges of removed messages (RFC 7162 Section 3.2.10).
-    ///
-    /// Returned when QRESYNC IS enabled. The server sends VANISHED
-    /// instead of EXPUNGE after `ENABLE QRESYNC`.
-    Vanished(Vec<UidRange>),
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct ExpungeResult {
+    /// Every removal, in arrival order.
+    pub removals: Vec<Removal>,
 }
 
-impl Default for ExpungeResult {
-    fn default() -> Self {
-        Self::Expunged(Vec::new())
-    }
+/// One removal report (RFC 3501 Section 7.4.1 / RFC 7162 Section 3.2.10).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Removal {
+    /// `* n EXPUNGE`: the message at sequence number `n` was removed.
+    Seq(u32),
+    /// `* VANISHED [(EARLIER)] uid-set`. `earlier` marks a historical report
+    /// of UIDs already gone, which does not change the message count.
+    Uids { earlier: bool, uids: Vec<UidRange> },
 }
 
 /// Result of a MOVE command (RFC 6851 Section 3).
