@@ -146,11 +146,12 @@ pub(crate) fn create<T: HttpTransport>(
                 "ContactCard/set",
                 false,
             ))?;
-        let id = card
-            .id()
-            .map(ContactCardId::into_string)
-            .unwrap_or_default();
-        Ok(ContactId(id))
+        super::error::require_created_id(
+            card.id().as_ref().map(ContactCardId::as_str),
+            AccountOperation::ContactCreate,
+            "ContactCard/set",
+        )
+        .map(ContactId)
     })
 }
 
@@ -1147,6 +1148,9 @@ mod tests {
     struct ScriptedQueryTransport {
         pages: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedPage>>>,
         calls: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        /// The `created` map a `ContactCard/set` answers with; `None` leaves
+        /// every create unanswered.
+        created: Option<Value>,
     }
 
     impl ScriptedQueryTransport {
@@ -1154,7 +1158,13 @@ mod tests {
             Self {
                 pages: std::sync::Arc::new(std::sync::Mutex::new(pages.into())),
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                created: None,
             }
+        }
+
+        fn with_created(mut self, created: Value) -> Self {
+            self.created = Some(created);
+            self
         }
 
         fn calls(&self) -> Vec<(String, Value)> {
@@ -1238,10 +1248,14 @@ mod tests {
                             "methodResponses": [["error", {"type": "stateMismatch"}, call_id]]
                         }).to_string()));
                         }
-                        json!({
+                        let mut answer = json!({
                             "accountId": "primary", "oldState": "s1", "newState": "s2",
                             "updated": {"one": null}, "destroyed": ["one"]
-                        })
+                        });
+                        if let Some(created) = &self.created {
+                            answer["created"] = created.clone();
+                        }
+                        answer
                     }
                     other => panic!("unexpected method {other}"),
                 };
@@ -1363,6 +1377,32 @@ mod tests {
             .unwrap_err();
         assert_eq!(create.kind(), &partial, "{create:?}");
         assert!(create.recovery().requires_reconciliation(), "{create:?}");
+    }
+
+    /// A create answered in the success map without a usable id is refused,
+    /// never handed back as `ContactId("")`.
+    #[tokio::test]
+    async fn a_created_contact_without_a_usable_id_is_refused() {
+        for entry in [json!({}), json!({"id": ""})] {
+            let transport =
+                ScriptedQueryTransport::new(Vec::new()).with_created(json!({"c0": entry}));
+            let error = create(Some(transport.account()), ContactCreate::default())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::MissingField
+                ),
+                "{error:?}"
+            );
+        }
+        let transport =
+            ScriptedQueryTransport::new(Vec::new()).with_created(json!({"c0": {"id": "card-1"}}));
+        let id = create(Some(transport.account()), ContactCreate::default())
+            .await
+            .expect("a usable created id");
+        assert_eq!(id, ContactId("card-1".into()));
     }
 
     #[tokio::test]

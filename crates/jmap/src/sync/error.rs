@@ -1736,6 +1736,48 @@ pub(crate) fn set_answer_error(
     }
 }
 
+/// The refusal for a write whose `method` answered a create in its success
+/// map but without a usable server id (absent or empty). The success entry
+/// proves the response arrived, so the leaf carries acknowledged evidence;
+/// the kind stays the terminal `Protocol(MissingField)`, since an empty id
+/// handed back as success would be a handle that names nothing. Single-set
+/// doors (filter, mailbox, event, contact creates) return it bare: whether
+/// an acknowledged create without identity should also carry a
+/// committed-unidentified partial-commit record is an open cross-provider
+/// question, not settled here. Multi-step doors wrap it in their own record.
+#[must_use]
+pub(crate) fn created_id_unusable(
+    operation: AccountOperation,
+    method: &'static str,
+) -> AccountError {
+    build(
+        AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(format!(
+                "JMAP {method} create result omitted a usable id"
+            ))),
+        }),
+        &JmapErrorContext::new(operation),
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
+    .try_build()
+    .expect("valid missing created id classification")
+}
+
+/// The usable server id of a create result, or [`created_id_unusable`].
+pub(crate) fn require_created_id(
+    id: Option<&str>,
+    operation: AccountOperation,
+    method: &'static str,
+) -> Result<String, AccountError> {
+    id.filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| created_id_unusable(operation, method))
+}
+
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
     if let Some(resource) = resource_from_scope(ctx.scope.as_ref()) {
         build(

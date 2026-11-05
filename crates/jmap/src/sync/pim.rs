@@ -483,54 +483,26 @@ fn send_boundary_error(
 }
 
 fn require_created_email_id(email: &Email, op: AccountOperation) -> Result<EmailId, AccountError> {
-    email
-        .id()
-        .filter(|id| !id.as_str().is_empty())
-        .cloned()
-        .ok_or_else(|| {
-            bifrost_types::AccountErrorBuilder::new(
-                bifrost_types::AccountErrorKind::Protocol(
-                    bifrost_types::ProtocolErrorKind::MissingField,
-                ),
-                bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
-                    protocol: bifrost_types::Protocol::Jmap,
-                    detail: Some(bifrost_types::DiagnosticText::support_only(
-                        "JMAP Email/set or Email/import create result omitted a usable id",
-                    )),
-                }),
-            )
-            .protocol(bifrost_types::Protocol::Jmap)
-            .operation(op)
-            .try_build()
-            .expect("valid missing Email id classification")
-        })
+    super::error::require_created_id(
+        email.id().map(EmailId::as_str),
+        op,
+        "Email/set or Email/import",
+    )
+    .map(EmailId::new)
 }
 
 fn require_created_submission_id(
     submission: &crate::email_submission::EmailSubmission,
     op: AccountOperation,
 ) -> Result<crate::email_submission::EmailSubmissionId, AccountError> {
-    submission
-        .id()
-        .filter(|id| !id.as_str().is_empty())
-        .cloned()
-        .ok_or_else(|| {
-            bifrost_types::AccountErrorBuilder::new(
-                bifrost_types::AccountErrorKind::Protocol(
-                    bifrost_types::ProtocolErrorKind::MissingField,
-                ),
-                bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
-                    protocol: bifrost_types::Protocol::Jmap,
-                    detail: Some(bifrost_types::DiagnosticText::support_only(
-                        "JMAP EmailSubmission/set create result omitted a usable id",
-                    )),
-                }),
-            )
-            .protocol(bifrost_types::Protocol::Jmap)
-            .operation(op)
-            .try_build()
-            .expect("valid missing EmailSubmission id classification")
-        })
+    super::error::require_created_id(
+        submission
+            .id()
+            .map(crate::email_submission::EmailSubmissionId::as_str),
+        op,
+        "EmailSubmission/set",
+    )
+    .map(crate::email_submission::EmailSubmissionId::new)
 }
 
 /// What a send asked the server to do to its Email once the submission
@@ -1713,12 +1685,20 @@ pub(crate) fn container_create<T: HttpTransport>(
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
-        let mut mailbox = response.created(&create_id).map_err(set_answer_error(
+        let mailbox = response.created(&create_id).map_err(set_answer_error(
             AccountOperation::ContainerCreate,
             "Mailbox/set",
             false,
         ))?;
-        Ok(ContainerId(mailbox.take_id().into_string()))
+        // An id-less success entry is refused, never handed back as an empty
+        // ContainerId; the state cache above still advances, since the set
+        // reported its new state either way.
+        super::error::require_created_id(
+            mailbox.id().map(MailboxId::as_str),
+            AccountOperation::ContainerCreate,
+            "Mailbox/set",
+        )
+        .map(ContainerId)
     })
 }
 
@@ -4779,9 +4759,12 @@ mod tests {
 
     /// Answers every `*/set` call with neither a success nor an error entry
     /// for any id: the omission an RFC 8620 server must not produce, but one
-    /// that does not prove the write failed.
-    #[derive(Clone)]
-    struct OmittingSetTransport;
+    /// that does not prove the write failed. `created`, when set, is the
+    /// `created` map every answer carries instead.
+    #[derive(Clone, Default)]
+    struct OmittingSetTransport {
+        created: Option<serde_json::Value>,
+    }
 
     impl HttpTransport for OmittingSetTransport {
         async fn api_request(
@@ -4795,13 +4778,14 @@ mod tests {
             let call = &request["methodCalls"][0];
             let method = call[0].as_str().expect("method name").to_string();
             assert!(method.ends_with("/set"), "unexpected {method}");
+            let mut answer =
+                serde_json::json!({"accountId": "primary", "oldState": "s1", "newState": "s2"});
+            if let Some(created) = &self.created {
+                answer["created"] = created.clone();
+            }
             let response = serde_json::json!({
                 "sessionState": "session-1",
-                "methodResponses": [[
-                    method,
-                    {"accountId": "primary", "oldState": "s1", "newState": "s2"},
-                    call[2].clone()
-                ]]
+                "methodResponses": [[method, answer, call[2].clone()]]
             });
             Ok(bytes::Bytes::from(response.to_string()))
         }
@@ -4840,7 +4824,7 @@ mod tests {
         );
         let mail = || {
             let client = crate::client::Client::with_transport(
-                OmittingSetTransport,
+                OmittingSetTransport::default(),
                 search_session(),
                 "https://example.test/.well-known/jmap",
             )
@@ -4904,6 +4888,52 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(cancel.kind(), &partial, "{cancel:?}");
+    }
+
+    /// A mailbox create answered in the success map without a usable id is
+    /// refused, never handed back as `ContainerId("")`, while the set's new
+    /// state still advances the cache.
+    #[tokio::test]
+    async fn a_created_mailbox_without_a_usable_id_is_refused() {
+        let run = |created: serde_json::Value| async move {
+            let client = crate::client::Client::with_transport(
+                OmittingSetTransport {
+                    created: Some(created),
+                },
+                search_session(),
+                "https://example.test/.well-known/jmap",
+            )
+            .expect("client builds");
+            let states = send_state_map();
+            let result = container_create(
+                crate::account::Account::new(client, "primary"),
+                std::sync::Arc::clone(&states),
+                "primary".to_string(),
+                ContainerKind::Folder,
+                "new".to_string(),
+                None,
+                None,
+            )
+            .await;
+            (result, state_cache::get(&states, "primary").await)
+        };
+        for entry in [serde_json::json!({}), serde_json::json!({"id": ""})] {
+            let (result, state) = run(serde_json::json!({"c0": entry})).await;
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::MissingField
+                ),
+                "{error:?}"
+            );
+            assert_eq!(state.as_deref(), Some("s2"));
+        }
+        let (result, _) = run(serde_json::json!({"c0": {"id": "mbx-1"}})).await;
+        assert_eq!(
+            result.expect("a usable created id"),
+            ContainerId("mbx-1".into())
+        );
     }
 
     /// A share whose `Mailbox/get` answers without `myRights` projected

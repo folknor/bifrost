@@ -186,11 +186,12 @@ pub(crate) fn create<T: HttpTransport>(
                 "CalendarEvent/set",
                 false,
             ))?;
-        let id = event
-            .id()
-            .map(CalendarEventId::into_string)
-            .unwrap_or_default();
-        Ok(EventId(id))
+        super::error::require_created_id(
+            event.id().as_ref().map(CalendarEventId::as_str),
+            AccountOperation::EventCreate,
+            "CalendarEvent/set",
+        )
+        .map(EventId)
     })
 }
 
@@ -2417,6 +2418,34 @@ mod tests {
         assert!(create.recovery().requires_reconciliation(), "{create:?}");
     }
 
+    /// A create answered in the success map without a usable id is refused,
+    /// never handed back as `EventId("")`.
+    #[tokio::test]
+    async fn a_created_event_without_a_usable_id_is_refused() {
+        let call = |created: Value| async move {
+            let transport = ScriptedQueryTransport::new(Vec::new()).with_created(created);
+            create(
+                Some(transport.account()),
+                create_with("2026-06-02T12:00:00Z", "2026-06-02T13:00:00Z"),
+            )
+            .await
+        };
+        for entry in [json!({}), json!({"id": ""})] {
+            let error = call(json!({"c0": entry})).await.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &bifrost_types::AccountErrorKind::Protocol(
+                    bifrost_types::ProtocolErrorKind::MissingField
+                ),
+                "{error:?}"
+            );
+        }
+        let id = call(json!({"c0": {"id": "event-1"}}))
+            .await
+            .expect("a usable created id");
+        assert_eq!(id, EventId("event-1".into()));
+    }
+
     #[tokio::test]
     async fn wrong_event_version_kind_is_refused_before_io() {
         let transport = ScriptedQueryTransport::new(Vec::new());
@@ -2923,6 +2952,9 @@ mod tests {
     struct ScriptedQueryTransport {
         pages: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<ScriptedPage>>>,
         calls: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+        /// The `created` map a `CalendarEvent/set` answers with; `None`
+        /// leaves every create unanswered.
+        created: Option<Value>,
     }
 
     impl ScriptedQueryTransport {
@@ -2930,7 +2962,13 @@ mod tests {
             Self {
                 pages: std::sync::Arc::new(std::sync::Mutex::new(pages.into())),
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                created: None,
             }
+        }
+
+        fn with_created(mut self, created: Value) -> Self {
+            self.created = Some(created);
+            self
         }
 
         fn calls(&self) -> Vec<(String, Value)> {
@@ -3026,10 +3064,14 @@ mod tests {
                             "methodResponses": [["error", {"type": "stateMismatch"}, call_id]]
                         }).to_string()));
                         }
-                        json!({
+                        let mut answer = json!({
                             "accountId": "primary", "oldState": "s1", "newState": "s2",
                             "updated": {"one": null}, "destroyed": ["one"]
-                        })
+                        });
+                        if let Some(created) = &self.created {
+                            answer["created"] = created.clone();
+                        }
+                        answer
                     }
                     other => panic!("unexpected method {other}"),
                 };

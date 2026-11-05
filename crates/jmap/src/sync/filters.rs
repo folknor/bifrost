@@ -198,14 +198,19 @@ pub(crate) fn create<T: HttpTransport>(
             .call(set)
             .await
             .map_err(to_acct_err(AccountOperation::FilterCreate))?;
-        let mut created = response
+        let created = response
             .created(&create_id)
             .map_err(super::error::set_answer_error(
                 AccountOperation::FilterCreate,
                 "SieveScript/set",
                 false,
             ))?;
-        Ok(ServerFilterId(created.take_id().into_string()))
+        super::error::require_created_id(
+            created.id().map(crate::sieve::SieveScriptId::as_str),
+            AccountOperation::FilterCreate,
+            "SieveScript/set",
+        )
+        .map(ServerFilterId)
     })
 }
 
@@ -736,6 +741,41 @@ mod tests {
         .await
         .expect_err("an omitted create answer");
         assert_eq!(created.kind(), &partial, "{created:?}");
+    }
+
+    /// A create answered in the success map without a usable id is refused,
+    /// never handed back as `ServerFilterId("")`.
+    #[tokio::test]
+    async fn a_created_script_without_a_usable_id_is_refused() {
+        for entry in [serde_json::json!({}), serde_json::json!({"id": ""})] {
+            let reply = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[
+                    "SieveScript/set",
+                    {"accountId": "primary", "oldState": "s1", "newState": "s2",
+                     "created": {"c0": entry}},
+                    "s0"
+                ]]
+            })
+            .to_string();
+            let meter = std::sync::Arc::new(DownloadMeter::default());
+            let error = create(
+                Some(sieve_account([reply], &meter)),
+                ServerFilterCreate::Script(bifrost_types::FilterScriptCreate {
+                    name: Some("new".into()),
+                    language: ScriptLanguage::Sieve,
+                    body: "keep;".into(),
+                    is_active: false,
+                }),
+            )
+            .await
+            .expect_err("an id-less create answer");
+            assert_eq!(
+                error.kind(),
+                &AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
+                "{error:?}"
+            );
+        }
     }
 
     /// A script the `/get` leaves out of `list` used to vanish from the

@@ -311,15 +311,6 @@ Narrow edge cases, audits with no known defect, and design work.
   Fixing it means carrying `DecodedObjectId::id` through `FolderEffect`; new
   destination ids stay canonical.
 
-- **JMAP filter, mailbox, event and contact creates return an empty id as
-  success.** When the created object comes back without its server id,
-  `filters.rs` `create` and `pim.rs` `container_create` (via `take_id`) and
-  `calendar_ops.rs` / `contacts.rs` `create` (via `unwrap_or_default`) hand
-  back `ServerFilterId("")`, `ContainerId("")`, `EventId("")` or
-  `ContactId("")`. The Email and submission creates refuse that case through
-  `require_created_email_id` / `require_created_submission_id`. These four
-  doors have no partial-commit record by design (one set call), so the fix
-  is a refusal shape for a confirmed create with an unusable identity.
 - **A refused JMAP send drops an unanswered Email create or import.** In
   `send_message` / `send_raw_message` the failure branch reads the Email
   result with `.ok()`, so an Email create answered in neither map, beside a
