@@ -82,7 +82,8 @@ pub use filter::{
 // Mail composition types.
 pub use compose::{
     Address, AttachmentHandle, AttachmentInline, DraftDiscardFailure, DraftHandle, DraftPatch,
-    IdentityId, SendAs, SendReceipt, SendRequest, SentCopy, SentCopyNotFiled, validate_scheduled,
+    IdentityId, RecipientNotAccepted, RecipientOutcome, SendAs, SendReceipt, SendRequest, SentCopy,
+    SentCopyNotFiled, validate_scheduled,
 };
 
 // Shared RFC 5322 / MIME assembler.

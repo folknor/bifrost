@@ -340,6 +340,13 @@ pub struct SendReceipt {
     /// means no separately reported discard failure, not that the draft's
     /// disappearance was verified.
     pub draft_discard: Option<DraftDiscardFailure>,
+    /// Envelope recipients the submission did not get accepted while at least
+    /// one other recipient did (IMAP's SMTP submission reports these per RCPT
+    /// / final reply). Empty means no recipient was reported as not accepted,
+    /// not that delivery to every recipient was verified: JMAP, Gmail and
+    /// Graph report nothing per recipient, and a relay's acceptance is not
+    /// delivery (later bounces arrive as DSN mail).
+    pub recipients_not_accepted: Vec<RecipientNotAccepted>,
 }
 
 impl SendReceipt {
@@ -349,7 +356,14 @@ impl SendReceipt {
             id,
             sent_copy,
             draft_discard: None,
+            recipients_not_accepted: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_recipients_not_accepted(mut self, recipients: Vec<RecipientNotAccepted>) -> Self {
+        self.recipients_not_accepted = recipients;
+        self
     }
 
     /// A receipt whose Sent copy is [`SentCopy::ProviderManaged`].
@@ -431,6 +445,51 @@ impl DraftDiscardFailure {
     pub fn new(draft: DraftHandle, error: crate::AccountError) -> Self {
         Self { draft, error }
     }
+}
+
+/// One envelope recipient of a submitted message that the submission did not
+/// get accepted, although another recipient did. It names an envelope
+/// occurrence: when the same address appears twice and one occurrence was
+/// accepted, that address may still have received the message.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RecipientNotAccepted {
+    /// The envelope recipient (RCPT TO address).
+    pub address: Address,
+    /// Whether the recipient is known not to have it, or may have it.
+    pub outcome: RecipientOutcome,
+    /// The recipient's own error, stamped with the send call's operation. Its
+    /// recovery applies to a NEW submission addressed to this recipient
+    /// alone, never to re-driving the call: that would deliver again to every
+    /// recipient that accepted, and after `draft_send` the draft may already
+    /// be discarded. Where `outcome` is `Uncertain` it is authoritative over
+    /// `error.recovery()`: do not resend to this recipient blindly, whatever
+    /// the recovery says (a malformed final reply classifies as a provider
+    /// contract violation yet still leaves acceptance unknown).
+    pub error: crate::AccountError,
+}
+
+impl RecipientNotAccepted {
+    #[must_use]
+    pub fn new(address: Address, outcome: RecipientOutcome, error: crate::AccountError) -> Self {
+        Self {
+            address,
+            outcome,
+            error,
+        }
+    }
+}
+
+/// The fate of a [`RecipientNotAccepted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecipientOutcome {
+    /// The server answered negatively for this recipient (RCPT refused, or a
+    /// negative final reply), so it did not accept the message for it.
+    Failed,
+    /// The recipient was accepted at RCPT but its final answer never arrived
+    /// or could not be read: the message may have been accepted for it.
+    Uncertain,
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use bifrost_types::cloud::HostedAttachment;
 use bifrost_types::compose::{
     Address, AttachmentHandle, DraftDiscardFailure, DraftHandle, DraftPatch, IdentityId,
-    SendReceipt, SendRequest, SentCopy, SentCopyNotFiled,
+    RecipientNotAccepted, SendReceipt, SendRequest, SentCopy, SentCopyNotFiled,
 };
 use bifrost_types::container::{
     Container, ContainerId, ContainerKind, ContainerList, ContainerNamespace, ContainerRights,
@@ -428,10 +428,11 @@ pub(crate) fn send_message(
         // relay surfaces an `Unsupported(Send)` AccountError from the
         // smtp boundary (kind set there, not here). Re-stamp only the
         // operation/protocol; `restamp` cannot change the kind.
-        submission
+        let not_accepted = submission
             .send_rfc5322(&rendered.envelope, &rendered.raw, request.scheduled)
             .await
             .map_err(|err| restamp(err, AccountOperation::Send))?;
+        let not_accepted = restamp_recipients(not_accepted, AccountOperation::Send);
 
         // The message is committed. Optionally append to Sent; a failed
         // APPEND is non-fatal (never resend) but is not swallowed: the
@@ -447,7 +448,8 @@ pub(crate) fn send_message(
         let sent_body = rendered.sent_copy.unwrap_or(rendered.raw);
         Ok(
             append_to_sent_or_fallback(&account, sent_body.into(), save, &rendered.message_id)
-                .await,
+                .await
+                .with_recipients_not_accepted(not_accepted),
         )
     })
 }
@@ -472,16 +474,21 @@ pub(crate) fn send_raw_message(
         // transmitted body, exactly as draft_send does for a saved draft.
         let parsed =
             parse_draft_for_submission(&raw, submission.default_from(), AccountOperation::Send)?;
-        submission
+        let not_accepted = submission
             .send_rfc5322(&parsed.envelope, &parsed.body, None)
             .await
             .map_err(|err| restamp(err, AccountOperation::Send))?;
+        let not_accepted = restamp_recipients(not_accepted, AccountOperation::Send);
 
         // Committed. Optionally append to Sent. The Sent copy keeps the
         // verbatim caller bytes (Bcc header retained, the sender's record);
         // only `parsed.body` strips Bcc for the wire.
         let save = save_to_sent.unwrap_or_else(|| submission.save_to_sent_default());
-        Ok(append_to_sent_or_fallback(&account, raw, save, &parsed.message_id).await)
+        Ok(
+            append_to_sent_or_fallback(&account, raw, save, &parsed.message_id)
+                .await
+                .with_recipients_not_accepted(not_accepted),
+        )
     })
 }
 
@@ -515,10 +522,11 @@ pub(crate) fn draft_send(
             submission.default_from(),
             AccountOperation::DraftSend,
         )?;
-        submission
+        let not_accepted = submission
             .send_rfc5322(&parsed.envelope, &parsed.body, None)
             .await
             .map_err(|err| restamp(err, AccountOperation::DraftSend))?;
+        let not_accepted = restamp_recipients(not_accepted, AccountOperation::DraftSend);
 
         // Sent; discard the draft from Drafts and optionally append to
         // Sent. The Sent copy is the saved draft `raw`, which retains the
@@ -530,7 +538,8 @@ pub(crate) fn draft_send(
             submission.save_to_sent_default(),
             &parsed.message_id,
         )
-        .await;
+        .await
+        .with_recipients_not_accepted(not_accepted);
 
         // Discard the original draft. The draft is discarded even when the
         // Sent copy above was not filed: a submitted message left in Drafts,
@@ -966,6 +975,23 @@ fn restamp(err: AccountError, op: AccountOperation) -> AccountError {
         .operation(op)
         .try_build()
         .expect("valid account error classification")
+}
+
+/// Stamp each not-accepted recipient's error with the send call's operation.
+fn restamp_recipients(
+    recipients: Vec<RecipientNotAccepted>,
+    op: AccountOperation,
+) -> Vec<RecipientNotAccepted> {
+    recipients
+        .into_iter()
+        .map(|recipient| {
+            RecipientNotAccepted::new(
+                recipient.address,
+                recipient.outcome,
+                restamp(recipient.error, op),
+            )
+        })
+        .collect()
 }
 
 /// Attribute a provider-neutral assembler error to IMAP. The shared

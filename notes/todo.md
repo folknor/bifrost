@@ -44,11 +44,6 @@ happen, plus one surface gap that matters if the consumer relies on it.
   404s or, on an id collision, resolves an unrelated primary Email. The same
   receipt's `SentCopy::Filed.id` is already foreign-encoded, so the two ids
   disagree about ownership.
-- **SMTP partial recipient acceptance is invisible to send callers.**
-  `SubmissionTransport::send_rfc5322` (`crates/imap/src/account/submission.rs`)
-  returns `Ok(())` and only logs when some recipients were rejected or are
-  uncertain. `SendReceipt` is `non_exhaustive` and is the natural carrier for
-  the rejected list; nothing reports it today.
 - **`SyncEngine` exposes almost no calendar primitives.** It forwards contact
   primitives, but of the calendar `Account` methods only `event_delete` and
   `event_delete_if_version` (`crates/sync/src/engine/passthrough.rs`). List,
@@ -105,6 +100,22 @@ Product, API-shape and error-model decisions. None is a live defect on its
 face.
 
 ### Error model and published surface
+
+- **An IMAP send with no acknowledged recipient but an uncertain one is `Err`.**
+  `send_rfc5322` (`crates/imap/src/account/submission.rs`) returns the uncertain
+  lane's error (InFlight evidence, `Application::Uncertain`) when nothing landed
+  in the succeeded lane, and the call skips the Sent APPEND and, for
+  `draft_send`, the draft discard, although the message may have been accepted.
+  A consumer dispatching on `error.recovery()` alone can also get terminal
+  advice: a malformed final reply in that lane is `ProviderContractViolation`.
+  The other recipients' failures are dropped from that `Err`. Decide whether
+  "acceptance uncertain, none acknowledged" becomes a receipt state, and if so
+  what Sent filing and draft cleanup do for a maybe-sent message.
+- **Only IMAP fills `SendReceipt::recipients_not_accepted`.** JMAP decodes
+  `EmailSubmission.deliveryStatus` (`crates/jmap/src/email_submission/`) but the
+  send path in `crates/jmap/src/sync/pim.rs` never reads it; Gmail and Graph
+  expose no per-recipient answer. Decide whether JMAP should populate the field
+  from `deliveryStatus` (its `smtpReply` per recipient is the same evidence).
 
 - **Gmail and Graph ignore `save_to_sent = false`.** Both file the Sent copy
   server-side unconditionally (`_save_to_sent` is unused in

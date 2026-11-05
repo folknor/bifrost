@@ -23,6 +23,7 @@ use bifrost_smtp::transport::smtp::{PoolConfig, SendOptions};
 use bifrost_smtp::{Address as SmtpAddress, AsyncSmtpTransport, TokioExecutor};
 use bifrost_types::error::{AccountError, BatchItem, BatchItemId};
 use bifrost_types::mime::SubmissionEnvelope;
+use bifrost_types::{RecipientNotAccepted, RecipientOutcome};
 
 use crate::types::{Credentials, CredentialsKind};
 
@@ -253,13 +254,15 @@ impl SubmissionTransport {
     /// reverse path / recipient set. This is the only place the
     /// `bifrost_types::Address -> bifrost_smtp::Address` conversion
     /// happens. Returns the already-translated `AccountError` from
-    /// `bifrost-smtp` on failure.
+    /// `bifrost-smtp` on failure, and on success the recipients that were
+    /// not accepted while another one was (empty on a clean send). Their
+    /// errors are not yet stamped with the caller's operation.
     pub(crate) async fn send_rfc5322(
         &self,
         envelope: &SubmissionEnvelope,
         raw: &[u8],
         hold: Option<std::time::SystemTime>,
-    ) -> Result<(), AccountError> {
+    ) -> Result<Vec<RecipientNotAccepted>, AccountError> {
         let from = to_smtp_address(&envelope.from);
         let recipients: Vec<BatchItem<SmtpAddress>> = envelope
             .recipients
@@ -277,56 +280,73 @@ impl SubmissionTransport {
             .send_raw_batch_with_options(Some(from), recipients, raw, &options)
             .await?;
 
-        // One shared DATA, three-lane per-recipient outcome. The
-        // `Err(_)`-means-nothing-transmitted boundary (error-model.md)
-        // governs what we may return: the IMAP send surface is
-        // `Result<(), _>` -> `Result<ObjectId, _>`, and the engine
-        // re-drives a non-idempotent `Send`/`DraftSend` on `Err`. So we
-        // must collapse to `Err` ONLY when the message reached no
-        // recipient at all. If any recipient landed in the succeeded
-        // lane, the body crossed the side-effect boundary; re-driving
-        // would double-deliver to those recipients. A partial send
-        // (recipient A delivered, B rejected on RCPT) is therefore an
-        // overall success at the send-commit boundary - the rejected
-        // recipients are logged for reconcile, never resent.
+        // One shared DATA, three-lane per-recipient outcome. An `Err` from
+        // a non-idempotent send reads as "send failed" and invites the
+        // caller to resend the whole message, so `Err` is returned ONLY
+        // when no recipient acknowledged acceptance. If any recipient
+        // landed in the succeeded lane, the body crossed the side-effect
+        // boundary and a resend would double-deliver to it. A partial
+        // send (A delivered, B rejected on RCPT) is therefore a success,
+        // and the recipients that were not accepted ride the receipt,
+        // each with its own error, never resent by us.
         if !outcome.succeeded().is_empty() {
-            if let Some(failure) = outcome.failed().first() {
+            let not_accepted = not_accepted_recipients(&envelope.recipients, &outcome);
+            if !not_accepted.is_empty() {
                 tracing::warn!(
                     target: "bifrost_imap::send",
                     delivered = outcome.succeeded().len(),
-                    rejected = outcome.failed().len(),
+                    failed = outcome.failed().len(),
                     uncertain = outcome.uncertain().len(),
-                    error = %failure.error,
                     "partial submission: message committed to some recipients while \
-                     others were rejected; not re-driving (would double-deliver)"
-                );
-            } else if let Some(uncertain) = outcome.uncertain().first() {
-                tracing::warn!(
-                    target: "bifrost_imap::send",
-                    delivered = outcome.succeeded().len(),
-                    uncertain = outcome.uncertain().len(),
-                    error = %uncertain.error,
-                    "partial submission: message committed to some recipients while \
-                     others are uncertain; not re-driving (would double-deliver)"
+                     others were not accepted; reported on the receipt"
                 );
             }
-            return Ok(());
+            return Ok(not_accepted);
         }
 
-        // Nothing succeeded. The whole message failed to reach any
-        // recipient, so `Err` (re-drive permitted) is correct. The first
-        // failed recipient's already-classified `AccountError` is
-        // authoritative; fall back to the uncertain lane (a transport
-        // drop after body carries `Reconcile(PartialCompletionSignal)`
-        // and stays a non-blind-retry).
-        if let Some(failure) = outcome.failed().first() {
-            return Err(failure.error.clone());
-        }
+        // Nothing acknowledged acceptance. An uncertain recipient may
+        // still have the message, so its error (InFlight evidence, so
+        // `Application::from_leaf` reads Uncertain) wins over a failed
+        // recipient's, whose recovery could advise resending the whole
+        // call and duplicate the uncertain one. Only with no uncertain
+        // recipient does the first failure speak for the send.
         if let Some(uncertain) = outcome.uncertain().first() {
             return Err(uncertain.error.clone());
         }
-        Ok(())
+        if let Some(failure) = outcome.failed().first() {
+            return Err(failure.error.clone());
+        }
+        Ok(Vec::new())
     }
+}
+
+/// Map the failed and uncertain lanes back to their envelope recipients.
+/// Each lane entry carries the `BatchItemId` `send_rfc5322` assigned (the
+/// envelope index); the mapping goes by that id, never by position within a
+/// lane, since LMTP's final-status drain skips rejected recipients. An id
+/// that names no envelope entry cannot come from bifrost-smtp, which checks
+/// one answer per submitted id; it is skipped rather than invented.
+fn not_accepted_recipients<T>(
+    recipients: &[bifrost_types::Address],
+    outcome: &bifrost_types::BatchOutcome<T>,
+) -> Vec<RecipientNotAccepted> {
+    let address = |id: &BatchItemId| {
+        id.0.parse::<usize>()
+            .ok()
+            .and_then(|index| recipients.get(index))
+            .cloned()
+    };
+    let failed = outcome.failed().iter().filter_map(|lane| {
+        address(&lane.item).map(|address| {
+            RecipientNotAccepted::new(address, RecipientOutcome::Failed, lane.error.clone())
+        })
+    });
+    let uncertain = outcome.uncertain().iter().filter_map(|lane| {
+        address(&lane.item).map(|address| {
+            RecipientNotAccepted::new(address, RecipientOutcome::Uncertain, lane.error.clone())
+        })
+    });
+    failed.chain(uncertain).collect()
 }
 
 /// Build the SMTP `SendOptions` for a submission. When `hold` is
@@ -684,6 +704,93 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn submission_budget_outbound_io() {
         submission_budget_contention(bifrost_net::BandwidthDirection::Outbound).await;
+    }
+
+    /// A submission whose single dial plays `after_mail_from` once the
+    /// greeting, AUTH and MAIL FROM steps are done.
+    fn two_recipient_submission(
+        after_mail_from: fn(
+            bifrost_smtp::transport::smtp::Transcript,
+        ) -> bifrost_smtp::transport::smtp::Transcript,
+    ) -> (SubmissionTransport, SubmissionEnvelope) {
+        use bifrost_smtp::transport::smtp::{ScriptedConnector, Transcript};
+        let connector = ScriptedConnector::new(move || {
+            let hello = format!(
+                "EHLO {}\r\n",
+                bifrost_smtp::transport::smtp::extension::ClientId::default()
+            );
+            after_mail_from(
+                Transcript::new("220 peer\r\n")
+                    .expect(&hello, "250-peer\r\n250 AUTH PLAIN\r\n")
+                    .expect("AUTH PLAIN AHVzZXIAcGFzcw==\r\n", "235 authenticated\r\n")
+                    .expect(&hello, "250 peer\r\n")
+                    .expect("MAIL FROM:<user@example.com>\r\n", "250 sender\r\n"),
+            )
+        });
+        let cfg = SmtpSubmissionConfig::new(
+            "smtp.invalid",
+            SubmissionTls::Plaintext,
+            bifrost_types::Address::bare("user@example.com"),
+        );
+        let submission = SubmissionTransport::build_with_connector(
+            &cfg,
+            &Credentials::password("user", "pass"),
+            None,
+            bifrost_net::BandwidthBudget::default(),
+            Some(connector),
+        )
+        .unwrap();
+        let envelope = SubmissionEnvelope {
+            from: bifrost_types::Address::bare("user@example.com"),
+            recipients: vec![
+                bifrost_types::Address::bare("a@example.com"),
+                bifrost_types::Address::bare("b@example.com"),
+            ],
+        };
+        (submission, envelope)
+    }
+
+    #[tokio::test]
+    async fn a_partial_send_reports_the_refused_recipient_on_success() {
+        let (submission, envelope) = two_recipient_submission(|script| {
+            script
+                .expect("RCPT TO:<a@example.com>\r\n", "250 recipient\r\n")
+                .expect("RCPT TO:<b@example.com>\r\n", "550 no such user\r\n")
+                .expect("DATA\r\n", "354 send\r\n")
+                .expect("Subject: test\r\n\r\nbody\r\n", "")
+                .expect(".\r\n", "250 delivered\r\n")
+        });
+        let not_accepted = submission
+            .send_rfc5322(&envelope, b"Subject: test\r\n\r\nbody\r\n", None)
+            .await
+            .expect("a recipient accepted, so the send is a success");
+        assert_eq!(not_accepted.len(), 1);
+        assert_eq!(not_accepted[0].address.address, "b@example.com");
+        assert_eq!(not_accepted[0].outcome, RecipientOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn with_no_acceptance_an_uncertain_recipient_outranks_a_refused_one() {
+        // B refused at RCPT, A accepted, the body sent and the peer gone
+        // before the final reply: A may have the message, so the returned
+        // error must say so rather than speak with B's refusal.
+        let (submission, envelope) = two_recipient_submission(|script| {
+            script
+                .expect("RCPT TO:<a@example.com>\r\n", "250 recipient\r\n")
+                .expect("RCPT TO:<b@example.com>\r\n", "450 try later\r\n")
+                .expect("DATA\r\n", "354 send\r\n")
+                .expect("Subject: test\r\n\r\nbody\r\n", "")
+                .expect(".\r\n", "")
+        });
+        let err = submission
+            .send_rfc5322(&envelope, b"Subject: test\r\n\r\nbody\r\n", None)
+            .await
+            .expect_err("no recipient acknowledged acceptance");
+        assert_eq!(
+            bifrost_types::error::Application::from_leaf(&err),
+            bifrost_types::error::Application::Uncertain,
+            "{err}"
+        );
     }
 
     #[test]

@@ -806,6 +806,15 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   which drives `AsyncSmtpTransport::send_raw_batch_with_options` and returns
   SMTP's already-translated `AccountError` (a build failure maps to
   `InvalidInput`). `draft_send` re-stamps the operation to `DraftSend`.
+- Per-recipient outcome: SMTP answers per envelope recipient in three lanes.
+  When any recipient was accepted the send is `Ok`, and every failed or
+  uncertain recipient rides `SendReceipt::recipients_not_accepted` (address
+  mapped back by the lane's envelope index, outcome `Failed` / `Uncertain`, its
+  own error re-stamped to the call's operation), never resent. `Err` is
+  returned only when no recipient acknowledged acceptance; then an uncertain
+  recipient's error (InFlight evidence) outranks a failed one's, because a
+  refusal's recovery could advise resending the whole call and duplicate the
+  recipient that may have the message.
 - Scheduled send is one-shot SMTP FUTURERELEASE: `SendRequest::scheduled`
   threads `hold: Option<SystemTime>` into `send_rfc5322` ->
   `SendOptions::hold_until(rfc3339(t))` (absolute-time, never races `now()`).
