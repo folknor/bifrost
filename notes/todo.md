@@ -36,14 +36,6 @@ not verified against the code. Verification happens when an item is worked.
 Items that leak something or report success for something that did not
 happen, plus one surface gap that matters if the consumer relies on it.
 
-- **JMAP send-as receipts return a bare foreign Email id.** `send_message` in
-  `crates/jmap/src/sync/pim.rs`, on the foreign (send-as) route, returns
-  `SendReceipt::id` as the foreign account's native Email id, not
-  `foreign::encode_object`-ed. Every id-only reader (`get_stream`,
-  `open_blob`, mutations) then routes it to the primary account, where it
-  404s or, on an id collision, resolves an unrelated primary Email. The same
-  receipt's `SentCopy::Filed.id` is already foreign-encoded, so the two ids
-  disagree about ownership.
 - **`SyncEngine` exposes almost no calendar primitives.** It forwards contact
   primitives, but of the calendar `Account` methods only `event_delete` and
   `event_delete_if_version` (`crates/sync/src/engine/passthrough.rs`). List,

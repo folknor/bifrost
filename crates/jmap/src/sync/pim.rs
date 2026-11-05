@@ -649,6 +649,20 @@ pub(crate) fn send_message<T: HttpTransport>(
     mut request: bifrost_types::SendRequest,
 ) -> AccountFuture<Result<bifrost_types::SendReceipt, AccountError>> {
     Box::pin(async move {
+        // Every id this call hands back - the receipt id, the Sent copy, and
+        // the partial-commit targets - is in the public form: a send-as
+        // through a foreign account owner-qualifies the native id, because
+        // id-only readers (`get_stream`, `open_blob`, mutations) would route
+        // a bare one to the primary account. The wire (implicit Email/set
+        // lookup, cleanup destroy) keeps the native id.
+        let is_foreign = foreign.is_some();
+        let public = |native: &str| {
+            if is_foreign {
+                super::foreign::encode_object(&account_id, native)
+            } else {
+                native.to_owned()
+            }
+        };
         let personal_identity = request.identity.clone();
         let identity = if let Some(foreign) = foreign.as_ref() {
             let selected = foreign_sending_identity(&mail, request.identity.as_ref()).await?;
@@ -846,7 +860,13 @@ pub(crate) fn send_message<T: HttpTransport>(
                     ),
                     _ => None,
                 };
-                return Err(failed_submission(error, rejected, email.as_ref(), cleanup));
+                let public_email = email.map(|email| EmailId::new(public(email.as_str())));
+                return Err(failed_submission(
+                    error,
+                    rejected,
+                    public_email.as_ref(),
+                    cleanup,
+                ));
             }
         };
 
@@ -896,36 +916,25 @@ pub(crate) fn send_message<T: HttpTransport>(
         }
 
         let email_id = email_result.map_err(|error| {
-            acknowledged_send_error(
-                error,
-                None,
-                submission
-                    .id()
-                    .map(crate::email_submission::EmailSubmissionId::as_str),
-            )
+            let public_submission = submission.id().map(|id| public(id.as_str()));
+            acknowledged_send_error(error, None, public_submission.as_deref())
         })?;
-        let public_email_id = if foreign.is_some() {
-            ObjectId(super::foreign::encode_object(
-                &account_id,
-                email_id.as_str(),
-            ))
-        } else {
-            ObjectId(email_id.as_str().to_string())
-        };
+        let public_email_id = EmailId::new(public(email_id.as_str()));
         let sent_copy = implicit_sent_copy(
             implicit.expect("the implicit outcome is read whenever the email id is"),
             on_success,
-            public_email_id,
+            ObjectId(public_email_id.as_str().to_owned()),
         );
 
         // A scheduled send returns its EmailSubmission id for
-        // cancel/reschedule. An immediate send keeps returning the email id.
+        // cancel/reschedule (scheduled send-as is refused upstream, so this
+        // arm is primary-only). An immediate send returns the Email id.
         let id = if scheduled.is_some() {
             let submission_id = require_created_submission_id(&submission, AccountOperation::Send)
-                .map_err(|error| acknowledged_send_error(error, Some(&email_id), None))?;
-            ObjectId(submission_id.into_string())
+                .map_err(|error| acknowledged_send_error(error, Some(&public_email_id), None))?;
+            ObjectId(public(submission_id.as_str()))
         } else {
-            ObjectId(email_id.into_string())
+            ObjectId(public_email_id.as_str().to_owned())
         };
         Ok(bifrost_types::SendReceipt::new(id, sent_copy))
     })
@@ -7392,10 +7401,41 @@ mod tests {
         .await
         .expect("foreign submission succeeds");
         let expected = super::super::foreign::encode_object("shared", "email-created");
+        // The receipt id and the Sent copy agree on ownership: a bare native
+        // id would route an id-only reader to the primary account.
+        assert_eq!(receipt.id, ObjectId(expected.clone()));
         assert!(matches!(
             receipt.sent_copy,
             bifrost_types::SentCopy::Filed { id: Some(ref id) } if id.0 == expected
         ));
+    }
+
+    #[tokio::test]
+    async fn foreign_send_partial_commit_names_the_foreign_email() {
+        let transport = SendTransport::new(true, false, false, false);
+        let primary = send_account(transport.clone());
+        let shared = crate::account::Account::new(primary.client().clone(), "shared");
+        let error = send_message(
+            shared,
+            send_state_map(),
+            "shared".to_string(),
+            0,
+            Some(ForeignSubmission {
+                mode: bifrost_types::SendAs::As(bifrost_types::MailboxId("shared".into())),
+                self_address: None,
+            }),
+            basic_send_request(),
+        )
+        .await
+        .expect_err("the rejected submission stays an error");
+        let expected = super::super::foreign::encode_object("shared", "email-created");
+        assert_eq!(
+            error.partial_commit().unwrap().steps()[0].targets(),
+            &email_targets(Some(&EmailId::new(expected)))
+        );
+        // The cleanup destroy still names the native id on the wire.
+        let sets = transport.calls("Email/set");
+        assert_eq!(sets[1]["destroy"], serde_json::json!(["email-created"]));
     }
 
     #[tokio::test]
