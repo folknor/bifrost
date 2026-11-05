@@ -79,6 +79,11 @@ struct CampaignState {
     /// so the campaign has more distinct directives than the reopen channel
     /// holds.
     directive_flood_first: AtomicBool,
+    /// The submission, counted from one (zero disables it), whose every item
+    /// asks for an account restart.
+    restart_at_submission: AtomicUsize,
+    /// `establish_initial_cursor` calls, counted on entry.
+    establishes: AtomicUsize,
     /// First attempt: one item raises an engine directive while a SIBLING item
     /// comes back `Uncertain`, i.e. parked in the read-back lane.
     engine_block_beside_uncertain: AtomicBool,
@@ -223,6 +228,9 @@ impl Account for FlagsAccount {
         &self,
         _scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
+        if let Some(campaign) = &self.campaign {
+            campaign.establishes.fetch_add(1, Ordering::SeqCst);
+        }
         Box::pin(async {
             Err(unsupported(
                 bifrost_types::AccountOperation::EstablishCursor,
@@ -518,6 +526,35 @@ impl Account for FlagsAccount {
                         retryable_transport(),
                     )),
                 ];
+                SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Final,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                })
+            }));
+        }
+        if campaign.restart_at_submission.load(Ordering::SeqCst) == attempt + 1 {
+            return Box::pin(stream::once(async move {
+                let items = targets
+                    .map(|id| {
+                        ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                            bifrost_types::BatchItemId(id.0),
+                            AccountErrorBuilder::new(
+                                AccountErrorKind::SyncState(
+                                    bifrost_types::SyncStateErrorKind::CapabilityChanged,
+                                ),
+                                Cause::State(bifrost_types::StateCause::CapabilityChanged {
+                                    delta: None,
+                                }),
+                            )
+                            .try_build()
+                            .expect("valid restart error"),
+                        ))
+                    })
+                    .collect()
+                    .await;
                 SyncEvent::Batch(Batch {
                     items,
                     page_boundary: PageBoundary::Final,
@@ -1471,6 +1508,85 @@ async fn a_pause_completes_while_campaign_directives_back_up_the_reopen_channel(
     })
     .await
     .expect("the forwarded account restart reaches the listener");
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// A campaign stamps its item directives with the incarnation it ran
+/// against, so the scope restarts queued behind its own account restart are
+/// declined once that restart has replaced the account, rather than resetting
+/// and re-establishing scopes on the replacement.
+///
+/// The first campaign raises one account restart and a scope restart per
+/// remaining item. A second campaign, run on the replacement, raises an
+/// account restart of its own: the listener is serial and that request is
+/// queued behind every request of the first campaign, so its replacement open
+/// proves they were all handled before the establishment count is read. Only
+/// the item-directive path is exercised here. Ablation: stamping the
+/// campaign's directives with `None` lets every scope restart reach
+/// `establish_initial_cursor`.
+#[tokio::test(start_paused = true)]
+async fn a_campaigns_scope_directives_are_declined_after_its_account_restart() {
+    const TARGETS: usize = 8;
+    let state = Arc::new(CampaignState::default());
+    state.directive_flood_first.store(true, Ordering::SeqCst);
+    let engine = SyncEngine::builder().build().expect("engine");
+    let account_id = AccountId("stamped-campaign".into());
+    let opens = Arc::new(AtomicUsize::new(0));
+    engine
+        .attach(
+            account_id.clone(),
+            Arc::new(CountingFactory {
+                inner: FlagsFactory(campaign_account(Arc::clone(&state))),
+                opens: Arc::clone(&opens),
+            }),
+        )
+        .await
+        .expect("attach");
+    let vendor = vendor();
+    let campaign = |targets: usize| {
+        engine.bulk_set_flags(
+            &account_id,
+            (0..targets)
+                .map(|n| ObjectId(format!("id-{n}")))
+                .collect::<Vec<_>>(),
+            FlagOp::Add(set(&["\\Seen"])),
+            &vendor,
+            ProtocolKind::Imap,
+        )
+    };
+    let wait_for_opens = |count: usize| {
+        let opens = Arc::clone(&opens);
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                while opens.load(Ordering::SeqCst) < count {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the account restart reaches the listener");
+        }
+    };
+
+    state.release_first_campaign.notify_one();
+    let first = campaign(TARGETS).await.expect("first campaign");
+    assert_eq!(first.blocked_by_engine, TARGETS as u64);
+    wait_for_opens(2).await;
+    // Let the replacement land before the second campaign loads the account.
+    // Were it to load the old incarnation, its restart would be declined and
+    // the wait below would fail loudly rather than pass.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    state.restart_at_submission.store(
+        state.submissions.load(Ordering::SeqCst) + 1,
+        Ordering::SeqCst,
+    );
+    campaign(1).await.expect("second campaign");
+    wait_for_opens(3).await;
+    assert_eq!(
+        state.establishes.load(Ordering::SeqCst),
+        0,
+        "a scope directive stamped with the replaced incarnation reached the replacement"
+    );
     engine.detach(&account_id).await.expect("detach");
 }
 

@@ -2258,6 +2258,85 @@ mod tests {
         assert!(cursors.lifecycle_epoch(&scope) > epoch);
     }
 
+    /// The lifecycle reader stamps a stream termination with the generation of
+    /// the incarnation whose stream it read. The listener's stale decline is
+    /// pinned separately with hand-built requests; this pins the producer, run
+    /// through the real `Multiplexer::run`, so a request queued past a reattach
+    /// carries the old incarnation and cannot restart the replacement.
+    /// Ablation: stamping `None` fails the match.
+    #[tokio::test(start_paused = true)]
+    async fn a_lifecycle_termination_is_stamped_with_its_streams_incarnation() {
+        const GENERATION: u64 = 7;
+        let account_id = AccountId("lifecycle-stamp".into());
+        let stub = crate::test_common::StubAccount::new(Vec::new());
+        stub.lifecycle_scripts
+            .lock()
+            .expect("scripts")
+            .push_back(vec![bifrost_types::ScopeLifecycleEvent::Terminated(
+                bifrost_types::AccountErrorBuilder::new(
+                    bifrost_types::AccountErrorKind::SyncState(
+                        bifrost_types::SyncStateErrorKind::CapabilityChanged,
+                    ),
+                    bifrost_types::Cause::State(bifrost_types::StateCause::CapabilityChanged {
+                        delta: None,
+                    }),
+                )
+                .try_build()
+                .expect("restart error"),
+            )]);
+        let account: Arc<dyn bifrost_types::Account> = Arc::new(stub);
+        let (boundary, view) = crate::cancel::Boundary::new();
+        let (priority, _priority) = watch::channel(bifrost_types::Priority::Normal);
+        let (bandwidth, _bandwidth) = watch::channel(None);
+        let control =
+            crate::control::SyncControl::new(account_id.clone(), boundary, priority, bandwidth);
+        let (tx, _events) = broadcast::channel(8);
+        let (reopen_tx, mut reopen_rx) = mpsc::channel(4);
+        let (_generation, generation_rx) = watch::channel(GENERATION);
+        let gate =
+            crate::scheduler::BudgetGate::new(crate::scheduler::ConcurrencyBudget::default());
+        gate.register(account_id.clone());
+        let shutdown = CancellationToken::new();
+        let mux = Multiplexer {
+            account_id,
+            account: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::types::Incarnation::new(account, GENERATION),
+            )),
+            account_generation: generation_rx,
+            cursors: Arc::new(CursorRegistry::new()),
+            config: MultiplexerConfig::default(),
+            boundary: view,
+            delivery: Arc::new(ChangeDelivery::new(tx)),
+            control,
+            shutdown: shutdown.clone(),
+            reopen_tx,
+            scope_tokens: Arc::default(),
+            throttles: Arc::new(StdMutex::new(crate::recovery::ThrottleBucket::new())),
+            scheduler: crate::scheduler::Scheduler::new(
+                crate::types::SchedulerConfig::default(),
+                gate,
+            ),
+        };
+        let run = tokio::spawn(mux.run());
+        let request = tokio::time::timeout(Duration::from_secs(60), reopen_rx.recv())
+            .await
+            .expect("the termination is forwarded")
+            .expect("request");
+        assert!(
+            matches!(
+                request,
+                ReopenRequest::Recovery {
+                    scope: None,
+                    generation: Some(GENERATION),
+                    ..
+                }
+            ),
+            "{request:?}"
+        );
+        shutdown.cancel();
+        run.await.expect("multiplexer");
+    }
+
     fn warning_event(message: &str) -> MultiplexerEvent {
         MultiplexerEvent {
             scope: CursorScope::Account,

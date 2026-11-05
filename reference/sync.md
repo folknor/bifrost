@@ -396,9 +396,13 @@ reattach's own discovery. The only unstamped producer is a consumer-injected
 `InvalidationSink::push` termination, which by policy acts on whichever
 incarnation is current: the consumer's watch is not one of the engine's
 connections, and sampling the current generation at push time would label an
-event that may predate a reattach with the replacement's identity. Pinned by
-`a_stale_push_recovery_is_declined_after_its_account_was_replaced` and
-`a_stale_stamped_recovery_is_declined_after_its_account_was_replaced`.
+event that may predate a reattach with the replacement's identity. The decline
+is pinned by `a_stale_push_recovery_is_declined_after_its_account_was_replaced`
+and `a_stale_stamped_recovery_is_declined_after_its_account_was_replaced`; the
+producers' stamps by `a_lifecycle_termination_is_stamped_with_its_streams_incarnation`,
+`a_deferred_walk_recovery_is_stamped_with_the_incarnation_it_walked` and
+`a_campaigns_scope_directives_are_declined_after_its_account_restart` (item
+directives only), alongside the poll-drive and reconciler tests.
 
 Cursor and membership topology live under one registry state lock, so
 reattach replaces both atomically. The same replacement increments a
@@ -2128,6 +2132,7 @@ deletion's `unpark` protect deletions preceding the park; the epoch
 additionally protects a deletion after the task has claimed and queued its
 request. Tasks leave through the shutdown token, so detach never waits on one.
 Pinned by `a_created_scope_declined_under_a_pause_is_established_after_resume`,
+`a_scope_created_request_leaves_a_registered_cursor_alone`,
 `a_parked_scope_is_dropped_by_detach`,
 `establish_if_absent_skips_a_registered_or_deleted_scope` and
 `a_park_claim_under_a_stale_epoch_takes_nothing`.

@@ -1008,6 +1008,176 @@ async fn establish_if_absent_skips_a_registered_or_deleted_scope() {
     fixture.engine.detach(&fixture.id).await.expect("detach");
 }
 
+/// The `ScopeCreated` listener arm, driven through the real listener: a
+/// `Created` for a scope that already has a cursor must leave that cursor
+/// alone, and one for an absent scope establishes it exactly once. The
+/// multiplexer-side test pins only that the request is sent; an arm that
+/// restarted a registered scope would pass it and reset healthy state.
+///
+/// The listener is serial, so a second `ScopeCreated` for an absent sentinel
+/// scope is the barrier: its cursor appearing proves the request queued ahead
+/// of it was handled. Ablation: an arm that deletes the cursor before
+/// `establish_if_absent` (a restart) fails the first assertion.
+#[tokio::test(start_paused = true)]
+async fn a_scope_created_request_leaves_a_registered_cursor_alone() {
+    const SENTINEL: CursorScope = CursorScope::Type(ObjectType::Contact);
+    let account = Arc::new(account());
+    let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![Arc::clone(
+        &account,
+    )])))
+    .await;
+    let cursors = &fixture.slot.cursors;
+    cursors.put(common::cursor_for(&SCOPE, b"registered-before-created"));
+    let created = |scope| ReopenRequest::ScopeCreated { scope };
+    let reopen = &fixture.slot.reopen_tx;
+    reopen.send(created(SCOPE)).await.expect("send");
+    reopen.send(created(SENTINEL)).await.expect("send");
+    let established = |scope: &CursorScope| {
+        account
+            .established
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|seen| *seen == scope)
+            .count()
+    };
+    let until_present = |scope: CursorScope| async move {
+        for _ in 0..1000 {
+            if cursors.snapshot(&scope).is_some() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{scope:?} was never established");
+    };
+    until_present(SENTINEL).await;
+    assert_eq!(established(&SENTINEL), 1);
+    assert_eq!(
+        established(&SCOPE),
+        0,
+        "a registered scope must not be re-established"
+    );
+    assert_eq!(
+        cursors
+            .snapshot(&SCOPE)
+            .expect("registered cursor")
+            .server_state
+            .bytes,
+        b"registered-before-created".to_vec()
+    );
+    cursors.delete(&SCOPE);
+    reopen.send(created(SCOPE)).await.expect("send");
+    until_present(SCOPE).await;
+    assert_eq!(established(&SCOPE), 1);
+    fixture.engine.detach(&fixture.id).await.expect("detach");
+}
+
+struct CountingFactory {
+    inner: common::StubFactory,
+    opens: AtomicUsize,
+}
+impl AccountFactory for CountingFactory {
+    fn open(
+        &self,
+        id: AccountId,
+    ) -> AccountFuture<Result<bifrost_types::OpenedAccount, AccountError>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.inner.open(id)
+    }
+}
+
+fn restart_account_error() -> AccountError {
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::SyncState(
+            bifrost_types::SyncStateErrorKind::CapabilityChanged,
+        ),
+        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
+    )
+    .try_build()
+    .expect("restart error")
+}
+
+/// The deferred inventory worker stamps a terminated walk's in-task recovery
+/// with the generation of the incarnation the walk ran against, read before
+/// the provider call, not whichever incarnation is current when it dispatches.
+///
+/// The walk of the first deferred scope swaps a replacement incarnation in
+/// from inside its inventory call, then terminates with `RestartAccount`. That
+/// swap stands in for a reattach landing mid-walk; it does not exercise the
+/// reattach transaction, only the attribution, and the listener-side decline
+/// is pinned separately. The worker walks its queue serially on one task, so
+/// the second scope's walk, on the replacement, proves the first scope's
+/// recovery has returned. Ablation: dispatching with `None`, or resampling the
+/// current generation, opens a second account.
+#[tokio::test(start_paused = true)]
+async fn a_deferred_walk_recovery_is_stamped_with_the_incarnation_it_walked() {
+    const FIRST: CursorScope = CursorScope::Type(ObjectType::Email);
+    const SECOND: CursorScope = CursorScope::Type(ObjectType::Contact);
+    let slot_handle: Arc<std::sync::OnceLock<Arc<AccountSlot>>> = Arc::default();
+    let second_walked = Arc::new(AtomicUsize::new(0));
+
+    let mut replacement = common::StubAccount::new(vec![]);
+    replacement.establishment = |_| CursorEstablishment::EstablishViaInventory;
+    let walked = Arc::clone(&second_walked);
+    replacement.inventory_hook = Some(Arc::new(move |scope| {
+        if *scope == SECOND {
+            walked.fetch_add(1, Ordering::SeqCst);
+        }
+        common::establishing_inventory()(scope)
+    }));
+    let replacement: Arc<dyn bifrost_types::Account> = Arc::new(replacement);
+
+    let mut initial = common::StubAccount::new(vec![FIRST, SECOND]);
+    initial.establishment = |_| CursorEstablishment::EstablishViaInventory;
+    let handle = Arc::clone(&slot_handle);
+    initial.inventory_hook = Some(Arc::new(move |scope| {
+        if *scope != FIRST {
+            return common::establishing_inventory()(scope);
+        }
+        let slot = handle.get().expect("slot handle set before any walk");
+        slot.current.store(Arc::new(crate::types::Incarnation::new(
+            Arc::clone(&replacement),
+            1,
+        )));
+        vec![bifrost_types::InventoryEvent::Terminated(
+            restart_account_error(),
+        )]
+    }));
+    let factory = Arc::new(CountingFactory {
+        inner: common::StubFactory::queue(vec![
+            Arc::new(initial),
+            Arc::new(common::StubAccount::new(vec![])),
+        ]),
+        opens: AtomicUsize::new(0),
+    });
+    let fixture = Fixture::new(Arc::clone(&factory) as Arc<dyn AccountFactory>).await;
+    slot_handle
+        .set(Arc::clone(&fixture.slot))
+        .unwrap_or_else(|_| panic!("set once"));
+    // The deferred worker waits for a numbered subscriber before walking.
+    let _receiver = fixture
+        .engine
+        .account_changes_stream(&fixture.id)
+        .expect("subscribe");
+    for _ in 0..1000 {
+        if second_walked.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        factory.opens.load(Ordering::SeqCst),
+        1,
+        "a walk's recovery must not restart the incarnation that replaced it"
+    );
+    assert_eq!(
+        second_walked.load(Ordering::SeqCst),
+        1,
+        "the second scope must be walked on the replacement"
+    );
+    fixture.engine.shutdown().await.expect("shutdown");
+}
+
 #[test]
 fn a_park_claim_under_a_stale_epoch_takes_nothing() {
     let repairs = DeferredScopeRepairs::new();
