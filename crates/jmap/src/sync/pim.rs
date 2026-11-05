@@ -527,6 +527,119 @@ fn require_created_submission_id(
         })
 }
 
+/// What a send asked the server to do to its Email once the submission
+/// succeeded (RFC 8621 s7.5 `onSuccessUpdateEmail` / `onSuccessDestroyEmail`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnSuccess {
+    /// Move it into Sent and drop Drafts and `$draft`.
+    File,
+    /// Destroy it (`save_to_sent == Some(false)`).
+    Destroy,
+}
+
+/// How the implicit `Email/set` answered for the send's Email.
+#[derive(Debug)]
+enum ImplicitOutcome {
+    Applied,
+    /// Proven not applied: the id is in `notUpdated` / `notDestroyed`, or the
+    /// implicit call failed with a method-level error other than
+    /// `serverPartialFail`, which RFC 8620 s3.6.2 guarantees made no change.
+    Refused(crate::Error),
+    /// Nothing proves either way: the implicit response is absent (RFC 8621
+    /// s7.5 requires it after a successful submission carrying onSuccess
+    /// arguments), undecodable, under another method name, a
+    /// `serverPartialFail`, or silent about the id.
+    Unknown(crate::Error),
+}
+
+/// Read the implicit `Email/set` RFC 8621 s7.5 appends under the submission
+/// call id, after the explicit submission response has been consumed (so the
+/// first remaining response under that id is the implicit one). Returns its
+/// non-empty `newState` and the outcome for `email`, which is the NATIVE id
+/// the server keys its answer by - never a foreign-encoded id.
+fn take_implicit_email_set(
+    response: &mut crate::core::response::Response,
+    call_id: &str,
+    email: &EmailId,
+    on_success: OnSuccess,
+) -> (Option<String>, ImplicitOutcome) {
+    let mut result = match response.get_method::<EmailSet>(call_id) {
+        Ok(result) => result,
+        Err(error) => {
+            let refused = matches!(
+                &error,
+                crate::Error::Method(e) if !matches!(
+                    e.error_type(),
+                    crate::core::error::MethodErrorType::ServerPartialFail
+                )
+            );
+            let outcome = if refused {
+                ImplicitOutcome::Refused(error)
+            } else {
+                ImplicitOutcome::Unknown(error)
+            };
+            return (None, outcome);
+        }
+    };
+    let state = result
+        .new_state()
+        .filter(|state| !state.is_empty())
+        .map(str::to_string);
+    let answer = match on_success {
+        OnSuccess::File => result.updated(email).map(drop),
+        OnSuccess::Destroy => result.destroyed(email),
+    };
+    let outcome = match answer {
+        Ok(()) => ImplicitOutcome::Applied,
+        Err(error @ crate::Error::SetIdUnanswered(_)) => ImplicitOutcome::Unknown(error),
+        Err(error) => ImplicitOutcome::Refused(error),
+    };
+    (state, outcome)
+}
+
+/// The `SentCopy` a JMAP send reports from its implicit `Email/set`.
+/// `public_id` is the email id as the consumer addresses it (foreign-encoded
+/// for a send-as through a foreign account). A destroy that did not confirm
+/// leaves `NotRequested` standing - no call ever targeted Sent - and is only
+/// logged: no receipt field carries a routable handle for the staging Email.
+fn implicit_sent_copy(
+    outcome: ImplicitOutcome,
+    on_success: OnSuccess,
+    public_id: ObjectId,
+) -> bifrost_types::SentCopy {
+    use bifrost_types::{SentCopy, SentCopyNotFiled};
+    let warning = |error: &crate::Error, what: &str| {
+        bifrost_types::Warning::user_safe(
+            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            format!("Message sent, but {what}; it may remain in Drafts."),
+        )
+        .with_protocol_detail(bifrost_types::DiagnosticText::support_only(
+            error.to_string(),
+        ))
+    };
+    match (on_success, outcome) {
+        (OnSuccess::File, ImplicitOutcome::Applied) => SentCopy::Filed {
+            id: Some(public_id),
+        },
+        (OnSuccess::File, ImplicitOutcome::Refused(error)) => SentCopy::NotFiled {
+            reason: SentCopyNotFiled::MoveRefused,
+            detail: Some(warning(&error, "the server refused to move it to Sent")),
+        },
+        (OnSuccess::File, ImplicitOutcome::Unknown(error)) => SentCopy::Uncertain {
+            detail: warning(&error, "the server did not confirm moving it to Sent"),
+        },
+        (OnSuccess::Destroy, ImplicitOutcome::Applied) => SentCopy::NotRequested,
+        (OnSuccess::Destroy, ImplicitOutcome::Refused(error) | ImplicitOutcome::Unknown(error)) => {
+            tracing::warn!(
+                email = %public_id.0,
+                %error,
+                "JMAP send: the staging Email for save_to_sent = false was not confirmed destroyed"
+            );
+            SentCopy::NotRequested
+        }
+    }
+}
+
 pub(crate) fn send_message<T: HttpTransport>(
     mail: MailAccount<T>,
     email_states: StateMap,
@@ -534,7 +647,7 @@ pub(crate) fn send_message<T: HttpTransport>(
     max_delayed_send: usize,
     foreign: Option<ForeignSubmission>,
     mut request: bifrost_types::SendRequest,
-) -> AccountFuture<Result<ObjectId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::SendReceipt, AccountError>> {
     Box::pin(async move {
         let personal_identity = request.identity.clone();
         let identity = if let Some(foreign) = foreign.as_ref() {
@@ -656,13 +769,15 @@ pub(crate) fn send_message<T: HttpTransport>(
             }
         }
 
-        if let Some(sent) = sent_mailbox.as_ref() {
+        let on_success = if let Some(sent) = sent_mailbox.as_ref() {
             submission_set
                 .on_success_update_email(SUBMISSION_CREATE_ID)
                 .submitted_to_sent(sent, Some(&draft_mailbox));
+            OnSuccess::File
         } else {
             submission_set = submission_set.on_success_destroy_email(SUBMISSION_CREATE_ID);
-        }
+            OnSuccess::Destroy
+        };
 
         // Capture the per-account email state observed before the set so
         // the post-call advance is compare-and-swap, not an
@@ -735,25 +850,41 @@ pub(crate) fn send_message<T: HttpTransport>(
             }
         };
 
+        let (email_result, created_state) = match email_result {
+            Ok((mut result, state)) => (
+                result
+                    .created(&email_create_id)
+                    .map_err(to_acct_err(AccountOperation::Send))
+                    .and_then(|email| require_created_email_id(&email, AccountOperation::Send)),
+                state,
+            ),
+            Err(error) => (Err(error), None),
+        };
         // RFC 8621 appends the implicit Email/set result under the
         // submission call id. Its state follows the initial Email create,
         // so advance once to the newest state rather than CAS-advancing
-        // twice against the same pre-call value.
-        let implicit_email_state = response
-            .get_method::<EmailSet>(&submission_handle.call_id)
-            .ok()
-            .and_then(|result| {
-                result
-                    .new_state()
-                    .filter(|state| !state.is_empty())
-                    .map(str::to_string)
-            });
-        let email_state = implicit_email_state.or_else(|| {
-            email_result
-                .as_ref()
-                .ok()
-                .and_then(|(_, state)| state.clone())
-        });
+        // twice against the same pre-call value. Its per-item answer for the
+        // created Email decides the receipt's Sent copy.
+        let (implicit_email_state, implicit) = match email_result.as_ref() {
+            Ok(email_id) => {
+                let (state, outcome) = take_implicit_email_set(
+                    &mut response,
+                    &submission_handle.call_id,
+                    email_id,
+                    on_success,
+                );
+                (state, Some(outcome))
+            }
+            Err(_) => (
+                response
+                    .get_method::<EmailSet>(&submission_handle.call_id)
+                    .ok()
+                    .and_then(crate::core::set::SetResponse::into_new_state)
+                    .filter(|state| !state.is_empty()),
+                None,
+            ),
+        };
+        let email_state = implicit_email_state.or(created_state);
         if let Some(new_state) = email_state {
             state_cache::advance(
                 &email_states,
@@ -764,14 +895,6 @@ pub(crate) fn send_message<T: HttpTransport>(
             .await;
         }
 
-        let email_result = email_result
-            .and_then(|(mut result, _)| {
-                result
-                    .created(&email_create_id)
-                    .map_err(to_acct_err(AccountOperation::Send))
-            })
-            .and_then(|email| require_created_email_id(&email, AccountOperation::Send));
-
         let email_id = email_result.map_err(|error| {
             acknowledged_send_error(
                 error,
@@ -781,16 +904,30 @@ pub(crate) fn send_message<T: HttpTransport>(
                     .map(crate::email_submission::EmailSubmissionId::as_str),
             )
         })?;
+        let public_email_id = if foreign.is_some() {
+            ObjectId(super::foreign::encode_object(
+                &account_id,
+                email_id.as_str(),
+            ))
+        } else {
+            ObjectId(email_id.as_str().to_string())
+        };
+        let sent_copy = implicit_sent_copy(
+            implicit.expect("the implicit outcome is read whenever the email id is"),
+            on_success,
+            public_email_id,
+        );
 
         // A scheduled send returns its EmailSubmission id for
         // cancel/reschedule. An immediate send keeps returning the email id.
-        if scheduled.is_some() {
+        let id = if scheduled.is_some() {
             let submission_id = require_created_submission_id(&submission, AccountOperation::Send)
                 .map_err(|error| acknowledged_send_error(error, Some(&email_id), None))?;
-            Ok(ObjectId(submission_id.into_string()))
+            ObjectId(submission_id.into_string())
         } else {
-            Ok(ObjectId(email_id.into_string()))
-        }
+            ObjectId(email_id.into_string())
+        };
+        Ok(bifrost_types::SendReceipt::new(id, sent_copy))
     })
 }
 
@@ -800,7 +937,7 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
     account_id: String,
     raw: Bytes,
     save_to_sent: Option<bool>,
-) -> AccountFuture<Result<ObjectId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::SendReceipt, AccountError>> {
     Box::pin(async move {
         // JMAP has no raw-bytes send. The pre-assembled RFC 5322 / RFC 8098
         // octets are uploaded as a blob, imported into Drafts via
@@ -843,13 +980,15 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
 
         let mut submission_set = EmailSubmissionSet::new();
         submission_set.create_with_id(SUBMISSION_CREATE_ID);
-        if let Some(sent) = sent_mailbox.as_ref() {
+        let on_success = if let Some(sent) = sent_mailbox.as_ref() {
             submission_set
                 .on_success_update_email(SUBMISSION_CREATE_ID)
                 .submitted_to_sent(sent, Some(&draft_mailbox));
+            OnSuccess::File
         } else {
             submission_set = submission_set.on_success_destroy_email(SUBMISSION_CREATE_ID);
-        }
+            OnSuccess::Destroy
+        };
 
         let mut batch = mail.build();
         let import_handle = batch
@@ -911,22 +1050,38 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
                 return Err(failed_submission(error, rejected, email.as_ref(), cleanup));
             }
         };
-        let implicit_email_state = response
-            .get_method::<EmailSet>(&submission_handle.call_id)
-            .ok()
-            .and_then(|result| {
+        let (email_result, imported_state) = match email_result {
+            Ok((mut result, state)) => (
                 result
-                    .new_state()
-                    .filter(|state| !state.is_empty())
-                    .map(str::to_string)
-            });
-        let email_state = implicit_email_state.or_else(|| {
-            email_result
-                .as_ref()
-                .ok()
-                .and_then(|(_, state)| (!state.is_empty()).then(|| state.clone()))
-        });
-        if let Some(new_state) = email_state {
+                    .created(&import_create_id)
+                    .map_err(to_acct_err(AccountOperation::Send))
+                    .and_then(|email| require_created_email_id(&email, AccountOperation::Send)),
+                (!state.is_empty()).then_some(state),
+            ),
+            Err(error) => (Err(error), None),
+        };
+        // The implicit Email/set's state follows the import; its per-item
+        // answer for the imported Email decides the Sent copy.
+        let (implicit_email_state, implicit) = match email_result.as_ref() {
+            Ok(email_id) => {
+                let (state, outcome) = take_implicit_email_set(
+                    &mut response,
+                    &submission_handle.call_id,
+                    email_id,
+                    on_success,
+                );
+                (state, Some(outcome))
+            }
+            Err(_) => (
+                response
+                    .get_method::<EmailSet>(&submission_handle.call_id)
+                    .ok()
+                    .and_then(crate::core::set::SetResponse::into_new_state)
+                    .filter(|state| !state.is_empty()),
+                None,
+            ),
+        };
+        if let Some(new_state) = implicit_email_state.or(imported_state) {
             state_cache::advance(
                 &email_states,
                 &account_id,
@@ -935,13 +1090,6 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             )
             .await;
         }
-        let email_result = email_result
-            .and_then(|(mut result, _)| {
-                result
-                    .created(&import_create_id)
-                    .map_err(to_acct_err(AccountOperation::Send))
-            })
-            .and_then(|email| require_created_email_id(&email, AccountOperation::Send));
         let email_id = email_result.map_err(|error| {
             acknowledged_send_error(
                 error,
@@ -951,7 +1099,13 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
                     .map(crate::email_submission::EmailSubmissionId::as_str),
             )
         })?;
-        Ok(ObjectId(email_id.into_string()))
+        let id = ObjectId(email_id.into_string());
+        let sent_copy = implicit_sent_copy(
+            implicit.expect("the implicit outcome is read whenever the email id is"),
+            on_success,
+            id.clone(),
+        );
+        Ok(bifrost_types::SendReceipt::new(id, sent_copy))
     })
 }
 
@@ -1149,7 +1303,7 @@ pub(crate) fn draft_send<T: HttpTransport>(
     email_states: StateMap,
     account_id: String,
     draft: bifrost_types::DraftHandle,
-) -> AccountFuture<Result<ObjectId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::SendReceipt, AccountError>> {
     Box::pin(async move {
         let draft_id = EmailId::new(draft.0.clone());
         // Sent and Drafts in one `Mailbox/get`: the submission patch
@@ -1198,21 +1352,20 @@ pub(crate) fn draft_send<T: HttpTransport>(
         // The submission is already committed. A failed cache refresh must
         // not turn that success into an error that invites a duplicate send;
         // the stale state will be reconciled by the next conditional mutation.
-        let implicit_state = response
-            .get_method::<EmailSet>(&submission_handle.call_id)
-            .ok()
-            .and_then(|result| {
-                result
-                    .new_state()
-                    .filter(|state| !state.is_empty())
-                    .map(str::to_string)
-            });
+        let (implicit_state, implicit) = take_implicit_email_set(
+            &mut response,
+            &submission_handle.call_id,
+            &draft_id,
+            OnSuccess::File,
+        );
         if let Some(state) = implicit_state {
             state_cache::advance(&email_states, &account_id, prior_state.as_deref(), state).await;
         } else if let Ok(fresh) = super::mutation::probe_email_state(&mail).await {
             state_cache::advance(&email_states, &account_id, prior_state.as_deref(), fresh).await;
         }
-        Ok(ObjectId(draft_id.into_string()))
+        let id = ObjectId(draft_id.into_string());
+        let sent_copy = implicit_sent_copy(implicit, OnSuccess::File, id.clone());
+        Ok(bifrost_types::SendReceipt::new(id, sent_copy))
     })
 }
 
@@ -6484,6 +6637,11 @@ mod tests {
         fail_probe_after_submission: bool,
         missing_email: bool,
         implicit_email_state: Option<&'static str>,
+        /// How the implicit Email/set (emitted only while
+        /// `implicit_email_state` is set) answers for the Email: `"applied"`,
+        /// `"refused"` (`notUpdated` / `notDestroyed`), `"unanswered"` (the id
+        /// omitted) or `"method"` (a method-level `forbidden`).
+        implicit_answer: &'static str,
     }
 
     impl SendTransport {
@@ -6503,6 +6661,7 @@ mod tests {
                 fail_probe_after_submission,
                 missing_email,
                 implicit_email_state: None,
+                implicit_answer: "applied",
             }
         }
 
@@ -6815,16 +6974,45 @@ mod tests {
                     && !self.fail_submission
                     && (email_success_update || email_success_destroy)
                 {
-                    responses.push(serde_json::json!([
-                        "Email/set",
-                        {
-                            "accountId": account_id.clone(),
-                            "oldState": "email-created-state",
-                            "newState": self.implicit_email_state,
-                            "updated": {"email-created": null}
-                        },
-                        call_id
-                    ]));
+                    // The implicit Email/set answers for the submitted
+                    // Email's real id: the draft's for `draft_send`, the
+                    // created/imported Email's otherwise.
+                    let email_id = args["create"]
+                        .as_object()
+                        .and_then(|create| create.values().next())
+                        .and_then(|submission| submission["emailId"].as_str())
+                        .unwrap_or("email-created")
+                        .to_string();
+                    let mut implicit = serde_json::json!({
+                        "accountId": account_id.clone(),
+                        "oldState": "email-created-state",
+                        "newState": self.implicit_email_state,
+                    });
+                    let refusal = serde_json::json!({"type": "forbidden"});
+                    match (self.implicit_answer, email_success_update) {
+                        ("method", _) => {
+                            responses.push(serde_json::json!([
+                                "error",
+                                {"type": "forbidden"},
+                                call_id
+                            ]));
+                            continue;
+                        }
+                        ("refused", true) => {
+                            implicit["notUpdated"] = Self::keyed(&email_id, refusal);
+                        }
+                        ("refused", false) => {
+                            implicit["notDestroyed"] = Self::keyed(&email_id, refusal);
+                        }
+                        ("unanswered", _) => {}
+                        (_, true) => {
+                            implicit["updated"] = Self::keyed(&email_id, serde_json::Value::Null);
+                        }
+                        (_, false) => {
+                            implicit["destroyed"] = serde_json::json!([email_id]);
+                        }
+                    }
+                    responses.push(serde_json::json!(["Email/set", implicit, call_id]));
                 }
             }
 
@@ -6996,7 +7184,11 @@ mod tests {
         .await
         .expect("submission succeeds");
 
-        assert_eq!(sent, ObjectId("email-created".to_string()));
+        assert_eq!(sent.id, ObjectId("email-created".to_string()));
+        assert!(matches!(
+            sent.sent_copy,
+            bifrost_types::SentCopy::Filed { id: Some(ref id) } if id.0 == "email-created"
+        ));
         assert_eq!(
             state_cache::get(&states, "primary").await.as_deref(),
             Some("email-after-send")
@@ -7050,7 +7242,11 @@ mod tests {
         .await
         .expect("submission succeeds without a post-send probe");
 
-        assert_eq!(sent, ObjectId("email-old".to_string()));
+        assert_eq!(sent.id, ObjectId("email-old".to_string()));
+        assert!(matches!(
+            sent.sent_copy,
+            bifrost_types::SentCopy::Filed { id: Some(ref id) } if id.0 == "email-old"
+        ));
         assert_eq!(
             state_cache::get(&states, "primary").await.as_deref(),
             Some("email-after-draft-send")
@@ -7059,6 +7255,147 @@ mod tests {
             transport.method_sequence(),
             vec!["Mailbox/get", "EmailSubmission/set"]
         );
+    }
+
+    async fn send_with_implicit_answer(
+        answer: &'static str,
+        save_to_sent: Option<bool>,
+    ) -> bifrost_types::SendReceipt {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.implicit_email_state = Some("email-after-send");
+        transport.implicit_answer = answer;
+        let mut request = basic_send_request();
+        request.save_to_sent = save_to_sent;
+        send_message(
+            send_account(transport),
+            send_state_map(),
+            "primary".to_string(),
+            3600,
+            None,
+            request,
+        )
+        .await
+        .expect("a committed submission is Ok whatever the implicit Email/set says")
+    }
+
+    #[tokio::test]
+    async fn send_reports_the_implicit_sent_move_per_item() {
+        use bifrost_types::{SentCopy, SentCopyNotFiled};
+        assert!(matches!(
+            send_with_implicit_answer("refused", None).await.sent_copy,
+            SentCopy::NotFiled {
+                reason: SentCopyNotFiled::MoveRefused,
+                detail: Some(_)
+            }
+        ));
+        assert!(matches!(
+            send_with_implicit_answer("method", None).await.sent_copy,
+            SentCopy::NotFiled {
+                reason: SentCopyNotFiled::MoveRefused,
+                detail: Some(_)
+            }
+        ));
+        assert!(matches!(
+            send_with_implicit_answer("unanswered", None)
+                .await
+                .sent_copy,
+            SentCopy::Uncertain { .. }
+        ));
+        // No implicit response at all, though RFC 8621 s7.5 requires one.
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.implicit_answer = "applied";
+        let receipt = send_message(
+            send_account(transport),
+            send_state_map(),
+            "primary".to_string(),
+            3600,
+            None,
+            basic_send_request(),
+        )
+        .await
+        .expect("submission succeeds");
+        assert!(matches!(receipt.sent_copy, SentCopy::Uncertain { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_declined_sent_copy_is_not_requested_whatever_the_destroy_answer() {
+        for answer in ["applied", "refused", "unanswered"] {
+            let receipt = send_with_implicit_answer(answer, Some(false)).await;
+            assert!(
+                matches!(receipt.sent_copy, bifrost_types::SentCopy::NotRequested),
+                "{answer}: {:?}",
+                receipt.sent_copy
+            );
+            assert!(receipt.draft_discard.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_and_draft_sends_report_a_refused_sent_move() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.implicit_email_state = Some("email-after-raw-send");
+        transport.implicit_answer = "refused";
+        let raw = send_raw_message(
+            send_account(transport),
+            send_state_map(),
+            "primary".to_string(),
+            Bytes::from_static(b"raw message"),
+            None,
+        )
+        .await
+        .expect("submission succeeds");
+        assert!(matches!(
+            raw.sent_copy,
+            bifrost_types::SentCopy::NotFiled {
+                reason: bifrost_types::SentCopyNotFiled::MoveRefused,
+                ..
+            }
+        ));
+
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.implicit_email_state = Some("email-after-draft-send");
+        transport.implicit_answer = "refused";
+        let draft = draft_send(
+            send_account(transport),
+            send_state_map(),
+            "primary".to_string(),
+            bifrost_types::DraftHandle("email-old".to_string()),
+        )
+        .await
+        .expect("submission succeeds");
+        assert!(matches!(
+            draft.sent_copy,
+            bifrost_types::SentCopy::NotFiled {
+                reason: bifrost_types::SentCopyNotFiled::MoveRefused,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn foreign_send_files_its_sent_copy_under_the_foreign_id() {
+        let mut transport = SendTransport::new(false, false, false, false);
+        transport.implicit_email_state = Some("email-after-send");
+        let primary = send_account(transport);
+        let shared = crate::account::Account::new(primary.client().clone(), "shared");
+        let receipt = send_message(
+            shared,
+            send_state_map(),
+            "shared".to_string(),
+            0,
+            Some(ForeignSubmission {
+                mode: bifrost_types::SendAs::As(bifrost_types::MailboxId("shared".into())),
+                self_address: None,
+            }),
+            basic_send_request(),
+        )
+        .await
+        .expect("foreign submission succeeds");
+        let expected = super::super::foreign::encode_object("shared", "email-created");
+        assert!(matches!(
+            receipt.sent_copy,
+            bifrost_types::SentCopy::Filed { id: Some(ref id) } if id.0 == expected
+        ));
     }
 
     #[tokio::test]
@@ -7117,7 +7454,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            result.expect("send was committed"),
+            result.expect("send was committed").id,
             ObjectId("email-old".to_string())
         );
         assert_eq!(
@@ -7416,7 +7753,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            result.expect("scheduled send was committed"),
+            result.expect("scheduled send was committed").id,
             ObjectId("new-submission".to_string())
         );
         let submissions = transport.calls("EmailSubmission/set");

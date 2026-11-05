@@ -386,11 +386,13 @@ pub enum SentCopy {
     /// unknown: the copy may be in Sent. Check the Sent folder before filing
     /// it again, or it may be duplicated.
     Uncertain { detail: crate::Warning },
-    /// The provider files (or, where it honours `save_to_sent = false`,
-    /// destroys) the copy as its own server-side effect of the submission:
-    /// JMAP `onSuccessUpdateEmail` / `onSuccessDestroyEmail`, Gmail and
-    /// Graph unconditionally. This call verifies neither the filing, nor its
-    /// absence, nor any draft cleanup, and the processing may be deferred.
+    /// The provider files the copy as its own server-side effect of the
+    /// submission (Gmail and Graph, unconditionally). This call verifies
+    /// neither the filing, nor its absence, nor any draft cleanup, and the
+    /// processing may be deferred. JMAP does not report this: it reads the
+    /// per-item answer of the implicit `Email/set` that RFC 8621 s7.5 runs in
+    /// the same request, and reports `Filed`, `NotFiled`, `Uncertain` or
+    /// `NotRequested` from it.
     ProviderManaged,
 }
 
@@ -404,6 +406,11 @@ pub enum SentCopyNotFiled {
     NoConnection,
     /// The APPEND failed and its evidence establishes it did not apply.
     AppendFailed,
+    /// The server refused to move the submitted message into Sent (JMAP: the
+    /// implicit `Email/set` answered `notUpdated` for it, or failed as a
+    /// method that made no change). The message keeps its pre-send
+    /// placement, so it may remain in Drafts.
+    MoveRefused,
 }
 
 /// A draft whose post-send discard failed. The message itself was sent.

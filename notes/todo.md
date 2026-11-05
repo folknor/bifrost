@@ -36,14 +36,14 @@ not verified against the code. Verification happens when an item is worked.
 Items that leak something or report success for something that did not
 happen, plus one surface gap that matters if the consumer relies on it.
 
-- **JMAP sends do not check the implicit Sent move.** `send_message`,
-  `send_raw_message` and `draft_send` in `crates/jmap/src/sync/pim.rs` ask the
-  server for `onSuccessUpdateEmail` (move to Sent, drop `$draft`) or
-  `onSuccessDestroyEmail`, then read the implicit `Email/set` response only for
-  its `newState`. A `notUpdated` / `notDestroyed` entry there means the Sent
-  copy was not filed or the temporary Email survives, and today the receipt
-  says `SentCopy::ProviderManaged` regardless. Reading that entry would let the
-  receipt report `Filed` or `NotFiled` as IMAP now does.
+- **JMAP send-as receipts return a bare foreign Email id.** `send_message` in
+  `crates/jmap/src/sync/pim.rs`, on the foreign (send-as) route, returns
+  `SendReceipt::id` as the foreign account's native Email id, not
+  `foreign::encode_object`-ed. Every id-only reader (`get_stream`,
+  `open_blob`, mutations) then routes it to the primary account, where it
+  404s or, on an id collision, resolves an unrelated primary Email. The same
+  receipt's `SentCopy::Filed.id` is already foreign-encoded, so the two ids
+  disagree about ownership.
 - **SMTP partial recipient acceptance is invisible to send callers.**
   `SubmissionTransport::send_rfc5322` (`crates/imap/src/account/submission.rs`)
   returns `Ok(())` and only logs when some recipients were rejected or are
@@ -118,6 +118,19 @@ face.
   Separate fields (message id, correlation id, scheduled handle) would let
   `cancel_scheduled_send` / `reschedule_send` take the handle by type. Also
   `draft_send` has no per-call `save_to_sent`; IMAP uses the account default.
+- **A JMAP send's leftover staging Email has no routable handle on the
+  receipt.** When the implicit `Email/set` refuses or does not confirm the
+  Sent move, the created/imported Email (or, for `draft_send`, the submitted
+  draft, which now looks sendable) may remain in Drafts with `$draft`; when it
+  refuses or does not confirm the `save_to_sent = false` destroy, the staging
+  Email may survive. The receipt says `NotFiled` / `Uncertain` / `NotRequested`
+  and the destroy case is only logged (`implicit_sent_copy` in
+  `crates/jmap/src/sync/pim.rs`). Reusing `DraftDiscardFailure` was rejected:
+  no discard was attempted on the move path, and `draft_discard` routes only
+  through the primary draft account, so a foreign send-as staging Email cannot
+  be addressed by a `DraftHandle`. Decide whether `SendReceipt` grows a field
+  naming the retained or possibly retained Email with an owner-preserving
+  handle, distinguishing refused, uncertain and failed-destroy.
 - **A proxy 407 maps to `AuthLost`, implying the wrong remedy.** JMAP
   classifies net's typed `TunnelError` (407 ->
   `Authentication(ReauthorizationRequired)` / `AuthLost`, proxy TLS ->
