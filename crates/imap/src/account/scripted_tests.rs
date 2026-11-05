@@ -3901,6 +3901,112 @@ async fn flags_only_fetch_without_flags_is_a_missing_field_failure() {
     script.await.unwrap();
 }
 
+/// Consumers correlate outcomes by exact string, so a legacy `imap1` id and a
+/// non-canonical `imap2` spelling must each come back under the string that
+/// was submitted - lane id and hydrated id alike - even when both name the
+/// same message and the miss lane answers for a third.
+#[tokio::test]
+async fn hydration_answers_under_the_submitted_id_spelling() {
+    use bifrost_types::{ItemOutcome, ObjectId, Projection, SyncEvent};
+    use futures::StreamExt;
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(&mut server, &format!("* FLAGS (\\Seen)\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 3] ok\r\n{} OK [READ-ONLY] done\r\n", tag_of(&select))).await;
+        let fetch = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n{} OK done\r\n",
+                tag_of(&fetch)
+            ),
+        )
+        .await;
+    });
+    let submitted = [
+        ObjectId("imap1:5:INBOX:5:1".to_owned()),
+        ObjectId("imap2:05:INBOX:005:001".to_owned()),
+        ObjectId("imap1:5:INBOX:5:2".to_owned()),
+    ];
+    let mut output = super::get::get_stream(
+        account,
+        Box::pin(futures::stream::iter(submitted.clone())),
+        Projection::FlagsOnly,
+    );
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    while let Some(event) = output.next().await {
+        if let SyncEvent::Batch(batch) = event {
+            for item in batch.items {
+                match item {
+                    ItemOutcome::Succeeded(s) => {
+                        assert_eq!(s.output.id.0, s.item.0, "hydrated id must echo the lane id");
+                        succeeded.push(s.item.0);
+                    }
+                    ItemOutcome::Failed(f) => failed.push(f.item.0),
+                    ItemOutcome::Uncertain(u) => panic!("unexpected uncertain {u:?}"),
+                }
+            }
+        }
+    }
+    succeeded.sort();
+    let mut expected = vec![submitted[0].0.clone(), submitted[1].0.clone()];
+    expected.sort();
+    assert_eq!(succeeded, expected);
+    assert_eq!(failed, vec![submitted[2].0.clone()]);
+    script.await.unwrap();
+}
+
+/// A mutation against a stored legacy id reports its outcome under that id.
+#[tokio::test]
+async fn mutation_answers_under_the_submitted_id_spelling() {
+    use bifrost_types::{FlagOp, ItemOutcome, ObjectId, SyncEvent};
+    use futures::StreamExt;
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(&mut server, &format!(
+            "* FLAGS (\\Seen)\r\n* 3 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 4] ok\r\n{} OK [READ-WRITE] done\r\n",
+            tag_of(&select),
+        )).await;
+        let store = read_line(&mut server).await;
+        assert!(store.contains("UID STORE"), "expected STORE, got {store}");
+        respond(&mut server, &format!("{} OK done\r\n", tag_of(&store))).await;
+        server
+    });
+    let submitted = ObjectId("imap1:5:INBOX:5:3".to_owned());
+    let mut output = super::mutate::mutation_stream(
+        account,
+        Box::pin(futures::stream::iter(vec![submitted.clone()])),
+        super::mutate::MutationKind::Flags(FlagOp::Add(std::collections::HashSet::from([
+            "$flagged".to_owned(),
+        ]))),
+    );
+    let mut ids = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), output.next())
+        .await
+        .expect("stream must make progress")
+    {
+        match event {
+            SyncEvent::Batch(batch) => {
+                for outcome in batch.items {
+                    match outcome {
+                        ItemOutcome::Succeeded(item) => ids.push(item.item.0),
+                        other => panic!("unexpected outcome {other:?}"),
+                    }
+                }
+            }
+            SyncEvent::Done(_) => break,
+            unexpected => panic!("unexpected event: {unexpected:?}"),
+        }
+    }
+    assert_eq!(ids, vec![submitted.0]);
+    let _server = script.await.unwrap();
+}
+
 fn drive_push_until_shutdown(account: &super::ImapAccount) -> tokio::task::JoinHandle<()> {
     use bifrost_types::Account;
     use futures::StreamExt;

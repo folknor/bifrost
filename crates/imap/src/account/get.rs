@@ -129,9 +129,7 @@ async fn flush_get_groups(
                 let uncertain: Vec<ItemOutcome<HydratedObject>> = pending
                     .into_iter()
                     .map(|id| {
-                        let item = BatchItemId(
-                            super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
-                        );
+                        let item = BatchItemId(id.id.0);
                         ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
                     })
                     .collect();
@@ -189,14 +187,12 @@ fn message_not_found_error(id: &DecodedObjectId) -> AccountError {
         AccountErrorKind::NotFound(ResourceKind::Message),
         Cause::Request(RequestCause::NotFound {
             what: ResourceKind::Message,
-            id: Some(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0),
+            id: Some(id.id.0.clone()),
         }),
     )
     .protocol(Protocol::Imap)
     .operation(AccountOperation::Hydrate)
-    .scope(bifrost_types::ErrorScope::Message {
-        id: super::encode_object_id(&id.folder, id.uidvalidity, id.uid),
-    })
+    .scope(bifrost_types::ErrorScope::Message { id: id.id.clone() })
     .try_build()
     .expect("valid account error classification")
 }
@@ -207,7 +203,7 @@ fn failed_hydration(
 ) -> Vec<ItemOutcome<HydratedObject>> {
     ids.into_iter()
         .map(|id| {
-            let item = BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
+            let item = BatchItemId(id.id.0);
             ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
         })
         .collect()
@@ -408,7 +404,7 @@ async fn run_folder_get(
         // The permit stamps the id: a hydrated object can only ever be
         // published under the id that was requested for it.
         let verdict = match hydrated_by_uid.get(&target.uid()).cloned() {
-            Some(Ok(object)) => Verdict::Succeeded(object),
+            Some(Ok(object)) => Verdict::Succeeded(answer_as(object, &target.id().id)),
             Some(Err(error)) => Verdict::Failed(error),
             None => Verdict::Failed(message_not_found_error(target.id())),
         };
@@ -488,6 +484,19 @@ fn selection_for_projection(projection: Projection, include_modseq: bool) -> Fet
             body: BodySelection::None,
         },
     }
+}
+
+/// Rename a hydrated object to the id its target was submitted under. The
+/// UID-keyed result is minted with the canonical id and may serve several
+/// targets naming the same message in different spellings, so each target
+/// stamps its own copy; the metadata entry carries a second id that must
+/// agree with the wrapper's.
+fn answer_as(mut object: HydratedObject, id: &bifrost_types::ObjectId) -> HydratedObject {
+    object.id = id.clone();
+    if let HydratedObjectKind::Metadata(entry) = &mut object.kind {
+        entry.id = id.clone();
+    }
+    object
 }
 
 fn fetch_to_hydrated(
@@ -736,6 +745,24 @@ mod tests {
     }
 
     #[test]
+    fn answering_as_a_submitted_id_renames_the_metadata_entry_too() {
+        let fetch = FetchResponse {
+            uid: Some(3),
+            rfc822_size: Some(77),
+            ..Default::default()
+        };
+        let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::Metadata, None)
+            .expect("uid present");
+        let legacy = bifrost_types::ObjectId("imap1:5:INBOX:9:3".to_owned());
+        let object = answer_as(object, &legacy);
+        assert_eq!(object.id, legacy);
+        match object.kind {
+            HydratedObjectKind::Metadata(entry) => assert_eq!(entry.id, legacy),
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn metadata_hydration_reuses_the_inventory_projection_and_owner_tag() {
         let fetch = FetchResponse {
             uid: Some(3),
@@ -849,11 +876,7 @@ mod tests {
 
     #[test]
     fn unreturned_and_stale_hydration_ids_are_failed() {
-        let stale = DecodedObjectId {
-            folder: folder(),
-            uidvalidity: 8,
-            uid: 2,
-        };
+        let stale = DecodedObjectId::canonical(folder(), 8, 2);
         let stale = failed_hydration(vec![stale], uidvalidity_changed_error(&folder()));
         assert!(
             matches!(stale.as_slice(), [ItemOutcome::Failed(failure)] if matches!(
@@ -862,11 +885,7 @@ mod tests {
             ))
         );
 
-        let missing = DecodedObjectId {
-            folder: folder(),
-            uidvalidity: 9,
-            uid: 3,
-        };
+        let missing = DecodedObjectId::canonical(folder(), 9, 3);
         let error = message_not_found_error(&missing);
         assert!(matches!(
             error.kind(),
@@ -996,11 +1015,7 @@ mod tests {
     #[tokio::test]
     async fn stale_failures_reach_the_consumer_before_the_fetch_can_fail() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let stale = vec![DecodedObjectId {
-            folder: folder(),
-            uidvalidity: 8,
-            uid: 2,
-        }];
+        let stale = vec![DecodedObjectId::canonical(folder(), 8, 2)];
         let (connection, _server) =
             crate::connection::test_support::driver_pair(b"* PREAUTH ready\r\n").await;
         let mut previous_bytes_in = connection.bytes_in();

@@ -40,6 +40,13 @@ ids regardless of the LIST connection's encoding mode. Object ids use `imap2`
 and thread ids use `imapthread2` for escaped folder identities; legacy `imap1`
 and `imapthread1` folders always decode literally. Part handles likewise use
 `imappart3`, with legacy `imappart2` folders decoded literally.
+New object ids are always minted `imap2`, but an outcome answers under the id
+as submitted: `DecodedObjectId` carries the submitted string, and batch lane
+ids, not-found error scopes, `HydratedObject.id` (and its metadata entry's id)
+and `message_hydrate`'s result all echo it rather than re-encoding. Consumers
+correlate by exact string, and the decoder also accepts spellings the encoder
+never mints (legacy `imap1`, leading-zero numerals). Inventory and changes keep
+minting `imap2`, which is how stored legacy ids migrate.
 Search concatenates selectable folders in display-name order with canonical
 wire octets and mode breaking ties, keeping offset pagination stable across
 registry rebuilds.

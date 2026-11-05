@@ -321,9 +321,7 @@ async fn flush_mutation_groups(
                 let outcomes = unaccounted
                     .into_iter()
                     .map(|id| {
-                        let item = BatchItemId(
-                            super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
-                        );
+                        let item = BatchItemId(id.id.0);
                         match &verdict {
                             Verdict::Uncertain(error) => {
                                 ItemOutcome::Uncertain(BatchUncertain::new(item, error.clone()))
@@ -1167,7 +1165,7 @@ fn mutation_verdict(
 fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.into_iter()
         .map(|id| {
-            let item = BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
+            let item = BatchItemId(id.id.0);
             ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
         })
         .collect()
@@ -1514,16 +1512,8 @@ mod tests {
         // in-flight-drop analogue that queues for read-back).
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
         let ids = vec![
-            DecodedObjectId {
-                folder: folder.clone(),
-                uidvalidity: 7,
-                uid: 2,
-            },
-            DecodedObjectId {
-                folder: folder.clone(),
-                uidvalidity: 7,
-                uid: 5,
-            },
+            DecodedObjectId::canonical(folder.clone(), 7, 2),
+            DecodedObjectId::canonical(folder.clone(), 7, 5),
         ];
         let outcome = StoreWireOutcome::PendingRetry(CompactUidSet::from_uids([2]));
         let outcomes =
@@ -1740,11 +1730,7 @@ mod tests {
 
     fn ids(uids: &[u32]) -> Vec<DecodedObjectId> {
         uids.iter()
-            .map(|uid| DecodedObjectId {
-                folder: folder(),
-                uidvalidity: 7,
-                uid: *uid,
-            })
+            .map(|uid| DecodedObjectId::canonical(folder(), 7, *uid))
             .collect()
     }
 
@@ -2103,16 +2089,8 @@ mod tests {
     fn stale_uidvalidity_targets_are_kept_for_failed_results() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");
         let ids = vec![
-            DecodedObjectId {
-                folder: folder.clone(),
-                uidvalidity: 9,
-                uid: 1,
-            },
-            DecodedObjectId {
-                folder,
-                uidvalidity: 10,
-                uid: 2,
-            },
+            DecodedObjectId::canonical(folder.clone(), 9, 1),
+            DecodedObjectId::canonical(folder, 10, 2),
         ];
 
         let (valid, stale) = split_by_uidvalidity(ids, 10);

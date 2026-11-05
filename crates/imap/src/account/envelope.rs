@@ -273,6 +273,28 @@ pub(crate) struct DecodedObjectId {
     pub(crate) folder: MailboxName,
     pub(crate) uidvalidity: u32,
     pub(crate) uid: u32,
+    /// The exact string this target answers to: the id as submitted when it
+    /// was decoded, the canonical encoding when it was synthesized (a thread
+    /// expansion). Every outcome, error scope and hydrated id echoes this
+    /// rather than re-encoding the triple, because consumers correlate by
+    /// exact string equality and the decoder accepts spellings the encoder
+    /// never mints: legacy `imap1` ids, and non-canonical `imap2` numerals
+    /// such as `imap2:05:INBOX:007:009`. Re-encoding would key the outcome
+    /// under a string the caller never sent.
+    pub(crate) id: ObjectId,
+}
+
+impl DecodedObjectId {
+    /// A target with no submitted spelling, answering to the canonical id.
+    pub(crate) fn canonical(folder: MailboxName, uidvalidity: u32, uid: u32) -> Self {
+        let id = encode_object_id(&folder, uidvalidity, uid);
+        Self {
+            folder,
+            uidvalidity,
+            uid,
+            id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +329,7 @@ pub(crate) fn decode_object_id(
         folder,
         uidvalidity,
         uid,
+        id: id.clone(),
     })
 }
 
@@ -465,6 +488,22 @@ fn schema_incompatible(detail: &str) -> AccountError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decoded_ids_keep_the_submitted_spelling() {
+        for submitted in [
+            "imap1:5:INBOX:7:9",
+            "imap2:05:INBOX:007:009",
+            "imap2:5:INBOX:7:9",
+        ] {
+            let id = ObjectId(submitted.to_owned());
+            let decoded = decode_object_id(&id, AccountOperation::Hydrate).unwrap();
+            assert_eq!(decoded.id, id);
+            assert_eq!((decoded.uidvalidity, decoded.uid), (7, 9));
+        }
+        let synthesized = DecodedObjectId::canonical(MailboxName::new("INBOX").unwrap(), 7, 9);
+        assert_eq!(synthesized.id.0, "imap2:5:INBOX:7:9");
+    }
+
     #[test]
     fn legacy_reserved_prefix_folders_remain_literal() {
         let encoded = MailboxName::from_wire("a".into(), b"&AGE-", false).account_id();

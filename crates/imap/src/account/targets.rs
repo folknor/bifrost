@@ -323,7 +323,7 @@ impl Drop for TargetBatch {
 }
 
 fn item_id(id: &DecodedObjectId) -> BatchItemId {
-    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0)
+    BatchItemId(id.id.0.clone())
 }
 
 fn excluded_from_operand_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
@@ -364,11 +364,7 @@ mod tests {
     }
 
     fn id(uid: u32) -> DecodedObjectId {
-        DecodedObjectId {
-            folder: folder(),
-            uidvalidity: 7,
-            uid,
-        }
+        DecodedObjectId::canonical(folder(), 7, uid)
     }
 
     fn applied(target: Target) -> Sealed<MutationSuccess> {

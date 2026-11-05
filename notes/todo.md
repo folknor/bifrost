@@ -49,9 +49,6 @@ happen, plus one surface gap that matters if the consumer relies on it.
   returns `Ok(())` and only logs when some recipients were rejected or are
   uncertain. `SendReceipt` is `non_exhaustive` and is the natural carrier for
   the rejected list; nothing reports it today.
-- **Legacy `imap1` object ids fail correlation.** They decode, but outcomes
-  re-encode as `imap2`, so legacy ids fail correlation in mutation and
-  hydration. Matters exactly when a consumer still holds stored `imap1` ids.
 - **`SyncEngine` exposes almost no calendar primitives.** It forwards contact
   primitives, but of the calendar `Account` methods only `event_delete` and
   `event_delete_if_version` (`crates/sync/src/engine/passthrough.rs`). List,
@@ -222,6 +219,18 @@ face.
 ## 5. Low priority
 
 Narrow edge cases, audits with no known defect, and design work.
+
+- **IMAP PIM partial-commit scopes name the canonical id, not the submitted
+  one.** `folder_effect_targets` (`crates/imap/src/account/pim.rs`) rebuilds
+  `ErrorScope::Message` from a `FolderEffect`'s folder, UIDVALIDITY and UID,
+  and `copy_messages`, `delete_messages` and `set_flag` reduce their decoded
+  targets to numeric UIDs via `valid_uids`, so a legacy `imap1` or
+  non-canonical source id is reported in its `imap2` spelling. Batch lanes and
+  hydration already echo the submitted id; no in-workspace consumer matches
+  these diagnostic scopes against submitted ids (sync attributes partial
+  commits by the enclosing `BatchItemId`), so this is attribution polish.
+  Fixing it means carrying `DecodedObjectId::id` through `FolderEffect`; new
+  destination ids stay canonical.
 
 - **JMAP set omissions outside the calendar and contact doors.** Direct
   single-id readers of `SetResponse::updated` / `destroyed` other than those

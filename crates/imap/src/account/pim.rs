@@ -1307,10 +1307,8 @@ pub(crate) fn thread_hydrate(
             decoded
                 .uids
                 .iter()
-                .map(|uid| DecodedObjectId {
-                    folder: decoded.folder.clone(),
-                    uidvalidity: decoded.uidvalidity,
-                    uid: *uid,
+                .map(|uid| {
+                    DecodedObjectId::canonical(decoded.folder.clone(), decoded.uidvalidity, *uid)
                 })
                 .collect(),
             HydrationProjection::Full,
@@ -1338,6 +1336,9 @@ pub(crate) fn message_hydrate(
         // ids `fetch_to_message` mints. `hydrate_decoded` already drops
         // FETCH responses for UIDs nobody asked about; picking by id rather
         // than by position keeps the answer right independently of that.
+        // The answer then carries the id as submitted (a legacy `imap1` or
+        // non-canonical spelling included), so the caller gets back the key
+        // it asked under, matching the batch hydration lane.
         let wanted = encode_object_id(&decoded.folder, decoded.uidvalidity, decoded.uid);
         let messages = hydrate_decoded(
             &account,
@@ -1346,10 +1347,12 @@ pub(crate) fn message_hydrate(
             AccountOperation::HydrateMessage,
         )
         .await?;
-        messages
+        let mut found = messages
             .into_iter()
             .find(|hydrated| hydrated.id == wanted)
-            .ok_or_else(|| expunged_message(wanted))
+            .ok_or_else(|| expunged_message(message.clone()))?;
+        found.id = message;
+        Ok(found)
     })
 }
 
@@ -1728,10 +1731,8 @@ fn decoded_targets(
             Ok(decoded
                 .uids
                 .into_iter()
-                .map(|uid| DecodedObjectId {
-                    folder: decoded.folder.clone(),
-                    uidvalidity: decoded.uidvalidity,
-                    uid,
+                .map(|uid| {
+                    DecodedObjectId::canonical(decoded.folder.clone(), decoded.uidvalidity, uid)
                 })
                 .collect())
         }
@@ -2791,11 +2792,11 @@ mod tests {
         assert_eq!(err.operation(), Some(AccountOperation::UpdateFlags));
 
         let err = valid_uids(
-            vec![DecodedObjectId {
-                folder: MailboxName::new("INBOX").expect("valid mailbox"),
-                uidvalidity: 2,
-                uid: 5,
-            }],
+            vec![DecodedObjectId::canonical(
+                MailboxName::new("INBOX").expect("valid mailbox"),
+                2,
+                5,
+            )],
             3,
             AccountOperation::BulkDestroy,
         )
@@ -4034,11 +4035,7 @@ mod partial_commit_tests {
         });
         let ids = ["A", "B"]
             .into_iter()
-            .map(|name| DecodedObjectId {
-                folder: MailboxName::new(name).unwrap(),
-                uidvalidity: 7,
-                uid: 1,
-            })
+            .map(|name| DecodedObjectId::canonical(MailboxName::new(name).unwrap(), 7, 1))
             .collect();
         let failure = match copy_messages(
             &account,
