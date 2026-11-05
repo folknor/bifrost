@@ -39,7 +39,7 @@ use idle::run_idle;
 #[cfg(test)]
 use pipeline::group_into_sub_batches;
 use pipeline::{PipelineEnd, run_pipeline};
-use upgrade::{logout_best_effort, run_upgrade};
+use upgrade::{logout_best_effort, required_capability_refresh, run_upgrade};
 use wire_send::{SendOutcome, send_wire_command};
 
 pub(in crate::connection) use upgrade::run_starttls_upgrade;
@@ -421,7 +421,9 @@ pub(super) async fn driver_task(
                         // framing intact, so it must not retire the
                         // connection whatever its error variant.
                         let mut refused_before_send = false;
-                        let result = match prepare_command(&state, &mut tag_gen, &command) {
+                        // Nothing may carry over from an earlier exchange.
+                        let _ = state.take_transition();
+                        let mut result = match prepare_command(&state, &mut tag_gen, &command) {
                             Ok(prepared) => {
                                 run_prepared_command(
                                     &mut wire_reader,
@@ -437,8 +439,31 @@ pub(super) async fn driver_task(
                                 Err(refusal)
                             }
                         };
-                        if !refused_before_send
-                            && result.as_ref().is_err_and(Error::is_connection_fatal)
+                        // A LOGIN / AUTHENTICATE / UNAUTHENTICATE whose tagged
+                        // OK committed the transition but carried no
+                        // capabilities owes its refresh here, before anything
+                        // is published or answered. Only after the consumer
+                        // finalized successfully (SCRAM verification included).
+                        if result.is_ok()
+                            && let Some(transition) = state.take_transition()
+                            && !transition.capabilities_supplied
+                            && let Err(error) = required_capability_refresh(
+                                &mut wire_reader,
+                                &mut state,
+                                &mut tag_gen,
+                                &mut event_sink,
+                            ).await
+                        {
+                            result = Err(error);
+                        }
+                        // A failed refresh marks Logout without necessarily
+                        // being connection-fatal (a tagged NO); the channel
+                        // must still close before the answer, so the caller
+                        // never sees a reusable connection.
+                        if (!refused_before_send
+                            && result.as_ref().is_err_and(Error::is_connection_fatal))
+                            || (result.is_err()
+                                && state.session_state() == super::SessionState::Logout)
                         {
                             state.apply_infrastructure_failure();
                             cmd_rx.close();
@@ -593,7 +618,8 @@ const LOGOUT_DRAIN_TIMEOUT: std::time::Duration = super::LOGOUT_DRAIN_TIMEOUT;
 /// [`prepare_command`], then [`run_prepared_command`].
 ///
 /// For the driver's own internal commands (connection setup's CAPABILITY, the
-/// STARTTLS and COMPRESS upgrades and their post-upgrade CAPABILITY). Their
+/// STARTTLS and COMPRESS upgrades, and the CAPABILITY refresh a committed
+/// session transition owes). Their
 /// admission follows from state this task owns rather than from a handle-side
 /// check: setup runs on the greeting's session state, and an upgrade payload
 /// was admitted by its handle. The legality check in `prepare_command` still

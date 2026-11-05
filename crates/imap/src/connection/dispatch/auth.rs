@@ -5,9 +5,7 @@ use bifrost_sasl::{
 
 use crate::connection::NotifyFlags;
 use crate::error::Error;
-use crate::types::response::{
-    ContinuationRequest, ResponseCode, StatusKind, TaggedResponse, UntaggedResponse,
-};
+use crate::types::response::{ContinuationRequest, StatusKind, TaggedResponse, UntaggedResponse};
 use crate::types::{AuthMechanism, SecretString};
 
 use super::{Consumer, ConsumerContext, ContinuationConsumer, ContinuationReply, Finalized};
@@ -59,19 +57,16 @@ fn require_ok_auth(
 
 /// Consumer for LOGIN (RFC 3501 Section6.2.3).
 ///
-/// LOGIN has no solicited untagged responses of its own. Tracks whether
-/// the server provided inline CAPABILITY data (either as an untagged
-/// CAPABILITY response or in the tagged OK response code per
-/// RFC 3501 Section6.2.3) so the caller knows whether to issue a follow-up
-/// CAPABILITY command.
+/// LOGIN has no solicited untagged responses of its own. Whether the
+/// post-authentication CAPABILITY refresh is owed is decided by the driver
+/// from the tagged OK alone (`ProtocolState::take_transition`), not here.
 #[derive(Default)]
 pub(crate) struct LoginConsumer {
-    caps_seen: bool,
     buffered: Vec<UntaggedResponse>,
 }
 
 impl Consumer for LoginConsumer {
-    type Output = bool;
+    type Output = ();
 
     fn on_response(
         &mut self,
@@ -79,29 +74,17 @@ impl Consumer for LoginConsumer {
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
     ) {
-        // RFC 3501 Section7.2.1: the server SHOULD send updated capabilities
-        // after authentication. Track it so the caller can skip a follow-up
-        // CAPABILITY command.
-        if matches!(&resp, UntaggedResponse::Capability(_)) {
-            self.caps_seen = true;
-        }
         self.buffered.push(resp);
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Finalized<bool> {
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // `buffered` is `Either`-classified data whose only carrier is the
         // event stream, so a rejected LOGIN surrenders it rather than
         // dropping it with the consumer.
-        let tagged = match require_ok_auth(tagged, AuthMechanism::Login.name()) {
-            Ok(t) => t,
-            Err(e) => return Finalized::failure(e, self.buffered),
-        };
-        let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
+        if let Err(e) = require_ok_auth(tagged, AuthMechanism::Login.name()) {
+            return Finalized::failure(e, self.buffered);
+        }
+        Finalized::success((), self.buffered)
     }
 }
 
@@ -117,8 +100,6 @@ pub(crate) struct AuthenticatePlainConsumer {
     /// Whether the initial response has already been sent (via SASL-IR
     /// in the command, or via a previous continuation reply).
     initial_sent: bool,
-    /// Whether capability data arrived during the exchange.
-    caps_seen: bool,
     buffered: Vec<UntaggedResponse>,
 }
 
@@ -127,14 +108,13 @@ impl AuthenticatePlainConsumer {
         Self {
             encoded,
             initial_sent: sasl_ir_used,
-            caps_seen: false,
             buffered: Vec::new(),
         }
     }
 }
 
 impl Consumer for AuthenticatePlainConsumer {
-    type Output = bool;
+    type Output = ();
 
     fn on_response(
         &mut self,
@@ -142,26 +122,15 @@ impl Consumer for AuthenticatePlainConsumer {
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
     ) {
-        // RFC 3501 Section7.2.1: capabilities may arrive as untagged response
-        // after authentication state changes.
-        if matches!(&resp, UntaggedResponse::Capability(_)) {
-            self.caps_seen = true;
-        }
         self.buffered.push(resp);
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Finalized<bool> {
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on both arms.
-        let tagged = match require_ok_auth(tagged, AuthMechanism::Plain.name()) {
-            Ok(t) => t,
-            Err(e) => return Finalized::failure(e, self.buffered),
-        };
-        let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
+        if let Err(e) = require_ok_auth(tagged, AuthMechanism::Plain.name()) {
+            return Finalized::failure(e, self.buffered);
+        }
+        Finalized::success((), self.buffered)
     }
 }
 
@@ -199,8 +168,6 @@ pub(crate) struct AuthenticateXoauth2Consumer {
     encoded: SecretString,
     /// Whether the initial credential payload has been sent.
     initial_sent: bool,
-    /// Whether capability data arrived during the exchange.
-    caps_seen: bool,
     buffered: Vec<UntaggedResponse>,
     /// Wire mechanism token this consumer is driving. The consumer is shared
     /// by XOAUTH2 and OAUTHBEARER (identical framing), so the token cannot be
@@ -213,7 +180,6 @@ impl AuthenticateXoauth2Consumer {
         Self {
             encoded,
             initial_sent: sasl_ir_used,
-            caps_seen: false,
             buffered: Vec::new(),
             mechanism,
         }
@@ -221,7 +187,7 @@ impl AuthenticateXoauth2Consumer {
 }
 
 impl Consumer for AuthenticateXoauth2Consumer {
-    type Output = bool;
+    type Output = ();
 
     fn on_response(
         &mut self,
@@ -229,24 +195,15 @@ impl Consumer for AuthenticateXoauth2Consumer {
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
     ) {
-        if matches!(&resp, UntaggedResponse::Capability(_)) {
-            self.caps_seen = true;
-        }
         self.buffered.push(resp);
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Finalized<bool> {
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on both arms.
-        let tagged = match require_ok_auth(tagged, self.mechanism) {
-            Ok(t) => t,
-            Err(e) => return Finalized::failure(e, self.buffered),
-        };
-        let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
+        if let Err(e) = require_ok_auth(tagged, self.mechanism) {
+            return Finalized::failure(e, self.buffered);
+        }
+        Finalized::success((), self.buffered)
     }
 }
 
@@ -278,7 +235,6 @@ pub(crate) struct AuthenticateCramMd5Consumer {
     user: String,
     pass: SecretString,
     response_sent: bool,
-    caps_seen: bool,
     buffered: Vec<UntaggedResponse>,
 }
 
@@ -288,14 +244,13 @@ impl AuthenticateCramMd5Consumer {
             user,
             pass,
             response_sent: false,
-            caps_seen: false,
             buffered: Vec::new(),
         }
     }
 }
 
 impl Consumer for AuthenticateCramMd5Consumer {
-    type Output = bool;
+    type Output = ();
 
     fn on_response(
         &mut self,
@@ -303,24 +258,15 @@ impl Consumer for AuthenticateCramMd5Consumer {
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
     ) {
-        if matches!(&resp, UntaggedResponse::Capability(_)) {
-            self.caps_seen = true;
-        }
         self.buffered.push(resp);
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Finalized<bool> {
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on both arms.
-        let tagged = match require_ok_auth(tagged, AuthMechanism::CramMd5.name()) {
-            Ok(t) => t,
-            Err(e) => return Finalized::failure(e, self.buffered),
-        };
-        let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
+        if let Err(e) = require_ok_auth(tagged, AuthMechanism::CramMd5.name()) {
+            return Finalized::failure(e, self.buffered);
+        }
+        Finalized::success((), self.buffered)
     }
 }
 
@@ -367,7 +313,6 @@ pub(crate) struct AuthenticateScramConsumer {
     binding: ScramChannelBinding,
     state: ScramState,
     expected_server_signature: Option<Vec<u8>>,
-    caps_seen: bool,
     buffered: Vec<UntaggedResponse>,
 }
 
@@ -394,7 +339,6 @@ impl AuthenticateScramConsumer {
                 ScramState::SendClientFirst
             },
             expected_server_signature: None,
-            caps_seen: false,
             buffered: Vec::new(),
         })
     }
@@ -443,7 +387,7 @@ impl AuthenticateScramConsumer {
 }
 
 impl Consumer for AuthenticateScramConsumer {
-    type Output = bool;
+    type Output = ();
 
     fn on_response(
         &mut self,
@@ -451,22 +395,14 @@ impl Consumer for AuthenticateScramConsumer {
         _notify_snapshot: NotifyFlags,
         _ctx: &ConsumerContext,
     ) {
-        if matches!(&resp, UntaggedResponse::Capability(_)) {
-            self.caps_seen = true;
-        }
         self.buffered.push(resp);
     }
 
-    fn finalize(
-        self: Box<Self>,
-        tagged: TaggedResponse,
-        _ctx: &ConsumerContext,
-    ) -> Finalized<bool> {
+    fn finalize(self: Box<Self>, tagged: TaggedResponse, _ctx: &ConsumerContext) -> Finalized<()> {
         // Surrender the `Either` buffer on every arm.
-        let tagged = match require_ok_auth(tagged, self.mechanism_name()) {
-            Ok(t) => t,
-            Err(e) => return Finalized::failure(e, self.buffered),
-        };
+        if let Err(e) = require_ok_auth(tagged, self.mechanism_name()) {
+            return Finalized::failure(e, self.buffered);
+        }
         if self.state != ScramState::Done {
             // Stays `Error::Protocol`, not a command failure: the driver reads
             // this class to decide the failure is connection-fatal before the
@@ -477,8 +413,7 @@ impl Consumer for AuthenticateScramConsumer {
                 self.buffered,
             );
         }
-        let caps_in_tagged = matches!(&tagged.code, Some(ResponseCode::Capability(_)));
-        Finalized::success(self.caps_seen || caps_in_tagged, self.buffered)
+        Finalized::success((), self.buffered)
     }
 }
 

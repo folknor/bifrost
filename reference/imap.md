@@ -70,7 +70,7 @@ Caller-written literals in SEARCH-family criteria are the one place literal synt
 
 Encoder refusals are the crate's own `Error` variants (`MissingCapability`, worded `<cmd> requires <cap>` for every capability gate; `InvalidInput`; `InvalidAppendDate`; ...), passed to the driver unchanged.
 
-**Session legality** is a property of the command: `CommandKind::legal_states` is the one table (RFC 3501 Section 6 and each extension's section; ID, CAPABILITY, NOOP and LOGOUT in every live state, LOGIN / AUTHENTICATE / STARTTLS in NotAuthenticated, ENABLE in Authenticated only, IDLE and the mailbox, APPEND, METADATA, NOTIFY, QUOTA, ACL, COMPRESS and UNAUTHENTICATE commands in Authenticated or Selected, message commands in Selected; no command in Logout). It is read twice, and the two reads report different facts. The handle reads it to refuse a command the caller should not have issued (`require_state(kind)`, `InvalidState`; `Pipeline::execute_raw` checks every command of a batch at execution and `idle()` checks IDLE). The driver reads it again when the command reaches the head of its queue (`prepare_command`, and `run_pipeline` for every command of a batch before any byte), and a refusal there means the session moved while the command waited: `StateChangedBeforeSend`, or `Closed` with `Unsent` in Logout. The driver's own internal commands (connection setup's CAPABILITY, the STARTTLS and COMPRESS upgrades and their post-upgrade CAPABILITY) run under the stated invariant that their admission follows from state the driver owns; the check still runs for them. Session HISTORY is read beside the table at both sites: RFC 5161 Section 3.1 forbids ENABLE once any mailbox has been selected in the session, even after CLOSE or UNSELECT returns it to Authenticated. `ProtocolState::mailbox_selected` records that a SELECT or EXAMINE has succeeded (a refused one selects nothing), the snapshot publishes it, and `CommandKind::refused_after_selection` names the commands it gates (ENABLE only): the handle refuses with `InvalidState`, the driver with `StateChangedBeforeSend`. UNAUTHENTICATE starts a new session and clears it (RFC 8437 Section 2).
+**Session legality** is a property of the command: `CommandKind::legal_states` is the one table (RFC 3501 Section 6 and each extension's section; ID, CAPABILITY, NOOP and LOGOUT in every live state, LOGIN / AUTHENTICATE / STARTTLS in NotAuthenticated, ENABLE in Authenticated only, IDLE and the mailbox, APPEND, METADATA, NOTIFY, QUOTA, ACL, COMPRESS and UNAUTHENTICATE commands in Authenticated or Selected, message commands in Selected; no command in Logout). It is read twice, and the two reads report different facts. The handle reads it to refuse a command the caller should not have issued (`require_state(kind)`, `InvalidState`; `Pipeline::execute_raw` checks every command of a batch at execution and `idle()` checks IDLE). The driver reads it again when the command reaches the head of its queue (`prepare_command`, and `run_pipeline` for every command of a batch before any byte), and a refusal there means the session moved while the command waited: `StateChangedBeforeSend`, or `Closed` with `Unsent` in Logout. The driver's own internal commands (connection setup's CAPABILITY, the STARTTLS and COMPRESS upgrades, and the CAPABILITY refresh after STARTTLS, LOGIN / AUTHENTICATE and UNAUTHENTICATE) run under the stated invariant that their admission follows from state the driver owns; the check still runs for them. Session HISTORY is read beside the table at both sites: RFC 5161 Section 3.1 forbids ENABLE once any mailbox has been selected in the session, even after CLOSE or UNSELECT returns it to Authenticated. `ProtocolState::mailbox_selected` records that a SELECT or EXAMINE has succeeded (a refused one selects nothing), the snapshot publishes it, and `CommandKind::refused_after_selection` names the commands it gates (ENABLE only): the handle refuses with `InvalidState`, the driver with `StateChangedBeforeSend`. UNAUTHENTICATE starts a new session and clears it (RFC 8437 Section 2).
 
 `run_one_command` is `prepare_command` then `run_prepared_command`. Preparation (legality, then encoding) writes nothing and arms nothing; only after it succeeds are the command's pending state effects armed (`in_auth`, `in_select`, `in_close`, `in_logout`, `in_unauthenticate`, the NOTIFY registration). A command refused before its first byte therefore cannot leave, say, a pending selection for the next command's tagged OK to complete. Every preparation refusal leaves the framing intact, and the driver loop does not apply `is_connection_fatal` to it.
 
@@ -630,10 +630,25 @@ an already authenticated cleartext session. The error maps to
 be met either when the capability is absent or when the greeting is PREAUTH.
 Its account-boundary diagnostic says the required STARTTLS upgrade is
 unavailable in this session, covering both cases. At runtime, `is_encrypted()` is
-updated when the TLS stream is installed. If the required post-upgrade
-CAPABILITY exchange fails, the driver retires the connection instead of
-returning a reusable half-upgraded session, while preserving the exchange's
-error for the caller.
+updated when the TLS stream is installed.
+
+**Session transitions own their capability refresh.** STARTTLS, a LOGIN or
+AUTHENTICATE that succeeds, and an UNAUTHENTICATE that succeeds each owe a
+CAPABILITY refresh, and the driver runs it inside the same claimed command
+(`required_capability_refresh` in `driver/upgrade.rs`) before it publishes the
+snapshot or answers. No other command is encoded against the pre-transition
+capability set, and the refresh has no admission of its own: it cannot be
+withdrawn, dropped unclaimed or refused at admission while the transition
+stands committed, and a caller that leaves during it left a claimed command
+(`InFlight`, connection abandoned). LOGIN / AUTHENTICATE / UNAUTHENTICATE skip
+the refresh only when their own tagged OK carries `[CAPABILITY ...]`
+(`ProtocolState::take_transition`); a capability list seen earlier in the
+exchange does not count, since it can precede the credentials. Any refresh
+failure retires the connection - the session is marked Logout and the command
+channel closes before the answer, so the caller never holds a reusable
+half-transitioned session - while the refresh's own error is returned
+unchanged. Its evidence describes the refresh, not the transition; the only
+recovery open is a fresh connection, which is safe whatever this one reached.
 
 ## Sync helpers
 

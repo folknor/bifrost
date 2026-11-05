@@ -355,11 +355,10 @@ impl ImapConnection {
             pass: pass.to_owned().into(),
         };
 
-        let caps_provided = self
-            .submit_regular(cmd, LoginConsumer::default(), Some(deadline))
-            .await?;
-
-        self.complete_auth(caps_provided, deadline).await
+        // The driver completes the post-authentication CAPABILITY refresh
+        // inside the same claimed command (`required_capability_refresh`).
+        self.submit_regular(cmd, LoginConsumer::default(), Some(deadline))
+            .await
     }
 
     /// Authenticate with SASL PLAIN mechanism (RFC 4616).
@@ -426,11 +425,8 @@ impl ImapConnection {
 
         let consumer = AuthenticatePlainConsumer::new(encoded, has_sasl_ir);
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided = self
-            .submit_with_continuations(cmd, consumer, Some(deadline))
-            .await?;
-
-        self.complete_auth(caps_provided, deadline).await
+        self.submit_with_continuations(cmd, consumer, Some(deadline))
+            .await
     }
 
     /// Authenticate with XOAUTH2 SASL mechanism (Google-defined, not an
@@ -490,11 +486,8 @@ impl ImapConnection {
             crate::types::AuthMechanism::XOAuth2.name(),
         );
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided = self
-            .submit_with_continuations(cmd, consumer, Some(deadline))
-            .await?;
-
-        self.complete_auth(caps_provided, deadline).await
+        self.submit_with_continuations(cmd, consumer, Some(deadline))
+            .await
     }
 
     /// Authenticate with SASL OAUTHBEARER (RFC 7628).
@@ -565,11 +558,8 @@ impl ImapConnection {
             crate::types::AuthMechanism::OAuthBearer.name(),
         );
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided = self
-            .submit_with_continuations(cmd, consumer, Some(deadline))
-            .await?;
-
-        self.complete_auth(caps_provided, deadline).await
+        self.submit_with_continuations(cmd, consumer, Some(deadline))
+            .await
     }
 
     /// Authenticate with SASL CRAM-MD5.
@@ -601,11 +591,8 @@ impl ImapConnection {
 
         let consumer = AuthenticateCramMd5Consumer::new(user.to_owned(), pass.to_owned().into());
         let deadline = tokio::time::Instant::now() + timeout;
-        let caps_provided = self
-            .submit_with_continuations(cmd, consumer, Some(deadline))
-            .await?;
-
-        self.complete_auth(caps_provided, deadline).await
+        self.submit_with_continuations(cmd, consumer, Some(deadline))
+            .await
     }
 
     /// Authenticate with SASL SCRAM-SHA-1 (RFC 5802).
@@ -723,11 +710,8 @@ impl ImapConnection {
             initial_response,
         };
 
-        let caps_provided = self
-            .submit_with_continuations(cmd, consumer, Some(deadline))
-            .await?;
-
-        self.complete_auth(caps_provided, deadline).await
+        self.submit_with_continuations(cmd, consumer, Some(deadline))
+            .await
     }
 
     /// Resolve the `tls-server-end-point` channel binding for the live
@@ -761,32 +745,6 @@ impl ImapConnection {
         scram_binding_from_der(der.as_deref())
     }
 
-    /// Finalize authentication: refresh capabilities if the server did
-    /// not provide them inline.
-    ///
-    /// State transition to `Authenticated` is handled by the driver task
-    /// via the `in_auth` flag in `ProtocolState::apply_tagged`  -  the
-    /// driver sets `in_auth` when it sees `Command::Login` or
-    /// `Command::Authenticate`, and `apply_tagged` transitions on tagged
-    /// OK (RFC 3501 Section6.2.2, Section6.2.3).
-    ///
-    /// If the server did not include updated capabilities in its response,
-    /// issue an explicit CAPABILITY command (RFC 3501 Section6.2.2 / Section6.2.3).
-    async fn complete_auth(
-        &self,
-        caps_provided: bool,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), Error> {
-        if !caps_provided {
-            // Send CAPABILITY via the driver. apply_side_effects inside
-            // the driver updates the cached capabilities automatically
-            // when it processes the untagged CAPABILITY or tagged
-            // [CAPABILITY] response code (RFC 3501 Section7.2.1).
-            self.fetch_capabilities_via_driver(deadline).await?;
-        }
-        Ok(())
-    }
-
     fn require_auth_mechanism(&self, mechanism: &str) -> Result<(), Error> {
         let snap = self.state_rx.borrow();
         if let Some(refusal) =
@@ -803,30 +761,6 @@ impl ImapConnection {
         Ok(())
     }
 
-    /// Send CAPABILITY via the driver task and wait for completion, bounded
-    /// by the caller's operation `deadline` (an authentication or
-    /// UNAUTHENTICATE that already spent part of it). A deadline already gone
-    /// submits nothing and is `Timeout` / `Unsent`.
-    ///
-    /// The driver's `apply_side_effects` updates the cached capability set
-    /// automatically. The consumer output is ignored  -  the canonical state
-    /// lives in `ProtocolState` inside the driver.
-    async fn fetch_capabilities_via_driver(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), Error> {
-        use super::dispatch::CapabilityConsumer;
-
-        let _caps: Vec<Capability> = self
-            .submit_regular(
-                Command::Capability,
-                CapabilityConsumer::default(),
-                Some(deadline),
-            )
-            .await?;
-        Ok(())
-    }
-
     /// UNAUTHENTICATE  -  reset to unauthenticated state (RFC 8437 Section 2).
     ///
     /// Resets the IMAP session to Not Authenticated without closing the
@@ -836,10 +770,13 @@ impl ImapConnection {
     /// Clears all per-user state: selected mailbox, NOTIFY registrations,
     /// and ENABLE'd extensions. The TLS layer remains intact.
     ///
-    /// After unauthentication, issues an explicit CAPABILITY command to
-    /// refresh the cached capabilities, since the server's advertised
-    /// capabilities may differ between authenticated and unauthenticated
-    /// states (RFC 8437 Section 2).
+    /// Unless the tagged OK carries `[CAPABILITY ...]`, the driver issues an
+    /// explicit CAPABILITY inside the same claimed command, since the
+    /// advertised capabilities may differ between authenticated and
+    /// unauthenticated states (RFC 8437 Section 2). No other command runs
+    /// between the two. If that refresh fails, the connection is retired:
+    /// the session has already been reset, and a reset session with the old
+    /// capability set is not handed back as reusable.
     ///
     /// # Stale events
     ///
@@ -872,11 +809,6 @@ impl ImapConnection {
             Some(deadline),
         )
         .await?;
-
-        // RFC 8437 Section2: capabilities may change after unauthentication.
-        // Unconditional refresh  -  the server SHOULD send caps but is not
-        // required to.
-        self.fetch_capabilities_via_driver(deadline).await?;
 
         Ok(())
     }

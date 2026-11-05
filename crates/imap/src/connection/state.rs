@@ -88,6 +88,22 @@ pub(crate) struct ProtocolState {
     /// Consulted by `apply_tagged` to transition to `NotAuthenticated`
     /// on tagged OK (RFC 8437 Section2).
     in_unauthenticate: bool,
+    /// Set when a tagged OK completed a LOGIN / AUTHENTICATE or
+    /// UNAUTHENTICATE transition; taken by the driver, which owes that
+    /// transition its capability refresh before it answers.
+    transition: Option<SessionTransition>,
+}
+
+/// A session transition that a tagged OK just completed.
+///
+/// `capabilities_supplied` is `true` only when that same tagged OK carried a
+/// `[CAPABILITY ...]` code (RFC 3501 Section 6.2.2). A capability list seen
+/// earlier in the exchange does not count: an untagged CAPABILITY can arrive
+/// before the credentials do, and describes the session before the
+/// transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::connection) struct SessionTransition {
+    pub(in crate::connection) capabilities_supplied: bool,
 }
 
 impl ProtocolState {
@@ -106,7 +122,13 @@ impl ProtocolState {
             in_close: false,
             in_notify_set: None,
             in_unauthenticate: false,
+            transition: None,
         }
+    }
+
+    /// Take the transition the last tagged OK completed, if any.
+    pub(in crate::connection) fn take_transition(&mut self) -> Option<SessionTransition> {
+        self.transition.take()
     }
 
     // -- Read-only getters --
@@ -426,9 +448,13 @@ impl ProtocolState {
 
         // RFC 3501 Section6.2.2, Section6.2.3: tagged OK for LOGIN or AUTHENTICATE
         // confirms authentication succeeded. Transition to Authenticated.
+        let capabilities_supplied = matches!(t.code, Some(ResponseCode::Capability(_)));
         if self.in_auth && t.status == crate::types::response::StatusKind::Ok {
             self.state = SessionState::Authenticated;
             self.in_auth = false;
+            self.transition = Some(SessionTransition {
+                capabilities_supplied,
+            });
         } else if self.in_auth {
             // Auth failed (NO/BAD)  -  clear the flag without transitioning.
             self.in_auth = false;
@@ -475,6 +501,9 @@ impl ProtocolState {
             // stale flags after the session has been reset.
             self.in_notify_set = None;
             self.in_unauthenticate = false;
+            self.transition = Some(SessionTransition {
+                capabilities_supplied,
+            });
         } else if self.in_unauthenticate {
             // NO/BAD  -  clear flag, no state change.
             self.in_unauthenticate = false;

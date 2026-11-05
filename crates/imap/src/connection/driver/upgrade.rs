@@ -152,6 +152,33 @@ pub(in crate::connection) async fn run_starttls_upgrade(
 
     // Step 6: Re-read capabilities after TLS upgrade (RFC 3501 Section6.2.1).
     state.apply_capability_fetch(Vec::new());
+    required_capability_refresh(wire_reader, state, tag_gen, event_sink).await?;
+
+    debug!("STARTTLS upgrade complete (RFC 3501 Section 6.2.1)");
+    Ok(())
+}
+
+/// The CAPABILITY refresh a committed session transition owes before the
+/// driver answers: after STARTTLS installs the TLS stream (RFC 3501 Section
+/// 6.2.1), and after a LOGIN / AUTHENTICATE or UNAUTHENTICATE whose tagged
+/// OK carried no capabilities (RFC 3501 Section 6.2.2, RFC 8437 Section 2).
+///
+/// It runs inside the arm that claimed the transition, so no other command
+/// is encoded against the pre-transition capability set, and it cannot be
+/// withdrawn, dropped unclaimed or refused at admission on its own: a caller
+/// that leaves meanwhile left a claimed command, `InFlight`.
+///
+/// Every failure retires the connection. The transition already committed,
+/// so a reusable session with the stale capability set would be a
+/// half-transitioned one. The refresh's own error is returned unchanged: its
+/// evidence describes the refresh, and the only recovery open to the caller
+/// is a fresh connection, which is safe whatever this one reached.
+pub(super) async fn required_capability_refresh(
+    wire_reader: &mut super::super::wire::WireReader,
+    state: &mut super::super::state::ProtocolState,
+    tag_gen: &mut super::super::tag::TagGenerator,
+    event_sink: &mut event_sink::DriverEventSink,
+) -> Result<(), Error> {
     let cap_consumer =
         DriverConsumer::Regular(Box::new(CapabilityConsumer::default()) as Box<dyn ConsumerErased>);
     let result = super::run_one_command(
@@ -163,33 +190,27 @@ pub(in crate::connection) async fn run_starttls_upgrade(
         cap_consumer,
     )
     .await
-    .map_err(|error| post_starttls_capability_failure(state, error))?;
+    .map_err(|error| retire_after_failed_refresh(state, error))?;
     let caps = result.downcast::<Vec<Capability>>().map_err(|_| {
-        // After the TLS swap and a completed post-TLS CAPABILITY: the
-        // driver's view of this connection cannot be trusted, so it
-        // retires rather than returning to the pool.
-        Error::internal_mid_exchange(
-            "CapabilityConsumer output downcast failed after STARTTLS",
-            bifrost_types::TransmissionState::Acknowledged,
+        retire_after_failed_refresh(
+            state,
+            Error::internal_mid_exchange(
+                "CapabilityConsumer output downcast failed after a session transition",
+                bifrost_types::TransmissionState::Acknowledged,
+            ),
         )
     })?;
     state.apply_capability_fetch(*caps);
-
-    debug!("STARTTLS upgrade complete (RFC 3501 Section 6.2.1)");
     Ok(())
 }
 
-/// Once STARTTLS has installed a new stream, returning a reusable connection
-/// without the required post-upgrade CAPABILITY result would leave callers
-/// with a half-upgraded session. Preserve existing fatal errors, and make a
-/// completed server refusal or other non-fatal refresh error retire the stream.
-fn post_starttls_capability_failure(
+/// Preserve the refresh's error, but mark the session dead so the driver
+/// retires it even when that error (such as a tagged NO) is normally
+/// reusable.
+fn retire_after_failed_refresh(
     state: &mut super::super::state::ProtocolState,
     error: Error,
 ) -> Error {
-    // The TLS stream has replaced the cleartext stream. Preserve the actual
-    // response error, but mark the session dead so the driver retires it even
-    // when that response (such as a tagged NO) is normally reusable.
     state.apply_infrastructure_failure();
     error
 }
@@ -347,7 +368,7 @@ mod bandwidth_review_tests {
     use tokio::time::{Duration, Instant};
 
     #[test]
-    fn nonfatal_post_starttls_capability_refusal_retires_the_connection() {
+    fn nonfatal_required_refresh_refusal_retires_the_connection() {
         let mut state = ProtocolState::new();
         let error = Error::No {
             text: "CAPABILITY refused".into(),
@@ -357,16 +378,16 @@ mod bandwidth_review_tests {
             )),
         };
 
-        let error = post_starttls_capability_failure(&mut state, error);
+        let error = retire_after_failed_refresh(&mut state, error);
         assert!(matches!(error, Error::No { text, .. } if text == "CAPABILITY refused"));
         assert_eq!(state.session_state(), SessionState::Logout);
     }
 
     #[test]
-    fn fatal_post_starttls_error_keeps_its_original_class() {
+    fn fatal_required_refresh_error_keeps_its_original_class() {
         let mut state = ProtocolState::new();
         let error = Error::Protocol("malformed post-upgrade response".into());
-        let result = post_starttls_capability_failure(&mut state, error);
+        let result = retire_after_failed_refresh(&mut state, error);
         assert!(
             matches!(result, Error::Protocol(message) if message == "malformed post-upgrade response")
         );

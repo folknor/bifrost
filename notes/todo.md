@@ -279,11 +279,12 @@ Narrow edge cases, audits with no known defect, and design work.
   traced: whether its scheduler admission permit or any activity guard is still
   held at that await. If either is, it has the pause cycle the bulk campaign
   sends had (serial listener parked in `wait_until_running`, full channel).
-- **IMAP connection transition partial completion.** Inspect `complete_auth`
-  and `unauthenticate` (including disposition after failed required
-  CAPABILITY), and `run_starttls_upgrade` for earlier committed transitions
-  followed by a later failure. Include later steps withdrawn while queued,
-  dropped unclaimed by a dying driver, and already expired at admission.
+- **IMAP connect-time STARTTLS expiry carries no evidence.** `setup_timeout`
+  in `crates/imap/src/connection/lifecycle.rs` maps every connect-time expiry
+  to `Error::Timeout { attempt: None }`, including one after the STARTTLS
+  tagged OK or the stream swap. Harmless today (the half-built session is
+  dropped before a driver exists and the only recovery is a fresh dial), but
+  it is the one transition path whose error states no phase.
 - **IMAP bandwidth admission after claim.** `send_wire_command` waits for
   `BandwidthBudget` after driver claim but before the socket write. Caller
   expiry there conservatively reads `InFlight`. Withdrawal through that window
