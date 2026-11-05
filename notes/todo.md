@@ -36,14 +36,6 @@ not verified against the code. Verification happens when an item is worked.
 Items that leak something or report success for something that did not
 happen, plus one surface gap that matters if the consumer relies on it.
 
-- **Upload session URLs can reach support exports.** bifrost-net's
-  `send_error_to_error` builds `Error::Network { message }` from reqwest's
-  Display, which names the request URL, and `support_cause_from_source` keeps
-  that message as support-only text. For the Graph and Google chunk PUTs the
-  URL is the pre-authenticated session credential, and the chunk-PUT error is
-  the failure leaf. The session cancel DELETE already passes through
-  `bifrost_net::Error::redact_request_text` at both cancel sites; the chunk PUT
-  still needs URL scrubbing at the net boundary or the upload call sites.
 - **Graph mixed flag operations silently discard unmodeled tokens while
   reporting Applied** (`patch_for_flags` and `flag_op_is_unexpressible`). The
   consumer believes a keyword is set that is not, and nothing corrects it. The

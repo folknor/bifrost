@@ -1248,9 +1248,12 @@ impl GraphClient {
             // one would send the chunk (and a URL that is itself the
             // credential's destination) somewhere never admitted, over plain
             // http included. Graph's upload flow does not redirect, so a 3xx
-            // comes back to the caller as the response it is.
+            // comes back to the caller as the response it is. The URL is the
+            // session credential, and the HTTP stack's error text names it,
+            // so every error of the request comes back redacted.
             builder = builder
                 .without_bearer_auth()
+                .credential_url()
                 .follow_redirects(bifrost_net::FollowRedirects::Disabled);
         }
         if let Some(timeout) = timeout {

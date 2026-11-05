@@ -192,9 +192,11 @@ Internal modules:
   failed webViewLink GET has an effectless primary and a committed permission.
   These effects are Repeatable relative to hosting: replay may leave expiring
   sessions or unlinked files, so recovery follows the failed leg. No session URL
-  enters scopes, and a failed cancel passes through
-  `bifrost_net::Error::redact_request_text` before it becomes the compensation,
-  so the transport's error text cannot carry the URL into an export. A successful session status without a usable
+  enters scopes, and the chunk PUT and the cancel are both sent
+  `credential_url()`, so their failures pass through
+  `bifrost_net::Error::redact_request_text` inside the transport and the
+  transport's error text cannot carry the URL into an export, neither as the
+  primary error nor as the compensation. A successful session status without a usable
   Location raises application to Uncertain, because the session may exist.
   Dropping the future cannot await cancellation and spawns no detached cleanup.
 - `error.rs` - translation boundary from `crate::Error` to

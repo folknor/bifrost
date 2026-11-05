@@ -176,7 +176,15 @@ the request URL (`Network`, `Tls`, `InvalidRequest` and the redirect messages,
 recursively through attempt history and local holds) with fixed text and drops
 boxed foreign sources, keeping variants, transmission states and response
 evidence, so the error classifies unchanged. It exists for requests whose URL
-is a credential, such as an upload session cancel.
+is a credential, such as a pre-authenticated upload session. A caller declares
+such a request with `RequestBuilder::credential_url()`, and the transport then
+applies the redaction itself: to every error `send` returns, body buffering
+included, and to every error `send_streaming` returns or its body stream
+yields, after earlier-attempt evidence is attached. The guarantee covers
+transport-generated request text only; server response bodies and headers are
+evidence and are kept, so a server that echoes the URL is not scrubbed. The
+flag is separate from `without_bearer_auth()` on purpose: Basic-auth requests
+to ordinary URLs are bearer-less too, and keep their URL in diagnostics.
 
 When history carries a possible commit on a non-replayable request, translation
 narrows idempotency and uses

@@ -408,9 +408,28 @@ struct RequestBuilderInner {
     hold_gate: Option<String>,
     error_observer: Option<ErrorObserver>,
     redirect_guard: Option<RedirectGuard>,
+    /// The request URL is itself a credential: every error this request
+    /// returns passes through [`Error::redact_request_text`].
+    credential_url: bool,
 }
 
 impl RequestBuilder {
+    /// Declare that the request URL is itself a credential (a
+    /// pre-authenticated upload session URL). Every error `send` returns,
+    /// and every error `send_streaming` returns or yields from its body,
+    /// then passes through [`Error::redact_request_text`], so the HTTP
+    /// stack's error text, which names the URL, never reaches the error
+    /// and from there support diagnostics. Classification is unchanged.
+    ///
+    /// The guarantee covers transport-generated request text only.
+    /// Server-supplied response bodies and headers are kept as evidence;
+    /// a server that echoes the URL back is not scrubbed.
+    #[must_use]
+    pub fn credential_url(mut self) -> Self {
+        self.inner.credential_url = true;
+        self
+    }
+
     /// Reject a followed redirect unless the guard accepts its source and
     /// resolved target URL. Runs before draining the redirect or admitting
     /// the target hop; pass-through responses do not invoke it.
@@ -466,6 +485,7 @@ impl RequestBuilder {
                 hold_gate: None,
                 error_observer: None,
                 redirect_guard: None,
+                credential_url: false,
             },
         }
     }
@@ -691,6 +711,18 @@ impl RequestBuilder {
     /// Drive the request to completion with the configured retry
     /// budget, returning the buffered response.
     pub async fn send(self) -> Result<Response, Error> {
+        // Wraps the whole request, body buffering included, so no `?` on
+        // any path returns an unredacted error.
+        if self.inner.credential_url {
+            self.send_buffered()
+                .await
+                .map_err(Error::redact_request_text)
+        } else {
+            self.send_buffered().await
+        }
+    }
+
+    async fn send_buffered(self) -> Result<Response, Error> {
         let limit = self.inner.account.max_buffered_response();
         let internal = send_streaming_inner(self).await?;
         // Held until the body is drained: this function returning, by any
@@ -739,7 +771,14 @@ impl RequestBuilder {
     /// as a `ByteStream` rather than buffering. Used for blob
     /// download endpoints.
     pub async fn send_streaming(self) -> Result<StreamingResponse, Error> {
-        let internal = send_streaming_inner(self).await?;
+        let credential_url = self.inner.credential_url;
+        let internal = send_streaming_inner(self).await.map_err(|error| {
+            if credential_url {
+                error.redact_request_text()
+            } else {
+                error
+            }
+        })?;
         // Caller-facing streaming response wraps the body in the
         // bandwidth meter + cap adapter.
         let metered = wrap_metered(
@@ -748,10 +787,17 @@ impl RequestBuilder {
             internal.deadline,
             internal.bytes_in.clone(),
         );
+        // Redacted after `wrap_stream`, which attaches the earlier attempts'
+        // evidence to a body error, so that history is redacted too.
+        let mut body = internal.evidence.wrap_stream(metered);
+        if credential_url {
+            use futures::TryStreamExt;
+            body = Box::pin(body.map_err(Error::redact_request_text));
+        }
         Ok(StreamingResponse {
             status: internal.status,
             headers: internal.headers,
-            body: hold_permit(internal.evidence.wrap_stream(metered), internal.permit),
+            body: hold_permit(body, internal.permit),
             bytes_in: internal.bytes_in,
             bytes_out: internal.bytes_out,
         })
@@ -1031,6 +1077,8 @@ pub(crate) async fn send_streaming_inner(
         hold_gate,
         error_observer,
         redirect_guard,
+        // Applied by `send` and `send_streaming` around this function.
+        credential_url: _,
     } = builder.inner;
 
     // Surface any deferred error from a fluent setter (e.g. `json()`
@@ -2133,6 +2181,52 @@ mod tests {
             initial_backoff: Duration::ZERO,
             max_backoff: Duration::ZERO,
             ..RetryPolicy::default()
+        }
+    }
+
+    /// A request declared `credential_url` returns no error text naming its
+    /// URL, on either send path and through the earlier attempts it carries,
+    /// while the error still classifies as the transport failure it was. An
+    /// undeclared request keeps the transport's text, URL included.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_credential_url_request_withholds_the_url_from_its_errors() {
+        const URL: &str = "https://upload.test/session/abc?token=preauth";
+        let failure = || {
+            Canned::Error(Error::Network {
+                message: format!("error sending request for url ({URL})"),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            })
+        };
+        for (credential, streaming) in [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let script = ScriptedDispatch::new([failure(), failure()]);
+            let account =
+                scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+            let mut request = account
+                .put(URL)
+                .without_bearer_auth()
+                .replay(ReplayPolicy::Idempotent)
+                .body(Bytes::from_static(b"chunk"));
+            if credential {
+                request = request.credential_url();
+            }
+            let error = if streaming {
+                request.send_streaming().await.map(|_| ()).unwrap_err()
+            } else {
+                request.send().await.map(|_| ()).unwrap_err()
+            };
+            assert_eq!(script.requests().len(), 2, "both attempts went out");
+            assert!(
+                matches!(error.terminal(), Error::Network { .. }),
+                "{error:?}"
+            );
+            let rendered = format!("{error:?} {error}");
+            assert_eq!(
+                rendered.contains("upload.test"),
+                !credential,
+                "credential {credential}, streaming {streaming}: {rendered}"
+            );
         }
     }
 

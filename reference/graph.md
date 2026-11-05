@@ -212,9 +212,10 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
   (`SESSION_CANCEL_TIMEOUT`), separate from the upload budget because the upload
   may have failed exactly because that budget ran out: one anonymous `DELETE`
   on the admitted URL, retaining its typed compensation outcome without
-  replacing the upload's own error (a failure first passes through
-  `bifrost_net::Error::redact_request_text`, since the transport's error text
-  names the URL and the compensation reaches exports; an unfollowed 3xx on the
+  replacing the upload's own error (every `AuxTarget::Anonymous` request is
+  sent `credential_url()`, so a failed chunk PUT and a failed cancel both come
+  back through `bifrost_net::Error::redact_request_text`, since the
+  transport's error text names the URL and both reach exports; an unfollowed 3xx on the
   cancel is a `Failed` compensation, `Protocol(ContractViolation)` naming the
   status and never the `Location`, not a cancelled session), skipped once the
   account has shut down and abandoned if shutdown fires mid-cancel, and not

@@ -435,6 +435,7 @@ async fn cancel_upload_session(
         .account_net()
         .delete(upload_url)
         .without_bearer_auth()
+        .credential_url()
         .follow_redirects(bifrost_net::FollowRedirects::Disabled)
         .retry(bifrost_net::RetryPolicy::disabled())
         .timeout(GDRIVE_CANCEL_TIMEOUT);
@@ -460,24 +461,9 @@ async fn cancel_upload_session(
         {
             Ok(())
         }
-        Err(error) => Err(Some(without_session_url(error))),
-    }
-}
-
-/// `error` with the transport text that can quote the request URL withheld
-/// (`bifrost_net::Error::redact_request_text`), classifying as before. A
-/// failed cancel is kept as the record's compensation, which reaches support
-/// exports, and the transport's error text names the session URI, which is
-/// the upload credential.
-fn without_session_url(error: Error) -> Error {
-    match error {
-        Error::Net(net) => Error::Net(net.redact_request_text()),
-        Error::ObservedNet(mut observed) => {
-            let net = std::mem::replace(&mut observed.error, bifrost_net::Error::Cancelled);
-            observed.error = net.redact_request_text();
-            Error::ObservedNet(observed)
-        }
-        other => other,
+        // Already redacted (`credential_url`): a failed cancel is kept as the
+        // record's compensation, which reaches support exports.
+        Err(error) => Err(Some(error)),
     }
 }
 
@@ -632,11 +618,14 @@ async fn upload_file_chunked_progress(
         // Redirects are never followed: the session URI is pre-authenticated
         // and admitted only as itself, so a hop would carry the payload
         // somewhere nobody admitted. Drive's `308 Resume Incomplete` carries
-        // no `Location` and still arrives here as a plain response.
+        // no `Location` and still arrives here as a plain response. The URI
+        // is the upload credential and the HTTP stack's error text names it,
+        // so the request's errors come back redacted (`credential_url`).
         let request = client
             .account_net()
             .put(upload_url)
             .without_bearer_auth()
+            .credential_url()
             .follow_redirects(bifrost_net::FollowRedirects::Disabled)
             .header("Content-Range", &content_range)
             .body(chunk);
@@ -1296,6 +1285,47 @@ mod tests {
             ),
             "a session that was cancelled must not be reported as abandoned"
         );
+    }
+
+    /// The failed chunk PUT is the upload's own error, and the HTTP stack's
+    /// text for it names the session URI, which is the upload credential.
+    /// It is withheld from every export of the error.
+    #[tokio::test]
+    async fn a_failed_chunk_put_does_not_carry_the_session_uri() {
+        let script = ScriptedDispatch::new([
+            session_created(),
+            Canned::Error(bifrost_net::Error::Network {
+                message: "error sending request for url \
+                          (https://www.googleapis.com/upload/drive/v3/files/session/abc)"
+                    .to_owned(),
+                transmission_state: bifrost_types::TransmissionState::InFlight,
+                source: None,
+            }),
+            Canned::Response {
+                status: reqwest::StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                body: Bytes::new(),
+            },
+        ]);
+        let client = scripted_client(&script);
+
+        let error = run(
+            &client,
+            "user@example.com",
+            Bytes::from_static(b"payload"),
+            upload_meta(),
+        )
+        .await
+        .expect_err("a dropped chunk PUT fails the upload");
+
+        assert_eq!(script.remaining(), 0, "the session was cancelled");
+        for export in [
+            format!("{error:?}"),
+            format!("{:?}", error.support_internal()),
+            format!("{:?}", error.support_consented()),
+        ] {
+            assert!(!export.contains("session/abc"), "{export}");
+        }
     }
 
     /// The cancel is best-effort. When it fails too, the original error is

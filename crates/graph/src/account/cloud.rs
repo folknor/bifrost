@@ -224,9 +224,9 @@ const SESSION_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// unfollowed 3xx is a contract violation with `Acknowledged` evidence, so a
 /// `Failed` compensation, never `Succeeded`.
 ///
-/// A failure comes back through [`without_session_url`]: it is kept as the
-/// record's compensation outcome, which reaches support exports, and the
-/// transport's error text names the session URL, which is the credential.
+/// A failure is kept as the record's compensation outcome, which reaches
+/// support exports; it arrives already redacted, because `execute_aux`
+/// marks every `AuxTarget::Anonymous` request `credential_url`.
 async fn cancel_upload_session(
     client: &GraphClient,
     upload_url: &UploadUrl,
@@ -263,21 +263,8 @@ async fn cancel_upload_session(
             response.status
         ))),
         Ok(_) => Ok(()),
-        Err(error) => Err(without_session_url(error)),
+        Err(error) => Err(error),
     })
-}
-
-/// `error` with the transport text that can quote the request URL withheld
-/// (`bifrost_net::Error::redact_request_text`), classifying as before.
-fn without_session_url(error: GraphError) -> GraphError {
-    match error {
-        GraphError::Net(net) => GraphError::Net(net.redact_request_text()),
-        GraphError::MailboxThrottled { budget, source } => GraphError::MailboxThrottled {
-            budget,
-            source: Box::new(without_session_url(*source)),
-        },
-        other => other,
-    }
 }
 
 /// Overall wall-clock budget for the whole chunked upload. A server that
@@ -1624,6 +1611,55 @@ mod tests {
             format!("{error:?}"),
             format!("{:?}", error.support_internal()),
             format!("{:?}", cancel.support_internal()),
+        ] {
+            assert!(!export.contains("upload.example"), "{export}");
+        }
+    }
+
+    /// The failed chunk PUT is the upload's own error, the leaf every export
+    /// of the failure renders, and the transport's text for it names the
+    /// session URL just as the cancel's does. It is withheld there too.
+    #[tokio::test]
+    async fn a_failed_chunk_put_does_not_carry_the_session_url() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "uploadUrl": SESSION_URL, "expirationDateTime": "2099-01-01T00:00:00Z" }),
+        )]);
+        client.script_wire(
+            [bifrost_net::test_support::Canned::Error(
+                bifrost_net::Error::Network {
+                    message: format!("error sending request for url ({SESSION_URL})"),
+                    transmission_state: TransmissionState::Unsent,
+                    source: None,
+                },
+            )],
+            bifrost_net::RetryPolicy::disabled(),
+        );
+        client.script_aux([ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT)]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let payload = Bytes::from_static(b"0123456789AB");
+        let error = host_attachment(
+            account,
+            payload.clone(),
+            CloudUploadMeta::new(
+                "a.txt",
+                "text/plain",
+                payload.len() as u64,
+                ShareScope::Organization,
+            ),
+        )
+        .await
+        .expect_err("the upload fails");
+        assert_cancelled_once(&client, 1);
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network)
+        );
+        for export in [
+            format!("{error:?}"),
+            format!("{:?}", error.support_internal()),
+            format!("{:?}", error.support_consented()),
         ] {
             assert!(!export.contains("upload.example"), "{export}");
         }
