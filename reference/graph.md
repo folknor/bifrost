@@ -1479,9 +1479,10 @@ projections degrade to `Metadata` for the same reason the REST arm does -
 The EWS `FlagsOnly` observation carries only `\seen`, and the EWS parser
 defaults `is_read` to `false` when `IsRead` is missing. That is a recorded
 exception to the `get_stream` contract that a `FlagsOnly` success is the
-object's whole flag state. It is harmless for reassertion: the mutation door
-does not route public-folder items to EWS, so they never reach a reassertable
-outcome, and the flag judge refuses any token other than `\seen` on them.
+object's whole flag state. It is harmless for reassertion: every mutation door
+refuses public-folder items locally as `Unsupported` (see the flag-write
+section), so they never reach a reassertable outcome, and the flag judge
+refuses any token other than `\seen` on them.
 
 Attachment bytes route through `open_blob`: the blob locator carries the
 folder-qualified message id, so `GraphBlobKind::Ews` fetches via SOAP
@@ -1876,6 +1877,30 @@ tokens sorted, never `Applied`, and the chunk's events open with one
 `StrategyDowngraded` warning. 412, failed and uncertain outcomes are
 unchanged, and the etag cache still consumes the acknowledged response. This
 matches Gmail's partial-flag lane.
+
+Public-folder items are write-refused. Their ids wrap a raw EWS `ItemId` no
+Graph REST route can address, and this crate has no EWS write arm (the EWS
+client is read-only). Sent down the primary `/me/messages/{itemId}` path, as
+it used to be, the etag GET answered `ErrorItemNotFound` (SetFlags and Move
+reported `NotFound(Message)`, a false "the item is gone"), and Destroy's
+`permanentDelete` 404 was filed `Succeeded(Skipped)`, a false "already
+deleted". So `submit_batch_with_version` partitions every public-folder id
+(`ews_read_folder` is `Some`) out of the chunk before the etag cache or a
+caller version is consulted, files each one
+`Failed(Unsupported(operation))` scoped to the message, and sends the
+siblings normally. A `Move` whose destination is a discovered public folder
+(`is_known_public_folder`: present in `routing_map` or `public_folder_meta`;
+a public folder id is a bare EWS `FolderId` that `parse_folder` reads as
+primary) refuses every id of the chunk the same way. An undiscovered bare
+destination id cannot be classified locally and is left to the server. The
+typed pim writers apply the same rule through `refuse_public_write`, called
+from `resolve_target_ids`, `resolve_target_values`, `move_messages` and the
+REST URL builder `message_batch_url`, so the tolerated-404 extended-property
+clear cannot report success on one either; `add_to_container` and
+`move_messages` refuse a discovered public destination, the former before
+thread expansion. `ContainerRights` on a public
+folder still project the server's EWS `EffectiveRights`: they state what the
+principal is permitted, not what this client implements.
 `bulk_move` requires `MembershipScope::Folder` (else fatal pre-request).
 `IdempotencyKey` is accepted but not sent (`MutationReplaySafety::None`).
 

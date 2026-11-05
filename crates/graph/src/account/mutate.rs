@@ -248,6 +248,39 @@ async fn submit_batch_with_version(
         })]);
     }
 
+    // A public-folder item is a raw EWS `ItemId` (or the destination is a
+    // discovered public folder), and no Graph REST route can address it:
+    // `/me/messages/{itemId}` answers `ErrorItemNotFound`, which SetFlags and
+    // Move would report as `NotFound(Message)` and Destroy as `Skipped`,
+    // both false claims that the item is gone. This crate has no EWS write
+    // arm, so each such id is refused locally, per item, before the etag
+    // cache or a caller version can authorize the wrong endpoint. Siblings
+    // of the chunk still go to `$batch`.
+    let destination_is_public = match kind {
+        MutationKind::Move(destination) => match folder_destination(destination.clone()) {
+            Some(folder) => account.is_known_public_folder(&folder).await,
+            None => false,
+        },
+        _ => false,
+    };
+    let (supported, refused): (Vec<ObjectId>, Vec<ObjectId>) = ids
+        .iter()
+        .cloned()
+        .partition(|id| !destination_is_public && super::pim::ews_read_folder(id).is_none());
+    let refused_outcomes: Vec<ItemOutcome<MutationSuccess>> = refused
+        .into_iter()
+        .map(|id| {
+            ItemOutcome::Failed(BatchFailure::new(
+                BatchItemId(id.0.clone()),
+                super::graph_error::unsupported_item_error(
+                    operation_for_kind(kind),
+                    ErrorScope::Message { id: id.0.into() },
+                ),
+            ))
+        })
+        .collect();
+    let ids = supported.as_slice();
+
     // One mutation chunk is the `$batch` submission plus whatever the
     // etag preflight had to re-read. `refresh_missing_etags` issues one
     // GET per id whose etag was not cached, so leaving it out would
@@ -267,7 +300,8 @@ async fn submit_batch_with_version(
             }
         }
     }
-    let mut preflight_outcomes = refresh_missing_etags(account, ids, kind, &mut etags).await;
+    let mut preflight_outcomes = refused_outcomes;
+    preflight_outcomes.extend(refresh_missing_etags(account, ids, kind, &mut etags).await);
     let mut requests = Vec::new();
     let mut request_ids = Vec::new();
     for id in ids {
@@ -1136,6 +1170,120 @@ mod tests {
             ),
             bifrost_types::FlagTargetState::Indeterminate
         );
+    }
+
+    #[tokio::test]
+    async fn public_folder_flag_write_is_refused_locally_even_with_a_cached_etag() {
+        let account = shared_account();
+        let public = crate::account::foreign::encode_public_item_id(
+            &FolderId("AAMkPF=".to_string()),
+            "AAMkItem=",
+        );
+        {
+            let mut cache = account.etag_index.write().await;
+            cache.insert(public.0.clone(), "W/\"pub\"".into());
+            cache.insert("m2".into(), "W/\"m2\"".into());
+        }
+        account
+            .client
+            .script_rest([crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m2"}}]}),
+            )]);
+        let events = bulk_set_flags_stream(
+            account.clone(),
+            Box::pin(futures::stream::iter([
+                public.clone(),
+                ObjectId("m2".into()),
+            ])),
+            FlagOp::Add(HashSet::from(["\\seen".into()])),
+            idempotency_key(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        let [
+            ItemOutcome::Failed(failure),
+            ItemOutcome::Succeeded(success),
+        ] = batch.items.as_slice()
+        else {
+            panic!("{batch:?}");
+        };
+        assert_eq!(failure.item.0, public.0);
+        assert_eq!(
+            failure.error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
+        );
+        assert_eq!(success.item.0, "m2");
+        let requests = account.client.take_rest_requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let subrequests = requests[0].body.as_ref().unwrap()["requests"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(subrequests.len(), 1, "the public id must not reach $batch");
+    }
+
+    #[tokio::test]
+    async fn public_folder_destroy_is_unsupported_not_skipped() {
+        let account = shared_account();
+        let public = crate::account::foreign::encode_public_item_id(
+            &FolderId("AAMkPF=".to_string()),
+            "AAMkItem=",
+        );
+        account.client.script_rest([]);
+        let events = bulk_destroy_stream(
+            account.clone(),
+            Box::pin(futures::stream::iter([public.clone()])),
+            idempotency_key(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+            panic!("{batch:?}");
+        };
+        assert_eq!(
+            failure.error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::BulkDestroy)
+        );
+        assert!(account.client.take_rest_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_into_a_discovered_public_folder_is_refused_before_any_request() {
+        let account = shared_account();
+        account.routing_map.write().await.insert(
+            FolderId("AAMkPF=".to_string()),
+            crate::account::cursor::PublicFolderRouting {
+                anchor_mailbox: "content@contoso.com".to_string(),
+                public_folder_mailbox: Some("pf@contoso.com".to_string()),
+            },
+        );
+        account.client.script_rest([]);
+        let events = bulk_move_stream(
+            account.clone(),
+            Box::pin(futures::stream::iter([ObjectId("m1".into())])),
+            MembershipScope::Folder(FolderId("AAMkPF=".to_string())),
+            idempotency_key(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let [SyncEvent::Batch(batch), SyncEvent::Done(None)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        let [ItemOutcome::Failed(failure)] = batch.items.as_slice() else {
+            panic!("{batch:?}");
+        };
+        assert_eq!(
+            failure.error.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::BulkMove)
+        );
+        assert!(account.client.take_rest_requests().is_empty());
     }
 
     #[tokio::test]

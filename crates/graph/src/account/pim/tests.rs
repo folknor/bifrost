@@ -2494,3 +2494,66 @@ async fn partial_commit_delete_thread_keeps_earlier_chunks_on_a_local_refusal() 
         }
     );
 }
+
+/// Typed writes on a public-folder item are refused before any Graph REST
+/// request: the read-modify-write paths, the tolerated-404 property clear
+/// (which would otherwise report success), and the move door.
+#[tokio::test]
+async fn typed_writes_refuse_public_folder_items_without_a_request() {
+    let client = GraphClient::new("token");
+    // An installed (empty) script makes any dispatch observable.
+    client.script_rest([]);
+    let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+    let public = encode_public_item_id(&FolderId("AAMkPF=".to_string()), "AAMkItem=");
+    account.routing_map.write().await.insert(
+        FolderId("AAMkPF=".to_string()),
+        crate::account::cursor::PublicFolderRouting {
+            anchor_mailbox: "content@contoso.com".to_string(),
+            public_folder_mailbox: Some("pf@contoso.com".to_string()),
+        },
+    );
+    let expect_unsupported = |result: Result<(), bifrost_types::AccountError>, operation| {
+        let error = result.expect_err("public-folder write must be refused");
+        assert_eq!(error.kind(), &AccountErrorKind::Unsupported(operation));
+    };
+    expect_unsupported(
+        set_is_read(
+            account.clone(),
+            MutationTarget::Message(public.clone()),
+            true,
+        )
+        .await,
+        AccountOperation::SetIsRead,
+    );
+    expect_unsupported(
+        set_extended_property(
+            account.clone(),
+            MutationTarget::Message(public.clone()),
+            "String {00020386-0000-0000-C000-000000000046} Name x".into(),
+            None,
+        )
+        .await,
+        AccountOperation::SetExtendedProperty,
+    );
+    expect_unsupported(
+        add_to_container(
+            account.clone(),
+            MutationTarget::Message(public.clone()),
+            ContainerId("Inbox".into()),
+        )
+        .await,
+        AccountOperation::AddToContainer,
+    );
+    // A thread move into a discovered public folder is refused before the
+    // thread expansion GET.
+    expect_unsupported(
+        add_to_container(
+            account.clone(),
+            MutationTarget::Thread(ThreadId("conv-1".into())),
+            ContainerId("AAMkPF=".into()),
+        )
+        .await,
+        AccountOperation::AddToContainer,
+    );
+    assert!(client.take_rest_requests().is_empty());
+}

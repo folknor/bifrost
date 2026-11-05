@@ -37,6 +37,15 @@ pub(crate) async fn add_to_container(
     target: MutationTarget,
     container: ContainerId,
 ) -> Result<(), AccountError> {
+    // Refused before thread expansion, which is itself a Graph REST read.
+    if account
+        .is_known_public_folder(&bifrost_types::FolderId(container.0.clone()))
+        .await
+    {
+        return Err(crate::account::graph_error::unsupported_account_error(
+            AccountOperation::AddToContainer,
+        ));
+    }
     let ids = resolve_target_ids(&account, target, AccountOperation::AddToContainer).await?;
     move_messages(
         &account,
@@ -322,7 +331,10 @@ pub(super) async fn resolve_target_ids(
     operation: AccountOperation,
 ) -> Result<Vec<ObjectId>, AccountError> {
     match target {
-        MutationTarget::Message(id) => Ok(vec![id]),
+        MutationTarget::Message(id) => {
+            refuse_public_write(&id, operation)?;
+            Ok(vec![id])
+        }
         MutationTarget::Thread(thread) => {
             let values = message_values_for_thread(account, &thread, "id").await?;
             let owner = crate::account::foreign::parse_thread_id(&thread)
@@ -347,6 +359,27 @@ pub(super) struct ResolvedMessage {
     pub(super) value: Value,
 }
 
+/// Refuse a write whose target is a public-folder item. Its id wraps a raw
+/// EWS `ItemId` that no Graph REST route can address, and this crate has no
+/// EWS write arm: sending it to `/me/messages/{itemId}` answers
+/// `ErrorItemNotFound`, which a write would report as the item being gone
+/// (or, for a tolerated-404 clear, as success). `Unsupported(operation)` is
+/// the true answer.
+pub(crate) fn refuse_public_write(
+    id: &ObjectId,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    if super::hydrate::ews_read_folder(id).is_some() {
+        return Err(crate::account::graph_error::unsupported_item_error(
+            operation,
+            ErrorScope::Message {
+                id: id.0.clone().into(),
+            },
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn resolve_target_values(
     account: &GraphAccount,
     target: MutationTarget,
@@ -355,6 +388,7 @@ pub(super) async fn resolve_target_values(
 ) -> Result<Vec<ResolvedMessage>, AccountError> {
     match target {
         MutationTarget::Message(id) => {
+            refuse_public_write(&id, operation)?;
             let value = fetch_message_value(account, &id, select).await?;
             Ok(vec![ResolvedMessage {
                 routing_id: id,
@@ -455,6 +489,9 @@ pub(crate) fn message_batch_url(
     suffix: &str,
     operation: AccountOperation,
 ) -> Result<String, AccountError> {
+    // Every caller is a Graph REST `$batch` surface; a public-folder id has
+    // no URL here (see `refuse_public_write`).
+    refuse_public_write(id, operation)?;
     let parsed = crate::account::foreign::parse_message_id(id);
     // A stale foreign owner is rejected per MESSAGE: this helper is the
     // per-item URL builder for four `$batch` surfaces, and the id it could
@@ -513,8 +550,18 @@ pub(super) async fn move_messages(
     // The destination may itself be foreign-encoded (a shared-mailbox
     // folder); the `move` body's `destinationId` must carry the native
     // folder id, never a `\u{1f}`-bearing one. Decode once up front.
-    let dest =
-        crate::account::foreign::parse_folder(&bifrost_types::FolderId(destination.to_string()));
+    let dest_folder = bifrost_types::FolderId(destination.to_string());
+    // A discovered public folder is a bare EWS `FolderId`, which
+    // `parse_folder` reads as primary; Graph REST cannot move into it.
+    if account.is_known_public_folder(&dest_folder).await {
+        return Err(crate::account::graph_error::unsupported_account_error(
+            operation,
+        ));
+    }
+    for id in ids {
+        refuse_public_write(id, operation)?;
+    }
+    let dest = crate::account::foreign::parse_folder(&dest_folder);
     // A cross-mailbox move is not expressible against one endpoint. Decided
     // from the ids alone, so it is refused BEFORE the etag GET - a local
     // refusal of the caller's request, `Request(Malformed)`, exactly as the

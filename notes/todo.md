@@ -249,6 +249,21 @@ face.
   means folder-aware move routing (Graph lists `parentFolderId` as an update
   field).
 
+- **Graph public-folder mail writes over EWS.** `crates/graph/src/account/mutate.rs`,
+  `pim/messages.rs`. Flag writes, moves, destroys and the typed writers refuse
+  public-folder items as `Unsupported` before I/O, because Graph REST cannot
+  address them and the EWS client has no write operations. Building it means an
+  EWS arm (`UpdateItem` for `IsRead` / `Flag` / `Categories`, `MoveItem`,
+  `DeleteItem`) routed by the folder's `routing_map` headers, with change-key
+  preconditions, replacement ids after a move, etag-cache and ambiguous-
+  completion handling that meet the mutation contracts, and a capability
+  story for a namespace-specific write gap. Not built: nobody has ruled
+  public folders writable.
+- **Undiscovered public-folder move destinations.** A public folder id is a
+  bare EWS `FolderId`; only discovery (`is_known_public_folder`) tells it
+  apart from a primary folder id, so a move into an undiscovered public
+  folder still goes to Graph REST and fails there.
+
 ## 5. Low priority
 
 Narrow edge cases, audits with no known defect, and design work.

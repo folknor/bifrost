@@ -562,6 +562,17 @@ impl GraphAccount {
         self.routing_map.read().await.get(folder).cloned()
     }
 
+    /// Whether `folder` is a public folder this account has discovered: in
+    /// the routing map (pinned for sync) or in the projection metadata
+    /// (visible in the hierarchy). A public folder id is a bare EWS
+    /// `FolderId`, so `foreign::parse_folder` reads it as primary; only
+    /// discovery can tell the two apart. An undiscovered bare id cannot be
+    /// classified here and is left to the server to refuse.
+    pub(crate) async fn is_known_public_folder(&self, folder: &bifrost_types::FolderId) -> bool {
+        self.routing_map.read().await.contains_key(folder)
+            || self.public_folder_meta.read().await.contains_key(folder)
+    }
+
     /// Record the EWS item class of every item a public-folder inventory or
     /// poll walk returned, so a later `GetItem` for one of those ids can ask
     /// for the property shape that item's class accepts.
