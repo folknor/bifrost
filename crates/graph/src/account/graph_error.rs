@@ -646,7 +646,9 @@ pub(crate) fn provider_answer_violation(
     finish(push_attempt(builder, TransmissionState::Acknowledged), ctx)
 }
 
-/// `GraphError::Json`: a success body that did not parse.
+/// `GraphError::Json`: a success body that did not parse. Carries
+/// `AttemptCause::unreadable_success`, so partial-commit application reads
+/// a write leg it fails as `Uncertain`.
 ///
 /// The variant is no longer only Graph REST JSON: the Autodiscover XML
 /// parsers and the OneDrive upload-session 202 read raise it too, each with a
@@ -678,7 +680,9 @@ fn json_parse_to_account_error(
     {
         builder = builder.text(text);
     }
-    builder = push_attempt(builder, TransmissionState::Acknowledged);
+    // Every producer raises this only on a success status, so the write the
+    // body reports on may have landed: unreadable-success evidence.
+    builder = builder.push_cause(Cause::Attempt(AttemptCause::unreadable_success()));
     finish(builder, ctx)
 }
 

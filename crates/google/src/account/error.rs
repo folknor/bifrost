@@ -349,19 +349,16 @@ pub(crate) fn into_account_error(error: Error, mut ctx: GmailErrorContext) -> Ac
         }
         // `Error::Response` is a terminal HTTP response; the request was
         // acknowledged. `Error::JsonDecode` / `Error::Base64` happen
-        // post-200 (decoding a successful response body), so they are
-        // also classified as `Acknowledged`.
+        // post-200 (decoding a successful response body), so they carry
+        // unreadable-success evidence: acknowledged, and the write the body
+        // reports on may have landed.
         Error::Response(resp) => translate_response(*resp, &ctx),
-        Error::JsonDecode { source, .. } => parse_failed(
-            &ctx,
-            format!("Gmail JSON decode: {source}"),
-            Some(TransmissionState::Acknowledged),
-        ),
-        Error::Base64 { encoding, source } => parse_failed(
-            &ctx,
-            format!("Gmail {encoding} decode failed: {source}"),
-            Some(TransmissionState::Acknowledged),
-        ),
+        Error::JsonDecode { source, .. } => {
+            parse_failed(&ctx, format!("Gmail JSON decode: {source}"))
+        }
+        Error::Base64 { encoding, source } => {
+            parse_failed(&ctx, format!("Gmail {encoding} decode failed: {source}"))
+        }
         Error::Local(local) => translate_local(local, &ctx),
     }
 }
@@ -1133,11 +1130,7 @@ fn throttle_scope_for(
     }
 }
 
-fn parse_failed(
-    ctx: &GmailErrorContext,
-    detail: String,
-    attempt: Option<TransmissionState>,
-) -> AccountError {
+fn parse_failed(ctx: &GmailErrorContext, detail: String) -> AccountError {
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
         Cause::Wire(WireCause::MalformedResponse {
@@ -1148,15 +1141,12 @@ fn parse_failed(
     .provider(Provider::Gmail)
     .protocol(Protocol::Gmail)
     .operation(ctx.operation)
-    .text(DiagnosticText::support_only(detail));
+    .text(DiagnosticText::support_only(detail))
+    // Post-200 decode failures (`JsonDecode`, `Base64`): the response was
+    // received with a success status before the decode failed.
+    .push_cause(Cause::Attempt(AttemptCause::unreadable_success()));
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
-    }
-    // post-200 decode failures (`JsonDecode`, `Base64`) get
-    // `Acknowledged` because the response was received before the
-    // decode failed.
-    if let Some(state) = attempt {
-        builder = builder.push_cause(Cause::Attempt(AttemptCause::new(state)));
     }
     builder
         .try_build()
@@ -2026,7 +2016,8 @@ mod tests {
         assert_eq!(attempt, bifrost_types::TransmissionState::Acknowledged);
     }
 
-    /// post-200 decode failures classify as Acknowledged.
+    /// post-200 decode failures classify as an unreadable success, so a
+    /// write leg they fail reads as Uncertain, not NotApplied.
     #[test]
     fn json_decode_pushes_acknowledged_attempt_cause() {
         let source = serde_json::from_slice::<serde_json::Value>(b"not json").expect_err("decode");
@@ -2039,11 +2030,15 @@ mod tests {
             .chain()
             .iter()
             .find_map(|cause| match cause {
-                bifrost_types::Cause::Attempt(a) => Some(a.transmission_state),
+                bifrost_types::Cause::Attempt(a) => Some(*a),
                 _ => None,
             })
             .expect("decode error carries an Attempt cause");
-        assert_eq!(attempt, bifrost_types::TransmissionState::Acknowledged);
+        assert_eq!(attempt, bifrost_types::AttemptCause::unreadable_success());
+        assert_eq!(
+            bifrost_types::Application::from_leaf(&acc),
+            bifrost_types::Application::Uncertain
+        );
     }
 
     /// Every `missing_field` producer raises it after a complete response

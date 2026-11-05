@@ -98,14 +98,17 @@ impl AccountError {
         &self.inner.leg_recovery
     }
     pub(crate) fn classification_attempt(&self) -> Option<super::TransmissionState> {
-        self.inner
-            .chain
-            .iter()
-            .take(self.inner.classification_cause_count)
-            .find_map(|c| match c {
-                super::Cause::Attempt(a) => Some(a.transmission_state),
-                _ => None,
-            })
+        self.classification_attempt_cause()
+            .map(|a| a.transmission_state)
+    }
+    /// The classification prefix's attempt evidence, answer evidence included.
+    pub(crate) fn classification_attempt_cause(&self) -> Option<super::AttemptCause> {
+        super::partial::first_attempt(
+            self.inner
+                .chain
+                .iter()
+                .take(self.inner.classification_cause_count),
+        )
     }
     /// Each failure with its own recovery, scope and budgets, including cleanup.
     pub fn throttle_observations(&self) -> Vec<(&AccountError, &RecoveryClass)> {
@@ -517,9 +520,7 @@ mod tests {
 
         let rebuilt = original
             .into_builder()
-            .push_cause(Cause::Attempt(AttemptCause {
-                transmission_state: TransmissionState::Unsent,
-            }))
+            .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
             .try_build()
             .expect("valid account error classification");
 
@@ -528,6 +529,7 @@ mod tests {
             rebuilt.chain().iter().last(),
             Some(Cause::Attempt(AttemptCause {
                 transmission_state: TransmissionState::Unsent,
+                ..
             }))
         );
         assert!(last_cause_is_attempt);

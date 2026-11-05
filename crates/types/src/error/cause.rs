@@ -91,6 +91,7 @@ impl Cause {
                 kind: "attempt",
                 detail: None,
                 transmission_state: Some(cause.transmission_state),
+                answer: (cause.answer != AnswerEvidence::Unspecified).then_some(cause.answer),
                 status: None,
                 native_code: None,
                 ..CauseSummary::empty("attempt")
@@ -272,23 +273,61 @@ pub enum TransportKind {
     Tls,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct AttemptCause {
     pub transmission_state: TransmissionState,
+    /// What the producer knows about the answer, beyond that one arrived.
+    pub answer: AnswerEvidence,
 }
 
 impl AttemptCause {
     #[must_use]
     pub fn new(transmission_state: TransmissionState) -> Self {
-        Self { transmission_state }
+        Self {
+            transmission_state,
+            answer: AnswerEvidence::Unspecified,
+        }
+    }
+
+    /// The exchange was answered with a success status whose body could not
+    /// be read. Always `Acknowledged`: the answer arrived. Partial-commit
+    /// application reads this as `Uncertain`, because the write the answer
+    /// reports on may have landed. Stamp it only where the producer knows the
+    /// status was a success; a decoded refusal whose body broke the contract
+    /// is plain `Acknowledged`.
+    #[must_use]
+    pub fn unreadable_success() -> Self {
+        Self {
+            transmission_state: TransmissionState::Acknowledged,
+            answer: AnswerEvidence::UnreadableSuccess,
+        }
     }
 }
 
 impl fmt::Display for AttemptCause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "attempt {:?}", self.transmission_state)
+        match self.answer {
+            AnswerEvidence::Unspecified => write!(f, "attempt {:?}", self.transmission_state),
+            AnswerEvidence::UnreadableSuccess => {
+                write!(
+                    f,
+                    "attempt {:?}, unreadable success",
+                    self.transmission_state
+                )
+            }
+        }
     }
+}
+
+/// Producer evidence about an answer's content, carried on `AttemptCause`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[non_exhaustive]
+pub enum AnswerEvidence {
+    /// No claim beyond the transmission state.
+    Unspecified,
+    /// A success status arrived and its body could not be read.
+    UnreadableSuccess,
 }
 
 impl StdError for AttemptCause {}
@@ -942,6 +981,9 @@ pub struct CauseSummary<'a> {
     pub kind: &'static str,
     pub detail: Option<&'a str>,
     pub transmission_state: Option<TransmissionState>,
+    /// Set only when the attempt carries evidence beyond its state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<AnswerEvidence>,
     pub status: Option<u16>,
     pub native_code: Option<&'a str>,
     pub transport_kind: Option<TransportKind>,
@@ -960,6 +1002,7 @@ impl<'a> CauseSummary<'a> {
             kind,
             detail: None,
             transmission_state: None,
+            answer: None,
             status: None,
             native_code: None,
             transport_kind: None,
@@ -995,16 +1038,15 @@ mod tests {
     #[test]
     fn cause_chain_preserves_order() {
         let chain = CauseChain::new(vec![
-            Cause::Attempt(AttemptCause {
-                transmission_state: TransmissionState::InFlight,
-            }),
+            Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)),
             Cause::Wire(WireCause::Jmap(JmapMethod::StateMismatch)),
         ]);
 
         assert!(matches!(
             chain.outermost(),
             Cause::Attempt(AttemptCause {
-                transmission_state: TransmissionState::InFlight
+                transmission_state: TransmissionState::InFlight,
+                ..
             })
         ));
         assert!(matches!(
@@ -1021,9 +1063,7 @@ mod tests {
 
     #[test]
     fn cause_summary_carries_attempt_state() {
-        let cause = Cause::Attempt(AttemptCause {
-            transmission_state: TransmissionState::Acknowledged,
-        });
+        let cause = Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged));
 
         assert_eq!(
             cause.summary().transmission_state,

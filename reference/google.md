@@ -1564,7 +1564,10 @@ Mapping highlights:
   (`JsonDecode`, `Base64`) pushes
   `AttemptCause(Acknowledged)` onto the chain so the central
   mapping never falls back to "absence treated as Unsent" for an
-  actually-acknowledged request.
+  actually-acknowledged request. The post-200 decode failures push
+  `AttemptCause::unreadable_success()`, so a write leg they fail
+  (the post-move event PATCH, the contact photo leg) reads as
+  `Uncertain` rather than `NotApplied`.
 - `failedPrecondition` from the history endpoint ->
   `SyncState(CursorInvalid)`. `failedPrecondition` elsewhere ->
   `ConcurrencyConflict` (etag / version mismatch semantics),

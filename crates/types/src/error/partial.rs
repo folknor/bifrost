@@ -4,9 +4,10 @@
 //! Successful compensation resolves only the effects it names. Plans describe
 //! execution constraints after prerequisites and directives, not continuations.
 use super::{
-    AccountError, AccountErrorBuildError, AccountErrorKind, EngineDirective, ErrorScope,
-    ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason, RecoveryClass,
-    RetryAdvice, RetryDisposition, RetryReason, ServerErrorKind, TransmissionState,
+    AccountError, AccountErrorBuildError, AccountErrorKind, AnswerEvidence, AttemptCause,
+    EngineDirective, ErrorScope, ReconcileAction, ReconcileAdvice, ReconcileGuidance,
+    ReconcileReason, RecoveryClass, RetryAdvice, RetryDisposition, RetryReason, ServerErrorKind,
+    TransmissionState,
 };
 use serde::Serialize;
 
@@ -42,13 +43,30 @@ pub enum Application {
     NotApplicable,
 }
 impl Application {
-    /// Read only the classification prefix: InFlight or Reconcile is uncertain.
+    /// Read only the classification prefix: InFlight, an unreadable success
+    /// answer, or Reconcile is uncertain.
+    ///
+    /// `NotApplied` is the absence of evidence that the write landed, not
+    /// proof that it did not: a terminal leaf such as `Protocol(MissingField)`
+    /// on a decoded answer still reads `NotApplied` here, and producers that
+    /// know more raise to `Uncertain` themselves.
     pub fn from_leaf(leaf: &AccountError) -> Self {
-        application(leaf.leg_recovery(), leaf.classification_attempt())
+        application(leaf.leg_recovery(), leaf.classification_attempt_cause())
     }
 }
-fn application(recovery: &RecoveryClass, attempt: Option<TransmissionState>) -> Application {
-    if attempt == Some(TransmissionState::InFlight)
+/// The first attempt cause of a classification prefix.
+pub(crate) fn first_attempt<'a>(
+    mut causes: impl Iterator<Item = &'a super::Cause>,
+) -> Option<AttemptCause> {
+    causes.find_map(|c| match c {
+        super::Cause::Attempt(a) => Some(*a),
+        _ => None,
+    })
+}
+fn application(recovery: &RecoveryClass, attempt: Option<AttemptCause>) -> Application {
+    let state = attempt.map(|a| a.transmission_state);
+    if state == Some(TransmissionState::InFlight)
+        || attempt.is_some_and(|a| a.answer == AnswerEvidence::UnreadableSuccess)
         || matches!(recovery, RecoveryClass::Reconcile(_))
     {
         Application::Uncertain
@@ -199,9 +217,16 @@ pub enum CompensationOutcome {
 }
 impl CompensationOutcome {
     pub fn from_error(error: AccountError) -> Self {
-        match error.classification_attempt() {
-            None | Some(TransmissionState::InFlight) => Self::Unconfirmed(error),
-            _ => Self::Failed(error),
+        // An unreadable success answer does not prove the reversal failed.
+        match error.classification_attempt_cause() {
+            None => Self::Unconfirmed(error),
+            Some(a)
+                if a.transmission_state == TransmissionState::InFlight
+                    || a.answer == AnswerEvidence::UnreadableSuccess =>
+            {
+                Self::Unconfirmed(error)
+            }
+            Some(_) => Self::Failed(error),
         }
     }
 }
@@ -351,7 +376,7 @@ impl PartialCommitBuilder {
     pub(crate) fn finish(
         self,
         recovery: &RecoveryClass,
-        attempt: Option<TransmissionState>,
+        attempt: Option<AttemptCause>,
         kind: &AccountErrorKind,
     ) -> Result<(PartialCommit, RecoveryClass), AccountErrorBuildError> {
         use AccountErrorBuildError as E;
@@ -378,7 +403,7 @@ impl PartialCommitBuilder {
                     step.effect,
                     *application,
                     error.recovery(),
-                    error.classification_attempt(),
+                    error.classification_attempt_cause(),
                 )?;
             } else if step.effect.is_none() {
                 return Err(E::PartialCommitApplication { step: step.id });
@@ -418,7 +443,9 @@ impl PartialCommitBuilder {
                     return Err(E::PartialCommitNested { step: c.id });
                 }
                 if matches!(&c.outcome, CompensationOutcome::Failed(_))
-                    && e.classification_attempt() == Some(TransmissionState::InFlight)
+                    && (e.classification_attempt() == Some(TransmissionState::InFlight)
+                        || e.classification_attempt_cause()
+                            .is_some_and(|a| a.answer == AnswerEvidence::UnreadableSuccess))
                     || matches!(&c.outcome, CompensationOutcome::Unconfirmed(_))
                         && e.classification_attempt() == Some(TransmissionState::Unsent)
                 {
@@ -451,7 +478,7 @@ fn validate_leg(
     effect: Option<StepEffect>,
     declared: Application,
     recovery: &RecoveryClass,
-    attempt: Option<TransmissionState>,
+    attempt: Option<AttemptCause>,
 ) -> Result<(), AccountErrorBuildError> {
     let invalid = if effect.is_none() {
         declared != Application::NotApplicable
@@ -461,7 +488,7 @@ fn validate_leg(
                 && application(recovery, attempt) == Application::Uncertain
             || declared == Application::Uncertain
                 && application(recovery, attempt) == Application::NotApplied
-                && attempt == Some(TransmissionState::Unsent)
+                && attempt.map(|a| a.transmission_state) == Some(TransmissionState::Unsent)
     };
     if invalid {
         Err(AccountErrorBuildError::PartialCommitApplication { step: id })

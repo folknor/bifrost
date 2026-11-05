@@ -421,6 +421,79 @@ fn partial_commit_unreadable_blocking_leg_requires_a_check() {
     );
 }
 #[test]
+fn partial_commit_unreadable_success_answer_is_uncertain() {
+    let leaf = |attempt: AttemptCause| {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Gmail,
+                detail: None,
+            }),
+        )
+        .operation(AccountOperation::EventUpdate)
+        .push_cause(Cause::Attempt(attempt))
+        .try_build()
+        .unwrap()
+    };
+    let unreadable = leaf(AttemptCause::unreadable_success());
+    // A decoded answer with a contract defect (an IMAP tagged BAD code, a
+    // malformed 400 body) is still a read answer: no claim either way.
+    let decoded = leaf(AttemptCause::new(TransmissionState::Acknowledged));
+    assert_eq!(unreadable.recovery(), decoded.recovery());
+    assert_eq!(Application::from_leaf(&unreadable), Application::Uncertain);
+    assert_eq!(Application::from_leaf(&decoded), Application::NotApplied);
+    // Declaring the unreadable leg NotApplied is refused, primary and sibling.
+    let primary = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Updated,
+        StepTargets::unknown(),
+        StepReplay::Repeatable,
+        Application::NotApplied,
+    ));
+    assert!(
+        unreadable
+            .clone()
+            .into_builder()
+            .partial_commit(primary)
+            .try_build()
+            .is_err()
+    );
+    let mut sibling = PartialCommitBuilder::new(PrimaryLeg::new(
+        StepEffect::Updated,
+        StepTargets::unknown(),
+        StepReplay::Repeatable,
+        Application::from_leaf(&decoded),
+    ));
+    sibling.failed_sibling(
+        Some(StepEffect::Updated),
+        StepTargets::unknown(),
+        StepReplay::Repeatable,
+        Application::NotApplied,
+        unreadable.clone(),
+    );
+    assert!(
+        decoded
+            .clone()
+            .into_builder()
+            .partial_commit(sibling)
+            .try_build()
+            .is_err()
+    );
+    assert!(matches!(
+        CompensationOutcome::from_error(unreadable.clone()),
+        CompensationOutcome::Unconfirmed(_)
+    ));
+    assert!(matches!(
+        CompensationOutcome::from_error(decoded),
+        CompensationOutcome::Failed(_)
+    ));
+    // A Repeatable unreadable primary is residual; recovery stays terminal.
+    let error = attach(unreadable, StepReplay::Repeatable, StepEffect::Moved);
+    let record = error.partial_commit().unwrap();
+    assert_eq!(record.primary().application, Application::Uncertain);
+    assert_eq!(record.plan().residual, [StepId(0)]);
+    assert_eq!(error.recovery(), &RecoveryClass::ProviderContractViolation);
+}
+#[test]
 fn partial_commit_mixed_sibling_prerequisites_keep_both_in_plan() {
     let leaf = classified(
         AccountErrorKind::Authentication(AuthErrorKind::RefreshTransient),

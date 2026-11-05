@@ -455,10 +455,7 @@ impl AccountErrorBuilder {
         );
         let leg_recovery = recovery.clone();
         let (partial_commit, recovery) = if let Some(record) = self.partial_commit {
-            let attempt = classification_chain.iter().find_map(|c| match c {
-                Cause::Attempt(a) => Some(a.transmission_state),
-                _ => None,
-            });
+            let attempt = super::partial::first_attempt(classification_chain.iter());
             let (record, projected) = record.finish(&recovery, attempt, &self.kind)?;
             (Some(Arc::new(record)), projected)
         } else {
@@ -713,9 +710,9 @@ mod tests {
                 message: None,
             }),
         )
-        .push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: TransmissionState::Acknowledged,
-        }))
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
         .try_build()
         .expect_err("transport + acknowledged is invalid");
 

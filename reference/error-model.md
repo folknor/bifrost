@@ -406,7 +406,7 @@ whether the connection survives is the producer's call, and IMAP retires it.
 (`#[non_exhaustive]`) variants:
 
 - `Transport(TransportCause { kind, message })`,
-- `Attempt(AttemptCause { transmission_state })`,
+- `Attempt(AttemptCause { transmission_state, answer })`,
 - `Auth(AuthCause)`, `Access(AccessCause)`, `Server(ServerCause)`,
   `State(StateCause)`, `Request(RequestCause)`,
 - `Wire(WireCause)`,
@@ -418,6 +418,18 @@ is the **transmission-evidence** carrier: it is what `derive` reads to
 choose retry-vs-reconcile, and what `try_build` cross-checks against
 `Transport`. Producers thread it via `push_cause` on a fresh builder.
 An attempt appended after `into_builder` is diagnostic evidence only.
+
+`answer: AnswerEvidence` is what the producer knows about the answer beyond
+its arrival: `Unspecified` (the `AttemptCause::new` default) or
+`UnreadableSuccess` (`AttemptCause::unreadable_success()`, always
+`Acknowledged`): a success status arrived and its body could not be read.
+`derive` ignores it; partial-commit application reads it (below). Only a
+producer that knows the status was a success stamps it - Google's post-200
+`JsonDecode`/`Base64` and Graph's `GraphError::Json`. A decoded refusal whose
+body broke the contract (an IMAP tagged `BAD` response code, a malformed Graph
+400 body) is plain `Acknowledged`: kind plus acknowledgement is not evidence of
+an unreadable success. The cause summary exports `answer` only when it is not
+`Unspecified`.
 
 `ServerCause` carries the optional `RetryHint` for the
 unavailable/rate/quota arms (the only structural channel for retry
@@ -706,7 +718,15 @@ invalid compensation references or contradictory compensation evidence.
 Primary and sibling legs name optional effects and role-tagged `StepTargets`.
 Incomplete targets mean unknown identities or at least the supplied identities.
 `Application::from_leaf` is the producer rule: explicit classification-prefix
-InFlight or reconciling recovery means Uncertain, otherwise NotApplied.
+InFlight, classification-prefix `UnreadableSuccess` answer evidence, or
+reconciling recovery means Uncertain, otherwise NotApplied. NotApplied is the
+absence of evidence that the leg landed, not proof that it did not: a terminal
+leaf on a decoded answer - JMAP's `Protocol(MissingField)` for a create
+answered without a usable id, say - reads NotApplied, and a producer that
+knows the write may have landed raises to Uncertain itself or records the
+effect as committed. Primary and sibling validation and
+`CompensationOutcome::from_error` read the same evidence: an unreadable
+success answer makes cleanup Unconfirmed, never Failed.
 Effectless reads/local failures use NotApplicable. Decoration cannot influence
 this judgment. Committed steps remain historical facts. Successful compensation
 resolves only the named effect-bearing committed or uncertain steps; failed or

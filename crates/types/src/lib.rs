@@ -131,10 +131,10 @@ pub use error::partial::{
 // Error + recovery vocabulary.
 pub use error::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuildError, AccountErrorBuilder,
-    AccountErrorKind, AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure,
-    BatchInputInvalidItem, BatchInputInvalidReason, BatchInvariantError, BatchItem, BatchItemId,
-    BatchItemOutcome, BatchOutcome, BatchOutcomeBuilder, BatchSuccess, BatchUncertain, Cause,
-    CauseChain, DetailVisibility, DiagnosticInfo, DiagnosticText, EngineDirective,
+    AccountErrorKind, AccountOperation, AnswerEvidence, AttemptCause, AuthCause, AuthErrorKind,
+    BatchFailure, BatchInputInvalidItem, BatchInputInvalidReason, BatchInvariantError, BatchItem,
+    BatchItemId, BatchItemOutcome, BatchOutcome, BatchOutcomeBuilder, BatchSuccess, BatchUncertain,
+    Cause, CauseChain, DetailVisibility, DiagnosticInfo, DiagnosticText, EngineDirective,
     EnhancedStatusCode, ErrorScope, Fatal, GmailSignal, GraphSignal, ImapResponseCode,
     InternalCause, InternalErrorKind, ItemOutcome, JmapMethod, MailboxUnavailableKind,
     MutationEffect, MutationSuccess, Protocol, ProtocolErrorKind, Provider, ReconcileAction,

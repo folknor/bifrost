@@ -1017,9 +1017,7 @@ mod tests {
                 kind: TransportKind::Network,
                 message: None,
             }),
-            Cause::Attempt(AttemptCause {
-                transmission_state: state,
-            }),
+            Cause::Attempt(AttemptCause::new(state)),
         ])
     }
 
@@ -1247,9 +1245,7 @@ mod tests {
                 Cause::Server(ServerCause::QuotaExhausted {
                     retry_hint: Some(hint),
                 }),
-                Cause::Attempt(AttemptCause {
-                    transmission_state: TransmissionState::InFlight,
-                }),
+                Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)),
             ]),
             Some(ThrottleScope::Account),
             None,
@@ -1281,9 +1277,7 @@ mod tests {
             Some(AccountOperation::Send),
             &CauseChain::new(vec![
                 Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
-                Cause::Attempt(AttemptCause {
-                    transmission_state: TransmissionState::Acknowledged,
-                }),
+                Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)),
             ]),
             Some(ThrottleScope::Account),
             None,
@@ -1309,9 +1303,7 @@ mod tests {
             Some(AccountOperation::Send),
             &CauseChain::new(vec![
                 Cause::Server(ServerCause::Unavailable { retry_hint: None }),
-                Cause::Attempt(AttemptCause {
-                    transmission_state: TransmissionState::InFlight,
-                }),
+                Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)),
             ]),
             None,
             None,
@@ -1336,9 +1328,7 @@ mod tests {
             Some(AccountOperation::SyncChanges),
             &CauseChain::new(vec![
                 Cause::Server(ServerCause::RateLimited { retry_hint: None }),
-                Cause::Attempt(AttemptCause {
-                    transmission_state: TransmissionState::Acknowledged,
-                }),
+                Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)),
             ]),
             None,
             None,
@@ -1836,9 +1826,7 @@ mod tests {
                         message: None,
                     }),
                 )
-                .push_cause(Cause::Attempt(AttemptCause {
-                    transmission_state: TransmissionState::Unsent,
-                }))
+                .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
                 .try_build()
                 .expect("valid"),
             ),
@@ -1852,9 +1840,9 @@ mod tests {
                     }),
                 )
                 .operation(AccountOperation::Send)
-                .push_cause(Cause::Attempt(AttemptCause {
-                    transmission_state: TransmissionState::InFlight,
-                }))
+                .push_cause(Cause::Attempt(AttemptCause::new(
+                    TransmissionState::InFlight,
+                )))
                 .try_build()
                 .expect("valid"),
             ),

@@ -180,9 +180,16 @@ face.
 - **Acknowledged single-request creates without a usable identity can invite
   a duplicating manual retry:** IMAP draft_create without APPENDUID, Google
   People contact_create without resourceName, standalone Graph draft_create,
-  Google and Graph filter_create, and Google calendar event_create. The
-  committed-unidentified partial-commit shape can carry them without inventing
-  uncertainty.
+  Google and Graph filter_create, Google calendar event_create, and JMAP's
+  filter, mailbox, event and contact creates (`error::require_created_id`
+  returns a bare terminal `Protocol(MissingField)` with acknowledged evidence
+  and no record; `Application::from_leaf` would read that leaf NotApplied, but
+  nothing calls it there). The committed-unidentified partial-commit shape can
+  carry them without inventing uncertainty.
+- **Graph and JMAP judge the same identity-less draft create differently.**
+  Graph `send_created_draft` (crates/graph/src/account/pim/send.rs) records
+  the committed unidentified `Created` as `Repeatable`; JMAP `draft_create`
+  records it `Blocking`. Unreviewed whether the difference is intended.
 - **IMAP container operations return a refresh_folders failure after the
   write commits.** The partial-commit record makes this honest; whether to
   return success with a stale registry is a separate API decision.
@@ -316,6 +323,9 @@ Narrow edge cases, audits with no known defect, and design work.
   result with `.ok()`, so an Email create answered in neither map, beside a
   proven submission refusal, becomes `email: None` and `failed_submission`
   returns the bare refusal: nothing records that a staging Email may exist.
+  The same `.ok()` swallows an Email created with no usable id (the
+  `require_created_email_id` MissingField leaf), where the Email certainly
+  exists.
   Recording it needs an uncertain, unidentified staging-Email step, which sits
   next to the owner-ruling entry on leftover staging Emails having no
   routable handle.

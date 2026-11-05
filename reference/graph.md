@@ -2272,7 +2272,10 @@ A provider body that does not parse is `GraphError::Json` ->
 Autodiscover XML answers and the OneDrive upload-session 202 and drive-item
 bodies all raise it, so its diagnostic label says only "provider response did
 not parse" and each producer's message names its own source and format (the
-REST funnel prefixes "Graph REST JSON body"). A complete answer that parsed but is semantically
+REST funnel prefixes "Graph REST JSON body"). Every producer raises it on a
+success status, so it carries `AttemptCause::unreadable_success()`: a write leg
+it fails (a `$batch` call, an upload-session create or chunk) reads as
+`Uncertain` in a partial-commit record. A complete answer that parsed but is semantically
 impossible (a repeated page link, an impossible upload offset, a refused
 upload URL) is `GraphError::ContractViolation` ->
 `Protocol(ContractViolation)`, both with `Acknowledged` evidence. The
