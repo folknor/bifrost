@@ -106,7 +106,10 @@ impl SyncEngine {
     /// Loads through the slot's `ArcSwap` so the caller sees the handle
     /// installed by the most recent reopen. Errors with
     /// `AccountNotAttached` when no slot exists for `account_id`.
-    fn live_account(&self, account_id: &AccountId) -> Result<Arc<Arc<dyn Account>>, Error> {
+    fn live_account(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Arc<crate::types::Incarnation>, Error> {
         let slot = self
             .accounts
             .get(account_id)

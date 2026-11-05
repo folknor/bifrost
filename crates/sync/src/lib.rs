@@ -82,7 +82,8 @@ pub use backfill::{BackfillPolicy, BackfillStrategy};
 // Engine configuration knobs.
 pub use scheduler::{BudgetGate, ConcurrencyBudget, Scheduler, WorkKind};
 pub use types::{
-    BackfillConfig, EngineConfig, MultiplexerConfig, MutationConfig, PushConfig, SchedulerConfig,
+    BackfillConfig, EngineConfig, Incarnation, MultiplexerConfig, MutationConfig, PushConfig,
+    SchedulerConfig,
 };
 
 // Engine-side control implementation, exposed so tests / consumers

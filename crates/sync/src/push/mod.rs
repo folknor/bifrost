@@ -144,9 +144,16 @@ pub(crate) fn route_watch_event(
                 if target.boundary.peek() != BoundaryRequest::Run {
                     return SinkPush::Refused(WatchEvent::Terminated(error));
                 }
+                // Unstamped by policy: an accepted injected directive applies
+                // to whichever incarnation is current when the listener
+                // reaches it. The consumer's watch is not one of the engine's
+                // connections and the push names no instance, and sampling the
+                // current generation here would label an event that may
+                // predate a reattach with the replacement's identity.
                 return match target.reopen_tx.try_send(ReopenRequest::Recovery {
                     scope: directive_target_scope(&directive),
                     error,
+                    generation: None,
                 }) {
                     Ok(()) => SinkPush::Accepted,
                     Err(mpsc::error::TrySendError::Full(ReopenRequest::Recovery {

@@ -67,7 +67,10 @@ impl Fixture {
         stub.push_sessions = Mutex::new(scripts.into());
         let stub = Arc::new(stub);
         let account: Arc<dyn Account> = Arc::<StubAccount>::clone(&stub);
-        let current = Arc::new(ArcSwap::from_pointee(account));
+        let current = Arc::new(ArcSwap::from_pointee(crate::types::Incarnation::new(
+            account,
+            generation_value,
+        )));
         let (generation, gen_rx) = watch::channel(generation_value);
         let (topology, topo_rx) = watch::channel(0);
         let (b, boundary_view) = Boundary::new();

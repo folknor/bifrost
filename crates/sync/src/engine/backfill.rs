@@ -935,7 +935,7 @@ impl BackfillScan {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_backfill_partition_at_boundary(
-    account: &Arc<ArcSwap<Arc<dyn Account>>>,
+    account: &Arc<ArcSwap<crate::types::Incarnation>>,
     account_id: &AccountId,
     scope: CursorScope,
     partition: InventoryPartition,

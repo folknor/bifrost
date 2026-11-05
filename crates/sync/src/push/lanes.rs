@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct PushLanes {
     pub account_id: AccountId,
-    pub current: Arc<ArcSwap<Arc<dyn Account>>>,
+    pub current: Arc<ArcSwap<crate::types::Incarnation>>,
     pub generation: watch::Receiver<u64>,
     pub topology: watch::Receiver<u64>,
     pub ingress: Arc<PushIngress>,

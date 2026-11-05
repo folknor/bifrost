@@ -132,10 +132,13 @@ face.
   `crates/types/src/mutation.rs` still contrasts itself with `StateBased` as
   "optimistic concurrency on the wire".
 - **Engine-internal requests on the published `ReopenRequest`.**
-  `ScopeDeleted`, `EstablishIfAbsent` and `SchemaReset` are engine plumbing
-  whose epochs and generations mean nothing to a consumer, on a `pub` enum
-  re-exported from `lib.rs`. Moving them to a crate-private request enum
-  removes published variants.
+  `ScopeDeleted`, `ScopeCreated`, `EstablishIfAbsent` and `SchemaReset` are
+  engine plumbing whose epochs and generations mean nothing to a consumer, on
+  a `pub` enum re-exported from `lib.rs`. Moving them to a crate-private
+  request enum removes published variants. Same ruling: `PushRecovery` is now
+  identical in meaning to `Recovery { generation: Some(_) }` (both are
+  stamped with the producing incarnation's generation and declined the same
+  way), so merging it into `Recovery` also removes a published variant.
 - **Caller-version residue.** Ruled (2026-10-21) and largely landed. Still
   open: JMAP PIM reads expose no caller type-state field, so a consumer has
   nothing to hand back, although JMAP capabilities already advertise
@@ -249,11 +252,26 @@ Narrow edge cases, audits with no known defect, and design work.
   the `SetIdUnanswered` treatment `updated` / `destroyed` now have. Distinct
   from a returned created object that lacks its server id, which is a
   confirmed create with an unusable identity.
-- **Generation stamps on non-push recovery producers.** Poll tasks, the
-  reconciler, lifecycle reader and deferred inventory still enqueue unstamped
-  `ReopenRequest::Recovery`. A request queued before reattach can act on the
-  replacement. Push session requests carry a generation checked under the
-  reopen lock; extending that fence to other producers is separate.
+- **Consumer-injected terminations cannot be attributed to an incarnation.**
+  `InvalidationSink::push` (`route_watch_event` in
+  `crates/sync/src/push/mod.rs`) sends `ReopenRequest::Recovery` with
+  `generation: None` by policy, so a delayed termination from an obsolete
+  external watch (a webhook or Pub/Sub subscription the consumer runs) still
+  restarts, resets or disables the replacement after a reattach. Closing it
+  needs optional incarnation attribution on the consumer-facing push API
+  (`WatchEvent` or `SinkPush` side) while keeping the unattributed door;
+  sampling the current generation at push time was rejected, since it labels
+  an old event with the new identity.
+- **Lifecycle `Renamed` can lose its create half.** Deleting the old scope can
+  remove the last registered folder cursor, after which
+  `membership_to_cursor_scopes` finds no shape for the new membership and
+  raises no `ScopeCreated`. Pre-existing.
+- **`ScopeCreated` listener arm has no end-to-end test.**
+  `created_lifecycle_requests_establishment_only_if_absent` pins only the
+  multiplexer's routing; a listener arm that restarted a registered scope
+  would pass it. Nor do tests independently pin the lifecycle, bulk or
+  deferred-inventory stamp attribution (the listener decline and the
+  reconciler stamp are pinned).
 - **Existing submission-item and stream directive sends await bounded
   `reopen_tx` while holding campaign activity and admission.** A handler
   waiting for activity drain could wait on the sender. Read-back forwarding

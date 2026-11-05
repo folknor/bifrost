@@ -1184,6 +1184,32 @@ async fn completed_reset_establishments_park_as_scope_repairs_on_a_second_pause(
 
 #[tokio::test(start_paused = true)]
 async fn a_stale_push_recovery_is_declined_after_its_account_was_replaced() {
+    stale_requests_are_declined_after_their_account_was_replaced(|error| {
+        ReopenRequest::PushRecovery {
+            scope: None,
+            error,
+            generation: 0,
+        }
+    })
+    .await;
+}
+
+/// The same fence for the non-push producers: two drives, a lifecycle stream
+/// or a mutation campaign failing on the same connection each raise
+/// `RestartAccount`, and only the first may replace the account.
+#[tokio::test(start_paused = true)]
+async fn a_stale_stamped_recovery_is_declined_after_its_account_was_replaced() {
+    stale_requests_are_declined_after_their_account_was_replaced(|error| ReopenRequest::Recovery {
+        scope: None,
+        error,
+        generation: Some(0),
+    })
+    .await;
+}
+
+async fn stale_requests_are_declined_after_their_account_was_replaced(
+    request: impl Fn(bifrost_types::AccountError) -> ReopenRequest,
+) {
     let initial = Arc::new(common::StubAccount::new(vec![]));
     let replacement = Arc::new(common::StubAccount::new(vec![]));
     let fixture = Fixture::new(Arc::new(common::StubFactory::queue(vec![
@@ -1204,11 +1230,7 @@ async fn a_stale_push_recovery_is_declined_after_its_account_was_replaced() {
         fixture
             .slot
             .reopen_tx
-            .send(ReopenRequest::PushRecovery {
-                scope: None,
-                error: error.clone(),
-                generation: 0,
-            })
+            .send(request(error.clone()))
             .await
             .unwrap();
     }
@@ -1216,6 +1238,7 @@ async fn a_stale_push_recovery_is_declined_after_its_account_was_replaced() {
         tokio::task::yield_now().await;
     }
     assert_eq!(*fixture.slot.account_generation_tx.borrow(), 1);
+    assert_eq!(fixture.slot.current.load().generation(), 1);
     assert_eq!(replacement.closed.load(Ordering::SeqCst), 0);
     fixture.engine.shutdown().await.unwrap();
 }

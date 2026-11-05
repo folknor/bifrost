@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bifrost_types::{
-    Account, AccountError, AccountId, AccountOperation, ChangeCursor, Checkpoint, CursorScope,
-    MembershipScope, ScopeLifecycle, SyncEvent,
+    Account, AccountError, AccountId, ChangeCursor, Checkpoint, CursorScope, MembershipScope,
+    ScopeLifecycle, SyncEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -663,10 +663,22 @@ pub enum ReopenRequest {
         error: AccountError,
         generation: u64,
     },
-    /// Account error observed at the scope's stream terminus.
+    /// Account error observed at the scope's stream terminus, or raised by a
+    /// mutation campaign or a cold-start walk.
+    ///
+    /// `generation` is the generation of the incarnation
+    /// ([`crate::Incarnation`]) whose operation failed. A stamped request is
+    /// declined, under the reopen lock and before any effect, once a reattach
+    /// has installed a different incarnation: a directive about the retired
+    /// connection must not restart, reset or disable its replacement, and the
+    /// replacement's own workers raise it again if the fault persists. `None`
+    /// acts on whichever incarnation is current when the listener reaches it;
+    /// the engine leaves only a consumer-injected `InvalidationSink::push`
+    /// termination unstamped, since nothing names the instance it came from.
     Recovery {
         scope: Option<CursorScope>,
         error: AccountError,
+        generation: Option<u64>,
     },
     /// A provider lifecycle event deleted this scope's folder. The engine
     /// must purge the scope's durable rows - the change cursor AND the
@@ -676,6 +688,13 @@ pub enum ReopenRequest {
     /// new incarnation's entire cold-start walk: data invisibility, not
     /// just a leaked row.
     ScopeDeleted { scope: CursorScope },
+    /// A provider lifecycle event created this scope's folder. The engine
+    /// establishes it unless it is already registered: a reattach whose
+    /// discovery ran while this request was queued may have established it on
+    /// the replacement already, and that cursor must not be reset. Not fenced
+    /// by account generation, since it states a fact about the server rather
+    /// than about the connection that observed it.
+    ScopeCreated { scope: CursorScope },
     /// Engine plumbing: establish `scope` unless it is already registered or
     /// a provider deletion moved its lifecycle epoch past `epoch` since the
     /// obligation was recorded. Raised by parked scope repairs and by the
@@ -836,7 +855,7 @@ static SCOPE_TOKEN_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// a `tokio::spawn`.
 pub struct Multiplexer {
     pub account_id: AccountId,
-    pub account: Arc<ArcSwap<Arc<dyn Account>>>,
+    pub account: Arc<ArcSwap<crate::types::Incarnation>>,
     pub account_generation: watch::Receiver<u64>,
     pub cursors: Arc<CursorRegistry>,
     pub config: MultiplexerConfig,
@@ -1033,6 +1052,11 @@ impl Multiplexer {
                                                 .send(ReopenRequest::Recovery {
                                                     scope: None,
                                                     error: err,
+                                                    // The incarnation whose stream
+                                                    // this is: a request queued past
+                                                    // a reattach must not restart
+                                                    // the replacement.
+                                                    generation: Some(acc.generation()),
                                                 })
                                                 .await
                                                 .is_err()
@@ -1195,7 +1219,7 @@ impl Multiplexer {
 #[allow(clippy::too_many_arguments)]
 fn spawn_and_track_scope_poll(
     account_id: AccountId,
-    account: Arc<ArcSwap<Arc<dyn Account>>>,
+    account: Arc<ArcSwap<crate::types::Incarnation>>,
     cursors: Arc<CursorRegistry>,
     config: MultiplexerConfig,
     boundary: BoundaryView,
@@ -1365,7 +1389,7 @@ pub(crate) fn cancel_scope_token(tokens: &ScopeTokens, scope: &CursorScope) {
 #[allow(clippy::too_many_arguments)]
 fn spawn_missing_scope_polls(
     account_id: AccountId,
-    account: Arc<ArcSwap<Arc<dyn Account>>>,
+    account: Arc<ArcSwap<crate::types::Incarnation>>,
     cursors: Arc<CursorRegistry>,
     config: MultiplexerConfig,
     boundary: BoundaryView,
@@ -1417,7 +1441,7 @@ fn spawn_missing_scope_polls(
 #[allow(clippy::too_many_arguments)]
 async fn spawn_scope_poll_inner(
     account_id: AccountId,
-    account: Arc<ArcSwap<Arc<dyn Account>>>,
+    account: Arc<ArcSwap<crate::types::Incarnation>>,
     cursors: Arc<CursorRegistry>,
     config: MultiplexerConfig,
     mut boundary: BoundaryView,
@@ -1604,7 +1628,7 @@ async fn spawn_scope_poll_inner(
                     let advanced = advance_cursors
                         .snapshot(&advance_scope)
                         .is_some_and(|c| c.server_state.bytes != pre_advance_state);
-                    Some((advanced, outcome))
+                    Some((advanced, outcome, acc_arc.generation()))
                 }
             }) => driven,
         };
@@ -1615,7 +1639,7 @@ async fn spawn_scope_poll_inner(
             // cleanly; if the scope is re-established the 1s scan respawns us.
             return PollExit::Retire;
         };
-        let Some((advanced, outcome)) = driven else {
+        let Some((advanced, outcome, generation)) = driven else {
             // Held at the last check: wait it out at the top of the loop.
             continue;
         };
@@ -1623,6 +1647,7 @@ async fn spawn_scope_poll_inner(
             &scope,
             outcome,
             advanced,
+            generation,
             &reopen_tx,
             &account_id,
             &throttles,
@@ -1711,6 +1736,9 @@ async fn handle_drive_outcome(
     // re-read here - the lease is already released by the time this runs, so
     // a concurrent push reconcile could be credited to this drive.
     advanced: bool,
+    // The generation of the incarnation the drive ran against, stamped on any
+    // engine directive so the listener declines it once that account is gone.
+    generation: u64,
     reopen_tx: &mpsc::Sender<ReopenRequest>,
     account_id: &AccountId,
     throttles: &StdMutex<crate::recovery::ThrottleBucket>,
@@ -1810,6 +1838,7 @@ async fn handle_drive_outcome(
                         .send(ReopenRequest::Recovery {
                             scope: directive_scope,
                             error: original,
+                            generation: Some(generation),
                         })
                         .await;
                     DriveRecovery {
@@ -1880,8 +1909,8 @@ pub(crate) fn retire_deleted_scope(
 /// Apply one `ScopeLifecycle` transition to the live registry, the poll
 /// tokens, and the engine's reopen channel.
 ///
-/// `Created` asks the engine (via a synthesized restart-scope error) to
-/// establish the new scope's cursor. `Deleted` cancels the poll task,
+/// `Created` asks the engine (`ReopenRequest::ScopeCreated`) to
+/// establish the new scope's cursor unless it is already registered. `Deleted` cancels the poll task,
 /// drops the in-memory cursor, and raises `ReopenRequest::ScopeDeleted`
 /// so the engine purges the scope's DURABLE rows too - change cursor and
 /// backfill rows, completion marker included; without that, a folder
@@ -1945,19 +1974,21 @@ async fn apply_lifecycle_transition(
         for scope in membership_to_cursor_scopes(cursors, membership) {
             // The cursor registry has no entry yet; the poll task would
             // see snapshot=None and exit cleanly unless the engine
-            // establishes a cursor first. Synthesize a cursor-invalid
-            // `AccountError` for this scope so the engine's
-            // `handle_account_error` dispatch derives
-            // `Engine(RestartScope(scope))` through the same path it
-            // uses for every other recovery.
-            let error =
-                crate::recovery::restart_scope_error(scope.clone(), AccountOperation::SyncChanges);
-            let _ = reopen_tx
-                .send(ReopenRequest::Recovery {
-                    scope: Some(scope.clone()),
-                    error,
-                })
-                .await;
+            // establishes a cursor first. The obligation is "establish this
+            // folder if it is still absent", not "restart it": the request
+            // can queue behind a reattach whose discovery already established
+            // the folder on the replacement, and a restart would delete that
+            // healthy cursor - stranding the scope if the re-establishment
+            // then failed. Nor is it fenced by account generation: it states
+            // a fact about the server (the folder exists), and the
+            // replacement's discovery may have run before the folder was
+            // created. Deletion is ordered by the channel itself: a later
+            // `Deleted` queues its `ScopeDeleted` behind this request, and the
+            // listener reads the lifecycle epoch only when it handles it. An
+            // epoch read here would predate the listener's own bump for a
+            // deletion queued ahead, and revoke a folder deleted and then
+            // created again.
+            let _ = reopen_tx.send(ReopenRequest::ScopeCreated { scope }).await;
         }
     }
 
@@ -2256,6 +2287,7 @@ mod tests {
             &scope,
             Ok(ChangesEvent::Terminated(error)),
             false,
+            7,
             &reopen_tx,
             &AccountId("cancelled".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),
@@ -2285,6 +2317,7 @@ mod tests {
             &scope,
             Err(Error::Account(error.clone())),
             false,
+            7,
             &reopen_tx,
             &AccountId("routing".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),
@@ -2297,7 +2330,7 @@ mod tests {
         let request = reopen_rx.try_recv().expect("engine directive forwarded");
         assert!(matches!(
             request,
-            ReopenRequest::Recovery { error: routed, .. }
+            ReopenRequest::Recovery { error: routed, generation: Some(7), .. }
                 if routed.kind() == error.kind()
         ));
     }
@@ -2359,6 +2392,44 @@ mod tests {
         ));
     }
 
+    /// A lifecycle `Created` asks for the folder to be established if it is
+    /// still absent. It used to synthesize a `RestartScope`, which, queued
+    /// behind a reattach whose discovery had already established the folder on
+    /// the replacement, deleted that healthy cursor and could strand the scope.
+    #[tokio::test]
+    async fn created_lifecycle_requests_establishment_only_if_absent() {
+        let cursors = CursorRegistry::new();
+        let sibling = CursorScope::Folder(bifrost_types::FolderId("Inbox".into()));
+        cursors.put(bifrost_types::ChangeCursor {
+            scope: sibling,
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: b"state".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        });
+        let folder = bifrost_types::FolderId("Fresh".into());
+        let scope = CursorScope::Folder(folder.clone());
+        let (reopen_tx, mut reopen_rx) = mpsc::channel(4);
+
+        apply_lifecycle_transition(
+            &cursors,
+            &lag_test_control(),
+            &scope_tokens(),
+            &reopen_tx,
+            ScopeLifecycle::Created(bifrost_types::MembershipScope::Folder(folder)),
+        )
+        .await;
+
+        let request = reopen_rx.try_recv().expect("establishment requested");
+        assert!(matches!(
+            request,
+            ReopenRequest::ScopeCreated { scope: requested } if requested == scope
+        ));
+    }
+
     /// A terminal recovery verdict must park the scope, not retire it: a
     /// retired token is exactly what the 1s scan reads as "please respawn",
     /// which turned every terminal changes-stream error into a
@@ -2379,6 +2450,7 @@ mod tests {
             &scope,
             Ok(ChangesEvent::Terminated(error)),
             false,
+            7,
             &reopen_tx,
             &AccountId("terminal".into()),
             &StdMutex::new(crate::recovery::ThrottleBucket::default()),

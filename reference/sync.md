@@ -362,8 +362,34 @@ the consumer's side is both cheaper and better informed. An
 default-on would be wrong for most deployments); an
 `accounts_awaiting_rediscovery()` accessor that exposes the candidate set
 without owning the clock is the alternative to revisit first if consumer
-footwork turns out to be the problem. A generation watch wakes
-the push and lifecycle readers even when their old streams never end.
+footwork turns out to be the problem. The slot's `current` is an
+`ArcSwap<Incarnation>`: the account together with the account generation it
+was installed under (zero at attach, one more per committed reattach), swapped
+as one value under the reopen lock. A generation watch, published after the
+swap with the same number, wakes the push and lifecycle readers even when
+their old streams never end; it is a wake signal only, and a stale recovery
+request is judged against the installed incarnation, never against the watch,
+since a read of the watch and the account could straddle the cutover.
+
+Recovery requests are stamped with the generation of the incarnation whose
+operation failed: `PushRecovery { generation, .. }` from push lanes and
+`Recovery { generation: Some(g), .. }` from poll drives, the lifecycle reader's
+stream terminations, push reconciler drives and mutation campaigns (every
+read-back, item and stream directive), and the deferred inventory worker's
+in-task dispatch. Every engine-directive arm declines a stamped request under
+the reopen lock, before any effect, once a different incarnation is installed:
+two drives failing on one connection both raise `RestartAccount`, and only the
+first may replace it; a stale `SchemaIncompatible` or `DisableScope` must not
+reset or disable the replacement. Declining is safe because the replacement's
+own workers re-drive the preserved cursors and streams and raise the directive
+again if the fault persists, and a cursorless deferred scope is established by
+reattach's own discovery. The only unstamped producer is a consumer-injected
+`InvalidationSink::push` termination, which by policy acts on whichever
+incarnation is current: the consumer's watch is not one of the engine's
+connections, and sampling the current generation at push time would label an
+event that may predate a reattach with the replacement's identity. Pinned by
+`a_stale_push_recovery_is_declined_after_its_account_was_replaced` and
+`a_stale_stamped_recovery_is_declined_after_its_account_was_replaced`.
 
 Cursor and membership topology live under one registry state lock, so
 reattach replaces both atomically. The same replacement increments a
@@ -999,8 +1025,15 @@ and the accompanying warning is what tells the consumer to reconcile.
   `Created` and `Renamed` consult the registered cursor shapes.
   Account-wide and type-wide models already cover the new membership
   and create no cursor. Per-folder and query models translate the
-  membership into matching `RestartScope` requests so the engine
-  establishes only shapes the protocol already advertises. `Deleted`
+  membership into matching `ReopenRequest::ScopeCreated` requests so the
+  engine establishes only shapes the protocol already advertises. The
+  listener establishes such a scope only if it is still absent, reading its
+  lifecycle epoch under the reopen lock when it handles the request: a
+  reattach whose discovery ran while the request was queued may already have
+  established it on the replacement, and a restart would delete that healthy
+  cursor. Deletion is ordered by the channel, and an epoch read by the
+  multiplexer would predate the listener's own bump for a deletion queued
+  ahead, revoking a folder deleted and created again. `Deleted`
   (and the delete half of `Renamed`) cancels the per-scope token, drops
   the in-memory cursor, and raises `ReopenRequest::ScopeDeleted`, on
   which the engine's reopen listener purges the scope's durable rows in
@@ -1904,7 +1937,11 @@ against a larger registry does not itself coarsen. A paused drive restores its
 scope and parks under both `Pause` and `CheckpointNow`. Scope-local throttle
 holds defer only their scopes. Account-wide directives retain the remainder
 under a hold until the generation changes or 30 seconds elapse; the stored
-generation, rather than a bare watch wake, decides whether it changed. Ready
+generation, rather than a bare watch wake, decides whether it changed. It is
+the generation of the incarnation the failing drive ran on, not the watch read
+after the hand-off, so a reattach landing during the hand-off releases the hold
+at once (pinned by
+`a_reattach_during_the_failing_drive_releases_the_hold_at_once`). Ready
 work sweeps before the task waits, so resuming needs no additional hint.
 Parked, deleted and refused scopes discharge their work rather than spin.
 Account errors from drives enter the same recovery path as stream terminations.
@@ -1924,7 +1961,10 @@ broadcasts its `Terminated` instead); recovery broadcasts nothing (the owed
 reconcile is the signal).
 
 Lane directives are stamped `PushRecovery { generation, scope, error }` and
-validated under the reopen lock before effects. Pending directives flush only
+validated under the reopen lock before effects, like every stamped recovery
+request (see the reattach section). A lane reads its generation from the
+watch before loading the incarnation, so its stamp is never newer than the
+account it runs on. Pending directives flush only
 while the account boundary reads Run, without blocking session polling or
 stop. Every engine subscribe/unsubscribe call outside reattach bumps topology,
 including cancellation and orphan retries. Maintenance sessions receive a gate
@@ -2045,9 +2085,9 @@ not repeat the clear. Pinned by
 
 A `Created` lifecycle scope, or a deferred inventory scope, has no cursor, so a
 repair declined under a pause has nothing for the poll to re-raise the
-directive from. `handle_account_error` returns it as a follow-up, and
-`SlotContext::recover` (the reopen listener and the deferred-inventory worker
-both dispatch through it) parks it in the slot's `DeferredScopeRepairs` with
+directive from. The dispatch returns it as a follow-up, and the reopen
+listener (directly, or through `SlotContext::recover`, which the
+deferred-inventory worker also dispatches through) parks it in the slot's `DeferredScopeRepairs` with
 the scope's lifecycle epoch. Each parked scope is a small task that waits for
 the boundary to read `Run`, claims only the map entry matching its captured
 epoch, and sends `EstablishIfAbsent` back through the slot's reopen channel. It

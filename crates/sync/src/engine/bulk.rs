@@ -453,6 +453,10 @@ impl SyncEngine {
                 }
             };
             let account = slot.current.load_full();
+            // Every directive this action raises is stamped with the incarnation
+            // it ran against, so one queued past a reattach is declined rather
+            // than restarting, resetting or disabling the replacement.
+            let incarnation = Some(account.generation());
             let cohort = &mut cohorts[index];
             let keys = if cohort.readback {
                 crate::recovery::declared_keys(
@@ -599,7 +603,11 @@ impl SyncEngine {
                 for (scope, error) in directives {
                     let _ = slot
                         .reopen_tx
-                        .send(ReopenRequest::Recovery { scope, error })
+                        .send(ReopenRequest::Recovery {
+                            scope,
+                            error,
+                            generation: incarnation,
+                        })
                         .await;
                 }
                 continue;
@@ -773,7 +781,11 @@ impl SyncEngine {
                                     let scope = crate::recovery::directive_target_scope(&directive);
                                     let _ = slot
                                         .reopen_tx
-                                        .send(ReopenRequest::Recovery { scope, error })
+                                        .send(ReopenRequest::Recovery {
+                                            scope,
+                                            error,
+                                            generation: incarnation,
+                                        })
                                         .await;
                                 }
                                 blocked_by_engine = true;
@@ -940,6 +952,7 @@ impl SyncEngine {
                                         .send(ReopenRequest::Recovery {
                                             scope,
                                             error: original,
+                                            generation: incarnation,
                                         })
                                         .await;
                                 }

@@ -251,7 +251,9 @@ impl SyncEngine {
 
         // ArcSwap holds the current `Arc<dyn Account>` so spawned
         // workers see post-reopen handles immediately.
-        let current: Arc<ArcSwap<Arc<dyn Account>>> = Arc::new(ArcSwap::from(Arc::new(opened)));
+        let current: Arc<ArcSwap<crate::types::Incarnation>> = Arc::new(ArcSwap::from_pointee(
+            crate::types::Incarnation::new(opened, 0),
+        ));
         let (account_generation_tx, account_generation_rx) = watch::channel(0_u64);
         let reopen_lock = Arc::new(AsyncMutex::new(()));
 
@@ -565,11 +567,15 @@ impl SyncEngine {
                             match req {
                                 ReopenRequest::PushRecovery { scope, error, generation } => {
                                     reopen_ctx
-                                        .recover_stamped(scope, error, Some(generation))
+                                        .recover(scope, error, Some(generation))
                                         .await;
                                 }
-                                ReopenRequest::Recovery { scope, error } => {
-                                    reopen_ctx.recover(scope, error).await;
+                                ReopenRequest::Recovery {
+                                    scope,
+                                    error,
+                                    generation,
+                                } => {
+                                    reopen_ctx.recover(scope, error, generation).await;
                                 }
                                 // Both run under the reopen lock, like every
                                 // other scope repair.
@@ -577,6 +583,22 @@ impl SyncEngine {
                                     let writer = reopen_ctx.writer();
                                     let recovery = reopen_ctx.recovery(&writer);
                                     let _guard = reopen_ctx.reopen_lock.lock().await;
+                                    let followup = super::reattach::establish_if_absent(
+                                        &recovery, scope, epoch,
+                                    )
+                                    .await;
+                                    reopen_ctx.park_followup(followup);
+                                }
+                                // The epoch is read here, under the lock, not by
+                                // the multiplexer: a deletion queued ahead of
+                                // this request has bumped it by now, and one
+                                // queued behind it bumps it later and retires
+                                // what this establishes.
+                                ReopenRequest::ScopeCreated { scope } => {
+                                    let writer = reopen_ctx.writer();
+                                    let recovery = reopen_ctx.recovery(&writer);
+                                    let _guard = reopen_ctx.reopen_lock.lock().await;
+                                    let epoch = reopen_ctx.cursors.lifecycle_epoch(&scope);
                                     let followup = super::reattach::establish_if_absent(
                                         &recovery, scope, epoch,
                                     )
@@ -970,6 +992,12 @@ pub(super) async fn run_deferred_inventory_establishment(
         }
         held_in_a_row = 0;
         earliest_hold = None;
+        // The generation of the incarnation the walk last ran against. A
+        // terminated walk's recovery is stamped with it: dispatched in-task, it
+        // can still reach the listener's arms after a reattach, and must not act
+        // on the replacement, whose own reattach discovery establishes the
+        // scope afresh.
+        let mut walked_generation: u64;
         let outcome = loop {
             if !control.wait_until_running(&shutdown).await {
                 return;
@@ -1037,6 +1065,7 @@ pub(super) async fn run_deferred_inventory_establishment(
             // against: a reopen during the waits above can install one whose
             // declaration differs from the keys computed before them.
             let acc_arc = account.load_full();
+            walked_generation = acc_arc.generation();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();
             let final_keys = crate::recovery::declared_keys(
                 acc,
@@ -1143,7 +1172,8 @@ pub(super) async fn run_deferred_inventory_establishment(
                 );
             }
             Ok(crate::multiplexer::FusionOutcome::Terminated(error)) => {
-                ctx.recover(Some(scope.clone()), error).await;
+                ctx.recover(Some(scope.clone()), error, Some(walked_generation))
+                    .await;
             }
             Err(err) => {
                 tracing::warn!(

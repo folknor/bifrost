@@ -264,10 +264,73 @@ impl Default for MutationConfig {
     }
 }
 
+/// One installed account instance together with the account generation it was
+/// installed under.
+///
+/// The engine swaps whole incarnations, so a worker that loads one holds the
+/// account and its generation from the same atomic read. A recovery request
+/// stamps the generation of the incarnation its failing operation ran
+/// against, and the reopen listener declines it, under the reopen lock, once a
+/// reattach has installed a different one. Reading the generation from the
+/// account-generation watch instead would straddle the cutover: reattach swaps
+/// the account and only afterwards publishes the watch, so a read of the two
+/// could pair an old account with a new generation.
+///
+/// Derefs to the account, so `incarnation.capabilities()` and
+/// `incarnation.as_ref().as_ref()` reach it directly.
+#[derive(Clone)]
+pub struct Incarnation {
+    account: Arc<dyn Account>,
+    generation: u64,
+}
+
+impl Incarnation {
+    #[must_use]
+    pub fn new(account: Arc<dyn Account>, generation: u64) -> Self {
+        Self {
+            account,
+            generation,
+        }
+    }
+
+    /// The account generation this instance was installed under: zero at
+    /// attach, one more at every committed reattach.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn account(&self) -> &Arc<dyn Account> {
+        &self.account
+    }
+}
+
+impl std::ops::Deref for Incarnation {
+    type Target = Arc<dyn Account>;
+    fn deref(&self) -> &Self::Target {
+        &self.account
+    }
+}
+
+impl AsRef<dyn Account> for Incarnation {
+    fn as_ref(&self) -> &(dyn Account + 'static) {
+        self.account.as_ref()
+    }
+}
+
+impl std::fmt::Debug for Incarnation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Incarnation")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Engine-side per-account state. Held inside the engine's
 /// `DashMap<AccountId, Arc<AccountSlot>>`.
 ///
-/// `current` is an `ArcSwap<Arc<dyn Account>>` so a reopen swap
+/// `current` is an `ArcSwap<Incarnation>` so a reopen swap
 /// becomes visible to spawned workers (reconciler, multiplexer,
 /// backfill, mutation) at their next iteration without re-spawning.
 /// Workers load with `current.load_full()`.
@@ -277,10 +340,12 @@ pub(crate) struct AccountSlot {
     pub bandwidth_budget: Option<bifrost_net::BandwidthBudget>,
     pub scheduler: Scheduler,
     pub factory: Arc<dyn AccountFactory>,
-    pub current: Arc<ArcSwap<Arc<dyn Account>>>,
-    /// Monotonic signal bumped after a successful handle swap. Long-
-    /// lived push and lifecycle streams select on it so they drop the
-    /// old stream even when that stream never terminates itself.
+    pub current: Arc<ArcSwap<Incarnation>>,
+    /// Monotonic signal bumped after a successful handle swap, carrying the
+    /// generation of the incarnation just installed. Long-lived push and
+    /// lifecycle streams select on it so they drop the old stream even when
+    /// that stream never terminates itself. A wake signal only: a stale
+    /// recovery request is judged against `current`, never against this.
     pub account_generation_tx: watch::Sender<u64>,
     pub push_health_tx: watch::Sender<crate::push::health::PushHealth>,
     pub push_topology_tx: watch::Sender<u64>,

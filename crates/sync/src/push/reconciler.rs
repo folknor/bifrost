@@ -22,7 +22,7 @@ use crate::multiplexer::{ChangeDelivery, ChangesEvent, ReopenRequest, drive_chan
 
 pub struct Reconciler {
     pub account_id: AccountId,
-    pub account: Arc<ArcSwap<Arc<dyn Account>>>,
+    pub account: Arc<ArcSwap<crate::types::Incarnation>>,
     pub cursors: Arc<CursorRegistry>,
     /// The account's change delivery gate. The reconciler's drives publish
     /// checkpoints, and a published checkpoint has to know whether a NUMBERED
@@ -331,7 +331,10 @@ impl Reconciler {
                         // throttled drive's hint is kept is a question about
                         // THIS account's declaration, not the one computed
                         // before admission.
-                        (final_keys, Some((registry_generation, outcome)))
+                        (
+                            final_keys,
+                            Some((registry_generation, account_swap.generation(), outcome)),
+                        )
                     }
                 }) => driven,
             };
@@ -350,7 +353,7 @@ impl Reconciler {
                 deferred.insert(scope);
                 continue;
             };
-            let (drive_generation, outcome) = outcome;
+            let (drive_generation, incarnation, outcome) = outcome;
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 // An account error already carries a complete recovery
@@ -457,11 +460,19 @@ impl Reconciler {
                                 .send(ReopenRequest::Recovery {
                                     scope: directive_scope,
                                     error: original,
+                                    generation: Some(incarnation),
                                 })
                                 .await;
                             if account_wide {
+                                // Held against the generation the failing
+                                // drive ran on, not the watch read after the
+                                // send: a reattach landing during the send
+                                // would otherwise be marked seen, and the
+                                // remainder would sit out the full 30s
+                                // fallback while the listener declines this
+                                // now-stale request.
                                 work.hold = Some((
-                                    *self.account_generation.borrow_and_update(),
+                                    incarnation,
                                     tokio::time::Instant::now()
                                         + std::time::Duration::from_secs(30),
                                 ));
@@ -589,7 +600,9 @@ mod tests {
             let shutdown = CancellationToken::new();
             let reconciler = Reconciler {
                 account_id,
-                account: Arc::new(ArcSwap::from_pointee(account)),
+                account: Arc::new(ArcSwap::from_pointee(crate::types::Incarnation::new(
+                    account, 0,
+                ))),
                 cursors,
                 delivery: Arc::new(ChangeDelivery::new(tx)),
                 boundary: view,

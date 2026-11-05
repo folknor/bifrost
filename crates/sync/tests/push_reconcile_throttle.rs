@@ -85,7 +85,9 @@ async fn sweep(scope_tokens: ScopeTokens) -> Vec<CursorScope> {
 
     let reconciler = Reconciler {
         account_id,
-        account: Arc::new(ArcSwap::from_pointee(account)),
+        account: Arc::new(ArcSwap::from_pointee(bifrost_sync::Incarnation::new(
+            account, 0,
+        ))),
         cursors,
         delivery: Arc::new(bifrost_sync::multiplexer::ChangeDelivery::new(changes_tx)),
         boundary: boundary_view,
@@ -158,26 +160,70 @@ struct Harness {
     ingress: Arc<bifrost_sync::push::PushIngress>,
     boundary: Boundary,
     shutdown: CancellationToken,
-    generation: tokio::sync::watch::Sender<u64>,
+    generation: Arc<tokio::sync::watch::Sender<u64>>,
+    account: Arc<ArcSwap<bifrost_sync::Incarnation>>,
     reopen: mpsc::Receiver<bifrost_sync::ReopenRequest>,
     driven: Arc<Mutex<Vec<CursorScope>>>,
     task: tokio::task::JoinHandle<()>,
 }
+
+/// What an engine reattach does to the reconciler's view, in production order:
+/// install the next incarnation, then publish its generation on the watch.
+fn reattach(account: &ArcSwap<bifrost_sync::Incarnation>, watch: &tokio::sync::watch::Sender<u64>) {
+    let current = account.load_full();
+    let next = current.generation() + 1;
+    account.store(Arc::new(bifrost_sync::Incarnation::new(
+        Arc::clone(current.account()),
+        next,
+    )));
+    watch.send_replace(next);
+}
+
 impl Harness {
     fn new(error: Option<bifrost_types::AccountError>, stall: bool) -> Self {
-        Self::with_capacity(error, stall, 4)
+        Self::build(error, stall, 4, false)
     }
     fn with_capacity(
         error: Option<bifrost_types::AccountError>,
         stall: bool,
         capacity: usize,
     ) -> Self {
+        Self::build(error, stall, capacity, false)
+    }
+    /// The first drive's failure is produced while a reattach lands: the
+    /// drive ran on incarnation 0, and the replacement is installed and
+    /// published before the reconciler sees the outcome.
+    fn reattaching_during_first_drive(error: bifrost_types::AccountError) -> Self {
+        Self::build(Some(error), false, 4, true)
+    }
+    fn build(
+        error: Option<bifrost_types::AccountError>,
+        stall: bool,
+        capacity: usize,
+        reattach_on_first_drive: bool,
+    ) -> Self {
         let scopes = vec![scope("one"), scope("two")];
         let driven = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&driven);
+        let (generation, generation_rx) = tokio::sync::watch::channel(0);
+        let generation = Arc::new(generation);
+        let slot: Arc<std::sync::OnceLock<Arc<ArcSwap<bifrost_sync::Incarnation>>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let hook_slot = Arc::clone(&slot);
+        let hook_watch = Arc::clone(&generation);
         let mut stub = StubAccount::new(scopes.clone());
         stub.changes_hook = Some(Arc::new(move |cursor| {
-            recorder.lock().expect("drives").push(cursor.scope.clone());
+            let first = {
+                let mut drives = recorder.lock().expect("drives");
+                drives.push(cursor.scope.clone());
+                drives.len() == 1
+            };
+            if reattach_on_first_drive
+                && first
+                && let Some(account) = hook_slot.get()
+            {
+                reattach(account, &hook_watch);
+            }
             error
                 .clone()
                 .map(SyncEvent::Terminated)
@@ -188,6 +234,10 @@ impl Harness {
             stub.changes_stall = Some(Arc::new(tokio::sync::Notify::new()));
         }
         let account: Arc<dyn Account> = Arc::new(stub);
+        let account = Arc::new(ArcSwap::from_pointee(bifrost_sync::Incarnation::new(
+            account, 0,
+        )));
+        let _ = slot.set(Arc::clone(&account));
         let cursors = Arc::new(CursorRegistry::new());
         for scope in scopes {
             cursors.put(cursor_for(&scope, b"live"));
@@ -199,14 +249,13 @@ impl Harness {
         let control = SyncControl::new(account_id.clone(), boundary.clone(), priority, bandwidth);
         let (tx, _) = broadcast::channel(8);
         let (reopen_tx, reopen) = mpsc::channel(8);
-        let (generation, generation_rx) = tokio::sync::watch::channel(0);
         let gate = BudgetGate::new(ConcurrencyBudget::default());
         gate.register(account_id.clone());
         let shutdown = CancellationToken::new();
         let ingress = Arc::new(bifrost_sync::push::PushIngress::new(capacity));
         let reconciler = Reconciler {
             account_id,
-            account: Arc::new(ArcSwap::from_pointee(account)),
+            account: Arc::clone(&account),
             cursors,
             delivery: Arc::new(bifrost_sync::multiplexer::ChangeDelivery::new(tx)),
             boundary: view,
@@ -224,10 +273,14 @@ impl Harness {
             boundary,
             shutdown,
             generation,
+            account,
             reopen,
             driven,
             task,
         }
+    }
+    fn reattach(&self) {
+        reattach(&self.account, &self.generation);
     }
     async fn settle(&self) {
         for _ in 0..100 {
@@ -275,8 +328,14 @@ async fn an_account_wide_directive_holds_the_remainder_until_the_generation_move
     harness.ingress.request_full();
     harness.settle().await;
     assert_eq!(harness.drives(), 1);
-    assert!(harness.reopen.try_recv().is_ok());
-    harness.generation.send_replace(1);
+    assert!(matches!(
+        harness.reopen.try_recv(),
+        Ok(bifrost_sync::ReopenRequest::Recovery {
+            generation: Some(0),
+            ..
+        })
+    ));
+    harness.reattach();
     harness.settle().await;
     assert_eq!(
         harness.drives(),
@@ -316,7 +375,7 @@ async fn a_hold_is_not_cleared_by_an_already_published_generation() {
     .try_build()
     .expect("restart");
     let harness = Harness::new(Some(error), false);
-    harness.generation.send_replace(1);
+    harness.reattach();
     harness.ingress.request_full();
     harness.settle().await;
     assert_eq!(harness.drives(), 1);
@@ -326,6 +385,37 @@ async fn a_hold_is_not_cleared_by_an_already_published_generation() {
         harness.drives(),
         1,
         "a stale watch notification must not clear the new hold"
+    );
+    harness.close().await;
+}
+
+/// The hold names the incarnation the failing drive ran on. A reattach that
+/// lands while the drive's directive is being handed over is already published
+/// when the hold is recorded; reading the watch at that point marked the
+/// replacement as seen, so the remainder sat out the whole 30s fallback while
+/// the listener declined the now-stale directive.
+#[tokio::test(start_paused = true)]
+async fn a_reattach_during_the_failing_drive_releases_the_hold_at_once() {
+    let error = AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
+        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
+    )
+    .try_build()
+    .expect("restart");
+    let mut harness = Harness::reattaching_during_first_drive(error);
+    harness.ingress.request_full();
+    harness.settle().await;
+    assert!(matches!(
+        harness.reopen.try_recv(),
+        Ok(bifrost_sync::ReopenRequest::Recovery {
+            generation: Some(0),
+            ..
+        })
+    ));
+    assert_eq!(
+        harness.drives(),
+        2,
+        "the sibling must be driven on the replacement without waiting out the hold"
     );
     harness.close().await;
 }

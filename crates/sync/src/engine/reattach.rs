@@ -11,7 +11,7 @@ pub(crate) struct RecoveryContext<'a> {
     pub deferred_schema_reset: &'a Arc<DeferredSchemaReset>,
     pub bandwidth_budget: Option<&'a bifrost_net::BandwidthBudget>,
     pub factory: &'a Arc<dyn AccountFactory>,
-    pub current: &'a Arc<ArcSwap<Arc<dyn Account>>>,
+    pub current: &'a Arc<ArcSwap<crate::types::Incarnation>>,
     pub cursors: &'a Arc<CursorRegistry>,
     pub changes_tx: &'a broadcast::Sender<MultiplexerEvent>,
     pub account_id: &'a AccountId,
@@ -27,8 +27,9 @@ pub(crate) struct RecoveryContext<'a> {
     pub push_retired: &'a watch::Sender<u64>,
     /// Bound on that wait (`EngineConfig::detach_timeout`).
     pub push_drain_wait: Duration,
-    /// The generation a `ReopenRequest::PushRecovery` was stamped with;
-    /// `None` for every other request kind.
+    /// The incarnation generation a stamped request (`PushRecovery`, or a
+    /// `Recovery` carrying one) was raised against; `None` for an unstamped
+    /// request, which acts on whichever incarnation is current.
     pub expected_generation: Option<u64>,
     pub reopen_lock: &'a Arc<AsyncMutex<()>>,
     /// Slot-lifetime open-skip lane; a successful reattach replaces it
@@ -140,7 +141,7 @@ pub(crate) async fn handle_account_error(
                 EngineDirective::RestartAccount | EngineDirective::DowngradeStrategy(_) => None,
                 _ => Some(ctx.reopen_lock.lock().await),
             };
-            if _reopen_guard.is_some() && stale_push_generation(ctx) {
+            if _reopen_guard.is_some() && stale_generation(ctx) {
                 return RecoveryFollowUp::None;
             }
             deferred = handle_engine_directive(ctx, scope, directive, error).await;
@@ -228,8 +229,8 @@ async fn handle_engine_directive(
             // the multiplexer event's `scope` matches the affected
             // scope - not the worker-suggested fallback. (sync-N4)
             //
-            // A declined repair of a scope with no registered cursor - the
-            // synthesized directive a lifecycle `Created` raises, before any
+            // A declined repair of a scope with no registered cursor - a
+            // deferred inventory scope whose walk terminated, before any
             // cursor exists - has no failing cursor to re-raise it after
             // resume, so it is handed back for the listener to re-offer. A
             // scope WITH a cursor needs nothing: the poll raises it again.
@@ -267,7 +268,7 @@ async fn handle_engine_directive(
             // Fence even the warning before releasing the lock for restart's
             // independently admitted loop.
             let warning_guard = ctx.reopen_lock.lock().await;
-            if stale_push_generation(ctx) {
+            if stale_generation(ctx) {
                 return RecoveryFollowUp::None;
             }
             // Route the warning to the scope the downgrade is actually
@@ -312,12 +313,12 @@ async fn handle_engine_directive(
                 // anything else means a later replacement owns the account now.
                 if ctx
                     .expected_generation
-                    .is_some_and(|g| *ctx.account_generation_tx.borrow() != g.saturating_add(1))
+                    .is_some_and(|g| ctx.current.load().generation() != g.saturating_add(1))
                 {
                     tracing::debug!(
                         target: "bifrost.sync.recovery",
                         account = ?ctx.account_id,
-                        "declining stale push scope repair after strategy downgrade"
+                        "declining stale scope repair after strategy downgrade"
                     );
                     return RecoveryFollowUp::None;
                 }
@@ -393,8 +394,8 @@ pub(crate) enum RecoveryFollowUp {
 ///
 /// A repair of a scope that HAS a cursor needs no help: it declines without
 /// touching the cursor, and the poll raises the directive again after resume. A
-/// scope that has none - the directive a lifecycle `Created` synthesizes, before
-/// any cursor exists, or a deferred inventory scope - is invisible to the
+/// scope that has none - a lifecycle `Created` establishment, before any cursor
+/// exists, or a deferred inventory scope - is invisible to the
 /// multiplexer, which only polls registered scopes, so a declined repair of it
 /// would simply be lost.
 ///
@@ -2006,11 +2007,17 @@ async fn reattach_account_paced(
         // replace_from advances the registry generation atomically with the
         // topology swap, so an old stream that finishes later cannot write a
         // cursor minted by the retired connection into this new topology.
-        let previous = ctx.current.swap(Arc::new(Arc::clone(&next)));
+        // The replacement is installed together with its generation, so a
+        // worker that loads it can never pair it with the retiring one.
+        let installed_generation = ctx.current.load().generation().saturating_add(1);
+        let previous = ctx.current.swap(Arc::new(crate::types::Incarnation::new(
+            Arc::clone(&next),
+            installed_generation,
+        )));
         // No await between the swap and this: from here a drop must close the
         // OLD account (the replacement is live) and promote the provisional
         // rows instead of rolling them back.
-        guard.swapped(Arc::clone(previous.as_ref()));
+        guard.swapped(Arc::clone(previous.account()));
         ctx.cursors.replace_topology_preserving_cursors(&staged);
         {
             let mut capabilities = match ctx.capabilities.write() {
@@ -2063,9 +2070,8 @@ async fn reattach_account_paced(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *skips = next_skips;
         }
-        let retiring_generation = *ctx.account_generation_tx.borrow();
-        ctx.account_generation_tx
-            .send_modify(|generation| *generation = generation.saturating_add(1));
+        let retiring_generation = previous.generation();
+        ctx.account_generation_tx.send_replace(installed_generation);
 
         // Past the last abort point, so the rows this reattach inserted are now
         // ordinary durable state. Leaving them marked provisional would let a
@@ -2224,7 +2230,7 @@ async fn restart_account(ctx: &RecoveryContext<'_>) -> bool {
                 continue 'restart;
             };
             let reopen_guard = Arc::clone(ctx.reopen_lock).lock_owned().await;
-            if stale_push_generation(ctx) {
+            if stale_generation(ctx) {
                 return false;
             }
             if pacing.pending_wait(ctx, None, None).is_zero() {
@@ -2638,19 +2644,20 @@ async fn run_establish(
 #[path = "reattach_tests.rs"]
 mod recovery_establishment_tests;
 
-/// True when this request is stamped (`ReopenRequest::PushRecovery`) with an
-/// account generation that has since been replaced. Called under the reopen
-/// lock, before any effect: reattach swaps the account and bumps the
-/// generation under that same lock, so the read cannot straddle a swap.
-fn stale_push_generation(ctx: &RecoveryContext<'_>) -> bool {
+/// True when this request is stamped with the generation of an incarnation
+/// that has since been replaced. Called under the reopen lock, before any
+/// effect: reattach swaps the incarnation under that same lock, so the read
+/// cannot straddle a swap. It reads the installed incarnation, not the
+/// account-generation watch, which reattach publishes only after the swap.
+fn stale_generation(ctx: &RecoveryContext<'_>) -> bool {
     let stale = ctx
         .expected_generation
-        .is_some_and(|g| g != *ctx.account_generation_tx.borrow());
+        .is_some_and(|g| g != ctx.current.load().generation());
     if stale {
         tracing::debug!(
             target: "bifrost.sync.recovery",
             account = ?ctx.account_id,
-            "declining stale push recovery"
+            "declining stale recovery raised against a replaced account"
         );
     }
     stale

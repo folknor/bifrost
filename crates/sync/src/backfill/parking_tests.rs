@@ -117,7 +117,9 @@ impl Harness {
             deferred_schema_reset: Arc::new(crate::engine::DeferredSchemaReset::default()),
             bandwidth_budget: None,
             factory,
-            current: Arc::new(ArcSwap::from_pointee(account)),
+            current: Arc::new(ArcSwap::from_pointee(crate::types::Incarnation::new(
+                account, 0,
+            ))),
             cursors,
             changes_tx,
             account_id,

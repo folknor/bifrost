@@ -23,7 +23,7 @@ pub(super) struct SlotContext {
     /// The currently-open protocol handle. Workers load through the
     /// `ArcSwap` on every hot-path use so a reopen is observed
     /// immediately.
-    pub current: Arc<ArcSwap<Arc<dyn Account>>>,
+    pub current: Arc<ArcSwap<crate::types::Incarnation>>,
     pub cursors: Arc<CursorRegistry>,
     pub changes_tx: broadcast::Sender<MultiplexerEvent>,
     pub account_id: AccountId,
@@ -76,15 +76,14 @@ impl SlotContext {
     /// dispatch declined because the account was paused (or, for an account
     /// reset, could not complete), when nothing else would raise it again. See
     /// [`DeferredScopeRepairs`] and [`DeferredSchemaReset`].
-    pub(super) async fn recover(&self, scope: Option<CursorScope>, error: AccountError) {
-        self.recover_stamped(scope, error, None).await;
-    }
-
-    /// [`Self::recover`] for a request stamped with the account generation
-    /// that raised it (`ReopenRequest::PushRecovery`): every engine-directive
-    /// arm declines it as stale, under the reopen lock and before any effect,
-    /// once the account it described has been replaced.
-    pub(super) async fn recover_stamped(
+    ///
+    /// `expected_generation` is the generation of the incarnation that raised
+    /// the error, when known (`ReopenRequest::PushRecovery`, a stamped
+    /// `ReopenRequest::Recovery`, a deferred inventory walk): every
+    /// engine-directive arm declines a stamped request as stale, under the
+    /// reopen lock and before any effect, once that incarnation has been
+    /// replaced. `None` acts on whichever incarnation is current.
+    pub(super) async fn recover(
         &self,
         scope: Option<CursorScope>,
         error: AccountError,
