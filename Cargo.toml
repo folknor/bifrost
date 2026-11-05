@@ -54,7 +54,7 @@ percent-encoding = "2.3"
 
 # Parsing
 nom = "8"
-caldata = "0.17"
+caldata = "0.18.0"
 
 # Time
 jiff = { version = "0.2", features = ["serde"] }
