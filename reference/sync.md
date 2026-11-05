@@ -400,9 +400,13 @@ event that may predate a reattach with the replacement's identity. The decline
 is pinned by `a_stale_push_recovery_is_declined_after_its_account_was_replaced`
 and `a_stale_stamped_recovery_is_declined_after_its_account_was_replaced`; the
 producers' stamps by `a_lifecycle_termination_is_stamped_with_its_streams_incarnation`,
-`a_deferred_walk_recovery_is_stamped_with_the_incarnation_it_walked` and
-`a_campaigns_scope_directives_are_declined_after_its_account_restart` (item
-directives only), alongside the poll-drive and reconciler tests.
+`a_deferred_walk_recovery_is_stamped_with_the_incarnation_it_walked`, and the
+campaign's three directive lanes by
+`a_campaigns_scope_directives_are_declined_after_its_account_restart` (item),
+`a_campaigns_termination_directive_is_declined_after_its_account_restart`
+(stream termination) and
+`a_campaigns_read_back_directive_is_declined_after_its_account_restart`
+(read-back), alongside the poll-drive and reconciler tests.
 
 Cursor and membership topology live under one registry state lock, so
 reattach replaces both atomically. The same replacement increments a

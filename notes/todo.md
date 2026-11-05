@@ -348,13 +348,6 @@ Narrow edge cases, audits with no known defect, and design work.
   (`WatchEvent` or `SinkPush` side) while keeping the unattributed door;
   sampling the current generation at push time was rejected, since it labels
   an old event with the new identity.
-- **Campaign read-back and stream-termination directive stamps are unpinned.**
-  `forward_campaign_directives` in `crates/sync/src/engine/bulk.rs` has two
-  call sites sharing one `incarnation` read; the item-directive path is pinned
-  through `a_campaigns_scope_directives_are_declined_after_its_account_restart`,
-  so a change that broke only the read-back call site's argument or the
-  stream-termination accumulation would pass. Needs a read-back-lane or
-  `Terminated`-stream variant of that test's two-campaign barrier.
 - **IMAP connect-time STARTTLS expiry carries no evidence.** `setup_timeout`
   in `crates/imap/src/connection/lifecycle.rs` maps every connect-time expiry
   to `Error::Timeout { attempt: None }`, including one after the STARTTLS

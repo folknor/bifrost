@@ -1521,7 +1521,8 @@ async fn a_pause_completes_while_campaign_directives_back_up_the_reopen_channel(
 /// account restart of its own: the listener is serial and that request is
 /// queued behind every request of the first campaign, so its replacement open
 /// proves they were all handled before the establishment count is read. Only
-/// the item-directive path is exercised here. Ablation: stamping the
+/// the item-directive path is exercised here; the stream-termination and
+/// read-back lanes have their own tests below. Ablation: stamping the
 /// campaign's directives with `None` lets every scope restart reach
 /// `establish_initial_cursor`.
 #[tokio::test(start_paused = true)]
@@ -4036,6 +4037,115 @@ async fn an_engine_block_turns_a_ready_reassertion_into_blocked_by_engine() {
         vec![CursorScope::Account],
         "exactly one recovery request forwarded"
     );
+}
+fn restart_account_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
+        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
+    )
+    .try_build()
+    .unwrap()
+}
+fn stale_folder_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CursorInvalid),
+        Cause::State(bifrost_types::StateCause::CursorInvalid),
+    )
+    .scope(bifrost_types::ErrorScope::Cursor(CursorScope::Folder(
+        bifrost_types::FolderId("stale".into()),
+    )))
+    .try_build()
+    .unwrap()
+}
+/// Runs the second campaign of a stamp test and waits until its fresh
+/// `CursorScope::Account` restart is established. The listener is serial and
+/// that request is queued behind every request of the first campaign, so the
+/// establishment proves they were all handled. The sentinel rides the lane
+/// under test, so a lane that stopped forwarding fails the wait. The one-second
+/// sleep lets the first campaign's account restart install the replacement
+/// first; were the sentinel to load the old incarnation it would be declined
+/// and the wait would fail loudly rather than pass.
+async fn second_campaign_establishes_account(
+    engine: &Arc<SyncEngine>,
+    id: &AccountId,
+    state: &ReassertState,
+) {
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    cohort_run(engine, id, &["c"]).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !state
+            .establishes
+            .lock()
+            .unwrap()
+            .contains(&CursorScope::Account)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second campaign's scope restart reaches the listener");
+    assert_eq!(
+        *state.establishes.lock().unwrap(),
+        vec![CursorScope::Account],
+        "a scope directive stamped with the replaced incarnation reached the replacement"
+    );
+}
+/// A campaign stamps the directive its STREAM TERMINATION raises with the
+/// incarnation the action ran against. The first campaign's round reports an
+/// item account restart and then ends `Terminated` with a folder-scoped
+/// cursor error; both directives are forwarded together, so the folder restart
+/// is queued behind the account restart that replaces the account and must be
+/// declined. Ablation: stamping the write tail's directives with `None` lets
+/// `Folder("stale")` reach `establish_initial_cursor` before the sentinel.
+#[tokio::test(start_paused = true)]
+async fn a_campaigns_termination_directive_is_declined_after_its_account_restart() {
+    let mut first = round(&["a"], ItemScript::Failed(restart_account_error()));
+    first.termination = Some(stale_folder_error());
+    let second = RoundScript {
+        termination: Some(engine_error()),
+        ..Default::default()
+    };
+    let state = reassert_state(&["a", "c"], vec![first, second]);
+    let (engine, id) = reassert_engine(&state, 3, 10, true, None).await;
+    let counters = cohort_run(&engine, &id, &["a"]).await.unwrap();
+    assert_eq!(counters.blocked_by_engine, 1);
+    second_campaign_establishes_account(&engine, &id, &state).await;
+}
+/// A campaign stamps the directives its READ-BACK raises with the incarnation
+/// the action ran against. The first campaign's write leaves both targets
+/// uncertain; read-back fails `a` with an account restart and `b` with a
+/// folder-scoped cursor error, in that order, and both are forwarded from the
+/// read-back tail, so the folder restart is queued behind the account restart
+/// and must be declined. Ablation: stamping the read-back tail's directives
+/// with `None` lets `Folder("stale")` reach `establish_initial_cursor` before
+/// the sentinel.
+#[tokio::test(start_paused = true)]
+async fn a_campaigns_read_back_directive_is_declined_after_its_account_restart() {
+    let state = reassert_state(
+        &["a", "b", "c"],
+        vec![
+            round(&["a", "b"], ItemScript::Uncertain(retryable_transport())),
+            round(&["c"], ItemScript::Uncertain(retryable_transport())),
+        ],
+    );
+    for (target, error) in [
+        ("a", restart_account_error()),
+        ("b", stale_folder_error()),
+        ("c", engine_error()),
+    ] {
+        state
+            .observations
+            .lock()
+            .unwrap()
+            .insert(ObjectId(target.into()), Observation::Fail(error));
+    }
+    let (engine, id) = reassert_engine(&state, 3, 10, true, None).await;
+    cohort_run(&engine, &id, &["a", "b"]).await.unwrap();
+    assert_eq!(
+        *state.reads.lock().unwrap().first().unwrap(),
+        vec![ObjectId("a".into()), ObjectId("b".into())]
+    );
+    second_campaign_establishes_account(&engine, &id, &state).await;
 }
 #[tokio::test(start_paused = true)]
 async fn a_guarded_stream_state_refresh_termination_still_retries_with_frozen_versions() {
