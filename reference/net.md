@@ -341,7 +341,9 @@ without sockets or listeners.
 
 The scripted dispatcher is published to downstream crates under the
 `test-support` feature, as `bifrost_net::test_support`: `Canned`
-(a `Response` / `Error` / `Pending` wire outcome), `ScriptedDispatch`
+(one scripted wire outcome: a buffered or streamed response, a body
+that fails or stalls after its chunks, a transport error, or a request
+that never answers), `ScriptedDispatch`
 (answers a script in order, records every `RequestSnapshot`), the
 `canned` / `canned_with_headers` constructors, and the `scripted_net`
 / `scripted_account` builders. Consumers enable it as a

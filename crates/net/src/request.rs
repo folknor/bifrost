@@ -2230,6 +2230,86 @@ mod tests {
         }
     }
 
+    /// A body the server starts and the connection then breaks fails after
+    /// the response was admitted: for `send_streaming` the error comes out
+    /// of the returned stream, past the point the request's own error was
+    /// redacted; for `send` it comes out of body buffering. Under
+    /// `credential_url` both are redacted, earlier-attempt history
+    /// included. The marker rides the I/O error the scripted body fails
+    /// with: `into_byte_stream` keeps the reqwest error, and through it that
+    /// I/O error, as the `Network` source, which the debug rendering quotes
+    /// and redaction must drop. reqwest attaches no URL to a body read
+    /// error and the body `Network` message is fixed text here, so this
+    /// pins the dropped source and the redacted history; message
+    /// replacement itself is pinned by `redact_request_text`'s own test.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_credential_url_request_withholds_the_url_from_its_body_error() {
+        use futures::StreamExt;
+        const URL: &str = "https://upload.test/session/abc?token=preauth";
+        const BODY_URL: &str = "https://body-read.test/session/abc?token=preauth";
+        for (credential, streaming) in [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let script = ScriptedDispatch::new([
+                Canned::Error(Error::Network {
+                    message: format!("error sending request for url ({URL})"),
+                    transmission_state: TransmissionState::Unsent,
+                    source: None,
+                }),
+                Canned::StreamThenError {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    chunks: vec![Bytes::from_static(b"partial")],
+                    message: format!("connection reset reading {BODY_URL}"),
+                },
+            ]);
+            let account =
+                scripted_account(&script, NetConfig::default(), Vec::new(), two_attempts());
+            let mut request = account
+                .get(URL)
+                .without_bearer_auth()
+                .replay(ReplayPolicy::Idempotent);
+            if credential {
+                request = request.credential_url();
+            }
+            let error = if streaming {
+                let mut response = request
+                    .send_streaming()
+                    .await
+                    .expect("second attempt streams");
+                let first = response.body.next().await.expect("a chunk");
+                assert_eq!(first.expect("chunk ok"), Bytes::from_static(b"partial"));
+                response
+                    .body
+                    .next()
+                    .await
+                    .expect("the body fails")
+                    .unwrap_err()
+            } else {
+                request.send().await.map(|_| ()).unwrap_err()
+            };
+            assert_eq!(script.requests().len(), 2, "both attempts went out");
+            assert!(
+                matches!(error.terminal(), Error::Network { .. }),
+                "{error:?}"
+            );
+            assert!(
+                matches!(error, Error::AttemptHistory { .. }),
+                "the earlier attempt rides the body error: {error:?}"
+            );
+            // Two markers, so the history and the body error each have to be
+            // scrubbed on their own: either one alone would satisfy a single
+            // check.
+            let rendered = format!("{error:?} {error}");
+            for marker in ["upload.test", "body-read.test"] {
+                assert_eq!(
+                    rendered.contains(marker),
+                    !credential,
+                    "credential {credential}, streaming {streaming}, {marker}: {rendered}"
+                );
+            }
+        }
+    }
+
     /// The duplicate-send bug. `send_error_to_error` classifies every
     /// non-connect, non-timeout reqwest failure as
     /// `Network { InFlight }` - the side effect may already have landed
