@@ -72,6 +72,60 @@ struct RegistryState {
     /// task's - and because the poll task is not the only drive path: the push
     /// reconciler holds no poll token at all.
     scope_cancels: HashMap<CursorScope, CancellationToken>,
+    /// Cursor shapes of the CURRENT account model: every scope discovered or
+    /// registered since the last topology replacement, which replaces it.
+    /// Lifecycle creation maps a new membership through this, not through the
+    /// live cursors, so a registry that momentarily holds no folder cursor
+    /// (a cross-id rename of the last one, its replacement still queued)
+    /// still knows the account is per-folder.
+    model: ScopeShapes,
+    /// Every shape seen during this attachment, across topology replacements,
+    /// never shrunk. Lifecycle deletion maps through this: a deletion must
+    /// reach a scope whose establishment is queued or parked even when no
+    /// cursor of its shape is registered, and an establishment raised under an
+    /// earlier model can still be outstanding after a reattach.
+    reach: ScopeShapes,
+}
+
+/// The cursor-scope shapes an account model uses, independent of which
+/// concrete scopes currently hold a cursor.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ScopeShapes {
+    /// A `CursorScope::Folder` was seen.
+    pub(crate) folder: bool,
+    /// Every object type a `CursorScope::FolderType` was seen with.
+    pub(crate) folder_types: Vec<bifrost_types::ObjectType>,
+    /// A `CursorScope::Query` was seen.
+    pub(crate) query: bool,
+    /// An account-wide or type-wide scope was seen.
+    pub(crate) wide: bool,
+}
+
+impl ScopeShapes {
+    fn record(&mut self, scope: &CursorScope) {
+        match scope {
+            CursorScope::Folder(_) => self.folder = true,
+            CursorScope::FolderType { ty, .. } => {
+                if !self.folder_types.contains(ty) {
+                    self.folder_types.push(*ty);
+                }
+            }
+            CursorScope::Query(_) => self.query = true,
+            CursorScope::Account | CursorScope::Type(_) => self.wide = true,
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.folder |= other.folder;
+        self.query |= other.query;
+        self.wide |= other.wide;
+        for ty in &other.folder_types {
+            if !self.folder_types.contains(ty) {
+                self.folder_types.push(*ty);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +241,8 @@ impl CursorRegistry {
             cursor.validate_envelope().is_ok(),
             "CursorRegistry received an unsupported ChangeCursor envelope version"
         );
+        guard.model.record(&cursor.scope);
+        guard.reach.record(&cursor.scope);
         if !guard.cursors.contains_key(&cursor.scope) {
             let incarnation = self.next_incarnation.fetch_add(1, Ordering::Relaxed);
             guard.incarnations.insert(cursor.scope.clone(), incarnation);
@@ -198,6 +254,27 @@ impl CursorRegistry {
                 .insert(cursor.scope.clone(), CancellationToken::new());
         }
         guard.cursors.insert(cursor.scope.clone(), cursor);
+    }
+
+    /// Record the scopes an account's discovery advertised as shapes of the
+    /// current model, whether or not each one ends up with a cursor (a scope
+    /// deferred to inventory, or one whose establishment failed, has none).
+    pub(crate) fn note_discovered(&self, scopes: &[CursorScope]) {
+        let mut guard = self.state.write().expect("poisoned");
+        for scope in scopes {
+            guard.model.record(scope);
+            guard.reach.record(scope);
+        }
+    }
+
+    /// Shapes of the current account model; see `RegistryState::model`.
+    pub(crate) fn model_shapes(&self) -> ScopeShapes {
+        self.state.read().expect("poisoned").model.clone()
+    }
+
+    /// Every shape seen this attachment; see `RegistryState::reach`.
+    pub(crate) fn reach_shapes(&self) -> ScopeShapes {
+        self.state.read().expect("poisoned").reach.clone()
     }
 
     /// Publish one drive result while its account generation is still
@@ -366,6 +443,11 @@ impl CursorRegistry {
                 .unwrap_or_default();
             replacement.scope_cancels.insert(scope.clone(), cancel);
         }
+        // The replacement's model is the account model from here on; deletion
+        // reach keeps every shape seen before it, merged under this write lock
+        // so a shape recorded on the live registry while the replacement was
+        // staged is not lost.
+        replacement.reach.merge(&current.reach);
         *current = replacement;
     }
 

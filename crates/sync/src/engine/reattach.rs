@@ -1728,6 +1728,9 @@ async fn reattach_account_paced(
     let result = async {
         let discovered = discover_scopes_from(next.as_ref()).await?;
         let staged = Arc::new(CursorRegistry::new());
+        // The replacement's discovery is the account model from the cutover
+        // on, including scopes left without a cursor below.
+        staged.note_discovered(&discovered);
         let mut newly_established = Vec::new();
 
         for scope in &discovered {

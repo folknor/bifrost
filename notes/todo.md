@@ -407,18 +407,6 @@ Narrow edge cases, audits with no known defect, and design work.
     `take_backfill_discards()` and sends `DiscardBackfillProgress` per scope; a
     discard recorded before an account reset deletes the post-reset walk's rows
     at detach. Safe direction (costs a re-walk).
-- **Lifecycle `Deleted` of a never-registered scope routes no deletion.**
-  `delete_scopes` in `crates/sync/src/multiplexer/mod.rs` derives the scopes
-  to retire from the registered cursor index plus
-  `membership_to_cursor_scopes`, which reads the registered topology. After a
-  cross-id `Renamed` of the last folder cursor, the registry is empty while
-  `ScopeCreated(new)` is still queued or parked under a pause; a following
-  `Deleted(new)` then finds no shape, bumps no epoch and sends no
-  `ScopeDeleted`, so the pending establishment survives and may establish a
-  deleted folder that nothing later retires. Found by source reading, not
-  reproduced. Neither an epoch read at the multiplexer nor a re-read fixes
-  it, since no deletion is observed; it needs deletion routing that knows
-  pending or parked scope shapes independently of registered cursors.
 
 ## Coverage gaps from the October 2026 hunt
 

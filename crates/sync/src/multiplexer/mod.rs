@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cancel::BoundaryView;
 use crate::control::SyncControl;
-use crate::cursor::CursorRegistry;
+use crate::cursor::{CursorRegistry, ScopeShapes};
 use crate::error::Error;
 use crate::types::MultiplexerConfig;
 
@@ -1968,11 +1968,13 @@ async fn apply_lifecycle_transition(
         reopen_tx: &mpsc::Sender<ReopenRequest>,
         membership: &bifrost_types::MembershipScope,
     ) {
-        // The scopes a `Created` for this membership would have asked the
-        // engine to establish, read BEFORE any registered scope is deleted
-        // below (the mapping reads the registered topology). Every one the
-        // membership index does not already name below is routed to the
-        // listener too, cursor or not:
+        // Every scope a `Created` for this membership could have asked the
+        // engine to establish this attachment, under any model it ran: the
+        // mapping reads remembered shapes, not live cursors, so it holds when
+        // no cursor of the shape is registered (a cross-id rename of the last
+        // folder cursor whose create half is still queued or parked). Every
+        // one the membership index does not already name below is routed to
+        // the listener too, cursor or not:
         // - with no cursor, its repair may be parked under a pause or still
         //   queued on the listener's channel ahead of this request; the
         //   listener's `ScopeDeleted` arm unparks the one and retires the
@@ -1981,7 +1983,7 @@ async fn apply_lifecycle_transition(
         //   refresh after its establishment failed), the arm retires it too,
         //   where the index loop below would never find it.
         let indexed = cursors.scopes_for_membership(membership);
-        let unindexed: Vec<CursorScope> = membership_to_cursor_scopes(cursors, membership)
+        let unindexed: Vec<CursorScope> = membership_to_deleted_scopes(cursors, membership)
             .into_iter()
             .filter(|scope| !indexed.contains(scope))
             .collect();
@@ -2045,12 +2047,12 @@ async fn apply_lifecycle_transition(
             establish_scopes(reopen_tx, scopes).await;
         }
         ScopeLifecycle::Renamed { old, new, .. } => {
-            // The new id's shapes are read BEFORE the delete half: the mapping
-            // reads the registered topology, and deleting the old id's
-            // cursors can remove the last registered shape of a kind, which
-            // would leave the create half nothing to establish. Only scope
-            // identities are captured; the listener still reads each epoch
-            // when it handles the request, after the queued `ScopeDeleted`.
+            // The new id's scopes come from the remembered account model, which
+            // the delete half does not shrink: deleting the old id's cursors
+            // can remove the last registered cursor of a shape and the create
+            // half still finds it. Only scope identities are captured; the
+            // listener still reads each epoch when it handles the request,
+            // after the queued `ScopeDeleted`.
             let scopes = membership_to_cursor_scopes(cursors, &new);
             delete_scopes(cursors, control, tokens, reopen_tx, &old).await;
             establish_scopes(reopen_tx, scopes).await;
@@ -2060,12 +2062,14 @@ async fn apply_lifecycle_transition(
 }
 
 /// Map a `MembershipScope` from `ScopeLifecycle` to newly-required
-/// cursor scopes using the account's registered cursor topology.
+/// cursor scopes using the account's cursor model: the shapes its
+/// discovery advertised and its registry has held since the last
+/// topology replacement, not only the cursors live at this instant.
 ///
 /// Account-wide and type-wide cursor models already cover a newly
 /// created membership, so they produce no scope. Per-folder models
-/// preserve their existing shape, including every registered
-/// `FolderType` object type. An empty or unrecognized topology also
+/// preserve their existing shape, including every `FolderType` object
+/// type the model uses. An empty or unrecognized topology also
 /// produces no scope rather than inventing one the protocol never
 /// advertised.
 #[must_use]
@@ -2073,51 +2077,50 @@ pub fn membership_to_cursor_scopes(
     cursors: &CursorRegistry,
     membership: &MembershipScope,
 ) -> Vec<CursorScope> {
-    use bifrost_types::FolderId;
-    let registered = cursors.all_scopes();
-    if registered
-        .iter()
-        .any(|scope| matches!(scope, CursorScope::Account | CursorScope::Type(_)))
-    {
+    let model = cursors.model_shapes();
+    if model.wide {
         return Vec::new();
     }
+    membership_scopes(&model, membership)
+}
+
+/// Map a deleted `MembershipScope` to every per-membership cursor scope a
+/// lifecycle creation could have raised for it during this attachment,
+/// under the current model or an earlier one a reattach replaced. Unlike
+/// the creation mapping, a wide shape does not suppress the per-folder
+/// ones: an over-reaching deletion retires nothing live and purges rows of
+/// a folder the provider deleted, while a missed one lets a queued or
+/// parked establishment create a cursor nothing retires. Account-wide and
+/// type-wide cursors are never produced; they cover other memberships.
+pub(crate) fn membership_to_deleted_scopes(
+    cursors: &CursorRegistry,
+    membership: &MembershipScope,
+) -> Vec<CursorScope> {
+    membership_scopes(&cursors.reach_shapes(), membership)
+}
+
+fn membership_scopes(shapes: &ScopeShapes, membership: &MembershipScope) -> Vec<CursorScope> {
+    use bifrost_types::FolderId;
     match membership {
-        MembershipScope::Folder(folder) => folder_cursor_shapes(&registered, folder.clone()),
+        MembershipScope::Folder(folder) => folder_cursor_shapes(shapes, folder.clone()),
         MembershipScope::Mailbox(mailbox) => {
-            folder_cursor_shapes(&registered, FolderId(mailbox.0.clone()))
+            folder_cursor_shapes(shapes, FolderId(mailbox.0.clone()))
         }
-        MembershipScope::Query(q)
-            if registered
-                .iter()
-                .any(|scope| matches!(scope, CursorScope::Query(_))) =>
-        {
-            vec![CursorScope::Query(q.clone())]
-        }
+        MembershipScope::Query(q) if shapes.query => vec![CursorScope::Query(q.clone())],
         _ => Vec::new(),
     }
 }
 
-fn folder_cursor_shapes(
-    registered: &[CursorScope],
-    folder: bifrost_types::FolderId,
-) -> Vec<CursorScope> {
+fn folder_cursor_shapes(shapes: &ScopeShapes, folder: bifrost_types::FolderId) -> Vec<CursorScope> {
     let mut scopes = Vec::new();
-    if registered
-        .iter()
-        .any(|scope| matches!(scope, CursorScope::Folder(_)))
-    {
+    if shapes.folder {
         scopes.push(CursorScope::Folder(folder.clone()));
     }
-    for scope in registered {
-        if let CursorScope::FolderType { ty, .. } = scope {
-            let candidate = CursorScope::FolderType {
-                folder: folder.clone(),
-                ty: *ty,
-            };
-            if !scopes.contains(&candidate) {
-                scopes.push(candidate);
-            }
-        }
+    for ty in &shapes.folder_types {
+        scopes.push(CursorScope::FolderType {
+            folder: folder.clone(),
+            ty: *ty,
+        });
     }
     scopes
 }
@@ -2582,8 +2585,8 @@ mod tests {
     }
 
     /// A rename across ids whose old id held the only registered folder
-    /// cursor must still establish the new id: its shapes are read before
-    /// the delete half empties the registry.
+    /// cursor must still establish the new id: the account model outlives
+    /// the delete half that empties the registry.
     #[tokio::test]
     async fn cross_id_rename_of_the_last_folder_cursor_still_creates_the_new_id() {
         let cursors = CursorRegistry::new();
@@ -2621,6 +2624,86 @@ mod tests {
             reopen_rx.try_recv().expect("creation requested"),
             ReopenRequest::ScopeCreated { scope } if scope == new_scope
         ));
+    }
+
+    /// A `Deleted` arriving while the registry holds no folder cursor - the
+    /// last one renamed away, its replacement's `ScopeCreated` still queued
+    /// or parked - must still route `ScopeDeleted` for the folder, or the
+    /// listener never unparks the pending establishment and it creates a
+    /// cursor for a deleted folder. Ablation: mapping deletion through the
+    /// live cursors sends nothing here.
+    #[tokio::test]
+    async fn deleting_a_folder_while_no_folder_cursor_is_registered_still_routes_the_deletion() {
+        let cursors = CursorRegistry::new();
+        let old_folder = bifrost_types::FolderId("Old".into());
+        let new_folder = bifrost_types::FolderId("New".into());
+        let old_scope = CursorScope::Folder(old_folder.clone());
+        let new_scope = CursorScope::Folder(new_folder.clone());
+        put_folder_cursor(&cursors, &old_scope);
+        let old = bifrost_types::MembershipScope::Folder(old_folder);
+        cursors.link_membership(old.clone(), old_scope.clone());
+        let new = bifrost_types::MembershipScope::Folder(new_folder);
+        let tokens = scope_tokens();
+        track(&tokens, &old_scope);
+        let control = lag_test_control();
+        let (reopen_tx, mut reopen_rx) = mpsc::channel(4);
+
+        apply_lifecycle_transition(
+            &cursors,
+            &control,
+            &tokens,
+            &reopen_tx,
+            ScopeLifecycle::Renamed {
+                old,
+                new: new.clone(),
+                old_name: "Old".into(),
+                new_name: "New".into(),
+            },
+        )
+        .await;
+        assert!(cursors.all_scopes().is_empty());
+        let _ = reopen_rx.try_recv().expect("old id deletion");
+        let _ = reopen_rx.try_recv().expect("new id creation");
+        let epoch_before = cursors.lifecycle_epoch(&new_scope);
+
+        apply_lifecycle_transition(
+            &cursors,
+            &control,
+            &tokens,
+            &reopen_tx,
+            ScopeLifecycle::Deleted(new),
+        )
+        .await;
+
+        assert!(matches!(
+            reopen_rx.try_recv().expect("deletion routed"),
+            ReopenRequest::ScopeDeleted { scope } if scope == new_scope
+        ));
+        assert!(reopen_rx.try_recv().is_err());
+        assert_eq!(cursors.lifecycle_epoch(&new_scope), epoch_before + 1);
+    }
+
+    /// A shape a reattach's replacement topology dropped no longer
+    /// authorizes creation, but deletion still reaches it: an establishment
+    /// raised under the earlier model may still be queued or parked.
+    #[test]
+    fn a_replaced_model_stops_creation_but_not_deletion_reach() {
+        let cursors = CursorRegistry::new();
+        put_folder_cursor(
+            &cursors,
+            &CursorScope::Folder(bifrost_types::FolderId("A".into())),
+        );
+        let replacement = CursorRegistry::new();
+        replacement.note_discovered(&[CursorScope::Type(bifrost_types::ObjectType::Email)]);
+        cursors.replace_topology_preserving_cursors(&replacement);
+        let membership =
+            bifrost_types::MembershipScope::Folder(bifrost_types::FolderId("B".into()));
+
+        assert!(membership_to_cursor_scopes(&cursors, &membership).is_empty());
+        assert_eq!(
+            membership_to_deleted_scopes(&cursors, &membership),
+            vec![CursorScope::Folder(bifrost_types::FolderId("B".into()))]
+        );
     }
 
     /// A terminal recovery verdict must park the scope, not retire it: a

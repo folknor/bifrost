@@ -1031,7 +1031,11 @@ and the accompanying warning is what tells the consumer to reconcile.
   same reason. Pinned by `a_cancelled_scope_does_not_wait_out_its_retry_hint`
   and `a_recovery_backoff_is_cut_short_by_shutdown`.
 - **Scope lifecycle** events from `Account::scope_lifecycle_stream`.
-  `Created` and `Renamed` consult the registered cursor shapes.
+  `Created` and `Renamed` consult the account's cursor model: the shapes
+  (`Folder`, each `FolderType` object type, `Query`, wide) that discovery
+  advertised or the registry has held since the last topology replacement,
+  which replaces it. It is remembered, not read off the live cursors, so a
+  registry that momentarily holds no cursor of a shape still maps to it.
   Account-wide and type-wide models already cover the new membership
   and create no cursor. Per-folder and query models translate the
   membership into matching `ReopenRequest::ScopeCreated` requests so the
@@ -1047,11 +1051,15 @@ and the accompanying warning is what tells the consumer to reconcile.
   emits that shape) is the create half alone: cursor scopes are keyed by
   id, so a display-name change invalidates no cursor, durable row or
   parked repair, and establish-if-absent leaves a registered scope
-  untouched. A `Renamed` across ids reads the new id's shapes BEFORE its
-  delete half runs, since deleting the old id's cursors can remove the
-  last registered shape of a kind and leave the create half nothing to
-  establish. `Deleted`
-  (and the delete half of a cross-id `Renamed`) cancels the per-scope token, drops
+  untouched. A `Renamed` across ids is the delete half on the old id plus
+  the create half on the new one; the model survives the delete half, so
+  renaming the last folder cursor still creates the new id. `Deleted`
+  (and the delete half of a cross-id `Renamed`) retires every scope the
+  membership index names and every per-membership scope of the deletion
+  reach - each shape seen during the attachment, across topology
+  replacements, with wide shapes never suppressing per-folder ones - so a
+  deletion reaches a scope whose establishment is queued or parked though
+  no cursor of its shape is registered. It cancels the per-scope token, drops
   the in-memory cursor, and raises `ReopenRequest::ScopeDeleted`, on
   which the engine's reopen listener purges the scope's durable rows in
   full - change cursor and backfill rows, completion marker included

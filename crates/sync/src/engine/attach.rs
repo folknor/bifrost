@@ -143,6 +143,9 @@ impl SyncEngine {
         // consumers observe cold-start data the same way they observe
         // live changes.
         let scopes = self.discover_scopes(opened.as_ref()).await?;
+        // Discovery is the account's cursor model, including scopes deferred
+        // to inventory that hold no cursor yet; lifecycle mapping reads it.
+        cursors.note_discovered(&scopes);
         // Read every discovered scope's stored cursor BEFORE establishing any.
         //
         // An unreadable row (an envelope outside the migration window, or one
