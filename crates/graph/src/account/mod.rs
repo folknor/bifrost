@@ -42,7 +42,7 @@ use bifrost_types::{
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Importance,
     InventoryEvent, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
     ObjectId, OpenedAccount, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, SkippedScope, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
     ThreadId, VacationConfig,
 };
@@ -1230,18 +1230,30 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::set_importance(account, target, level).await })
     }
 
-    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         let account = self.clone();
-        Box::pin(async move { pim::send_message(account, request).await })
+        // Graph files the Sent copy server-side; this call does not verify it.
+        Box::pin(async move {
+            pim::send_message(account, request)
+                .await
+                .map(SendReceipt::provider_managed)
+        })
     }
 
     fn send_raw_message(
         &self,
         raw: Bytes,
         save_to_sent: Option<bool>,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         let account = self.clone();
-        Box::pin(async move { pim::send_raw_message(account, raw, save_to_sent).await })
+        Box::pin(async move {
+            pim::send_raw_message(account, raw, save_to_sent)
+                .await
+                .map(SendReceipt::provider_managed)
+        })
     }
 
     fn attachment_upload(
@@ -1283,9 +1295,13 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::draft_discard(account, draft).await })
     }
 
-    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         let account = self.clone();
-        Box::pin(async move { pim::draft_send(account, draft).await })
+        Box::pin(async move {
+            pim::draft_send(account, draft)
+                .await
+                .map(SendReceipt::provider_managed)
+        })
     }
 
     fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {

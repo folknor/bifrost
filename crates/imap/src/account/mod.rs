@@ -18,7 +18,7 @@ use bifrost_types::{
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
@@ -656,7 +656,10 @@ impl Account for ImapAccount {
         pim::set_importance(self.clone(), target, level)
     }
 
-    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         pim::send_message(self.clone(), request)
     }
 
@@ -664,7 +667,7 @@ impl Account for ImapAccount {
         &self,
         raw: bytes::Bytes,
         save_to_sent: Option<bool>,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         pim::send_raw_message(self.clone(), raw, save_to_sent)
     }
 
@@ -700,7 +703,7 @@ impl Account for ImapAccount {
         pim::draft_discard(self.clone(), draft)
     }
 
-    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         pim::draft_send(self.clone(), draft)
     }
 

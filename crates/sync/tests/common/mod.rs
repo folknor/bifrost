@@ -33,9 +33,9 @@ use bifrost_types::{
     ItemOutcome, MembershipScope, Message, MutationCapabilities, MutationConcurrency,
     MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
     Priority, Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
-    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig,
+    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
+    ThreadHydration, ThreadId, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -1137,7 +1137,10 @@ impl Account for StubAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetImportance)) })
     }
 
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Send)) })
     }
 
@@ -1177,7 +1180,7 @@ impl Account for StubAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftDiscard)) })
     }
 
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftSend)) })
     }
 

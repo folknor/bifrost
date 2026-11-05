@@ -23,7 +23,7 @@ use bifrost_types::{
     Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, Page, PageBoundary, PimMethodSupport, Priority, Projection,
     PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RsvpStatus, ScopeLifecycleEvent,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
     VacationConfig,
 };
@@ -387,7 +387,10 @@ impl Account for StubAccount {
         Box::pin(async { Err(unsupported(AccountOperation::SetImportance)) })
     }
 
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::Send)) })
     }
 
@@ -423,7 +426,7 @@ impl Account for StubAccount {
         Box::pin(async { Err(unsupported(AccountOperation::DraftDiscard)) })
     }
 
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DraftSend)) })
     }
 

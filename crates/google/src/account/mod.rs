@@ -31,9 +31,9 @@ use bifrost_types::{
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InventoryEvent, ItemOutcome, MembershipScope, Message,
     MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, OpenedAccount, Page, Priority,
-    Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -315,6 +315,14 @@ fn shutdown_stream<T: Send + 'static>(
 /// operations from blind replay. `AccountFuture` exposes neither request
 /// progress nor a target continuation; multi-step writes need a richer
 /// operation boundary to retain resource-specific recovery scope.
+/// Gmail files the Sent copy itself (and ignores `save_to_sent = false`), so a
+/// send receipt reports it as provider-managed.
+fn provider_managed(
+    send: AccountFuture<Result<ObjectId, AccountError>>,
+) -> AccountFuture<Result<SendReceipt, AccountError>> {
+    Box::pin(async move { send.await.map(SendReceipt::provider_managed) })
+}
+
 fn shutdown_future<T: Send + 'static>(
     shutdown: CancellationToken,
     operation: AccountOperation,
@@ -780,14 +788,17 @@ impl Account for GoogleAccount {
         )
     }
 
-    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         self.shutdown_future(
             AccountOperation::Send,
-            pim::send_message(
+            provider_managed(pim::send_message(
                 Arc::clone(&self.client),
                 self.profile.email_address.clone(),
                 request,
-            ),
+            )),
         )
     }
 
@@ -795,10 +806,14 @@ impl Account for GoogleAccount {
         &self,
         raw: Bytes,
         save_to_sent: Option<bool>,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         self.shutdown_future(
             AccountOperation::Send,
-            pim::send_raw_message(Arc::clone(&self.client), raw, save_to_sent),
+            provider_managed(pim::send_raw_message(
+                Arc::clone(&self.client),
+                raw,
+                save_to_sent,
+            )),
         )
     }
 
@@ -862,10 +877,10 @@ impl Account for GoogleAccount {
         )
     }
 
-    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         self.shutdown_future(
             AccountOperation::DraftSend,
-            pim::draft_send(Arc::clone(&self.client), draft),
+            provider_managed(pim::draft_send(Arc::clone(&self.client), draft)),
         )
     }
 

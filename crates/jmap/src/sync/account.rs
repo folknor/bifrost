@@ -15,7 +15,7 @@ use bifrost_types::{
     HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
     InventoryEvent, InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope,
     Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
-    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendAs, SendRequest, ServerFilter,
+    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendAs, SendReceipt, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
     SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
@@ -1012,7 +1012,10 @@ impl Account for JmapAccount {
         )
     }
 
-    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         if let Some(send_as) = request.send_as.as_ref() {
             let id = send_as.mailbox().0.clone();
             if let Err(err) = route_send_as(
@@ -1034,7 +1037,7 @@ impl Account for JmapAccount {
                 .first()
                 .cloned()
                 .map(bifrost_types::Address::bare);
-            return pim::send_message(
+            return provider_managed(pim::send_message(
                 mail,
                 Arc::clone(&self.email_states),
                 id,
@@ -1044,7 +1047,7 @@ impl Account for JmapAccount {
                     self_address,
                 }),
                 request,
-            );
+            ));
         }
         let Some(submission) = self.submission.clone() else {
             let err = super::error::unsupported_error(
@@ -1060,21 +1063,21 @@ impl Account for JmapAccount {
         // account; the draft `Email/set` and the `EmailSubmission/set`
         // must both target the submission account.
         let account_id = submission.id_str().to_string();
-        pim::send_message(
+        provider_managed(pim::send_message(
             submission,
             Arc::clone(&self.email_states),
             account_id,
             self.max_delayed_send,
             None,
             request,
-        )
+        ))
     }
 
     fn send_raw_message(
         &self,
         raw: bytes::Bytes,
         save_to_sent: Option<bool>,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         let Some(submission) = self.submission.clone() else {
             let err = super::error::unsupported_error(
                 AccountOperation::Send,
@@ -1086,13 +1089,13 @@ impl Account for JmapAccount {
         // Same submission-account routing as `send_message`: the import +
         // EmailSubmission must both target the submission-capable account.
         let account_id = submission.id_str().to_string();
-        pim::send_raw_message(
+        provider_managed(pim::send_raw_message(
             submission,
             Arc::clone(&self.email_states),
             account_id,
             raw,
             save_to_sent,
-        )
+        ))
     }
 
     fn attachment_upload(
@@ -1154,7 +1157,7 @@ impl Account for JmapAccount {
         )
     }
 
-    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         let Some(submission) = self.submission.clone() else {
             let err = super::error::unsupported_error(
                 AccountOperation::DraftSend,
@@ -1166,12 +1169,12 @@ impl Account for JmapAccount {
         // The `EmailSubmission/set` and the Sent-folder move both target
         // the resolved submission account, not necessarily `self.mail`.
         let account_id = submission.id_str().to_string();
-        pim::draft_send(
+        provider_managed(pim::draft_send(
             submission,
             Arc::clone(&self.email_states),
             account_id,
             draft,
-        )
+        ))
     }
 
     fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
@@ -1650,6 +1653,16 @@ impl Account for JmapAccount {
 /// as a `Protocol(PartialResponse)` after every WebSocket drop, for a
 /// teardown that had nothing left to tear down. The timeout arm in
 /// `close()` is the same argument for a wedged sink.
+/// JMAP files the Sent copy inside the submission request
+/// (`onSuccessUpdateEmail`, or `onSuccessDestroyEmail` for
+/// `save_to_sent = false`), so a send receipt reports it as provider-managed:
+/// the implicit `Email/set` result is not checked per item.
+fn provider_managed(
+    send: AccountFuture<Result<ObjectId, AccountError>>,
+) -> AccountFuture<Result<SendReceipt, AccountError>> {
+    Box::pin(async move { send.await.map(SendReceipt::provider_managed) })
+}
+
 fn close_outcome(result: crate::Result<()>) -> Result<(), AccountError> {
     match result {
         Ok(()) | Err(crate::Error::WebSocketNotConnected | crate::Error::WebSocketSend(_)) => {

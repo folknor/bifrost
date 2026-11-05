@@ -25,8 +25,8 @@ use bifrost_types::{
     IdentityId, IdentityPatch, Importance, InternalCause, InternalErrorKind, InventoryEvent,
     InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
     MutationSuccess, MutationTarget, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
-    Priority, Protocol, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
+    Priority, Protocol, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendReceipt,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SkippedScope,
     SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
@@ -924,7 +924,10 @@ impl Account for CardDavAccount {
         unsupported_future(AccountOperation::SetImportance)
     }
 
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         unsupported_future(AccountOperation::Send)
     }
 
@@ -960,7 +963,7 @@ impl Account for CardDavAccount {
         unsupported_future(AccountOperation::DraftDiscard)
     }
 
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         unsupported_future(AccountOperation::DraftSend)
     }
 

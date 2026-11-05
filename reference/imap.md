@@ -786,16 +786,29 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   without angle brackets are not recognized and use the existing sender-domain
   fallback. Header decoding does not rewrite the transmitted draft bytes; only
   the Bcc header is stripped from the SMTP copy.
-- `ObjectId` rule: `send_message` / `draft_send` return the APPENDUID-derived id
-  from the Sent APPEND when UIDPLUS yields one, else the generated/parsed
-  `Message-ID` (`imapmsgid1:<id>`). The send result is authoritative for `Ok`.
-- Sent-APPEND contract: after a committed send, a failed (or no-UIDPLUS, or
-  no-Sent-folder) APPEND is non-fatal (SMTP is never re-driven), logs an
-  uncertain-Sent reconcile warning, and falls back to the generated `Message-ID`.
+- Receipt id rule: the `SendReceipt::id` of `send_message`, `send_raw_message`
+  and `draft_send` is the APPENDUID-derived id from the Sent APPEND when UIDPLUS
+  yields one, else the generated/parsed `Message-ID` (`imapmsgid1:<id>`). `Ok`
+  means SMTP accepted the submission; nothing after it turns into `Err`.
+- Sent-APPEND contract: after a committed send, a Sent APPEND failure is
+  non-fatal (SMTP is never re-driven) and is reported in `SendReceipt::sent_copy`
+  (`append_to_sent_or_fallback`): `Filed { id }` on a tagged OK (`id: None`
+  without APPENDUID), `NotRequested` for `save_to_sent = false`,
+  `NotFiled { NoSentFolder | NoConnection | AppendFailed }`, or `Uncertain` when
+  the APPEND error's `Application::from_leaf` is `Uncertain` (the copy may have
+  been stored, so appending again may duplicate it). The Sent-leg detail is a
+  `Warning`, not an `AccountError`: an error stamped `Send` on a success value
+  would advise re-sending.
 - `draft_send` is "fetch + send + discard": a one-shot raw `BODY[]` fetch
   (bounded by `DRAFT_FETCH_BUDGET` 64 MiB, through `FetchLimit`) recovers the
   verbatim octets, the headers build the envelope, `Bcc:` is folded into RCPT but
-  stripped from the body. A failed post-send discard is logged, not fatal.
+  stripped from the body. A failed post-send discard is not fatal: it rides
+  `SendReceipt::draft_discard` as the handle plus the discard's own error,
+  built exactly as `draft_discard` builds it (`AccountOperation::DraftDiscard`,
+  `folder_progress_error`, so a MarkedDeleted step survives a failed EXPUNGE),
+  whose recovery therefore advises `draft_discard`, never a re-driven send. The
+  draft is discarded even when the Sent copy was not filed: a submitted message
+  left in Drafts invites a duplicate send from any client.
 - `draft_send` finalizes `Date`: before submission every `Date` field (folds
   included; `Resent-Date` and `X-Date` kept) is dropped and one carrying the
   send time is inserted first, and both the SMTP body and the Sent copy derive
@@ -1342,12 +1355,13 @@ write leg gets a record; a refusal or preparation failure is the plain leaf.
 Public add/remove/keyword/read/importance,
 draft_discard, move_thread and delete_thread attach once. The composed thread
 operations call add_to_container_inner, remove_from_container_inner and
-move_thread_inner, never the attaching public forms. draft_send still logs and
-absorbs its private discard failure after SMTP succeeds.
+move_thread_inner, never the attaching public forms. draft_send reports its
+post-send discard failure, record attached, in its `SendReceipt` rather than as
+`Err`.
 
 Container CREATE/RENAME/move/DELETE followed by a failed refresh records a
 Blocking Created/Moved/Moved/Deleted effect and an effectless refresh primary.
 Replay protection does not change the existing failure-return contract.
-Sent APPEND and post-send draft discard failures remain logged successes,
-outside the applicable failure-path producer set. Single-request draft creates
+Sent APPEND and post-send draft discard failures are successes reported on the
+`SendReceipt`, outside the failure-path producer set. Single-request draft creates
 without APPENDUID are likewise outside this multi-step adoption.

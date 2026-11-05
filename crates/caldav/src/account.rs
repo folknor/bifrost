@@ -748,7 +748,10 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::SetImportance)
     }
 
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         unsupported_future(AccountOperation::Send)
     }
 
@@ -784,7 +787,7 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::DraftDiscard)
     }
 
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         unsupported_future(AccountOperation::DraftSend)
     }
 

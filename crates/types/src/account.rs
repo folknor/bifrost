@@ -30,7 +30,9 @@ use crate::calendar::{
 };
 use crate::capabilities::{AccountCapabilities, StarredFlagShape};
 use crate::cloud::{CloudUploadMeta, HostedAttachment};
-use crate::compose::{AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest};
+use crate::compose::{
+    AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendReceipt, SendRequest,
+};
 use crate::contact::{
     AddressBook, AddressBookId, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest,
@@ -882,7 +884,14 @@ pub trait Account: Send + Sync {
     /// Send an RFC 5322 message. JMAP `EmailSubmission/set`; Gmail
     /// `messages.send`; Graph `POST /me/sendMail`; IMAP via the
     /// configured `bifrost-smtp` transport.
-    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>>;
+    ///
+    /// `Ok` means the submission was accepted. Follow-up steps that run as
+    /// separate requests after it (IMAP's Sent APPEND) report through the
+    /// [`SendReceipt`], never through `Err`.
+    fn send_message(
+        &self,
+        request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>>;
 
     /// Send a pre-assembled RFC 5322 / RFC 8098 message verbatim. Unlike
     /// [`send_message`](Self::send_message), the caller hands over the
@@ -903,7 +912,7 @@ pub trait Account: Send + Sync {
         &self,
         raw: Bytes,
         save_to_sent: Option<bool>,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         let _ = (raw, save_to_sent);
         let error = AccountError::unsupported(AccountOperation::Send, self.protocol());
         Box::pin(async move { Err(error) })
@@ -953,8 +962,10 @@ pub trait Account: Send + Sync {
 
     /// Convert a draft into a sent message. The provider chooses
     /// atomicity; protocols that don't support atomic draft->send
-    /// implement this as draft fetch + send + discard.
-    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>>;
+    /// implement this as draft fetch + send + discard. A discard that fails
+    /// after the send commits is reported in
+    /// [`SendReceipt::draft_discard`], not as `Err`.
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>>;
 
     /// Cancel a previously scheduled (not yet delivered) send. `handle`
     /// is the `ObjectId` `send_message` returned for the scheduled

@@ -25,7 +25,7 @@ use bifrost_types::{
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, Page, PimMethodSupport, Priority, Projection, ProtocolKind,
     Provenance, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch, StarredFlagShape, SubscriptionHandle, SyncEvent,
     ThreadHydration, ThreadId, VacationConfig,
 };
@@ -319,7 +319,10 @@ impl Account for RecorderAccount {
 
     // ---- remaining required methods: unsupported stubs ----
 
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::Send)) })
     }
 
@@ -355,7 +358,7 @@ impl Account for RecorderAccount {
         Box::pin(async { Err(unsupported(AccountOperation::DraftDiscard)) })
     }
 
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DraftSend)) })
     }
 

@@ -66,6 +66,126 @@ fn scripted_dav_account(
     })
 }
 
+/// A registry holding a SPECIAL-USE `\Sent` folder named `Sent`.
+fn sent_registry() -> FolderRegistry {
+    FolderRegistry::from_list(vec![crate::types::MailboxInfo {
+        name: crate::types::MailboxName::new("Sent").unwrap(),
+        delimiter: Some('/'),
+        attributes: vec![crate::types::MailboxAttribute::Sent],
+        ..crate::types::MailboxInfo::default()
+    }])
+}
+
+/// Drive the post-send Sent APPEND against a LITERAL+ server that reads the
+/// literal and then answers with `reply` (tagged with the APPEND's tag), or
+/// hangs up without answering when `reply` is `None`.
+async fn sent_append_receipt(reply: Option<&'static str>) -> bifrost_types::SendReceipt {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 LITERAL+ UIDPLUS")).await;
+    let account = scripted_sync_account(conn, 1, false, None, sent_registry());
+    let script = tokio::spawn(async move {
+        let header = read_line(&mut server).await;
+        assert!(header.contains("APPEND"), "expected APPEND, got {header}");
+        let tag = tag_of(&header).to_owned();
+        let body = crate::connection::test_support::read_exact(&mut server, 5).await;
+        assert_eq!(&body[..], b"HELLO");
+        let _trailer = read_line(&mut server).await;
+        if let Some(reply) = reply {
+            respond(&mut server, &format!("{tag} {reply}\r\n")).await;
+            Some(server)
+        } else {
+            drop(server);
+            None
+        }
+    });
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pim::append_to_sent_or_fallback(
+            &account,
+            bytes::Bytes::from_static(b"HELLO"),
+            true,
+            "m1@example.com",
+        ),
+    )
+    .await
+    .expect("the Sent APPEND must finish");
+    let _server = script.await.unwrap();
+    receipt
+}
+
+#[tokio::test]
+async fn sent_append_with_appenduid_reports_the_filed_copy() {
+    let receipt = sent_append_receipt(Some("OK [APPENDUID 7 3] done")).await;
+    let filed = super::encode_object_id(&crate::types::MailboxName::new("Sent").unwrap(), 7, 3);
+    assert_eq!(receipt.id, filed);
+    assert!(matches!(
+        receipt.sent_copy,
+        bifrost_types::SentCopy::Filed { id: Some(ref id) } if *id == filed
+    ));
+}
+
+#[tokio::test]
+async fn sent_append_without_appenduid_is_filed_but_unidentified() {
+    let receipt = sent_append_receipt(Some("OK done")).await;
+    assert_eq!(receipt.id.0, "imapmsgid1:m1@example.com");
+    assert!(matches!(
+        receipt.sent_copy,
+        bifrost_types::SentCopy::Filed { id: None }
+    ));
+}
+
+#[tokio::test]
+async fn refused_sent_append_reports_the_copy_not_filed() {
+    let receipt = sent_append_receipt(Some("NO [OVERQUOTA] full")).await;
+    assert_eq!(receipt.id.0, "imapmsgid1:m1@example.com");
+    assert!(
+        matches!(
+            receipt.sent_copy,
+            bifrost_types::SentCopy::NotFiled {
+                reason: bifrost_types::SentCopyNotFiled::AppendFailed,
+                detail: Some(_),
+            }
+        ),
+        "{:?}",
+        receipt.sent_copy
+    );
+}
+
+/// The connection drops after the whole message was written, so the server
+/// may have stored it: appending again could duplicate the copy.
+#[tokio::test]
+async fn sent_append_cut_off_after_the_write_is_uncertain() {
+    let receipt = sent_append_receipt(None).await;
+    assert_eq!(receipt.id.0, "imapmsgid1:m1@example.com");
+    assert!(
+        matches!(receipt.sent_copy, bifrost_types::SentCopy::Uncertain { .. }),
+        "{:?}",
+        receipt.sent_copy
+    );
+}
+
+#[tokio::test]
+async fn sent_copy_without_a_sent_folder_or_request_writes_nothing() {
+    let (conn, _server) = driver_pair(&preauth_greeting("IMAP4rev1 LITERAL+ UIDPLUS")).await;
+    let account = scripted_account(conn, 1);
+    let raw = bytes::Bytes::from_static(b"HELLO");
+    let missing =
+        super::pim::append_to_sent_or_fallback(&account, raw.clone(), true, "m1@example.com").await;
+    assert!(matches!(
+        missing.sent_copy,
+        bifrost_types::SentCopy::NotFiled {
+            reason: bifrost_types::SentCopyNotFiled::NoSentFolder,
+            ..
+        }
+    ));
+    let declined =
+        super::pim::append_to_sent_or_fallback(&account, raw, false, "m1@example.com").await;
+    assert!(matches!(
+        declined.sent_copy,
+        bifrost_types::SentCopy::NotRequested
+    ));
+    assert_eq!(declined.id.0, "imapmsgid1:m1@example.com");
+}
+
 /// A container mutation must complete with a single-permit pool.
 ///
 /// `container_create` holds its pooled checkout across the post-mutation

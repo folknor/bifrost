@@ -317,6 +317,115 @@ pub struct DraftPatch {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdentityId(pub String);
 
+/// What `send_message`, `send_raw_message` and `draft_send` return once the
+/// provider accepted the submission.
+///
+/// `Ok` means the message was submitted; it never means every follow-up step
+/// succeeded. The follow-ups a provider performs as separate requests after the
+/// submission commits (IMAP's Sent-folder APPEND and post-send draft discard)
+/// are reported here rather than through `Err`, because an `Err` after a
+/// committed send would read as "send failed" and invite a duplicating resend.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct SendReceipt {
+    /// The id the call has always returned: what `cancel_scheduled_send` and
+    /// `reschedule_send` accept for a scheduled send, otherwise the
+    /// provider's message id (IMAP: the APPENDUID-derived Sent id when one
+    /// exists, else an `imapmsgid1:<Message-ID>` correlation token, which is
+    /// not an addressable IMAP object).
+    pub id: ObjectId,
+    /// What became of the sender's Sent copy.
+    pub sent_copy: SentCopy,
+    /// `draft_send` only: the post-send discard of the draft failed. `None`
+    /// means no separately reported discard failure, not that the draft's
+    /// disappearance was verified.
+    pub draft_discard: Option<DraftDiscardFailure>,
+}
+
+impl SendReceipt {
+    #[must_use]
+    pub fn new(id: ObjectId, sent_copy: SentCopy) -> Self {
+        Self {
+            id,
+            sent_copy,
+            draft_discard: None,
+        }
+    }
+
+    /// A receipt whose Sent copy is [`SentCopy::ProviderManaged`].
+    #[must_use]
+    pub fn provider_managed(id: ObjectId) -> Self {
+        Self::new(id, SentCopy::ProviderManaged)
+    }
+
+    #[must_use]
+    pub fn with_draft_discard(mut self, failure: DraftDiscardFailure) -> Self {
+        self.draft_discard = Some(failure);
+        self
+    }
+}
+
+/// The fate of the Sent copy of a submitted message.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SentCopy {
+    /// This call filed the copy and the server acknowledged it. `id` is the
+    /// copy's object id when the server identified it (IMAP APPENDUID), else
+    /// `None`.
+    Filed { id: Option<ObjectId> },
+    /// The caller (or the account default) asked for no Sent copy, and this
+    /// call filed none.
+    NotRequested,
+    /// This call did not file a copy. It does not claim no copy exists
+    /// anywhere, only that this call wrote none.
+    NotFiled {
+        reason: SentCopyNotFiled,
+        detail: Option<crate::Warning>,
+    },
+    /// The filing request failed in a way that leaves its application
+    /// unknown: the copy may be in Sent. Check the Sent folder before filing
+    /// it again, or it may be duplicated.
+    Uncertain { detail: crate::Warning },
+    /// The provider files (or, where it honours `save_to_sent = false`,
+    /// destroys) the copy as its own server-side effect of the submission:
+    /// JMAP `onSuccessUpdateEmail` / `onSuccessDestroyEmail`, Gmail and
+    /// Graph unconditionally. This call verifies neither the filing, nor its
+    /// absence, nor any draft cleanup, and the processing may be deferred.
+    ProviderManaged,
+}
+
+/// Why a Sent copy was not filed by this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SentCopyNotFiled {
+    /// No folder resolved to the Sent role.
+    NoSentFolder,
+    /// No connection could be obtained; no APPEND was attempted.
+    NoConnection,
+    /// The APPEND failed and its evidence establishes it did not apply.
+    AppendFailed,
+}
+
+/// A draft whose post-send discard failed. The message itself was sent.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DraftDiscardFailure {
+    /// The draft `draft_send` was handed.
+    pub draft: DraftHandle,
+    /// The discard's own error, stamped as `DraftDiscard`: its recovery and
+    /// any partial-commit record (for instance a draft marked deleted whose
+    /// expunge failed) apply to `draft_discard` of `draft`, never to
+    /// re-driving `draft_send`, which would send the message again.
+    pub error: crate::AccountError,
+}
+
+impl DraftDiscardFailure {
+    #[must_use]
+    pub fn new(draft: DraftHandle, error: crate::AccountError) -> Self {
+        Self { draft, error }
+    }
+}
+
 #[cfg(test)]
 mod scheduled_send_tests {
     use std::time::{Duration, SystemTime};

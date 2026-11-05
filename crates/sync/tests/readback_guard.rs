@@ -25,9 +25,9 @@ use bifrost_types::{
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
     MutationTarget, ObjectId, OpenedAccount, Page, PageBoundary, PimMethodSupport, Priority,
     Projection, ProtocolKind, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause,
-    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig,
+    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
+    ThreadHydration, ThreadId, VacationConfig,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -692,7 +692,10 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetImportance)) })
     }
 
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Send)) })
     }
 
@@ -732,7 +735,7 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftDiscard)) })
     }
 
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftSend)) })
     }
 
@@ -2161,7 +2164,10 @@ impl Account for JudgingAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         self.inner.set_importance(_target, _level)
     }
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         self.inner.send_message(_request)
     }
     fn attachment_upload(
@@ -2191,7 +2197,7 @@ impl Account for JudgingAccount {
     fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
         self.inner.draft_discard(_draft)
     }
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         self.inner.draft_send(_draft)
     }
     fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
@@ -2976,7 +2982,10 @@ impl Account for ReassertAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         self.inner.set_importance(_target, _level)
     }
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         self.inner.send_message(_request)
     }
     fn attachment_upload(
@@ -3006,7 +3015,7 @@ impl Account for ReassertAccount {
     fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
         self.inner.draft_discard(_draft)
     }
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         self.inner.draft_send(_draft)
     }
     fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {

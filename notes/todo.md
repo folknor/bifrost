@@ -36,14 +36,19 @@ not verified against the code. Verification happens when an item is worked.
 Items that leak something or report success for something that did not
 happen, plus one surface gap that matters if the consumer relies on it.
 
-- **IMAP sends report success when the Sent copy failed.** `send_message`,
-  `send_raw_message` and `draft_send` log a failed Sent APPEND and return
-  success; `draft_send` likewise logs a post-send discard failure. The caller
-  cannot learn that the Sent copy is missing or the draft lingers. The mail did
-  go out, so this is not an error; it needs a "sent, but" signal (a warning on
-  the success value, or the partial-commit record). These paths return Ok after
-  SMTP commits, so they are outside the adopted failure-path contract in
-  `account/pim.rs`.
+- **JMAP sends do not check the implicit Sent move.** `send_message`,
+  `send_raw_message` and `draft_send` in `crates/jmap/src/sync/pim.rs` ask the
+  server for `onSuccessUpdateEmail` (move to Sent, drop `$draft`) or
+  `onSuccessDestroyEmail`, then read the implicit `Email/set` response only for
+  its `newState`. A `notUpdated` / `notDestroyed` entry there means the Sent
+  copy was not filed or the temporary Email survives, and today the receipt
+  says `SentCopy::ProviderManaged` regardless. Reading that entry would let the
+  receipt report `Filed` or `NotFiled` as IMAP now does.
+- **SMTP partial recipient acceptance is invisible to send callers.**
+  `SubmissionTransport::send_rfc5322` (`crates/imap/src/account/submission.rs`)
+  returns `Ok(())` and only logs when some recipients were rejected or are
+  uncertain. `SendReceipt` is `non_exhaustive` and is the natural carrier for
+  the rejected list; nothing reports it today.
 - **Legacy `imap1` object ids fail correlation.** They decode, but outcomes
   re-encode as `imap2`, so legacy ids fail correlation in mutation and
   hydration. Matters exactly when a consumer still holds stored `imap1` ids.
@@ -104,6 +109,18 @@ face.
 
 ### Error model and published surface
 
+- **Gmail and Graph ignore `save_to_sent = false`.** Both file the Sent copy
+  server-side unconditionally (`_save_to_sent` is unused in
+  `crates/google/src/account/pim.rs` and `crates/graph/src/account/pim/send.rs`),
+  and their `SendReceipt` says `ProviderManaged`. Decide whether a declined Sent
+  copy should be refused as `Unsupported`, honoured by a post-send delete, or
+  documented as a provider limit on `SendRequest::save_to_sent`.
+- **`SendReceipt::id` multiplexes three identities.** It is a message id, a
+  scheduled-send handle (JMAP returns the EmailSubmission id when scheduled), or
+  an IMAP `imapmsgid1:` correlation token that names no addressable object.
+  Separate fields (message id, correlation id, scheduled handle) would let
+  `cancel_scheduled_send` / `reschedule_send` take the handle by type. Also
+  `draft_send` has no per-call `save_to_sent`; IMAP uses the account default.
 - **A proxy 407 maps to `AuthLost`, implying the wrong remedy.** JMAP
   classifies net's typed `TunnelError` (407 ->
   `Authentication(ReauthorizationRequired)` / `AuthLost`, proxy TLS ->

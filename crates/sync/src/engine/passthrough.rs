@@ -593,7 +593,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         request: bifrost_types::SendRequest,
-    ) -> Result<bifrost_types::ObjectId, Error> {
+    ) -> Result<bifrost_types::SendReceipt, Error> {
         Ok(self.live_account(account_id)?.send_message(request).await?)
     }
 
@@ -604,7 +604,7 @@ impl SyncEngine {
         account_id: &AccountId,
         raw: bytes::Bytes,
         save_to_sent: Option<bool>,
-    ) -> Result<bifrost_types::ObjectId, Error> {
+    ) -> Result<bifrost_types::SendReceipt, Error> {
         Ok(self
             .live_account(account_id)?
             .send_raw_message(raw, save_to_sent)
@@ -649,7 +649,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         draft: bifrost_types::DraftHandle,
-    ) -> Result<bifrost_types::ObjectId, Error> {
+    ) -> Result<bifrost_types::SendReceipt, Error> {
         Ok(self.live_account(account_id)?.draft_send(draft).await?)
     }
 

@@ -17,7 +17,8 @@ use std::time::SystemTime;
 
 use bifrost_types::cloud::HostedAttachment;
 use bifrost_types::compose::{
-    Address, AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest,
+    Address, AttachmentHandle, DraftDiscardFailure, DraftHandle, DraftPatch, IdentityId,
+    SendReceipt, SendRequest, SentCopy, SentCopyNotFiled,
 };
 use bifrost_types::container::{
     Container, ContainerId, ContainerKind, ContainerList, ContainerNamespace, ContainerRights,
@@ -400,7 +401,7 @@ pub(crate) fn draft_create(
 pub(crate) fn send_message(
     account: ImapAccount,
     request: SendRequest,
-) -> AccountFuture<Result<ObjectId, AccountError>> {
+) -> AccountFuture<Result<SendReceipt, AccountError>> {
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
         if account.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -433,9 +434,9 @@ pub(crate) fn send_message(
             .map_err(|err| restamp(err, AccountOperation::Send))?;
 
         // The message is committed. Optionally append to Sent; a failed
-        // APPEND is non-fatal (never resend) but is not swallowed: it
-        // surfaces the uncertain Sent state and falls back to the
-        // generated Message-ID for the returned id.
+        // APPEND is non-fatal (never resend) but is not swallowed: the
+        // receipt's `sent_copy` reports it, and the returned id falls back
+        // to the generated Message-ID.
         let save = request
             .save_to_sent
             .unwrap_or_else(|| submission.save_to_sent_default());
@@ -444,10 +445,10 @@ pub(crate) fn send_message(
         // assembler hands back a distinct Bcc-bearing body when a Bcc is
         // present, else the two are identical and we reuse `raw`.
         let sent_body = rendered.sent_copy.unwrap_or(rendered.raw);
-        let object_id =
+        Ok(
             append_to_sent_or_fallback(&account, sent_body.into(), save, &rendered.message_id)
-                .await;
-        Ok(object_id)
+                .await,
+        )
     })
 }
 
@@ -455,7 +456,7 @@ pub(crate) fn send_raw_message(
     account: ImapAccount,
     raw: bytes::Bytes,
     save_to_sent: Option<bool>,
-) -> AccountFuture<Result<ObjectId, AccountError>> {
+) -> AccountFuture<Result<SendReceipt, AccountError>> {
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
         if account.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -480,15 +481,14 @@ pub(crate) fn send_raw_message(
         // verbatim caller bytes (Bcc header retained, the sender's record);
         // only `parsed.body` strips Bcc for the wire.
         let save = save_to_sent.unwrap_or_else(|| submission.save_to_sent_default());
-        let object_id = append_to_sent_or_fallback(&account, raw, save, &parsed.message_id).await;
-        Ok(object_id)
+        Ok(append_to_sent_or_fallback(&account, raw, save, &parsed.message_id).await)
     })
 }
 
 pub(crate) fn draft_send(
     account: ImapAccount,
     draft: DraftHandle,
-) -> AccountFuture<Result<ObjectId, AccountError>> {
+) -> AccountFuture<Result<SendReceipt, AccountError>> {
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
         if account.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -524,7 +524,7 @@ pub(crate) fn draft_send(
         // Sent. The Sent copy is the saved draft `raw`, which retains the
         // `Bcc:` header (the sender's record of who was blind copied) -
         // only `parsed.body` (the transmitted bytes) strips it.
-        let object_id = append_to_sent_or_fallback(
+        let receipt = append_to_sent_or_fallback(
             &account,
             raw,
             submission.save_to_sent_default(),
@@ -532,19 +532,25 @@ pub(crate) fn draft_send(
         )
         .await;
 
-        // Discard the original draft. A failed discard is non-fatal: the
-        // message was sent. Surface it as a warning rather than failing.
-        if let Err(err) =
-            delete_messages(&account, vec![decoded], AccountOperation::DraftSend).await
-        {
-            tracing::warn!(
-                target: "bifrost_imap::draft_send",
-                error = %err.error,
-                "draft sent but discard from Drafts failed; the draft may linger"
-            );
+        // Discard the original draft. The draft is discarded even when the
+        // Sent copy above was not filed: a submitted message left in Drafts,
+        // whose ordinary action is Send, invites a duplicate from any client.
+        // A failed discard is not an `Err` (the message was sent); it rides
+        // the receipt as a `DraftDiscard` error, so its recovery and
+        // partial-commit record (marked deleted, expunge failed) advise
+        // `draft_discard`, never a re-driven send.
+        match delete_messages(&account, vec![decoded], AccountOperation::DraftDiscard).await {
+            Ok(_) => Ok(receipt),
+            Err(progress) => {
+                let error = folder_progress_error(progress);
+                tracing::warn!(
+                    target: "bifrost_imap::draft_send",
+                    error = %error,
+                    "draft sent but discard from Drafts failed; the draft may linger"
+                );
+                Ok(receipt.with_draft_discard(DraftDiscardFailure::new(draft, error)))
+            }
         }
-
-        Ok(object_id)
     })
 }
 
@@ -553,27 +559,32 @@ pub(crate) fn draft_send(
 /// when the server surfaces one under UIDPLUS, else the supplied
 /// fallback `Message-ID` (controlled domain). A failed APPEND after a
 /// committed send is non-fatal: the send already succeeded, so we never
-/// re-drive SMTP; the uncertain Sent state is logged for reconcile.
+/// re-drive SMTP. The receipt's `sent_copy` says what happened: an APPEND
+/// failure whose transmission evidence leaves its application unknown is
+/// `Uncertain` (the copy may be filed; appending again may duplicate it),
+/// otherwise `NotFiled`.
 ///
 /// Takes the message by value: `append_message` carries that allocation to the
 /// socket as it is, where `append(&[u8])` would copy the whole message once
 /// more just to cross the driver channel.
-async fn append_to_sent_or_fallback(
+pub(super) async fn append_to_sent_or_fallback(
     account: &ImapAccount,
     raw: bytes::Bytes,
     save: bool,
     fallback_message_id: &str,
-) -> ObjectId {
+) -> SendReceipt {
     let fallback = || ObjectId(format!("imapmsgid1:{fallback_message_id}"));
+    let not_filed =
+        |reason, detail| SendReceipt::new(fallback(), SentCopy::NotFiled { reason, detail });
     if !save {
-        return fallback();
+        return SendReceipt::new(fallback(), SentCopy::NotRequested);
     }
     let Some(sent) = role_folder(account, FolderRole::Sent) else {
         tracing::warn!(
             target: "bifrost_imap::send",
             "save_to_sent requested but no Sent folder resolved; returning generated Message-ID"
         );
-        return fallback();
+        return not_filed(SentCopyNotFiled::NoSentFolder, None);
     };
     let conn = match account.pool.checkout_any().await {
         Ok(conn) => conn,
@@ -582,9 +593,15 @@ async fn append_to_sent_or_fallback(
                 target: "bifrost_imap::send",
                 error = %err,
                 "message sent but Sent-folder APPEND could not get a connection; \
-                 local Sent view is uncertain (reconcile by checking the Sent folder)"
+                 no Sent copy was filed"
             );
-            return fallback();
+            return not_filed(
+                SentCopyNotFiled::NoConnection,
+                Some(sent_copy_warning(
+                    &err,
+                    "no connection for the Sent-folder APPEND",
+                )),
+            );
         }
     };
     let mut message = crate::types::AppendMessage::new(raw);
@@ -594,21 +611,43 @@ async fn append_to_sent_or_fallback(
         .append_message(&sent, message, account.command_timeout())
         .await
     {
-        Ok(Some((uidvalidity, uid))) => encode_object_id(&sent, uidvalidity, uid),
-        Ok(None) => {
-            // Sent succeeded but the server gave no UIDPLUS code.
-            fallback()
+        Ok(Some((uidvalidity, uid))) => {
+            let id = encode_object_id(&sent, uidvalidity, uid);
+            SendReceipt::new(id.clone(), SentCopy::Filed { id: Some(id) })
         }
+        // Filed, but the server gave no UIDPLUS code to identify the copy.
+        Ok(None) => SendReceipt::new(fallback(), SentCopy::Filed { id: None }),
         Err(err) => {
             tracing::warn!(
                 target: "bifrost_imap::send",
                 error = %err,
                 "message sent but Sent-folder APPEND failed; \
-                 local Sent view is uncertain (reconcile by checking the Sent folder)"
+                 check the Sent folder before filing it again"
             );
-            fallback()
+            // Classified through the same leaf rule as every partial-commit
+            // producer, so transmission evidence decides, not error text.
+            let leaf = op_err(AccountOperation::Send)(err);
+            let uncertain = Application::from_leaf(&leaf) == Application::Uncertain;
+            let detail = sent_copy_warning(&leaf, "the Sent-folder APPEND failed");
+            if uncertain {
+                SendReceipt::new(fallback(), SentCopy::Uncertain { detail })
+            } else {
+                not_filed(SentCopyNotFiled::AppendFailed, Some(detail))
+            }
         }
     }
+}
+
+/// The advisory detail of a Sent copy this call could not confirm. A
+/// `Warning`, not an `AccountError`: an error stamped `Send` on a success
+/// value would carry recovery advice for re-sending, and there is no public
+/// Sent-append operation for it to advise instead.
+fn sent_copy_warning(err: &dyn std::fmt::Display, what: &str) -> bifrost_types::Warning {
+    bifrost_types::Warning::user_safe(
+        bifrost_types::WarningKind::OperatorAttentionNeeded,
+        format!("Message sent, but {what}; the Sent folder may lack a copy."),
+    )
+    .with_protocol_detail(DiagnosticText::support_only(err.to_string()))
 }
 
 /// One-shot raw `BODY[]` full-message fetch. Hydration returns a parsed

@@ -9,7 +9,7 @@ use bifrost_types::{
     HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
     Importance, InventoryEvent, ItemOutcome, MembershipScope, Message, MutationSuccess,
     MutationTarget, ObjectId, Page, PageBoundary, Priority, Projection, QuotaInfo, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ScopeLifecycleEvent, SearchRequest, SendReceipt, SendRequest, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
     VacationConfig,
 };
@@ -206,7 +206,10 @@ impl Account for ScriptAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         unreachable!("unexpected account door")
     }
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<SendReceipt, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn attachment_upload(
@@ -236,7 +239,7 @@ impl Account for ScriptAccount {
     fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
         unreachable!("unexpected account door")
     }
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
