@@ -1031,14 +1031,18 @@ pub(crate) fn search(
         }
         let err = op_err(AccountOperation::Search);
         let plan = search_plan(&request, AccountOperation::Search)?;
-        let mut threads = Vec::new();
-        for folder in search_folders(&account, plan.folder.as_ref()) {
+        let mut pager = SearchPager::new(&request, plan.folder.as_ref(), AccountOperation::Search)?;
+        for folder in pager.folders(search_folders(&account, plan.folder.as_ref())) {
+            if pager.is_full() {
+                break;
+            }
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let selected = account
                 .select_folder(&mut conn, &folder, None, true)
                 .await
                 .map_err(err)?;
             let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
+            pager.check_epoch(&folder, uidvalidity)?;
             let roots = conn
                 .connection()
                 .uid_thread(
@@ -1049,15 +1053,22 @@ pub(crate) fn search(
                 )
                 .await
                 .map_err(err)?;
+            // A thread's position is its lowest member UID: member sets are
+            // disjoint, so the minima order the folder's threads totally,
+            // and an expunge elsewhere cannot move an untouched thread.
+            let mut threads = Vec::new();
             for root in roots {
                 let mut uids = Vec::new();
                 flatten_thread(&root, &mut uids);
-                if !uids.is_empty() {
-                    threads.push(encode_thread_id(&folder, uidvalidity, &uids));
+                if let Some(&key) = uids.iter().min() {
+                    threads.push((key, uids));
                 }
             }
+            pager.accept(&folder, uidvalidity, threads, |uids| {
+                encode_thread_id(&folder, uidvalidity, &uids)
+            })?;
         }
-        page_from_items(threads, &request, AccountOperation::Search)
+        Ok(pager.finish())
     })
 }
 
@@ -1071,27 +1082,33 @@ pub(crate) fn search_messages(
         }
         let err = op_err(AccountOperation::SearchMessages);
         let plan = search_plan(&request, AccountOperation::SearchMessages)?;
-        let mut messages = Vec::new();
-        for folder in search_folders(&account, plan.folder.as_ref()) {
+        let mut pager = SearchPager::new(
+            &request,
+            plan.folder.as_ref(),
+            AccountOperation::SearchMessages,
+        )?;
+        for folder in pager.folders(search_folders(&account, plan.folder.as_ref())) {
+            if pager.is_full() {
+                break;
+            }
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let selected = account
                 .select_folder(&mut conn, &folder, None, true)
                 .await
                 .map_err(err)?;
             let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
+            pager.check_epoch(&folder, uidvalidity)?;
             let result = conn
                 .connection()
                 .uid_search(&plan.criteria, account.command_timeout())
                 .await
                 .map_err(err)?;
-            messages.extend(
-                result
-                    .ids
-                    .into_iter()
-                    .map(|uid| encode_object_id(&folder, uidvalidity, uid)),
-            );
+            let uids = result.ids.into_iter().map(|uid| (uid, uid)).collect();
+            pager.accept(&folder, uidvalidity, uids, |uid| {
+                encode_object_id(&folder, uidvalidity, uid)
+            })?;
         }
-        page_from_items(messages, &request, AccountOperation::SearchMessages)
+        Ok(pager.finish())
     })
 }
 
@@ -2153,12 +2170,11 @@ fn search_folders(account: &ImapAccount, restriction: Option<&MailboxName>) -> V
         return vec![folder.clone()];
     }
     // `entries()` iterates a `HashMap`, so its order is not stable
-    // run-to-run. The multi-folder search cursor is a plain offset into
-    // the concatenated per-folder result list, so a nondeterministic
-    // folder order would make the same `page_cursor` resolve to a
-    // different slice on the next page request (dropped / duplicated
-    // results across pages). Sort by display name and wire identity so
-    // the concatenation order - and therefore the offset cursor - is stable.
+    // run-to-run. The search page cursor is a position in a walk ordered
+    // by folder and then UID, and `SearchPager` resumes by skipping every
+    // folder ordered before the cursor's; a nondeterministic folder order
+    // would skip folders the walk never visited. Sort by display name and
+    // wire identity, the same total order the pager compares by.
     sorted_search_folders(&account.folders)
 }
 
@@ -2173,30 +2189,210 @@ fn sorted_search_folders(registry: &super::folder_registry::FolderRegistry) -> V
     folders
 }
 
-fn page_from_items<T: Clone>(
-    items: Vec<T>,
-    request: &SearchRequest,
-    op: AccountOperation,
-) -> Result<Page<T>, AccountError> {
-    let offset = match &request.page_cursor {
-        Some(cursor) => std::str::from_utf8(cursor)
+/// Prefix of the search page cursor. The payload after it is the canonical
+/// `imap2` object id of the walk position, so the folder rides in the same
+/// length-prefixed wire-identity encoding object ids use.
+const SEARCH_CURSOR_PREFIX: &str = "imapsearch1:";
+
+/// Where a search walk stands: the folder, its UIDVALIDITY, and the key UID
+/// of the last item handed back (the message UID, or a thread's lowest
+/// member UID).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchPosition {
+    folder: MailboxName,
+    uidvalidity: u32,
+    key: u32,
+}
+
+impl SearchPosition {
+    fn encode(&self) -> Vec<u8> {
+        let id = encode_object_id(&self.folder, self.uidvalidity, self.key);
+        format!("{SEARCH_CURSOR_PREFIX}{}", id.0).into_bytes()
+    }
+
+    fn decode(bytes: &[u8], op: AccountOperation) -> Result<Self, AccountError> {
+        let invalid = || pim_malformed(op, "invalid IMAP page cursor");
+        let payload = std::str::from_utf8(bytes)
             .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .ok_or_else(|| pim_malformed(op, "invalid IMAP page cursor"))?,
-        None => 0,
-    };
-    let limit = usize::try_from(request.limit.unwrap_or(500)).unwrap_or(usize::MAX);
-    let end = offset.saturating_add(limit).min(items.len());
-    let page_items = items.get(offset..end).unwrap_or(&[]).to_vec();
-    let next_cursor = (end < items.len()).then(|| end.to_string().into_bytes());
-    Ok(Page {
-        truncated: false,
-        items: page_items,
-        next_cursor,
-        estimated_total: Some(u64::try_from(items.len()).unwrap_or(u64::MAX)),
-        failed_ids: Vec::new(),
-        skipped_scopes: Vec::new(),
-    })
+            .and_then(|text| text.strip_prefix(SEARCH_CURSOR_PREFIX))
+            .filter(|payload| payload.starts_with("imap2:"))
+            .ok_or_else(invalid)?;
+        let decoded = decode_object_id(&ObjectId(payload.to_owned()), op).map_err(|_| invalid())?;
+        Ok(Self {
+            folder: decoded.folder,
+            uidvalidity: decoded.uidvalidity,
+            key: decoded.uid,
+        })
+    }
+}
+
+/// Pages a multi-folder search by position, not by offset.
+///
+/// IMAP has no server-side result state a page cursor could pin, so every
+/// page call re-runs the search. An offset into that fresh result is not
+/// stable: expunging an item on an earlier page shifts every later item down
+/// one place and the item at the boundary is never returned. The cursor is
+/// instead the position of the last item handed back, in a walk ordered by
+/// folder (`MailboxName::cmp_account_order`) and then key UID ascending. UIDs
+/// within one UIDVALIDITY never move, so "key greater than the cursor's" names
+/// the same survivors whatever was expunged meanwhile, and folders ordered
+/// before the cursor's are not searched again.
+///
+/// What a position walk does not promise: an item moved into, or a folder
+/// created or renamed into, a position the walk already passed is not
+/// returned; a thread whose membership changed between pages can come back
+/// under a new id or be passed. A changed UIDVALIDITY on the cursor's folder
+/// voids every UID in the cursor, so the call fails `ConcurrencyConflict` and
+/// the caller repeats the walk.
+struct SearchPager<T> {
+    resume: Option<SearchPosition>,
+    limit: usize,
+    collected: Vec<(SearchPosition, T)>,
+    op: AccountOperation,
+}
+
+impl<T> SearchPager<T> {
+    fn new(
+        request: &SearchRequest,
+        restriction: Option<&MailboxName>,
+        op: AccountOperation,
+    ) -> Result<Self, AccountError> {
+        let resume = request
+            .page_cursor
+            .as_deref()
+            .map(|bytes| SearchPosition::decode(bytes, op))
+            .transpose()?;
+        if let (Some(resume), Some(restriction)) = (&resume, restriction)
+            && resume.folder.cmp_account_order(restriction) != std::cmp::Ordering::Equal
+        {
+            return Err(pim_malformed(
+                op,
+                "IMAP page cursor names a folder outside the search restriction",
+            ));
+        }
+        // A zero-item page has no last item to mint a position from: reusing
+        // the incoming cursor would loop, and advancing would skip.
+        let limit = request.limit.unwrap_or(500);
+        if limit == 0 {
+            return Err(pim_malformed(op, "IMAP search page limit must be nonzero"));
+        }
+        Ok(Self {
+            resume,
+            limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            collected: Vec::new(),
+            op,
+        })
+    }
+
+    /// The folders still ahead of the cursor, in walk order. `all` must
+    /// already be sorted by `cmp_account_order`.
+    fn folders(&self, all: Vec<MailboxName>) -> Vec<MailboxName> {
+        match &self.resume {
+            None => all,
+            Some(resume) => all
+                .into_iter()
+                .filter(|folder| folder.cmp_account_order(&resume.folder).is_ge())
+                .collect(),
+        }
+    }
+
+    /// One item past the page is known, so the page is settled and later
+    /// folders need not be searched.
+    fn is_full(&self) -> bool {
+        self.collected.len() > self.limit
+    }
+
+    /// The UID floor this folder resumes above, or a `ConcurrencyConflict`
+    /// when it is the cursor's folder under a different UIDVALIDITY. Call it
+    /// straight after SELECT, so a changed epoch is reported as itself rather
+    /// than as whatever the following search command did.
+    fn check_epoch(
+        &self,
+        folder: &MailboxName,
+        uidvalidity: u32,
+    ) -> Result<Option<u32>, AccountError> {
+        match &self.resume {
+            Some(resume) if folder.cmp_account_order(&resume.folder).is_eq() => {
+                if resume.uidvalidity != uidvalidity {
+                    return Err(search_cursor_voided(self.op, folder));
+                }
+                Ok(Some(resume.key))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Take one folder's results, `(key, item)` in any order.
+    fn accept<K>(
+        &mut self,
+        folder: &MailboxName,
+        uidvalidity: u32,
+        mut entries: Vec<(u32, K)>,
+        mint: impl Fn(K) -> T,
+    ) -> Result<(), AccountError> {
+        let floor = self.check_epoch(folder, uidvalidity)?;
+        entries.sort_by_key(|(key, _)| *key);
+        entries.dedup_by_key(|(key, _)| *key);
+        for (key, entry) in entries {
+            if self.is_full() {
+                break;
+            }
+            if floor.is_some_and(|floor| key <= floor) {
+                continue;
+            }
+            let position = SearchPosition {
+                folder: folder.clone(),
+                uidvalidity,
+                key,
+            };
+            self.collected.push((position, mint(entry)));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Page<T> {
+        let (next_cursor, estimated_total) = if self.collected.len() > self.limit {
+            // The lookahead item stays ahead of the cursor for the next call.
+            self.collected.truncate(self.limit);
+            let last = self.collected.last().map(|(position, _)| position.encode());
+            (last, None)
+        } else if self.resume.is_none() {
+            // This call enumerated the whole result from the start.
+            (
+                None,
+                Some(u64::try_from(self.collected.len()).unwrap_or(u64::MAX)),
+            )
+        } else {
+            (None, None)
+        };
+        Page {
+            truncated: false,
+            items: self.collected.into_iter().map(|(_, item)| item).collect(),
+            next_cursor,
+            estimated_total,
+            failed_ids: Vec::new(),
+            skipped_scopes: Vec::new(),
+        }
+    }
+}
+
+/// The cursor's folder answered with a different UIDVALIDITY, so the UID
+/// the walk resumes after no longer names anything there.
+fn search_cursor_voided(op: AccountOperation, folder: &MailboxName) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::ConcurrencyConflict,
+        Cause::State(bifrost_types::StateCause::ConcurrencyConflict),
+    )
+    .protocol(Protocol::Imap)
+    .operation(op)
+    .scope(bifrost_types::ErrorScope::Cursor(
+        bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
+    ))
+    .text(DiagnosticText::support_only(
+        "UIDVALIDITY of the folder this search page cursor resumes in changed; repeat the search",
+    ))
+    .try_build()
+    .expect("valid account error classification")
 }
 
 fn flatten_thread(node: &ThreadNode, out: &mut Vec<u32>) {
@@ -2861,12 +3057,13 @@ mod tests {
         .expect_err("a folder restriction inside an Or is refused");
         assert_eq!(err.operation(), Some(AccountOperation::Search));
 
-        let err = page_from_items(
-            vec![1u32],
+        let Err(err) = SearchPager::<u32>::new(
             &search_request(None, Some("not-a-number")),
+            None,
             AccountOperation::Search,
-        )
-        .expect_err("a page cursor this crate did not mint");
+        ) else {
+            panic!("a page cursor this crate did not mint");
+        };
         assert_eq!(err.operation(), Some(AccountOperation::Search));
     }
 
@@ -3544,52 +3741,147 @@ body text\r\n";
         request
     }
 
-    #[test]
-    fn page_from_items_walks_an_offset_cursor_to_exhaustion() {
-        let items: Vec<u32> = (0..5).collect();
-
-        let first = page_from_items(
-            items.clone(),
-            &search_request(Some(2), None),
+    /// One page call over `folders` (each `(name, uidvalidity, uids)`, in
+    /// walk order), driven the way `search_messages` drives the pager.
+    fn search_page(
+        folders: &[(&str, u32, &[u32])],
+        restriction: Option<&str>,
+        limit: u32,
+        cursor: Option<Vec<u8>>,
+    ) -> Result<Page<(String, u32)>, AccountError> {
+        let mut request = search_request(Some(limit), None);
+        request.page_cursor = cursor;
+        let restriction = restriction.map(|name| MailboxName::new(name).unwrap());
+        let mut pager = SearchPager::new(
+            &request,
+            restriction.as_ref(),
             AccountOperation::SearchMessages,
-        )
-        .expect("page");
-        assert_eq!(first.items, vec![0, 1]);
-        assert_eq!(first.next_cursor.as_deref(), Some(b"2".as_slice()));
-        assert_eq!(first.estimated_total, Some(5));
+        )?;
+        let names = folders
+            .iter()
+            .map(|(name, _, _)| MailboxName::new(*name).unwrap())
+            .collect();
+        for folder in pager.folders(names) {
+            if pager.is_full() {
+                break;
+            }
+            let (_, uidvalidity, uids) = folders
+                .iter()
+                .find(|(name, _, _)| *name == folder.as_str())
+                .unwrap();
+            let entries = uids.iter().map(|uid| (*uid, *uid)).collect();
+            pager.accept(&folder, *uidvalidity, entries, |uid| {
+                (folder.as_str().to_owned(), uid)
+            })?;
+        }
+        Ok(pager.finish())
+    }
 
-        let last = page_from_items(
-            items.clone(),
-            &search_request(Some(2), Some("4")),
-            AccountOperation::SearchMessages,
-        )
-        .expect("page");
-        assert_eq!(last.items, vec![4]);
-        assert_eq!(last.next_cursor, None, "the final page ends the walk");
-
-        // A cursor at or past the end yields an empty final page rather
-        // than an error or a panic on the slice.
-        let past = page_from_items(
-            items,
-            &search_request(Some(2), Some("99")),
-            AccountOperation::SearchMessages,
-        )
-        .expect("page");
-        assert!(past.items.is_empty());
-        assert_eq!(past.next_cursor, None);
+    fn uids_of(page: &Page<(String, u32)>) -> Vec<u32> {
+        page.items.iter().map(|(_, uid)| *uid).collect()
     }
 
     #[test]
-    fn page_from_items_rejects_a_cursor_it_did_not_mint() {
-        let err = page_from_items(
-            vec![1u32],
-            &search_request(None, Some("not-a-number")),
-            AccountOperation::SearchMessages,
+    fn a_search_walk_does_not_skip_a_survivor_when_an_earlier_result_is_expunged() {
+        let first =
+            search_page(&[("INBOX", 7, &[101, 102, 103, 104])], None, 2, None).expect("first page");
+        assert_eq!(uids_of(&first), vec![101, 102]);
+        assert_eq!(first.estimated_total, None, "the walk was not enumerated");
+
+        // 101 is expunged before the next page is asked for. An offset of 2
+        // into the fresh [102, 103, 104] would hand back 104 and lose 103.
+        let second = search_page(
+            &[("INBOX", 7, &[102, 103, 104])],
+            None,
+            2,
+            first.next_cursor,
         )
-        .expect_err("garbage cursor");
+        .expect("second page");
+        assert_eq!(uids_of(&second), vec![103, 104]);
+        assert_eq!(second.next_cursor, None, "the final page ends the walk");
+    }
+
+    #[test]
+    fn a_search_walk_crosses_folders_in_order_and_skips_folders_it_passed() {
+        let folders: &[(&str, u32, &[u32])] =
+            &[("A", 1, &[3, 1]), ("B", 2, &[5]), ("C", 3, &[9, 8])];
+        let first = search_page(folders, None, 3, None).expect("first page");
         assert_eq!(
-            *err.kind(),
-            AccountErrorKind::Request(RequestErrorKind::Malformed)
+            first.items,
+            vec![
+                ("A".to_owned(), 1),
+                ("A".to_owned(), 3),
+                ("B".to_owned(), 5)
+            ],
+            "a folder's results are walked in UID order"
+        );
+        // The cursor now stands in B, so folder A changing UIDVALIDITY is
+        // not observed: passed folders are not searched again.
+        let passed: &[(&str, u32, &[u32])] = &[("A", 99, &[1]), ("B", 2, &[5]), ("C", 3, &[9, 8])];
+        let second = search_page(passed, None, 1, first.next_cursor).expect("second page");
+        assert_eq!(second.items, vec![("C".to_owned(), 8)]);
+        let third = search_page(passed, None, 1, second.next_cursor).expect("third page");
+        assert_eq!(third.items, vec![("C".to_owned(), 9)]);
+        assert_eq!(third.next_cursor, None);
+        assert_eq!(third.estimated_total, None, "a resumed call saw a suffix");
+
+        let whole = search_page(folders, None, 10, None).expect("one page");
+        assert_eq!(whole.next_cursor, None);
+        assert_eq!(whole.estimated_total, Some(5));
+    }
+
+    #[test]
+    fn a_search_cursor_whose_folder_vanished_resumes_at_the_next_folder() {
+        let first =
+            search_page(&[("A", 1, &[1, 2]), ("C", 3, &[4])], None, 1, None).expect("first page");
+        assert_eq!(uids_of(&first), vec![1]);
+        let second =
+            search_page(&[("C", 3, &[4])], None, 5, first.next_cursor).expect("second page");
+        assert_eq!(uids_of(&second), vec![4]);
+    }
+
+    #[test]
+    fn a_changed_uidvalidity_in_the_cursor_folder_voids_the_walk() {
+        let first = search_page(&[("INBOX", 7, &[1, 2])], None, 1, None).expect("first page");
+        let err = search_page(&[("INBOX", 8, &[1, 2])], None, 1, first.next_cursor)
+            .expect_err("the cursor's UIDs name nothing under a new UIDVALIDITY");
+        assert_eq!(*err.kind(), AccountErrorKind::ConcurrencyConflict);
+        assert_eq!(err.operation(), Some(AccountOperation::SearchMessages));
+    }
+
+    #[test]
+    fn a_search_page_refuses_cursors_and_limits_it_cannot_honour() {
+        let malformed = AccountErrorKind::Request(RequestErrorKind::Malformed);
+        // The retired offset spelling, garbage, and a legacy imap1 payload.
+        for cursor in ["2", "not-a-number", "imapsearch1:imap1:5:INBOX:7:9"] {
+            let err = search_page(&[], None, 2, Some(cursor.as_bytes().to_vec()))
+                .expect_err("a cursor this crate did not mint");
+            assert_eq!(*err.kind(), malformed, "{cursor}");
+        }
+        let err = search_page(&[], None, 0, None).expect_err("a zero limit");
+        assert_eq!(*err.kind(), malformed);
+
+        let first = search_page(&[("A", 1, &[1, 2])], Some("A"), 1, None).expect("first page");
+        let err = search_page(&[("B", 1, &[1, 2])], Some("B"), 1, first.next_cursor)
+            .expect_err("a cursor from another folder restriction");
+        assert_eq!(*err.kind(), malformed);
+    }
+
+    #[test]
+    fn the_search_cursor_encoding_is_frozen() {
+        let position = SearchPosition {
+            folder: MailboxName::new("INBOX").unwrap(),
+            uidvalidity: 7,
+            key: 9,
+        };
+        let bytes = position.encode();
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            format!("imapsearch1:{}", encode_object_id(&position.folder, 7, 9).0)
+        );
+        assert_eq!(
+            SearchPosition::decode(&bytes, AccountOperation::Search).unwrap(),
+            position
         );
     }
 

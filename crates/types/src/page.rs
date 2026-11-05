@@ -25,8 +25,10 @@ pub struct Page<T> {
     /// last item in `items`. `None` when the underlying primitive
     /// returned its final page.
     pub next_cursor: Option<Vec<u8>>,
-    /// Server-reported total when known. `None` when the protocol
-    /// does not expose an estimate (most do not for search).
+    /// Total size of the whole result when known: server-reported, or
+    /// counted by a call that enumerated the entire result itself. `None`
+    /// when the protocol does not expose an estimate (most do not for
+    /// search) or when this call saw only part of the result.
     pub estimated_total: Option<u64>,
     /// Native identifiers of resources the provider fetched for this
     /// page but could not materialize into an item - for example a

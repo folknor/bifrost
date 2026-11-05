@@ -3020,6 +3020,133 @@ async fn pim_select_without_uidvalidity_is_the_providers_missing_field() {
     }
 }
 
+/// Drive one search page call against a server that selects INBOX at
+/// UIDVALIDITY 7 and answers the search command (`UID SEARCH` or
+/// `UID THREAD`) with `untagged`.
+async fn search_page_against<T: std::fmt::Debug>(
+    untagged: &'static str,
+    call: impl FnOnce(
+        ImapAccount,
+    ) -> bifrost_types::AccountFuture<Result<T, bifrost_types::AccountError>>,
+) -> T {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 THREAD=REFERENCES")).await;
+    let mut caps = super::test_support::stub_capabilities();
+    caps.pim_methods.search = true;
+    caps.pim_methods.search_messages = true;
+    let account = ImapAccount::new(ImapAccountParts {
+        capabilities: caps,
+        ..scripted_account_parts(conn, 1)
+    });
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE \"INBOX\"") || select.contains("SELECT \"INBOX\""),
+            "expected a select of INBOX, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                 * 4 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 7] ok\r\n\
+                 * OK [UIDNEXT 200] ok\r\n\
+                 {} OK done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let search = read_line(&mut server).await;
+        assert!(
+            search.contains("UID SEARCH") || search.contains("UID THREAD"),
+            "expected the search command, got {search}"
+        );
+        respond(
+            &mut server,
+            &format!("{untagged}\r\n{} OK done\r\n", tag_of(&search)),
+        )
+        .await;
+        server
+    });
+
+    let page = tokio::time::timeout(Duration::from_secs(5), call(account))
+        .await
+        .expect("the search call must not hang")
+        .expect("the search page");
+    let _server = script.await.unwrap();
+    page
+}
+
+/// Every page call re-runs the search. Resuming by offset into the fresh
+/// result skipped the boundary survivor when an earlier result was expunged
+/// between pages; the cursor is a position, so the survivor is returned.
+#[tokio::test]
+async fn search_messages_returns_the_boundary_survivor_after_an_earlier_expunge() {
+    use bifrost_types::{SearchFilter, SearchRequest};
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let request = |cursor: Option<Vec<u8>>| {
+        let mut request = SearchRequest::filter(SearchFilter::In(ContainerId("INBOX".to_owned())));
+        request.limit = Some(2);
+        request.page_cursor = cursor;
+        request
+    };
+    let ids = |uids: &[u32]| {
+        uids.iter()
+            .map(|uid| super::encode_object_id(&inbox, 7, *uid))
+            .collect::<Vec<_>>()
+    };
+
+    let first = search_page_against("* SEARCH 101 102 103 104", |account| {
+        super::pim::search_messages(account, request(None))
+    })
+    .await;
+    assert_eq!(first.items, ids(&[101, 102]));
+
+    // 101 is expunged before page two.
+    let cursor = first.next_cursor.clone();
+    let second = search_page_against("* SEARCH 102 103 104", move |account| {
+        super::pim::search_messages(account, request(cursor))
+    })
+    .await;
+    assert_eq!(second.items, ids(&[103, 104]));
+    assert_eq!(second.next_cursor, None);
+}
+
+/// Thread search pages by each thread's lowest member UID, not by the
+/// server's thread order, so the same expunge cannot skip a thread.
+#[tokio::test]
+async fn thread_search_pages_by_lowest_member_uid() {
+    use bifrost_types::{SearchFilter, SearchRequest};
+    let inbox = crate::types::MailboxName::new("INBOX").unwrap();
+    let request = |cursor: Option<Vec<u8>>| {
+        let mut request = SearchRequest::filter(SearchFilter::In(ContainerId("INBOX".to_owned())));
+        request.limit = Some(1);
+        request.page_cursor = cursor;
+        request
+    };
+
+    let first = search_page_against("* THREAD (104)(102 105)(101)(103)", |account| {
+        super::pim::search(account, request(None))
+    })
+    .await;
+    assert_eq!(
+        first.items,
+        vec![super::encode_thread_id(&inbox, 7, &[101])]
+    );
+
+    // Thread 101 is expunged; an offset of 1 would land past thread 102.
+    let cursor = first.next_cursor.clone();
+    let second = search_page_against("* THREAD (104)(102 105)(103)", move |account| {
+        super::pim::search(account, request(cursor))
+    })
+    .await;
+    assert_eq!(
+        second.items,
+        vec![super::encode_thread_id(&inbox, 7, &[102, 105])]
+    );
+}
+
 /// Run `message_hydrate` for INBOX uid 3 (UIDVALIDITY 5) against a server that
 /// selects INBOX at UIDVALIDITY 5 and answers the UID FETCH with `fetch_data`
 /// (untagged FETCH lines, possibly none) before its tagged OK.

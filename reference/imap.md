@@ -523,7 +523,7 @@ refusal, search-criteria assembly, page-cursor parsing) both take an
 entry points thread it down rather than guessing: `decode_object_id`,
 `decode_thread_id`, `decoded_targets`, `pim_operand`, `valid_uids`,
 `folder_from_container`, `search_plan` and its criteria combinators,
-`page_from_items`, `child_name`, `renamed_sibling`,
+`SearchPager::new`, `child_name`, `renamed_sibling`,
 `parse_draft_for_submission`. The recovery class is `ClientBug` on all of
 them and does not depend on the operation; what the threading buys is
 telemetry that attributes a client bug to the lane that hit it. It also
@@ -784,6 +784,7 @@ race cannot be closed by this client.
 - Read state: `set_is_read` via `\Seen`.
 - Importance: `set_importance` maps onto the `$important` keyword (no native IMAP field). Two-valued/exclusive: `High` sets it, `Normal`/`Low` clear it (one STORE); the read side maps `$important` presence to `Message.importance`.
 - Search messages: UID SEARCH across selectable folders, `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only with `THREAD=REFERENCES`, returning synthetic thread ids containing folder, UIDVALIDITY, and member UIDs.
+- Search paging (`pim::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. A changed UIDVALIDITY on the cursor's folder fails `ConcurrencyConflict` (repeat the walk); an undecodable cursor, a cursor outside the `SearchFilter::In` restriction, and a zero limit are `Request(Malformed)`. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised. The account probes the Inbox role when it exists; otherwise it chooses the first selectable folder by display name, wire octets, and encoding mode. Hydration: one-shot message FETCH and synthetic thread hydration.
 - Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present; discard is advertised only when UID EXPUNGE is available. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.

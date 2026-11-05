@@ -260,6 +260,23 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
+- **IMAP search: one failing folder fails the whole page.** `search` and
+  `search_messages` (`crates/imap/src/account/pim.rs`) propagate any
+  per-folder SELECT or SEARCH error with `?` across every selectable folder,
+  shared ones included, and never use `Page::skipped_scopes`; Graph
+  quarantines a revoked mailbox instead. Needs a ruling on which per-folder
+  failures quarantine rather than fail.
+- **IMAP search: the ESEARCH expansion cap is reported as `Request(Malformed)`.**
+  `SearchResultTruncated` (`crates/imap/src/account/error.rs`) maps to a
+  `ClientBug` class although the request was well formed and the server
+  answered correctly; a caller cannot tell "criteria malformed" from "result
+  too large" except by support-only text. Position paging does not help, since
+  every page call still expands the whole folder result.
+- **IMAP search cursor is not bound to its query.** The `imapsearch1:` cursor
+  carries only a position, so it is accepted for a different `SearchRequest`.
+  A position is meaningful under any query, so this resumes rather than
+  corrupts, but JMAP and Graph bind their search cursors to owner and state.
+
 - **IMAP PIM partial-commit scopes name the canonical id, not the submitted
   one.** `folder_effect_targets` (`crates/imap/src/account/pim.rs`) rebuilds
   `ErrorScope::Message` from a `FolderEffect`'s folder, UIDVALIDITY and UID,
