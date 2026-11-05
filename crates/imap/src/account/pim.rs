@@ -500,6 +500,11 @@ pub(crate) fn draft_send(
 
         let decoded = decode_object_id(&ObjectId(draft.0.clone()), AccountOperation::DraftSend)?;
         let raw = fetch_full_message(&account, &decoded).await?;
+        // Finalize: the saved `Date` is the save time; the message is ready
+        // for delivery now. Both the transmitted body and the Sent copy
+        // below derive from these restamped bytes, so they agree.
+        let raw: bytes::Bytes =
+            restamp_draft_date(&raw, jiff::Timestamp::now(), AccountOperation::DraftSend)?.into();
 
         // Parse the draft headers to build the envelope: To/Cc/Bcc drive
         // RCPT TO, From/Sender drive MAIL FROM. The Bcc header is folded
@@ -780,16 +785,33 @@ fn split_header_body(raw: &[u8]) -> (usize, usize) {
 /// (CRLF unless the draft is bare-LF) so a uniform-LF draft is not
 /// emitted with a mixed CRLF separator.
 fn strip_bcc_header(header_block: &[u8], body: &[u8]) -> Vec<u8> {
+    rewrite_header_block(header_block, body, b"bcc", None)
+}
+
+/// Reassemble a message with every field named `drop` (case-insensitive,
+/// continuation lines included) removed from the header block and, when
+/// `prepend` is set, that complete field line inserted as the first
+/// header. Same byte-exact and separator policy as [`strip_bcc_header`].
+fn rewrite_header_block(
+    header_block: &[u8],
+    body: &[u8],
+    drop: &[u8],
+    prepend: Option<&str>,
+) -> Vec<u8> {
     let uses_crlf = header_block.windows(2).any(|w| w == b"\r\n") || !header_block.contains(&b'\n');
     let sep: &[u8] = if uses_crlf { b"\r\n" } else { b"\n" };
 
     let mut kept = Vec::with_capacity(header_block.len() + body.len() + 4);
+    if let Some(field) = prepend {
+        kept.extend_from_slice(field.as_bytes());
+        kept.extend_from_slice(sep);
+    }
     let mut skipping = false;
     for line in split_inclusive_lf(header_block) {
         let trimmed = trim_leading_crlf(line);
         let is_continuation = line.first() == Some(&b' ') || line.first() == Some(&b'\t');
         if !is_continuation {
-            skipping = header_name_is_bcc(trimmed);
+            skipping = header_name_is(trimmed, drop);
         }
         if !skipping {
             kept.extend_from_slice(line);
@@ -839,13 +861,58 @@ fn trim_leading_crlf(line: &[u8]) -> &[u8] {
     s
 }
 
-/// True when a header line's field name (before the first `:`) is `Bcc`,
+/// True when a header line's field name (before the first `:`) is `name`,
 /// case-insensitive, ignoring surrounding whitespace.
-fn header_name_is_bcc(line: &[u8]) -> bool {
+fn header_name_is(line: &[u8], name: &[u8]) -> bool {
     match line.iter().position(|&b| b == b':') {
-        Some(idx) => line[..idx].trim_ascii().eq_ignore_ascii_case(b"bcc"),
+        Some(idx) => line[..idx].trim_ascii().eq_ignore_ascii_case(name),
         None => false,
     }
+}
+
+/// Replace a saved draft's `Date:` with the send time, at finalization.
+///
+/// A draft's `Date` is its save time (or absent, for a draft another
+/// client wrote); RFC 5322 section 3.6.1 makes `Date` the moment the
+/// message is ready for delivery, which is now. Every `Date` field is
+/// dropped and one fresh field is inserted first, so the transmitted body
+/// and the Sent copy built from the result agree.
+///
+/// Returns the draft unchanged when it carries a `DKIM-Signature`: the
+/// signer committed to those header bytes, and replacing or inserting a
+/// `Date` would invalidate the signature, so a signed draft keeps its own
+/// `Date` (stale or missing). Raw sends never come through here.
+///
+/// # Errors
+///
+/// `Request(Malformed)` when the header block opens with a continuation
+/// line: inserting a field in front would absorb it into the new `Date`.
+fn restamp_draft_date(
+    raw: &[u8],
+    now: jiff::Timestamp,
+    op: AccountOperation,
+) -> Result<Vec<u8>, AccountError> {
+    let (header_end, body_start) = split_header_body(raw);
+    let header_block = &raw[..header_end];
+    if split_inclusive_lf(header_block).any(|line| {
+        !matches!(line.first(), Some(b' ' | b'\t'))
+            && header_name_is(trim_leading_crlf(line), b"dkim-signature")
+    }) {
+        return Ok(raw.to_vec());
+    }
+    if matches!(header_block.first(), Some(b' ' | b'\t')) {
+        return Err(pim_malformed(
+            op,
+            "draft header block opens with a continuation line",
+        ));
+    }
+    let date = bifrost_types::format_rfc5322_date(now).map_err(stamp_imap_protocol)?;
+    Ok(rewrite_header_block(
+        header_block,
+        &raw[body_start..],
+        b"date",
+        Some(&format!("Date: {date}")),
+    ))
 }
 
 /// Collapse RFC 5322 folded header lines into `(lowercase-name, value)`
@@ -2516,6 +2583,9 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
     let empty_attachments: Vec<bifrost_types::AttachmentInline> = Vec::new();
 
     let composed = bifrost_types::ComposedMessage {
+        // Provisional save-time stamp so a stored draft is a conforming
+        // message; `draft_send` replaces it with the send time.
+        date: Some(jiff::Timestamp::now()),
         from,
         to: patch.to.as_deref().unwrap_or(&empty_addresses),
         cc: patch.cc.as_deref().unwrap_or(&empty_addresses),
@@ -2536,7 +2606,7 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
         // on SendRequest, not DraftPatch).
         disposition_notification_to: None,
     };
-    Ok(bifrost_types::render_rfc5322(&composed))
+    bifrost_types::render_rfc5322(&composed).map_err(stamp_imap_protocol)
 }
 
 /// The message a completed `UID FETCH` did not answer for.
@@ -3649,12 +3719,69 @@ body text\r\n";
 
     #[test]
     fn header_name_matching_is_trimmed_and_case_insensitive() {
-        assert!(header_name_is_bcc(b"Bcc: x@y"));
-        assert!(header_name_is_bcc(b"BCC:x@y"));
-        assert!(header_name_is_bcc(b" bcc : x@y"));
-        assert!(!header_name_is_bcc(b"Bcc-Original: x@y"));
-        assert!(!header_name_is_bcc(b"X-Original-Bcc: x@y"));
-        assert!(!header_name_is_bcc(b"Bcc x@y"), "no colon, no header");
+        assert!(header_name_is(b"Bcc: x@y", b"bcc"));
+        assert!(header_name_is(b"BCC:x@y", b"bcc"));
+        assert!(header_name_is(b" bcc : x@y", b"bcc"));
+        assert!(!header_name_is(b"Bcc-Original: x@y", b"bcc"));
+        assert!(!header_name_is(b"X-Original-Bcc: x@y", b"bcc"));
+        assert!(!header_name_is(b"Bcc x@y", b"bcc"), "no colon, no header");
+    }
+
+    fn fixed_now() -> jiff::Timestamp {
+        "2026-11-05T12:00:00Z".parse().expect("timestamp")
+    }
+
+    #[test]
+    fn restamp_replaces_every_date_field_and_keeps_lookalikes() {
+        let raw = b"Date: Mon, 2 Nov 2026 09:00:00 +0000\r\nTo: a@b.test\r\nDATE: Tue,\r\n 3 Nov 2026 09:00:00 +0000\r\nResent-Date: kept\r\nX-Date: kept\r\n\r\nDate: in the body\r\n";
+        let out =
+            restamp_draft_date(raw, fixed_now(), AccountOperation::DraftSend).expect("restamped");
+        let text = String::from_utf8(out).expect("ascii");
+        assert_eq!(
+            text,
+            "Date: Thu, 5 Nov 2026 12:00:00 +0000\r\nTo: a@b.test\r\nResent-Date: kept\r\nX-Date: kept\r\n\r\nDate: in the body\r\n"
+        );
+    }
+
+    #[test]
+    fn restamp_inserts_a_date_into_a_draft_without_one() {
+        let raw = b"To: a@b.test\nSubject: hi\n\nbody\n";
+        let out =
+            restamp_draft_date(raw, fixed_now(), AccountOperation::DraftSend).expect("restamped");
+        assert_eq!(
+            out,
+            b"Date: Thu, 5 Nov 2026 12:00:00 +0000\nTo: a@b.test\nSubject: hi\n\nbody\n"
+        );
+    }
+
+    #[test]
+    fn restamp_handles_an_unterminated_header_only_draft() {
+        let raw = b"To: a@b.test\r\nDate: old";
+        let out =
+            restamp_draft_date(raw, fixed_now(), AccountOperation::DraftSend).expect("restamped");
+        assert_eq!(
+            out,
+            b"Date: Thu, 5 Nov 2026 12:00:00 +0000\r\nTo: a@b.test\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn restamp_leaves_a_dkim_signed_draft_verbatim() {
+        let raw = b"DKIM-Signature: v=1; h=date:from\r\nDate: old\r\nTo: a@b.test\r\n\r\nbody";
+        let out =
+            restamp_draft_date(raw, fixed_now(), AccountOperation::DraftSend).expect("verbatim");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn restamp_rejects_a_leading_continuation_line() {
+        let raw = b" bcc: secret@example.test\r\nTo: a@b.test\r\n\r\nbody";
+        let err = restamp_draft_date(raw, fixed_now(), AccountOperation::DraftSend)
+            .expect_err("orphan continuation");
+        assert_eq!(
+            *err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
     }
 
     #[test]

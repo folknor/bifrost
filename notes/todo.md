@@ -199,6 +199,17 @@ face.
 
 ### New capability
 
+- **Caller-supplied composition `Date` on `SendRequest`.** The shared
+  renderer stamps `Date:` with the submission instant. An offline outbox that
+  submits later would want the moment the user pressed Send instead; a
+  `SendRequest` field (defaulting to now) would carry it. Surfaced by the
+  codex spar on bz#1; not built because it is a new consumer-facing knob.
+- **Gmail `draft_send` and `Date`.** Google drafts are rendered without a
+  `Date` and handed to drafts.send as stored. If a live probe shows Gmail
+  keeps a missing `Date` missing in the sent copy, `draft_send` could fetch
+  the draft and pass replacement `message.raw` stamped with the send time
+  in the same drafts.send call.
+
 - **Graph contact moves.** `crates/graph/src/account/contacts.rs`. A folder
   change is refused as `Unsupported(ContactUpdate)` before I/O. Supporting it
   means folder-aware move routing (Graph lists `parentFolderId` as an update

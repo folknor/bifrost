@@ -89,8 +89,8 @@ pub use compose::{
 pub use mime::{
     ComposedMessage, DecodedAttachment, DecodedBody, Defect, MimeLimits, MimePart, ParsedMessage,
     PartBody, RenderedMessage, SelectOptions, SubmissionEnvelope, TransferEncoding,
-    decode_encoded_words, parse_message, render_rfc5322, select_body, select_body_with,
-    send_request_to_rfc5322,
+    decode_encoded_words, format_rfc5322_date, parse_message, render_rfc5322, select_body,
+    select_body_with, send_request_to_rfc5322,
 };
 
 // Container / label / mutation-target types.

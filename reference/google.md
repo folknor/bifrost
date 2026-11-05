@@ -526,6 +526,10 @@ base64url message through Gmail. `MailDocument` keeps Gmail
 orchestration (draft-patch apply, hydration) and emits `Bcc:` so Gmail
 learns blind recipients:
 
+- `Date:` is stamped (UTC) on `send_message` only. Draft MIME carries no
+  `Date`, so `draft_send` hands Gmail exactly what it received before
+  bifrost emitted one; whether Gmail refreshes a supplied `Date` at
+  drafts.send is unverified, and a save-time stamp could go out stale.
 - `send_message` calls `users.messages.send`. Inline attachments are
   encoded into the MIME tree. Pre-uploaded attachment handles are
   unsupported (Gmail has no separate message-attachment upload).

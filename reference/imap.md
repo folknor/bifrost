@@ -773,8 +773,11 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
 - MIME assembly is the shared `bifrost-types::mime` serializer
   (`send_request_to_rfc5322` for send, `render_rfc5322` for drafts; shared with
   Google's `MailDocument`): text/html/`multipart/alternative` bodies, a
-  `multipart/mixed` wrapper for inline attachments, RFC 2047 display names, and a
-  controlled-domain `Message-ID` (sender domain, never `hostname::get()`).
+  `multipart/mixed` wrapper for inline attachments, RFC 2047 display names, a
+  controlled-domain `Message-ID` (sender domain, never `hostname::get()`), and a
+  UTC `Date:` (`+0000`, whole seconds) as the first header. `send_message` stamps
+  one instant into both the SMTP body and the Sent copy; a saved draft carries
+  its save time as a provisional `Date`.
 - Draft submission reads its header block through `HeaderMap::parse`, with
   shared address-list parsing (quoted-pairs and RFC 2047 display names) and
   `HeaderMap::message_ids`. `HeaderMap::addresses_checked` validates From,
@@ -793,6 +796,13 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   (bounded by `DRAFT_FETCH_BUDGET` 64 MiB, through `FetchLimit`) recovers the
   verbatim octets, the headers build the envelope, `Bcc:` is folded into RCPT but
   stripped from the body. A failed post-send discard is logged, not fatal.
+- `draft_send` finalizes `Date`: before submission every `Date` field (folds
+  included; `Resent-Date` and `X-Date` kept) is dropped and one carrying the
+  send time is inserted first, and both the SMTP body and the Sent copy derive
+  from those bytes. A draft carrying `DKIM-Signature` is left verbatim, keeping
+  its own `Date`, because rewriting it would break the signature. A header block
+  that opens with a continuation line is `Request(Malformed)`. `send_raw_message`
+  never restamps: caller-supplied raw bytes are sent as given.
 - Sent-copy Bcc retention: the SMTP body strips `Bcc:` but the Sent APPEND
   retains it. `send_message` uses the assembler's `sent_copy` variant (Bcc-bearing,
   only when the request has a Bcc); `draft_send` APPENDs the saved-draft octets,

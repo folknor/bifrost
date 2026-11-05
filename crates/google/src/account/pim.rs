@@ -1363,7 +1363,14 @@ fn render_message(
     // Gmail learns the Bcc recipients from the message headers (it strips
     // the Bcc header itself before delivery), so the Google path emits it.
     // Gmail mints its own Message-ID, so none is requested here.
+    //
+    // A send stamps a fresh `Date`. A draft carries none: Gmail's
+    // drafts.send transmits the stored draft, and whether Gmail refreshes a
+    // supplied `Date` at that point is unverified, so a save-time stamp
+    // could go out stale. Leaving it absent keeps what Gmail received
+    // before.
     let composed = bifrost_types::ComposedMessage {
+        date: require_recipient.then(jiff::Timestamp::now),
         from: Some(&from),
         to: &doc.to,
         cc: &doc.cc,
@@ -1381,7 +1388,7 @@ fn render_message(
         // the header in the sent MIME. `None` when unrequested.
         disposition_notification_to: doc.request_read_receipt.then_some(&from),
     };
-    let raw = bifrost_types::render_rfc5322(&composed);
+    let raw = bifrost_types::render_rfc5322(&composed)?;
     Ok(URL_SAFE_NO_PAD.encode(&raw))
 }
 

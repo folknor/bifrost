@@ -8,6 +8,7 @@
 //! divergent hand-rolled serializer each.
 //!
 //! It emits:
+//! - a `Date` header in UTC (always on the send path),
 //! - text-only, html-only, or `multipart/alternative` body entities,
 //! - a `multipart/mixed` wrapper when inline attachments are present,
 //! - `Content-Disposition: inline` / `attachment` per
@@ -103,8 +104,12 @@ pub fn send_request_to_rfc5322(
 
     let from = request.from.clone().unwrap_or_else(|| default_from.clone());
     let message_id = generate_message_id(&from);
+    // One instant for both bodies, so the transmitted message and the Sent
+    // copy carry the identical `Date:`.
+    let date = jiff::Timestamp::now();
 
     let mut composed = ComposedMessage {
+        date: Some(date),
         from: Some(&from),
         to: &request.to,
         cc: &request.cc,
@@ -128,12 +133,12 @@ pub fn send_request_to_rfc5322(
     // disclosed on the wire. The sender's own Sent copy retains it: it is
     // the sender's record of who was blind copied. Only render the second
     // variant when there is actually a Bcc to preserve.
-    let raw = render_rfc5322(&composed);
+    let raw = render_rfc5322(&composed)?;
     let sent_copy = if request.bcc.is_empty() {
         None
     } else {
         composed.include_bcc_header = true;
-        Some(render_rfc5322(&composed))
+        Some(render_rfc5322(&composed)?)
     };
 
     let mut recipients =
@@ -154,6 +159,12 @@ pub fn send_request_to_rfc5322(
 /// their own composition struct (e.g. Google's `MailDocument`) build one
 /// of these to share the body-building path.
 pub struct ComposedMessage<'a> {
+    /// `Date` header (RFC 5322 section 3.6.1), emitted first and rendered
+    /// in UTC to whole seconds. Every message bifrost transmits must carry
+    /// one: the send path always sets it. `None` is for provider-managed
+    /// draft serialization only (the Google draft path), which preserves
+    /// what that provider received before this field existed.
+    pub date: Option<jiff::Timestamp>,
     /// `From` header. `None` omits the header (a draft without a resolved
     /// sender); the send path always supplies one.
     pub from: Option<&'a Address>,
@@ -188,9 +199,16 @@ pub struct ComposedMessage<'a> {
 /// This performs no recipient validation: it serializes whatever fields
 /// it is given. Callers that need the "at least one recipient" guard
 /// (the send path) check before calling.
-#[must_use]
-pub fn render_rfc5322(msg: &ComposedMessage<'_>) -> Vec<u8> {
+///
+/// # Errors
+///
+/// `Request(Malformed)` when [`ComposedMessage::date`] lies outside the
+/// years RFC 5322 can express (see [`format_rfc5322_date`]).
+pub fn render_rfc5322(msg: &ComposedMessage<'_>) -> Result<Vec<u8>, AccountError> {
     let mut headers = Vec::new();
+    if let Some(date) = msg.date {
+        headers.push(format!("Date: {}", format_rfc5322_date(date)?));
+    }
     if let Some(from) = msg.from {
         push_header(&mut headers, "From", &format_address(from));
     }
@@ -237,7 +255,31 @@ pub fn render_rfc5322(msg: &ComposedMessage<'_>) -> Vec<u8> {
     headers.push("MIME-Version: 1.0".to_string());
 
     let entity = render_entity(msg);
-    format!("{}\r\n{entity}\r\n", headers.join("\r\n")).into_bytes()
+    Ok(format!("{}\r\n{entity}\r\n", headers.join("\r\n")).into_bytes())
+}
+
+/// Format an instant as an RFC 5322 `date-time` in UTC, whole seconds:
+/// `Tue, 15 Nov 1994 08:12:31 +0000`.
+///
+/// UTC rather than the host's local offset: the machine's zone need not be
+/// the author's, and a local offset discloses it. The offset is printed as
+/// `+0000` (UTC known) rather than the `-0000` RFC 5322 section 3.3
+/// reserves for "local zone unknown".
+///
+/// # Errors
+///
+/// `Request(Malformed)` when the year falls outside `1900..=9999`: RFC 5322
+/// requires a year of at least 1900 and four digits.
+pub fn format_rfc5322_date(date: jiff::Timestamp) -> Result<String, AccountError> {
+    let zoned = date.to_zoned(jiff::tz::TimeZone::UTC);
+    if !(1900..=9999).contains(&zoned.year()) {
+        return Err(malformed(
+            "Date year outside the RFC 5322 range 1900..=9999",
+        ));
+    }
+    jiff::fmt::rfc2822::DateTimePrinter::new()
+        .zoned_to_string(&zoned)
+        .map_err(|_| malformed("Date not representable as RFC 5322 date-time"))
 }
 
 fn render_entity(msg: &ComposedMessage<'_>) -> String {
@@ -916,6 +958,48 @@ mod tests {
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");
         assert!(!raw.contains("Disposition-Notification-To:"));
+    }
+
+    #[test]
+    fn send_request_stamps_one_date_on_wire_and_sent_copy() {
+        let request = SendRequest {
+            to: vec![addr(None, "a@example.com")],
+            bcc: vec![addr(None, "c@example.com")],
+            body_text: Some("hi".to_owned()),
+            ..SendRequest::default()
+        };
+        let rendered =
+            send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
+        let wire = String::from_utf8(rendered.raw).expect("utf8");
+        let sent = String::from_utf8(rendered.sent_copy.expect("bcc -> sent copy")).expect("utf8");
+        let date_line = |raw: &str| {
+            raw.split("\r\n")
+                .find(|line| line.starts_with("Date: "))
+                .map(ToOwned::to_owned)
+        };
+        let wire_date = date_line(&wire).expect("wire body carries Date");
+        assert!(wire.starts_with("Date: "), "Date is the first header");
+        assert!(wire_date.ends_with(" +0000"), "{wire_date}");
+        assert_eq!(date_line(&sent), Some(wire_date));
+    }
+
+    #[test]
+    fn rfc5322_date_is_utc_plus_zero_whole_seconds() {
+        let ts: jiff::Timestamp = "1994-11-15T08:12:31.987654321Z".parse().expect("timestamp");
+        assert_eq!(
+            format_rfc5322_date(ts).expect("in range"),
+            "Tue, 15 Nov 1994 08:12:31 +0000"
+        );
+    }
+
+    #[test]
+    fn rfc5322_date_rejects_years_before_1900() {
+        let ts: jiff::Timestamp = "1899-12-31T23:59:59Z".parse().expect("timestamp");
+        let err = format_rfc5322_date(ts).expect_err("pre-1900 rejected");
+        assert_eq!(
+            *err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
     }
 
     #[test]
