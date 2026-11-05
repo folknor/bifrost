@@ -347,7 +347,9 @@ impl<O: SetObject> SetResponse<O> {
         } else if let Some(error) = self.not_created.as_mut().and_then(|r| r.remove(id)) {
             Err(error.to_string_error().into())
         } else {
-            Err(Error::IdNotFound(id.to_string()))
+            // An omitted create may still have landed: no answer, not a
+            // proven failure, exactly as for `updated` / `destroyed`.
+            Err(Error::SetIdUnanswered(id.to_string()))
         }
     }
 

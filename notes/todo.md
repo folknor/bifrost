@@ -311,17 +311,23 @@ Narrow edge cases, audits with no known defect, and design work.
   Fixing it means carrying `DecodedObjectId::id` through `FolderEffect`; new
   destination ids stay canonical.
 
-- **JMAP create-id omissions still classify as terminal `MissingField`.**
-  `SetResponse::created` answers a create-id in neither `created` nor
-  `notCreated` with `Error::IdNotFound`, which the generic translation makes
-  `Protocol(MissingField)`; the create may have landed. Readers: filter create
-  (`sync/filters.rs`), event and contact create, and the `sync/pim.rs` send,
-  draft, import and replacement-submission creates. Several wrap it in their
-  own partial-commit handling (reschedule's `replacement_error` raises it to
-  `Uncertain`), so each needs a case-by-case check before giving `created`
-  the `SetIdUnanswered` treatment `updated` / `destroyed` now have. Distinct
-  from a returned created object that lacks its server id, which is a
-  confirmed create with an unusable identity.
+- **JMAP filter, mailbox, event and contact creates return an empty id as
+  success.** When the created object comes back without its server id,
+  `filters.rs` `create` and `pim.rs` `container_create` (via `take_id`) and
+  `calendar_ops.rs` / `contacts.rs` `create` (via `unwrap_or_default`) hand
+  back `ServerFilterId("")`, `ContainerId("")`, `EventId("")` or
+  `ContactId("")`. The Email and submission creates refuse that case through
+  `require_created_email_id` / `require_created_submission_id`. These four
+  doors have no partial-commit record by design (one set call), so the fix
+  is a refusal shape for a confirmed create with an unusable identity.
+- **A refused JMAP send drops an unanswered Email create or import.** In
+  `send_message` / `send_raw_message` the failure branch reads the Email
+  result with `.ok()`, so an Email create answered in neither map, beside a
+  proven submission refusal, becomes `email: None` and `failed_submission`
+  returns the bare refusal: nothing records that a staging Email may exist.
+  Recording it needs an uncertain, unidentified staging-Email step, which sits
+  next to the owner-ruling entry on leftover staging Emails having no
+  routable handle.
 - **Consumer-injected terminations cannot be attributed to an incarnation.**
   `InvalidationSink::push` (`route_watch_event` in
   `crates/sync/src/push/mod.rs`) sends `ReopenRequest::Recovery` with

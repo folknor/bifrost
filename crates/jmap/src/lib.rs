@@ -322,10 +322,13 @@ pub(crate) enum Error {
         expected: &'static str,
         actual: String,
     },
-    /// Requested object ID not found in a create/copy/parse/import response.
+    /// Requested object ID not found in a parse or blob-copy response, or in
+    /// a fetched object list.
     IdNotFound(String),
-    /// `SetResponse::updated` / `destroyed` found no answer for this id in
-    /// either the success or the error map. Usually the server omitted it,
+    /// A write-result lookup (`SetResponse::created` / `updated` /
+    /// `destroyed`, and the create maps of `Email/import`, `*/copy` and
+    /// `Blob/upload`) found no answer for this id in either the success or
+    /// the error map. Usually the server omitted it,
     /// which does not prove the write failed; it is also what a second
     /// lookup of an already-consumed id returns, so it means "no answer
     /// available", not proof of omission. Kept distinct from `IdNotFound` so

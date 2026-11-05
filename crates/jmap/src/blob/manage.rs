@@ -244,7 +244,7 @@ impl BlobUploadResponse {
                 "Blob {id} not created: {error:?}"
             )))
         } else {
-            Err(Error::IdNotFound(id.to_string()))
+            Err(Error::SetIdUnanswered(id.to_string()))
         }
     }
 

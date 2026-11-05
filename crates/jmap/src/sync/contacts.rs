@@ -141,7 +141,11 @@ pub(crate) fn create<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContactCreate))?;
         let card = response
             .created(&create_id)
-            .map_err(to_acct_err(AccountOperation::ContactCreate))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::ContactCreate,
+                "ContactCard/set",
+                false,
+            ))?;
         let id = card
             .id()
             .map(ContactCardId::into_string)
@@ -1351,6 +1355,14 @@ mod tests {
             .unwrap_err();
             assert_eq!(delete.kind(), &partial, "{delete:?}");
         }
+        // The scripted set answers no create either: an omitted create may
+        // have landed, so it reconciles rather than terminating.
+        let transport = ScriptedQueryTransport::new(Vec::new());
+        let create = create(Some(transport.account()), ContactCreate::default())
+            .await
+            .unwrap_err();
+        assert_eq!(create.kind(), &partial, "{create:?}");
+        assert!(create.recovery().requires_reconciliation(), "{create:?}");
     }
 
     #[tokio::test]

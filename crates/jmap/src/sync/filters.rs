@@ -200,7 +200,11 @@ pub(crate) fn create<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::FilterCreate))?;
         let mut created = response
             .created(&create_id)
-            .map_err(to_acct_err(AccountOperation::FilterCreate))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::FilterCreate,
+                "SieveScript/set",
+                false,
+            ))?;
         Ok(ServerFilterId(created.take_id().into_string()))
     })
 }
@@ -440,10 +444,18 @@ mod tests {
         async fn upload(
             &self,
             _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
+            body: Vec<u8>,
+            content_type: Option<&str>,
         ) -> Result<bytes::Bytes, TransportError> {
-            Err(TransportError::new("no upload reply"))
+            Ok(bytes::Bytes::from(
+                serde_json::json!({
+                    "accountId": "primary",
+                    "blobId": "b-uploaded",
+                    "type": content_type.unwrap_or("application/octet-stream"),
+                    "size": body.len()
+                })
+                .to_string(),
+            ))
         }
 
         async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
@@ -710,6 +722,20 @@ mod tests {
         .await
         .expect_err("an omitted destroy answer");
         assert_eq!(deleted.kind(), &partial, "{deleted:?}");
+
+        // The create may have landed too: no answer is not a refusal.
+        let created = create(
+            Some(sieve_account([omitted()], &meter)),
+            ServerFilterCreate::Script(bifrost_types::FilterScriptCreate {
+                name: Some("new".into()),
+                language: ScriptLanguage::Sieve,
+                body: "keep;".into(),
+                is_active: false,
+            }),
+        )
+        .await
+        .expect_err("an omitted create answer");
+        assert_eq!(created.kind(), &partial, "{created:?}");
     }
 
     /// A script the `/get` leaves out of `list` used to vanish from the

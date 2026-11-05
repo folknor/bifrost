@@ -191,7 +191,7 @@ impl EmailImportResponse {
         } else if let Some(error) = self.not_created.as_mut().and_then(|r| r.remove(id)) {
             Err(error.to_string_error().into())
         } else {
-            Err(Error::IdNotFound(id.to_string()))
+            Err(Error::SetIdUnanswered(id.to_string()))
         }
     }
 

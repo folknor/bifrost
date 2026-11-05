@@ -181,7 +181,11 @@ pub(crate) fn create<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::EventCreate))?;
         let event = response
             .created(&create_id)
-            .map_err(to_acct_err(AccountOperation::EventCreate))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::EventCreate,
+                "CalendarEvent/set",
+                false,
+            ))?;
         let id = event
             .id()
             .map(CalendarEventId::into_string)
@@ -2400,6 +2404,17 @@ mod tests {
             .unwrap_err();
             assert_eq!(delete.kind(), &partial, "{delete:?}");
         }
+        // The scripted set answers no create either: an omitted create may
+        // have landed, so it reconciles rather than terminating.
+        let transport = ScriptedQueryTransport::new(Vec::new());
+        let create = create(
+            Some(transport.account()),
+            create_with("2026-06-02T12:00:00Z", "2026-06-02T13:00:00Z"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(create.kind(), &partial, "{create:?}");
+        assert!(create.recovery().requires_reconciliation(), "{create:?}");
     }
 
     #[tokio::test]

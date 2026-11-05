@@ -1672,8 +1672,9 @@ pub(crate) fn get_id_unresolved_after_query(
     .expect("valid account error classification")
 }
 
-/// A `*/set` response (`method`, e.g. `Email/set`) that accounted for a
-/// submitted update or destroy id in neither its success nor its error map.
+/// A write response (`method`, e.g. `Email/set` or `Email/import`) that
+/// accounted for a submitted create, update or destroy id in neither its
+/// success nor its error map.
 /// RFC 8620 requires exactly one answer per submitted id, but the omission
 /// says nothing about whether the write landed. The method response did
 /// arrive, so preserve acknowledged transmission evidence and let
@@ -1715,8 +1716,9 @@ pub(crate) fn set_id_unanswered(
         .expect("valid account error classification")
 }
 
-/// The error mapper for a direct single-id `*/set` lookup
-/// (`SetResponse::updated` / `destroyed`): an omitted id is
+/// The error mapper for a direct single-id write-result lookup
+/// (`SetResponse::created` / `updated` / `destroyed`,
+/// `EmailImportResponse::created`): an omitted id is
 /// [`set_id_unanswered`] naming the method and the guard the request actually
 /// carried, never the terminal `Protocol(MissingField)`, because the omission
 /// does not prove the write failed. Every other error takes the ordinary

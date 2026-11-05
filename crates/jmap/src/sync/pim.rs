@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::error::set_answer_error;
+
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AccountStream, AttachmentSource,
     BlobCapabilities, BlobEncoding, BlobHandle, BlobId, Container, ContainerId, ContainerKind,
@@ -377,7 +379,11 @@ fn submission_create_error(
         ),
         _ => false,
     };
-    (to_acct_err(operation)(error), rejected)
+    // An omitted submission create is not a refusal: it may have landed.
+    (
+        set_answer_error(operation, "EmailSubmission/set", false)(error),
+        rejected,
+    )
 }
 /// A send whose submission did not succeed. `rejected` is a proven refusal
 /// (`notCreated`, or any method error except `serverPartialFail`): the
@@ -874,7 +880,7 @@ pub(crate) fn send_message<T: HttpTransport>(
             Ok((mut result, state)) => (
                 result
                     .created(&email_create_id)
-                    .map_err(to_acct_err(AccountOperation::Send))
+                    .map_err(set_answer_error(AccountOperation::Send, "Email/set", false))
                     .and_then(|email| require_created_email_id(&email, AccountOperation::Send)),
                 state,
             ),
@@ -1063,7 +1069,11 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
             Ok((mut result, state)) => (
                 result
                     .created(&import_create_id)
-                    .map_err(to_acct_err(AccountOperation::Send))
+                    .map_err(set_answer_error(
+                        AccountOperation::Send,
+                        "Email/import",
+                        false,
+                    ))
                     .and_then(|email| require_created_email_id(&email, AccountOperation::Send)),
                 (!state.is_empty()).then_some(state),
             ),
@@ -1230,9 +1240,11 @@ pub(crate) fn draft_create<T: HttpTransport>(
             )
             .await;
         }
-        let email = response
-            .created(&create_id)
-            .map_err(to_acct_err(AccountOperation::DraftCreate))?;
+        let email = response.created(&create_id).map_err(set_answer_error(
+            AccountOperation::DraftCreate,
+            "Email/set",
+            false,
+        ))?;
         let email_id =
             require_created_email_id(&email, AccountOperation::DraftCreate).map_err(|error| {
                 let mut record =
@@ -1701,9 +1713,11 @@ pub(crate) fn container_create<T: HttpTransport>(
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
-        let mut mailbox = response
-            .created(&create_id)
-            .map_err(to_acct_err(AccountOperation::ContainerCreate))?;
+        let mut mailbox = response.created(&create_id).map_err(set_answer_error(
+            AccountOperation::ContainerCreate,
+            "Mailbox/set",
+            false,
+        ))?;
         Ok(ContainerId(mailbox.take_id().into_string()))
     })
 }
@@ -4301,10 +4315,14 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
             let raisable = matches!(
                 &error,
                 crate::Error::ResponseDecode(_)
-                    | crate::Error::IdNotFound(_)
+                    | crate::Error::SetIdUnanswered(_)
                     | crate::Error::CallNotFound(_)
             ) || matches!(&error, crate::Error::Transport(transport) if transport.local.is_none());
-            let error = to_acct_err(AccountOperation::RescheduleSend)(error);
+            let error = set_answer_error(
+                AccountOperation::RescheduleSend,
+                "EmailSubmission/set",
+                false,
+            )(error);
             let unsent = error.chain().iter().any(|cause| {
                 matches!(
                     cause,
@@ -4867,6 +4885,20 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(delete.kind(), &partial, "{delete:?}");
+
+        let create = container_create(
+            mail(),
+            states(),
+            "primary".to_string(),
+            ContainerKind::Folder,
+            "new".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(create.kind(), &partial, "{create:?}");
+        assert!(create.recovery().requires_reconciliation(), "{create:?}");
 
         let cancel = cancel_scheduled_send(mail(), ObjectId("sub".into()))
             .await
@@ -6827,19 +6859,27 @@ mod tests {
                                 .keys()
                                 .next()
                                 .expect("email create id");
-                            serde_json::json!({
-                                "accountId": account_id,
-                                "oldState": "email-state-before-create",
-                                "newState": "email-created-state",
-                                "created": Self::keyed(
-                                    create_id,
-                                    if self.submission_reply == Some("missing_email_id") {
-                                        serde_json::json!({})
-                                    } else {
-                                        serde_json::json!({"id": "email-created"})
-                                    }
-                                )
-                            })
+                            if self.submission_reply == Some("omitted_email") {
+                                serde_json::json!({
+                                    "accountId": account_id,
+                                    "oldState": "email-state-before-create",
+                                    "newState": "email-created-state"
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "accountId": account_id,
+                                    "oldState": "email-state-before-create",
+                                    "newState": "email-created-state",
+                                    "created": Self::keyed(
+                                        create_id,
+                                        if self.submission_reply == Some("missing_email_id") {
+                                            serde_json::json!({})
+                                        } else {
+                                            serde_json::json!({"id": "email-created"})
+                                        }
+                                    )
+                                })
+                            }
                         }
                     }
                     "Identity/get" => {
@@ -6858,6 +6898,13 @@ mod tests {
                                 "email": email
                             }],
                             "notFound": []
+                        })
+                    }
+                    "Email/import" if self.submission_reply == Some("omitted_email") => {
+                        serde_json::json!({
+                            "accountId": account_id,
+                            "oldState": "email-state-before-import",
+                            "newState": "email-imported-state"
                         })
                     }
                     "Email/import" => serde_json::json!({
@@ -7683,6 +7730,60 @@ mod tests {
         assert!(
             matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCommit && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::DedupeByClientId, bifrost_types::ReconcileAction::ObserveOnly])
         );
+    }
+
+    /// An Email create or import the server answers in neither `created` nor
+    /// `notCreated` may still have landed, so it is a partial response that
+    /// reconciles, never the terminal `MissingField` of a create that came
+    /// back without its id.
+    #[tokio::test]
+    async fn an_omitted_email_create_answer_is_a_partial_response() {
+        let partial = bifrost_types::AccountErrorKind::Protocol(
+            bifrost_types::ProtocolErrorKind::PartialResponse,
+        );
+        let omitting = || {
+            let mut transport = SendTransport::new(false, false, false, false);
+            transport.submission_reply = Some("omitted_email");
+            transport
+        };
+
+        let draft = draft_create(
+            send_account(omitting()),
+            send_state_map(),
+            "primary".to_string(),
+            bifrost_types::DraftPatch::default(),
+        )
+        .await
+        .expect_err("an omitted draft create answer");
+        assert_eq!(draft.kind(), &partial, "{draft:?}");
+        assert!(draft.recovery().requires_reconciliation(), "{draft:?}");
+
+        let transport = omitting();
+        let send = send_message(
+            send_account(transport.clone()),
+            send_state_map(),
+            "primary".to_string(),
+            0,
+            None,
+            basic_send_request(),
+        )
+        .await
+        .expect_err("an omitted Email create answer after an acknowledged submission");
+        assert_eq!(send.kind(), &partial, "{send:?}");
+        assert!(send.recovery().requires_reconciliation(), "{send:?}");
+        assert_eq!(transport.calls("Email/set").len(), 1, "no cleanup destroy");
+
+        let raw = send_raw_message(
+            send_account(omitting()),
+            send_state_map(),
+            "primary".to_string(),
+            Bytes::from_static(b"raw message"),
+            None,
+        )
+        .await
+        .expect_err("an omitted Email import answer after an acknowledged submission");
+        assert_eq!(raw.kind(), &partial, "{raw:?}");
+        assert!(raw.recovery().requires_reconciliation(), "{raw:?}");
     }
 
     #[tokio::test]
