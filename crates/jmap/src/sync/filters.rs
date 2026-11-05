@@ -263,7 +263,11 @@ pub(crate) fn update<T: HttpTransport>(
         if has_patch {
             response
                 .updated(&id)
-                .map_err(to_acct_err(AccountOperation::FilterUpdate))?;
+                .map_err(super::error::set_answer_error(
+                    AccountOperation::FilterUpdate,
+                    "SieveScript/set",
+                    false,
+                ))?;
         } else {
             response
                 .unwrap_update_errors()
@@ -286,7 +290,11 @@ pub(crate) fn delete<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::FilterDelete))?;
         response
             .destroyed(&id)
-            .map_err(to_acct_err(AccountOperation::FilterDelete))
+            .map_err(super::error::set_answer_error(
+                AccountOperation::FilterDelete,
+                "SieveScript/set",
+                false,
+            ))
     })
 }
 
@@ -662,6 +670,46 @@ mod tests {
                 vec!["s5".to_string()],
             ],
         );
+    }
+
+    /// A `SieveScript/set` that answers the submitted id in neither its
+    /// success nor its error map does not prove the write failed: update and
+    /// delete report a partial response, not a terminal missing field.
+    #[tokio::test]
+    async fn an_omitted_script_set_answer_is_a_partial_response() {
+        let omitted = || {
+            serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[
+                    "SieveScript/set",
+                    {"accountId": "primary", "oldState": "s1", "newState": "s2"},
+                    "s0"
+                ]]
+            })
+            .to_string()
+        };
+        let meter = std::sync::Arc::new(DownloadMeter::default());
+        let partial = AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse);
+
+        let updated = update(
+            Some(sieve_account([omitted()], &meter)),
+            ServerFilterId("s1".into()),
+            ServerFilterPatch::Script(bifrost_types::FilterScriptPatch {
+                name: Some(Some("renamed".into())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("an omitted update answer");
+        assert_eq!(updated.kind(), &partial, "{updated:?}");
+
+        let deleted = delete(
+            Some(sieve_account([omitted()], &meter)),
+            ServerFilterId("s1".into()),
+        )
+        .await
+        .expect_err("an omitted destroy answer");
+        assert_eq!(deleted.kind(), &partial, "{deleted:?}");
     }
 
     /// A script the `/get` leaves out of `list` used to vanish from the

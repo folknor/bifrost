@@ -145,7 +145,13 @@ face.
 - **BulkDestroy PartialResponse derives DedupeByClientId** even though destroy
   has no client-id deduplication. This protects Graph/JMAP's usual ambiguous
   destroy answers from reassertion. An operation-aware derivation requires an
-  error-model ruling.
+  error-model ruling. The same derivation now reaches the JMAP single-id
+  doors that read an unanswered set id as `PartialResponse`: an unanswered
+  `CancelScheduledSend`, the `RescheduleSend` cancel leg (no replacement
+  create was attempted), `ContainerDelete`, `FilterDelete` and `DraftDiscard`
+  all carry `DedupeByClientId`. A reschedule-only partial-commit record with a
+  `Cancelled` Uncertain primary would drop it there, but was not built ahead
+  of the general ruling.
 - **A dedupe-bearing stream termination leaves same-round per-item
   SameRequest/AfterAuthRefresh blind retry candidates eligible.** Whether
   whole-submission dedupe should suppress these retries needs a ruling.
@@ -232,13 +238,17 @@ Narrow edge cases, audits with no known defect, and design work.
   Fixing it means carrying `DecodedObjectId::id` through `FolderEffect`; new
   destination ids stay canonical.
 
-- **JMAP set omissions outside the calendar and contact doors.** Direct
-  single-id readers of `SetResponse::updated` / `destroyed` other than those
-  doors still map an omission through the generic translation (`IdNotFound`,
-  terminal `MissingField`): the filter doors in `sync/filters.rs`, and in
-  `sync/pim.rs` the email update, mailbox destroy and submission update reads.
-  Not checked case by case; some sit inside multi-step operations that already
-  carry their own partial-commit record.
+- **JMAP create-id omissions still classify as terminal `MissingField`.**
+  `SetResponse::created` answers a create-id in neither `created` nor
+  `notCreated` with `Error::IdNotFound`, which the generic translation makes
+  `Protocol(MissingField)`; the create may have landed. Readers: filter create
+  (`sync/filters.rs`), event and contact create, and the `sync/pim.rs` send,
+  draft, import and replacement-submission creates. Several wrap it in their
+  own partial-commit handling (reschedule's `replacement_error` raises it to
+  `Uncertain`), so each needs a case-by-case check before giving `created`
+  the `SetIdUnanswered` treatment `updated` / `destroyed` now have. Distinct
+  from a returned created object that lacks its server id, which is a
+  confirmed create with an unusable identity.
 - **Generation stamps on non-push recovery producers.** Poll tasks, the
   reconciler, lifecycle reader and deferred inventory still enqueue unstamped
   `ReopenRequest::Recovery`. A request queued before reattach can act on the

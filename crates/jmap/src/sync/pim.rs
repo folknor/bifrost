@@ -154,7 +154,12 @@ pub(crate) fn set_keyword<T: HttpTransport>(
                 }
             };
             for id in chunk {
-                progress.item(id, response.updated(id), AccountOperation::SetKeyword);
+                progress.item(
+                    id,
+                    response.updated(id),
+                    AccountOperation::SetKeyword,
+                    false,
+                );
             }
             if progress.is_failed() {
                 break;
@@ -252,12 +257,22 @@ impl SetProgress {
             error,
         });
     }
-    fn item(&mut self, id: &EmailId, result: crate::Result<impl Sized>, op: AccountOperation) {
+    /// Record one id's `Email/set` answer. `guarded` says the set carried
+    /// `ifInState`. An unanswered id is `Uncertain` explicitly: for an
+    /// idempotent unguarded op its PartialResponse leaf advises a same-request
+    /// retry, which `from_leaf` would read as `NotApplied`.
+    fn item(
+        &mut self,
+        id: &EmailId,
+        result: crate::Result<impl Sized>,
+        op: AccountOperation,
+        guarded: bool,
+    ) {
         match result {
             Ok(_) => self.committed.push(id.clone()),
             Err(error) => {
-                let missing = matches!(error, crate::Error::IdNotFound(_));
-                let error = to_acct_err(op)(error);
+                let missing = matches!(error, crate::Error::SetIdUnanswered(_));
+                let error = super::error::set_answer_error(op, "Email/set", guarded)(error);
                 let application = if missing {
                     Application::Uncertain
                 } else {
@@ -943,8 +958,9 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
 /// Destroy the Email a refused send created, and report how that cleanup
 /// ended. The outcome comes from `CompensationOutcome::from_error`, with one
 /// stated override: a decoded response missing the `destroyed(id)` result
-/// (mapped to `Protocol(MissingField)`) is `Unconfirmed`, never `Failed` -
-/// the destroy may have applied.
+/// (mapped to `Protocol(PartialResponse)`, which `from_error` would call
+/// `Failed` for its acknowledged evidence) is `Unconfirmed` - the destroy may
+/// have applied.
 async fn discard_created_send_email<T: HttpTransport>(
     mail: &MailAccount<T>,
     email_states: &StateMap,
@@ -965,7 +981,7 @@ async fn discard_created_send_email<T: HttpTransport>(
             if matches!(
                 error.kind(),
                 bifrost_types::AccountErrorKind::Protocol(
-                    bifrost_types::ProtocolErrorKind::MissingField
+                    bifrost_types::ProtocolErrorKind::PartialResponse
                 )
             ) =>
         {
@@ -1101,7 +1117,11 @@ pub(crate) fn draft_update<T: HttpTransport>(
         .await?;
         response
             .updated(&email_id)
-            .map_err(to_acct_err(AccountOperation::DraftUpdate))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::DraftUpdate,
+                "Email/set",
+                false,
+            ))?;
         Ok(())
     })
 }
@@ -1597,7 +1617,11 @@ pub(crate) fn container_delete<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::ContainerDelete))?;
         response
             .destroyed(&mailbox)
-            .map_err(to_acct_err(AccountOperation::ContainerDelete))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::ContainerDelete,
+                "Mailbox/set",
+                false,
+            ))?;
         if let Some(new_state) = response.new_state().filter(|state| !state.is_empty()) {
             state_cache::set(&mailbox_states, &account_id, new_state.to_string()).await;
         }
@@ -2398,7 +2422,7 @@ async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
             .await;
         }
         for id in chunk {
-            progress.item(id, response.destroyed(id), op);
+            progress.item(id, response.destroyed(id), op, true);
         }
         if progress.is_failed() {
             break;
@@ -2484,7 +2508,7 @@ async fn patch_mailbox_membership_of<T: HttpTransport>(
             }
         };
         for id in chunk {
-            progress.item(id, response.updated(id), op);
+            progress.item(id, response.updated(id), op, false);
         }
         if progress.is_failed() {
             break;
@@ -2617,7 +2641,9 @@ async fn destroy_emails<T: HttpTransport>(
     })
     .await?;
     for id in &ids_vec {
-        response.destroyed(id).map_err(to_acct_err(op))?;
+        response
+            .destroyed(id)
+            .map_err(super::error::set_answer_error(op, "Email/set", false))?;
     }
     Ok(())
 }
@@ -3998,7 +4024,11 @@ pub(crate) fn cancel_scheduled_send<T: HttpTransport>(
             .map_err(to_acct_err(AccountOperation::CancelScheduledSend))?;
         set_response
             .updated(&submission_id)
-            .map_err(to_acct_err(AccountOperation::CancelScheduledSend))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::CancelScheduledSend,
+                "EmailSubmission/set",
+                false,
+            ))?;
         Ok(())
     })
 }
@@ -4081,9 +4111,15 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
             .call(cancel)
             .await
             .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
+        // An unanswered cancel may have landed and nothing follows it, so it
+        // is a plain reconcilable PartialResponse leaf with no record.
         cancel_response
             .updated(&submission_id)
-            .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
+            .map_err(super::error::set_answer_error(
+                AccountOperation::RescheduleSend,
+                "EmailSubmission/set",
+                false,
+            ))?;
 
         let mut set = EmailSubmissionSet::new();
         {
@@ -4559,6 +4595,121 @@ mod tests {
         ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
             Err(crate::core::transport::TransportError::new("no session"))
         }
+    }
+
+    /// Answers every `*/set` call with neither a success nor an error entry
+    /// for any id: the omission an RFC 8620 server must not produce, but one
+    /// that does not prove the write failed.
+    #[derive(Clone)]
+    struct OmittingSetTransport;
+
+    impl HttpTransport for OmittingSetTransport {
+        async fn api_request(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+            _replay: bifrost_net::ReplayPolicy,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).expect("the client emits JSON");
+            let call = &request["methodCalls"][0];
+            let method = call[0].as_str().expect("method name").to_string();
+            assert!(method.ends_with("/set"), "unexpected {method}");
+            let response = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[
+                    method,
+                    {"accountId": "primary", "oldState": "s1", "newState": "s2"},
+                    call[2].clone()
+                ]]
+            });
+            Ok(bytes::Bytes::from(response.to_string()))
+        }
+
+        async fn upload(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+            _content_type: Option<&str>,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no upload"))
+        }
+
+        async fn download(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no download"))
+        }
+
+        async fn get_session(
+            &self,
+            _url: &str,
+        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+            Err(crate::core::transport::TransportError::new("no session"))
+        }
+    }
+
+    /// The direct single-id mail writes classify an omitted set answer as a
+    /// reconcilable or retryable partial response, never the terminal
+    /// `MissingField` a missing id once translated to.
+    #[tokio::test]
+    async fn an_omitted_mail_set_answer_is_a_partial_response() {
+        let partial = bifrost_types::AccountErrorKind::Protocol(
+            bifrost_types::ProtocolErrorKind::PartialResponse,
+        );
+        let mail = || {
+            let client = crate::client::Client::with_transport(
+                OmittingSetTransport,
+                search_session(),
+                "https://example.test/.well-known/jmap",
+            )
+            .expect("client builds");
+            crate::account::Account::new(client, "primary")
+        };
+        let states = send_state_map;
+        let mut patch = bifrost_types::DraftPatch::default();
+        patch.subject = Some(Some("s".into()));
+
+        let update = draft_update(
+            mail(),
+            states(),
+            "primary".to_string(),
+            bifrost_types::DraftHandle("d1".into()),
+            patch,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(update.kind(), &partial, "{update:?}");
+
+        let discard = draft_discard(
+            mail(),
+            states(),
+            "primary".to_string(),
+            bifrost_types::DraftHandle("d1".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(discard.kind(), &partial, "{discard:?}");
+        assert!(matches!(
+            discard.recovery(),
+            bifrost_types::RecoveryClass::Reconcile(_)
+        ));
+
+        let delete = container_delete(
+            mail(),
+            states(),
+            "primary".to_string(),
+            ContainerId("mbx".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(delete.kind(), &partial, "{delete:?}");
+
+        let cancel = cancel_scheduled_send(mail(), ObjectId("sub".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(cancel.kind(), &partial, "{cancel:?}");
     }
 
     /// A share whose `Mailbox/get` answers without `myRights` projected

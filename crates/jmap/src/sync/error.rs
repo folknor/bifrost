@@ -232,6 +232,13 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         .try_build()
         .expect("valid account error classification"),
         crate::Error::IdNotFound(id) => convert_id_not_found(id, ctx),
+        // A reader that skipped `set_answer_error` still gets a partial
+        // response, never the terminal `MissingField`. Whether the set carried
+        // `ifInState` is unknown here, so idempotency is narrowed as if it
+        // had: a same-request retry is never advised for a write that may
+        // have landed under a guard. `set_answer_error` supplies the real
+        // method and guard for every reader in this crate.
+        crate::Error::SetIdUnanswered(id) => set_id_unanswered("*/set", &id, ctx, true),
         crate::Error::NotParsable(detail) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
@@ -1710,16 +1717,17 @@ pub(crate) fn set_id_unanswered(
 
 /// The error mapper for a direct single-id `*/set` lookup
 /// (`SetResponse::updated` / `destroyed`): an omitted id is
-/// [`set_id_unanswered`], never the terminal `Protocol(MissingField)` a bare
-/// `IdNotFound` would classify as, because the omission does not prove the
-/// write failed. Every other error takes the ordinary translation.
+/// [`set_id_unanswered`] naming the method and the guard the request actually
+/// carried, never the terminal `Protocol(MissingField)`, because the omission
+/// does not prove the write failed. Every other error takes the ordinary
+/// translation.
 pub(crate) fn set_answer_error(
     operation: AccountOperation,
     method: &'static str,
     guarded: bool,
-) -> impl FnOnce(crate::Error) -> AccountError + Send + 'static {
+) -> impl Fn(crate::Error) -> AccountError + Send + 'static {
     move |error| match error {
-        crate::Error::IdNotFound(id) => {
+        crate::Error::SetIdUnanswered(id) => {
             set_id_unanswered(method, &id, JmapErrorContext::new(operation), guarded)
         }
         other => into_account_error(other, JmapErrorContext::new(operation)),
@@ -3231,6 +3239,23 @@ mod replay_tests {
                 ));
             }
         }
+    }
+    /// A set reader that skipped `set_answer_error` cannot know whether its
+    /// request was guarded, so the generic translation never advises a
+    /// same-request retry for an unanswered id.
+    #[test]
+    fn an_unanswered_set_id_without_a_mapper_reconciles() {
+        let error = into_account_error(
+            crate::Error::SetIdUnanswered("m1".into()),
+            JmapErrorContext::new(AccountOperation::UpdateFlags),
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+        );
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
+        );
     }
     #[tokio::test]
     async fn a_dropped_set_reconciles_under_an_idempotent_operation() {

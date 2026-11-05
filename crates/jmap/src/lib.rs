@@ -322,8 +322,16 @@ pub(crate) enum Error {
         expected: &'static str,
         actual: String,
     },
-    /// Requested object ID not found in set/copy/parse response.
+    /// Requested object ID not found in a create/copy/parse/import response.
     IdNotFound(String),
+    /// `SetResponse::updated` / `destroyed` found no answer for this id in
+    /// either the success or the error map. Usually the server omitted it,
+    /// which does not prove the write failed; it is also what a second
+    /// lookup of an already-consumed id returns, so it means "no answer
+    /// available", not proof of omission. Kept distinct from `IdNotFound` so
+    /// the generic translation can classify it as a partial response rather
+    /// than a terminal missing field.
+    SetIdUnanswered(String),
     /// Not parsable as the expected format.
     NotParsable(String),
     /// A URL or URL-component value this crate's own caller supplied is
@@ -519,6 +527,7 @@ impl Display for Error {
                 actual,
             } => write!(f, "Call {call_id} returned {actual}, expected {expected}"),
             Error::IdNotFound(id) => write!(f, "Id {id} not found"),
+            Error::SetIdUnanswered(id) => write!(f, "Id {id} unanswered in set response"),
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
             Error::MalformedSessionUrl { property, detail } => {

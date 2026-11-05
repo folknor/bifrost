@@ -518,7 +518,7 @@ The crate-internal JMAP error type uses structured variants. No
   status, title and detail.
 - `Method(MethodError)` - JMAP method-level errors. `Set(SetError)` - per-object set errors.
 - Local request refusals: `RequestEncode`, `RequestCallLimit { max }`, `RequestSizeLimit { max, size }`, `NoPrimaryAccount { capability }`.
-- Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `NotParsable`.
+- Response-shape failures: `ResponseDecode`, `CallNotFound`, `UnexpectedMethodResponse`, `IdNotFound`, `SetIdUnanswered`, `NotParsable`.
 - `InvalidUrl` - a URL or URL-component value the crate's own caller supplied is unusable. Sources include an empty session URL and an empty EventSource type list.
 - `MalformedSessionUrl { property, detail }` - a URL or URL template the SERVER published in its session is unusable: `apiUrl` and the `uploadUrl`, `downloadUrl` and `eventSourceUrl` templates (an unbalanced or unknown template variable, or not an absolute http or https URL; `eventSourceUrl` raises only when EventSource is used) and the WebSocket capability's `url` (an unparseable URI or a non-websocket scheme). The provider described itself wrongly, so this is never the caller's `InvalidUrl`.
 - `MalformedCapability { capability }` - an advertised capability whose object does not parse.
@@ -835,7 +835,7 @@ short batch cannot be held to end-of-input by a busy one; the wait is capped
 at the same input volume a full batch already accepts. A route holding only
 locally-rejected targets emits them without probing Email state.
 
-`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so unguarded idempotent flag work retries, guarded flag work reconciles with CheckTarget only, and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. The direct single-id calendar and contact writes (event update, RSVP and delete; contact update and delete) map an omitted id the same way, through `error::set_answer_error`, rather than as the terminal `Protocol(MissingField)` a bare `IdNotFound` classifies as. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
+`IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back observes current state; eligible targets may reassert within bounds). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so unguarded idempotent flag work retries, guarded flag work reconciles with CheckTarget only, and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. `SetResponse::updated`/`destroyed` report an omission as `Error::SetIdUnanswered`, distinct from the `IdNotFound` that create, copy, parse and import lookups still raise. Every direct single-id reader (calendar and contact writes, filter update and delete, draft update and discard, send cleanup, container delete, scheduled-send cancel and the reschedule cancel leg) and the `SetProgress` bulk readers map it through `error::set_answer_error`, which names the method and the guard the request carried. A reader that skips the mapper still gets `Protocol(PartialResponse)` from the generic translation, with idempotency narrowed because its guard is unknown, never the terminal `Protocol(MissingField)`. Send cleanup reports an unanswered destroy as `CompensationOutcome::Unconfirmed`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations, wholly empty patches, and patches naming the same flag in both sets are rejected up front as `Terminated(Request(Malformed))` rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
 
 ### PIM primitives and conveniences
 
@@ -1213,7 +1213,8 @@ arrived) and, unless its primary cause already is one, the typed
   `CallNotFound` -> `Protocol(MissingField)`, all
   `ProviderContractViolation`. `IdNotFound` -> `NotFound(resource)`
   (`ProviderRefused`) when the scope names a resource, else
-  `Protocol(MissingField)`.
+  `Protocol(MissingField)`. `SetIdUnanswered` -> `Protocol(PartialResponse)`
+  with acknowledged evidence and idempotency narrowed (guard unknown).
 - Caller faults -> `Request(Malformed)` -> `ClientBug`: `RequestEncode`,
   `RequestCallLimit`, `RequestSizeLimit`, and `InvalidUrl` (field `url`, for
   an empty session URL or an unusable EventSource URL component).

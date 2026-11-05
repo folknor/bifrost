@@ -661,7 +661,7 @@ fn classify_set_response(
             });
             super::error::classify_set_item(set_error, ctx, BatchItemId(id.0.clone()), item_scope)
         }
-        Err(crate::Error::IdNotFound(_)) => ItemOutcome::Failed(BatchFailure::new(
+        Err(crate::Error::SetIdUnanswered(_)) => ItemOutcome::Failed(BatchFailure::new(
             BatchItemId(id.0.clone()),
             super::error::set_id_unanswered(
                 "Email/set",
@@ -1719,7 +1719,7 @@ mod tests {
     #[test]
     fn an_unanswered_set_id_is_a_reconcilable_partial_response() {
         let outcome = classify_set_response(
-            Err(crate::Error::IdNotFound("m1".to_string())),
+            Err(crate::Error::SetIdUnanswered("m1".to_string())),
             ObjectId("m1".to_string()),
             AccountOperation::BulkDestroy,
             false,

@@ -357,7 +357,7 @@ impl<O: SetObject> SetResponse<O> {
         } else if let Some(error) = self.not_updated.as_mut().and_then(|r| r.remove(id)) {
             Err(error.to_string_error().into())
         } else {
-            Err(Error::IdNotFound(id.to_string()))
+            Err(Error::SetIdUnanswered(id.to_string()))
         }
     }
 
@@ -371,7 +371,7 @@ impl<O: SetObject> SetResponse<O> {
         } else if let Some(error) = self.not_destroyed.as_mut().and_then(|r| r.remove(id)) {
             Err(error.to_string_error().into())
         } else {
-            Err(Error::IdNotFound(id.to_string()))
+            Err(Error::SetIdUnanswered(id.to_string()))
         }
     }
 
