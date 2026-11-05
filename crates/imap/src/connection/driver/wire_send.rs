@@ -58,6 +58,32 @@ pub(super) fn write_failure_evidence(
     }
 }
 
+/// Commit a withdrawable command (or pipelined batch) through `gate` just
+/// before its first byte is offered: wait for the first outbound bandwidth
+/// grant, racing the caller's withdrawal, then commit. `false` means the
+/// caller withdrew first and nothing may be written or answered.
+///
+/// Call it after every refusal-before-send decision and BEFORE arming any
+/// pending state effect, and send immediately after it returns `true`, with
+/// no await in between: the grant it leaves on the reader is sized for the
+/// first nonempty chunk of `wires`, which is exactly what the send offers
+/// first (a command's first segment always opens with its tag).
+pub(super) async fn commit_before_first_write<'w>(
+    wire_reader: &mut super::super::wire::WireReader,
+    gate: &super::super::reply::CommitGate,
+    wires: impl IntoIterator<Item = &'w WireCommand>,
+) -> bool {
+    let first = wires
+        .into_iter()
+        .flat_map(|wire| wire.segments().iter().flatten())
+        .map(bytes::Bytes::len)
+        .find(|&len| len > 0);
+    match first {
+        Some(len) => wire_reader.admit_first_write(len, gate).await,
+        None => gate.commit(),
+    }
+}
+
 /// Send one encoded command, waiting for a `+` continuation between each
 /// pair of consecutive segments (RFC 3501 Section 4.3).
 ///

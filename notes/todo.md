@@ -285,11 +285,6 @@ Narrow edge cases, audits with no known defect, and design work.
   tagged OK or the stream swap. Harmless today (the half-built session is
   dropped before a driver exists and the only recovery is a fresh dial), but
   it is the one transition path whose error states no phase.
-- **IMAP bandwidth admission after claim.** `send_wire_command` waits for
-  `BandwidthBudget` after driver claim but before the socket write. Caller
-  expiry there conservatively reads `InFlight`. Withdrawal through that window
-  needs retirement rules for bytes buffered by TLS even when the socket
-  counter has not advanced.
 - **Session cap does not span account incarnations.** A failed or cancelled
   factory open, or a closing incarnation during reopen, can leave a transport
   tail that the next incarnation's cap does not count.

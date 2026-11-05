@@ -122,25 +122,45 @@ member to the idle list. Tagged NO/BAD responses and local validation or
 capability errors leave the connection reusable.
 
 A timed-out or cancelled command is a third case, decided by admission. Each
-wire command (`connection/reply.rs`) is queued, claimed, or withdrawn: one
-compare-exchange shared by the caller's `Pending` and the driver's `Reply`
-picks exactly one winner, and the command's payload is reachable only by the
-winner, so the driver can neither write nor answer a command it did not
-claim. The driver claims at the head of its queue, before `prepare_command`.
+wire command (`connection/reply.rs`) is queued, claimed, committed, or
+withdrawn, arbitrated by compare-exchange on one state word shared by the
+caller's `Pending` and the driver's `Reply`. The driver claims at the head of
+its queue, before `prepare_command`, and only the claim can take the payload,
+so the driver never writes or answers a command it did not claim. The claim
+does not end withdrawal: the driver commits (`CommitGate::commit`) just
+before it offers the command's first byte to the stream, after every
+refusal-before-send decision and before arming any pending state effect
+(`commit_before_first_write` in `driver/wire_send.rs`), and answering commits
+too, so a won withdrawal is never written and never answered. The window
+between claim and commit is the wait for the command's first outbound
+bandwidth grant (see "Bandwidth metering"); the driver races that wait
+against the withdrawal and returns at once when the caller leaves. The commit
+point is the first offer, not the first socket progress: once a byte is
+offered, a TLS or COMPRESS layer may hold it while the socket counter has not
+moved, so nothing past the commit is withdrawable, and nothing before it can
+be buffered anywhere (the previous command ended with a successful flush).
 The submit helpers own the deadline, because they are the only code that
 knows the phase, and admit strictly: reserve a channel slot under the
 deadline, re-check it, and only then send, so a deadline gone at or during
 admission submits nothing and is `Timeout` / `Unsent`. A caller that leaves
-before the driver claims its command withdraws it: it is never written, its
-payload (an APPEND's bytes, a streaming consumer and with it the caller's
-item sender) is released at once, the evidence is `Unsent`, and the
-connection is not abandoned. Once claimed, the driver completes the exchange
-(cancellation safety by socket ownership); a caller that leaves with no
-answer in hand reports `InFlight` and marks the connection `abandoned`. An
-answer already buffered when the deadline fires wins the tie. A reply
-dropped by a dead driver is `Unsent` when never claimed and `InFlight` once
-claimed, and does not mark the connection abandoned (it is already not
-reusable). A withdrawn command's shell keeps its channel slot until the
+before the driver commits its command withdraws it: it is never written, the
+evidence is `Unsent`, and the connection is not abandoned. A command still
+queued has its payload (an APPEND's bytes, a streaming consumer and with it
+the caller's item sender) released at once; a claimed one leaves the payload
+to the driver, which drops it when it sees the withdrawal. Once committed,
+the driver completes the exchange (cancellation safety by socket ownership);
+a caller that leaves with no answer in hand reports `InFlight` and marks the
+connection `abandoned`. An answer already buffered when the deadline fires
+wins the tie. Because answering commits, a refusal the driver is answering
+at the instant the caller leaves can read `InFlight`; that window is
+accepted as conservative. A reply dropped by a dead driver is `Unsent` when
+never committed and `InFlight` once committed, and does not mark the
+connection abandoned (it is already not reusable). Every gated path commits
+this way: a regular command, a pipelined batch (once, before the first byte
+of its first sub-batch, whichever send branch writes it), IDLE, and the
+STARTTLS and COMPRESS upgrades (a COMPRESS withdrawn there closes its read
+boundary and leaves the connection usable). Connection setup and the
+transition CAPABILITY refresh have no admission cell and are not gated. A withdrawn command's shell keeps its channel slot until the
 driver dequeues it, so a channel full of withdrawn commands behind a stalled
 head still blocks new admissions until their deadlines (each then
 truthfully `Unsent`), while the connection reads reusable unless something
@@ -156,13 +176,13 @@ it while queued withdraws the batch. IDLE follows the same arbiter: its
 admission races capacity against the cancel token and the event deadline,
 and every departure from its wait that would send DONE (an event, `Cancelled`,
 `Timeout`) first withdraws, returning the departure's value with nothing
-written when the IDLE was never claimed. A claimed IDLE must complete DONE; a
-DONE handshake that times out, or an `idle()` future dropped after the claim,
+written when the IDLE was never committed. A committed IDLE must complete DONE; a
+DONE handshake that times out, or an `idle()` future dropped after the commit,
 leaves the connection abandoned, while token cancellation that completes
 DONE leaves it reusable (push re-IDLEs on it).
 
 An abandoned connection's LAST handle aborts its driver (`ImapConnection`'s
-`Drop`). The driver claimed an exchange whose caller is gone; closing
+`Drop`). The driver committed an exchange whose caller is gone; closing
 the command channel cannot reach a driver blocked in that exchange, so
 against a stalled peer it and its socket would otherwise outlive every
 handle, unreachable by `close()`. A connection that is not abandoned keeps
@@ -355,11 +375,12 @@ for astring labels, system labels verbatim); requesting them needs
 `X-GM-EXT-1`, and they count toward the buffered-FETCH byte estimate. The
 generic IMAP account layer assigns them no folder semantics.
 
-From the claim onward, cancellation safety comes from socket ownership:
+From the commit onward, cancellation safety comes from socket ownership:
 dropping a caller's future does not cancel the wire exchange. The driver
 completes the command and preserves framing before accepting the next
-command. Before the claim nothing of the command exists on the wire, so a
-departing caller withdraws it instead (see "Connection state machine").
+command. Before the commit nothing of the command has been offered to any
+layer of the stream, so a departing caller withdraws it instead (see
+"Connection state machine").
 
 ## Typed events
 
@@ -637,10 +658,12 @@ AUTHENTICATE that succeeds, and an UNAUTHENTICATE that succeeds each owe a
 CAPABILITY refresh, and the driver runs it inside the same claimed command
 (`required_capability_refresh` in `driver/upgrade.rs`) before it publishes the
 snapshot or answers. No other command is encoded against the pre-transition
-capability set, and the refresh has no admission of its own: it cannot be
-withdrawn, dropped unclaimed or refused at admission while the transition
-stands committed, and a caller that leaves during it left a claimed command
-(`InFlight`, connection abandoned). LOGIN / AUTHENTICATE / UNAUTHENTICATE skip
+capability set, and the refresh has no admission cell of its own: it cannot
+be withdrawn, dropped unclaimed or refused at admission while the transition
+stands committed, and a caller that leaves during it left a committed command
+(`InFlight`, connection abandoned). It still waits on the bandwidth budget
+like any write; that wait is past the transition's commit, so it is not a
+withdrawal window. LOGIN / AUTHENTICATE / UNAUTHENTICATE skip
 the refresh only when their own tagged OK carries `[CAPABILITY ...]`
 (`ProtocolState::take_transition`); a capability list seen earlier in the
 exchange does not count, since it can precede the credentials. Any refresh
@@ -984,6 +1007,14 @@ slice. Inflation drains retained decoded output even when compressed input is
 empty, so a small grant cannot strand already received bytes. There is at most
 one outstanding reservation per direction on a connection. Short success
 finishes with the actual byte count and refunds only a current tail. Error or cancellation after offer retains the full charge.
+The first grant of a withdrawable command is taken by
+`WireReader::admit_first_write`, sized for the command's first nonempty
+chunk: it waits for the grant (racing the caller's withdrawal), offers it,
+then commits the command, and leaves the offered grant for the very next
+write. A withdrawal that wins the commit finishes the grant with zero bytes,
+so only a current tail is refunded, as for any short write. Every later slice
+waits on the budget past the commit, where a departing caller reads
+`InFlight` (see "Connection state machine").
 STARTTLS and COMPRESS rebuild the reader with cloned metering state, preserving
 the budget and observation sink. The underlying socket progress counter remains
 below TLS and COMPRESS for transmission evidence, independently of admission.
@@ -998,8 +1029,9 @@ field in which to report its reads. The delta relies on exclusive data
 checkouts: a `PoolMember` is removed from the idle list until its `PooledConn`
 drops, and IDLE workers dial separate connections. Concurrent account streams
 therefore sample different connection counters. A cancelled command the
-driver had claimed marks its connection abandoned, preventing reuse by
-another checkout (one withdrawn before its claim wrote nothing). The shared
+driver had committed marks its connection abandoned, preventing reuse by
+another checkout (one withdrawn before its commit, including during its first
+bandwidth wait, wrote nothing). The shared
 counter is not a per-command attribution API for arbitrary concurrent users of
 one `ImapConnection`. Read-ahead can put several responses into one batch's byte
 count, and trailing reads after the last emitted batch have no batch field;
@@ -1108,9 +1140,9 @@ Revocation quarantines, not escalates. A shared-folder SELECT permission denial 
 
 Failures on the client side of the wire map to `Internal(_)` (`reference/error-model.md` owns its recovery: terminal `InternalFailure`, except `InFlight` on a non-idempotent operation, which reconciles), never to a provider fault. `Error::Internal` is a local invariant violation raised where the command framing is intact (before the first byte, or after the tagged completion), so it is not connection-fatal; it maps to `Internal(InvariantViolated)`. `Error::InternalMidExchange { message, attempt }` is a local invariant failure raised after bytes of the same exchange are on the wire: the SCRAM server signature missing from client state, the STARTTLS and COMPRESS refusals after the server's tagged OK (the stream is already swapped out), the post-STARTTLS CAPABILITY downcast, a literal continuation refused outside a pipeline, and the BYE digest without a status response. It also maps to `Internal(InvariantViolated)`, but the driver's view of the exchange can no longer be trusted, so it is connection-fatal, and its attempt state is REQUIRED (`Error::internal_mid_exchange(message, state)`), because some of the exchange was sent by construction and a missing state would read as `Unsent`. `Error::LocalRuntime` is a local facility failing at runtime (the system entropy source for a SCRAM nonce): neither the server's fault nor the caller's, not connection-fatal, `Internal(RuntimeFailure)`. `Error::DriverPanicked` maps to `Internal(Panicked)`; `Error::DriverGone` stays `Transport(Network)`. The phaseless `Error::driver_gone()` constructor is test-only: a missing phase reads as `Unsent`, so production mints through `driver_gone_at` or `observe_driver_panic`.
 
-A driver death carries the caller's phase. `ImapConnection::observe_driver_panic(phase)` turns a dead driver into `DriverPanicked` (with the panic message) or `DriverGone`, and stamps `phase` on every outcome, including when another caller already took the join handle, since the evidence cannot depend on being first. Only the caller knows the phase: `Unsent` when the driver never claimed the command, `InFlight` once it had claimed it. Admission failures and post-admission withdrawals are also `Unsent`. The submit helpers in `connection/auth.rs` (`submit_regular`, `submit_streaming`, `submit_with_continuations`, `submit_upgrade`), `set_keepalive`, IDLE's entry and completion waits, and `Pipeline` execution all pass it, so a non-idempotent command the driver had claimed when it died reconciles rather than being declared failed, and a `DriverGone` no longer skips that reconciliation for lack of a phase. `PipelineError::Disconnected` carries the stamped error rather than being a bare variant.
+A driver death carries the caller's phase. `ImapConnection::observe_driver_panic(phase)` turns a dead driver into `DriverPanicked` (with the panic message) or `DriverGone`, and stamps `phase` on every outcome, including when another caller already took the join handle, since the evidence cannot depend on being first. Only the caller knows the phase: `Unsent` when the driver never committed the command, `InFlight` once it had committed it. Admission failures and post-admission withdrawals are also `Unsent`. The submit helpers in `connection/auth.rs` (`submit_regular`, `submit_streaming`, `submit_with_continuations`, `submit_upgrade`), `set_keepalive`, IDLE's entry and completion waits, and `Pipeline` execution all pass it, so a non-idempotent command the driver had committed when it died reconciles rather than being declared failed, and a `DriverGone` no longer skips that reconciliation for lack of a phase. `PipelineError::Disconnected` carries the stamped error rather than being a bare variant.
 
-IDLE is the case where the phase is easy to get wrong. `next_event` submits no command, so it stamps a driver death `Unsent`, which is not IDLE's phase. When `ImapConnection::idle` sees the event channel close (`DriverGone` / `DriverPanicked`), it first does a non-blocking `Pending::try_take` on the IDLE result channel: the driver answers the IDLE command before exiting whenever it can, so the real outcome (a BYE, an I/O failure) is usually already there and is returned as the error (or `ServerTerminated` for an `Ok`), instead of being replaced by a generic `DriverGone`. With no answer it withdraws the IDLE and restamps the death `Unsent` if never claimed, or `InFlight` once claimed. Inside the driver, IDLE's own reads (the `+` grant wait, the loop, the DONE write, the post-DONE drain) stamp transport failures `InFlight` for the same reason; an EOF mid-IDLE used to carry no phase and read as `Unsent`.
+IDLE is the case where the phase is easy to get wrong. `next_event` submits no command, so it stamps a driver death `Unsent`, which is not IDLE's phase. When `ImapConnection::idle` sees the event channel close (`DriverGone` / `DriverPanicked`), it first does a non-blocking `Pending::try_take` on the IDLE result channel: the driver answers the IDLE command before exiting whenever it can, so the real outcome (a BYE, an I/O failure) is usually already there and is returned as the error (or `ServerTerminated` for an `Ok`), instead of being replaced by a generic `DriverGone`. With no answer it withdraws the IDLE and restamps the death `Unsent` if never committed, or `InFlight` once committed. Inside the driver, IDLE's own reads (the `+` grant wait, the loop, the DONE write, the post-DONE drain) stamp transport failures `InFlight` for the same reason; an EOF mid-IDLE used to carry no phase and read as `Unsent`.
 
 Local refusals made before the first byte follow the cross-crate rule in `reference/error-model.md` ("Local refusals") and each has its own variant, none of them connection-fatal: `InvalidInput` (caller input the encoder or a handle validator refuses) -> `Request(Malformed)`; `InvalidState` (a command the connection's local state does not permit - wrong session state, or UTF8=ONLY before `ENABLE UTF8=ACCEPT`) -> `Request(Malformed)`; `MissingCapability` (the server lacks an extension, or its revision removed the command, e.g. LSUB, STATUS RECENT or CHECK on rev2, or STATUS DELETED without rev2 or `QUOTA=RES-MESSAGE`) -> `Unsupported(op)`; `UnsupportedOperation` (a variant of a published `#[non_exhaustive]` request type this crate has not learned) -> `Unsupported(op)`; `StateChangedBeforeSend` (the driver's head-of-queue check found the session had moved) -> `ConcurrencyConflict` with `Unsent`. A session already in Logout is `Closed` with `Unsent` at either check, through the shared `helpers::state_refusal`. `MissingCapability` stays distinct from `UnsupportedOperation` because `should_disable_qresync` reads `MissingCapability` strings as evidence about the server.
 
@@ -1293,7 +1325,7 @@ crates/imap/src/
 |   |-- helpers.rs   - server_profile, drain_events, ...
 |   |-- lifecycle.rs - greeting, STARTTLS, ENABLE
 |   |-- pipeline/    - command pipelining
-|   |-- reply.rs     - queued/claimed/withdrawn admission arbiter
+|   |-- reply.rs     - queued/claimed/committed/withdrawn admission arbiter
 |   |-- seq_ops.rs   - sequence-number command surface
 |   `-- uid_ops.rs   - UID command surface
 |-- account/         - bifrost_types::Account implementation

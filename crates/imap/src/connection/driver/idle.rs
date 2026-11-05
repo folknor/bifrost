@@ -28,17 +28,37 @@ pub(super) async fn run_idle(
     tag_gen: &mut super::super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
     done_rx: oneshot::Receiver<()>,
-) -> Result<IdleTermination, Error> {
+    gate: &super::super::reply::CommitGate,
+) -> Result<super::Gated<IdleTermination>, Error> {
     // 1. Send IDLE command (RFC 2177 Section 2), checked against live state
     //    like every other command: a session that left Authenticated/Selected
-    //    while IDLE was queued is refused before a byte is written.
+    //    while IDLE was queued is refused before a byte is written. The
+    //    caller may withdraw until the commit before the first byte.
     let super::PreparedCommand { tag, wire } =
         super::prepare_command(state, tag_gen, &Command::Idle)?;
+    if !super::commit_before_first_write(wire_reader, gate, [&wire]).await {
+        return Ok(super::Gated::Withdrawn);
+    }
+    run_committed_idle(wire_reader, state, event_sink, &tag, &wire, done_rx)
+        .await
+        .map(super::Gated::Ran)
+}
+
+/// Steps 1 to 5 of [`run_idle`] for an IDLE that is committed: its first byte
+/// is about to be offered, so it is the driver's exchange to the end.
+async fn run_committed_idle(
+    wire_reader: &mut super::super::wire::WireReader,
+    state: &mut super::super::state::ProtocolState,
+    event_sink: &mut event_sink::DriverEventSink,
+    tag: &str,
+    wire: &crate::codec::encode::WireCommand,
+    done_rx: oneshot::Receiver<()>,
+) -> Result<IdleTermination, Error> {
     let baseline = wire_reader.written();
     // IDLE has no literal, so there is no continuation wait in the send and
     // the outcome is always `Sent`.
     let SendOutcome::Sent =
-        send_wire_command(wire_reader, state, event_sink, &wire, &tag, baseline, None).await?
+        send_wire_command(wire_reader, state, event_sink, wire, tag, baseline, None).await?
     else {
         return Err(Error::internal_mid_exchange(
             "IDLE reported a refused literal it does not have",
@@ -47,7 +67,7 @@ pub(super) async fn run_idle(
     };
 
     // 2. Wait for `+` continuation (RFC 2177 Section 3).
-    wait_for_idle_grant(wire_reader, state, event_sink, &tag).await?;
+    wait_for_idle_grant(wire_reader, state, event_sink, tag).await?;
 
     trace!(tag, "driver: entered IDLE mode");
 
@@ -117,7 +137,7 @@ pub(super) async fn run_idle(
                 .write_all(b"DONE\r\n")
                 .await
                 .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
-            drain_idle_responses(wire_reader, state, event_sink, &tag).await?;
+            drain_idle_responses(wire_reader, state, event_sink, tag).await?;
             trace!(tag, "driver: exited IDLE mode");
             return Ok(IdleTermination::ClientDone);
         }

@@ -2732,6 +2732,86 @@ mod withdrawal {
         assert_eq!(err.attempt(), Some(InFlight));
         assert!(!conn.is_reusable());
     }
+    /// A connection whose outbound bandwidth is booked solid for ten seconds,
+    /// so the next command the driver claims waits for its first grant.
+    async fn starved_pair() -> (
+        Arc<ImapConnection>,
+        tokio::io::DuplexStream,
+        bifrost_net::BandwidthBudget,
+        Vec<bifrost_net::Reservation>,
+    ) {
+        let budget = bifrost_net::BandwidthBudget::new(Some(10));
+        let (conn, server) = crate::connection::test_support::driver_pair_metered(
+            &preauth_greeting("IMAP4rev1"),
+            budget.clone(),
+        )
+        .await;
+        let hog = (0..10)
+            .map(|_| budget.reserve(bifrost_net::BandwidthDirection::Outbound, 10))
+            .collect();
+        (Arc::new(conn), server, budget, hog)
+    }
+    async fn capability_reaches_the_wire_next(
+        conn: &Arc<ImapConnection>,
+        server: &mut tokio::io::DuplexStream,
+    ) {
+        let conn = Arc::clone(conn);
+        let c = tokio::spawn(async move { conn.capability(LONG).await });
+        let line = read_line(server).await;
+        assert!(
+            line.contains(" CAPABILITY"),
+            "withdrawn command reached wire: {line:?}"
+        );
+        respond(
+            server,
+            &format!("* CAPABILITY IMAP4rev1\r\n{} OK done\r\n", tag_of(&line)),
+        )
+        .await;
+        c.await.unwrap().unwrap();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_claimed_command_withdrawn_during_its_first_bandwidth_wait_is_unsent_and_reusable() {
+        let (conn, mut server, budget, hog) = starved_pair().await;
+        let err = append_task(&conn, SHORT).await.unwrap().unwrap_err();
+        assert!(matches!(err, Error::Timeout { .. }), "got {err:?}");
+        assert_eq!(err.attempt(), Some(Unsent));
+        assert!(conn.is_reusable());
+        drop(hog);
+        budget.set_cap(None);
+        capability_reaches_the_wire_next(&conn, &mut server).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_command_waiting_for_its_first_bandwidth_grant_does_not_abandon() {
+        let (conn, mut server, budget, hog) = starved_pair().await;
+        let mut b = Box::pin(conn.append("INBOX", &[], None, b"hello", LONG));
+        assert!(futures::poll!(&mut b).is_pending());
+        // Let the driver claim it and park on the grant.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(conn.cmd_tx.capacity(), conn.cmd_tx.max_capacity());
+        drop(b);
+        assert!(conn.is_reusable());
+        drop(hog);
+        budget.set_cap(None);
+        capability_reaches_the_wire_next(&conn, &mut server).await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_command_whose_driver_dies_during_its_first_bandwidth_wait_is_unsent() {
+        let (conn, _server, _budget, _hog) = starved_pair().await;
+        let b = append_task(&conn, LONG);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(conn.cmd_tx.capacity(), conn.cmd_tx.max_capacity());
+        conn.terminate().await;
+        let err = b.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            Error::DriverGone { .. } | Error::DriverPanicked { .. }
+        ));
+        assert_eq!(err.attempt(), Some(Unsent));
+    }
     #[tokio::test(start_paused = true)]
     async fn a_command_queued_behind_a_connection_fatal_failure_is_unsent() {
         let (conn, mut server) = pair("IMAP4rev1").await;

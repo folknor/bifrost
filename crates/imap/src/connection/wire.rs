@@ -35,6 +35,9 @@ pub(crate) struct WireReader {
     metering: WireMetering,
     compress_read: Option<(Reservation, usize)>,
     compress_boundary: bool,
+    /// The offered grant a gated command committed on, spent by the very next
+    /// write. See [`admit_first_write`](Self::admit_first_write).
+    first_write: Option<Reservation>,
     #[cfg(test)]
     compacted_bytes: usize,
 }
@@ -53,6 +56,7 @@ impl WireReader {
             metering: WireMetering::disabled(),
             compress_read: None,
             compress_boundary: false,
+            first_write: None,
             #[cfg(test)]
             compacted_bytes: 0,
         }
@@ -70,6 +74,7 @@ impl WireReader {
             metering: WireMetering::new(sink, bandwidth_budget),
             compress_read: None,
             compress_boundary: false,
+            first_write: None,
             #[cfg(test)]
             compacted_bytes: 0,
         }
@@ -83,6 +88,7 @@ impl WireReader {
             metering,
             compress_read: None,
             compress_boundary: false,
+            first_write: None,
             #[cfg(test)]
             compacted_bytes: 0,
         }
@@ -229,12 +235,66 @@ impl WireReader {
         Ok(())
     }
 
+    /// Wait for the first outbound grant of a command its caller may still
+    /// withdraw, then commit the command through `gate` before any byte of it
+    /// is offered to the stream. `len` is the length of the command's first
+    /// nonempty chunk, which the next write offers.
+    ///
+    /// `true`: the grant is offered and the command committed; the next
+    /// [`write_admitted`](Self::write_admitted) spends this grant, and the
+    /// caller must reach it with no await in between. `false`: the caller
+    /// withdrew first, nothing was offered, the grant's unused allowance went
+    /// back to the schedule (only when it is still the tail), and the command
+    /// must not be written or answered.
+    ///
+    /// This is what lets a withdrawal through the bandwidth wait report a true
+    /// `Unsent` with no rule for bytes buffered above the socket: the commit
+    /// precedes the first offer, so no TLS or COMPRESS layer can hold any of
+    /// the command while it is still withdrawable.
+    pub(in crate::connection) async fn admit_first_write(
+        &mut self,
+        len: usize,
+        gate: &super::reply::CommitGate,
+    ) -> bool {
+        debug_assert!(self.first_write.is_none(), "one gated command at a time");
+        loop {
+            let mut grant = tokio::select! {
+                biased;
+                () = gate.withdrawn() => return false,
+                grant = self.metering.budget.ready(BandwidthDirection::Outbound, len) => grant,
+            };
+            if !grant.offer() {
+                // The policy epoch moved under the ready grant; wait again.
+                continue;
+            }
+            if gate.commit() {
+                self.first_write = Some(grant);
+                return true;
+            }
+            grant.finish(0);
+            return false;
+        }
+    }
+
     async fn write_admitted(&mut self, bytes: &[u8]) -> Result<usize, Error> {
-        let grant = self
-            .metering
-            .budget
-            .admit(BandwidthDirection::Outbound, bytes.len())
-            .await;
+        let grant = match self.first_write.take() {
+            Some(grant) if grant.granted() <= bytes.len() => grant,
+            stale => {
+                // The committed grant is sized from the chunk this write
+                // offers, so a mismatch is a broken handoff, not a case to
+                // serve: fail loudly in tests, and in release spend the grant
+                // unused and admit afresh (conservatively: the command is
+                // already committed).
+                if let Some(stale) = stale {
+                    debug_assert!(false, "first-write grant larger than the first chunk");
+                    stale.finish(0);
+                }
+                self.metering
+                    .budget
+                    .admit(BandwidthDirection::Outbound, bytes.len())
+                    .await
+            }
+        };
         // On error or cancellation the offered grant stays spent.
         let n = peer_io(
             self.metering.peer_timeout.clone(),

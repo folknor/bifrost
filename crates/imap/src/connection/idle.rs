@@ -110,8 +110,9 @@ impl ImapConnection {
         let (done_tx, done_rx) = oneshot::channel();
         let (reply, mut pending) = reply_channel(done_rx, &self.abandoned);
         permit.send(DriverCommand::Idle { reply });
-        // Submitted, but not yet the driver's: only its claim at the head of
-        // the queue transfers the exchange. Until then every departure
+        // Submitted, but not yet the driver's: only its commit, just before
+        // the IDLE line's first byte, transfers the exchange. Until then every
+        // departure
         // withdraws the IDLE (never written, DONE receiver released), and a
         // dropped future does the same through `Pending`'s drop.
 
@@ -154,11 +155,11 @@ impl ImapConnection {
                             // a generic `DriverGone`. `try_take`, not an
                             // await: nothing guarantees the answer exists.
                             //
-                            // With no answer the phase is the claim's, not
+                            // With no answer the phase is the commit's, not
                             // `next_event`'s (which stamps `Unsent` because IT
-                            // sent nothing): an IDLE still queued in the dying
-                            // driver's channel is withdrawn here and was never
-                            // written; a claimed one may have been. A
+                            // sent nothing): an IDLE the dying driver never
+                            // committed is withdrawn here and was never
+                            // written; a committed one may have been. A
                             // `try_take` that saw the reply dropped settled the
                             // pending, so a dead driver is not marked abandoned.
                             return match pending.try_take() {
@@ -167,7 +168,7 @@ impl ImapConnection {
                                 None => {
                                     let attempt = match pending.withdraw() {
                                         Withdrawal::Withdrawn => TransmissionState::Unsent,
-                                        Withdrawal::Claimed => TransmissionState::InFlight,
+                                        Withdrawal::Committed => TransmissionState::InFlight,
                                     };
                                     Err(driver_death.with_attempt(attempt))
                                 }
@@ -199,13 +200,13 @@ impl ImapConnection {
         };
 
         // Every departure that would send DONE withdraws first. An IDLE the
-        // driver never claimed was never written: there is nothing to end,
+        // driver never committed was never written: there is nothing to end,
         // and the departure's value (an event already taken from the
         // connection-wide queue is a real server event) is returned as is.
         if pending.withdraw() == Withdrawal::Withdrawn {
             return Ok(idle_event);
         }
-        // A claimed IDLE is the driver's exchange from here, and must
+        // A committed IDLE is the driver's exchange from here, and must
         // complete DONE to preserve framing.
         let _ = done_tx.send(());
         trace!("idle handle: sent DONE signal");
@@ -222,9 +223,9 @@ impl ImapConnection {
             Ok(Err(phase)) => return Err(self.observe_driver_panic(phase.attempt()).await),
             Err(_) => match on_expiry(&mut pending) {
                 Expired::Answer(answer) => answer,
-                Expired::Claimed => return Err(Error::timeout_inflight()),
+                Expired::Committed => return Err(Error::timeout_inflight()),
                 Expired::Withdrawn => {
-                    debug_assert!(false, "DONE requires a claimed IDLE");
+                    debug_assert!(false, "DONE requires a committed IDLE");
                     return Err(Error::timeout_inflight());
                 }
             },

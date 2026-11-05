@@ -20,14 +20,15 @@ pub(super) async fn run_upgrade(
     tag_gen: &mut super::super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
     payload: UpgradePayload,
-) -> Result<(), Error> {
+    gate: &super::super::reply::CommitGate,
+) -> Result<super::Gated<()>, Error> {
     match payload {
         UpgradePayload::StartTls {
             tls_connector,
             server_name,
             tls_active,
         } => {
-            run_starttls_upgrade(
+            starttls_upgrade(
                 wire_reader,
                 state,
                 tag_gen,
@@ -35,11 +36,12 @@ pub(super) async fn run_upgrade(
                 tls_connector,
                 server_name,
                 Some(tls_active),
+                Some(gate),
             )
             .await
         }
         UpgradePayload::Compress => {
-            run_compress_upgrade(wire_reader, state, tag_gen, event_sink).await
+            run_compress_upgrade(wire_reader, state, tag_gen, event_sink, Some(gate)).await
         }
     }
 }
@@ -66,18 +68,49 @@ pub(in crate::connection) async fn run_starttls_upgrade(
     server_name: String,
     tls_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), Error> {
+    starttls_upgrade(
+        wire_reader,
+        state,
+        tag_gen,
+        event_sink,
+        tls_connector,
+        server_name,
+        tls_active,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`run_starttls_upgrade`], withdrawable through `gate` until the STARTTLS
+/// line's first byte. Ungated (connection setup) it always runs.
+#[allow(clippy::too_many_arguments)]
+async fn starttls_upgrade(
+    wire_reader: &mut super::super::wire::WireReader,
+    state: &mut super::super::state::ProtocolState,
+    tag_gen: &mut super::super::tag::TagGenerator,
+    event_sink: &mut event_sink::DriverEventSink,
+    tls_connector: native_tls::TlsConnector,
+    server_name: String,
+    tls_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    gate: Option<&super::super::reply::CommitGate>,
+) -> Result<super::Gated<()>, Error> {
     // Step 1: Send STARTTLS command, await tagged OK (RFC 3501 Section6.2.1).
     let consumer =
         DriverConsumer::Regular(Box::new(TaggedOkConsumer::default()) as Box<dyn ConsumerErased>);
-    super::run_one_command(
+    if let super::Gated::Withdrawn = super::run_gated_command(
         wire_reader,
         state,
         tag_gen,
         event_sink,
         Command::StartTls,
         consumer,
+        gate,
     )
-    .await?;
+    .await?
+    {
+        return Ok(super::Gated::Withdrawn);
+    }
 
     // Step 2: Verify buffer is empty BEFORE the swap (B10 fix).
     // RFC 3501 Section6.2.1: After STARTTLS OK, the client MUST discard
@@ -155,7 +188,7 @@ pub(in crate::connection) async fn run_starttls_upgrade(
     required_capability_refresh(wire_reader, state, tag_gen, event_sink).await?;
 
     debug!("STARTTLS upgrade complete (RFC 3501 Section 6.2.1)");
-    Ok(())
+    Ok(super::Gated::Ran(()))
 }
 
 /// The CAPABILITY refresh a committed session transition owes before the
@@ -164,9 +197,11 @@ pub(in crate::connection) async fn run_starttls_upgrade(
 /// OK carried no capabilities (RFC 3501 Section 6.2.2, RFC 8437 Section 2).
 ///
 /// It runs inside the arm that claimed the transition, so no other command
-/// is encoded against the pre-transition capability set, and it cannot be
-/// withdrawn, dropped unclaimed or refused at admission on its own: a caller
-/// that leaves meanwhile left a claimed command, `InFlight`.
+/// is encoded against the pre-transition capability set, and it has no
+/// admission cell of its own: it cannot be withdrawn, dropped unclaimed or
+/// refused at admission. It still waits on the bandwidth budget like every
+/// write, but the transition it follows is already committed, so a caller
+/// that leaves meanwhile left a committed command, `InFlight`.
 ///
 /// Every failure retires the connection. The transition already committed,
 /// so a reusable session with the stale capability set would be a
@@ -228,23 +263,35 @@ async fn run_compress_upgrade(
     state: &mut super::super::state::ProtocolState,
     tag_gen: &mut super::super::tag::TagGenerator,
     event_sink: &mut event_sink::DriverEventSink,
-) -> Result<(), Error> {
+    gate: Option<&super::super::reply::CommitGate>,
+) -> Result<super::Gated<()>, Error> {
     // Defer the final inbound grant until the plaintext boundary is known.
     wire_reader.begin_compress_boundary();
     let consumer =
         DriverConsumer::Regular(Box::new(TaggedOkConsumer::default()) as Box<dyn ConsumerErased>);
-    let result = super::run_one_command(
+    let result = super::run_gated_command(
         wire_reader,
         state,
         tag_gen,
         event_sink,
         Command::Compress,
         consumer,
+        gate,
     )
     .await;
-    if let Err(error) = result {
-        wire_reader.finish_compress_boundary(0);
-        return Err(error);
+    match result {
+        Ok(super::Gated::Ran(_)) => {}
+        // Withdrawn before the COMPRESS line's first byte: no inbound read
+        // happened, and the boundary is closed the same way as on failure,
+        // so the reader is left exactly as before the upgrade.
+        Ok(super::Gated::Withdrawn) => {
+            wire_reader.finish_compress_boundary(0);
+            return Ok(super::Gated::Withdrawn);
+        }
+        Err(error) => {
+            wire_reader.finish_compress_boundary(0);
+            return Err(error);
+        }
     }
 
     // The suffix is compressed framing, below the new admission boundary.
@@ -298,7 +345,7 @@ async fn run_compress_upgrade(
         super::super::wire::WireReader::with_metering(ImapStream::Compressed(compressed), metering);
 
     debug!("COMPRESS=DEFLATE activated (RFC 4978)");
-    Ok(())
+    Ok(super::Gated::Ran(()))
 }
 
 /// Best-effort LOGOUT on graceful shutdown (RFC 3501 Section6.1.3).
@@ -451,7 +498,7 @@ mod bandwidth_review_tests {
             ok.len()
         };
         let (result, ok_len) = tokio::join!(
-            run_compress_upgrade(&mut reader, &mut state, &mut tags, &mut events),
+            run_compress_upgrade(&mut reader, &mut state, &mut tags, &mut events, None),
             script
         );
         result.unwrap();

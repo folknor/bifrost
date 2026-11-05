@@ -966,12 +966,13 @@ impl ImapConnection {
     /// channel is a driver death stamped `Unsent`.
     ///
     /// After admission, an expiry is decided by `on_expiry`: withdrawn before
-    /// the driver's claim is `Timeout` / `Unsent` (never written, connection
-    /// untouched); an answer already buffered wins the tie; claimed and
+    /// the driver's commit (still queued, or claimed and waiting for its first
+    /// bandwidth grant) is `Timeout` / `Unsent` (never written, connection
+    /// untouched); an answer already buffered wins the tie; committed and
     /// unanswered is `timeout_inflight()`, and dropping the `Pending` then
     /// abandons the connection unless the answer lands first. A reply the
     /// driver dropped is a driver death stamped `Unsent` when it was never
-    /// claimed and `InFlight` once it was. `Unsent` is never inferred from the
+    /// committed and `InFlight` once it was. `Unsent` is never inferred from the
     /// timer alone after admission: only a won withdrawal earns it.
     async fn submit_driver_command<P: Send, T>(
         &self,
@@ -1006,7 +1007,7 @@ impl ImapConnection {
                         Expired::Withdrawn => {
                             Err(Error::timeout().with_attempt(TransmissionState::Unsent))
                         }
-                        Expired::Claimed => Err(Error::timeout_inflight()),
+                        Expired::Committed => Err(Error::timeout_inflight()),
                     };
                 }
             },

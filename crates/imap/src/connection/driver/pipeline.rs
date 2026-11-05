@@ -481,6 +481,10 @@ pub(super) enum PipelineEnd {
     /// a command the live session does not permit, or an encoding refusal.
     /// Nothing ran, the framing is intact, and the connection stays usable.
     Refused(Error),
+    /// The caller withdrew the batch while the driver waited for its first
+    /// bandwidth grant, before any byte was offered. Nothing is answered and
+    /// the connection stays usable.
+    Withdrawn,
     /// The batch went on the wire. `results` has one entry per command, in
     /// submission order, in one of three lanes:
     ///
@@ -532,6 +536,7 @@ pub(super) async fn run_pipeline(
     event_sink: &mut event_sink::DriverEventSink,
     commands: Vec<Command>,
     consumers: Vec<Box<dyn ConsumerErased>>,
+    gate: &super::super::reply::CommitGate,
 ) -> PipelineEnd {
     let count = commands.len();
     if count == 0 {
@@ -577,6 +582,12 @@ pub(super) async fn run_pipeline(
             }
             Err(refusal) => return PipelineEnd::Refused(refusal),
         }
+    }
+
+    // Commit once for the whole batch, after every refusal and before the
+    // first byte of the first sub-batch, whichever send branch writes it.
+    if !super::commit_before_first_write(wire_reader, gate, wires.iter().flatten()).await {
+        return PipelineEnd::Withdrawn;
     }
 
     // Transmission evidence is relative to the WHOLE pipeline, not to a

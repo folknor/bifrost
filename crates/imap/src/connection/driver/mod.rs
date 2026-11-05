@@ -40,7 +40,7 @@ use idle::run_idle;
 use pipeline::group_into_sub_batches;
 use pipeline::{PipelineEnd, run_pipeline};
 use upgrade::{logout_best_effort, required_capability_refresh, run_upgrade};
-use wire_send::{SendOutcome, send_wire_command};
+use wire_send::{SendOutcome, commit_before_first_write, send_wire_command};
 
 pub(in crate::connection) use upgrade::run_starttls_upgrade;
 
@@ -411,7 +411,9 @@ pub(super) async fn driver_task(
                         // effect armed and no byte written for a command its
                         // caller withdrew, so skipping it leaves no state to
                         // publish and cannot desynchronize the wire. The same
-                        // holds for the other three wire arms.
+                        // holds for the other three wire arms. The claim does
+                        // not end withdrawal: that is the commit just before
+                        // the first byte (`commit_before_first_write`).
                         let Some(((command, consumer), reply)) = reply.claim() else {
                             trace!("driver: caller withdrew the command before it reached the head of the queue");
                             continue;
@@ -425,6 +427,17 @@ pub(super) async fn driver_task(
                         let _ = state.take_transition();
                         let mut result = match prepare_command(&state, &mut tag_gen, &command) {
                             Ok(prepared) => {
+                                // The caller may still withdraw while the
+                                // first bandwidth grant is pending; nothing is
+                                // armed or offered until it has committed.
+                                if !commit_before_first_write(
+                                    &mut wire_reader,
+                                    reply.gate(),
+                                    [&prepared.wire],
+                                ).await {
+                                    trace!("driver: caller withdrew the command before its first byte");
+                                    continue;
+                                }
                                 run_prepared_command(
                                     &mut wire_reader,
                                     &mut state,
@@ -481,13 +494,21 @@ pub(super) async fn driver_task(
                             trace!("driver: caller withdrew the upgrade before it reached the head of the queue");
                             continue;
                         };
-                        let result = run_upgrade(
+                        let result = match run_upgrade(
                             &mut wire_reader,
                             &mut state,
                             &mut tag_gen,
                             &mut event_sink,
                             payload,
-                        ).await;
+                            reply.gate(),
+                        ).await {
+                            Ok(Gated::Withdrawn) => {
+                                trace!("driver: caller withdrew the upgrade before its first byte");
+                                continue;
+                            }
+                            Ok(Gated::Ran(())) => Ok(()),
+                            Err(error) => Err(error),
+                        };
                         if result.as_ref().is_err_and(Error::is_connection_fatal)
                             || (result.is_err()
                                 && state.session_state() == super::SessionState::Logout)
@@ -516,7 +537,12 @@ pub(super) async fn driver_task(
                             &mut event_sink,
                             commands,
                             consumers,
+                            reply.gate(),
                         ).await {
+                            PipelineEnd::Withdrawn => {
+                                trace!("driver: caller withdrew the batch before its first byte");
+                                continue;
+                            }
                             // Refused before the first byte: the framing is
                             // intact whatever the error, as for a single
                             // command refused in `prepare_command`.
@@ -559,13 +585,21 @@ pub(super) async fn driver_task(
                             trace!("driver: caller withdrew IDLE before it reached the head of the queue");
                             continue;
                         };
-                        let result = run_idle(
+                        let result = match run_idle(
                             &mut wire_reader,
                             &mut state,
                             &mut tag_gen,
                             &mut event_sink,
                             done_rx,
-                        ).await;
+                            reply.gate(),
+                        ).await {
+                            Ok(Gated::Withdrawn) => {
+                                trace!("driver: caller withdrew IDLE before its first byte");
+                                continue;
+                            }
+                            Ok(Gated::Ran(termination)) => Ok(termination),
+                            Err(error) => Err(error),
+                        };
                         if result.as_ref().is_err_and(Error::is_connection_fatal) {
                             state.apply_infrastructure_failure();
                             cmd_rx.close();
@@ -634,6 +668,36 @@ pub(in crate::connection) async fn run_one_command(
 ) -> Result<Box<dyn std::any::Any + Send>, Error> {
     let prepared = prepare_command(state, tag_gen, &cmd)?;
     run_prepared_command(wire_reader, state, event_sink, &cmd, prepared, consumer).await
+}
+
+/// The end of a driver path its caller may withdraw from until the first
+/// byte: it ran, or the caller withdrew before the commit and nothing was
+/// written, armed or answered.
+pub(super) enum Gated<T> {
+    Ran(T),
+    Withdrawn,
+}
+
+/// [`run_one_command`] for a command whose caller may withdraw until its first
+/// byte. With `gate: None` it is `run_one_command` and always `Ran`.
+pub(super) async fn run_gated_command(
+    wire_reader: &mut super::wire::WireReader,
+    state: &mut super::state::ProtocolState,
+    tag_gen: &mut super::tag::TagGenerator,
+    event_sink: &mut event_sink::DriverEventSink,
+    cmd: Command,
+    consumer: DriverConsumer,
+    gate: Option<&super::reply::CommitGate>,
+) -> Result<Gated<Box<dyn std::any::Any + Send>>, Error> {
+    let prepared = prepare_command(state, tag_gen, &cmd)?;
+    if let Some(gate) = gate
+        && !commit_before_first_write(wire_reader, gate, [&prepared.wire]).await
+    {
+        return Ok(Gated::Withdrawn);
+    }
+    run_prepared_command(wire_reader, state, event_sink, &cmd, prepared, consumer)
+        .await
+        .map(Gated::Ran)
 }
 
 /// A command checked and encoded against live state, not yet written.
