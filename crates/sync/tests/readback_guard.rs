@@ -74,6 +74,11 @@ struct CampaignState {
     observations: std::sync::Mutex<Vec<Vec<ObjectId>>>,
     duplicate_observations: AtomicBool,
     engine_block_first: AtomicBool,
+    /// First attempt: once `release_first_campaign` fires, one item asks for
+    /// an account restart and every other item for a distinct scope restart,
+    /// so the campaign has more distinct directives than the reopen channel
+    /// holds.
+    directive_flood_first: AtomicBool,
     /// First attempt: one item raises an engine directive while a SIBLING item
     /// comes back `Uncertain`, i.e. parked in the read-back lane.
     engine_block_beside_uncertain: AtomicBool,
@@ -109,6 +114,18 @@ impl AccountFactory for FlagsFactory {
         let concrete = Arc::clone(&self.0);
         let account: Arc<dyn Account> = concrete;
         Box::pin(async move { Ok(OpenedAccount::complete(account)) })
+    }
+}
+
+struct CountingFactory {
+    inner: FlagsFactory,
+    opens: Arc<AtomicUsize>,
+}
+
+impl AccountFactory for CountingFactory {
+    fn open(&self, account: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.inner.open(account)
     }
 }
 
@@ -501,6 +518,52 @@ impl Account for FlagsAccount {
                         retryable_transport(),
                     )),
                 ];
+                SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Final,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                })
+            }));
+        }
+        if campaign.directive_flood_first.load(Ordering::SeqCst) && attempt == 0 {
+            let campaign = Arc::clone(campaign);
+            return Box::pin(stream::once(async move {
+                let ids: Vec<ObjectId> = targets.collect().await;
+                campaign.release_first_campaign.notified().await;
+                let items = ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, id)| {
+                        let error = if n == 0 {
+                            AccountErrorBuilder::new(
+                                AccountErrorKind::SyncState(
+                                    bifrost_types::SyncStateErrorKind::CapabilityChanged,
+                                ),
+                                Cause::State(bifrost_types::StateCause::CapabilityChanged {
+                                    delta: None,
+                                }),
+                            )
+                        } else {
+                            AccountErrorBuilder::new(
+                                AccountErrorKind::SyncState(
+                                    bifrost_types::SyncStateErrorKind::CursorInvalid,
+                                ),
+                                Cause::State(bifrost_types::StateCause::CursorInvalid),
+                            )
+                            .scope(bifrost_types::ErrorScope::Cursor(
+                                CursorScope::Folder(bifrost_types::FolderId(format!("folder-{n}"))),
+                            ))
+                        }
+                        .try_build()
+                        .expect("valid engine-directive error");
+                        ItemOutcome::Failed(bifrost_types::BatchFailure::new(
+                            bifrost_types::BatchItemId(id.0),
+                            error,
+                        ))
+                    })
+                    .collect();
                 SyncEvent::Batch(Batch {
                     items,
                     page_boundary: PageBoundary::Final,
@@ -1328,6 +1391,86 @@ async fn per_item_engine_block_accounts_for_unseen_campaign_ids() {
         .expect("campaign");
 
     assert_eq!(counters.blocked_by_engine, 3);
+    engine.detach(&account_id).await.expect("detach");
+}
+
+/// A pause must complete while a campaign has more directives to forward than
+/// the reopen channel holds.
+///
+/// The reopen listener is serial, and the account restart it takes first parks
+/// in `wait_until_running` because the pause already holds the boundary. The
+/// channel then fills behind it. A campaign that awaited the next send while
+/// still holding its activity guard kept the pause waiting on the campaign, the
+/// campaign waiting on the listener, and the listener waiting on a resume the
+/// caller only issues once the pause returns.
+#[tokio::test(start_paused = true)]
+async fn a_pause_completes_while_campaign_directives_back_up_the_reopen_channel() {
+    const TARGETS: usize = 24;
+    let state = Arc::new(CampaignState::default());
+    state.directive_flood_first.store(true, Ordering::SeqCst);
+    let engine = Arc::new(SyncEngine::builder().build().expect("engine"));
+    let account_id = AccountId("directive-flood".into());
+    let opens = Arc::new(AtomicUsize::new(0));
+    let control = engine
+        .attach(
+            account_id.clone(),
+            Arc::new(CountingFactory {
+                inner: FlagsFactory(campaign_account(Arc::clone(&state))),
+                opens: Arc::clone(&opens),
+            }),
+        )
+        .await
+        .expect("attach");
+    let campaign_engine = Arc::clone(&engine);
+    let campaign_id = account_id.clone();
+    let campaign = tokio::spawn(async move {
+        campaign_engine
+            .bulk_set_flags(
+                &campaign_id,
+                (0..TARGETS)
+                    .map(|n| ObjectId(format!("id-{n}")))
+                    .collect::<Vec<_>>(),
+                FlagOp::Add(set(&["\\Seen"])),
+                &vendor(),
+                ProtocolKind::Imap,
+            )
+            .await
+    });
+    state.submitted.notified().await;
+
+    // One poll installs Pause on the boundary; the campaign's activity keeps
+    // the future pending, so the listener's restart parks before any
+    // directive arrives.
+    let mut pause = Box::pin(control.pause());
+    assert!(futures::poll!(&mut pause).is_pending());
+    state.release_first_campaign.notify_one();
+
+    tokio::time::timeout(std::time::Duration::from_secs(60), pause)
+        .await
+        .expect("the pause must not wait on a campaign blocked by the reopen channel")
+        .expect("pause");
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        1,
+        "no restart runs while paused"
+    );
+
+    control.resume();
+    let counters = tokio::time::timeout(std::time::Duration::from_secs(60), campaign)
+        .await
+        .expect("the campaign delivers its directives once resumed")
+        .expect("campaign task")
+        .expect("campaign");
+    assert_eq!(counters.blocked_by_engine, TARGETS as u64);
+    // The account restart was delivered, not dropped: the listener resumed it
+    // and opened a replacement.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while opens.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the forwarded account restart reaches the listener");
     engine.detach(&account_id).await.expect("detach");
 }
 

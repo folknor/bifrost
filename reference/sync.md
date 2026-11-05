@@ -2302,9 +2302,18 @@ read-back. Guarded ids retain the safe retry through the versioned door with
 their frozen versions. Per-item read-back delays honor reconcile advice,
 state-refresh retry advice (including its fallback), and other retry advice
 when it carries a hint, including operation-local hints that do not enter
-the shared throttle bucket. Read-back engine failures block reassertion;
-their directives are deduplicated per campaign and forwarded after releasing
-the activity and admission guards.
+the shared throttle bucket. Read-back engine failures block reassertion.
+
+Every campaign directive, read-back, per-item and stream-termination alike,
+is classified the moment it is observed (`BlockedByEngine` accounting is
+immediate) but delivered on the reopen channel only once its action has
+dropped the provider stream, the activity guard and the admission permit,
+with each send selected against shutdown (a shutdown there records
+`ShuttingDown`). The channel is bounded and the listener serial; a listener
+parked in `wait_until_running` under a pause or `checkpoint_now` stops
+draining, and a send awaited under activity would keep that pause from ever
+completing. An item directive therefore reaches the listener when its action
+ends, not mid-stream. Sends are still awaited before the campaign returns.
 
 Reassertion is desired-state enforcement: it may overwrite a concurrent
 writer's later change and supplies no lost-update guarantee. Destroy

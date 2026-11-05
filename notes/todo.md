@@ -272,10 +272,13 @@ Narrow edge cases, audits with no known defect, and design work.
   would pass it. Nor do tests independently pin the lifecycle, bulk or
   deferred-inventory stamp attribution (the listener decline and the
   reconciler stamp are pinned).
-- **Existing submission-item and stream directive sends await bounded
-  `reopen_tx` while holding campaign activity and admission.** A handler
-  waiting for activity drain could wait on the sender. Read-back forwarding
-  releases both guards first; the existing paths need a lifetime review.
+- **Push reconciler awaits `reopen_tx` with no shutdown arm.** The
+  `ReopenRequest::Recovery` send in `crates/sync/src/push/reconciler.rs` is a
+  bare `.await`, unlike every other engine producer (bulk campaigns, deferred
+  inventory, parked repairs, push lanes), which select against shutdown. Not
+  traced: whether its scheduler admission permit or any activity guard is still
+  held at that await. If either is, it has the pause cycle the bulk campaign
+  sends had (serial listener parked in `wait_until_running`, full channel).
 - **IMAP connection transition partial completion.** Inspect `complete_auth`
   and `unauthenticate` (including disposition after failed required
   CAPABILITY), and `run_starttls_upgrade` for earlier committed transitions

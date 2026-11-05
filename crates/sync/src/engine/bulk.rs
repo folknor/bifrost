@@ -600,15 +600,9 @@ impl SyncEngine {
                 }
                 drop(activity);
                 drop(admission);
-                for (scope, error) in directives {
-                    let _ = slot
-                        .reopen_tx
-                        .send(ReopenRequest::Recovery {
-                            scope,
-                            error,
-                            generation: incarnation,
-                        })
-                        .await;
+                if !forward_campaign_directives(&slot, directives, incarnation).await {
+                    first_error.get_or_insert(Error::ShuttingDown);
+                    break;
                 }
                 continue;
             }
@@ -699,6 +693,10 @@ impl SyncEngine {
             // parked there survives attempts that resubmit its siblings.
             let mut stream_termination_advice: Option<RetryAdvice> = None;
             let mut item_retry_advice: Option<RetryAdvice> = None;
+            // Engine directives are classified as they arrive but delivered
+            // only after this action has let go of its stream, activity and
+            // admission; see `forward_campaign_directives`.
+            let mut directives = Vec::new();
 
             loop {
                 let event = tokio::select! {
@@ -778,15 +776,10 @@ impl SyncEngine {
                                     &mut forwarded_directives,
                                     &directive,
                                 ) {
-                                    let scope = crate::recovery::directive_target_scope(&directive);
-                                    let _ = slot
-                                        .reopen_tx
-                                        .send(ReopenRequest::Recovery {
-                                            scope,
-                                            error,
-                                            generation: incarnation,
-                                        })
-                                        .await;
+                                    directives.push((
+                                        crate::recovery::directive_target_scope(&directive),
+                                        error,
+                                    ));
                                 }
                                 blocked_by_engine = true;
                             }
@@ -946,15 +939,10 @@ impl SyncEngine {
                                     &mut forwarded_directives,
                                     &directive,
                                 ) {
-                                    let scope = crate::recovery::directive_target_scope(&directive);
-                                    let _ = slot
-                                        .reopen_tx
-                                        .send(ReopenRequest::Recovery {
-                                            scope,
-                                            error: original,
-                                            generation: incarnation,
-                                        })
-                                        .await;
+                                    directives.push((
+                                        crate::recovery::directive_target_scope(&directive),
+                                        original,
+                                    ));
                                 }
                                 blocked_by_engine = true;
                                 for id in &remaining {
@@ -1044,8 +1032,13 @@ impl SyncEngine {
                         );
                 }
             }
+            drop(stream);
             drop(activity);
             drop(admission);
+            if !forward_campaign_directives(&slot, directives, incarnation).await {
+                first_error.get_or_insert(Error::ShuttingDown);
+                break;
+            }
         }
         // Never-submitted targets are known unsent and never observed. A
         // cancelled, paused, detached or failed observation leaves submitted
@@ -1613,6 +1606,40 @@ fn directive_key(directive: &EngineDirective) -> DirectiveKey {
         EngineDirective::DisableScope(scope) => DirectiveKey::DisableScope(scope.clone()),
         other => DirectiveKey::Other(crate::recovery::directive_target_scope(other)),
     }
+}
+
+/// Deliver one action's engine directives to the reopen listener. Returns
+/// `false` if shutdown interrupted delivery.
+///
+/// The single place a campaign sends on `reopen_tx`, and every caller must
+/// already have dropped the action's provider stream, activity guard and
+/// admission permit. The channel is bounded and its listener is serial: a
+/// listener handling `RestartAccount` parks in `wait_until_running` while a
+/// pause or `checkpoint_now` holds the boundary, and those wait for activity
+/// to drain. A send awaited under the activity guard against a full channel
+/// closes that cycle, so pause never completes and the listener never
+/// resumes. The cost is that an item directive reaches the listener when its
+/// action ends, not mid-stream; classification and `BlockedByEngine`
+/// accounting stay immediate. Every request carries the incarnation the action
+/// ran against, so one delivered after a reattach is declined.
+async fn forward_campaign_directives(
+    slot: &AccountSlot,
+    directives: Vec<(Option<CursorScope>, AccountError)>,
+    generation: Option<u64>,
+) -> bool {
+    for (scope, error) in directives {
+        let request = ReopenRequest::Recovery {
+            scope,
+            error,
+            generation,
+        };
+        tokio::select! {
+            biased;
+            () = slot.shutdown.cancelled() => return false,
+            _ = slot.reopen_tx.send(request) => {}
+        }
+    }
+    true
 }
 
 /// Return whether this campaign has not yet forwarded this exact directive.
