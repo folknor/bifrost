@@ -24,15 +24,18 @@ pub enum MutationSuccess {
     /// Something was done, but NOT what was asked - the provider accepted a
     /// weaker form of the operation.
     ///
-    /// Distinct from `Applied` because the target is not in the requested
-    /// state, and from `Skipped` because the target DID change. Reporting
-    /// either in its place is a wrong answer a consumer cannot detect: claiming
-    /// `Applied` makes an engine believe a state it will keep re-observing as
-    /// false, and claiming `Skipped` hides a mutation that really happened.
+    /// Distinct from `Applied` because the requested operation was not the
+    /// one performed, and from `Skipped` because the provider acknowledged a
+    /// real write. Reporting either in its place is a wrong answer a consumer
+    /// cannot detect: claiming `Applied` makes an engine believe a state it
+    /// will keep re-observing as false, and claiming `Skipped` hides a
+    /// mutation that really happened.
     ///
-    /// "The target DID change" is a precondition, not a description: an
-    /// operation a provider could not perform AT ALL is not a downgrade and
-    /// must not be reported here. A protocol crate that finds nothing it can
+    /// An acknowledged, non-empty weaker write is a precondition. It proves
+    /// the provider accepted the weaker operation, not that the target's
+    /// observable state moved: a weaker flag write against a message already
+    /// in that state is still `Downgraded`. An operation a provider could not
+    /// perform AT ALL is not a downgrade and must not be reported here. A protocol crate that finds nothing it can
     /// express owes the caller a failure lane, not the weakest available
     /// success. `bifrost-sync` counts `Downgraded` in its own
     /// `MutationCounters::downgraded` bucket, retains the reported effect in
@@ -60,10 +63,12 @@ pub enum MutationEffect {
     /// Only the provider-representable subset of a requested flag operation
     /// was applied; the listed flags were not.
     ///
-    /// Requires a non-empty representable subset that actually reached the
-    /// provider. An operation whose flags are ALL unrepresentable changed
-    /// nothing and belongs in the failure lane, classified
-    /// `Unsupported(operation)`, not here.
+    /// Requires a non-empty representable write that actually reached the
+    /// provider and was acknowledged. That write need not name a supplied
+    /// flag: a full-replace `Set` naming only unrepresentable flags still
+    /// clears every flag the provider does model. An operation that projects
+    /// onto NO write changed nothing and belongs in the failure lane,
+    /// classified `Unsupported(operation)`, not here.
     FlagsPartiallyApplied {
         unsupported: Vec<String>,
     },

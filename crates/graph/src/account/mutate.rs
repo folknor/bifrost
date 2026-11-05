@@ -372,13 +372,46 @@ async fn submit_batch_with_version(
         }
     }
 
-    let events = vec![SyncEvent::Batch(Batch {
+    // Graph models only read, flagged and categories. A token outside that
+    // vocabulary (`\answered`, `$Junk`, any keyword) is absent from the
+    // PATCH body, so an acknowledged write carried only the projection:
+    // report it `Downgraded { FlagsPartiallyApplied }` naming the dropped
+    // tokens, never `Applied`, which would let the caller believe a keyword
+    // is set that Graph never stored. An op whose projection is EMPTY was
+    // already refused above as `Unsupported`.
+    let mut events = Vec::with_capacity(2);
+    if let MutationKind::SetFlags(op) = kind {
+        let unsupported = unsupported_flag_tokens(op);
+        if !unsupported.is_empty() {
+            for outcome in &mut item_outcomes {
+                if let ItemOutcome::Succeeded(success) = outcome
+                    && success.output == MutationSuccess::Applied
+                {
+                    success.output = MutationSuccess::Downgraded {
+                        actual: bifrost_types::MutationEffect::FlagsPartiallyApplied {
+                            unsupported: unsupported.clone(),
+                        },
+                    };
+                }
+            }
+            // Per chunk, before its outcomes. The chunk may hold only
+            // preflight failures or 412s, so the text claims nothing landed.
+            events.push(SyncEvent::Warning(bifrost_types::Warning::support_only(
+                bifrost_types::WarningKind::StrategyDowngraded,
+                format!(
+                    "Graph cannot express flags {}; only the supported projection is attempted",
+                    unsupported.join(", ")
+                ),
+            )));
+        }
+    }
+    events.push(SyncEvent::Batch(Batch {
         items: item_outcomes,
         page_boundary: PageBoundary::Page,
         server_latency: Duration::default(),
         bytes_in: tally.take(),
         checkpoint: None::<Checkpoint>,
-    })];
+    }));
     Ok(events)
 }
 
@@ -868,6 +901,29 @@ fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
         .collect();
     categories.sort();
     categories
+}
+
+/// The op's tokens Graph does not model, so `patch_for_flags` drops them:
+/// neither a `graph_flag_field` alias nor `category:`-prefixed (the prefix
+/// is case-sensitive, as in `categories_from_flags`). Incremental category
+/// ops never reach the wire (`flag_op_requires_category_rmw`), so a
+/// `category:` token is only ever sent by `Set`, which expresses it. Sorted
+/// and deduplicated for a deterministic report.
+fn unsupported_flag_tokens(op: &FlagOp) -> Vec<String> {
+    let sets: Vec<&HashSet<String>> = match op {
+        FlagOp::Add(flags) | FlagOp::Remove(flags) | FlagOp::Set(flags) => vec![flags],
+        FlagOp::Patch { add, remove } => vec![add, remove],
+        _ => Vec::new(),
+    };
+    let mut tokens: Vec<String> = sets
+        .into_iter()
+        .flatten()
+        .filter(|flag| graph_flag_field(flag).is_none() && !flag.starts_with("category:"))
+        .cloned()
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    tokens
 }
 
 /// A flag op that Graph cannot express as a PATCH: either it needs the
@@ -1987,13 +2043,124 @@ mod tests {
             add: flag_set(&["\\Answered"]),
             remove: flag_set(&["\\Draft"]),
         }));
-        // A mixed op still carries an expressible half, so it proceeds.
+        // A mixed op still carries an expressible half, so it is sent; its
+        // acknowledgement is reported `Downgraded`, not `Applied` (pinned by
+        // `mixed_flag_ops_report_the_dropped_tokens_as_downgraded`).
         assert!(!flag_op_is_unexpressible(&FlagOp::Add(flag_set(&[
             "\\Answered",
             "\\Seen"
         ]))));
         // `Set` is full-replace and always writes all three owned fields.
         assert!(!flag_op_is_unexpressible(&FlagOp::Set(HashSet::new())));
+    }
+
+    #[test]
+    fn unsupported_flag_tokens_name_only_what_the_patch_drops() {
+        assert_eq!(
+            unsupported_flag_tokens(&FlagOp::Patch {
+                add: flag_set(&["\\Seen", "$Junk", "category:Work"]),
+                remove: flag_set(&["starred", "\\Answered", "$Junk"]),
+            }),
+            vec!["$Junk".to_string(), "\\Answered".to_string()]
+        );
+        assert!(
+            unsupported_flag_tokens(&FlagOp::Set(flag_set(&["read", "category:x"]))).is_empty()
+        );
+        // `category:` is case-sensitive, as in `categories_from_flags`.
+        assert_eq!(
+            unsupported_flag_tokens(&FlagOp::Set(flag_set(&["Category:x"]))),
+            vec!["Category:x".to_string()]
+        );
+    }
+
+    /// Graph drops every token it does not model from the PATCH body. An
+    /// acknowledged write therefore landed only the projection, and must say
+    /// which tokens it dropped rather than claim the whole op was applied. A
+    /// `Set` naming only unmodeled tokens still writes the three owned fields,
+    /// so it is a downgrade too, not a refusal.
+    #[tokio::test]
+    async fn mixed_flag_ops_report_the_dropped_tokens_as_downgraded() {
+        for (op, expected_body) in [
+            (
+                FlagOp::Add(flag_set(&["\\Seen", "$Junk"])),
+                json!({"isRead": true}),
+            ),
+            (
+                FlagOp::Set(flag_set(&["\\Answered"])),
+                json!({"isRead": false, "flag": {"flagStatus": "notFlagged"}, "categories": []}),
+            ),
+        ] {
+            let account = shared_account();
+            let id = ObjectId("m1".to_string());
+            account
+                .etag_index
+                .write()
+                .await
+                .insert("m1".into(), "W/\"e\"".into());
+            account
+                .client
+                .script_rest([crate::client::ScriptedRestResponse::json(
+                    reqwest::StatusCode::OK,
+                    json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m1"}}]}),
+                )]);
+            let events = submit_batch(
+                &account,
+                std::slice::from_ref(&id),
+                &MutationKind::SetFlags(op.clone()),
+            )
+            .await
+            .expect("scripted batch");
+            let [SyncEvent::Warning(warning), SyncEvent::Batch(batch)] = events.as_slice() else {
+                panic!("{op:?}: {events:?}");
+            };
+            assert_eq!(warning.kind, bifrost_types::WarningKind::StrategyDowngraded);
+            let unsupported = unsupported_flag_tokens(&op);
+            assert!(
+                matches!(batch.items.as_slice(), [ItemOutcome::Succeeded(success)]
+                if success.output == MutationSuccess::Downgraded {
+                    actual: bifrost_types::MutationEffect::FlagsPartiallyApplied { unsupported },
+                }),
+                "{op:?}: {batch:?}"
+            );
+            let requests = account.client.take_rest_requests();
+            assert_eq!(
+                requests[0].body.as_ref().unwrap()["requests"][0]["body"],
+                expected_body,
+                "{op:?}"
+            );
+        }
+    }
+
+    /// A modeled-only op stays `Applied` with no warning.
+    #[tokio::test]
+    async fn modeled_flag_ops_stay_applied_without_a_warning() {
+        let account = shared_account();
+        let id = ObjectId("m1".to_string());
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("m1".into(), "W/\"e\"".into());
+        account
+            .client
+            .script_rest([crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"responses": [{"id": "0", "status": 200, "body": {"id": "m1"}}]}),
+            )]);
+        let events = submit_batch(
+            &account,
+            std::slice::from_ref(&id),
+            &MutationKind::SetFlags(FlagOp::Add(flag_set(&["\\Seen"]))),
+        )
+        .await
+        .expect("scripted batch");
+        let [SyncEvent::Batch(batch)] = events.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert!(
+            matches!(batch.items.as_slice(), [ItemOutcome::Succeeded(success)]
+            if success.output == MutationSuccess::Applied)
+        );
     }
 
     #[tokio::test]

@@ -526,8 +526,8 @@ lane. `MutationSuccess::{Applied, Skipped, Downgraded { actual }}` is the
 mutation success payload, and the three are distinct answers to
 distinct questions: `Applied` means the target is in the requested
 state, `Skipped` means it already was and nothing was done, and
-`Downgraded` means the provider accepted a WEAKER operation - the target
-changed but is not in the requested state, and `actual: MutationEffect` says
+`Downgraded` means the provider accepted a WEAKER operation - a real write
+landed, but not the one requested, and `actual: MutationEffect` says
 what weaker operation landed.
 
 `Downgraded` exists because reporting either neighbour in its place is
@@ -547,9 +547,14 @@ apply for read-back and diagnostics. It is deliberately NOT queued for
 resubmission: a downgrade is not
 transient, and replaying it earns the same downgrade.
 
-"The target changed" is a precondition of `Downgraded`, not a description
-of it. An operation the provider could not perform at all - every
-requested flag unrepresentable, so no request is even sent - is not a
+An acknowledged, non-empty weaker write is the precondition of
+`Downgraded`. It proves the provider accepted the weaker operation, not that
+the target's observable state moved: a partial flag write against a message
+already in that state is still `Downgraded`. The weaker write need not name
+a requested flag - a Graph full-replace `Set` naming only flags Graph does
+not model still clears read, flagged and categories, and is reported
+`FlagsPartiallyApplied`. An operation the provider could not perform at
+all - its projection is empty, so no request is even sent - is not a
 downgrade and must not borrow the lane. It produces `ItemOutcome::Failed`
 per id with `Unsupported(operation)` -> `RecoveryClass::Unsupported`,
 which is permanent and not retried. This matters beyond tidiness:

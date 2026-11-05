@@ -36,11 +36,6 @@ not verified against the code. Verification happens when an item is worked.
 Items that leak something or report success for something that did not
 happen, plus one surface gap that matters if the consumer relies on it.
 
-- **Graph mixed flag operations silently discard unmodeled tokens while
-  reporting Applied** (`patch_for_flags` and `flag_op_is_unexpressible`). The
-  consumer believes a keyword is set that is not, and nothing corrects it. The
-  read-back flag judge already refuses to decide these operations; the write
-  outcome needs its own answer, likely refusing the unexpressible part.
 - **IMAP sends report success when the Sent copy failed.** `send_message`,
   `send_raw_message` and `draft_send` log a failed Sent APPEND and return
   success; `draft_send` likewise logs a post-send discard failure. The caller

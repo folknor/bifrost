@@ -1864,9 +1864,18 @@ tests the BUILT BODY, not the token namespace: an incremental category op
 so the partial patch would drop the other tokens) and an op naming only flags
 Graph does not model at all (`\answered`, `\draft`, arbitrary keywords) both
 produce `{}`. Graph answers 200 to an empty PATCH, so filing it would tell the
-caller a flag change landed that never reached the wire. A mixed op keeping an
-expressible half still proceeds, and `Set` is full-replace so it always writes
-all three owned fields.
+caller a flag change landed that never reached the wire.
+
+A mixed op keeping an expressible half is sent, and `Set` is full-replace so
+it always writes all three owned fields, even when it names only unmodeled
+tokens. The PATCH carries only the projection, so when the op names any
+token Graph does not model (no `graph_flag_field` alias, no case-sensitive
+`category:` prefix; `unsupported_flag_tokens`), each acknowledged id is
+reported `Downgraded { FlagsPartiallyApplied { unsupported } }` with those
+tokens sorted, never `Applied`, and the chunk's events open with one
+`StrategyDowngraded` warning. 412, failed and uncertain outcomes are
+unchanged, and the etag cache still consumes the acknowledged response. This
+matches Gmail's partial-flag lane.
 `bulk_move` requires `MembershipScope::Folder` (else fatal pre-request).
 `IdempotencyKey` is accepted but not sent (`MutationReplaySafety::None`).
 
