@@ -280,7 +280,13 @@ what releases the drive LEASE when a scope is deleted or restarted while the
 account boundary is still `Run`. The push reconciler also selects shutdown
 around its engine-directive send on the bounded reopen channel, so a full
 channel behind a busy listener cannot outlive shutdown; that send holds no
-admission, lease or activity, so it never blocks a pause from draining.
+admission, lease or activity, so it never blocks a pause from draining. The
+per-scope poll task's engine-directive send selects shutdown the same way: poll
+tasks are not detach workers and nothing holds their handles, so a parked send
+would otherwise outlive detach. It does not select the per-scope token, because
+the directive may be account-wide. The lifecycle reader's reopen sends select
+nothing; an abort-on-drop guard in the multiplexer aborts the reader whenever
+the multiplexer task ends, by its shutdown tail or by detach aborting it.
 
 In every case cancellation stops the loop at a poll boundary. It never
 interrupts the processing or publication of an event the stream has already
@@ -1654,8 +1660,8 @@ a parked deferred-inventory walk, and drops a receiver holding an
 unacknowledged page into that window. Both ablations were run and both fail it.
 
 One mechanical note that cost a round: parking a CHANGES stream does not hold
-`detach` at all. The multiplexer spawns its per-scope poll tasks itself and
-aborts them; the workers `detach` joins are the ones `attach` stored, so the
+`detach` at all. The multiplexer spawns its per-scope poll tasks itself, holds
+no handles to them and stops them through their per-scope tokens; the workers `detach` joins are the ones `attach` stored, so the
 straggler has to be one of those - the deferred-inventory worker, the backfill
 orchestrator, the multiplexer task itself. A test that stages a window must
 assert it is really in one (`JoinHandle::is_finished`), because a detach that

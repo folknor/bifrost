@@ -971,7 +971,14 @@ impl Multiplexer {
         let mut lifecycle_generation = account_generation;
         let lifecycle_throttles = Arc::clone(&throttles);
         let lifecycle_account_id = account_id.clone();
-        let lifecycle_handle = tokio::spawn(async move {
+        // The lifecycle reader's reopen sends (its Terminated forward and the
+        // Created / Deleted / Renamed requests in `apply_lifecycle_transition`)
+        // are bare awaits on purpose: this guard aborts the reader when `run`
+        // ends, however it ends - the shutdown tail below, or detach aborting
+        // the multiplexer worker before it got there - so a send parked on a
+        // full channel behind a busy listener never outlives the multiplexer.
+        // A plain `JoinHandle` would detach the reader on drop instead.
+        let _lifecycle_guard = AbortOnDrop(tokio::spawn(async move {
             let mut backoff =
                 crate::backoff::ReconnectBackoff::new(bifrost_types::BackoffPolicy::new(
                     LIFECYCLE_RECONNECT_MIN,
@@ -1136,7 +1143,7 @@ impl Multiplexer {
                     () = tokio::time::sleep(delay.max(retry_wait)) => {}
                 }
             }
-        });
+        }));
 
         // Park until shutdown while periodically noticing cursors
         // established by deferred inventory or lifecycle recovery.
@@ -1172,7 +1179,7 @@ impl Multiplexer {
         for token in drained {
             token.cancel();
         }
-        lifecycle_handle.abort();
+        // `_lifecycle_guard` drops here and aborts the lifecycle reader.
     }
 
     /// Apply an inventory-fusion `Done`: only the terminal `Done` of
@@ -1698,6 +1705,15 @@ async fn spawn_scope_poll_inner(
     }
 }
 
+/// Aborts its task when dropped, unlike `JoinHandle`, which detaches it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// How an exiting per-scope poll task leaves its `ScopeToken` entry.
 ///
 /// `Retire` removes the entry so the 1s scan can respawn the scope when
@@ -1835,13 +1851,27 @@ async fn handle_drive_outcome(
                 }
                 RecoveryPlan::Engine(directive) => {
                     let directive_scope = directive_target_scope(&directive);
-                    let _ = reopen_tx
-                        .send(ReopenRequest::Recovery {
-                            scope: directive_scope,
-                            error: original,
-                            generation: Some(generation),
-                        })
-                        .await;
+                    let request = ReopenRequest::Recovery {
+                        scope: directive_scope,
+                        error: original,
+                        generation: Some(generation),
+                    };
+                    // Nothing is held here: admission was dropped by the
+                    // caller and the lease and activity guard ended with the
+                    // drive. Per-scope poll tasks are not detach workers -
+                    // nobody holds their handles - so a bare send against a
+                    // full channel behind a busy listener (which keeps its
+                    // receiver while inside a repair) would outlive detach
+                    // until the listener died. Shutdown wins and the owed
+                    // directive is dropped; the reopen channel has no
+                    // shutdown drain. The scope token is deliberately NOT
+                    // selected: the directive may be account-wide, and a
+                    // deleted scope does not revoke it.
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => return retired(),
+                        _ = reopen_tx.send(request) => {}
+                    }
                     DriveRecovery {
                         advanced: false,
                         exit: None,
@@ -1920,6 +1950,10 @@ pub(crate) fn retire_deleted_scope(
 /// half on the old id plus the create half on the new one, whose shapes
 /// are read before the delete; `Renamed` on one stable id is the create
 /// half alone.
+///
+/// Its reopen sends select no shutdown arm: the lifecycle reader that calls
+/// it is aborted by an abort-on-drop guard in `Multiplexer::run`, which is
+/// what frees a send parked on a full channel.
 async fn apply_lifecycle_transition(
     cursors: &CursorRegistry,
     control: &SyncControl,
@@ -2351,6 +2385,50 @@ mod tests {
             ReopenRequest::Recovery { error: routed, generation: Some(7), .. }
                 if routed.kind() == error.kind()
         ));
+    }
+
+    /// A poll task is nobody's detach worker, so an engine directive parked
+    /// on a full reopen channel (the listener alive but busy) must be freed
+    /// by shutdown alone, leaving the scope retired.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_unparks_an_engine_directive_send_against_a_full_reopen_channel() {
+        let (reopen_tx, reopen_rx) = mpsc::channel(1);
+        reopen_tx
+            .try_send(ReopenRequest::ScopeCreated {
+                scope: CursorScope::Account,
+            })
+            .expect("prefill");
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                let error = crate::recovery::cursor_decode_failure(AccountOperation::SyncChanges);
+                handle_drive_outcome(
+                    &CursorScope::Account,
+                    Err(Error::Account(error)),
+                    false,
+                    7,
+                    &reopen_tx,
+                    &AccountId("parked".into()),
+                    &StdMutex::new(crate::recovery::ThrottleBucket::default()),
+                    &shutdown,
+                    &CancellationToken::new(),
+                )
+                .await
+                .exit
+            }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "parked on the full channel");
+        shutdown.cancel();
+        let exit = tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("shutdown frees the send")
+            .expect("task");
+        assert_eq!(exit, Some(PollExit::Retire));
+        drop(reopen_rx);
     }
 
     /// `ScopeLifecycle::Deleted` must retire more than the in-memory
