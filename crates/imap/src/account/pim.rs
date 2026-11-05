@@ -496,6 +496,18 @@ pub(crate) fn draft_send(
     account: ImapAccount,
     draft: DraftHandle,
 ) -> AccountFuture<Result<SendReceipt, AccountError>> {
+    draft_send_with_clock(account, draft, jiff::Timestamp::now)
+}
+
+/// `draft_send` with the send-time clock injected, so a scripted test can
+/// match the restamped `Date` byte for byte. The clock is a callable, not a
+/// timestamp, so it is still read at the restamp site after the draft FETCH,
+/// exactly as production reads it.
+pub(super) fn draft_send_with_clock(
+    account: ImapAccount,
+    draft: DraftHandle,
+    now: fn() -> jiff::Timestamp,
+) -> AccountFuture<Result<SendReceipt, AccountError>> {
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
         if account.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -511,7 +523,7 @@ pub(crate) fn draft_send(
         // for delivery now. Both the transmitted body and the Sent copy
         // below derive from these restamped bytes, so they agree.
         let raw: bytes::Bytes =
-            restamp_draft_date(&raw, jiff::Timestamp::now(), AccountOperation::DraftSend)?.into();
+            restamp_draft_date(&raw, now(), AccountOperation::DraftSend)?.into();
 
         // Parse the draft headers to build the envelope: To/Cc/Bcc drive
         // RCPT TO, From/Sender drive MAIL FROM. The Bcc header is folded

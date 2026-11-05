@@ -187,6 +187,191 @@ async fn sent_copy_without_a_sent_folder_or_request_writes_nothing() {
     assert_eq!(declined.id.0, "imapmsgid1:m1@example.com");
 }
 
+/// The saved draft, its `Date` the save time.
+const SAVED_DRAFT: &str = "Date: Mon, 1 Jan 2001 00:00:00 +0000\r\n\
+    From: user@example.com\r\n\
+    To: to@example.com\r\n\
+    Message-ID: <d1@example.com>\r\n\
+    Subject: hi\r\n\
+    \r\n\
+    body\r\n";
+
+/// The bytes SMTP must carry: the saved `Date` replaced, first, by the
+/// injected send time. Spelled out rather than derived from the restamp
+/// helper, so the test pins the wire and not the helper's own idea of it.
+const SENT_DRAFT: &str = "Date: Sun, 9 Sep 2001 01:46:40 +0000\r\n\
+    From: user@example.com\r\n\
+    To: to@example.com\r\n\
+    Message-ID: <d1@example.com>\r\n\
+    Subject: hi\r\n\
+    \r\n\
+    body\r\n";
+
+fn draft_send_clock() -> jiff::Timestamp {
+    jiff::Timestamp::from_second(1_000_000_000).unwrap()
+}
+
+/// Drive `draft_send` end to end against a scripted IMAP peer and a scripted
+/// SMTP peer: EXAMINE and FETCH the draft, submit it, then discard it with a
+/// read-write SELECT and `UID STORE`, answering the STORE with `store_reply`
+/// and, when it is OK, the `UID EXPUNGE` with `expunge_reply`. No Sent copy
+/// is requested, so the discard is the only post-send IMAP traffic.
+async fn draft_send_with_discard(
+    store_reply: &'static str,
+    expunge_reply: Option<&'static str>,
+) -> Result<bifrost_types::SendReceipt, bifrost_types::AccountError> {
+    use bifrost_smtp::transport::smtp::extension::ClientId;
+    use bifrost_smtp::transport::smtp::{ScriptedConnector, Transcript};
+
+    let transcripts: Arc<std::sync::Mutex<Vec<Transcript>>> = Arc::default();
+    let dialed = Arc::clone(&transcripts);
+    let connector = ScriptedConnector::new(move || {
+        let hello = format!("EHLO {}\r\n", ClientId::default());
+        let transcript = Transcript::new("220 peer\r\n")
+            .expect(&hello, "250-peer\r\n250 AUTH PLAIN\r\n")
+            .expect("AUTH PLAIN AHVzZXIAcGFzcw==\r\n", "235 authenticated\r\n")
+            .expect(&hello, "250 peer\r\n")
+            .expect("MAIL FROM:<user@example.com>\r\n", "250 sender\r\n")
+            .expect("RCPT TO:<to@example.com>\r\n", "250 recipient\r\n")
+            .expect("DATA\r\n", "354 send\r\n")
+            .expect(SENT_DRAFT, "")
+            .expect(".\r\n", "250 delivered\r\n");
+        dialed.lock().unwrap().push(transcript.clone());
+        transcript
+    });
+    let cfg = super::SmtpSubmissionConfig::new(
+        "smtp.invalid",
+        super::SubmissionTls::Plaintext,
+        bifrost_types::Address::bare("user@example.com"),
+    )
+    .with_save_to_sent_default(false);
+    let submission = super::submission::SubmissionTransport::build_with_connector(
+        &cfg,
+        &crate::types::Credentials::password("user", "pass"),
+        None,
+        bifrost_net::BandwidthBudget::default(),
+        Some(connector),
+    )
+    .unwrap();
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 UIDPLUS")).await;
+    let mut parts = scripted_account_parts(conn, 1);
+    parts.submission = Some(Arc::new(submission));
+    let account = ImapAccount::new(parts);
+    let script = tokio::spawn(async move {
+        let selected = |tag: &str| {
+            format!(
+                "* 1 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Deleted)\r\n\
+                 * OK [UIDVALIDITY 7] epoch\r\n{tag} OK selected\r\n"
+            )
+        };
+        let line = read_line(&mut server).await;
+        assert!(line.contains("EXAMINE"), "expected EXAMINE, got {line}");
+        respond(&mut server, &selected(tag_of(&line))).await;
+        let line = read_line(&mut server).await;
+        assert!(line.contains("UID FETCH"), "expected UID FETCH, got {line}");
+        respond(
+            &mut server,
+            &format!(
+                "* 1 FETCH (UID 1 BODY[] {{{}}}\r\n{SAVED_DRAFT})\r\n{} OK fetched\r\n",
+                SAVED_DRAFT.len(),
+                tag_of(&line)
+            ),
+        )
+        .await;
+        let line = read_line(&mut server).await;
+        assert!(line.contains("SELECT"), "expected SELECT, got {line}");
+        respond(&mut server, &selected(tag_of(&line))).await;
+        let line = read_line(&mut server).await;
+        assert!(line.contains("UID STORE"), "expected UID STORE, got {line}");
+        respond(&mut server, &format!("{} {store_reply}\r\n", tag_of(&line))).await;
+        if let Some(expunge_reply) = expunge_reply {
+            let line = read_line(&mut server).await;
+            assert!(
+                line.contains("UID EXPUNGE"),
+                "expected UID EXPUNGE, got {line}"
+            );
+            respond(
+                &mut server,
+                &format!("{} {expunge_reply}\r\n", tag_of(&line)),
+            )
+            .await;
+        }
+        server
+    });
+    let draft = super::encode_object_id(&crate::types::MailboxName::new("Drafts").unwrap(), 7, 1);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::pim::draft_send_with_clock(
+            account,
+            bifrost_types::DraftHandle(draft.0),
+            draft_send_clock,
+        ),
+    )
+    .await
+    .expect("draft_send must finish");
+    let _server = script.await.unwrap();
+    let transcripts = transcripts.lock().unwrap();
+    assert_eq!(transcripts.len(), 1, "one SMTP session");
+    transcripts[0].assert_exhausted();
+    outcome
+}
+
+fn assert_discard_failure(receipt: &bifrost_types::SendReceipt) -> &bifrost_types::AccountError {
+    assert!(matches!(
+        receipt.sent_copy,
+        bifrost_types::SentCopy::NotRequested
+    ));
+    let failure = receipt
+        .draft_discard
+        .as_ref()
+        .expect("a failed discard rides the receipt");
+    let draft = super::encode_object_id(&crate::types::MailboxName::new("Drafts").unwrap(), 7, 1);
+    assert_eq!(failure.draft.0, draft.0);
+    assert_eq!(
+        failure.error.operation(),
+        Some(AccountOperation::DraftDiscard)
+    );
+    &failure.error
+}
+
+/// The draft was marked deleted but the expunge failed: the send still
+/// succeeds, and the discard failure carries the committed MarkedDeleted
+/// step so its recovery advises `draft_discard`, never a re-driven send.
+#[tokio::test]
+async fn draft_send_reports_a_failed_expunge_with_its_partial_commit() {
+    let receipt = draft_send_with_discard("OK stored", Some("NO [UNAVAILABLE] busy"))
+        .await
+        .expect("the message was sent");
+    let error = assert_discard_failure(&receipt);
+    assert_eq!(
+        error
+            .partial_commit()
+            .expect("marked deleted is recorded")
+            .steps()[0]
+            .effect(),
+        Some(bifrost_types::StepEffect::MarkedDeleted)
+    );
+}
+
+/// A refused STORE committed nothing, so the discard failure is a plain error.
+#[tokio::test]
+async fn draft_send_reports_a_refused_discard_without_a_partial_commit() {
+    let receipt = draft_send_with_discard("NO [UNAVAILABLE] busy", None)
+        .await
+        .expect("the message was sent");
+    assert!(assert_discard_failure(&receipt).partial_commit().is_none());
+}
+
+/// A clean discard leaves the receipt without a discard failure.
+#[tokio::test]
+async fn draft_send_with_a_clean_discard_reports_none() {
+    let receipt = draft_send_with_discard("OK stored", Some("OK expunged"))
+        .await
+        .expect("the message was sent");
+    assert!(receipt.draft_discard.is_none());
+}
+
 /// A container mutation must complete with a single-permit pool.
 ///
 /// `container_create` holds its pooled checkout across the post-mutation

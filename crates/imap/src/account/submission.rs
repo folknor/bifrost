@@ -197,7 +197,7 @@ impl SubmissionTransport {
         )
     }
 
-    fn build_with_connector(
+    pub(super) fn build_with_connector(
         cfg: &SmtpSubmissionConfig,
         imap_credentials: &Credentials,
         meter: Option<bifrost_net::MeterSinkHandle>,
