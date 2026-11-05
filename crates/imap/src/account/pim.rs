@@ -578,9 +578,22 @@ pub(super) fn draft_send_with_clock(
         // Sent copy above was not filed: a submitted message left in Drafts,
         // whose ordinary action is Send, invites a duplicate from any client.
         // A failed discard is not an `Err` (the message was sent); it rides
-        // the receipt as a `DraftDiscard` error, so its recovery and
-        // partial-commit record (marked deleted, expunge failed) advise
-        // `draft_discard`, never a re-driven send.
+        // the receipt as a `DraftDiscard` error, attributing the failure to
+        // the cleanup rather than the send, with its partial-commit record
+        // (marked deleted, expunge failed). Its recovery class follows the
+        // actual error; the follow-up is `draft_discard`, never a re-driven
+        // send.
+        //
+        // Deliberately not gated on `pim_methods.draft_discard`: this is the
+        // same `delete_messages` removal `draft_discard` runs, and that flag
+        // is advertised on every server for the reason given in
+        // `build_capabilities`. Without UIDPLUS the removal falls back to plain
+        // EXPUNGE only when `UID SEARCH DELETED` finds no `\Deleted` message
+        // but this draft, and otherwise refuses with the draft left flagged;
+        // it never knowingly expunges another message. The non-atomic
+        // SEARCH-to-EXPUNGE window is the one `expunge_uids_or_fall_back`
+        // documents for every removal path. Skipping the discard instead would
+        // leave a submitted message live in Drafts, inviting a duplicate send.
         match delete_messages(&account, vec![decoded], AccountOperation::DraftDiscard).await {
             Ok(_) => Ok(receipt),
             Err(progress) => {
@@ -4469,6 +4482,75 @@ mod partial_commit_tests {
     async fn partial_commit_delete_thread_attaches_once() {
         let error = composed_failure(true).await;
         assert_eq!(error.partial_commit().unwrap().steps().len(), 1);
+    }
+    /// A bare server (no UIDPLUS, no IMAP4rev2) advertises removal, so
+    /// `move_thread` reaches the guarded plain-EXPUNGE fallback. A foreign
+    /// `\Deleted` message found by `UID SEARCH DELETED` stops it before any
+    /// EXPUNGE, and the failure keeps both the COPY and the MarkedDeleted step.
+    #[tokio::test]
+    async fn bare_server_move_thread_refuses_expunge_over_foreign_deleted() {
+        let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        let mut parts = scripted_account_parts(conn, 1);
+        let profile = crate::types::ServerProfile::new(Vec::new(), Vec::new());
+        parts.capabilities = super::super::capabilities::build_capabilities(
+            &profile,
+            &[],
+            false,
+            None,
+            None,
+            false,
+            false,
+            1,
+        );
+        assert!(parts.capabilities.pim_methods.remove_from_container);
+        let account = ImapAccount::new(parts);
+        let script = tokio::spawn(async move {
+            loop {
+                let line = read_line(&mut server).await;
+                if line.contains("SELECT") {
+                    respond(&mut server,&format!("* 1 EXISTS\r\n* 0 RECENT\r\n* FLAGS (\\Deleted)\r\n* OK [UIDVALIDITY 7] epoch\r\n{} OK selected\r\n",tag_of(&line))).await;
+                } else if line.contains("UID COPY") || line.contains("NOOP") {
+                    respond(&mut server, &format!("{} OK copied\r\n", tag_of(&line))).await;
+                } else if line.contains("UID STORE") {
+                    respond(&mut server, &format!("{} OK stored\r\n", tag_of(&line))).await;
+                } else {
+                    assert!(line.contains("UID SEARCH DELETED"), "{line}");
+                    respond(
+                        &mut server,
+                        &format!("* SEARCH 1 9\r\n{} OK searched\r\n", tag_of(&line)),
+                    )
+                    .await;
+                    break;
+                }
+            }
+            server
+        });
+        let thread = encode_thread_id(&MailboxName::new("INBOX").unwrap(), 7, &[1]);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            move_thread(
+                account,
+                thread,
+                ContainerId("Archive".into()),
+                Some(ContainerId("INBOX".into())),
+            ),
+        )
+        .await
+        .expect("no EXPUNGE may follow a foreign \\Deleted")
+        .unwrap_err();
+        let effects: Vec<_> = error
+            .partial_commit()
+            .unwrap()
+            .steps()
+            .iter()
+            .map(bifrost_types::Step::effect)
+            .collect();
+        assert!(effects.contains(&Some(StepEffect::Copied)), "{effects:?}");
+        assert!(
+            effects.contains(&Some(StepEffect::MarkedDeleted)),
+            "{effects:?}"
+        );
+        let _server = script.await.unwrap();
     }
     #[tokio::test]
     async fn partial_commit_draft_discard_expunge_failure_marks_deleted() {

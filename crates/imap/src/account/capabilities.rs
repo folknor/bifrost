@@ -37,7 +37,17 @@ pub(crate) fn build_capabilities(
                 .eq_ignore_ascii_case("drafts")
     });
     let mail_set_flags = profile.supports_condstore();
-    let can_expunge_by_uid = profile.supports(Capability::UidPlus);
+    // `draft_create` returns the APPENDUID-derived id of the saved draft, so
+    // it needs UIDPLUS (advertised, or in the IMAP4rev2 baseline). Message
+    // removal does not: every removal path runs `expunge_uids_or_fall_back`,
+    // which on a server without UID EXPUNGE falls back to plain EXPUNGE only
+    // when `UID SEARCH DELETED` shows no foreign `\Deleted` message, and
+    // otherwise refuses with the batch left flagged. A `PimMethodSupport`
+    // flag means "handled", not "always succeeds", so `remove_from_container`
+    // and `draft_discard` are advertised on every server; gating them on
+    // UIDPLUS also left a failed post-send discard in `draft_send` (which
+    // always runs the same removal) with no public method to retry it.
+    let can_identify_append = profile.supports(Capability::UidPlus);
     let has_thread_references = profile.capabilities.iter().any(
         |cap| matches!(cap, Capability::Thread(alg) if alg.eq_ignore_ascii_case("REFERENCES")),
     );
@@ -138,7 +148,7 @@ pub(crate) fn build_capabilities(
             category_definitions: false,
             message_reactions: false,
             add_to_container: true,
-            remove_from_container: can_expunge_by_uid,
+            remove_from_container: true,
             set_keyword: true,
             set_label_membership: false,
             set_category: false,
@@ -148,9 +158,9 @@ pub(crate) fn build_capabilities(
             send_message: submission_configured,
             attachment_upload: false,
             host_attachment: false,
-            draft_create: has_drafts && can_expunge_by_uid,
+            draft_create: has_drafts && can_identify_append,
             draft_update: false,
-            draft_discard: can_expunge_by_uid,
+            draft_discard: true,
             draft_send: submission_configured,
             // IMAP relay FUTURERELEASE is per-connection (advertised in
             // EHLO at send time), unknown at open. The honest snapshot
@@ -620,11 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn expunge_backed_methods_require_uidplus_or_rev2() {
+    fn removal_is_advertised_everywhere_and_draft_create_needs_uidplus_or_rev2() {
+        // Removal runs the guarded plain-EXPUNGE fallback without UIDPLUS,
+        // so it is handled on a bare server; draft_create needs APPENDUID.
         let bare = ServerProfile::new(Vec::new(), Vec::new());
-        let caps = build_capabilities(&bare, &[], false, None, None, false, false, 1);
-        assert!(!caps.pim_methods.remove_from_container);
-        assert!(!caps.pim_methods.draft_discard);
+        let drafts = [mailbox("Drafts", Vec::new())];
+        let caps = build_capabilities(&bare, &drafts, false, None, None, false, false, 1);
+        assert!(caps.pim_methods.remove_from_container);
+        assert!(caps.pim_methods.draft_discard);
         assert!(!caps.pim_methods.draft_create);
 
         let uidplus = ServerProfile::new(vec![Capability::UidPlus], Vec::new());

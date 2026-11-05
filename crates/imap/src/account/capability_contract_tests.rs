@@ -17,14 +17,16 @@
 //! half nothing else pins: nothing advertised `false` may quietly work.
 //!
 //! Writing this file immediately found three flags that did not gate their
-//! methods at all: `remove_from_container` and `draft_discard` (both false
-//! when the server offers neither UIDPLUS nor IMAP4rev2, so no UID EXPUNGE)
-//! and `thread_hydrate` (false without `THREAD=REFERENCES`). All three decoded
-//! their target and proceeded toward the wire regardless of the flag, while
-//! `search`, `draft_create` and `quota_get` in the same module read theirs
-//! correctly. The methods were fixed to match the flags - the capability is
-//! derived from a server capability string, so the flag was the true half -
-//! and all three are now driven below like everything else.
+//! methods at all: `remove_from_container`, `draft_discard` and
+//! `thread_hydrate`. All three decoded their target and proceeded toward the
+//! wire regardless of the flag, while `search`, `draft_create` and
+//! `quota_get` in the same module read theirs correctly. The methods were
+//! fixed to read their flags, and all three are driven below like everything
+//! else. `remove_from_container` and `draft_discard` have since become true on
+//! every server (removal has a guarded plain-EXPUNGE fallback without UID
+//! EXPUNGE), so against this bare fixture their `refuses!` arms assert nothing;
+//! they stay so that a future derivation that clears either flag is pinned
+//! again without anyone remembering to add the case back.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]

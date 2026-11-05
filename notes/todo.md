@@ -267,6 +267,15 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
+- **IMAP `draft_send` and `draft_discard` do not check that the handle is a
+  draft.** Both decode any `imap2` object id (`crates/imap/src/account/pim.rs`)
+  and neither verifies Drafts-folder membership or the `\Draft` flag, so a
+  handle naming an ordinary message submits it and then marks it `\Deleted`
+  and expunges it. Only that one UID can be removed (the expunge fallback's
+  allowed set is the singleton), so this is an input-contract question, not
+  collateral expunging. Needs a ruling on whether a non-draft handle is
+  `Request(Malformed)`.
+
 - **IMAP search: one failing folder fails the whole page.** `search` and
   `search_messages` (`crates/imap/src/account/pim.rs`) propagate any
   per-folder SELECT or SEARCH error with `?` across every selectable folder,

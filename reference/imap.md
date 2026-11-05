@@ -779,11 +779,18 @@ message metadata and parses selected bytes through `bifrost-types::mime`.
 
 `capabilities.rs` fills `AccountCapabilities::pim_methods` and `conveniences` at open time, and sets `AccountCapabilities::discovers_foreign_namespaces_on_rediscovery` from the open-time NAMESPACE response (`namespaces_advertise_foreign`, pure, `factory.rs`): true iff any `other`/`shared` descriptor carries a non-empty prefix, independent of whether any folders are currently shared. IMAP emits no scope-lifecycle events and discovers foreign folders only at open, so consumers read this flag to decide whether a periodic `SyncEngine::reattach` (the only way a post-open ACL grant becomes visible) can ever surface anything on this server. IMAP advertises real support for:
 
-- Container membership: `add_to_container` via UID COPY, `remove_from_container` via `+FLAGS.SILENT \Deleted` plus UID EXPUNGE. `add_to_container` and `message_hydrate` check their own `pim_methods` flag first and answer `Unsupported` when it is false, like the other primitives.
+- Container membership: `add_to_container` via UID COPY, `remove_from_container` via `+FLAGS.SILENT \Deleted` plus UID EXPUNGE, or the guarded plain-EXPUNGE fallback below; it is advertised on every server. `add_to_container` and `message_hydrate` check their own `pim_methods` flag first and answer `Unsupported` when it is false, like the other primitives.
 
 The per-folder PIM primitives (`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`) stamp failures in the folder's PREPARATION (checkout, SELECT/EXAMINE, UIDVALIDITY read) `Unsent` through `preflight_err`, relative to the operation: the SELECT's own evidence (a tagged NO is `Acknowledged`) is about the SELECT, not the COPY / STORE / FETCH that was never sent, and publishing it would make recovery reconcile a non-idempotent mutation that never reached the server. It speaks for the folder being prepared only; earlier folders of a multi-folder call may already have been mutated. The helpers return FolderProgress carrying those effects, and a preparation failure becomes an effectless primary.
 
 Every path that removes messages (sync-side `bulk_destroy`, PIM `delete_messages`) goes through `expunge_uids_or_fall_back`. It issues `UID EXPUNGE` (RFC 4315 Section 2), and on `MissingCapability` - a server with neither UIDPLUS nor IMAP4rev2 - falls back to plain `EXPUNGE` only when `UID SEARCH DELETED` shows the mailbox's `\Deleted` set is a subset of the UIDs this batch just marked. Plain EXPUNGE names no messages: running it with a foreign `\Deleted` present would silently destroy another client's mail, so that case keeps the `MissingCapability` failure with the batch left flagged.
+
+Because removal works without UID EXPUNGE, `pim_methods.remove_from_container`
+and `pim_methods.draft_discard` are true on every server: a flag means the
+method is handled, not that it always succeeds, and the foreign-`\Deleted`
+refusal is a runtime `Unsupported` like any other. The composed `move_thread`
+and `delete_thread` therefore reach the guarded removal on a bare server too,
+with its partial effects (Copied, MarkedDeleted) and its race.
 
 A reasserted destroy repeats this non-atomic plain-EXPUNGE fallback check
 once per attempt; the existing limitation applies to every reassertion.
@@ -799,7 +806,7 @@ race cannot be closed by this client.
 - Search paging (`pim::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. A changed UIDVALIDITY on the cursor's folder fails `ConcurrencyConflict` (repeat the walk); an undecodable cursor, a cursor outside the `SearchFilter::In` restriction, and a zero limit are `Request(Malformed)`. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised. The account probes the Inbox role when it exists; otherwise it chooses the first selectable folder by display name, wire octets, and encoding mode. Hydration: one-shot message FETCH and synthetic thread hydration.
-- Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present; discard is advertised only when UID EXPUNGE is available. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
+- Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present (create returns the APPENDUID-derived id); discard is advertised on every server and removes through the shared removal path above. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
 - Send / draft-send: real when `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` is set (see "Submission" below); `Unsupported` otherwise.
 
 Unsupported PIM methods return `Error::Unsupported` with false flags: attachment upload, `host_attachment` (Gmail/Graph only), draft update, Gmail label membership, Graph categories/extended properties, identities + identity update, vacation get/set, `scheduled_send` (cancel/reschedule too). `scheduled_send` is statically false even with submission because FUTURERELEASE is a per-connection EHLO truth unknown at open; the send is attempted and the relay's EHLO decides. SMTP send/draft-send are unsupported only without submission config. IMAP identities and vacation responders are not in Stage 1.
@@ -873,9 +880,15 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   `SendReceipt::draft_discard` as the handle plus the discard's own error,
   built exactly as `draft_discard` builds it (`AccountOperation::DraftDiscard`,
   `folder_progress_error`, so a MarkedDeleted step survives a failed EXPUNGE),
-  whose recovery therefore advises `draft_discard`, never a re-driven send. The
-  draft is discarded even when the Sent copy was not filed: a submitted message
-  left in Drafts invites a duplicate send from any client.
+  so the failure is attributed to the cleanup, not the send; its recovery class
+  follows the actual error, and the follow-up is `draft_discard`, never a
+  re-driven send. The draft is discarded even when the Sent copy was not filed:
+  a submitted message left in Drafts invites a duplicate send from any client.
+  The discard deliberately does not read `pim_methods.draft_discard` (true on
+  every server anyway): on a server without UIDPLUS it runs the same guarded
+  plain-EXPUNGE fallback as every removal, so it never knowingly expunges
+  another `\Deleted` message, and skipping it would leave the sent message live
+  in Drafts.
 - `draft_send` finalizes `Date`: before submission every `Date` field (folds
   included; `Resent-Date` and `X-Date` kept) is dropped and one carrying the
   send time is inserted first, and both the SMTP body and the Sent copy derive
