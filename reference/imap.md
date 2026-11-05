@@ -685,7 +685,19 @@ recovery open is a fresh connection, which is safe whatever this one reached.
 
 The shared `bifrost_types::Account` impl lives under `crates/imap/src/account/`. `ImapAccountFactory::open(account_id)` opens a connection pool, lists folders, builds capabilities, and threads the engine account id into plaintext bandwidth admission and optional byte accounting. `ImapAccount` backs both the sync methods and Stage 1 PIM primitives.
 
-The public account module re-exports only `ImapAccountFactory`, `ImapAccountConfig`, and `ManageSieveConfig` (preserving the conformance-test path `bifrost_imap::account::{...}`); the crate root re-exports the factory and config types directly. `ImapAccount` itself is `pub(crate)`.
+The public account module re-exports the factory and config types (`ImapAccountFactory`, `ImapAccountConfig`, `ManageSieveConfig`, the submission config types; preserving the conformance-test path `bifrost_imap::account::{...}`) and the UID polling surface below; the crate root re-exports both directly. `ImapAccount` itself is `pub(crate)`.
+
+### UID polling surface (`poll.rs`)
+
+The one published surface beside the factory, added at the owner's request for consumers that track arrivals per folder by UID instead of running change streams (a message moved in with an old INTERNALDATE has a fresh UID, so a UID watermark sees what a date search misses). It is IMAP-specific on purpose: UIDVALIDITY and UID have no meaning on the other providers, so it is not on the `Account` trait.
+
+- `ImapMessageRef::parse(&ObjectId)` is the fallible typed view of a message id: container (the canonical `containers_list` spelling, wire identity preserved), nonzero UIDVALIDITY, nonzero UID. It normalises every spelling the decoder accepts (`imap1`, leading zeros); `object_id()` mints the canonical `imap2` id. The `Account` methods still answer under the exact submitted string; the ref is the place that canonicalises.
+- `ImapAccountFactory::open_with_poller(account_id)` opens through the same construction path as `open` and returns the `OpenedAccount` plus an `ImapPoller` over the same instance (shared pool and registry). Closing the account closes the poller (each call checks `closed` before checkout); a later open is a new instance an old poller never follows.
+- `ImapPoller::observe` reports UIDVALIDITY, UIDNEXT and EXISTS from one EXAMINE. A missing or zero UIDVALIDITY or UIDNEXT is `Error::ProtocolMissing`, never a guessed 0 (unlike `cursor_from_select`, which stores 0 for a Basic cursor's unknown UIDNEXT). A `UIDNOTSTICKY` folder (RFC 4315) is `Unsupported(op)` scoped to `Cursor(Folder)`, since UID tracking would see a generation change on every selection.
+- `ImapPoller::list_uids(container, UidScan)` enumerates one generation. A UIDVALIDITY other than the scan's answers `UidListing::GenerationChanged` and lists nothing. The bound is `through` clamped to UIDNEXT - 1, and `from` above it returns an empty page with `completed_through: None` without sending a SEARCH, so `*` is never sent and the `n:*` rule (a range past the highest UID still matches it) cannot surface a UID below `from`. Otherwise it searches `UID lo:hi` windows of 65,536 UIDs (so no SEARCH nears the 1,000,000-UID ESEARCH expansion cap), at most 16 per call, filtering each to its window, sorting and deduplicating. The invariant: `refs` are exactly the UIDs the server reported in `from..=completed_through`; when the limit cuts a window, `completed_through` is the last kept UID; `next_from` resumes past it while the bound is not reached. UID-position continuation is expunge-stable. With an open `through` the bound is re-derived per call, so a caller needing a finite pass freezes it.
+- `ImapPoller::fetch_raw(&ImapMessageRef)` answers `RawMessage::{Message(Bytes), Absent, GenerationChanged { observed }}` through the same `run_fetch` core as `open_raw_rfc822` and its 256 MiB budget, refusing a `UIDNOTSTICKY` folder before the generation is judged; every other failure is the classified `Err`.
+- Errors carry `SearchMessages` (observe, list) or `OpenRawRfc822` (fetch); shared-folder permission denials map to `ScopeRevoked` as the raw read does.
+- `(container, UIDVALIDITY, UID)` is unique only within one account; consumers key persisted state by account too. A rename is a container identity change.
 
 Submodules:
 
@@ -921,7 +933,7 @@ Output ordering is therefore input-window order, then folder display-name order 
 
 ### Blob openers
 
-`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream_budgeted`), passing the remaining `RAW_FETCH_BUDGET` to the reader. The wire parser charges all literals in each FETCH response against that remaining amount before decoding, so an over-budget response is rejected before the literal is materialized. The consumer's back-pressure still reaches the socket through the driver's `OwnedPermit` reservation. The account drain retains a post-decode `Error::FetchLimit` check as a defensive guard. Each body section is emitted as its own `Bytes` page after the complete FETCH response has been buffered and decoded. The command future stays authoritative for the wire outcome, as in inventory / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability is filed as imap-G1 and is being built in stages.
+`AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream_budgeted`), passing the remaining `RAW_FETCH_BUDGET` to the reader. The wire parser charges all literals in each FETCH response against that remaining amount before decoding, so an over-budget response is rejected before the literal is materialized. The consumer's back-pressure still reaches the socket through the driver's `OwnedPermit` reservation. The account drain retains a post-decode `Error::FetchLimit` check as a defensive guard. The whole body (`BODY[]`, no origin) of the requested UID is emitted as one `Bytes` page after its FETCH response has been buffered and decoded. The outcome is judged over the whole command after the tagged completion, not per response: responses for other UIDs are ignored, a body-less fragment for the UID (an unsolicited FLAGS update) beside the body is fine, an identical repeated body is emitted once, and a conflicting repeat, a NIL body, or the UID answered with no body at all is `Error::Protocol`. A tagged OK with no response for the UID means the message was expunged: the stream terminates `NotFound(Message)` keyed by the submitted id, never `Done` with zero batches. A zero-octet body is a delivered message. The command future stays authoritative for the wire outcome, as in inventory / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability is filed as imap-G1 and is being built in stages.
 
 **imap-G1 stage 1 (`account/parts.rs`) - foundation, deliberately unwired.**
 Two pieces exist and are exercised by tests, but nothing calls them: no
@@ -1340,6 +1352,7 @@ crates/imap/src/
 |   `-- uid_ops.rs   - UID command surface
 |-- account/         - bifrost_types::Account implementation
 |   |-- blob.rs            - open_raw_rfc822 (BODY.PEEK[]); no blob openers
+|   |-- poll.rs            - public UID polling surface (ImapMessageRef, ImapPoller)
 |   |-- capabilities.rs    - AccountCapabilities builder
 |   |-- changes.rs         - QRESYNC / CONDSTORE / Basic diff dispatch
 |   |-- close.rs           - graceful shutdown
@@ -1364,7 +1377,7 @@ crates/imap/src/
 
 - Connection methods take `&self`.
 - Internal raw protocol operations take an explicit `Duration` or document the timeout policy.
-- Public enums/structs are limited to the factory/config surface and are `#[non_exhaustive]` absent a strong reason.
+- Public enums/structs are limited to the factory/config surface and the UID polling surface in `poll.rs`, and are `#[non_exhaustive]` absent a strong reason (`ImapMessageRef` keeps private fields and validating constructors instead).
 - Credentials and SASL intermediate strings use `Zeroizing` and redact under `Debug`; malformed SASL mechanism names are rejected before any wire write.
 
 ## Unsupported error construction

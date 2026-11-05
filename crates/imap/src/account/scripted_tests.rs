@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bifrost_types::{AccountErrorKind, AccountOperation, ResourceKind};
 use bifrost_types::{ContainerId, ContainerKind};
 
 use crate::connection::test_support::{driver_pair, preauth_greeting, read_line, respond, tag_of};
@@ -2610,11 +2611,13 @@ async fn the_blob_openers_terminate_unsupported_with_their_own_operation() {
 
 /// `open_raw_rfc822` must STREAM, not buffer the whole message.
 ///
-/// The transcript gates the second half of the FETCH behind the test having
-/// already received the first chunk, so a buffered `uid_fetch` - which
-/// emits nothing until the tagged completion - deadlocks and fails on the
-/// timeout instead of quietly holding an arbitrarily large message in one
-/// `Vec<FetchResponse>`.
+/// The transcript gates the rest of the FETCH (a FLAGS-only fragment for the
+/// same UID and the tagged OK) behind the test having already received the
+/// body, so a buffered `uid_fetch` - which emits nothing until the tagged
+/// completion - deadlocks and fails on the timeout instead of quietly holding
+/// an arbitrarily large message in one `Vec<FetchResponse>`. The fragment
+/// also pins that a body-less response for the UID beside the body is not a
+/// missing body.
 #[tokio::test]
 async fn open_raw_rfc822_emits_chunks_before_the_tagged_completion() {
     use bytes::Bytes;
@@ -2653,7 +2656,7 @@ async fn open_raw_rfc822_emits_chunks_before_the_tagged_completion() {
         respond(
             &mut server,
             &format!(
-                "* 1 FETCH (UID 7 BODY[] {{5}}\r\nworld)\r\n{} OK FETCH done\r\n",
+                "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n{} OK FETCH done\r\n",
                 tag_of(&fetch)
             ),
         )
@@ -2685,8 +2688,360 @@ async fn open_raw_rfc822_emits_chunks_before_the_tagged_completion() {
             other => panic!("unexpected event: {other:?}"),
         }
     }
-    assert_eq!(rest, vec![Bytes::from_static(b"world")]);
+    assert!(rest.is_empty(), "one message body, emitted once: {rest:?}");
     let _server = script.await.unwrap();
+}
+
+/// Drive `open_raw_rfc822` for `imap2 INBOX 5:7` against one scripted
+/// EXAMINE (UIDVALIDITY 5) and one scripted FETCH answer, returning every
+/// event the stream yields.
+async fn raw_read_events(fetch_answer: &'static str) -> Vec<SyncEvent<bytes::Bytes>> {
+    use futures::StreamExt;
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Seen)\r\n\
+                 * 1 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 9] ok\r\n\
+                 {} OK [READ-ONLY] done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let fetch = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!("{fetch_answer}{} OK FETCH done\r\n", tag_of(&fetch)),
+        )
+        .await;
+        server
+    });
+    let mut stream = super::blob::open_raw_rfc822(account, super::encode_object_id(&folder, 5, 7));
+    let mut events = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream must finish")
+    {
+        events.push(event);
+    }
+    let _server = script.await.unwrap();
+    events
+}
+
+/// An expunged UID (tagged OK, no FETCH response for it) is `NotFound`, keyed
+/// by the submitted id, not a successful empty read.
+#[tokio::test]
+async fn a_raw_read_of_an_expunged_uid_is_not_found() {
+    let events = raw_read_events("").await;
+    let [SyncEvent::Terminated(err)] = events.as_slice() else {
+        panic!("expected one Terminated, got {events:?}");
+    };
+    assert_eq!(
+        err.kind(),
+        &AccountErrorKind::NotFound(ResourceKind::Message)
+    );
+    assert_eq!(err.operation(), Some(AccountOperation::OpenRawRfc822));
+}
+
+/// A response for another UID is not this message's body.
+#[tokio::test]
+async fn a_raw_read_ignores_responses_for_other_uids() {
+    let events = raw_read_events("* 2 FETCH (UID 8 BODY[] {3}\r\nabc)\r\n").await;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [SyncEvent::Terminated(err)]
+                if err.kind() == &AccountErrorKind::NotFound(ResourceKind::Message)
+        ),
+        "{events:?}"
+    );
+}
+
+/// A UID answered without its body, or with two different bodies, is the
+/// server's protocol violation.
+#[tokio::test]
+async fn a_raw_read_refuses_a_missing_or_conflicting_body() {
+    for answer in [
+        "* 1 FETCH (UID 7 FLAGS (\\Seen))\r\n",
+        "* 1 FETCH (UID 7 BODY[] NIL)\r\n",
+        "* 1 FETCH (UID 7 BODY[] {3}\r\nabc)\r\n* 1 FETCH (UID 7 BODY[] {3}\r\nxyz)\r\n",
+    ] {
+        let events = raw_read_events(answer).await;
+        assert!(
+            matches!(
+                events.as_slice(),
+                [.., SyncEvent::Terminated(err)]
+                    if matches!(err.kind(), AccountErrorKind::Protocol(_))
+            ),
+            "{answer:?}: {events:?}"
+        );
+    }
+}
+
+/// A zero-octet body is a delivered message; an identical repeat is emitted
+/// once.
+#[tokio::test]
+async fn a_raw_read_delivers_an_empty_body_and_tolerates_an_identical_repeat() {
+    let events = raw_read_events("* 1 FETCH (UID 7 BODY[] {0}\r\n)\r\n").await;
+    assert!(
+        matches!(events.as_slice(), [SyncEvent::Batch(b), SyncEvent::Done(_)] if b.items == vec![bytes::Bytes::new()]),
+        "{events:?}"
+    );
+    let events = raw_read_events(
+        "* 1 FETCH (UID 7 BODY[] {3}\r\nabc)\r\n* 1 FETCH (UID 7 BODY[] {3}\r\nabc)\r\n",
+    )
+    .await;
+    assert!(
+        matches!(events.as_slice(), [SyncEvent::Batch(_), SyncEvent::Done(_)]),
+        "{events:?}"
+    );
+}
+
+/// Run one poller call against a scripted EXAMINE answering `select_codes`
+/// (the untagged lines before the tagged OK) and then the scripted answers to
+/// each further command in order, returning the command lines the server saw
+/// after the EXAMINE.
+async fn poller_transcript<T, F, Fut>(
+    select_codes: &'static str,
+    answers: Vec<&'static str>,
+    call: F,
+) -> (T, Vec<String>)
+where
+    F: FnOnce(super::ImapPoller) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let poller = super::ImapPoller::new(scripted_account(conn, 1));
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("EXAMINE"), "expected EXAMINE, got {select}");
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Seen)\r\n* 0 RECENT\r\n{select_codes}{} OK [READ-ONLY] done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let mut seen = Vec::new();
+        for answer in answers {
+            let line = read_line(&mut server).await;
+            respond(
+                &mut server,
+                &format!("{answer}{} OK done\r\n", tag_of(&line)),
+            )
+            .await;
+            seen.push(line);
+        }
+        (server, seen)
+    });
+    let out = tokio::time::timeout(Duration::from_secs(5), call(poller))
+        .await
+        .expect("the poller call must finish");
+    let (_server, seen) = script.await.unwrap();
+    (out, seen)
+}
+
+const POLL_SELECT: &str = "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n";
+
+fn nz(value: u32) -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(value).unwrap()
+}
+
+#[tokio::test]
+async fn observe_reports_uidvalidity_and_uidnext_of_the_selection() {
+    let (observation, seen) = poller_transcript(POLL_SELECT, vec![], |poller| async move {
+        poller.observe(&ContainerId("INBOX".into())).await.unwrap()
+    })
+    .await;
+    assert!(seen.is_empty());
+    assert_eq!(observation.uid_validity, nz(5));
+    assert_eq!(observation.uid_next, nz(9));
+    assert_eq!(observation.exists, 4);
+    assert_eq!(observation.container, ContainerId("INBOX".into()));
+}
+
+#[tokio::test]
+async fn observe_refuses_a_missing_uidnext_and_a_uidnotsticky_folder() {
+    let (missing, _) = poller_transcript(
+        "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n",
+        vec![],
+        |poller| async move { poller.observe(&ContainerId("INBOX".into())).await },
+    )
+    .await;
+    assert!(
+        matches!(missing.unwrap_err().kind(), AccountErrorKind::Protocol(_)),
+        "a server that omits UIDNEXT is not guessed at"
+    );
+    let (sticky, _) = poller_transcript(
+        "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n* NO [UIDNOTSTICKY] non-persistent UIDs\r\n",
+        vec![],
+        |poller| async move { poller.observe(&ContainerId("INBOX".into())).await },
+    )
+    .await;
+    assert_eq!(
+        sticky.unwrap_err().kind(),
+        &AccountErrorKind::Unsupported(AccountOperation::SearchMessages)
+    );
+}
+
+/// The listing searches an explicit range bounded by UIDNEXT - 1 (never
+/// `*`), drops UIDs the server reported outside it, and when the limit cuts
+/// the window short it completes through the last kept UID only.
+#[tokio::test]
+async fn list_uids_bounds_the_range_and_resumes_after_the_last_kept_uid() {
+    let (listing, seen) = poller_transcript(
+        POLL_SELECT,
+        vec!["* SEARCH 8 2 3 5 7 3\r\n"],
+        |poller| async move {
+            poller
+                .list_uids(
+                    &ContainerId("INBOX".into()),
+                    super::UidScan::new(nz(5), nz(3), std::num::NonZeroUsize::new(2).unwrap()),
+                )
+                .await
+                .unwrap()
+        },
+    )
+    .await;
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].contains("UID SEARCH UID 3:8"), "{}", seen[0]);
+    let super::UidListing::Listed(page) = listing else {
+        panic!("expected Listed, got {listing:?}");
+    };
+    let uids: Vec<u32> = page.refs.iter().map(|r| r.uid().get()).collect();
+    assert_eq!(uids, vec![3, 5]);
+    assert_eq!(page.completed_through, Some(nz(5)));
+    assert_eq!(page.next_from, Some(nz(6)));
+}
+
+#[tokio::test]
+async fn list_uids_completes_the_bound_when_everything_fits() {
+    let (listing, seen) =
+        poller_transcript(POLL_SELECT, vec!["* SEARCH 4 6\r\n"], |poller| async move {
+            poller
+                .list_uids(
+                    &ContainerId("INBOX".into()),
+                    super::UidScan::new(nz(5), nz(3), std::num::NonZeroUsize::new(10).unwrap())
+                        .through(nz(6)),
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+    assert!(seen[0].contains("UID SEARCH UID 3:6"), "{}", seen[0]);
+    let super::UidListing::Listed(page) = listing else {
+        panic!("expected Listed, got {listing:?}");
+    };
+    assert_eq!(page.refs.len(), 2);
+    assert_eq!(page.completed_through, Some(nz(6)));
+    assert_eq!(page.next_from, None);
+}
+
+/// From at or past UIDNEXT has nothing to scan and sends no SEARCH at all,
+/// so the `n:*` rule cannot hand back the highest UID below `n`.
+#[tokio::test]
+async fn list_uids_past_uidnext_sends_no_search() {
+    let (listing, seen) = poller_transcript(POLL_SELECT, vec![], |poller| async move {
+        poller
+            .list_uids(
+                &ContainerId("INBOX".into()),
+                super::UidScan::new(nz(5), nz(9), std::num::NonZeroUsize::new(10).unwrap()),
+            )
+            .await
+            .unwrap()
+    })
+    .await;
+    assert!(seen.is_empty());
+    let super::UidListing::Listed(page) = listing else {
+        panic!("expected Listed, got {listing:?}");
+    };
+    assert!(page.refs.is_empty());
+    assert_eq!(page.completed_through, None);
+    assert_eq!(page.next_from, None);
+}
+
+#[tokio::test]
+async fn list_uids_in_a_changed_generation_lists_nothing() {
+    let (listing, seen) = poller_transcript(POLL_SELECT, vec![], |poller| async move {
+        poller
+            .list_uids(
+                &ContainerId("INBOX".into()),
+                super::UidScan::new(nz(4), nz(1), std::num::NonZeroUsize::new(10).unwrap()),
+            )
+            .await
+            .unwrap()
+    })
+    .await;
+    assert!(seen.is_empty());
+    assert!(
+        matches!(&listing, super::UidListing::GenerationChanged { observation } if observation.uid_validity == nz(5)),
+        "{listing:?}"
+    );
+}
+
+/// The typed read tells a delivered body, an expunged UID and a voided
+/// generation apart.
+#[tokio::test]
+async fn fetch_raw_distinguishes_message_absent_and_generation() {
+    let inbox = ContainerId("INBOX".into());
+    let message = super::ImapMessageRef::new(&inbox, nz(5), nz(7)).unwrap();
+    let (body, _) = poller_transcript(
+        POLL_SELECT,
+        vec!["* 1 FETCH (UID 7 BODY[] {3}\r\nabc)\r\n"],
+        |poller| {
+            let message = message.clone();
+            async move { poller.fetch_raw(&message).await.unwrap() }
+        },
+    )
+    .await;
+    assert_eq!(
+        body,
+        super::RawMessage::Message(bytes::Bytes::from_static(b"abc"))
+    );
+    let (absent, _) = poller_transcript(POLL_SELECT, vec![""], |poller| {
+        let message = message.clone();
+        async move { poller.fetch_raw(&message).await.unwrap() }
+    })
+    .await;
+    assert_eq!(absent, super::RawMessage::Absent);
+    let stale = super::ImapMessageRef::new(&inbox, nz(4), nz(7)).unwrap();
+    let (changed, seen) = poller_transcript(POLL_SELECT, vec![], |poller| async move {
+        poller.fetch_raw(&stale).await.unwrap()
+    })
+    .await;
+    assert!(seen.is_empty(), "a voided generation fetches nothing");
+    assert_eq!(
+        changed,
+        super::RawMessage::GenerationChanged { observed: nz(5) }
+    );
+}
+
+/// A UIDNOTSTICKY folder is refused on the read too, before its (always
+/// fresh) generation is judged, so a caller cannot loop on
+/// `GenerationChanged`.
+#[tokio::test]
+async fn fetch_raw_refuses_a_uidnotsticky_folder() {
+    let message = super::ImapMessageRef::new(&ContainerId("INBOX".into()), nz(4), nz(7)).unwrap();
+    let (outcome, seen) = poller_transcript(
+        "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n* NO [UIDNOTSTICKY] non-persistent UIDs\r\n",
+        vec![],
+        |poller| async move { poller.fetch_raw(&message).await },
+    )
+    .await;
+    assert!(seen.is_empty());
+    assert_eq!(
+        outcome.unwrap_err().kind(),
+        &AccountErrorKind::Unsupported(AccountOperation::OpenRawRfc822)
+    );
 }
 
 /// The raw-message lane carries a byte budget like every other body path.
@@ -2737,13 +3092,9 @@ async fn a_raw_message_read_stops_at_its_byte_budget() {
             &folder,
             5,
             7,
-            crate::types::FetchAttr::BodySection {
-                peek: true,
-                section: None,
-                partial: None,
-            },
             bifrost_types::AccountOperation::OpenRawRfc822,
             3,
+            false,
             &tx,
         ),
     )
@@ -2758,7 +3109,7 @@ async fn a_raw_message_read_stops_at_its_byte_budget() {
         Err(super::blob::BlobError::Imap(other)) => panic!("unexpected imap error: {other:?}"),
         Err(super::blob::BlobError::Account(err)) => panic!("unexpected account error: {err:?}"),
         Err(super::blob::BlobError::ChannelDropped) => panic!("the receiver was held"),
-        Ok(()) => panic!("a body past the budget must not stream in full"),
+        Ok(_) => panic!("a body past the budget must not stream in full"),
     }
     let _server = script.await.unwrap();
 }
@@ -2803,13 +3154,9 @@ async fn a_uid_the_operand_cannot_carry_never_reaches_the_fetch() {
             &folder,
             5,
             0,
-            crate::types::FetchAttr::BodySection {
-                peek: true,
-                section: None,
-                partial: None,
-            },
             bifrost_types::AccountOperation::OpenRawRfc822,
             1024,
+            false,
             &tx,
         ),
     )
@@ -2826,7 +3173,7 @@ async fn a_uid_the_operand_cannot_carry_never_reaches_the_fetch() {
             ),
             "a UID the operand cannot carry is a client-side request defect: {err:?}"
         ),
-        Ok(()) => panic!("a UID the server never saw must not complete as a successful read"),
+        Ok(_) => panic!("a UID the server never saw must not complete as a successful read"),
         Err(_) => panic!("unexpected error variant"),
     }
     let _server = script.await.unwrap();

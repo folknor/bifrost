@@ -46,6 +46,7 @@ mod mutate;
 /// Not wired into any projection or opener yet; see the module docs.
 mod parts;
 mod pim;
+mod poll;
 mod pool;
 mod push;
 mod scopes;
@@ -60,6 +61,12 @@ mod test_support;
 
 // pub: consumers register this factory with bifrost-sync without naming ImapAccount.
 pub use factory::{ImapAccountConfig, ImapAccountFactory};
+// pub: the UID polling surface, reached through
+// `ImapAccountFactory::open_with_poller`.
+pub use poll::{
+    FolderObservation, ImapMessageRef, ImapPoller, InvalidImapRef, RawMessage, UidListing, UidPage,
+    UidScan,
+};
 pub use sieve::ManageSieveConfig;
 // pub: consumers configure IMAP submission (SMTP send) through these.
 pub use submission::{SmtpSubmissionConfig, SubmissionCredentials, SubmissionTls};

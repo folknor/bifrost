@@ -276,6 +276,28 @@ Narrow edge cases, audits with no known defect, and design work.
   carries only a position, so it is accepted for a different `SearchRequest`.
   A position is meaningful under any query, so this resumes rather than
   corrupts, but JMAP and Graph bind their search cursors to owner and state.
+- **IMAP `provider_query` is documented as ignored but is sent as raw SEARCH
+  criteria.** The module doc of `crates/types/src/search.rs` says IMAP ignores
+  `provider_query` unless an adapter interprets it; `search_plan`
+  (`crates/imap/src/account/pim.rs`) validates it structurally and substitutes
+  or appends it to the UID SEARCH criteria, and reference/imap.md has no
+  paragraph on it. One of the two is wrong; the doc is the likelier one.
+- **reference/imap.md still says search keeps "offset pagination stable"** in
+  the object-id section, while search pages by position since the bifrost#2
+  fix; the test `search_folder_offsets_survive_registry_rebuild_with_display_ties`
+  keeps the old word too.
+- **UIDVALIDITY change has four classifications across the IMAP account.**
+  Changes stream `SyncState(CursorInvalid)`, search cursor
+  `ConcurrencyConflict`, hydration, mutation and `open_raw_rfc822`
+  `Request(Malformed)` (a `ClientBug` class for a server-side generation
+  change); reference/error-model.md never names UIDVALIDITY. The poller
+  (`crates/imap/src/account/poll.rs`) answers a typed `GenerationChanged`
+  instead. Needs a ruling on the shared class.
+- **No persistence contract for a `ChangeCursor` held outside the engine.**
+  bifrost#3 offered it as the alternative to the UID polling surface; the
+  surface landed instead. The cursor codec lives in bifrost-sync and nothing
+  documents how a direct `Account` consumer persists and migrates a cursor.
+  Design work, no consumer asking today.
 
 - **IMAP PIM partial-commit scopes name the canonical id, not the submitted
   one.** `folder_effect_targets` (`crates/imap/src/account/pim.rs`) rebuilds

@@ -83,39 +83,116 @@ async fn run_raw(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
 ) -> Result<(), BlobError> {
     let decoded = decode_object_id(&message, AccountOperation::OpenRawRfc822)?;
-    let attr = FetchAttr::BodySection {
-        peek: true,
-        section: None,
-        partial: None,
-    };
-    run_fetch(
+    let outcome = run_fetch(
         &account,
         &decoded.folder,
         decoded.uidvalidity,
         decoded.uid,
-        attr,
         AccountOperation::OpenRawRfc822,
         RAW_FETCH_BUDGET,
+        false,
         tx,
     )
-    .await
+    .await?;
+    match outcome {
+        RawFetchOutcome::Delivered => Ok(()),
+        RawFetchOutcome::NotSticky => {
+            unreachable!("this lane passes refuse_not_sticky = false")
+        }
+        // The server completed the FETCH without answering for the UID: the
+        // message was expunged after the caller learned its id. Completing
+        // the stream with zero batches presented that as an empty message.
+        RawFetchOutcome::Absent => Err(BlobError::Account(raw_message_not_found(&decoded.id))),
+        RawFetchOutcome::GenerationChanged { .. } => Err(BlobError::Account(
+            AccountErrorBuilder::new(
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only("UIDVALIDITY changed before fetch"),
+                }),
+            )
+            .protocol(Protocol::Imap)
+            .operation(AccountOperation::OpenRawRfc822)
+            // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder
+            // producers' documented scope shape (see get.rs / mutate.rs).
+            .scope(bifrost_types::ErrorScope::Cursor(super::folder_scope(
+                &decoded.folder,
+            )))
+            .try_build()
+            .expect("valid account error classification"),
+        )),
+    }
+}
+
+/// `NotFound(Message)` for a raw read whose UID the server no longer holds,
+/// keyed by the id exactly as submitted.
+fn raw_message_not_found(id: &ObjectId) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message),
+        Cause::Request(RequestCause::NotFound {
+            what: bifrost_types::ResourceKind::Message,
+            id: Some(id.0.clone()),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::OpenRawRfc822)
+    .scope(bifrost_types::ErrorScope::Message { id: id.clone() })
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// What a completed raw read established about the requested message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RawFetchOutcome {
+    /// The server answered for the UID with its whole body, which was
+    /// forwarded (possibly zero octets).
+    Delivered,
+    /// The FETCH completed OK and no response named the UID.
+    Absent,
+    /// The selected folder's UIDVALIDITY is not the one the id was minted
+    /// under; nothing was fetched.
+    GenerationChanged { observed: u32 },
+    /// The folder is `UIDNOTSTICKY` and the caller asked for that to be
+    /// refused before the generation is judged; nothing was fetched.
+    NotSticky,
+}
+
+fn missing_body(uid: u32) -> crate::Error {
+    crate::Error::Protocol(format!(
+        "FETCH answered for UID {uid} without its whole BODY[] section"
+    ))
 }
 
 /// Shared selection / UIDVALIDITY recheck / streaming-FETCH core for the
-/// blob and raw-message reads. `op` tags the UIDVALIDITY-mismatch error
-/// so the caller's operation is preserved, and `budget` is the client-side
-/// ceiling on the octets one read may stream before `Error::FetchLimit`.
+/// raw-message reads (`open_raw_rfc822` and the polling surface's
+/// `fetch_raw`). `op` tags the errors so the caller's operation is
+/// preserved, and `budget` is the client-side ceiling on the octets one read
+/// may stream before `Error::FetchLimit`.
+///
+/// The outcome is judged over the whole command, not per response: a server
+/// may answer the UID in several FETCH responses (an unsolicited FLAGS update
+/// beside the body), and responses for other UIDs are ignored. The whole
+/// body (`BODY[]`, no origin) is forwarded once; a repeat with identical
+/// octets is tolerated, a conflicting repeat or a NIL body is a protocol
+/// violation, and a UID answered without any body is too.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_fetch(
     account: &ImapAccount,
     folder: &MailboxName,
     expected_uidvalidity: u32,
     uid: u32,
-    attr: FetchAttr,
     op: AccountOperation,
     budget: usize,
+    refuse_not_sticky: bool,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
-) -> Result<(), BlobError> {
+) -> Result<RawFetchOutcome, BlobError> {
+    let attr = FetchAttr::BodySection {
+        peek: true,
+        section: None,
+        partial: None,
+    };
+    if account.closed.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(BlobError::Imap(crate::Error::closed()));
+    }
     let mut conn = account.checkout_for_folder(folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
     let folder_entry = account.folders.get(folder);
@@ -142,25 +219,14 @@ pub(super) async fn run_fetch(
         }
         Err(err) => return Err(err.into()),
     };
+    if refuse_not_sticky && selected.mailbox.uid_not_sticky {
+        return Ok(RawFetchOutcome::NotSticky);
+    }
     let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
     if uidvalidity != expected_uidvalidity {
-        return Err(BlobError::Account(
-            AccountErrorBuilder::new(
-                AccountErrorKind::Request(RequestErrorKind::Malformed),
-                Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only("UIDVALIDITY changed before fetch"),
-                }),
-            )
-            .protocol(Protocol::Imap)
-            .operation(op)
-            // Cursor(Folder(..)), not ErrorScope::Mailbox: the folder
-            // producers' documented scope shape (see get.rs / mutate.rs).
-            .scope(bifrost_types::ErrorScope::Cursor(
-                bifrost_types::CursorScope::Folder(bifrost_types::FolderId(folder.account_id())),
-            ))
-            .try_build()
-            .expect("valid account error classification"),
-        ));
+        return Ok(RawFetchOutcome::GenerationChanged {
+            observed: uidvalidity,
+        });
     }
     // Build the operand from the same source the batch lanes use. This lane
     // streams bytes and has no per-id outcome to report an exclusion in, so
@@ -205,10 +271,12 @@ pub(super) async fn run_fetch(
     // out (every exit below) is what releases the driver to read through the
     // tagged completion instead of parking on a permit that will never be
     // taken.
+    let requested_uid = uid;
     let drain = async {
-        let mut streamed: usize = 0;
+        let mut matched = false;
+        let mut body: Option<Bytes> = None;
         let mut outcome: Result<(), BlobError> = Ok(());
-        while let Some(item) = rx.recv().await {
+        'responses: while let Some(item) = rx.recv().await {
             let fetch = match item {
                 Ok(fetch) => fetch,
                 Err(err) => {
@@ -216,19 +284,38 @@ pub(super) async fn run_fetch(
                     break;
                 }
             };
-            let (seq, uid) = (fetch.seq, fetch.uid);
+            if fetch.uid != Some(requested_uid) {
+                continue;
+            }
+            matched = true;
+            let seq = fetch.seq;
             for section in fetch.body_sections {
-                let Some(data) = section.data else { continue };
-                streamed = streamed.saturating_add(data.len());
-                if streamed > budget {
+                if !section.section.is_empty() || section.origin.is_some() {
+                    continue;
+                }
+                let Some(data) = section.data else {
+                    outcome = Err(BlobError::Imap(missing_body(requested_uid)));
+                    break 'responses;
+                };
+                if let Some(first) = &body {
+                    if *first != data {
+                        outcome = Err(BlobError::Imap(crate::Error::Protocol(format!(
+                            "FETCH answered UID {requested_uid} with two different bodies"
+                        ))));
+                        break 'responses;
+                    }
+                    continue;
+                }
+                if data.len() > budget {
                     outcome = Err(BlobError::Imap(crate::Error::FetchLimit {
-                        estimated: streamed,
+                        estimated: data.len(),
                         limit: budget,
                         seq: Some(seq),
-                        uid,
+                        uid: Some(requested_uid),
                     }));
-                    break;
+                    break 'responses;
                 }
+                body = Some(data.clone());
                 if tx
                     .send(batch(
                         vec![data],
@@ -240,15 +327,16 @@ pub(super) async fn run_fetch(
                     .is_err()
                 {
                     outcome = Err(BlobError::ChannelDropped);
-                    break;
+                    break 'responses;
                 }
-            }
-            if outcome.is_err() {
-                break;
             }
         }
         drop(rx);
-        outcome
+        outcome.map(|()| match (matched, body.is_some()) {
+            (false, _) => Ok(RawFetchOutcome::Absent),
+            (true, true) => Ok(RawFetchOutcome::Delivered),
+            (true, false) => Err(BlobError::Imap(missing_body(requested_uid))),
+        })
     };
     // The command future is authoritative for the wire outcome, exactly as
     // in inventory / QRESYNC / CONDSTORE: the driver drops the streaming
@@ -257,7 +345,7 @@ pub(super) async fn run_fetch(
     // (limit crossed, dropped consumer) still wins, since it describes this
     // caller rather than the server.
     let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain);
-    drain_result?;
+    let judged = drain_result?;
     match fetch_result {
         Err(crate::Error::FetchLiteralLimit { estimated, limit }) => {
             // The response was stopped at its literal marker, before parsing
@@ -274,5 +362,7 @@ pub(super) async fn run_fetch(
         }
         other => other?,
     }
-    Ok(())
+    // Judged only after the tagged completion: bytes forwarded before a
+    // failed command never make the read a success.
+    judged
 }

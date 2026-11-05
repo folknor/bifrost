@@ -2,8 +2,10 @@
 //!
 //! Consumers construct an [`ImapAccountFactory`] from [`ImapAccountConfig`],
 //! [`ImapConfig`], [`Credentials`], and [`AuthPolicy`], then register it as a
-//! `bifrost_types::AccountFactory`. The raw IMAP connection, parser, and wire
-//! types are crate-internal implementation detail.
+//! `bifrost_types::AccountFactory`. A consumer that tracks folders by UID
+//! opens through [`ImapAccountFactory::open_with_poller`] instead and gets an
+//! [`ImapPoller`] beside the account. The raw IMAP connection, parser, and
+//! wire types are crate-internal implementation detail.
 
 // The Account impl drives a subset of the IMAP4rev2 + extensions surface
 // implemented under `connection/` and `types/`. The remaining commands,
@@ -22,8 +24,9 @@ mod error;
 mod types;
 
 pub use account::{
-    ImapAccountConfig, ImapAccountFactory, ManageSieveConfig, SmtpSubmissionConfig,
-    SubmissionCredentials, SubmissionTls,
+    FolderObservation, ImapAccountConfig, ImapAccountFactory, ImapMessageRef, ImapPoller,
+    InvalidImapRef, ManageSieveConfig, RawMessage, SmtpSubmissionConfig, SubmissionCredentials,
+    SubmissionTls, UidListing, UidPage, UidScan,
 };
 pub use connection::ImapConfig;
 pub use types::{AuthPolicy, Credentials};

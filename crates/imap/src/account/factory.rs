@@ -189,6 +189,53 @@ impl ImapAccountFactory {
             bifrost_net::BandwidthBudget,
         ) -> AccountFuture<Result<crate::ImapConnection, crate::Error>>,
     ) -> AccountFuture<Result<OpenedAccount, AccountError>> {
+        let opening = self.open_concrete_using(account_id, default, connect);
+        Box::pin(async move {
+            let (account, skipped_scopes) = opening.await?;
+            Ok(OpenedAccount {
+                account: Arc::new(account) as Arc<dyn Account>,
+                skipped_scopes,
+            })
+        })
+    }
+
+    /// Open the account and hand back a polling handle bound to the same
+    /// instance. Both views share one connection pool and folder registry:
+    /// closing the `Account` closes the poller, and a later open builds a new
+    /// instance that an earlier poller never follows. See
+    /// [`ImapPoller`](super::ImapPoller).
+    pub fn open_with_poller(
+        &self,
+        account_id: AccountId,
+    ) -> AccountFuture<Result<(OpenedAccount, super::ImapPoller), AccountError>> {
+        let opening = self.open_concrete_using(
+            account_id,
+            bifrost_net::Net::shared_default,
+            production_connect,
+        );
+        Box::pin(async move {
+            let (account, skipped_scopes) = opening.await?;
+            let poller = super::ImapPoller::new(account.clone());
+            Ok((
+                OpenedAccount {
+                    account: Arc::new(account) as Arc<dyn Account>,
+                    skipped_scopes,
+                },
+                poller,
+            ))
+        })
+    }
+
+    fn open_concrete_using(
+        &self,
+        account_id: AccountId,
+        default: impl FnOnce() -> bifrost_net::Net,
+        connect: impl FnOnce(
+            Arc<ImapAccountConfig>,
+            Option<bifrost_net::MeterSinkHandle>,
+            bifrost_net::BandwidthBudget,
+        ) -> AccountFuture<Result<crate::ImapConnection, crate::Error>>,
+    ) -> AccountFuture<Result<(ImapAccount, Vec<SkippedScope>), AccountError>> {
         let cfg = Arc::clone(&self.cfg);
         let net = Arc::new(self.resolve_net(default));
         let bandwidth_budget = net.bandwidth_registry().budget(account_id.clone());
@@ -287,12 +334,22 @@ impl ImapAccountFactory {
                 submission,
                 dav_degraded,
             });
-            Ok(OpenedAccount {
-                account: Arc::new(account) as Arc<dyn Account>,
-                skipped_scopes,
-            })
+            Ok((account, skipped_scopes))
         })
     }
+}
+
+fn production_connect(
+    cfg: Arc<ImapAccountConfig>,
+    meter: Option<bifrost_net::MeterSinkHandle>,
+    budget: bifrost_net::BandwidthBudget,
+) -> AccountFuture<Result<crate::ImapConnection, crate::Error>> {
+    Box::pin(async move {
+        cfg.imap
+            .connect_authenticated_metered(&cfg.credentials, &cfg.auth_policy, meter, Some(budget))
+            .await
+            .map(|(conn, _auth)| conn)
+    })
 }
 
 impl AccountFactory for ImapAccountFactory {
@@ -300,19 +357,7 @@ impl AccountFactory for ImapAccountFactory {
         self.open_using(
             account_id,
             bifrost_net::Net::shared_default,
-            |cfg, meter, budget| {
-                Box::pin(async move {
-                    cfg.imap
-                        .connect_authenticated_metered(
-                            &cfg.credentials,
-                            &cfg.auth_policy,
-                            meter,
-                            Some(budget),
-                        )
-                        .await
-                        .map(|(conn, _auth)| conn)
-                })
-            },
+            production_connect,
         )
     }
 }
