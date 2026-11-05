@@ -1036,8 +1036,16 @@ and the accompanying warning is what tells the consumer to reconcile.
   established it on the replacement, and a restart would delete that healthy
   cursor. Deletion is ordered by the channel, and an epoch read by the
   multiplexer would predate the listener's own bump for a deletion queued
-  ahead, revoking a folder deleted and created again. `Deleted`
-  (and the delete half of `Renamed`) cancels the per-scope token, drops
+  ahead, revoking a folder deleted and created again. A `Renamed` whose
+  old and new membership are the same stable id (every in-tree producer
+  emits that shape) is the create half alone: cursor scopes are keyed by
+  id, so a display-name change invalidates no cursor, durable row or
+  parked repair, and establish-if-absent leaves a registered scope
+  untouched. A `Renamed` across ids reads the new id's shapes BEFORE its
+  delete half runs, since deleting the old id's cursors can remove the
+  last registered shape of a kind and leave the create half nothing to
+  establish. `Deleted`
+  (and the delete half of a cross-id `Renamed`) cancels the per-scope token, drops
   the in-memory cursor, and raises `ReopenRequest::ScopeDeleted`, on
   which the engine's reopen listener purges the scope's durable rows in
   full - change cursor and backfill rows, completion marker included

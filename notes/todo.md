@@ -332,10 +332,6 @@ Narrow edge cases, audits with no known defect, and design work.
   (`WatchEvent` or `SinkPush` side) while keeping the unattributed door;
   sampling the current generation at push time was rejected, since it labels
   an old event with the new identity.
-- **Lifecycle `Renamed` can lose its create half.** Deleting the old scope can
-  remove the last registered folder cursor, after which
-  `membership_to_cursor_scopes` finds no shape for the new membership and
-  raises no `ScopeCreated`. Pre-existing.
 - **`ScopeCreated` listener arm has no end-to-end test.**
   `created_lifecycle_requests_establishment_only_if_absent` pins only the
   multiplexer's routing; a listener arm that restarted a registered scope

@@ -17,8 +17,8 @@
 //!   adds the appropriate scope-bearing arm.
 //! - `restart_scope_error` constructs the single account-error shape
 //!   the engine itself emits when synthesizing a `RestartScope`
-//!   directive (scope lifecycle Created / Renamed, or fresh
-//!   establishment via the reopen listener).
+//!   directive for a fresh establishment of one scope. Scope lifecycle
+//!   events do not use it: they raise establish-if-absent requests.
 //! - `cursor_decode_failure` translates a cursor envelope schema
 //!   mismatch into an `AccountError` whose recovery derives to
 //!   `Engine(SchemaIncompatible)`.
@@ -177,9 +177,9 @@ pub(crate) fn directive_target_scope(directive: &EngineDirective) -> Option<Curs
 }
 
 /// Build a sync-state cursor-invalid error scoped to a single cursor.
-/// Used by scope lifecycle (`Created`, `Renamed`) and the reopen
-/// listener when the engine needs to ask itself for a fresh
-/// establishment of one scope. The derived recovery is
+/// Used when the engine needs to ask itself for a fresh establishment
+/// of one scope. Scope lifecycle events do not: a restart would delete a
+/// healthy cursor, so they raise establish-if-absent requests instead. The derived recovery is
 /// `Engine(RestartScope(scope))`.
 #[must_use]
 pub(crate) fn restart_scope_error(scope: CursorScope, operation: AccountOperation) -> AccountError {

@@ -959,7 +959,8 @@ impl Multiplexer {
         // Drive scope_lifecycle in the background. `Created` asks the
         // engine to establish a cursor; the scan loop below notices it
         // and starts polling. `Deleted` cancels and drops the matching
-        // scope; `Renamed` is delete+create on a fresh CursorScope id.
+        // scope; `Renamed` is delete+create across ids, and only the
+        // establish-if-absent half on an unchanged id.
         let lifecycle_account = Arc::clone(&account);
         let lifecycle_shutdown = shutdown.clone();
         let lifecycle_cursors = Arc::clone(&cursors);
@@ -1915,8 +1916,10 @@ pub(crate) fn retire_deleted_scope(
 /// so the engine purges the scope's DURABLE rows too - change cursor and
 /// backfill rows, completion marker included; without that, a folder
 /// recreated under the same id would find the old completion marker and
-/// skip its entire cold-start walk. `Renamed` is the delete half plus
-/// the create half on the new id.
+/// skip its entire cold-start walk. `Renamed` across ids is the delete
+/// half on the old id plus the create half on the new one, whose shapes
+/// are read before the delete; `Renamed` on one stable id is the create
+/// half alone.
 async fn apply_lifecycle_transition(
     cursors: &CursorRegistry,
     control: &SyncControl,
@@ -1966,12 +1969,8 @@ async fn apply_lifecycle_transition(
         }
     }
 
-    async fn establish_scopes(
-        cursors: &CursorRegistry,
-        reopen_tx: &mpsc::Sender<ReopenRequest>,
-        membership: &bifrost_types::MembershipScope,
-    ) {
-        for scope in membership_to_cursor_scopes(cursors, membership) {
+    async fn establish_scopes(reopen_tx: &mpsc::Sender<ReopenRequest>, scopes: Vec<CursorScope>) {
+        for scope in scopes {
             // The cursor registry has no entry yet; the poll task would
             // see snapshot=None and exit cleanly unless the engine
             // establishes a cursor first. The obligation is "establish this
@@ -1994,14 +1993,33 @@ async fn apply_lifecycle_transition(
 
     match lifecycle {
         ScopeLifecycle::Created(membership) => {
-            establish_scopes(cursors, reopen_tx, &membership).await;
+            let scopes = membership_to_cursor_scopes(cursors, &membership);
+            establish_scopes(reopen_tx, scopes).await;
         }
         ScopeLifecycle::Deleted(membership) => {
             delete_scopes(cursors, control, tokens, reopen_tx, &membership).await;
         }
+        ScopeLifecycle::Renamed { old, new, .. } if old == new => {
+            // A display-name change on a stable id. Every cursor scope is
+            // keyed by id, so no cursor, durable row, completion marker,
+            // membership edge, parked repair or lifecycle epoch is invalidated
+            // by it; the delete half would only purge valid progress and force
+            // a cold-start re-walk of the folder. The create half still runs:
+            // establish-if-absent leaves a registered scope untouched, and
+            // establishes one whose earlier establishment never landed.
+            let scopes = membership_to_cursor_scopes(cursors, &new);
+            establish_scopes(reopen_tx, scopes).await;
+        }
         ScopeLifecycle::Renamed { old, new, .. } => {
+            // The new id's shapes are read BEFORE the delete half: the mapping
+            // reads the registered topology, and deleting the old id's
+            // cursors can remove the last registered shape of a kind, which
+            // would leave the create half nothing to establish. Only scope
+            // identities are captured; the listener still reads each epoch
+            // when it handles the request, after the queued `ScopeDeleted`.
+            let scopes = membership_to_cursor_scopes(cursors, &new);
             delete_scopes(cursors, control, tokens, reopen_tx, &old).await;
-            establish_scopes(cursors, reopen_tx, &new).await;
+            establish_scopes(reopen_tx, scopes).await;
         }
         _ => {}
     }
@@ -2427,6 +2445,103 @@ mod tests {
         assert!(matches!(
             request,
             ReopenRequest::ScopeCreated { scope: requested } if requested == scope
+        ));
+    }
+
+    fn put_folder_cursor(cursors: &CursorRegistry, scope: &CursorScope) {
+        cursors.put(bifrost_types::ChangeCursor {
+            scope: scope.clone(),
+            server_state: bifrost_types::OpaqueChangeState {
+                protocol: bifrost_types::ProtocolKind::Jmap,
+                envelope_version: 1,
+                bytes: b"state".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        });
+    }
+
+    /// A rename on one stable id changes only a display name. It must not
+    /// retire the healthy cursor (that purged valid progress and forced a
+    /// cold-start re-walk); it only asks for establish-if-absent.
+    #[tokio::test]
+    async fn same_id_rename_keeps_the_cursor_and_requests_only_establishment() {
+        let cursors = CursorRegistry::new();
+        let folder = bifrost_types::FolderId("Projects".into());
+        let scope = CursorScope::Folder(folder.clone());
+        put_folder_cursor(&cursors, &scope);
+        let membership =
+            bifrost_types::MembershipScope::Mailbox(bifrost_types::MailboxId(folder.0.clone()));
+        cursors.link_membership(membership.clone(), scope.clone());
+        let tokens = scope_tokens();
+        track(&tokens, &scope);
+        let epoch = cursors.lifecycle_epoch(&scope);
+        let (reopen_tx, mut reopen_rx) = mpsc::channel(4);
+
+        apply_lifecycle_transition(
+            &cursors,
+            &lag_test_control(),
+            &tokens,
+            &reopen_tx,
+            ScopeLifecycle::Renamed {
+                old: membership.clone(),
+                new: membership,
+                old_name: "Projects".into(),
+                new_name: "Work".into(),
+            },
+        )
+        .await;
+
+        assert!(cursors.snapshot(&scope).is_some(), "cursor survives");
+        assert_eq!(cursors.lifecycle_epoch(&scope), epoch, "no deletion");
+        assert!(tokens.lock().expect("poisoned").contains_key(&scope));
+        let request = reopen_rx.try_recv().expect("establishment requested");
+        assert!(matches!(
+            request,
+            ReopenRequest::ScopeCreated { scope: requested } if requested == scope
+        ));
+        assert!(reopen_rx.try_recv().is_err(), "no ScopeDeleted");
+    }
+
+    /// A rename across ids whose old id held the only registered folder
+    /// cursor must still establish the new id: its shapes are read before
+    /// the delete half empties the registry.
+    #[tokio::test]
+    async fn cross_id_rename_of_the_last_folder_cursor_still_creates_the_new_id() {
+        let cursors = CursorRegistry::new();
+        let old_folder = bifrost_types::FolderId("Old".into());
+        let new_folder = bifrost_types::FolderId("New".into());
+        let old_scope = CursorScope::Folder(old_folder.clone());
+        let new_scope = CursorScope::Folder(new_folder.clone());
+        put_folder_cursor(&cursors, &old_scope);
+        let old = bifrost_types::MembershipScope::Folder(old_folder);
+        cursors.link_membership(old.clone(), old_scope.clone());
+        let tokens = scope_tokens();
+        track(&tokens, &old_scope);
+        let (reopen_tx, mut reopen_rx) = mpsc::channel(4);
+
+        apply_lifecycle_transition(
+            &cursors,
+            &lag_test_control(),
+            &tokens,
+            &reopen_tx,
+            ScopeLifecycle::Renamed {
+                old,
+                new: bifrost_types::MembershipScope::Folder(new_folder),
+                old_name: "Old".into(),
+                new_name: "New".into(),
+            },
+        )
+        .await;
+
+        assert!(cursors.snapshot(&old_scope).is_none());
+        assert!(matches!(
+            reopen_rx.try_recv().expect("deletion requested"),
+            ReopenRequest::ScopeDeleted { scope } if scope == old_scope
+        ));
+        assert!(matches!(
+            reopen_rx.try_recv().expect("creation requested"),
+            ReopenRequest::ScopeCreated { scope } if scope == new_scope
         ));
     }
 
