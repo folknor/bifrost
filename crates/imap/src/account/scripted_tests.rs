@@ -372,6 +372,457 @@ async fn draft_send_with_a_clean_discard_reports_none() {
     assert!(receipt.draft_discard.is_none());
 }
 
+/// A caller-assembled message carrying a Bcc and an old, unsigned `Date`.
+const RAW_WITH_BCC: &str = "Date: Mon, 1 Jan 2001 00:00:00 +0000\r\n\
+    From: user@example.com\r\n\
+    To: a@example.com\r\n\
+    Bcc: b@example.com\r\n\
+    Message-ID: <r1@example.com>\r\n\
+    Subject: hi\r\n\
+    \r\n\
+    body\r\n";
+
+/// What SMTP must carry for `RAW_WITH_BCC`: the Bcc line stripped, the
+/// caller's `Date` untouched.
+const RAW_ON_THE_WIRE: &str = "Date: Mon, 1 Jan 2001 00:00:00 +0000\r\n\
+    From: user@example.com\r\n\
+    To: a@example.com\r\n\
+    Message-ID: <r1@example.com>\r\n\
+    Subject: hi\r\n\
+    \r\n\
+    body\r\n";
+
+/// How the scripted IMAP peer treats the post-send Sent APPEND.
+enum SentPeer {
+    /// No IMAP traffic is expected at all.
+    Silent,
+    /// Read the APPEND and its literal, then answer with this tagged reply.
+    Reply(&'static str),
+    /// Read the APPEND and its literal, then hang up without answering.
+    HangUp,
+}
+
+/// Which send entry the harness drives.
+enum SendCall {
+    /// `send_message` through the render seam, wrapping the real renderer.
+    Message(Box<bifrost_types::SendRequest>),
+    /// `send_raw_message` with these bytes, the wire body SMTP must see, and
+    /// the per-call `save_to_sent`.
+    Raw {
+        raw: &'static str,
+        wire: &'static str,
+        save_to_sent: Option<bool>,
+    },
+}
+
+/// What one scripted send produced.
+struct SentThrough {
+    outcome: Result<bifrost_types::SendReceipt, bifrost_types::AccountError>,
+    /// The real renderer's output, for a `send_message` call.
+    rendered: Option<bifrost_types::RenderedMessage>,
+    /// The APPEND literal the IMAP peer received, when it read one.
+    appended: Option<Vec<u8>>,
+}
+
+/// Drive a send entry end to end against a scripted SMTP peer answering
+/// `rcpts` (address, reply) in envelope order and a scripted IMAP peer
+/// treating the Sent APPEND as `sent` says. When any RCPT is accepted the
+/// SMTP peer takes DATA and expects the wire body byte for byte: for
+/// `send_message` that is the body the real renderer produced, recorded by
+/// the render closure and read when the connector dials, which happens only
+/// after render (the pool keeps no idle connections, so nothing dials at
+/// build). With every RCPT refused it expects the RSET instead.
+async fn send_through_peers(
+    call: SendCall,
+    rcpts: &'static [(&'static str, &'static str)],
+    save_to_sent_default: bool,
+    sent: SentPeer,
+) -> SentThrough {
+    use bifrost_smtp::transport::smtp::extension::ClientId;
+    use bifrost_smtp::transport::smtp::{PoolConfig, ScriptedConnector, Transcript};
+
+    let rendered: Arc<std::sync::Mutex<Option<bifrost_types::RenderedMessage>>> = Arc::default();
+    let raw_wire = match &call {
+        SendCall::Message(_) => None,
+        SendCall::Raw { wire, .. } => Some(*wire),
+    };
+    let transcripts: Arc<std::sync::Mutex<Vec<Transcript>>> = Arc::default();
+    let dialed = Arc::clone(&transcripts);
+    let seen = Arc::clone(&rendered);
+    let connector = ScriptedConnector::new(move || {
+        let hello = format!("EHLO {}\r\n", ClientId::default());
+        let mut transcript = Transcript::new("220 peer\r\n")
+            .expect(&hello, "250-peer\r\n250 AUTH PLAIN\r\n")
+            .expect("AUTH PLAIN AHVzZXIAcGFzcw==\r\n", "235 authenticated\r\n")
+            .expect(&hello, "250 peer\r\n")
+            .expect("MAIL FROM:<user@example.com>\r\n", "250 sender\r\n");
+        for (address, reply) in rcpts {
+            transcript = transcript.expect(format!("RCPT TO:<{address}>\r\n"), *reply);
+        }
+        if rcpts.iter().any(|(_, reply)| reply.starts_with('2')) {
+            let wire = match raw_wire {
+                Some(wire) => wire.as_bytes().to_vec(),
+                None => seen
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("render completed before the SMTP dial")
+                    .raw
+                    .clone(),
+            };
+            transcript = transcript
+                .expect("DATA\r\n", "354 send\r\n")
+                .expect(wire, "")
+                .expect(".\r\n", "250 delivered\r\n");
+        } else {
+            transcript = transcript.expect("RSET\r\n", "250 reset ok\r\n");
+        }
+        dialed.lock().unwrap().push(transcript.clone());
+        transcript
+    });
+    let cfg = super::SmtpSubmissionConfig::new(
+        "smtp.invalid",
+        super::SubmissionTls::Plaintext,
+        bifrost_types::Address::bare("user@example.com"),
+    )
+    .with_save_to_sent_default(save_to_sent_default)
+    .with_pool(PoolConfig::new().min_idle(0));
+    let submission = super::submission::SubmissionTransport::build_with_connector(
+        &cfg,
+        &crate::types::Credentials::password("user", "pass"),
+        None,
+        bifrost_net::BandwidthBudget::default(),
+        Some(connector),
+    )
+    .unwrap();
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 LITERAL+ UIDPLUS")).await;
+    let mut parts = ImapAccountParts {
+        folders: Arc::new(sent_registry()),
+        ..scripted_account_parts(conn, 1)
+    };
+    parts.submission = Some(Arc::new(submission));
+    let account = ImapAccount::new(parts);
+    let reply = match sent {
+        SentPeer::Silent => None,
+        SentPeer::Reply(reply) => Some(Some(reply)),
+        SentPeer::HangUp => Some(None),
+    };
+    let script = tokio::spawn(async move {
+        let Some(reply) = reply else {
+            return (Some(server), None);
+        };
+        let header = read_line(&mut server).await;
+        assert!(
+            header.contains(" APPEND \"Sent\" (\\Seen) {"),
+            "expected a Seen APPEND to Sent, got {header}"
+        );
+        let tag = tag_of(&header).to_owned();
+        let size = header
+            .rsplit_once('{')
+            .and_then(|(_, rest)| rest.split_once("+}"))
+            .map(|(size, _)| size.parse::<usize>().unwrap())
+            .expect("a LITERAL+ APPEND literal");
+        let body = crate::connection::test_support::read_exact(&mut server, size).await;
+        assert_eq!(
+            read_line(&mut server).await,
+            "\r\n",
+            "the APPEND ends at its literal"
+        );
+        if let Some(reply) = reply {
+            respond(&mut server, &format!("{tag} {reply}\r\n")).await;
+            (Some(server), Some(body))
+        } else {
+            drop(server);
+            (None, Some(body))
+        }
+    });
+    // Held past the send, so the account's own teardown traffic cannot be
+    // mistaken for, or hide, a command the send wrote.
+    let held = account.clone();
+    let send = match call {
+        SendCall::Message(request) => {
+            let record = Arc::clone(&rendered);
+            super::pim::send_message_with_render(account, *request, move |request, from| {
+                let out = bifrost_types::send_request_to_rfc5322(request, from)?;
+                *record.lock().unwrap() = Some(out.clone());
+                Ok(out)
+            })
+        }
+        SendCall::Raw {
+            raw, save_to_sent, ..
+        } => super::pim::send_raw_message(
+            account,
+            bytes::Bytes::from_static(raw.as_bytes()),
+            save_to_sent,
+        ),
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(5), send)
+        .await
+        .expect("the send must finish");
+    let (server, appended) = script.await.unwrap();
+    if let Some(mut server) = server.filter(|_| appended.is_none()) {
+        // The send is finished, so any IMAP command it wrote is buffered.
+        let mut byte = [0u8; 1];
+        let read =
+            futures::FutureExt::now_or_never(tokio::io::AsyncReadExt::read(&mut server, &mut byte));
+        assert!(read.is_none(), "no IMAP traffic expected, read {read:?}");
+    }
+    drop(held);
+    let transcripts = transcripts.lock().unwrap();
+    assert_eq!(transcripts.len(), 1, "one SMTP session, never re-driven");
+    transcripts[0].assert_exhausted();
+    let rendered = rendered.lock().unwrap().take();
+    SentThrough {
+        outcome,
+        rendered,
+        appended,
+    }
+}
+
+/// The header block of a message: everything before the blank line.
+fn header_block(message: &[u8]) -> &str {
+    let text = std::str::from_utf8(message).unwrap();
+    text.split_once("\r\n\r\n").unwrap().0
+}
+
+/// The message's only `Date:` line, asserted to be its first header.
+fn sole_first_date(message: &[u8]) -> &str {
+    let headers = header_block(message);
+    let dates: Vec<&str> = headers
+        .split("\r\n")
+        .filter(|line| line.starts_with("Date: "))
+        .collect();
+    assert_eq!(dates.len(), 1, "exactly one Date header: {headers}");
+    assert!(
+        headers.starts_with(dates[0]),
+        "Date is the first header: {headers}"
+    );
+    dates[0]
+}
+
+/// A plain-text request to `to` with a subject.
+fn text_request(to: &str) -> bifrost_types::SendRequest {
+    let mut request = bifrost_types::SendRequest::default();
+    request.to = vec![bifrost_types::Address::bare(to)];
+    request.subject = Some("hi".into());
+    request.body_text = Some("body".into());
+    request
+}
+
+fn assert_refused(receipt: &bifrost_types::SendReceipt, address: &str) {
+    assert_eq!(receipt.recipients_not_accepted.len(), 1);
+    let refused = &receipt.recipients_not_accepted[0];
+    assert_eq!(refused.address.address, address);
+    assert_eq!(refused.outcome, bifrost_types::RecipientOutcome::Failed);
+    assert_eq!(refused.error.operation(), Some(AccountOperation::Send));
+}
+
+/// The wire drops the Bcc while the filed Sent copy keeps it; both carry the
+/// renderer's single `Date` first; an explicit `save_to_sent` overrides a
+/// declining default; the receipt id is the APPENDUID-derived copy id.
+#[tokio::test]
+async fn send_message_files_the_bcc_bearing_copy_and_transmits_without_it() {
+    let mut request = text_request("a@example.com");
+    request.bcc = vec![bifrost_types::Address::bare("b@example.com")];
+    request.save_to_sent = Some(true);
+    let sent = send_through_peers(
+        SendCall::Message(Box::new(request)),
+        &[
+            ("a@example.com", "250 recipient\r\n"),
+            ("b@example.com", "250 recipient\r\n"),
+        ],
+        false,
+        SentPeer::Reply("OK [APPENDUID 7 3] filed"),
+    )
+    .await;
+    let receipt = sent.outcome.expect("the message was sent");
+    let rendered = sent.rendered.unwrap();
+    let appended = sent.appended.unwrap();
+    assert_eq!(appended, rendered.sent_copy.clone().unwrap());
+    assert!(
+        header_block(&appended).contains("\r\nBcc: b@example.com"),
+        "the Sent copy keeps the Bcc: {}",
+        header_block(&appended)
+    );
+    assert!(
+        !header_block(&rendered.raw).contains("Bcc:"),
+        "the wire drops the Bcc: {}",
+        header_block(&rendered.raw)
+    );
+    assert_eq!(sole_first_date(&rendered.raw), sole_first_date(&appended));
+    let filed = super::encode_object_id(&crate::types::MailboxName::new("Sent").unwrap(), 7, 3);
+    assert_eq!(receipt.id, filed);
+    assert!(matches!(
+        receipt.sent_copy,
+        bifrost_types::SentCopy::Filed { id: Some(ref id) } if *id == filed
+    ));
+    assert!(receipt.recipients_not_accepted.is_empty());
+}
+
+/// A partial accept is a success that names the refused recipient, stamped
+/// with the call's operation, and still files the Sent copy. With no Bcc the
+/// copy is the transmitted body itself; the account default requests it; no
+/// APPENDUID leaves the copy unidentified and the id the Message-ID.
+#[tokio::test]
+async fn send_message_partial_accept_reports_the_refused_recipient_and_still_files() {
+    let mut request = text_request("a@example.com");
+    request.cc = vec![bifrost_types::Address::bare("b@example.com")];
+    let sent = send_through_peers(
+        SendCall::Message(Box::new(request)),
+        &[
+            ("a@example.com", "250 recipient\r\n"),
+            ("b@example.com", "550 no such user\r\n"),
+        ],
+        true,
+        SentPeer::Reply("OK filed"),
+    )
+    .await;
+    let receipt = sent.outcome.expect("a recipient accepted the message");
+    let rendered = sent.rendered.unwrap();
+    assert!(rendered.sent_copy.is_none());
+    assert_eq!(sent.appended.unwrap(), rendered.raw);
+    assert_refused(&receipt, "b@example.com");
+    assert_eq!(receipt.id.0, format!("imapmsgid1:{}", rendered.message_id));
+    assert!(matches!(
+        receipt.sent_copy,
+        bifrost_types::SentCopy::Filed { id: None }
+    ));
+}
+
+/// The caller's bytes go out as given (Bcc stripped, `Date` never
+/// restamped), the Sent copy is the verbatim original with its Bcc, and a
+/// partial accept rides the receipt.
+#[tokio::test]
+async fn send_raw_message_transmits_as_given_and_files_the_verbatim_original() {
+    let sent = send_through_peers(
+        SendCall::Raw {
+            raw: RAW_WITH_BCC,
+            wire: RAW_ON_THE_WIRE,
+            save_to_sent: Some(true),
+        },
+        &[
+            ("a@example.com", "250 recipient\r\n"),
+            ("b@example.com", "550 no such user\r\n"),
+        ],
+        false,
+        SentPeer::Reply("OK filed"),
+    )
+    .await;
+    let receipt = sent.outcome.expect("a recipient accepted the message");
+    assert_eq!(sent.appended.unwrap(), RAW_WITH_BCC.as_bytes());
+    assert_refused(&receipt, "b@example.com");
+    assert_eq!(receipt.id.0, "imapmsgid1:r1@example.com");
+    assert!(matches!(
+        receipt.sent_copy,
+        bifrost_types::SentCopy::Filed { id: None }
+    ));
+}
+
+/// A declined Sent copy writes nothing to IMAP, whether the call declines
+/// over a requesting default or leaves it to a declining one.
+#[tokio::test]
+async fn send_raw_message_declined_copy_writes_nothing() {
+    for (save_to_sent, default) in [(Some(false), true), (None, false)] {
+        let sent = send_through_peers(
+            SendCall::Raw {
+                raw: RAW_WITH_BCC,
+                wire: RAW_ON_THE_WIRE,
+                save_to_sent,
+            },
+            &[
+                ("a@example.com", "250 recipient\r\n"),
+                ("b@example.com", "250 recipient\r\n"),
+            ],
+            default,
+            SentPeer::Silent,
+        )
+        .await;
+        let receipt = sent.outcome.expect("the message was sent");
+        assert!(matches!(
+            receipt.sent_copy,
+            bifrost_types::SentCopy::NotRequested
+        ));
+        assert_eq!(receipt.id.0, "imapmsgid1:r1@example.com");
+    }
+}
+
+/// A refused Sent APPEND after a committed send is still `Ok`, the copy
+/// reported not filed, SMTP not re-driven.
+#[tokio::test]
+async fn send_message_refused_sent_append_is_still_a_success() {
+    let request = text_request("a@example.com");
+    let sent = send_through_peers(
+        SendCall::Message(Box::new(request)),
+        &[("a@example.com", "250 recipient\r\n")],
+        true,
+        SentPeer::Reply("NO [OVERQUOTA] full"),
+    )
+    .await;
+    let receipt = sent.outcome.expect("the message was sent");
+    assert!(
+        matches!(
+            receipt.sent_copy,
+            bifrost_types::SentCopy::NotFiled {
+                reason: bifrost_types::SentCopyNotFiled::AppendFailed,
+                detail: Some(_),
+            }
+        ),
+        "{:?}",
+        receipt.sent_copy
+    );
+}
+
+/// A Sent APPEND cut off after its literal is `Uncertain` on a successful
+/// receipt, SMTP not re-driven.
+#[tokio::test]
+async fn send_raw_message_cut_off_sent_append_is_uncertain() {
+    let sent = send_through_peers(
+        SendCall::Raw {
+            raw: RAW_WITH_BCC,
+            wire: RAW_ON_THE_WIRE,
+            save_to_sent: None,
+        },
+        &[
+            ("a@example.com", "250 recipient\r\n"),
+            ("b@example.com", "250 recipient\r\n"),
+        ],
+        true,
+        SentPeer::HangUp,
+    )
+    .await;
+    let receipt = sent.outcome.expect("the message was sent");
+    assert!(
+        matches!(receipt.sent_copy, bifrost_types::SentCopy::Uncertain { .. }),
+        "{:?}",
+        receipt.sent_copy
+    );
+}
+
+/// With every recipient refused nothing was sent: the call is `Err`, stamped
+/// `Send`, and no Sent copy is attempted.
+#[tokio::test]
+async fn send_raw_message_with_every_recipient_refused_files_nothing() {
+    let sent = send_through_peers(
+        SendCall::Raw {
+            raw: RAW_WITH_BCC,
+            wire: RAW_ON_THE_WIRE,
+            save_to_sent: Some(true),
+        },
+        &[
+            ("a@example.com", "550 no such user\r\n"),
+            ("b@example.com", "550 no such user\r\n"),
+        ],
+        true,
+        SentPeer::Silent,
+    )
+    .await;
+    let Err(err) = sent.outcome else {
+        panic!("no recipient accepted the message");
+    };
+    assert_eq!(err.operation(), Some(AccountOperation::Send));
+}
+
 /// A container mutation must complete with a single-permit pool.
 ///
 /// `container_create` holds its pooled checkout across the post-mutation

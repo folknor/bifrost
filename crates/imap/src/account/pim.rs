@@ -402,6 +402,28 @@ pub(crate) fn send_message(
     account: ImapAccount,
     request: SendRequest,
 ) -> AccountFuture<Result<SendReceipt, AccountError>> {
+    send_message_with_render(account, request, bifrost_types::send_request_to_rfc5322)
+}
+
+/// `send_message` with the renderer injected. The shared renderer mints the
+/// `Date` and `Message-ID` from the wall clock, so a scripted SMTP peer that
+/// matches DATA byte for byte cannot know the body in advance; a test passes
+/// a closure that calls the real renderer and records what it produced. The
+/// closure runs at the render site, after the gates, exactly as production
+/// renders.
+pub(super) fn send_message_with_render<R>(
+    account: ImapAccount,
+    request: SendRequest,
+    render: R,
+) -> AccountFuture<Result<SendReceipt, AccountError>>
+where
+    R: FnOnce(
+            &SendRequest,
+            &bifrost_types::Address,
+        ) -> Result<bifrost_types::RenderedMessage, AccountError>
+        + Send
+        + 'static,
+{
     Box::pin(async move {
         let _send_gate = account.send_gate.read().await;
         if account.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -421,8 +443,7 @@ pub(crate) fn send_message(
         // The shared assembler is provider-neutral and leaves the protocol
         // unknown; attribute it to IMAP here so a "no recipient" /
         // "uploaded attachments" rejection carries the right protocol.
-        let rendered = bifrost_types::send_request_to_rfc5322(&request, submission.default_from())
-            .map_err(stamp_imap_protocol)?;
+        let rendered = render(&request, submission.default_from()).map_err(stamp_imap_protocol)?;
         // Scheduled send rides on SMTP FUTURERELEASE (HOLDUNTIL). The
         // relay's EHLO at send time is authoritative: an unsupporting
         // relay surfaces an `Unsupported(Send)` AccountError from the
