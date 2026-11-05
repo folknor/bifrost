@@ -277,7 +277,10 @@ account in the shutdown loop is some time after root cancellation. The per-scope
 poll task and the push reconciler additionally select the shutdown token around
 the whole drive, and the poll task selects its per-scope token too, which is
 what releases the drive LEASE when a scope is deleted or restarted while the
-account boundary is still `Run`.
+account boundary is still `Run`. The push reconciler also selects shutdown
+around its engine-directive send on the bounded reopen channel, so a full
+channel behind a busy listener cannot outlive shutdown; that send holds no
+admission, lease or activity, so it never blocks a pause from draining.
 
 In every case cancellation stops the loop at a poll boundary. It never
 interrupts the processing or publication of an event the stream has already

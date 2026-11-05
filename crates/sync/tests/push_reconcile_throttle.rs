@@ -163,6 +163,7 @@ struct Harness {
     generation: Arc<tokio::sync::watch::Sender<u64>>,
     account: Arc<ArcSwap<bifrost_sync::Incarnation>>,
     reopen: mpsc::Receiver<bifrost_sync::ReopenRequest>,
+    reopen_tx: mpsc::Sender<bifrost_sync::ReopenRequest>,
     driven: Arc<Mutex<Vec<CursorScope>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -261,7 +262,7 @@ impl Harness {
             boundary: view,
             shutdown: shutdown.clone(),
             control,
-            reopen_tx,
+            reopen_tx: reopen_tx.clone(),
             throttles: Arc::new(Mutex::new(bifrost_sync::ThrottleBucket::new())),
             scheduler: Scheduler::new(SchedulerConfig::default(), gate),
             scope_tokens: empty_tokens(),
@@ -275,6 +276,7 @@ impl Harness {
             generation,
             account,
             reopen,
+            reopen_tx,
             driven,
             task,
         }
@@ -343,6 +345,48 @@ async fn an_account_wide_directive_holds_the_remainder_until_the_generation_move
         "undispatched sibling must survive repair"
     );
     harness.close().await;
+}
+
+/// The receiver stays alive and full, as it does while the reopen listener is
+/// busy in a repair: shutdown alone must unpark the pending directive send.
+#[tokio::test(start_paused = true)]
+async fn shutdown_unparks_a_directive_send_against_a_full_reopen_channel() {
+    let error = AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::CapabilityChanged),
+        Cause::State(bifrost_types::StateCause::CapabilityChanged { delta: None }),
+    )
+    .try_build()
+    .expect("restart");
+    let harness = Harness::new(Some(error.clone()), false);
+    while harness
+        .reopen_tx
+        .try_send(bifrost_sync::ReopenRequest::Recovery {
+            scope: None,
+            error: error.clone(),
+            generation: None,
+        })
+        .is_ok()
+    {}
+    harness.ingress.request_full();
+    harness.settle().await;
+    assert_eq!(
+        harness.drives(),
+        1,
+        "the drive finished and reached the send"
+    );
+    assert!(!harness.task.is_finished(), "parked on the full channel");
+    let Harness {
+        shutdown,
+        task,
+        reopen,
+        ..
+    } = harness;
+    shutdown.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(60), task)
+        .await
+        .expect("shutdown unparks the send")
+        .expect("reconciler joins");
+    drop(reopen);
 }
 
 #[tokio::test(start_paused = true)]

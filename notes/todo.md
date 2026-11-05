@@ -342,13 +342,18 @@ Narrow edge cases, audits with no known defect, and design work.
   would pass it. Nor do tests independently pin the lifecycle, bulk or
   deferred-inventory stamp attribution (the listener decline and the
   reconciler stamp are pinned).
-- **Push reconciler awaits `reopen_tx` with no shutdown arm.** The
-  `ReopenRequest::Recovery` send in `crates/sync/src/push/reconciler.rs` is a
-  bare `.await`, unlike every other engine producer (bulk campaigns, deferred
-  inventory, parked repairs, push lanes), which select against shutdown. Not
-  traced: whether its scheduler admission permit or any activity guard is still
-  held at that await. If either is, it has the pause cycle the bulk campaign
-  sends had (serial listener parked in `wait_until_running`, full channel).
+- **Poll-loop and lifecycle reopen sends are bare awaits.** In
+  `crates/sync/src/multiplexer/mod.rs`, `handle_drive_outcome`'s Engine arm
+  (`ReopenRequest::Recovery`) and the lifecycle reader's `delete_scopes`
+  (`ScopeDeleted`) and `establish_scopes` (`ScopeCreated`) sends `.await` the
+  bounded reopen channel with no shutdown arm, though `handle_drive_outcome`'s
+  own Retry and Reconcile arms select shutdown and the scope token. Admission
+  is dropped before `handle_drive_outcome` runs, so no pause cycle is known;
+  the open question is only whether a full channel behind a busy listener
+  (which holds its receiver while inside a repair) keeps these tasks alive
+  past shutdown until detach aborts them. The push reconciler's equivalent
+  send was given a shutdown arm and a test
+  (`shutdown_unparks_a_directive_send_against_a_full_reopen_channel`).
 - **IMAP connect-time STARTTLS expiry carries no evidence.** `setup_timeout`
   in `crates/imap/src/connection/lifecycle.rs` maps every connect-time expiry
   to `Error::Timeout { attempt: None }`, including one after the STARTTLS

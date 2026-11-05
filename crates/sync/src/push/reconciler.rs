@@ -455,14 +455,29 @@ impl Reconciler {
                             // wastes wire calls against cursors it is about
                             // to discard.
                             let account_wide = directive_scope.is_none();
-                            let _ = self
-                                .reopen_tx
-                                .send(ReopenRequest::Recovery {
-                                    scope: directive_scope,
-                                    error: original,
-                                    generation: Some(incarnation),
-                                })
-                                .await;
+                            // Nothing is held here: admission was dropped
+                            // above, the lease ended with `with_drive`, and
+                            // the drive's activity guard ended inside it. So
+                            // a full channel behind a listener parked in
+                            // `wait_until_running` stalls only this task and
+                            // cannot keep a pause or `checkpoint_now` from
+                            // draining. The shutdown arm is still needed:
+                            // the listener drops its receiver only once it
+                            // is back at `recv`, and while it is busy in a
+                            // repair a bare send would leave this task a
+                            // straggler until detach aborts it. A directive
+                            // owed at shutdown is dropped; the reopen
+                            // channel has no shutdown drain.
+                            let request = ReopenRequest::Recovery {
+                                scope: directive_scope,
+                                error: original,
+                                generation: Some(incarnation),
+                            };
+                            tokio::select! {
+                                biased;
+                                () = self.shutdown.cancelled() => return Ok(()),
+                                _ = self.reopen_tx.send(request) => {}
+                            }
                             if account_wide {
                                 // Held against the generation the failing
                                 // drive ran on, not the watch read after the
