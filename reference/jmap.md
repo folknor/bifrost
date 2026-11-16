@@ -1691,7 +1691,12 @@ arrived) and, unless its primary cause already is one, the typed
 Cursor-decode failures from `cursor::envelope` (protocol mismatch, unknown envelope, malformed payload) build their own AccountError with `SyncState(SchemaIncompatible)`, routed to `Engine(SchemaIncompatible)`.
 
 Known JMAP `SetErrorType` vocabulary lands on typed
-`WireCause::Jmap(JmapMethod::*)` variants. `SetErrorType::Other(code)` is
+`WireCause::Jmap(JmapMethod::*)` variants, each on its own same-spelled
+variant, so the wire cause's `native_code` is the code the server sent. The
+primary may collapse types (`forbidden`, `forbiddenFrom`, `forbiddenMailFrom`
+and `forbiddenToSend` all classify as `PermissionDenied`); the wire evidence
+does not, so a support export tells a sender-identity refusal from a plain
+permission refusal. `SetErrorType::Other(code)` is
 the only path to `JmapMethod::Unknown { code }`, carrying the actual wire
 code (no synthesized `"other"` literal; string-matching unknown
 vocabulary is forbidden by the gate-5 invariant).

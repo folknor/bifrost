@@ -98,21 +98,6 @@ repeated authoritative inventory (today `NoCursor` schedules no further poll),
 plus safe hydration and mutation semantics for UID handles that do not survive
 a re-SELECT. A wave of one owning types, sync and imap.
 
-## BUG-177 - JMAP projects three distinct set-error types onto `JmapMethod::Forbidden`
-
-**Reported by:** the provider-vocabulary consolidation (spar review).
-
-`set_error_type_to_jmap_method` in `crates/jmap/src/sync/error.rs` maps
-`SetErrorType::ForbiddenFrom`, `ForbiddenMailFrom` and `ForbiddenToSend` to
-`JmapMethod::Forbidden`, although the shared vocabulary has a variant for each.
-The wire cause, and so `CauseSummary.native_code`, reports `forbidden` for a
-`forbiddenMailFrom` refusal; an admin reading support exports cannot tell a
-sender-identity refusal from a plain permission refusal. The primary
-classification may stay collapsed; the wire evidence should map each type to
-its own variant, with a test over every `SetErrorType` and `MethodErrorType`
-spelling against `JmapMethod::code()`. Not fixed with the vocabulary change
-because the file was mid-edit by another item.
-
 ## BUG-190 - Graph webhook subscriptions collide with Graph's duplicate rule across handles and on reattach
 
 **Reported by:** the Graph calendar and contact scope discovery work (spar review).

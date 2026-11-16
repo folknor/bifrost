@@ -847,12 +847,19 @@ pub(crate) fn set_error_to_account_error(
 }
 
 /// The typed native signal retained as forensic evidence for each known code.
+///
+/// Every known type lands on its own same-spelled variant, so the support
+/// export's `native_code` is the code the server sent. The primary
+/// classification may collapse several types (the forbidden family all mean
+/// `PermissionDenied`), but the evidence must not: an admin has to tell a
+/// sender-identity refusal (`forbiddenFrom`, `forbiddenMailFrom`) or a
+/// sending-right refusal (`forbiddenToSend`) from a plain `forbidden`.
 fn set_error_type_to_jmap_method(error_type: SetErrorType) -> Option<JmapMethod> {
     match error_type {
-        SetErrorType::Forbidden
-        | SetErrorType::ForbiddenFrom
-        | SetErrorType::ForbiddenMailFrom
-        | SetErrorType::ForbiddenToSend => Some(JmapMethod::Forbidden),
+        SetErrorType::Forbidden => Some(JmapMethod::Forbidden),
+        SetErrorType::ForbiddenFrom => Some(JmapMethod::ForbiddenFrom),
+        SetErrorType::ForbiddenMailFrom => Some(JmapMethod::ForbiddenMailFrom),
+        SetErrorType::ForbiddenToSend => Some(JmapMethod::ForbiddenToSend),
         SetErrorType::OverQuota => Some(JmapMethod::OverQuota),
         SetErrorType::RateLimit => Some(JmapMethod::RateLimit),
         SetErrorType::NotFound => Some(JmapMethod::NotFound),
@@ -3548,7 +3555,12 @@ mod tests {
         let mut saw_wire = false;
         let mut saw_acknowledged = false;
         for cause in err.chain().iter() {
-            saw_wire |= matches!(cause.wire(), Some(WireCause::Jmap(_)));
+            if let Some(WireCause::Jmap(method)) = cause.wire() {
+                saw_wire = true;
+                // The wire evidence is the only native code JMAP exports, so
+                // it must be the spelling the server sent, not a collapsed one.
+                assert_eq!(method.code(), code, "{code}: wire cause respells it");
+            }
             match cause {
                 Cause::Attempt(attempt)
                     if attempt.transmission_state == TransmissionState::Acknowledged =>
