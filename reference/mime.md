@@ -95,13 +95,20 @@ keeps it; a Bcc-only send carries `To: undisclosed-recipients:;`. Rendering
 has no account identity and stamps `Protocol::Unknown`; account boundaries
 stamp their protocol when propagating renderer failures.
 
-Current limits of the header writer: only Subject is folded (between encoded
-words). Address headers, `References` and `In-Reply-To` are written on one
-line, and the CRLF folds between the encoded words of a non-ASCII display
-name are flattened to spaces, so a long recipient list or reference chain
-can exceed the RFC 5322 998-octet line limit. Attachment `name=` and
-`filename=` are quoted strings carrying raw UTF-8 for non-ASCII names, with
-no RFC 2231 encoding.
+`write_header` and `HeaderValue` own structured outbound header encoding.
+The renderer uses address lists, message-id lists, unstructured text and
+parameterized MIME values. Folding prefers 78 octets (76 for encoded words)
+and occurs only at structural whitespace, never inside a quoted string or
+angle address. Caller CR/LF is sanitized before writer-owned folds are added.
+Long or non-ASCII phrases and long indivisible ASCII unstructured words use
+RFC 2047; attachment parameters use UTF-8 RFC 2231 continuations when non-ASCII
+or too long for a short quoted value. Small ASCII parameters remain escaped
+quoted strings. The 998-octet hard limit includes the header name and folding
+whitespace: an indivisible addr-spec, message-id or other structured token
+that cannot fit fails as `Request(Malformed)`. Enterprise send queues must
+report an unrepresentable value rather than submit a line a relay may truncate.
+`format_address` remains a value-formatting convenience; `write_header` owns
+physical-line enforcement.
 
 `bifrost-smtp`'s `message` builder is a second, independent RFC 5322 writer
 with its own header encoding, folding, Message-ID (hostname-based) and Date
@@ -122,4 +129,5 @@ crates/mime/src/
   select.rs     body and attachment selection
   transfer.rs   base64 / quoted-printable transfer decoding
   words.rs      RFC 2047 encoded-word decoding
+  writer.rs     structured outbound header encoding and folding
 ```

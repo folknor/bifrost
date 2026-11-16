@@ -27,7 +27,7 @@ stays; DKIM stays in bifrost-smtp.
 - Attachment `name=` / `filename=` carry raw UTF-8 for non-ASCII names; no
   RFC 2231 (smtp uses `email_encoding::headers::rfc2231`).
 
-## Link 1 - one structured header writer in bifrost-mime
+## Link 1 - one structured header writer in bifrost-mime (built)
 
 - Typed header values (unstructured text, address list, msg-id list,
   parameterized value) with folding at structural boundaries (between
@@ -44,6 +44,48 @@ stays; DKIM stays in bifrost-smtp.
 - The bifrost-mime renderer adopts it first. The smtp builder still has its
   own writer after this link; that is accepted, the link does not claim
   unification.
+
+### Link 1 implementation and rulings (2026-11-16)
+
+Built: public `HeaderValue` / `write_header` in `bifrost-mime`, adopted by
+`render_rfc5322` for addresses (including receipt targets), Subject, message-id
+fields and attachment headers. RFC 2047 encoding now survives address folding;
+recipient and reference chains fold; attachment parameters use RFC 2231.
+`format_address` keeps its public convenience surface. The entity serializer
+and SMTP writer remain separate, as planned.
+
+Hard-limit ruling, binding on link 2 as well: prefer 78-octet lines (76 when
+emitting encoded words), never exceed 998 including the name or continuation
+whitespace. Encode long ASCII words in unstructured text and long/non-ASCII
+phrases with RFC 2047, where it is legal. Short ASCII parameters stay escaped
+quoted strings; long/non-ASCII parameters use UTF-8 RFC 2231 indexed encoded
+continuations, in chunks of 15 source octets, with percent triplets kept whole.
+Continuation decoding concatenates octets before UTF-8 decoding, so a scalar
+may cross parameter segments. An oversized indivisible addr-spec, msg-id or
+other structured token fails as `Request(Malformed)`; it is never encoded in a
+position where encoded words are illegal. This rejects an unrepresentable
+message locally instead of leaving an enterprise user's queued send vulnerable
+to relay truncation or rejection. SMTP's old preserve-overlong-line policy is
+superseded when link 2 adopts the writer.
+
+Folding trusts no caller CR/LF, replacing them with spaces first. Structural
+whitespace is preserved; quotes and angle addresses protect internal whitespace
+from folding. Unstructured text uses its own whitespace boundaries, since
+quotes and angle brackets there are ordinary text. Message-id inputs retain
+existing bracketing policy: References/In-Reply-To carry caller syntax, while
+Message-ID and Content-ID are wrapped by the renderer.
+
+Validation: `brokkr check -p bifrost-mime -p bifrost-smtp` passed, 2,416 tests
+across five sweeps. The five new hermetic tests cover renderer folding and
+round trips, RFC 2231 parameter decoding, text encoding and hard-limit refusal.
+Replacing the renderer with its pre-link implementation made all four
+`writer_renderer` regressions fail in both MIME sweeps; the implementation was
+restored afterward. No unscoped gate was run in the concurrently edited tree.
+
+Remaining work: link 2 (medium/large) adopts the writer in SMTP, including any
+adapter needed for its custom typed headers, implements author-domain ID
+precedence and shared minted Date formatting, and pins final-byte DKIM signing.
+Link 3 (large) shares MIME entity serialization. No decision handed back.
 
 ## Link 2 - smtp builder consumes the header writer and the policies
 

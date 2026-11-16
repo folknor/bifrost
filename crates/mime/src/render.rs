@@ -28,6 +28,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
+#[cfg(test)]
+use crate::writer::{ENCODED_WORD_MAX, encode_header_value, encode_phrase};
+use crate::writer::{HeaderValue, is_atext, sanitize_header, write_header};
+
 use bifrost_types::compose::{Address, AttachmentInline, SendRequest};
 use bifrost_types::error::{
     AccountError, AccountErrorBuilder, AccountOperation, DiagnosticText, PrimaryCause, RequestCause,
@@ -200,19 +204,20 @@ pub struct ComposedMessage<'a> {
 /// # Errors
 ///
 /// `Request(Malformed)` when [`ComposedMessage::date`] lies outside the
-/// years RFC 5322 can express (see [`format_rfc5322_date`]).
+/// years RFC 5322 can express (see [`format_rfc5322_date`]), or an
+/// indivisible structured header token cannot fit the 998-octet line limit.
 pub fn render_rfc5322(msg: &ComposedMessage<'_>) -> Result<Vec<u8>, AccountError> {
     let mut headers = Vec::new();
     if let Some(date) = msg.date {
         headers.push(format!("Date: {}", format_rfc5322_date(date)?));
     }
     if let Some(from) = msg.from {
-        push_header(&mut headers, "From", &format_address(from));
+        push_address_header(&mut headers, "From", std::slice::from_ref(from))?;
     }
-    push_address_header(&mut headers, "To", msg.to);
-    push_address_header(&mut headers, "Cc", msg.cc);
+    push_address_header(&mut headers, "To", msg.to)?;
+    push_address_header(&mut headers, "Cc", msg.cc)?;
     if msg.include_bcc_header {
-        push_address_header(&mut headers, "Bcc", msg.bcc);
+        push_address_header(&mut headers, "Bcc", msg.bcc)?;
     } else if msg.to.is_empty() && msg.cc.is_empty() {
         // Bcc-only transmitted copy: the wire body drops `Bcc:`, leaving
         // no destination header at all. RFC 5322 §3.6.3 permits a group
@@ -222,36 +227,38 @@ pub fn render_rfc5322(msg: &ComposedMessage<'_>) -> Result<Vec<u8>, AccountError
         // disclosing the blind recipients.
         headers.push("To: undisclosed-recipients:;".to_string());
     }
-    push_address_header(&mut headers, "Reply-To", msg.reply_to);
+    push_address_header(&mut headers, "Reply-To", msg.reply_to)?;
     if let Some(notify) = msg.disposition_notification_to {
-        // RFC 8098 read-receipt request. The target is an address, so it
-        // goes through the same RFC 2047 / phrase encoding as From/To.
-        push_header(
+        push_address_header(
             &mut headers,
             "Disposition-Notification-To",
-            &format_address(notify),
-        );
+            std::slice::from_ref(notify),
+        )?;
     }
     if let Some(subject) = msg.subject {
-        // `encode_header_value` already sanitizes its input and, for a
-        // non-ASCII value, emits CRLF folds between encoded-words. Those
-        // folds must survive verbatim, so this goes through the
-        // pre-folded push that does not re-run `sanitize_header` (which
-        // would flatten the folding CRLFs back into one over-long line).
-        push_header_prefolded(&mut headers, "Subject", &encode_header_value(subject));
+        headers.push(write_header("Subject", HeaderValue::Unstructured(subject))?);
     }
     if let Some(in_reply_to) = msg.in_reply_to {
-        push_header(&mut headers, "In-Reply-To", in_reply_to);
+        headers.push(write_header(
+            "In-Reply-To",
+            HeaderValue::MessageIds(in_reply_to),
+        )?);
     }
     if !msg.references.is_empty() {
-        push_header(&mut headers, "References", &msg.references.join(" "));
+        headers.push(write_header(
+            "References",
+            HeaderValue::MessageIds(&msg.references.join(" ")),
+        )?);
     }
     if let Some(message_id) = msg.message_id {
-        push_header(&mut headers, "Message-ID", &format!("<{message_id}>"));
+        headers.push(write_header(
+            "Message-ID",
+            HeaderValue::MessageIds(&format!("<{message_id}>")),
+        )?);
     }
     headers.push("MIME-Version: 1.0".to_string());
 
-    let entity = render_entity(msg);
+    let entity = render_entity(msg)?;
     Ok(format!("{}\r\n{entity}\r\n", headers.join("\r\n")).into_bytes())
 }
 
@@ -279,9 +286,9 @@ pub fn format_rfc5322_date(date: jiff::Timestamp) -> Result<String, AccountError
         .map_err(|_| malformed("Date not representable as RFC 5322 date-time"))
 }
 
-fn render_entity(msg: &ComposedMessage<'_>) -> String {
+fn render_entity(msg: &ComposedMessage<'_>) -> Result<String, AccountError> {
     if msg.attachments_inline.is_empty() {
-        return render_body_entity(msg);
+        return Ok(render_body_entity(msg));
     }
 
     let boundary = boundary("mixed");
@@ -291,10 +298,10 @@ fn render_entity(msg: &ComposedMessage<'_>) -> String {
     ));
     push_part(&mut out, &boundary, &render_body_entity(msg));
     for attachment in msg.attachments_inline {
-        push_part(&mut out, &boundary, &render_attachment_entity(attachment));
+        push_part(&mut out, &boundary, &render_attachment_entity(attachment)?);
     }
     out.push_str(&format!("--{boundary}--\r\n"));
-    out
+    Ok(out)
 }
 
 fn render_body_entity(msg: &ComposedMessage<'_>) -> String {
@@ -323,30 +330,42 @@ fn render_text_entity(mime: &str, body: &str) -> String {
     )
 }
 
-fn render_attachment_entity(attachment: &AttachmentInline) -> String {
+fn render_attachment_entity(attachment: &AttachmentInline) -> Result<String, AccountError> {
     let disposition = if attachment.inline {
         "inline"
     } else {
         "attachment"
     };
-    let filename = quote_param(&attachment.filename);
-    // Stamp `Content-ID: <cid>` (RFC 2045 §7) so a `cid:` reference in the
-    // HTML body resolves to this part. The value is sanitized and wrapped
-    // in angle brackets; absent when the consumer set no content_id.
+    let content_type = write_header(
+        "Content-Type",
+        HeaderValue::Parameterized {
+            value: &attachment.mime,
+            parameters: &[("name", &attachment.filename)],
+        },
+    )?;
+    let disposition = write_header(
+        "Content-Disposition",
+        HeaderValue::Parameterized {
+            value: disposition,
+            parameters: &[("filename", &attachment.filename)],
+        },
+    )?;
     let content_id = match attachment
         .content_id
         .as_deref()
         .map(sanitize_header)
-        .filter(|cid| !cid.is_empty())
+        .filter(|id| !id.is_empty())
     {
-        Some(cid) => format!("Content-ID: <{cid}>\r\n"),
+        Some(id) => format!(
+            "{}\r\n",
+            write_header("Content-ID", HeaderValue::MessageIds(&format!("<{id}>")))?
+        ),
         None => String::new(),
     };
-    format!(
-        "Content-Type: {}; name=\"{filename}\"\r\nContent-Disposition: {disposition}; filename=\"{filename}\"\r\n{content_id}Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
-        quote_param(&attachment.mime),
+    Ok(format!(
+        "{content_type}\r\n{disposition}\r\n{content_id}Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
         wrap_base64(&attachment.data)
-    )
+    ))
 }
 
 fn push_part(out: &mut String, boundary: &str, part: &str) {
@@ -354,199 +373,15 @@ fn push_part(out: &mut String, boundary: &str, part: &str) {
     out.push_str(part);
 }
 
-fn push_header(headers: &mut Vec<String>, name: &str, value: &str) {
-    let value = sanitize_header(value);
-    if value.trim().is_empty() {
-        return;
+fn push_address_header(
+    headers: &mut Vec<String>,
+    name: &str,
+    addresses: &[Address],
+) -> Result<(), AccountError> {
+    if !addresses.is_empty() {
+        headers.push(write_header(name, HeaderValue::Addresses(addresses))?);
     }
-    headers.push(format!("{name}: {value}"));
-}
-
-/// Push a header whose value is already sanitized and may carry RFC 5322
-/// folding (`CRLF SP`) that must not be flattened. Used for RFC 2047
-/// encoded-word values, which `encode_header_value` produces folded and
-/// CRLF-safe; running `sanitize_header` over them would collapse the
-/// folds into one over-long line.
-fn push_header_prefolded(headers: &mut Vec<String>, name: &str, value: &str) {
-    if value.is_empty() {
-        return;
-    }
-    headers.push(format!("{name}: {value}"));
-}
-
-fn push_address_header(headers: &mut Vec<String>, name: &str, addresses: &[Address]) {
-    if addresses.is_empty() {
-        return;
-    }
-    let rendered = addresses
-        .iter()
-        .map(format_address)
-        .collect::<Vec<_>>()
-        .join(", ");
-    push_header(headers, name, &rendered);
-}
-
-/// Format an [`Address`] as an RFC 5322 header value: `Name <addr>` with
-/// the display name RFC 2047 encoded when non-ASCII, or the bare
-/// addr-spec when there is no name.
-#[must_use]
-pub fn format_address(address: &Address) -> String {
-    let email = sanitize_header(&address.address);
-    match address
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        Some(name) => format!("{} <{email}>", encode_phrase(name)),
-        None => email,
-    }
-}
-
-/// Encode an address display name as an RFC 5322 phrase.
-///
-/// Matches the bifrost-smtp builder (and `reference/smtp.md`): an
-/// atom-shaped ASCII name is emitted as bare phrase text (no quoting),
-/// which avoids the DKIM-breaking quoted-string rewrites some relays
-/// perform; an ASCII name carrying specials that an atom may not hold is
-/// quoted; a non-ASCII name becomes RFC 2047 encoded-words. Producing the
-/// bare form when possible keeps the two send paths (IMAP and Google)
-/// emitting identical From/To phrases.
-fn encode_phrase(value: &str) -> String {
-    let sanitized = sanitize_header(value);
-    if !sanitized.is_ascii() {
-        return encode_header_value(&sanitized);
-    }
-    if is_atom_phrase(&sanitized) {
-        sanitized
-    } else {
-        format!(
-            "\"{}\"",
-            sanitized.replace('\\', "\\\\").replace('"', "\\\"")
-        )
-    }
-}
-
-/// An RFC 5322 phrase that needs no quoting: at least one `atext`
-/// character and nothing outside `atext` plus the inter-atom whitespace
-/// (space / tab). Mirrors `bifrost-smtp`'s `is_valid_phrase`.
-fn is_atom_phrase(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| is_atext(b) || b == b' ' || b == b'\t')
-        && value.bytes().any(is_atext)
-}
-
-/// RFC 5322 `atext` (the unquoted-atom character set).
-fn is_atext(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-        || matches!(
-            b,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'/'
-                | b'='
-                | b'?'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'{'
-                | b'|'
-                | b'}'
-                | b'~'
-        )
-}
-
-fn encode_header_value(value: &str) -> String {
-    let sanitized = sanitize_header(value);
-    if sanitized.is_ascii() {
-        sanitized
-    } else {
-        encode_words(&sanitized)
-    }
-}
-
-/// Maximum length of a single RFC 2047 encoded-word, including the
-/// `=?UTF-8?B?` prefix and `?=` suffix. RFC 2047 caps an encoded-word at
-/// 75 octets so a folded header line of `space + encoded-word` stays
-/// within the 76-octet practical line budget (well under the 998-octet
-/// hard limit).
-const ENCODED_WORD_MAX: usize = 75;
-
-/// Length of the `=?UTF-8?B?` ... `?=` framing around the base64 payload.
-const ENCODED_WORD_OVERHEAD: usize = "=?UTF-8?B?".len() + "?=".len();
-
-/// Encode a non-ASCII value as one or more RFC 2047 base64 encoded-words,
-/// each capped at [`ENCODED_WORD_MAX`] octets and split on UTF-8
-/// character boundaries (a multibyte scalar is never split across two
-/// words, per RFC 2047 §5). Multiple words are joined by CRLF + a single
-/// space (folding white space), so the assembled header obeys both the
-/// per-word cap and the 998-octet line limit.
-fn encode_words(value: &str) -> String {
-    // base64 expands 3 input octets to 4 output octets; the payload
-    // budget is the per-word cap minus the framing, rounded down to a
-    // multiple of 3 so each chunk encodes without padding ambiguity.
-    let payload_budget = (ENCODED_WORD_MAX - ENCODED_WORD_OVERHEAD) / 4 * 3;
-
-    let mut words: Vec<String> = Vec::new();
-    let mut chunk_start = 0;
-    let mut chunk_len = 0;
-    let bytes = value.as_bytes();
-    let mut idx = 0;
-    while idx < value.len() {
-        // Advance to the next char boundary so we never split a scalar.
-        let char_len = utf8_char_len(bytes[idx]);
-        if chunk_len + char_len > payload_budget && chunk_len > 0 {
-            words.push(encode_one_word(&value[chunk_start..idx]));
-            chunk_start = idx;
-            chunk_len = 0;
-        }
-        chunk_len += char_len;
-        idx += char_len;
-    }
-    if chunk_start < value.len() {
-        words.push(encode_one_word(&value[chunk_start..]));
-    }
-    // Folding white space between encoded-words: CRLF + a single space.
-    // Encoded-words carry no internal whitespace, so the linear-white-
-    // space between them is semantically elided by the parser per §6.2.
-    words.join("\r\n ")
-}
-
-fn encode_one_word(segment: &str) -> String {
-    format!("=?UTF-8?B?{}?=", STANDARD.encode(segment.as_bytes()))
-}
-
-/// Length in bytes of the UTF-8 scalar that starts at this lead byte.
-fn utf8_char_len(lead: u8) -> usize {
-    match lead {
-        0x00..=0x7F => 1,
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        _ => 4,
-    }
-}
-
-fn sanitize_header(value: &str) -> String {
-    value.replace(['\r', '\n'], " ").trim().to_string()
-}
-
-/// Sanitize and escape a value destined for a quoted MIME parameter
-/// (`name="..."` / `filename="..."`). CRLF is stripped by
-/// [`sanitize_header`]; embedded `"` and `\` are backslash-escaped so a
-/// quote in the value cannot prematurely close the parameter and malform
-/// the surrounding header.
-fn quote_param(value: &str) -> String {
-    sanitize_header(value)
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
+    Ok(())
 }
 
 fn wrap_base64(bytes: &[u8]) -> String {
@@ -627,7 +462,7 @@ fn unsupported(operation: AccountOperation) -> AccountError {
 // operation is `Send` because `send_request_to_rfc5322` is the send path;
 // the consuming crate stamps its protocol via the account-boundary
 // context as the error propagates.
-fn malformed(detail: &str) -> AccountError {
+pub(crate) fn malformed(detail: &str) -> AccountError {
     AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
         detail: DiagnosticText::support_only(detail),
     }))
