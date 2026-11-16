@@ -464,6 +464,7 @@ fn reconcile_hydration_responses(
                 Some(ErrorScope::Message {
                     id: (id.0.clone()).into(),
                 }),
+                bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
                 format!("Graph $batch GET for {} returned 2xx with no body", id.0),
             );
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));
@@ -481,6 +482,7 @@ fn reconcile_hydration_responses(
                 Some(ErrorScope::Message {
                     id: (id.0.clone()).into(),
                 }),
+                bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
                 format!("Graph FlagsOnly hydration for {}: {detail}", id.0),
             );
             outcomes.push(ItemOutcome::Failed(BatchFailure::new(batch_id, error)));

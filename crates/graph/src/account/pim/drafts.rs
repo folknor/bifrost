@@ -281,20 +281,29 @@ pub(super) async fn create_draft_message(
     message: Value,
 ) -> Result<bifrost_types::Created<DraftHandle>, AccountError> {
     let created = post_draft_message(client, &message, AccountOperation::DraftCreate).await?;
-    // Only an absent, null or empty id is an unidentified success. An id of
-    // the wrong JSON type is an answer this client cannot read, so it stays
-    // an error, as a required id that fails to decode does elsewhere.
-    let id = match created.get("id") {
+    // Only an absent, null or empty id in an object answer is an
+    // unidentified success. A non-object answer, or an id of the wrong JSON
+    // type, is a success this client cannot read, so it stays an error with
+    // unreadable-success evidence, as a create answer that fails to decode
+    // does on every other create door (`account::created::CreateAnswer`).
+    let unreadable = |detail| {
+        crate::account::graph_error::protocol_violation(
+            bifrost_types::ProtocolErrorKind::ParseFailed,
+            AccountOperation::DraftCreate,
+            None,
+            bifrost_types::AttemptCause::unreadable_success(),
+            detail,
+        )
+    };
+    let Some(answer) = created.as_object() else {
+        return Err(unreadable(
+            "Graph draft create returned a non-object answer",
+        ));
+    };
+    let id = match answer.get("id") {
         None | Some(Value::Null) => None,
         Some(Value::String(id)) => Some(id.clone()),
-        Some(_) => {
-            return Err(crate::account::graph_error::protocol_violation(
-                bifrost_types::ProtocolErrorKind::ParseFailed,
-                AccountOperation::DraftCreate,
-                None,
-                "Graph draft create returned a non-string id",
-            ));
-        }
+        Some(_) => return Err(unreadable("Graph draft create returned a non-string id")),
     };
     Ok(crate::account::created::created_or_unidentified(
         id,

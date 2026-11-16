@@ -1382,16 +1382,29 @@ pub(crate) fn cursor_error_to_account_error(
 }
 
 /// Build a typed `Protocol(_)` `AccountError` for graph-side
-/// data-shape violations (missing id, missing etag, etc.). Used by
-/// the `pim` modules and mutate.rs for the produce-without-attempting-the-wire
-/// path. `scope` carries the affected resource so support exports
-/// can pinpoint the message; the caller's `operation` is preserved
+/// data-shape violations (missing id, missing etag, etc.) found in an
+/// answer that decoded. `scope` carries the affected resource so support
+/// exports can pinpoint the message; the caller's `operation` is preserved
 /// rather than coerced into `Hydrate`.
+///
+/// `attempt` is required because the violation alone does not say what
+/// happened to the failing operation's own request, and a missing `Attempt`
+/// cause would read as `Unsent`. It describes the operation, not the request
+/// whose answer broke the contract:
+/// - `Acknowledged` when the broken answer is the operation's own (a read,
+///   or a create whose answer lacks a usable id);
+/// - `unreadable_success()` when that answer is a success status whose body
+///   this client cannot read (a create id of the wrong JSON type), so
+///   partial-commit application reads it as `Uncertain`, like a body that
+///   failed to decode;
+/// - `Unsent` when a preflight answer (an etag or id lookup) aborts a write
+///   before the write is sent.
 #[must_use]
 pub(crate) fn protocol_violation(
     inner: ProtocolErrorKind,
     operation: AccountOperation,
     scope: Option<ErrorScope>,
+    attempt: AttemptCause,
     detail: impl Into<String>,
 ) -> AccountError {
     let detail = DiagnosticText::support_only(detail.into());
@@ -1404,7 +1417,8 @@ pub(crate) fn protocol_violation(
     })
     .operation(operation)
     .context(GraphErrorContext::graph(operation).identity())
-    .text(detail);
+    .text(detail)
+    .push_cause(Cause::Attempt(attempt));
     if let Some(scope) = scope {
         builder = builder.scope(scope);
     }

@@ -332,6 +332,8 @@ pub(super) fn reconcile_translated_ews_scopes(
                     ProtocolErrorKind::ContractViolation,
                     AccountOperation::PushSubscribe,
                     Some(error_scope),
+                    // A preflight: the subscription it gates was never sent.
+                    bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Unsent),
                     "translateExchangeIds omitted a subscribed folder",
                 ),
             );
@@ -360,6 +362,7 @@ pub(super) fn reconcile_translated_ews_scopes(
                 ProtocolErrorKind::ContractViolation,
                 AccountOperation::PushSubscribe,
                 Some(error_scope),
+                bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Unsent),
                 "translateExchangeIds answered without a target id or error details",
             ),
         };

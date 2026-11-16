@@ -1,4 +1,6 @@
-use crate::account::pim::search::{kql_quoted, odata_filter, search_message_rows, search_url};
+use crate::account::pim::search::{
+    kql_quoted, odata_filter, search_message_rows, search_url, search_url_for,
+};
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
 use bifrost_types::{
@@ -501,8 +503,11 @@ async fn a_corrupt_search_cursor_blames_the_request_not_the_provider() {
 
 #[test]
 fn search_filter_escapes_odata_strings() {
-    let filter =
-        odata_filter(&SearchFilter::Subject("Bob's plan".to_string())).expect("filter builds");
+    let filter = odata_filter(
+        &SearchFilter::Subject("Bob's plan".to_string()),
+        AccountOperation::Search,
+    )
+    .expect("filter builds");
     assert_eq!(filter, "contains(subject,'Bob''s plan')");
 }
 
@@ -739,7 +744,7 @@ fn an_unbounded_date_range_is_a_constant_not_an_empty_fragment() {
         SearchFilter::Or(vec![]),
         SearchFilter::Not(Box::new(SearchFilter::And(vec![]))),
     ] {
-        let err = odata_filter(&filter).expect_err("unfolded constant");
+        let err = odata_filter(&filter, AccountOperation::Search).expect_err("unfolded constant");
         assert!(matches!(
             err.kind(),
             AccountErrorKind::Request(RequestErrorKind::Malformed)
@@ -1129,6 +1134,50 @@ fn attachment_presence_stays_odata_and_a_name_routes_to_kql() {
     assert!(matches!(
         err.kind(),
         bifrost_types::AccountErrorKind::Unsupported(_)
+    ));
+}
+
+#[test]
+fn compile_refusals_name_the_receiving_search_operation() {
+    use bifrost_types::{AttachmentFilter, MediaTypePattern};
+    let op = AccountOperation::SearchMessages;
+    // Unsupported carries the operation in its kind and recovery as well as
+    // in `operation()`; all three must name SearchMessages.
+    let pdf = SearchFilter::Attachment(AttachmentFilter::MediaType(
+        MediaTypePattern::parse("application/pdf").unwrap(),
+    ));
+    for filter in [
+        pdf.clone(),
+        // OData path, nested so the refusal comes through a join.
+        SearchFilter::Or(vec![
+            SearchFilter::Subject("a".into()),
+            SearchFilter::Not(Box::new(pdf)),
+        ]),
+    ] {
+        let err = search_url_for("/me", &SearchRequest::filter(filter), op).expect_err("refused");
+        assert_eq!(err.operation(), Some(op));
+        assert_eq!(
+            err.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(op)
+        );
+        assert_eq!(
+            err.recovery(),
+            &bifrost_types::RecoveryClass::Unsupported(op)
+        );
+    }
+    // A malformed raw KQL leaf beneath And/Or/Not.
+    let nested = SearchFilter::And(vec![
+        SearchFilter::From("x@example.com".into()),
+        SearchFilter::Or(vec![
+            SearchFilter::Subject("a".into()),
+            SearchFilter::Not(Box::new(SearchFilter::ProviderQuery("a) OR (b".into()))),
+        ]),
+    ]);
+    let err = search_url_for("/me", &SearchRequest::filter(nested), op).expect_err("unbalanced");
+    assert_eq!(err.operation(), Some(op));
+    assert!(matches!(
+        err.kind(),
+        AccountErrorKind::Request(RequestErrorKind::Malformed)
     ));
 }
 

@@ -114,6 +114,9 @@ pub(super) fn walk(
                             error: super::graph_error::protocol_violation(
                                 ProtocolErrorKind::ContractViolation, operation,
                                 Some(ErrorScope::Cursor(scope.clone())),
+                                bifrost_types::AttemptCause::new(
+                                    bifrost_types::TransmissionState::Acknowledged,
+                                ),
                                 "Graph delta page carried a value with no usable id",
                             ),
                             // A page URL dies with this delta session; it is
@@ -189,7 +192,9 @@ pub(super) fn walk(
                 });
                 yield DeltaEvent::Terminated(super::graph_error::protocol_violation(
                     ProtocolErrorKind::ContractViolation, operation,
-                    Some(ErrorScope::Cursor(scope.clone())), failure.expect("missing links"),
+                    Some(ErrorScope::Cursor(scope.clone())),
+                    bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
+                    failure.expect("missing links"),
                 ));
                 return;
             }
@@ -234,7 +239,9 @@ pub(super) fn walk(
                 // candidate in its adapter. Both lanes terminate after siblings.
                 yield DeltaEvent::Terminated(super::graph_error::protocol_violation(
                     ProtocolErrorKind::ContractViolation, operation,
-                    Some(ErrorScope::Cursor(scope.clone())), message,
+                    Some(ErrorScope::Cursor(scope.clone())),
+                    bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
+                    message,
                 ));
                 return;
             }

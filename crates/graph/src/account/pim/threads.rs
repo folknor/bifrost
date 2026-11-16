@@ -99,6 +99,7 @@ pub(crate) async fn delete_thread(
                     super::common::pim_protocol_error(
                         AccountOperation::BulkDestroy,
                         Some(scope.clone()),
+                        super::common::write_unsent(),
                         "Graph conversation message did not include parentFolderId",
                     )
                 })?;
@@ -107,6 +108,7 @@ pub(crate) async fn delete_thread(
                     super::common::pim_protocol_error(
                         AccountOperation::BulkDestroy,
                         Some(scope.clone()),
+                        super::common::write_unsent(),
                         "Graph conversation message did not include an entity tag",
                     )
                 })?;

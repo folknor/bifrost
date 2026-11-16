@@ -652,6 +652,11 @@ async fn refresh_missing_etags(
                             Some(ErrorScope::Message {
                                 id: (id.0.clone()).into(),
                             }),
+                            // The refresh was answered; this item's write is
+                            // left out of the batch, so it was never sent.
+                            bifrost_types::AttemptCause::new(
+                                bifrost_types::TransmissionState::Unsent,
+                            ),
                             format!(
                                 "Graph message {} did not expose an etag after refresh",
                                 id.0

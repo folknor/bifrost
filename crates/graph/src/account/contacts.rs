@@ -186,7 +186,7 @@ pub(crate) async fn create(
     let created = account
         .mailboxes
         .primary()
-        .post::<GraphContact, _>(
+        .post::<super::created::CreateAnswer, _>(
             Resource::Outlook,
             &path,
             &graph_contact_from_create(&contact),
@@ -195,9 +195,9 @@ pub(crate) async fn create(
         .await
         .map_err(|error| into_error(error, AccountOperation::ContactCreate))?;
     Ok(super::created::created_or_unidentified(
-        Some(created.id),
+        created.id,
         AccountOperation::ContactCreate,
-        "created Graph contact has an empty id",
+        "created Graph contact has no usable id",
     )
     .map(ContactId))
 }

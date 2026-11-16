@@ -718,7 +718,11 @@ empty value is an acknowledged success without an id (`Created` with a
 `CreatedWithoutIdentity` warning carrying the `Protocol(MissingField)` leaf with
 acknowledged evidence), never a failure. Every Google create door applies the
 same rule (`account::created`): Gmail drafts, labels and filters, Calendar
-events and People contacts.
+events and People contacts. Gmail draft and label creates decode their answer
+into `CreateAnswer` (an optional id), not `GmailDraft` / `GmailLabel`, so an
+answer that omits the id or the draft's `message` still reports the save. Only
+an answer that is not a JSON object, or whose id is present but neither a
+string nor `null`, stays an unreadable-success `Protocol(ParseFailed)` error.
 Update fetches the raw `Person`, preserves its CONTACT source identity and
 requires that source's ETag, and replaces only
 fields named by the shared `ContactPatch`. Display-name updates rewrite the

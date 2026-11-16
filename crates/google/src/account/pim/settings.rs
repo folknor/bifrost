@@ -63,9 +63,9 @@ pub(crate) fn container_create(
             )
         })?;
         Ok(crate::account::created::created_or_unidentified(
-            Some(label.id),
+            label.id,
             "id",
-            "created Gmail label has an empty id",
+            "created Gmail label has no usable id",
             error::GmailErrorContext::container(bifrost_types::AccountOperation::ContainerCreate),
         )
         .map(ContainerId))

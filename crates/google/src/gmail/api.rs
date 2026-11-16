@@ -3,8 +3,8 @@ use serde_json::json;
 use crate::Result;
 pub(crate) use crate::transport::GmailApi;
 use crate::types::{
-    GmailAttachmentData, GmailDraft, GmailFilter, GmailHistoryResponse, GmailLabel, GmailMessage,
-    GmailProfile, GmailSendAs, GmailThread, GmailThreadStub, GmailVacationSettings,
+    CreateAnswer, GmailAttachmentData, GmailDraft, GmailFilter, GmailHistoryResponse, GmailLabel,
+    GmailMessage, GmailProfile, GmailSendAs, GmailThread, GmailThreadStub, GmailVacationSettings,
     ListFiltersResponse, ListLabelsResponse, ListMessagesResponse, ListSendAsResponse,
     ListThreadsResponse,
 };
@@ -23,7 +23,7 @@ impl GmailApi {
         &self,
         name: &str,
         color: Option<(&str, &str)>,
-    ) -> Result<GmailLabel> {
+    ) -> Result<CreateAnswer> {
         let mut body = json!({
             "name": name,
             "labelListVisibility": "labelShow",
@@ -249,7 +249,7 @@ impl GmailApi {
         &self,
         raw: &str,
         thread_id: Option<&str>,
-    ) -> Result<GmailDraft> {
+    ) -> Result<CreateAnswer> {
         let mut message = json!({ "raw": raw });
         if let Some(tid) = thread_id {
             message["threadId"] = json!(tid);

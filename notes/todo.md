@@ -295,15 +295,6 @@ face.
 
 ### Write outcomes and compensation
 
-- **A required create id that fails to decode is still an `Err`.** The five
-  create doors now return `Created<T>`, so a decoded success answer without a
-  usable id is an unidentified success. Graph mail folder, contact and event
-  creates (`GraphMailFolder.id`, `GraphContact.id`, `GraphEvent.id`) and Gmail
-  draft and label creates (`GmailDraft.id`, `GmailLabel.id`) declare the id a
-  required `String`, so an id-less 2xx body fails JSON decode instead and
-  returns `Protocol(ParseFailed)` with unreadable-success evidence (Uncertain).
-  Making those ids `Option` would route them to the same unidentified success;
-  a wholly unparseable body would rightly stay an `Err`.
 - **A JMAP create answered in both `created` and `notCreated` reads as
   success.** `IdAnswer::from_parts` (crates/jmap/src/core/answer.rs) prefers
   the success entry and drops the refusal. With a usable id that was already
@@ -317,12 +308,10 @@ face.
   activation reference, so an identified script the server left inactive
   reports plain success. `Created::with_warning` can now carry "created but
   not activated".
-- **Graph `protocol_violation` carries no `Attempt` cause.** The Graph send
-  leg's id-less draft leaf (`pim/send.rs` `send_created_draft`) and the
-  warning evidence of every Graph create (`account::created`) come from a
-  decoded answer, yet read as Unsent by the error-model rule that a missing
-  Attempt cause means Unsent. JMAP and Google stamp the equivalent leaf
-  Acknowledged.
+- **Graph BulkMove caches an empty Deleted Items folder id.** The
+  `deletedItems` lookup in `pim/containers.rs` refuses an answer without an
+  `id`, but accepts and caches `{"id":""}`, so later thread deletes route to a
+  folder id that names nothing instead of failing at the lookup.
 - **IMAP draft_create still requires UIDPLUS.** The gate
   (`capabilities.rs`, `draft_create: has_drafts && can_identify_append`)
   existed because the door needed APPENDUID; an APPEND without one is now an
@@ -466,9 +455,6 @@ Narrow edge cases, audits with no known defect, and design work.
 - **`reference/types.md` implies IMAP search cursors are unbound.** It says
   other providers keep their existing cursor formats, which reads as though
   IMAP does not bind its cursors to the query; it does. Reword.
-- **Graph search errors always report the operation as `Search`**, even for
-  `SearchMessages`. Unverified beyond the report of the agent that fixed
-  Graph KQL fragment folding.
 - **SMTP builder: a single-part root whose payload ends in CRLF gains a blank
   line** (small). `Message` with a `SinglePart` body, `SinglePart::formatted`
   and `MultiPart::formatted` append one CRLF after the root entity

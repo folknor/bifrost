@@ -3229,11 +3229,28 @@ folder, message rule, contact, event) applies one rule
 (`account::created::created_or_unidentified`): a decoded create-success answer
 whose id is absent or empty is an acknowledged success, `Created` without an
 id, whose `CreatedWithoutIdentity` warning carries the
-`Protocol(ContractViolation)` leaf - never a failure, since the object exists
-and an enterprise user whose save worked expects "saved". The send leg's
-id-less draft is different: Send fails because that draft cannot be sent, so
-it keeps its Repeatable orphan record above. A required id that fails to
-decode is still an unreadable success (`Err`), not this case.
+`Protocol(ContractViolation)` leaf with `Acknowledged` evidence - never a
+failure, since the object exists and an enterprise user whose save worked
+expects "saved". The send leg's id-less draft is different: Send fails because
+that draft cannot be sent, so it keeps its Repeatable orphan record above (its
+leaf is `Acknowledged` too; the primary stays effectless). The folder, contact
+and event doors decode their answer into `account::created::CreateAnswer`, not
+the full resource type, so an omitted id or a field the door never reads
+cannot turn the save into a failure; the message-rule door's id is already
+optional and the draft door reads its answer as JSON. Only an answer that is
+not a JSON object, or whose id is present but neither a string nor `null`,
+stays an unreadable success (`Err`, `Protocol(ParseFailed)` with
+`AttemptCause::unreadable_success()`), not this case.
+
+Every `Protocol(_)` error built from a decoded answer
+(`graph_error::protocol_violation`) states its transmission evidence
+explicitly, for the failing operation rather than for the request whose answer
+broke the contract: `Acknowledged` where that answer is the operation's own (a
+read, a create answer), `Unsent` where a preflight lookup (an etag, a thread
+member id, the Deleted Items folder id, `translateExchangeIds`) aborts a write
+or subscription before it is sent. None of these kinds derives differently by
+transmission state; the evidence is what a support export and partial-commit
+application read.
 
 ## Subscription expiry representation
 

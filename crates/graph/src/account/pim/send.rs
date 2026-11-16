@@ -335,7 +335,14 @@ fn send_created_draft(created: &Value, detail: &'static str) -> Result<DraftHand
     // sent, nothing was submitted, and the draft is a by-product. Replaying
     // the send creates another orphan draft at worst, which `StepReplay`
     // names an accepted Repeatable by-product; it never sends twice.
-    let error = pim_protocol_error(AccountOperation::Send, None, detail);
+    // Acknowledged: the draft POST that opens the send was answered. The
+    // primary leg stays effectless, so this never reads as an uncertain send.
+    let error = pim_protocol_error(
+        AccountOperation::Send,
+        None,
+        super::common::acknowledged(),
+        detail,
+    );
     let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
     record.committed(
         StepEffect::Created,

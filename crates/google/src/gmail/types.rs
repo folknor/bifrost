@@ -262,6 +262,36 @@ pub(crate) struct GmailAttachmentData {
     pub(crate) data: String,
 }
 
+/// The part of a Gmail create-success answer a create door reads: its id.
+///
+/// Draft and label creates decode into this rather than into
+/// [`GmailDraft`] / [`GmailLabel`], so an answer that omits the id (or the
+/// draft's `message`, which the door never reads) still reports the save that
+/// happened instead of failing to decode. The answer must still be a JSON
+/// object, and a present id must be a string or `null`: anything else is a
+/// success this client cannot read, and stays the unreadable-success
+/// `Protocol(ParseFailed)` error of a body that fails to decode.
+#[derive(Debug)]
+pub(crate) struct CreateAnswer {
+    pub(crate) id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CreateAnswer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            #[serde(default)]
+            id: Option<String>,
+        }
+        // Through a map first: a derived struct also accepts a JSON array,
+        // which would read `[]` as an object without an id.
+        let map = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let fields = Fields::deserialize(serde_json::Value::Object(map))
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self { id: fields.id })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GmailDraft {
     pub(crate) id: String,
@@ -366,5 +396,17 @@ mod history_id_tests {
             serde_json::to_string(&value).expect("serialize"),
             r#""18446744073709551615""#
         );
+    }
+
+    #[test]
+    fn a_create_answer_reads_only_an_object_id() {
+        let decode = |raw: &str| serde_json::from_str::<CreateAnswer>(raw).map(|a| a.id);
+        // A draft answer without `message` still names the saved draft.
+        assert_eq!(decode(r#"{"id":"d1"}"#).unwrap().as_deref(), Some("d1"));
+        assert_eq!(decode("{}").unwrap(), None);
+        assert_eq!(decode(r#"{"id":null}"#).unwrap(), None);
+        for unreadable in [r#"{"id":7}"#, "[]", r#"["x"]"#, "\"x\"", "null"] {
+            assert!(decode(unreadable).is_err(), "{unreadable} must not decode");
+        }
     }
 }

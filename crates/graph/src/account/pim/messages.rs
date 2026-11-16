@@ -84,6 +84,7 @@ pub(crate) async fn set_category(
                 Some(ErrorScope::Message {
                     id: id.0.clone().into(),
                 }),
+                write_unsent(),
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
@@ -139,6 +140,7 @@ pub(crate) async fn set_extended_property(
                         Some(ErrorScope::Message {
                             id: id.0.clone().into(),
                         }),
+                        write_unsent(),
                         format!("Graph message {} did not expose an etag", id.0),
                     )
                 })?;
@@ -237,6 +239,7 @@ pub(crate) async fn set_is_read(
                 Some(ErrorScope::Message {
                     id: id.0.clone().into(),
                 }),
+                write_unsent(),
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
@@ -279,6 +282,7 @@ pub(crate) async fn set_importance(
                 Some(ErrorScope::Message {
                     id: id.0.clone().into(),
                 }),
+                write_unsent(),
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
@@ -345,7 +349,9 @@ pub(super) async fn resolve_target_ids(
                 .map(str::to_string);
             values
                 .iter()
-                .map(|value| object_id_from_value(value, operation, owner.as_deref()))
+                .map(|value| {
+                    object_id_from_value(value, operation, owner.as_deref(), write_unsent())
+                })
                 .collect()
         }
         _ => Err(unsupported_account_error(operation)),
@@ -408,7 +414,8 @@ pub(super) async fn resolve_target_values(
             values
                 .into_iter()
                 .map(|value| {
-                    let routing_id = object_id_from_value(&value, operation, owner.as_deref())?;
+                    let routing_id =
+                        object_id_from_value(&value, operation, owner.as_deref(), write_unsent())?;
                     Ok(ResolvedMessage { routing_id, value })
                 })
                 .collect()
@@ -589,6 +596,7 @@ pub(super) async fn move_messages(
                 Some(ErrorScope::Message {
                     id: id.0.clone().into(),
                 }),
+                write_unsent(),
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;

@@ -20,12 +20,21 @@ fn invalid(op: AccountOperation, detail: impl Into<String>) -> AccountError {
 // label predicates while stored rules also have sizes and arbitrary headers.
 // Unifying those public contracts belongs in their owning crate. Here both
 // surfaces use one encoder so escaping, grouping and containers cannot drift.
-pub(super) fn filter_query(filter: &SearchFilter) -> Result<String, AccountError> {
-    let condition = search_condition(filter)?;
-    condition_query(&condition, AccountOperation::Search)
+//
+// `op` stamps every refusal, so a `SearchMessages` request refused here reports
+// `SearchMessages`, not `Search`.
+pub(super) fn filter_query(
+    filter: &SearchFilter,
+    op: AccountOperation,
+) -> Result<String, AccountError> {
+    let condition = search_condition(filter, op)?;
+    condition_query(&condition, op)
 }
 
-fn search_condition(filter: &SearchFilter) -> Result<FilterCondition, AccountError> {
+fn search_condition(
+    filter: &SearchFilter,
+    op: AccountOperation,
+) -> Result<FilterCondition, AccountError> {
     Ok(match filter {
         SearchFilter::From(value) => FilterCondition::From(value.clone()),
         SearchFilter::To(value) => FilterCondition::To(value.clone()),
@@ -36,10 +45,7 @@ fn search_condition(filter: &SearchFilter) -> Result<FilterCondition, AccountErr
         // matching), which is what the shared Name form promises.
         SearchFilter::Attachment(AttachmentFilter::Name(name)) => {
             if name.trim().is_empty() {
-                return Err(invalid(
-                    AccountOperation::Search,
-                    "attachment name search needs a name",
-                ));
+                return Err(invalid(op, "attachment name search needs a name"));
             }
             FilterCondition::ProviderExpression {
                 provider: Provider::Gmail,
@@ -50,8 +56,8 @@ fn search_condition(filter: &SearchFilter) -> Result<FilterCondition, AccountErr
         // be a filename search, so the type form is refused, not faked.
         SearchFilter::Attachment(_) => {
             return Err(into_account_error(
-                crate::Error::unsupported(AccountOperation::Search),
-                GmailErrorContext::base(AccountOperation::Search),
+                crate::Error::unsupported(op),
+                GmailErrorContext::base(op),
             ));
         }
         // Raw Gmail query, as `provider_query` takes it, parenthesised so an
@@ -60,14 +66,11 @@ fn search_condition(filter: &SearchFilter) -> Result<FilterCondition, AccountErr
         SearchFilter::ProviderQuery(raw) => {
             let raw = sanitize_term(raw);
             if raw.is_empty() {
-                return Err(invalid(
-                    AccountOperation::Search,
-                    "provider query leaf is empty",
-                ));
+                return Err(invalid(op, "provider query leaf is empty"));
             }
             if !balanced_raw_query(&raw) {
                 return Err(invalid(
-                    AccountOperation::Search,
+                    op,
                     "provider query leaf has unbalanced parentheses or quotes",
                 ));
             }
@@ -88,20 +91,20 @@ fn search_condition(filter: &SearchFilter) -> Result<FilterCondition, AccountErr
         SearchFilter::And(items) => FilterCondition::And(
             items
                 .iter()
-                .map(search_condition)
+                .map(|item| search_condition(item, op))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         SearchFilter::Or(items) => FilterCondition::Or(
             items
                 .iter()
-                .map(search_condition)
+                .map(|item| search_condition(item, op))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        SearchFilter::Not(item) => FilterCondition::Not(Box::new(search_condition(item)?)),
+        SearchFilter::Not(item) => FilterCondition::Not(Box::new(search_condition(item, op)?)),
         _ => {
             return Err(into_account_error(
-                crate::Error::unsupported(AccountOperation::Search),
-                GmailErrorContext::base(AccountOperation::Search),
+                crate::Error::unsupported(op),
+                GmailErrorContext::base(op),
             ));
         }
     })
@@ -321,6 +324,44 @@ pub(super) fn gmail_date(
 mod tests {
     use super::*;
     use bifrost_types::ContainerId;
+
+    fn filter_query(filter: &SearchFilter) -> Result<String, AccountError> {
+        super::filter_query(filter, AccountOperation::Search)
+    }
+
+    #[test]
+    fn refusals_name_the_receiving_search_operation() {
+        let op = AccountOperation::SearchMessages;
+        let pdf = SearchFilter::Attachment(AttachmentFilter::MediaType(
+            bifrost_types::MediaTypePattern::parse("application/pdf").unwrap(),
+        ));
+        // Unsupported carries the operation in its kind and recovery as well
+        // as in `operation()`; nesting proves the recursion keeps it.
+        let nested = SearchFilter::Or(vec![
+            SearchFilter::Subject("a".into()),
+            SearchFilter::Not(Box::new(pdf)),
+        ]);
+        let err = super::filter_query(&nested, op).expect_err("no type operator");
+        assert_eq!(err.operation(), Some(op));
+        assert_eq!(
+            err.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(op)
+        );
+        assert_eq!(
+            err.recovery(),
+            &bifrost_types::RecoveryClass::Unsupported(op)
+        );
+        let malformed = SearchFilter::And(vec![
+            SearchFilter::From("x@example.com".into()),
+            SearchFilter::Not(Box::new(SearchFilter::ProviderQuery("a) OR (b".into()))),
+        ]);
+        let err = super::filter_query(&malformed, op).expect_err("unbalanced");
+        assert_eq!(err.operation(), Some(op));
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    }
 
     #[test]
     fn compiler_refuses_unfolded_constants() {

@@ -141,6 +141,7 @@ fn rule_from_graph(rule: GraphMessageRule) -> Result<FilterRule, AccountError> {
             ProtocolErrorKind::ContractViolation,
             AccountOperation::FiltersList,
             None,
+            bifrost_types::AttemptCause::new(bifrost_types::TransmissionState::Acknowledged),
             "listed Graph message rule did not include an id",
         )
     })?;

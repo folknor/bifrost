@@ -14,7 +14,7 @@ pub(crate) fn search(
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
-        let query = gmail_query(&request)?;
+        let query = gmail_query(&request, bifrost_types::AccountOperation::Search)?;
         let binding = query.as_deref().unwrap_or_default();
         let page_token = page_token(&request, bifrost_types::AccountOperation::Search, binding)?;
         let max = request
@@ -62,7 +62,7 @@ pub(crate) fn search_messages(
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
-        let query = gmail_query(&request)?;
+        let query = gmail_query(&request, bifrost_types::AccountOperation::SearchMessages)?;
         let binding = query.as_deref().unwrap_or_default();
         let page_token = page_token(
             &request,
@@ -110,10 +110,13 @@ pub(crate) fn search_messages(
     })
 }
 
-fn gmail_query(request: &SearchRequest) -> Result<Option<String>, AccountError> {
+fn gmail_query(
+    request: &SearchRequest,
+    operation: bifrost_types::AccountOperation,
+) -> Result<Option<String>, AccountError> {
     let mut parts = Vec::new();
     if let Some(filter) = &request.filter {
-        parts.push(filter_query(filter)?);
+        parts.push(filter_query(filter, operation)?);
     }
     if let Some(provider) = &request.provider_query
         && !provider.trim().is_empty()
@@ -157,7 +160,9 @@ mod tests {
         let mut request = SearchRequest::default();
         request.filter = Some(SearchFilter::From("ada@example.com".to_string()));
         request.provider_query = Some("larger:5M".to_string());
-        let query = gmail_query(&request).expect("query").expect("some query");
+        let query = gmail_query(&request, bifrost_types::AccountOperation::Search)
+            .expect("query")
+            .expect("some query");
         assert_eq!(query, "from:ada@example.com larger:5M");
     }
 

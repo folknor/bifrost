@@ -250,7 +250,7 @@ pub(crate) async fn container_create(
         ),
         None => format!("{prefix}/mailFolders"),
     };
-    let folder: GraphMailFolder = account
+    let folder: crate::account::created::CreateAnswer = account
         .mailboxes
         .primary()
         .post(
@@ -267,9 +267,9 @@ pub(crate) async fn container_create(
             )
         })?;
     Ok(crate::account::created::created_or_unidentified(
-        Some(folder.id),
+        folder.id,
         AccountOperation::ContainerCreate,
-        "created Graph mail folder has an empty id",
+        "created Graph mail folder has no usable id",
     )
     .map(ContainerId))
 }
@@ -501,6 +501,8 @@ pub(super) async fn trash_container_id(
             pim_protocol_error(
                 AccountOperation::BulkMove,
                 Some(scope),
+                // The lookup was answered; the moves it precedes were never sent.
+                super::common::write_unsent(),
                 "Graph deletedItems lookup returned no folder id",
             )
         })?

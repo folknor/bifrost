@@ -2,7 +2,10 @@
 //! construction, extended-property naming, and the Graph time formats.
 
 use crate::account::graph_error::{invalid_account_error, protocol_violation};
-use bifrost_types::{AccountError, AccountOperation, ErrorScope, ObjectId, ProtocolErrorKind};
+use bifrost_types::{
+    AccountError, AccountOperation, AttemptCause, ErrorScope, ObjectId, ProtocolErrorKind,
+    TransmissionState,
+};
 use jiff::tz::Offset;
 use jiff::{Timestamp, civil};
 use serde_json::Value;
@@ -10,29 +13,59 @@ use std::time::SystemTime;
 
 use super::messages::*;
 
+/// The message id of a decoded Graph message. `attempt` is the failing
+/// operation's evidence (see `protocol_violation`): `Acknowledged` for a
+/// read whose own answer lacks the id, `Unsent` when the lookup is a
+/// preflight to a write that is then never sent.
 pub(super) fn object_id_from_value(
     value: &Value,
     operation: AccountOperation,
     owner: Option<&str>,
+    attempt: AttemptCause,
 ) -> Result<ObjectId, AccountError> {
     value
         .get("id")
         .and_then(Value::as_str)
         .map(|id| ObjectId(crate::account::foreign::qualify_with_owner(owner, id)))
-        .ok_or_else(|| pim_protocol_error(operation, None, "Graph message did not include an id"))
+        .ok_or_else(|| {
+            pim_protocol_error(
+                operation,
+                None,
+                attempt,
+                "Graph message did not include an id",
+            )
+        })
 }
 
 /// Build a `Protocol(ContractViolation)` `AccountError` for pim-layer
 /// data-shape violations (missing id, missing etag, etc.). The
-/// caller threads its `AccountOperation` and the scope of the
-/// affected resource (typically `ErrorScope::Message { id }`); both
+/// caller threads its `AccountOperation`, the scope of the
+/// affected resource (typically `ErrorScope::Message { id }`) and its
+/// transmission evidence (see `protocol_violation`); all three
 /// flow through into telemetry and support exports.
 pub(super) fn pim_protocol_error(
     operation: AccountOperation,
     scope: Option<ErrorScope>,
+    attempt: AttemptCause,
     msg: impl Into<String>,
 ) -> AccountError {
-    protocol_violation(ProtocolErrorKind::ContractViolation, operation, scope, msg)
+    protocol_violation(
+        ProtocolErrorKind::ContractViolation,
+        operation,
+        scope,
+        attempt,
+        msg,
+    )
+}
+
+/// Evidence for a violation in the failing operation's own answer.
+pub(super) fn acknowledged() -> AttemptCause {
+    AttemptCause::new(TransmissionState::Acknowledged)
+}
+
+/// Evidence for a preflight answer that aborts a write before it is sent.
+pub(super) fn write_unsent() -> AttemptCause {
+    AttemptCause::new(TransmissionState::Unsent)
 }
 
 pub(super) fn graph_extended_property_id(property_id: &str) -> String {

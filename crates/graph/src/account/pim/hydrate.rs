@@ -223,7 +223,12 @@ pub(super) fn message_from_value(
     projection: HydrationProjection,
     owner: Option<&str>,
 ) -> Result<Message, AccountError> {
-    let id = object_id_from_value(value, AccountOperation::HydrateMessage, owner)?;
+    let id = object_id_from_value(
+        value,
+        AccountOperation::HydrateMessage,
+        owner,
+        acknowledged(),
+    )?;
     let body = value.get("body");
     let (mut body_text, mut body_html) = match body {
         Some(body) => body_parts_from_graph_body(body),

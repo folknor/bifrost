@@ -214,7 +214,7 @@ pub(crate) async fn create(
     let created = account
         .mailboxes
         .primary()
-        .post::<GraphEvent, _>(
+        .post::<super::created::CreateAnswer, _>(
             Resource::Outlook,
             &path,
             &body,
@@ -222,12 +222,12 @@ pub(crate) async fn create(
         )
         .await
         .map_err(|error| into_error(error, AccountOperation::EventCreate))?;
-    // The native id is validated before it is joined, so an empty one never
-    // becomes a composite id that names nothing.
+    // The native id is validated before it is joined, so an absent or empty
+    // one never becomes a composite id that names nothing.
     Ok(super::created::created_or_unidentified(
-        Some(created.id),
+        created.id,
         AccountOperation::EventCreate,
-        "created Graph event has an empty id",
+        "created Graph event has no usable id",
     )
     .map(|id| EventId(join_event_id(&calendar_id, &id))))
 }

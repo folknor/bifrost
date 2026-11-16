@@ -369,6 +369,7 @@ pub(super) async fn search_message_rows(
                     &client.api_path_prefix(),
                     &request,
                     &plan,
+                    operation,
                 )?)
                 .map_err(|error| into_account_error(error, ctx.clone()))?,
         };
@@ -429,7 +430,7 @@ pub(super) async fn search_message_rows(
     };
     let mut rows = Vec::new();
     for value in page.value {
-        let id = object_id_from_value(&value, operation, None)?;
+        let id = object_id_from_value(&value, operation, None, acknowledged())?;
         let id = ObjectId(crate::account::foreign::qualify_with_owner(
             owner.as_deref(),
             &id.0,
@@ -597,8 +598,18 @@ pub(super) fn plan_uses_search(plan: &MailboxPlan) -> bool {
 /// primary out has no URL there.
 #[cfg(test)]
 pub(super) fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountError> {
+    search_url_for(prefix, request, AccountOperation::Search)
+}
+
+/// [`search_url`] for a named operation.
+#[cfg(test)]
+pub(super) fn search_url_for(
+    prefix: &str,
+    request: &SearchRequest,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
     let plan = plan_for_owner(request, None).expect("the request searches the primary mailbox");
-    mailbox_search_url(prefix, request, &plan)
+    mailbox_search_url(prefix, request, &plan, operation)
 }
 
 /// Build the FIRST-page URL for one mailbox. Continuations never come
@@ -609,6 +620,7 @@ pub(super) fn mailbox_search_url(
     prefix: &str,
     request: &SearchRequest,
     plan: &MailboxPlan,
+    operation: AccountOperation,
 ) -> Result<String, AccountError> {
     let collection = match &plan.folder {
         Some(folder) => format!(
@@ -632,14 +644,14 @@ pub(super) fn mailbox_search_url(
     // reduced against this mailbox and the endpoint folder lifted out.
     if let Some(filter) = &plan.filter {
         if filter_requires_search(filter) {
-            let search = kql_filter(filter)?;
+            let search = kql_filter(filter, operation)?;
             params.push(format!(
                 "$search={}",
                 bifrost_net::url::encode_query_value(&format!("\"{search}\""))
             ));
         } else {
             // Never empty: constants were folded out of the plan.
-            let filter = odata_filter(filter)?;
+            let filter = odata_filter(filter, operation)?;
             params.push(format!(
                 "$filter={}",
                 bifrost_net::url::encode_query_value(&filter)
@@ -681,13 +693,23 @@ pub(super) fn filter_requires_search(filter: &SearchFilter) -> bool {
 /// top-level folder - is a clean `Request(Malformed)` rather than silently
 /// dropped (returning matches from other folders) or sent as an invalid
 /// mixed request.
-pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> {
-    kql_compile(filter, true)
+///
+/// `operation` stamps every refusal, so a `SearchMessages` request refused
+/// here reports `SearchMessages`, not `Search`.
+pub(super) fn kql_filter(
+    filter: &SearchFilter,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    kql_compile(filter, true, operation)
 }
 
 /// `positive` is the leaf's Boolean polarity: true at the root and through
 /// `And`/`Or`, flipped by each `Not`. Only date rounding reads it.
-fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountError> {
+fn kql_compile(
+    filter: &SearchFilter,
+    positive: bool,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
     match filter {
         SearchFilter::From(value) => Ok(format!("from:{}", kql_quoted(value))),
         // KQL `to:` and `cc:` cover the recipient set; there is no KQL
@@ -701,14 +723,14 @@ fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountE
         SearchFilter::Attachment(AttachmentFilter::Name(name)) => {
             if name.trim().is_empty() {
                 return Err(invalid_account_error(
-                    AccountOperation::Search,
+                    operation,
                     "attachment name search needs a name",
                 ));
             }
             Ok(format!("attachment:{}", kql_quoted(name)))
         }
         // No KQL or OData property carries an attachment's MIME type.
-        SearchFilter::Attachment(_) => Err(unsupported_account_error(AccountOperation::Search)),
+        SearchFilter::Attachment(_) => Err(unsupported_account_error(operation)),
         // Raw KQL (a leaf, or the request-level `provider_query` that
         // `plan_for_owner` folded in as one), escaped and grouped by `kql_join`/`NOT (...)` like every other leaf; the balance
         // check stops an unmatched `)` or quote from escaping that group.
@@ -716,13 +738,13 @@ fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountE
             let raw = raw.trim();
             if raw.is_empty() {
                 return Err(invalid_account_error(
-                    AccountOperation::Search,
+                    operation,
                     "provider query leaf is empty",
                 ));
             }
             if !balanced_raw_query(raw) {
                 return Err(invalid_account_error(
-                    AccountOperation::Search,
+                    operation,
                     "provider query leaf has unbalanced parentheses or quotes",
                 ));
             }
@@ -753,27 +775,30 @@ fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountE
         SearchFilter::DateRange { after, before } => {
             let mut parts = Vec::new();
             if let Some(after) = after {
-                parts.push(format!("sent>={}", kql_day(*after, !positive)?));
+                parts.push(format!("sent>={}", kql_day(*after, !positive, operation)?));
             }
             if let Some(before) = before {
-                parts.push(format!("sent<{}", kql_day(*before, positive)?));
+                parts.push(format!("sent<{}", kql_day(*before, positive, operation)?));
             }
-            nonempty_fragment(parts.join(" AND "))
+            nonempty_fragment(parts.join(" AND "), operation)
         }
-        SearchFilter::And(filters) => kql_join(filters, "AND", positive),
-        SearchFilter::Or(filters) => kql_join(filters, "OR", positive),
-        SearchFilter::Not(filter) => Ok(format!("NOT ({})", kql_compile(filter, !positive)?)),
+        SearchFilter::And(filters) => kql_join(filters, "AND", positive, operation),
+        SearchFilter::Or(filters) => kql_join(filters, "OR", positive, operation),
+        SearchFilter::Not(filter) => Ok(format!(
+            "NOT ({})",
+            kql_compile(filter, !positive, operation)?
+        )),
         // A folder restriction the endpoint cannot carry has no KQL
         // property; failing cleanly beats shipping a request that would
         // silently search every folder.
         SearchFilter::In(_) => Err(invalid_account_error(
-            AccountOperation::Search,
+            operation,
             "Graph search can scope a sender/recipient, attachment-name or \
              raw KQL term to one folder only as a top-level AND condition \
              (KQL has no folder property); a folder under OR or NOT, or a \
              second folder, cannot be combined with such a term",
         )),
-        _ => Err(unsupported_account_error(AccountOperation::Search)),
+        _ => Err(unsupported_account_error(operation)),
     }
 }
 
@@ -782,13 +807,17 @@ fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountE
 /// bound outside the representable range, or a ceiling past its last date,
 /// is refused: substituting another date would move the bound the wrong
 /// way and drop matches.
-fn kql_day(time: std::time::SystemTime, ceil: bool) -> Result<String, AccountError> {
-    let civil = utc_civil(time, AccountOperation::Search)?;
+fn kql_day(
+    time: std::time::SystemTime,
+    ceil: bool,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    let civil = utc_civil(time, operation)?;
     let mut date = civil.date();
     if ceil && civil.time() != jiff::civil::Time::midnight() {
         date = date.tomorrow().map_err(|_| {
             invalid_account_error(
-                AccountOperation::Search,
+                operation,
                 "date bound rounds past the last date KQL can represent",
             )
         })?;
@@ -800,10 +829,13 @@ fn kql_day(time: std::time::SystemTime, ceil: bool) -> Result<String, AccountErr
 /// range, an empty `And`/`Or`) are folded by `reduce_for_owner` before
 /// either compiler runs; an empty rendering here would silently vanish from
 /// a join (narrowing an `Or`) or produce `NOT ()`, so it is refused.
-fn nonempty_fragment(fragment: String) -> Result<String, AccountError> {
+fn nonempty_fragment(
+    fragment: String,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
     if fragment.is_empty() {
         Err(invalid_account_error(
-            AccountOperation::Search,
+            operation,
             "search filter holds a constant (an unbounded date range or an \
              empty AND/OR) that was not folded before compiling",
         ))
@@ -812,12 +844,17 @@ fn nonempty_fragment(fragment: String) -> Result<String, AccountError> {
     }
 }
 
-fn kql_join(filters: &[SearchFilter], op: &str, positive: bool) -> Result<String, AccountError> {
+fn kql_join(
+    filters: &[SearchFilter],
+    op: &str,
+    positive: bool,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
     let parts = filters
         .iter()
-        .map(|filter| kql_compile(filter, positive).map(|part| format!("({part})")))
+        .map(|filter| kql_compile(filter, positive, operation).map(|part| format!("({part})")))
         .collect::<Result<Vec<_>, _>>()?;
-    nonempty_fragment(parts.join(&format!(" {op} ")))
+    nonempty_fragment(parts.join(&format!(" {op} ")), operation)
 }
 
 /// KQL-quoted string value: wrap in double quotes (so multi-word values are
@@ -826,7 +863,12 @@ pub(super) fn kql_quoted(value: &str) -> String {
     format!("\"{}\"", graph_search_escape(value))
 }
 
-pub(super) fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError> {
+/// `operation` stamps every refusal, so a `SearchMessages` request refused
+/// here reports `SearchMessages`, not `Search`.
+pub(super) fn odata_filter(
+    filter: &SearchFilter,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
     // `From`/`To` are never reached here: any filter tree containing a
     // sender/recipient substring leaf is detected by `filter_requires_search`
     // in `mailbox_search_url` and routed onto `$search`/KQL instead (Graph
@@ -849,7 +891,7 @@ pub(super) fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError
         // `Name` and `ProviderQuery` never reach here (`filter_requires_search`
         // routes them to KQL), and no OData property carries a MIME type.
         SearchFilter::Attachment(_) | SearchFilter::ProviderQuery(_) => {
-            Err(unsupported_account_error(AccountOperation::Search))
+            Err(unsupported_account_error(operation))
         }
         // Already reduced against the searched mailbox by `plan_for_owner`,
         // so the id is native (owner qualification stripped) and belongs to
@@ -866,30 +908,34 @@ pub(super) fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError
             if let Some(after) = after {
                 parts.push(format!(
                     "sentDateTime ge {}",
-                    system_time_rfc3339(*after, AccountOperation::Search)?
+                    system_time_rfc3339(*after, operation)?
                 ));
             }
             if let Some(before) = before {
                 parts.push(format!(
                     "sentDateTime lt {}",
-                    system_time_rfc3339(*before, AccountOperation::Search)?
+                    system_time_rfc3339(*before, operation)?
                 ));
             }
-            nonempty_fragment(parts.join(" and "))
+            nonempty_fragment(parts.join(" and "), operation)
         }
-        SearchFilter::And(filters) => join_filters(filters, "and"),
-        SearchFilter::Or(filters) => join_filters(filters, "or"),
-        SearchFilter::Not(filter) => Ok(format!("not ({})", odata_filter(filter)?)),
-        _ => Err(unsupported_account_error(AccountOperation::Search)),
+        SearchFilter::And(filters) => join_filters(filters, "and", operation),
+        SearchFilter::Or(filters) => join_filters(filters, "or", operation),
+        SearchFilter::Not(filter) => Ok(format!("not ({})", odata_filter(filter, operation)?)),
+        _ => Err(unsupported_account_error(operation)),
     }
 }
 
-pub(super) fn join_filters(filters: &[SearchFilter], op: &str) -> Result<String, AccountError> {
+pub(super) fn join_filters(
+    filters: &[SearchFilter],
+    op: &str,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
     let parts = filters
         .iter()
-        .map(|filter| odata_filter(filter).map(|part| format!("({part})")))
+        .map(|filter| odata_filter(filter, operation).map(|part| format!("({part})")))
         .collect::<Result<Vec<_>, _>>()?;
-    nonempty_fragment(parts.join(&format!(" {op} ")))
+    nonempty_fragment(parts.join(&format!(" {op} ")), operation)
 }
 
 pub(super) fn label_id_native(label: &LabelId) -> String {

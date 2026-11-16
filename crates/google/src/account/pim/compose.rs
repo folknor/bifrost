@@ -94,9 +94,9 @@ pub(crate) fn draft_create(
                 )
             })?;
         Ok(crate::account::created::created_or_unidentified(
-            Some(draft.id),
+            draft.id,
             "id",
-            "created Gmail draft has an empty id",
+            "created Gmail draft has no usable id",
             error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftCreate),
         )
         .map(DraftHandle))
