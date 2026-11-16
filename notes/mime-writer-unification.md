@@ -189,3 +189,70 @@ Leftover, filed here with sizes:
   a boundary, after which `boundary()` panics at format time; pre-existing,
   not introduced here (small).
 - Link 3 below is unchanged (large).
+
+
+### Phrase leftover built; multipart mutation hand-back (2026-11-16)
+
+Built: shared `HeaderValue::PhraseList` and `ListId` grammars, adopted by
+SMTP Keywords and List-ID. Each display phrase uses the existing RFC 2047
+policy, including long ASCII words. Keywords commas inside quotes or nested
+comments are not separators. Quoted-pairs are decoded before display encoding;
+ASCII comments stay comments. Typed getters keep the original text. The
+List-ID identifier stays ASCII dot-atom text in angle brackets, never an
+encoded word; invalid or oversized identifiers fail at insertion.
+
+Decision made: declared grammars validate structure at the existing fallible
+header insertion boundary. Empty list items and unfinished quotes/comments
+are refused rather than encoded as if punctuation were display text. Comments
+are structural and retain ASCII spelling; controls and non-ASCII in comments
+are refused instead of guessing how to repair their grammar. This gives an
+enterprise send queue an actionable malformed-header error. Raw custom headers
+remain available for caller-owned spellings. These rules are recorded in both
+crate references.
+
+Validation: `brokkr check -p bifrost-mime -p bifrost-smtp` passed: 2,476
+tests across five sweeps. Three new hermetic regressions cover long Keywords
+phrases with quoted commas/comments, long List-ID display phrases with an
+unencoded identifier, and malformed syntax/identifier refusal. Replacing both
+typed grammar routes with their old Raw routes made all three tests fail in
+every SMTP sweep.
+
+### Multipart mutation boundary settled and built (2026-11-16)
+
+Settled with codex (converged over four exchanges): transactional editing,
+not fallible finalization, so link 2's infallible-format ruling stands. The
+binding contract is in `reference/smtp.md` (the multipart paragraphs after
+the boundary re-roll rule). In short: `MultiPart::headers_mut` and
+`Message::headers_mut` are replaced by `edit_headers` transactions; one
+validator (`validate_multipart_headers`) backs builder insertion and edits,
+requires `multipart/*` with a legal boundary, adds or re-rolls the boundary
+against every child, re-sets the entry from its parsed value so wire and
+getter agree, and limits a multipart CTE to 7bit/8bit/binary. Report
+cardinality and report-type moved from a format-time panic to the Message
+gate (recursive, by subtype); a message-level Content-Type or CTE beside a
+MIME body is refused. Rejected: format-time repair (adding a boundary is
+fallible), multipart/mixed fallback (loses subtype and parameters), a typed
+non-header Content-Type model (would have to reinvent caller spelling),
+and inspecting opaque SinglePart bodies that declare multipart (would remove
+pre-assembled S/MIME or report blobs).
+
+Validation: `brokkr check -p bifrost-mime -p bifrost-smtp` green, 2,486
+tests across five sweeps. Ablations bit: short-circuiting the multipart
+validator failed three tests, the Message gate one, the root-owner check one.
+
+Remaining work, in order:
+
+- Link 3: shared transfer-encoding selection, CRLF normalization, and nested
+  MIME entity serialization with collision re-roll, preserving explicit
+  encodings and pre-encoded bodies (large). Not started. Now unblocked: the
+  boundary is validated at every header change, so a shared serializer can
+  trust `boundary()` and keep formatting infallible. Starting point is a
+  spar on where the serializer sits (bifrost-mime, below both composers) and
+  how the renderer's always-base64 parts give up the "collision is
+  impossible" shortcut on `boundary()`.
+- Lateral, small: `Message::edit_headers` (like the old `headers_mut`) can
+  remove or change From/Sender/To after build without re-deriving the
+  envelope or re-checking the From/Sender rule. Whether a post-build edit
+  should re-validate originators needs its own ruling.
+- On chain completion, reconcile every durable design rule into the crate
+  references or code comments (small audit). The chain is not ready to close.

@@ -939,8 +939,10 @@ From/Sender/To/Cc/Bcc/Reply-To are address lists; Message-ID, In-Reply-To,
 References and Content-ID are message ids; Content-Type, Content-Location,
 List-* URLs, Content-Transfer-Encoding, MIME-Version and a minted Date are
 structured ASCII, never encoded; Content-Disposition is parameterized
-(RFC 2231 for long or non-ASCII file names); Keywords, List-ID and User-Agent
-are stored unparsed and take the caller-spelling rule. Content-Type is
+(RFC 2231 for long or non-ASCII file names); Keywords uses a phrase list;
+List-ID encodes its optional display phrase separately from its ASCII
+angle-bracketed dot-atom identifier. User-Agent takes the caller-spelling
+rule. Content-Type is
 structured rather than parameterized because the shared parameter rule
 turns a long ASCII value into RFC 2231 continuations, and a 70-octet
 `boundary*0*=` breaks many MIME parsers.
@@ -951,8 +953,15 @@ octets) is emitted byte-for-byte, with no trim and no inserted fold. That is
 how a caller's `Date` stays byte-for-byte. Otherwise words holding non-ASCII
 or control octets become encoded words and the value folds at 78; an ASCII
 word is never encoded, because the grammar is unknown, so one past 998
-octets is refused. A refused long phrase word in Keywords or List-ID is the
-cost of those headers being unparsed.
+octets is refused.
+
+Keywords and List-ID use the shared phrase writer: quoted strings and
+quoted-pairs become display text before RFC 2047 encoding, and commas split
+Keywords only outside quotes and nested comments. ASCII comments remain
+comments; control or non-ASCII octets in comments are refused. Empty list
+items, unfinished syntax and invalid List-ID identifiers fail at header
+insertion. Typed getters retain the original input. Long phrase words encode,
+while an overlong identifier fails instead of being encoded as display text.
 
 `dangerous_new_pre_encoded` validates framing only; that its raw and encoded
 values mean the same thing stays the caller's responsibility.
@@ -972,7 +981,7 @@ keeps encoding.
 
 `MultiPart` kinds: `Mixed`, `Alternative`, `Related`, `Signed`, `Encrypted`, `Report { report_type }`. `Mixed` is the default for `MultiPart::builder().build()`.
 
-Multipart builders ensure a `boundary` is present even when a caller supplies a boundary-less multipart `Content-Type`. `try_boundary`, `try_encrypted`, and `try_signed` are the fallible validation entry points; the infallible `boundary`, `MultiPart::encrypted`, and `MultiPart::signed` keep their signatures and panic on values that would break out of the MIME parameter (a deliberate runtime behavior change for callers passing unvalidated strings); default boundaries use OS randomness, and a caller-supplied boundary is regenerated if it appears at a MIME delimiter position in an added part.
+Multipart builders ensure a `boundary` is present even when a caller supplies a boundary-less multipart `Content-Type`, and refuse a non-multipart one. `try_boundary`, `try_encrypted`, and `try_signed` are the fallible validation entry points; the infallible `boundary`, `MultiPart::encrypted`, and `MultiPart::signed` keep their signatures and panic on values that would break out of the MIME parameter (a deliberate runtime behavior change for callers passing unvalidated strings); default boundaries use OS randomness, and a caller-supplied boundary is regenerated if it appears at a MIME delimiter position in an added part.
 
 A regeneration replaces the `boundary` PARAMETER and keeps every other
 parameter on the multipart `Content-Type` verbatim, including ones outside this
@@ -981,6 +990,36 @@ reproduce only the kind's own parameters, and since a re-roll is data-driven,
 the same message would keep or lose a caller's vendor parameter depending on
 its body. The edit works on the caller's spelling, so there is no fallback
 case that loses parameters.
+
+Multipart headers change only through checked doors: `MultiPartBuilder::header`
+and `MultiPart::edit_headers`, a transaction that runs the caller's closure on
+a copy and commits only if the result still describes a multipart. There is no
+`headers_mut`. One validator serves both: Content-Type must parse, be
+`multipart/*` and carry a legal RFC 2046 boundary (a missing one is added, one
+a child contains is re-rolled, an illegal one refused); the entry is then
+re-set from the parsed value, so the emitted bytes are what `boundary()` reads
+(a raw, parameterized or pre-encoded spelling cannot hide a different
+delimiter, and duplicate boundary parameters collapse to one).
+Content-Transfer-Encoding on a multipart may only be 7bit, 8bit or binary.
+`edit_headers` refuses a removed Content-Type; a builder may lack one until
+`build` supplies multipart/mixed. Repair at format time was rejected: adding a
+boundary can push an indivisible media-type token past the line limit, so it
+can only happen where refusal is reportable, and formatting stays infallible.
+Falling back to multipart/mixed was rejected because it loses the caller's
+subtype and parameters.
+
+`Message` is the delivery gate for structure the chained part API passes
+through incomplete: `MessageBuilder::multipart` / `singlepart` refuse, at any
+nesting depth, a `multipart/report` (recognized by subtype) without two or
+three children or without a token `report-type`. Standalone
+`MultiPart::formatted()` emits whatever was assembled and never panics. A
+`SinglePart` body is opaque caller-encoded bytes and is not inspected, which
+keeps pre-assembled S/MIME or report blobs sendable. For a MIME body the part
+owns the root Content-Type and Content-Transfer-Encoding (it writes them in
+the same header block as the message headers), so a message-level copy is
+refused at build and by `Message::edit_headers`, the transactional
+replacement for `Message::headers_mut`; a raw `body` keeps them on the
+message. `Message::edit_headers` does not re-derive the envelope.
 
 `SinglePartBuilder::body(String)` and `MessageBuilder::body(String)` infer `Content-Type: text/plain; charset=utf-8` when no content type is set.
 
@@ -1115,9 +1154,10 @@ TLS headers, MACs, padding and bytes buffered below the adapter are excluded.
 Absolute async setup deadlines include admission waits. Per-operation writes
 admit before arming their peer timer. Replies use cumulative peer time as
 described above; admission is excluded by construction, without extending a
-deadline after waiting. Blocking admission uses the synchronous reserve/offer
-API and sleeps the calling thread in slices of at most one second, checking
-policy between slices. No Tokio runtime is required by the blocking transport.
+deadline after waiting. Blocking admission calls
+`BandwidthBudget::blocking_admit`, which parks the calling thread until its slot
+is due and wakes it at once on a policy change. No Tokio runtime is required by
+the blocking transport.
 
 IMAP submission and IMAP connections share the account meter and one
 `BandwidthBudget`, including its inbound and outbound admission schedules.
@@ -1436,9 +1476,8 @@ errors and is not a protocol-independent computation to move into that crate.
 
 The retained message-builder error translation uses `MessageError::Display`
 for both diagnostic copies, keeping all message construction failures in the
-existing malformed-input classification. Blocking bandwidth admission remains
-in the SMTP adapter until bifrost-net supplies a blocking budget API; removing
-that wait loop would remove blocking transport throttling.
+existing malformed-input classification. Blocking bandwidth admission is owned
+by bifrost-net's `BandwidthBudget::blocking_admit`; the SMTP adapter delegates.
 
 ## Wire dialect and submission interpretation
 

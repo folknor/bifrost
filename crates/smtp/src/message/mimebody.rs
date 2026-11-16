@@ -302,27 +302,6 @@ impl MultiPartKind {
         .parse()
         .unwrap()
     }
-
-    fn from_mime(m: &Mime) -> Option<Self> {
-        match m.subtype().as_ref() {
-            "mixed" => Some(Self::Mixed),
-            "alternative" => Some(Self::Alternative),
-            "related" => Some(Self::Related),
-            "report" => m.get_param("report-type").map(|report_type| Self::Report {
-                report_type: report_type.as_str().to_owned(),
-            }),
-            "signed" => m.get_param("protocol").and_then(|p| {
-                m.get_param("micalg").map(|micalg| Self::Signed {
-                    protocol: p.as_str().to_owned(),
-                    micalg: micalg.as_str().to_owned(),
-                })
-            }),
-            "encrypted" => m.get_param("protocol").map(|p| Self::Encrypted {
-                protocol: p.as_str().to_owned(),
-            }),
-            _ => None,
-        }
-    }
 }
 
 /// Longest kind parameter value accepted, so a kind-derived Content-Type,
@@ -358,6 +337,124 @@ fn is_mime_quoted_value(value: &str) -> bool {
             .all(|byte| (b' '..=b'~').contains(&byte) && !matches!(byte, b'"' | b'\\'))
 }
 
+fn invalid(message: &str) -> crate::error::Error {
+    crate::error::Error::InvalidInput(message.to_owned())
+}
+
+/// The one structural check every multipart header change passes through:
+/// builder insertion, [`MultiPart::edit_headers`] and nothing else, since a
+/// built multipart exposes no unchecked `&mut Headers`.
+///
+/// A multipart's Content-Type must be `multipart/*` with a legal RFC 2046
+/// boundary that no child contains; a missing boundary is added, a colliding
+/// one re-rolled (as adding a child does). The entry is always re-set from the
+/// parsed value, so the bytes emitted are the spelling the typed getter and
+/// `boundary()` read: a raw, parameterized or pre-encoded Content-Type cannot
+/// carry a different delimiter on the wire, and duplicate `boundary`
+/// parameters collapse to one. Adding a boundary can push an indivisible
+/// token past the line limit, which is why this runs at a fallible boundary
+/// and never at format time. Content-Transfer-Encoding of a multipart may only
+/// be 7bit, 8bit or binary (RFC 2046 section 5.1), since the delimiters and
+/// child headers are written unencoded.
+///
+/// `require_content_type` is false only for a builder that has not set one
+/// yet; `build` supplies multipart/mixed.
+fn validate_multipart_headers(
+    headers: &mut Headers,
+    children: &[Part],
+    require_content_type: bool,
+) -> Result<(), crate::error::Error> {
+    let cte_name = ContentTransferEncoding::name();
+    if headers.get_raw(&cte_name).is_some() {
+        match headers.get::<ContentTransferEncoding>() {
+            Some(
+                encoding @ (ContentTransferEncoding::SevenBit
+                | ContentTransferEncoding::EightBit
+                | ContentTransferEncoding::Binary),
+            ) => headers.set(encoding)?,
+            _ => {
+                return Err(invalid(
+                    "multipart Content-Transfer-Encoding must be 7bit, 8bit or binary",
+                ));
+            }
+        }
+    }
+
+    let content_type_name = ContentType::name();
+    if headers.get_raw(&content_type_name).is_none() {
+        return if require_content_type {
+            Err(invalid("a multipart requires a Content-Type"))
+        } else {
+            Ok(())
+        };
+    }
+    let content_type = headers
+        .get::<ContentType>()
+        .ok_or_else(|| invalid("multipart Content-Type does not parse"))?;
+    let mime = content_type.as_ref();
+    if mime.type_() != mime::MULTIPART {
+        return Err(invalid("a multipart Content-Type must be multipart/*"));
+    }
+    let existing = match mime.get_param(mime::BOUNDARY) {
+        Some(boundary) if is_mime_boundary(boundary.as_str()) => Some(boundary.as_str().to_owned()),
+        Some(_) => {
+            return Err(invalid(
+                "multipart boundary must contain 1 to 70 RFC 2046 boundary characters and must not end in a space",
+            ));
+        }
+        None => None,
+    };
+    let mut boundary = existing.unwrap_or_else(make_boundary);
+    while children_contain_boundary(children, &boundary) {
+        boundary = make_boundary();
+    }
+    let spelled = with_boundary(mime.as_ref(), &boundary)
+        .parse::<Mime>()
+        .map_err(|_| invalid("multipart Content-Type does not accept a boundary"))?;
+    headers.set(ContentType::from_mime(spelled))
+}
+
+fn children_contain_boundary(children: &[Part], boundary: &str) -> bool {
+    let opening = format!("--{boundary}");
+    let marker = format!("\r\n{opening}");
+    children.iter().any(|part| {
+        let mut formatted = Vec::new();
+        part.format(&mut formatted);
+        formatted.starts_with(opening.as_bytes())
+            || formatted
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+    })
+}
+
+/// The delivery gate's structural check, run when a part becomes a
+/// [`Message`](crate::Message) body: every assembled `multipart/report`
+/// (found by subtype, so a missing `report-type` is caught rather than
+/// skipped) has two or three children and a token `report-type`. Standalone
+/// parts are assembly objects whose chained API passes through incomplete
+/// states, so this is not checked while building or formatting them. A
+/// `SinglePart` body is opaque caller-encoded bytes and is not inspected.
+pub(super) fn validate_for_message(part: &Part) -> Result<(), crate::error::Error> {
+    let Part::Multi(multi) = part else {
+        return Ok(());
+    };
+    if let Some(content_type) = multi.headers.get::<ContentType>()
+        && content_type.as_ref().subtype() == "report"
+    {
+        if !(2..=3).contains(&multi.parts.len()) {
+            return Err(invalid("multipart/report requires two or three body parts"));
+        }
+        if !content_type
+            .as_ref()
+            .get_param("report-type")
+            .is_some_and(|value| is_mime_token(value.as_str()))
+        {
+            return Err(invalid("multipart/report report-type must be a MIME token"));
+        }
+    }
+    multi.parts.iter().try_for_each(validate_for_message)
+}
+
 /// Multipart builder
 #[derive(Debug, Clone)]
 pub struct MultiPartBuilder {
@@ -382,18 +479,12 @@ impl MultiPartBuilder {
     /// `InvalidInput` when the header, or the Content-Type with its added
     /// boundary, cannot be encoded (see [`Headers::set`]).
     pub fn header<H: Header>(mut self, header: H) -> Result<Self, crate::error::Error> {
-        self.headers.set(header)?;
-        if let Some(content_type) = self.headers.get::<ContentType>()
-            && content_type.as_ref().get_param(mime::BOUNDARY).is_none()
-        {
-            let spelled = with_boundary(content_type.as_ref().as_ref(), &make_boundary());
-            let mime = spelled.parse::<Mime>().map_err(|_| {
-                crate::error::Error::InvalidInput(
-                    "multipart Content-Type does not accept a boundary parameter".to_owned(),
-                )
-            })?;
-            self.headers.set(ContentType::from_mime(mime))?;
-        }
+        let mut candidate = self.headers.clone();
+        candidate.set(header)?;
+        // A builder may still lack its Content-Type; `build` supplies
+        // multipart/mixed then.
+        validate_multipart_headers(&mut candidate, &[], false)?;
+        self.headers = candidate;
         Ok(self)
     }
 
@@ -430,12 +521,7 @@ impl MultiPartBuilder {
             Some(content_type) => {
                 let mime = with_boundary(content_type.as_ref().as_ref(), &boundary)
                     .parse::<Mime>()
-                    .map_err(|_| {
-                        crate::error::Error::InvalidInput(
-                            "multipart Content-Type does not accept a boundary parameter"
-                                .to_owned(),
-                        )
-                    })?;
+                    .map_err(|_| invalid("multipart Content-Type does not accept a boundary"))?;
                 self.headers.set(ContentType::from_mime(mime))?;
             }
             None => self.headers.set_known(ContentType::from_mime(
@@ -656,9 +742,26 @@ impl MultiPart {
         &self.headers
     }
 
-    /// Get a mutable reference to the headers
-    pub fn headers_mut(&mut self) -> &mut Headers {
-        &mut self.headers
+    /// Edit the headers as one transaction.
+    ///
+    /// `edit` runs on a copy; the result must still describe a multipart:
+    /// a `multipart/*` Content-Type (a missing boundary is added, one that a
+    /// child contains is re-rolled, an illegal one refused) and a
+    /// Content-Transfer-Encoding, if any, of 7bit, 8bit or binary. On an
+    /// error from `edit` or from that check the headers are left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The error `edit` returned, or `InvalidInput` for a refused edit.
+    pub fn edit_headers<F>(&mut self, edit: F) -> Result<(), crate::error::Error>
+    where
+        F: FnOnce(&mut Headers) -> Result<(), crate::error::Error>,
+    {
+        let mut candidate = self.headers.clone();
+        edit(&mut candidate)?;
+        validate_multipart_headers(&mut candidate, &self.parts, true)?;
+        self.headers = candidate;
+        Ok(())
     }
 
     /// Get message content formatted for SMTP
@@ -694,7 +797,7 @@ impl MultiPart {
     /// and the cost is quadratic in total body size.
     fn ensure_boundary_absent(&mut self, from: usize) {
         let current = self.boundary();
-        if !self.parts_contain_boundary(&current, from) {
+        if !children_contain_boundary(&self.parts[from..], &current) {
             return;
         }
 
@@ -704,7 +807,7 @@ impl MultiPart {
             .expect("a built multipart has a Content-Type with a boundary");
         loop {
             let boundary = make_boundary();
-            if !self.parts_contain_boundary(&boundary, 0) {
+            if !children_contain_boundary(&self.parts, &boundary) {
                 // Re-roll the BOUNDARY, not the whole Content-Type: the edit
                 // keeps every other parameter and the subtype as the caller
                 // spelled them, and keeps the value encodable (see
@@ -716,19 +819,6 @@ impl MultiPart {
                 return;
             }
         }
-    }
-
-    fn parts_contain_boundary(&self, boundary: &str, from: usize) -> bool {
-        let opening = format!("--{boundary}");
-        let marker = format!("\r\n{opening}");
-        self.parts[from..].iter().any(|part| {
-            let mut formatted = Vec::new();
-            part.format(&mut formatted);
-            formatted.starts_with(opening.as_bytes())
-                || formatted
-                    .windows(marker.len())
-                    .any(|window| window == marker.as_bytes())
-        })
     }
 }
 
@@ -782,19 +872,11 @@ impl PartsOk for Result<MultiPartBuilder, crate::error::Error> {
 }
 
 impl EmailFormat for MultiPart {
+    /// Infallible and never panics: an incomplete standalone
+    /// `multipart/report` is emitted as assembled. Report validity is
+    /// checked where the part becomes a `Message` body (see
+    /// `validate_for_message`).
     fn format(&self, out: &mut Vec<u8>) {
-        if self
-            .headers
-            .get::<ContentType>()
-            .and_then(|content_type| MultiPartKind::from_mime(content_type.as_ref()))
-            .is_some_and(|kind| matches!(kind, MultiPartKind::Report { .. }))
-        {
-            assert!(
-                (2..=3).contains(&self.parts.len()),
-                "multipart/report requires two or three body parts"
-            );
-        }
-
         write!(out, "{}", self.headers)
             .expect("A Write implementation panicked while formatting headers");
         out.extend_from_slice(b"\r\n");
@@ -1000,15 +1082,6 @@ mod test {
         assert!(MultiPart::try_report("message/delivery-status").is_err());
         assert!(MultiPart::try_report("delivery\r\nstatus").is_err());
         assert!(MultiPart::try_report("delivery\"status").is_err());
-    }
-
-    #[test]
-    #[should_panic(expected = "multipart/report requires two or three body parts")]
-    fn multi_part_report_rejects_wrong_part_count() {
-        let part = MultiPart::report("delivery-status".to_owned())
-            .singlepart(SinglePart::plain("Delivery failed".to_owned()));
-
-        let _ = part.formatted();
     }
 
     #[test]
@@ -1222,6 +1295,110 @@ mod test {
 
         assert!(!part.boundary().is_empty());
         assert!(!part.formatted().is_empty());
+    }
+
+    /// Every way the old unrestricted `headers_mut` could leave a multipart
+    /// that panics or forges delimiters at format time is refused or repaired
+    /// by the transaction, and a refusal leaves the headers untouched.
+    #[test]
+    fn multipart_header_edits_are_transactional() {
+        let mut part = MultiPart::mixed()
+            .boundary("BOUNDARY")
+            .singlepart(SinglePart::plain("a\r\n--COLLIDE\r\nb".to_owned()));
+        let before = part.headers().to_string();
+
+        for refused in [
+            ContentType::TEXT_PLAIN,
+            ContentType::parse(&format!("multipart/mixed; boundary={}", "a".repeat(71))).unwrap(),
+            ContentType::parse("multipart/mixed; boundary=\"ends in space \"").unwrap(),
+        ] {
+            assert!(part.edit_headers(|h| h.set(refused)).is_err());
+            assert_eq!(part.headers().to_string(), before);
+        }
+        assert!(
+            part.edit_headers(|h| {
+                h.remove::<ContentType>();
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(
+            part.edit_headers(|h| h.set(ContentTransferEncoding::Base64))
+                .is_err()
+        );
+        assert_eq!(part.headers().to_string(), before);
+
+        // A boundary-less type gets one; a colliding one is re-rolled; a
+        // raw spelling is re-set so the wire and `boundary()` agree.
+        part.edit_headers(|h| h.set(ContentType::parse("multipart/alternative").unwrap()))
+            .unwrap();
+        assert!(is_mime_boundary(&part.boundary()));
+        part.edit_headers(|h| {
+            h.insert_raw(header::HeaderValue::new(
+                ContentType::name(),
+                "multipart/related; boundary=COLLIDE; boundary=other".to_owned(),
+            ))
+        })
+        .unwrap();
+        assert_ne!(part.boundary(), "COLLIDE");
+        let wire = String::from_utf8(part.formatted()).unwrap();
+        assert_eq!(wire.matches("boundary=").count(), 1);
+        assert_eq!(wire.matches(&format!("--{}--", part.boundary())).count(), 1);
+    }
+
+    #[test]
+    fn multipart_builder_refuses_non_multipart_types_and_encodings() {
+        assert!(
+            MultiPart::builder()
+                .header(ContentType::TEXT_PLAIN)
+                .is_err()
+        );
+        assert!(
+            MultiPart::builder()
+                .header(ContentTransferEncoding::QuotedPrintable)
+                .is_err()
+        );
+        assert!(
+            MultiPart::builder()
+                .header(ContentTransferEncoding::SevenBit)
+                .is_ok()
+        );
+    }
+
+    /// Report cardinality moved from a format-time panic to the Message gate.
+    #[test]
+    fn incomplete_reports_are_refused_at_the_message_gate() {
+        let from = || {
+            crate::Message::builder()
+                .from("a@example.org".parse().unwrap())
+                .to("b@example.org".parse().unwrap())
+        };
+        let one = MultiPart::report("delivery-status".to_owned())
+            .singlepart(SinglePart::plain("x".to_owned()));
+        assert!(!one.formatted().is_empty());
+        assert!(from().multipart(one.clone()).is_err());
+        assert!(
+            from()
+                .multipart(MultiPart::mixed().multipart(one.clone()))
+                .is_err()
+        );
+        let two = one.clone().singlepart(SinglePart::plain("y".to_owned()));
+        assert!(from().multipart(two.clone()).is_ok());
+
+        let mut bad_type = two.clone();
+        bad_type
+            .edit_headers(|h| {
+                h.set(ContentType::parse("multipart/report; report-type=\"bad/type\"").unwrap())
+            })
+            .unwrap();
+        assert!(from().multipart(bad_type).is_err());
+
+        assert!(
+            from()
+                .header(ContentType::TEXT_PLAIN)
+                .multipart(two)
+                .is_err()
+        );
     }
 
     #[test]

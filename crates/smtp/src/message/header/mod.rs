@@ -304,6 +304,8 @@ impl PartialEq<HeaderName> for &str {
 enum Grammar {
     Unstructured,
     MessageIds,
+    PhraseList,
+    ListId,
     Structured,
     Raw,
     /// Display name and addr-spec per mailbox.
@@ -353,6 +355,16 @@ impl HeaderValue {
     /// Space-separated message identifiers, already bracketed.
     pub fn message_ids(name: HeaderName, ids: String) -> Self {
         Self::with_grammar(name, ids, Grammar::MessageIds)
+    }
+
+    /// Comma-separated RFC 5322 phrases.
+    pub fn phrase_list(name: HeaderName, text: String) -> Self {
+        Self::with_grammar(name, text, Grammar::PhraseList)
+    }
+
+    /// Optional display phrase and an angle-bracketed list identifier.
+    pub fn list_id(name: HeaderName, text: String) -> Self {
+        Self::with_grammar(name, text, Grammar::ListId)
     }
 
     /// An ASCII structured value emitted verbatim and folded at whitespace;
@@ -418,6 +430,8 @@ impl HeaderValue {
         let value = match &self.grammar {
             Grammar::Unstructured => Wire::Unstructured(raw),
             Grammar::MessageIds => Wire::MessageIds(raw),
+            Grammar::PhraseList => Wire::PhraseList(raw),
+            Grammar::ListId => Wire::ListId(raw),
             Grammar::Structured => Wire::Structured(raw),
             Grammar::Raw => Wire::Raw(raw),
             Grammar::Addresses(owned) => {

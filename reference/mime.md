@@ -127,6 +127,14 @@ non-ASCII or control octets become encoded words and the result folds at
 78, while an ASCII word is never encoded, so one past 998 octets is refused.
 `PreEncoded` validates the same framing and refuses rather than normalizes.
 
+`PhraseList` encodes Keywords phrases independently, separating commas only
+outside quoted strings and nested comments. Quoted-pairs are decoded before
+phrase encoding. ASCII comments retain their grammar; controls and non-ASCII
+in comments are refused. `ListId` encodes an optional display phrase, keeping
+its required ASCII angle-bracketed dot-atom identifier structural. Empty list
+items, unfinished syntax and invalid identifiers fail locally. Long phrases
+encode; an identifier too long for a physical line fails.
+
 `bifrost-smtp`'s `message` builder writes every header through
 `write_header` (see `reference/smtp.md`), and mints its Date with
 `format_rfc5322_date`. Envelope derivation is shared as well (its

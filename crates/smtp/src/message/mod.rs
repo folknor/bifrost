@@ -449,6 +449,10 @@ impl MessageBuilder {
         if let Some(invalid) = self.invalid.take() {
             return Err(EmailError::InvalidInput(invalid));
         }
+        if let MessageBody::Mime(part) = &body {
+            check_root_entity_owner(&self.headers, &body)?;
+            mimebody::validate_for_message(part)?;
+        }
         // Check for missing required headers
         // https://tools.ietf.org/html/rfc5322#section-3.6
 
@@ -601,9 +605,27 @@ impl Message {
         &self.headers
     }
 
-    /// Get a mutable reference to the headers
-    pub fn headers_mut(&mut self) -> &mut Headers {
-        &mut self.headers
+    /// Edit the headers as one transaction.
+    ///
+    /// `edit` runs on a copy, which replaces the headers only if it succeeds
+    /// and, for a MIME body, adds no message-level Content-Type or
+    /// Content-Transfer-Encoding (the body part writes those itself, so a
+    /// second one would give the root entity two conflicting declarations).
+    /// The envelope is not re-derived.
+    ///
+    /// # Errors
+    ///
+    /// The error `edit` returned, or `InvalidInput` for a refused edit; the
+    /// headers are then unchanged.
+    pub fn edit_headers<F>(&mut self, edit: F) -> Result<(), EmailError>
+    where
+        F: FnOnce(&mut Headers) -> Result<(), EmailError>,
+    {
+        let mut candidate = self.headers.clone();
+        edit(&mut candidate)?;
+        check_root_entity_owner(&candidate, &self.body)?;
+        self.headers = candidate;
+        Ok(())
     }
 
     /// Get `Message` envelope
@@ -708,6 +730,26 @@ impl Default for MessageBuilder {
     fn default() -> Self {
         MessageBuilder::new()
     }
+}
+
+/// A MIME body part writes the root entity's Content-Type and
+/// Content-Transfer-Encoding right after the message headers, in the same
+/// header block, so the part owns them; a message-level copy would be a
+/// second, conflicting declaration. A raw body has no part, so the message
+/// headers own them there.
+fn check_root_entity_owner(headers: &Headers, body: &MessageBody) -> Result<(), EmailError> {
+    if matches!(body, MessageBody::Mime(_))
+        && (headers.get_raw(&header::ContentType::name()).is_some()
+            || headers
+                .get_raw(&header::ContentTransferEncoding::name())
+                .is_some())
+    {
+        return Err(EmailError::InvalidInput(
+            "a MIME body declares its own Content-Type and Content-Transfer-Encoding; set them on the part, not the message"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Create a random message id.

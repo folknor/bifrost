@@ -137,9 +137,8 @@ text_header!(
 text_header!(
     /// `Keywords` header. Should contain a comma-separated list of one or more
     /// words or quoted-strings, defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.5)
-    /// The phrase list is stored unparsed, so it takes the caller-spelling
-    /// rule of [`HeaderValue::new`].
-    Header(Keywords, "Keywords", new)
+    /// Display phrases use the shared phrase-list writer.
+    Header(Keywords, "Keywords", phrase_list)
 );
 text_header!(
     /// `In-Reply-To` header. Contains one or more
@@ -165,8 +164,8 @@ text_header!(
 );
 text_header!(
     /// `List-Id` header, defined in [RFC2919](https://www.rfc-editor.org/rfc/rfc2919)
-    /// Stored unparsed: the caller-spelling rule of [`HeaderValue::new`].
-    Header(ListId, "List-ID", new)
+    /// The display phrase is encoded separately from the list identifier.
+    Header(ListId, "List-ID", list_id)
 );
 list_url_header!(
     /// `List-Help` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
@@ -244,6 +243,61 @@ mod test {
 
     use super::{ListId, ListPost, ListUnsubscribe, ListUnsubscribePost, Subject};
     use crate::message::header::{Header, HeaderName, HeaderValue, Headers};
+
+    #[test]
+    fn typed_phrases_encode_long_words_and_keep_structure() {
+        let word = "x".repeat(1200);
+        let mut headers = Headers::new();
+        headers
+            .set(super::Keywords::from(format!(
+                "{word}, \"sales, west\" (team, one)"
+            )))
+            .unwrap();
+
+        let wire = headers.to_string();
+        assert!(wire.contains("=?UTF-8?B?"));
+        assert!(wire.contains("\"sales, west\""));
+        assert!(wire.replace("\r\n", "").contains("(team, one)"));
+
+        assert!(wire.split("\r\n").all(|line| line.len() <= 998));
+    }
+
+    #[test]
+    fn typed_phrases_list_id_encodes_only_the_display_phrase() {
+        let word = "x".repeat(1200);
+        let mut headers = Headers::new();
+        headers
+            .set(ListId::from(format!("{word} <users.example.com>")))
+            .unwrap();
+        let wire = headers.to_string();
+        assert!(wire.contains("=?UTF-8?B?"));
+        assert!(wire.contains("<users.example.com>"));
+        assert!(wire.split("\r\n").all(|line| line.len() <= 998));
+        assert_eq!(
+            headers.get::<ListId>().unwrap().as_ref(),
+            format!("{word} <users.example.com>")
+        );
+    }
+
+    #[test]
+    fn typed_phrases_refuse_unfinished_syntax_and_identifier_encoding() {
+        let mut headers = Headers::new();
+        assert!(
+            headers
+                .set(super::Keywords::from("\"unfinished".to_owned()))
+                .is_err()
+        );
+        assert!(
+            headers
+                .set(ListId::from("Name <bad id>".to_owned()))
+                .is_err()
+        );
+        assert!(
+            headers
+                .set(ListId::from(format!("Name <{}>", "x".repeat(1200))))
+                .is_err()
+        );
+    }
 
     #[test]
     fn format_ascii() {

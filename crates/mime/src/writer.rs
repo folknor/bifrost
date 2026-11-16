@@ -13,6 +13,10 @@ use bifrost_types::error::AccountError;
 pub enum HeaderValue<'a> {
     /// Subject-like text; RFC 2047 is legal here.
     Unstructured(&'a str),
+    /// Comma-separated phrases, with quoted strings and quoted-pairs.
+    PhraseList(&'a str),
+    /// An optional display phrase followed by an ASCII angle-bracketed list id.
+    ListId(&'a str),
     /// Validated mailbox values, with optional display names.
     Addresses(&'a [Address]),
     /// Space-separated message identifiers, already bracketed when required.
@@ -120,6 +124,28 @@ pub fn write_header(name: &str, value: HeaderValue<'_>) -> Result<String, Accoun
     let structured = !matches!(value, HeaderValue::Unstructured(_) | HeaderValue::Raw(_));
     let value = match value {
         HeaderValue::Unstructured(text) => encode_header_value(text),
+        HeaderValue::PhraseList(text) => phrase_list(text)?,
+        HeaderValue::ListId(text) => {
+            let text = sanitize_header(text);
+            let (phrase, id) = text
+                .rsplit_once('<')
+                .ok_or_else(|| malformed("List-ID requires an angle identifier"))?;
+            let id = id
+                .strip_suffix('>')
+                .ok_or_else(|| malformed("Unfinished List-ID"))?;
+            if id
+                .split('.')
+                .any(|atom| atom.is_empty() || !atom.bytes().all(is_atext))
+            {
+                return Err(malformed("Invalid List-ID identifier"));
+            }
+            let phrase = phrase.trim();
+            if phrase.is_empty() {
+                format!("<{id}>")
+            } else {
+                format!("{} <{id}>", phrase_list_item(phrase)?)
+            }
+        }
         HeaderValue::Addresses(addresses) => {
             for address in addresses {
                 refuse_controls(&address.address, false)?;
@@ -184,6 +210,98 @@ pub fn write_header(name: &str, value: HeaderValue<'_>) -> Result<String, Accoun
         }
     };
     fold(name, &value.replace("\r\n ", " "), structured)
+}
+
+// Decode quoted-pairs before encoding a phrase; syntax must never become
+// part of an encoded display name. Comments retain their own grammar.
+fn phrase_list_item(text: &str) -> Result<String, AccountError> {
+    let mut plain = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut comment = String::new();
+    let mut pieces = Vec::new();
+    for ch in text.chars() {
+        if depth > 0 {
+            comment.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    refuse_controls(&comment, true)?;
+                    pieces.push(std::mem::take(&mut comment));
+                }
+            }
+            continue;
+        }
+        if !quoted && ch == '(' {
+            if !plain.trim().is_empty() {
+                pieces.push(encode_phrase(plain.trim()));
+                plain.clear();
+            }
+            depth = 1;
+            comment.push(ch);
+            continue;
+        }
+        if escaped {
+            plain.push(ch);
+            escaped = false;
+        } else if quoted && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if !quoted
+            && ch.is_ascii()
+            && !is_atext(ch as u8)
+            && ch != ' '
+            && ch != '\t'
+            && ch != '.'
+            && !is_control(ch as u8)
+        {
+            return Err(malformed("Invalid phrase syntax"));
+        } else {
+            plain.push(ch);
+        }
+    }
+    if quoted || escaped || depth != 0 || (plain.trim().is_empty() && pieces.is_empty()) {
+        return Err(malformed("Empty or unfinished phrase"));
+    }
+    if !plain.trim().is_empty() {
+        pieces.push(encode_phrase(plain.trim()));
+    }
+    Ok(pieces.join(" "))
+}
+
+fn phrase_list(text: &str) -> Result<String, AccountError> {
+    let text = sanitize_header(text);
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut start = 0;
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if (quoted || depth > 0) && ch == '\\' {
+            escaped = true;
+        } else if !quoted && ch == '(' {
+            depth += 1;
+        } else if depth > 0 && ch == ')' {
+            depth -= 1;
+        } else if depth == 0 && ch == '"' {
+            quoted = !quoted;
+        } else if !quoted && depth == 0 && ch == ',' {
+            items.push(phrase_list_item(text[start..index].trim())?);
+            start = index + 1;
+        }
+    }
+    items.push(phrase_list_item(text[start..].trim())?);
+    Ok(items.join(", "))
 }
 
 fn fold(name: &str, value: &str, structured: bool) -> Result<String, AccountError> {
