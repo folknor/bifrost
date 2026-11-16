@@ -312,7 +312,7 @@ impl AccountFactory for JmapAccountFactory {
             );
 
             Ok(OpenedAccount {
-                account: Arc::new(account) as Arc<dyn Account>,
+                account: bifrost_types::ClosingAccount::wrap(Arc::new(account) as Arc<dyn Account>),
                 skipped_scopes,
             })
         })

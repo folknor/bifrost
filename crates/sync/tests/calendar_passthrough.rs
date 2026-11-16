@@ -500,7 +500,7 @@ impl AccountFactory for Factory {
     fn open(&self, _: AccountId) -> AccountFuture<Result<OpenedAccount, AccountError>> {
         let account = Arc::clone(&self.0);
         let account: Arc<dyn Account> = account;
-        Box::pin(async move { Ok(OpenedAccount::complete(account)) })
+        Box::pin(async move { Ok(OpenedAccount::complete(ClosingAccount::wrap(account))) })
     }
 }
 
@@ -591,4 +591,31 @@ async fn calendar_rsvp_forwards_present_and_absent_versions() {
     }
     assert_eq!(account.calls.lock().unwrap().len(), 2);
     engine.detach(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn calendar_factory_refuses_after_unpolled_close_without_forwarding() {
+    let provider = Arc::new(CalendarAccount {
+        inner: common::StubAccount::new(Vec::new()),
+        degraded: false,
+        calls: Mutex::new(Vec::new()),
+    });
+    let opened = Factory(Arc::clone(&provider))
+        .open(AccountId("calendar-closed".into()))
+        .await
+        .unwrap();
+    let pending =
+        opened
+            .account
+            .event_rsvp_if_version(EventId("event".into()), RsvpStatus::Declined, None);
+    drop(opened.account.close());
+    let error = pending.await.unwrap_err();
+    assert_eq!(error.kind(), &AccountErrorKind::AccountClosed);
+    let error = opened
+        .account
+        .event_rsvp_if_version(EventId("event".into()), RsvpStatus::Declined, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), &AccountErrorKind::AccountClosed);
+    assert!(provider.calls.lock().unwrap().is_empty());
 }

@@ -211,7 +211,7 @@ impl ImapAccountFactory {
         Box::pin(async move {
             let (account, skipped_scopes) = opening.await?;
             Ok(OpenedAccount {
-                account: Arc::new(account) as Arc<dyn Account>,
+                account: bifrost_types::ClosingAccount::wrap(Arc::new(account) as Arc<dyn Account>),
                 skipped_scopes,
             })
         })
@@ -236,7 +236,9 @@ impl ImapAccountFactory {
             let poller = super::ImapPoller::new(account.clone());
             Ok((
                 OpenedAccount {
-                    account: Arc::new(account) as Arc<dyn Account>,
+                    account: bifrost_types::ClosingAccount::wrap(
+                        Arc::new(account) as Arc<dyn Account>
+                    ),
                     skipped_scopes,
                 },
                 poller,

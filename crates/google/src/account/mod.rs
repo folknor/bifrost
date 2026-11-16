@@ -220,7 +220,9 @@ impl AccountFactory for GoogleAccountFactory {
             match GoogleAccount::open(Arc::clone(&client), pubsub).await {
                 // Single-namespace account: open probes only the
                 // principal's own profile, so nothing can be skipped.
-                Ok(account) => Ok(OpenedAccount::complete(account as Arc<dyn Account>)),
+                Ok(account) => Ok(OpenedAccount::complete(
+                    bifrost_types::ClosingAccount::wrap(account as Arc<dyn Account>),
+                )),
                 Err(error) => {
                     client.detach_account();
                     Err(error)

@@ -1,5 +1,15 @@
 # bifrost-carddav reference
 
+Factory-returned accounts have `bifrost_types::ClosingAccount` as their
+outermost boundary. The shared `Account::close` contract governs admission:
+calling close synchronously shuts admission, and work first polled afterward
+refuses with `AccountClosed` / terminal `Cancelled`, including inherited
+unsupported methods and new streams. Pure accessors and cursor classification
+remain available. Admitted work retains provider shutdown behavior and
+transmission evidence. Provider transport and resource guards remain in place
+for work admitted before close; an enterprise user removing an account expects
+new work to stop without hiding the outcome of an already admitted write.
+
 DAV status errors and generic net failures use `bifrost_net::classify_status`
 with the same declared policy: a dialect resource hint and a 423 conflict
 override. Shared 409/412 conflicts refresh state, 400/422 are malformed
@@ -747,8 +757,8 @@ All mail, filter, blob, push subscription CRUD, calendar, and settings methods r
 `push_lanes` is empty. Every lane passed to `push_stream` fails with
 `Internal(AccountContract)` because this account has no push lane.
 `scope_lifecycle_stream` emits no events and stays pending until `close()`.
-Closing wakes all lifecycle subscribers; subscriptions created after close end
-immediately. Repeated close calls succeed.
+Closing wakes admitted lifecycle subscribers; new subscriptions through the
+factory-returned gate terminate with `AccountClosed`. Repeated close calls succeed.
 `set_priority` and `set_bandwidth_cap` forward to `client.net()`, the crate's
 `AccountNet` handle, so DAV traffic is scheduled and metered like every other
 HTTP protocol crate's. A CardDAV leg composed into an IMAP-shaped account is

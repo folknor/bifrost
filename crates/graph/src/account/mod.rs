@@ -511,7 +511,7 @@ impl AccountFactory for GraphAccountFactory {
             // than letting it re-walk the same hierarchy moments later.
             *account.open_folder_seed.write().await = Some(folders);
             Ok(OpenedAccount {
-                account: Arc::new(account) as Arc<dyn Account>,
+                account: bifrost_types::ClosingAccount::wrap(Arc::new(account) as Arc<dyn Account>),
                 skipped_scopes,
             })
         })

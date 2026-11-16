@@ -1,5 +1,15 @@
 # bifrost-google reference
 
+Factory-returned accounts have `bifrost_types::ClosingAccount` as their
+outermost boundary. The shared `Account::close` contract governs admission:
+calling close synchronously shuts admission, and work first polled afterward
+refuses with `AccountClosed` / terminal `Cancelled`, including inherited
+unsupported methods and new streams. Pure accessors and cursor classification
+remain available. Admitted work retains provider shutdown behavior and
+transmission evidence. Provider transport and resource guards remain in place
+for work admitted before close; an enterprise user removing an account expects
+new work to stop without hiding the outcome of an already admitted write.
+
 Closed-account refusals, including push registration, use the shared
 `AccountClosed` / terminal `Cancelled` classification. Active operations interrupted
 by shutdown retain their existing transmission evidence and recovery.

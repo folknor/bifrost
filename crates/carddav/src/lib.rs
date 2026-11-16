@@ -100,7 +100,7 @@ impl AccountFactory for CardDavAccountFactory {
             // users expect all collections to sync, so a successful open has
             // no collection-limit gaps to report.
             Ok(OpenedAccount {
-                account: Arc::new(account) as Arc<dyn Account>,
+                account: bifrost_types::ClosingAccount::wrap(Arc::new(account) as Arc<dyn Account>),
                 skipped_scopes: Vec::new(),
             })
         })

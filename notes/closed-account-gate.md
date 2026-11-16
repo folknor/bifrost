@@ -1,7 +1,7 @@
 # Closed-account gate: one admission boundary for every Account method
 
 Design chain for the closed-account bullet of the wave 10 to 16 residue in
-`notes/bugs.md`. Sparred and agreed; link 1 built, links 2 to 4 not yet.
+`notes/bugs.md`. Sparred and agreed; links 1 and 2 built, links 3 and 4 not yet.
 
 ## Problem
 
@@ -98,6 +98,32 @@ gated method, as `run_resume_with_broadcast` returns `NoCursor`. Fencing a
 local cursor install after close is the engine's lifecycle concern, not the
 wrapper's, and changing classification is the wrong mechanism for it.
 
+### Ruling: retain provider shutdown guards (link 2)
+
+The wrapper covers new admission, not every later shutdown check. No existing
+provider refusal was proven redundant across its whole use:
+
+- IMAP send and draft guards run after acquiring the send lock, so close may
+  win after wrapper admission; raw fetch checks run within admitted streams.
+  Polling EXAMINE also serves the separately published `ImapPoller`, which is
+  deliberately not an `Account` and cannot be covered by this wrapper.
+- JMAP push registration checks closed under its subscription locks. Graph
+  and Google push guards protect lease exchange, task and registration
+  ownership, including work already admitted while open.
+- Google's future adapter keeps both its initial shutdown check and its
+  cancellation race. Close can occur between wrapper admission and the
+  adapter's first poll; removing the initial check changes a local refusal
+  into an ambiguous in-flight failure. Its stream adapter still governs
+  admitted streams, which link 3 will address.
+
+Retain these guards and their transport counterparts. An enterprise user
+removing an account expects no late lease or send to escape teardown, and
+expects an admitted write's actual transmission evidence to survive. This
+link changes only the outer admission boundary, not admitted-work policy.
+The hand-written calendar forwarder remains a provider implementation;
+putting the gate in its test factory exercises provider overrides through
+the same outer boundary as production factories.
+
 ## Link plan
 
 Each link is one commit with its own gate.
@@ -107,12 +133,16 @@ Each link is one commit with its own gate.
    ablation-checked). A method added without a policy is a macro compile error;
    no trybuild test pins that, since the workspace has no compile-fail
    harness.
-2. (Large) Wire every factory (IMAP, JMAP, Graph, Google, CalDAV, CardDAV) to
-   return `ClosingAccount::wrap(..)` as the outermost account. Delete the
-   per-crate refusals the wrapper now owns only where the wrapper provably
-   covers them (keep transport gates). Update provider references to point at
-   the `Account::close` contract. Check the sync test doubles that hand-forward
-   `Account` (`crates/sync/tests/calendar_passthrough.rs`) still make sense.
+2. Built: all six factories return `ClosingAccount::wrap(..)` outermost,
+   including both IMAP `open` and `open_with_poller`. Provider references
+   describe the shared `Account::close` contract. The calendar passthrough
+   test factory now wraps its hand-written provider forwarder too; its
+   provider overrides remain inside the gate. A hermetic regression checks
+   that a calendar call constructed before close and one constructed after
+   close both refuse without invoking the provider, even when the close
+   future is dropped unpolled. Existing provider guards remain as ruled above.
+   Validation results are recorded below. No implementation work remains for
+   this link; the separate gate/commit agent owns the final workspace gate.
 3. (Medium) Stream termination policy for ADMITTED streams per stream kind
    (drain or end when close lands mid-stream), with tests that a closed
    inventory stream never reports completion. Link 1 decides only refusal
@@ -126,3 +156,17 @@ share one teardown (Google returns `Ok` at once on a repeated close while the
 first is still awaiting its watch teardown; Graph's `PushTasks::join` takes the
 handles, so a concurrent close can finish without waiting). That is a provider
 close-contract question; see `notes/todo.md`.
+
+## Link 2 validation
+
+- `brokkr test -p bifrost-sync calendar_factory_refuses_after_unpolled_close_without_forwarding --sweep workspace`
+  passed. Removing only the calendar test factory's wrapper made that exact
+  test fail: the preconstructed RSVP returned `Ok(())` after close. The
+  wrapper was restored before the gate.
+- `brokkr check -p bifrost-imap -p bifrost-jmap -p bifrost-graph -p bifrost-google -p bifrost-caldav -p bifrost-carddav -p bifrost-sync`
+  passed: clippy and 14,959 tests across five sweeps, 1m53s total.
+  This was deliberately package-scoped because other agents are editing the
+  tree; final workspace validation and commit belong to the separate gate
+  agent. `git diff --check` also passed.
+- No decision handed back. Link 3 (medium) and link 4 (small) remain as listed;
+  no extra implementation work was added to the plan.

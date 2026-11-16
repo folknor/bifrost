@@ -1,5 +1,15 @@
 # bifrost-imap reference
 
+Factory-returned accounts have `bifrost_types::ClosingAccount` as their
+outermost boundary. The shared `Account::close` contract governs admission:
+calling close synchronously shuts admission, and work first polled afterward
+refuses with `AccountClosed` / terminal `Cancelled`, including inherited
+unsupported methods and new streams. Pure accessors and cursor classification
+remain available. Admitted work retains provider shutdown behavior and
+transmission evidence. Provider transport and resource guards remain in place
+for work admitted before close; an enterprise user removing an account expects
+new work to stop without hiding the outcome of an already admitted write.
+
 Explicit account-shutdown guards in send, draft send, raw blob fetch and
 polling EXAMINE use `AccountClosed` / terminal `Cancelled`. Ordinary connection
 closure retains its transport classification and transmission evidence.

@@ -1,5 +1,15 @@
 # bifrost-jmap reference
 
+Factory-returned accounts have `bifrost_types::ClosingAccount` as their
+outermost boundary. The shared `Account::close` contract governs admission:
+calling close synchronously shuts admission, and work first polled afterward
+refuses with `AccountClosed` / terminal `Cancelled`, including inherited
+unsupported methods and new streams. Pure accessors and cursor classification
+remain available. Admitted work retains provider shutdown behavior and
+transmission evidence. Provider transport and resource guards remain in place
+for work admitted before close; an enterprise user removing an account expects
+new work to stop without hiding the outcome of an already admitted write.
+
 Push subscription refused by the closed-account gate uses the shared
 `AccountClosed` / terminal `Cancelled` classification, with account scope.
 
@@ -945,7 +955,7 @@ Buffered request counts reach the client through `ReqwestTransport::api_request_
 
 A guarded bulk batch can require up to four API requests: an initial state probe, `Email/set`, a re-probe after `stateMismatch`, and one retry. For JSON sync paths, each batch emitted after a method-level error carries the measured response bytes; a transport-level error terminates without a batch. Blob streams instead account complete chunks as they are yielded and leave any failed tail out of batch accounting. See "Foreign (shared/delegate) accounts" below.
 
-Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountFactory::open` again. `close()` cancels the shutdown token (ending any push session, which observes it at every await, and in-flight streams) and disables push. The disable is bounded by `ReconnectPolicy::connect_timeout`: a WebSocket sink write parks indefinitely on a half-open socket, and teardown blocking there would block the engine's reopen on a connection that is already gone. An unsubscribe that times out is not a close failure (the server drops the subscription with the connection). There is no reader task to join: the engine drains its push sessions before it closes a replaced account, and a session that outlives the drain bound is dropped. The `closed` flag makes a repeated `close()` a no-op and refuses a later push subscribe with `AccountClosed`; other `Account` methods do not read it and still dispatch after close. Cancellation safety relies on the shared `CancellationToken` plus `tokio::select!`; no `Account` method holds non-cancel-safe state across an await.
+Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountFactory::open` again. `close()` cancels the shutdown token (ending any push session, which observes it at every await, and in-flight streams) and disables push. The disable is bounded by `ReconnectPolicy::connect_timeout`: a WebSocket sink write parks indefinitely on a half-open socket, and teardown blocking there would block the engine's reopen on a connection that is already gone. An unsubscribe that times out is not a close failure (the server drops the subscription with the connection). There is no reader task to join: the engine drains its push sessions before it closes a replaced account, and a session that outlives the drain bound is dropped. The `closed` flag makes a repeated `close()` a no-op and refuses a later push subscribe with `AccountClosed`; other provider methods do not read it, while the outer factory-returned gate refuses new work after close. Cancellation safety relies on the shared `CancellationToken` plus `tokio::select!`; no `Account` method holds non-cancel-safe state across an await.
 
 ### Capabilities advertised
 
