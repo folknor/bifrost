@@ -1247,6 +1247,24 @@ fn payload_limits_are_refusals_with_native_evidence() {
 }
 
 #[test]
+fn metadata_response_codes_reach_telemetry_as_their_wire_cause_name() {
+    for (code, expected) in [
+        (ResponseCode::MetadataLongEntries(5), "METADATA-LONGENTRIES"),
+        (ResponseCode::MetadataMaxSize(10), "METADATA-MAXSIZE"),
+        (ResponseCode::MetadataTooMany, "METADATA-TOOMANY"),
+        (ResponseCode::MetadataNoPrivate, "METADATA-NOPRIVATE"),
+    ] {
+        let wire = ImapResponseCode::from(&code);
+        assert_eq!(wire.code(), expected);
+        let error = into_account_error(
+            Error::no_with_code("metadata".into(), Some(code)),
+            ImapErrorContext::operation(AccountOperation::Discover),
+        );
+        assert_eq!(error.telemetry_fields().native_code, Some(expected));
+    }
+}
+
+#[test]
 fn local_result_budgets_are_internal_limits_with_accurate_attempts() {
     use crate::error::ResultLimit;
     for (limit, state) in [

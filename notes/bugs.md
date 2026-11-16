@@ -113,17 +113,6 @@ its own variant, with a test over every `SetErrorType` and `MethodErrorType`
 spelling against `JmapMethod::code()`. Not fixed with the vocabulary change
 because the file was mid-edit by another item.
 
-## BUG-178 - IMAP `[METADATA ...]` native codes fail the telemetry token check
-
-**Reported by:** the provider-vocabulary consolidation (scout, by reading).
-
-`ImapResponseCode::code()` spells the four METADATA codes with an embedded
-space (`METADATA LONGENTRIES` and so on), and IMAP account translation uses
-that as `native_code`. `TelemetryToken::new` admits only `is_ascii_graphic`
-bytes, so the code is dropped from telemetry and demoted to support text. Not
-executed; confirm with a test, then pick a token spelling for the telemetry
-field (the wire cause can keep the RFC spelling).
-
 ## BUG-190 - Graph webhook subscriptions collide with Graph's duplicate rule across handles and on reattach
 
 **Reported by:** the Graph calendar and contact scope discovery work (spar review).

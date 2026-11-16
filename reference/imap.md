@@ -2157,7 +2157,9 @@ an outage to retry without asking for a replacement password.
 `types::response` owns `From<&ResponseCode>` into `ImapResponseCode`.
 The latter's public `code()` owns diagnostic wire names. Both auth and status
 classification derive `native_code` from that projection, including the actual
-server name of an unknown extension response code.
+server name of an unknown extension response code. Named codes are single
+telemetry tokens, so the RFC 5464 `METADATA <sub>` codes are hyphen-joined
+(`METADATA-MAXSIZE`); a limit argument rides as support-only text.
 
 ## Shared role and ACL classifiers
 

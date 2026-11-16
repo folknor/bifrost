@@ -1003,7 +1003,13 @@ retains its existing provider, protocol and wire identities.
 `ImapResponseCode::code()` exposes the diagnostic response-code name, including
 the retained server name for `Unknown`. IMAP's protocol type owns conversion
 into this shared vocabulary; account translation uses the same projection for
-wire causes and `native_code`.
+wire causes and `native_code`, so for IMAP the error's `native_code` is the
+canonical name, not the received bytes. Every named variant's name is a single
+telemetry token: RFC 5464's two-word `METADATA <sub>` codes are spelled
+`METADATA-LONGENTRIES`, `METADATA-MAXSIZE`, `METADATA-TOOMANY` and
+`METADATA-NOPRIVATE`, because a space fails the `TelemetryToken` check and
+would drop the code from telemetry. The numeric limit of `MAXSIZE` and
+`LONGENTRIES` rides as support-only text in the wire spelling.
 
 SMTP `EnhancedStatusCode::components` preserves the optional numeric
 (class, subject, detail) triple independently of consent-tier diagnostics.

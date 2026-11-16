@@ -1058,7 +1058,9 @@ pub enum ImapResponseCode {
 }
 
 impl ImapResponseCode {
-    /// Response-code name, retaining the server spelling for unknown codes.
+    /// Canonical diagnostic response-code name, retaining the server spelling
+    /// for unknown codes. Every named variant's name is a valid telemetry
+    /// token.
     pub fn code(&self) -> &str {
         match self {
             Self::Alert => "ALERT",
@@ -1117,10 +1119,16 @@ impl ImapResponseCode {
             Self::TooBig => "TOOBIG",
             Self::CompressionActive => "COMPRESSIONACTIVE",
             Self::UseAttr => "USEATTR",
-            Self::MetadataLongEntries => "METADATA LONGENTRIES",
-            Self::MetadataMaxSize => "METADATA MAXSIZE",
-            Self::MetadataTooMany => "METADATA TOOMANY",
-            Self::MetadataNoPrivate => "METADATA NOPRIVATE",
+            // RFC 5464 puts these on the wire as `METADATA <sub>`, an atom
+            // plus an argument. The diagnostic name joins them with a hyphen
+            // so it is a single token: IMAP translation uses `code()` as the
+            // error's `native_code`, and the telemetry token check refuses a
+            // space, which dropped all four codes from telemetry. The numeric
+            // limits ride as support-only payload text in the wire spelling.
+            Self::MetadataLongEntries => "METADATA-LONGENTRIES",
+            Self::MetadataMaxSize => "METADATA-MAXSIZE",
+            Self::MetadataTooMany => "METADATA-TOOMANY",
+            Self::MetadataNoPrivate => "METADATA-NOPRIVATE",
             Self::Unknown { code, .. } => code.as_str(),
         }
     }
