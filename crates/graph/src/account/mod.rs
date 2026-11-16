@@ -307,9 +307,13 @@ pub struct GraphAccountFactory {
     shared_mailboxes: Vec<String>,
     public_folders: Option<PublicFolderScope>,
     delegate_discovery: bool,
-    /// Handed to every account this factory opens; see
-    /// `push::WebhookRegistry`.
-    recreated_subscription_ids: push::RecreatedSubscriptionIds,
+    /// The webhook subscription rows every account this factory opens
+    /// shares. Graph allows one subscription per resource, and a reopen
+    /// subscribes on the replacement account while the old one still holds
+    /// its rows; see `push::WebhookStore`. One factory per account is
+    /// therefore the contract: two factories for the same credentials do not
+    /// share rows and collide on Graph's duplicate rule.
+    webhook_store: Arc<push::WebhookStore>,
 }
 
 impl GraphAccountFactory {
@@ -321,7 +325,7 @@ impl GraphAccountFactory {
             shared_mailboxes: Vec::new(),
             public_folders: None,
             delegate_discovery: false,
-            recreated_subscription_ids: Arc::default(),
+            webhook_store: Arc::default(),
         }
     }
 
@@ -427,7 +431,7 @@ impl AccountFactory for GraphAccountFactory {
         let shared_mailboxes = self.shared_mailboxes.clone();
         let public_folders = self.public_folders.clone();
         let delegate_discovery = self.delegate_discovery;
-        let recreated_subscription_ids = Arc::clone(&self.recreated_subscription_ids);
+        let webhook_store = Arc::clone(&self.webhook_store);
         Box::pin(async move {
             client.attach_account(account_id);
             let profile = client.get_profile().await.map_err(|e| {
@@ -451,9 +455,7 @@ impl AccountFactory for GraphAccountFactory {
                 public_folders,
                 user_email.clone(),
             );
-            account
-                .webhooks
-                .set_recreated_ids(recreated_subscription_ids);
+            account.webhooks = push::WebhookRegistry::attached(webhook_store);
 
             // Opt-in delegate enumeration: additive to config-supplied
             // shared mailboxes, deduped by routing key. Autodiscover is a
@@ -1635,37 +1637,31 @@ mod tests {
             crate::client::ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
         ]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-        account.webhooks.groups_for_tests().write().await.insert(
-            bifrost_types::SubscriptionHandle("h".to_string()),
-            push::GraphSubscriptionGroup::live(vec![
-                push::GraphSubscriptionState {
-                    server_id: "one".to_string(),
-                    expires_at: "2099-01-01T00:00:00Z".to_string(),
-                    resource: "/me/mailFolders/inbox/messages".to_string(),
-                    scopes: vec![CursorScope::FolderType {
-                        folder: FolderId("inbox".to_string()),
-                        ty: ObjectType::Email,
-                    }],
-                    warned_unparseable_expiry: false,
-                    terminated: false,
-                },
-                push::GraphSubscriptionState {
-                    server_id: "two".to_string(),
-                    expires_at: "2099-01-01T00:00:00Z".to_string(),
-                    resource: "/me/calendars/cal/events".to_string(),
-                    scopes: vec![CursorScope::FolderType {
-                        folder: FolderId("cal".to_string()),
-                        ty: ObjectType::CalendarEvent,
-                    }],
-                    warned_unparseable_expiry: false,
-                    terminated: false,
-                },
-            ]),
+        let handle = bifrost_types::SubscriptionHandle("h".to_string());
+        account.webhooks.lease_for_tests(
+            &handle,
+            "/me/events",
+            "one",
+            "2099-01-01T00:00:00Z",
+            vec![CursorScope::FolderType {
+                folder: FolderId("cal".to_string()),
+                ty: ObjectType::CalendarEvent,
+            }],
+        );
+        account.webhooks.lease_for_tests(
+            &handle,
+            "/me/mailFolders/inbox/messages",
+            "two",
+            "2099-01-01T00:00:00Z",
+            vec![CursorScope::FolderType {
+                folder: FolderId("inbox".to_string()),
+                ty: ObjectType::Email,
+            }],
         );
 
         Account::close(&account).await.expect("close succeeds");
 
-        assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+        assert!(account.webhooks.store().rows_for_tests().is_empty());
         let requests = client.take_rest_requests();
         assert_eq!(requests.len(), 2);
         assert!(requests[0].url.ends_with("/subscriptions/one"));

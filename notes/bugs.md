@@ -98,32 +98,25 @@ repeated authoritative inventory (today `NoCursor` schedules no further poll),
 plus safe hydration and mutation semantics for UID handles that do not survive
 a re-SELECT. A wave of one owning types, sync and imap.
 
-## BUG-190 - Graph webhook subscriptions collide with Graph's duplicate rule across handles and on reattach
+## BUG-190 - A Graph subscription row this process does not know still 409s every subscribe for its resource
 
-**Reported by:** the Graph calendar and contact scope discovery work (spar review).
+**Reported by:** the Graph calendar and contact scope discovery work (spar
+review); narrowed by the shared-row fix.
 
-Graph refuses a second subscription with the same `resource` and `changeType`
-with 409 Conflict ("Subscription Id <> already exists for the requested
-combination", subscription-post-subscriptions, Duplicate subscription
-behavior). The webhook arm owns subscriptions per handle, so two cases fail:
-
-- Reattach (`crates/sync/src/engine/reattach/transaction.rs`) creates the
-  replacement subscriptions BEFORE deleting the old handle's rows, so every
-  replacement create is a duplicate of a live row and 409s; the whole request
-  fails and the old handle survives. Affects mail folder resources too, not
-  only calendars. Not reproduced live; inferred from the documented rule.
-- Two subscribe calls whose scopes share a resource collide. Calendar and
-  contact scopes now all map to the mailbox-wide `/events` and `/contacts`
-  resources (the only documented ones), so two calls over disjoint calendars
-  hit it; before, only two calls over the same mail folder did.
-
-`create_and_register` treats the 409 as whole-request failure with rollback,
-which keeps the old coverage alive but makes the second subscribe or the
-reattach fail. A fix needs subscription rows owned per account and shared by
-handles (reference-counted teardown, renewal once per row), or a reattach that
-adopts the old rows instead of recreating them. Laning the 409 per resource
-was tried and rejected: reattach would then commit the other groups and delete
-the old row, silently dropping working coverage.
+The in-process cases are fixed: rows live in a factory-shared `WebhookStore`
+(`crates/graph/src/account/push/registry.rs`) and handles lease them, so a
+reopen and overlapping subscribes attach instead of creating a duplicate. The
+residue is a row the store cannot see: one left by a previous process (a crash,
+or a teardown that never ran; it lives up to the seven-day expiry we request),
+or one made by a second `GraphAccountFactory` for the same credentials. Graph
+answers 409 to every create for that resource until it expires, and the
+subscribe fails whole-request, so the account has no push for up to a week.
+A fix means listing `/subscriptions` on 409 and adopting or deleting the row
+whose resource and notification URL match. Adopting keeps a clientState that
+may have been rotated; deleting can kill another live process's identical
+subscription (the trade-off `run_subscribe`'s doc records). Product decision
+before build. Not reproduced live; the 409 rule is documented
+(subscription-post-subscriptions, Duplicate subscription behavior).
 
 ## BUG-191 - A Graph claims challenge's `claims` value never reaches sign-in
 

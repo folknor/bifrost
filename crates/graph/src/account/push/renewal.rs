@@ -1,9 +1,19 @@
-//! Webhook maintenance sessions and account-owned recreate effects.
+//! Webhook maintenance sessions and the store-owned renewal and recreate
+//! effects behind them.
+//!
+//! A session belongs to one opened account and renews the rows that account
+//! holds a live lease on. Rows are shared through the factory store (see
+//! `super::registry`), so during a reopen the old and the new account may
+//! both hold one: every renewal step therefore runs under the store's
+//! exchange, re-reads the row before it sends anything, and commits before it
+//! lets go, so two sessions never PATCH or recreate the same row twice and no
+//! stale answer is ever applied. What a step finds out that concerns every
+//! holder (a recreated row's gap, a terminal verdict) is queued to each
+//! holding account's sink, and each session delivers only its own.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
-use bifrost_types::{AccountOperation, CursorScope, ErrorScope, SubscriptionHandle};
+use bifrost_types::{AccountError, AccountOperation, CursorScope, ErrorScope};
 
 use crate::account::GraphAccount;
 use crate::account::graph_error::{GraphErrorContext, into_account_error};
@@ -12,8 +22,7 @@ use crate::webhooks::{
     subscription_is_gone,
 };
 
-use super::common::PushEndpoint;
-use super::webhook::{GraphSubscriptionGroup, GraphSubscriptionState};
+use super::registry::{DueRow, Exchange, InstanceEvent, Row};
 
 pub(crate) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub(super) const RENEWAL_THRESHOLD_MINUTES: i64 = 30;
@@ -29,135 +38,99 @@ pub(crate) fn renewal_session(
         let mut topology = account.webhooks.topology();
         let mut established = false;
         loop {
-            while let Some(scope) = account.webhooks.pop_gap() { yield E::Invalidated(gap_hint(scope)); }
+            // Mark the topology seen BEFORE reading events and rows: an
+            // enqueue that lands after this is a change the next wait sees,
+            // never one marked seen without having been read.
             topology.borrow_and_update();
-            let live = account.webhooks.has_live().await;
-            if !live {
+            // A terminal verdict delivered here (another account's step
+            // terminated a row this account shares) ends the session like one
+            // found by its own pass, so the engine's lane health and pacing
+            // see it, even when that row was this account's only one.
+            let mut delivered_terminal = false;
+            while let Some(event) = deliverable(&account) {
+                delivered_terminal |= matches!(event, E::UnitFailed(_));
+                yield event;
+            }
+            if delivered_terminal { yield E::Ended(End::Incomplete); return; }
+            if !account.webhooks.has_live() {
                 tokio::select! { () = stop.stopped() => break, () = account.shutdown.cancelled() => break, _ = topology.changed() => {} }
                 continue;
             }
             if !established { established = true; yield E::Established; }
-            let due = account.webhooks.due().await;
-        // Whether any row in this pass failed non-terminally. Every row is
-        // attempted once regardless (a failing row must not starve its
-        // siblings); the pass then ends `Incomplete` instead of `Healthy`.
-        let mut had_error = false;
-        for DueRenewal {
-            handle,
-            server_id,
-            resource,
-            scopes,
-        } in due
-        {
-            tokio::select! { () = stop.stopped() => { yield E::Ended(End::Stopped); return; }, () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; }, () = gate.clear() => {} }
-            let renewal = tokio::select! {
-                biased;
-                () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; },
-                () = stop.stopped() => { yield E::Ended(End::Stopped); return; },
-                result = renew_subscription(account.mailboxes.primary(), &server_id, None) => result,
-            };
-            match renewal {
-                Ok(new_expiry) => {
-                    account.webhooks.renewed(&handle, &server_id, new_expiry).await;
-                }
-                Err(error) => {
-                    // Graph retains no deleted subscription to PATCH, so a
-                    // vanished (404/410) subscription is replaced by a fresh
-                    // create for the same resource; otherwise every renewal
-                    // tick retries a permanent 404. The stale state stays
-                    // installed until the replacement is in hand: dropping it
-                    // first meant a failed create left the resource with no
-                    // state at all, so no later tick could ever see it as due
-                    // and coverage was lost until reopen.
-                    let (phase, error) = match account.push_config.endpoint() {
-                        Some(endpoint) if subscription_is_gone(&error) => {
-                            match replace_gone_subscription(
-                                &account, endpoint, &handle, &server_id, &resource, &scopes,
-                            )
-                            .await
-                            {
-                                Ok(Replacement::Installed) => {
-                                    // The resource had NO live subscription
-                                    // between its disappearance and this
-                                    // create, and Graph does not replay
-                                    // notifications for that window. The
-                                    // install queued the row's scopes on
-                                    // `pending_gaps` under the same lock,
-                                    // and the drain after this pass (or the
-                                    // next session, if this one is dropped)
-                                    // invalidates them.
-                                    continue;
-                                }
-                                Ok(
-                                    Replacement::HandleUnsubscribed | Replacement::AccountClosed,
-                                ) => {
-                                    continue;
-                                }
-                                // Classify the failure that actually blocks
-                                // recovery. The original 404 only says the
-                                // old subscription is gone, which is already
-                                // known and acted on; the create error is the
-                                // one whose recovery class decides whether
-                                // this is worth another tick.
-                                Err(recreate_error) => ("recreate", recreate_error),
-                            }
-                        }
-                        _ => ("renew", error),
-                    };
-                    // Name what lost coverage when the resource covers exactly
-                    // one scope; otherwise stay account-scoped rather than
-                    // pick one arbitrarily (or index an empty list).
-                    let context = GraphErrorContext::graph(AccountOperation::PushSubscribe);
-                    let context = match scopes.as_slice() {
-                        [only] => context.with_scope(ErrorScope::Cursor(only.clone())),
-                        _ => context,
-                    };
-                    let account_error = into_account_error(error, context);
-                    // Every failure is reported to the engine as
-                    // `UnitFailed`, which owns its throttle, directive or
-                    // terminal broadcast. The structured telemetry is
-                    // logged here too so dashboards can group on kind /
-                    // message-key.
-                    {
-                        let telemetry = account_error.telemetry_fields();
-                        tracing::warn!(
-                            target: "bifrost_graph::webhooks",
-                            provider = ?telemetry.provider,
-                            protocol = ?telemetry.protocol,
-                            message_key = telemetry.message_key,
-                            recovery = telemetry.recovery_discriminant,
-                            server_id = %server_id,
-                            phase = phase,
-                            scopes = ?scopes,
-                            "Graph webhook renewal failed"
-                        );
-                    }
-                    if account_error.recovery().is_terminal() {
-                        // A 404 from the replacement create is a permanent
-                        // refusal for this resource (for example, its folder
-                        // was deleted). Keep the old row reachable by
-                        // teardown, but stop every later pass from issuing the
-                        // same doomed PATCH and POST.
-                        // Flagged, not removed: renewing stops, but teardown
-                        // must still be able to DELETE it.
-                        account.webhooks.terminate(&handle, &server_id).await;
-
-                    }
-                    had_error |= !account_error.recovery().is_terminal();
-                    yield E::UnitFailed(account_error);
+            let due = account
+                .webhooks
+                .store()
+                .renewable(account.webhooks.instance(), is_due);
+            // Whether any row in this pass failed non-terminally. Every row is
+            // attempted once regardless (a failing row must not starve its
+            // siblings); the pass then ends `Incomplete` instead of `Healthy`.
+            let mut had_error = false;
+            for snapshot in due {
+                tokio::select! { () = stop.stopped() => { yield E::Ended(End::Stopped); return; }, () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; }, () = gate.clear() => {} }
+                let outcome = tokio::select! {
+                    biased;
+                    () = account.shutdown.cancelled() => { yield E::Ended(End::Stopped); return; },
+                    () = stop.stopped() => { yield E::Ended(End::Stopped); return; },
+                    outcome = maintain_row(&account, snapshot) => outcome,
+                };
+                // A terminal verdict reaches every holder through its queue,
+                // this session included, and is delivered by the drain below.
+                if let RowOutcome::Failed(error) = outcome {
+                    had_error = true;
+                    yield E::UnitFailed(error);
                 }
             }
-        }
-
-        while let Some(scope) = account.webhooks.pop_gap() { yield E::Invalidated(gap_hint(scope)); }
-        let retired = account.webhooks.has_terminated().await;
-        if had_error || retired { yield E::Ended(End::Incomplete); return; }
-        yield E::Healthy;
-        tokio::select! { () = stop.stopped() => break, () = account.shutdown.cancelled() => break, () = tokio::time::sleep(RENEWAL_CHECK_INTERVAL) => {} }
+            while let Some(event) = deliverable(&account) { yield event; }
+            let retired = account.webhooks.has_terminated();
+            if had_error || retired { yield E::Ended(End::Incomplete); return; }
+            yield E::Healthy;
+            tokio::select! { () = stop.stopped() => break, () = account.shutdown.cancelled() => break, () = tokio::time::sleep(RENEWAL_CHECK_INTERVAL) => {}, _ = topology.changed() => {} }
         }
         yield E::Ended(End::Stopped);
     })
 }
+
+/// The next queued event this session still owes the engine. A terminal
+/// verdict is attributed to this account's CURRENT live scopes on the row,
+/// and dropped once the row recovered or this account no longer holds it.
+fn deliverable(account: &GraphAccount) -> Option<bifrost_types::PushSessionEvent> {
+    use bifrost_types::PushSessionEvent as E;
+    loop {
+        match account.webhooks.pop_event()? {
+            InstanceEvent::Gap(scope) => return Some(E::Invalidated(gap_hint(scope))),
+            InstanceEvent::Terminal {
+                resource,
+                generation,
+                error,
+            } => {
+                let Some(scopes) = account.webhooks.store().terminal_scopes(
+                    account.webhooks.instance(),
+                    &resource,
+                    generation,
+                ) else {
+                    continue;
+                };
+                return Some(E::UnitFailed(attribute(error, &scopes)));
+            }
+        }
+    }
+}
+
+/// Name what lost coverage when the row covers exactly one of this
+/// account's scopes; otherwise stay account-scoped rather than pick one
+/// arbitrarily.
+fn attribute(error: AccountError, scopes: &[CursorScope]) -> AccountError {
+    match scopes {
+        [only] => error
+            .clone()
+            .into_builder()
+            .scope(ErrorScope::Cursor(only.clone()))
+            .try_build()
+            .unwrap_or(error),
+        _ => error,
+    }
+}
+
 /// A recreated row's coverage gap: one precise scope, so it names the Graph
 /// subscription source rather than the wide-wake-up `Coalesced`.
 fn gap_hint(scope: CursorScope) -> bifrost_types::InvalidationHint {
@@ -167,251 +140,197 @@ fn gap_hint(scope: CursorScope) -> bifrost_types::InvalidationHint {
     }
 }
 
-/// Whether any registered subscription still needs renewing. A condemned
-/// group and a `terminated` row both stay registered for teardown's sake and
-/// both need nothing from a renewal pass, so with only those left a session
-/// parks instead of running one.
-pub(super) fn has_live_graph_subscription_group(
-    groups: &HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
-) -> bool {
-    groups.values().any(|group| {
-        !group.tearing_down && group.subscriptions.iter().any(|state| !state.terminated)
+/// Whether a row is inside the renewal threshold, warning once about an
+/// expiry it cannot read (renewing is the safe direction for those).
+fn is_due(row: &mut Row) -> bool {
+    match check_expiry(&row.expires_at, RENEWAL_THRESHOLD_MINUTES) {
+        ExpiryCheck::Live => false,
+        ExpiryCheck::ExpiringSoon => true,
+        ExpiryCheck::Unparseable => {
+            if !row.warned_unparseable_expiry {
+                row.warned_unparseable_expiry = true;
+                tracing::warn!(
+                    subscription = row.server_id,
+                    expiration = row.expires_at,
+                    "[Graph webhooks] Unparseable subscription expiry; treating as due for renewal"
+                );
+            }
+            true
+        }
+    }
+}
+
+/// What one maintenance step reports to the session that asked for it.
+#[derive(Debug)]
+pub(super) enum RowOutcome {
+    /// Renewed, recreated, terminally failed (queued to every holder), or
+    /// found obsolete: nothing for this session to report itself.
+    Settled,
+    /// A non-terminal failure worth another tick, attributed to this
+    /// account's scopes.
+    Failed(AccountError),
+}
+
+/// Renew one snapshotted row, or recreate it if Graph lost it.
+///
+/// The step runs in a task the account owns, holding the store's exchange
+/// from the re-read through the commit. A session dropped mid-step only
+/// drops the reply: a PATCH that succeeded still records its expiry, and a
+/// create that succeeded is still installed or undone.
+pub(super) async fn maintain_row(account: &GraphAccount, snapshot: DueRow) -> RowOutcome {
+    let owner = account.clone();
+    let (reply, response) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let store = std::sync::Arc::clone(owner.webhooks.store());
+        let exchange = store.exchange().await;
+        let _ = reply.send(maintain_locked(&owner, &exchange, &snapshot).await);
+    });
+    crate::account::push_tasks::track(account, task);
+    response.await.unwrap_or_else(|_| {
+        // The task panicked or the runtime is shutting down under it.
+        RowOutcome::Failed(into_account_error(
+            crate::error::GraphError::RuntimeFailure {
+                message: "the webhook renewal task ended without an answer".to_string(),
+            },
+            GraphErrorContext::graph(AccountOperation::PushSubscribe),
+        ))
     })
 }
 
-/// One subscription inside the renewal threshold, with everything a pass
-/// needs to renew it, recreate it, or report what it covered.
-#[derive(Debug, Clone)]
-pub(super) struct DueRenewal {
-    pub(super) handle: SubscriptionHandle,
-    pub(super) server_id: String,
-    pub(super) resource: String,
-    pub(super) scopes: Vec<CursorScope>,
-}
-
-/// The subscriptions inside the renewal threshold.
-///
-/// A condemned (`tearing_down`) group contributes nothing. Renewing its
-/// subscriptions would extend the life of exactly what the caller asked to
-/// delete, and recreating a vanished one would hand teardown a server id its
-/// snapshot cannot contain. Their rows stay registered only so that a failed
-/// DELETE can be retried against them.
-pub(super) fn due_renewals(
-    groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
-) -> Vec<DueRenewal> {
-    let mut due = Vec::new();
-    for (handle, group) in groups.iter_mut() {
-        if group.tearing_down {
-            continue;
-        }
-        for state in &mut group.subscriptions {
-            // Its renewal failed terminally; renewing or recreating it again
-            // would repeat the failure every tick. It waits for teardown.
-            if state.terminated {
-                continue;
-            }
-            match check_expiry(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
-                ExpiryCheck::Live => continue,
-                ExpiryCheck::ExpiringSoon => {}
-                ExpiryCheck::Unparseable => {
-                    if !state.warned_unparseable_expiry {
-                        state.warned_unparseable_expiry = true;
-                        tracing::warn!(
-                            subscription = state.server_id,
-                            expiration = state.expires_at,
-                            "[Graph webhooks] Unparseable subscription expiry; treating as due for renewal"
-                        );
-                    }
-                }
-            }
-            due.push(DueRenewal {
-                handle: handle.clone(),
-                server_id: state.server_id.clone(),
-                resource: state.resource.clone(),
-                scopes: state.scopes.clone(),
-            });
-        }
+async fn maintain_locked(
+    account: &GraphAccount,
+    exchange: &Exchange,
+    snapshot: &DueRow,
+) -> RowOutcome {
+    let store = account.webhooks.store();
+    let instance = account.webhooks.instance();
+    // Another session (the other account of a reopen) may have renewed,
+    // recreated or terminated the row since the snapshot.
+    if !store.still_due(exchange, instance, snapshot, is_due) {
+        return RowOutcome::Settled;
     }
-    due
+    let client = account.mailboxes.primary();
+    let error = match renew_subscription(client, &snapshot.server_id, None).await {
+        Ok(expires_at) => {
+            store.renewed(exchange, snapshot, expires_at);
+            return RowOutcome::Settled;
+        }
+        Err(error) => error,
+    };
+    // Graph retains no deleted subscription to PATCH, so a vanished (404/410)
+    // row is replaced by a fresh create for the same resource; otherwise
+    // every tick retries a permanent 404. The stale row stays recorded until
+    // the replacement is in hand, so a failed create leaves a row that reads
+    // as due rather than coverage lost until reopen.
+    let (phase, error) = match account.push_config.endpoint() {
+        Some(endpoint) if subscription_is_gone(&error) => {
+            match recreate_locked(account, exchange, endpoint, snapshot).await {
+                Ok(_) => return RowOutcome::Settled,
+                // Classify the failure that actually blocks recovery: the
+                // original 404 only says the old row is gone.
+                Err(recreate_error) => ("recreate", recreate_error),
+            }
+        }
+        _ => ("renew", error),
+    };
+    let account_error = into_account_error(
+        error,
+        GraphErrorContext::graph(AccountOperation::PushSubscribe),
+    );
+    {
+        let telemetry = account_error.telemetry_fields();
+        tracing::warn!(
+            target: "bifrost_graph::webhooks",
+            provider = ?telemetry.provider,
+            protocol = ?telemetry.protocol,
+            message_key = telemetry.message_key,
+            recovery = telemetry.recovery_discriminant,
+            server_id = %snapshot.server_id,
+            resource = %snapshot.resource,
+            phase = phase,
+            "Graph webhook renewal failed"
+        );
+    }
+    if account_error.recovery().is_terminal() {
+        // A 404 from the replacement create is a permanent refusal for this
+        // resource (its folder was deleted, say). Flagged, not removed:
+        // renewing stops, but release and close must still DELETE it.
+        store.terminate(exchange, snapshot, &account_error);
+        return RowOutcome::Settled;
+    }
+    RowOutcome::Failed(attribute(
+        account_error,
+        &store.scopes_of(instance, &snapshot.resource),
+    ))
 }
 
-/// What happened to a subscription a renewal pass had to recreate.
+/// What happened to a row a renewal step had to recreate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Replacement {
-    /// The fresh subscription took the vanished one's place in the group.
+    /// The fresh subscription took the vanished one's place, and every live
+    /// holder is owed a gap.
     Installed,
-    /// The handle stopped being registered while the create was in flight,
-    /// so the fresh subscription was deleted again instead of installed.
-    HandleUnsubscribed,
-    /// The account was already closed (or closing), so nothing was created.
-    AccountClosed,
+    /// Nobody holds the row live any more, so the fresh subscription was
+    /// deleted again instead of installed.
+    Unwanted,
+    /// The row changed under the snapshot; another step already handled it.
+    Obsolete,
 }
 
-/// Everything the replacement task owns.
-struct ReplaceRequest {
-    endpoint: PushEndpoint,
-    handle: SubscriptionHandle,
-    stale_server_id: String,
-    resource: String,
-    scopes: Vec<CursorScope>,
-}
-
-/// Create a replacement for a vanished subscription and install it under
-/// `handle`, or undo the create when the handle is no longer registered.
+/// Create a replacement for a vanished row and install it, under the held
+/// exchange.
 ///
-/// The create happens before any local state changes so a failure leaves the
-/// stale entry in place for the next renewal tick to retry - the resource
-/// keeps a row that reads as due rather than silently losing coverage.
-///
-/// The account owns the create, install and undo task. Dropping its session
-/// only drops the reply receiver; committed gap obligations remain queued for
-/// the next session. Close awaits these effects under its bounded join and
-/// detaches unfinished tasks instead of aborting them.
+/// Admission is "the row still has a live lease", of any account: a recreate
+/// started by an account that is closing still finishes for the other
+/// holders, and one whose holders all left undoes its create. Never the
+/// initiating account's shutdown token.
 ///
 /// What cannot be made safe: a create whose response never arrived may have
 /// succeeded on Graph and its id is unknowable (see `run_subscribe` in
 /// `webhook.rs`); it lives until Graph's own expiry.
-pub(super) async fn replace_gone_subscription(
+async fn recreate_locked(
     account: &GraphAccount,
-    endpoint: &PushEndpoint,
-    handle: &SubscriptionHandle,
-    stale_server_id: &str,
-    resource: &str,
-    scopes: &[CursorScope],
+    exchange: &Exchange,
+    endpoint: &super::common::PushEndpoint,
+    snapshot: &DueRow,
 ) -> Result<Replacement, crate::error::GraphError> {
-    let account = account.clone();
-    let request = ReplaceRequest {
-        endpoint: endpoint.clone(),
-        handle: handle.clone(),
-        stale_server_id: stale_server_id.to_string(),
-        resource: resource.to_string(),
-        scopes: scopes.to_vec(),
-    };
-    let (reply, response) = tokio::sync::oneshot::channel();
-    let owner = account.clone();
-    let task = tokio::spawn(async move {
-        let _ = reply.send(create_and_install_replacement(&owner, request).await);
-    });
-    crate::account::push_tasks::track(&account, task);
-    response.await.unwrap_or_else(|_| {
-        // The task panicked or the runtime is shutting down under it.
-        Err(crate::error::GraphError::RuntimeFailure {
-            message: "the webhook replacement task ended without an answer".to_string(),
-        })
-    })
-}
-
-async fn create_and_install_replacement(
-    account: &GraphAccount,
-    request: ReplaceRequest,
-) -> Result<Replacement, crate::error::GraphError> {
-    let ReplaceRequest {
-        endpoint,
-        handle,
-        stale_server_id,
-        resource,
-        scopes,
-    } = request;
-    // A closed account must not gain server-side state. The registration
-    // check under the write lock below is what covers a create already in
-    // flight when `close()` began; this one only spares the common case a
-    // POST that could only be rolled back.
-    if account.shutdown.is_cancelled() {
-        return Ok(Replacement::AccountClosed);
+    let store = account.webhooks.store();
+    if !store.unchanged(exchange, snapshot) {
+        return Ok(Replacement::Obsolete);
+    }
+    if !store.wanted(exchange, &snapshot.resource) {
+        return Ok(Replacement::Unwanted);
     }
     let response = create_subscription(
         account.mailboxes.primary(),
-        &resource,
+        &snapshot.resource,
         &endpoint.webhook_url,
         &endpoint.client_state,
         None,
     )
     .await?;
-    let replacement = GraphSubscriptionState {
-        server_id: response.id,
-        expires_at: response.expiration_date_time,
-        resource,
-        scopes,
-        warned_unparseable_expiry: false,
-        terminated: false,
-    };
-    let created_id = replacement.server_id.clone();
-    let installed = account
-        .webhooks
-        .install_replacement(&account.shutdown, &handle, &stale_server_id, replacement)
-        .await;
-    if installed {
+    store.pass_commit_gate().await;
+    if store.wanted(exchange, &snapshot.resource) {
+        store.recover(
+            exchange,
+            &snapshot.resource,
+            Some(response.id),
+            response.expiration_date_time,
+        );
         return Ok(Replacement::Installed);
     }
-
-    // `push_unsubscribe` retired the handle, or condemned it and is walking
-    // a server-id snapshot that cannot contain this create, while the create
-    // was in flight. Either way it deletes every subscription it knows about
-    // and reports teardown as successful, so installing this one would keep
-    // notifications flowing for a subscription the caller believes is gone -
-    // and re-registering the group would resurrect a handle nothing will
-    // ever tear down again. Delete the subscription we just minted instead.
-    // Best effort: the caller's `push_unsubscribe` may already have
-    // returned, so there may be nobody left to report a cleanup failure to.
-    if let Err(cleanup_error) = delete_subscription(account.mailboxes.primary(), &created_id).await
+    // Every holder left while the create was in flight (a lease whose
+    // account was dropped stops counting). Installing would keep
+    // notifications flowing for coverage nobody wants. Best effort: there may
+    // be nobody left to report a cleanup failure to.
+    if let Err(cleanup_error) = delete_subscription(account.mailboxes.primary(), &response.id).await
     {
         tracing::warn!(
             target: "bifrost_graph::webhooks",
-            server_id = %created_id,
+            server_id = %response.id,
             error = ?cleanup_error,
-            "failed to delete a Graph webhook subscription recreated for an unsubscribed handle"
+            "failed to delete a Graph webhook subscription recreated for a row nobody holds"
         );
     }
-    Ok(Replacement::HandleUnsubscribed)
-}
-
-/// Note `created_id` as recreated under `handle`, in place of
-/// `stale_server_id` when that was itself an earlier recreate. A stale id the
-/// handle names stays named there; its DELETE answers 404, which teardown
-/// counts as already gone.
-pub(super) fn record_recreated_id(
-    ledger: &mut HashMap<SubscriptionHandle, Vec<String>>,
-    handle: &SubscriptionHandle,
-    stale_server_id: &str,
-    created_id: &str,
-) {
-    let ids = ledger.entry(handle.clone()).or_default();
-    ids.retain(|id| id != stale_server_id);
-    ids.push(created_id.to_string());
-}
-
-/// Swap `replacement` in for `stale_server_id` under `handle`.
-///
-/// Returns `false` when the replacement must not be installed, in which case
-/// the caller deletes the subscription it just minted. Two refusals:
-///
-/// - `handle` is no longer registered. The lookup is a plain `get_mut`,
-///   never an `entry().or_insert_with()`: a pass's due list is a
-///   snapshot, and a concurrent `push_unsubscribe` can retire the handle
-///   before the replacement lands. Re-creating the group there would
-///   contradict a teardown the caller was already told succeeded.
-/// - the group is registered but marked `tearing_down`. Teardown keeps the
-///   group registered while it deletes each server subscription, so
-///   "registered" no longer implies "live". It walks a snapshot of the
-///   server ids taken when the marker went up, so a replacement installed
-///   after that point is invisible to it: teardown would delete the stale
-///   id, retire the group, return success - and the replacement would keep
-///   delivering notifications for a handle the caller believes is gone.
-pub(super) fn install_replacement(
-    groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
-    handle: &SubscriptionHandle,
-    stale_server_id: &str,
-    replacement: GraphSubscriptionState,
-) -> bool {
-    let Some(group) = groups.get_mut(handle) else {
-        return false;
-    };
-    if group.tearing_down {
-        return false;
-    }
-    group
-        .subscriptions
-        .retain(|state| state.server_id != stale_server_id);
-    group.subscriptions.push(replacement);
-    true
+    Ok(Replacement::Unwanted)
 }

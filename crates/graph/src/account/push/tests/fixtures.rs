@@ -1,7 +1,7 @@
 //! Builders shared by more than one half of the push suite.
 //!
-//! `state` / `expiring` are read by the webhook teardown tests and by every
-//! renewal test; `email_scope` / `pending` / `ledger` / `converted` are read by
+//! `lease` / `lease_expiring` / `reopened` / `row_ids` are read by the webhook
+//! release tests and by every renewal test; `email_scope` / `pending` / `ledger` / `converted` are read by
 //! the EWS translation tests and by the dispatcher tests that drive a request
 //! through the EWS arm. Keeping them in one module is what lets the split
 //! avoid duplicating a fixture whose shape is itself an assertion.
@@ -14,38 +14,66 @@ use crate::account::push::common::PushEndpoint;
 use crate::account::push::ews::{
     PendingEwsScope, TranslatedExchangeId, ews_subscribable_folder_id,
 };
-use crate::account::push::webhook::GraphSubscriptionState;
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
+use bifrost_types::SubscriptionHandle;
 
-pub(super) fn state(server_id: &str, resource: &str) -> GraphSubscriptionState {
-    GraphSubscriptionState {
-        server_id: server_id.to_string(),
-        expires_at: "2099-01-01T00:00:00Z".to_string(),
-        resource: resource.to_string(),
-        scopes: vec![CursorScope::FolderType {
-            folder: FolderId(resource.to_string()),
-            ty: ObjectType::Email,
-        }],
-        warned_unparseable_expiry: false,
-        terminated: false,
+/// The scope a hand-built row covers: one email scope named after the
+/// resource, so assertions can tell rows apart.
+pub(super) fn resource_scope(resource: &str) -> CursorScope {
+    CursorScope::FolderType {
+        folder: FolderId(resource.to_string()),
+        ty: ObjectType::Email,
     }
 }
 
-/// A subscription whose expiry is already past, so it is unconditionally
-/// inside the renewal threshold.
-pub(super) fn expiring(server_id: &str, resource: &str) -> GraphSubscriptionState {
-    GraphSubscriptionState {
-        server_id: server_id.to_string(),
-        expires_at: "2000-01-01T00:00:00Z".to_string(),
-        resource: resource.to_string(),
-        scopes: vec![CursorScope::FolderType {
-            folder: FolderId(resource.to_string()),
-            ty: ObjectType::Email,
-        }],
-        warned_unparseable_expiry: false,
-        terminated: false,
-    }
+/// Give `account` a live lease on a healthy row (far-future expiry).
+pub(super) fn lease(account: &GraphAccount, handle: &str, resource: &str, server_id: &str) {
+    account.webhooks.lease_for_tests(
+        &SubscriptionHandle(handle.to_string()),
+        resource,
+        server_id,
+        "2099-01-01T00:00:00Z",
+        vec![resource_scope(resource)],
+    );
+}
+
+/// Give `account` a live lease on a row whose expiry is already past, so it
+/// is unconditionally inside the renewal threshold.
+pub(super) fn lease_expiring(
+    account: &GraphAccount,
+    handle: &str,
+    resource: &str,
+    server_id: &str,
+) {
+    account.webhooks.lease_for_tests(
+        &SubscriptionHandle(handle.to_string()),
+        resource,
+        server_id,
+        "2000-01-01T00:00:00Z",
+        vec![resource_scope(resource)],
+    );
+}
+
+/// A second account of the same factory: a fresh instance on `account`'s
+/// row store, as a reopen opens it.
+pub(super) fn reopened(account: &GraphAccount, client: &GraphClient) -> GraphAccount {
+    let mut next = webhook_account(client);
+    next.webhooks = crate::account::push::WebhookRegistry::attached(std::sync::Arc::clone(
+        account.webhooks.store(),
+    ));
+    next
+}
+
+/// The server ids the store holds, by resource.
+pub(super) fn row_ids(account: &GraphAccount) -> Vec<(String, String)> {
+    account
+        .webhooks
+        .store()
+        .rows_for_tests()
+        .into_iter()
+        .map(|(resource, row)| (resource, row.server_id))
+        .collect()
 }
 
 pub(super) fn email_scope(folder: &str) -> CursorScope {
@@ -132,10 +160,6 @@ pub(super) async fn settle(mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
-pub(super) fn groups_empty(account: &GraphAccount) -> bool {
-    account
-        .webhooks
-        .groups_for_tests()
-        .try_read()
-        .is_ok_and(|groups| groups.is_empty())
+pub(super) fn rows_empty(account: &GraphAccount) -> bool {
+    account.webhooks.store().rows_for_tests().is_empty()
 }

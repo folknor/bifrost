@@ -137,7 +137,7 @@ async fn a_public_folder_scope_is_rejected_in_both_push_modes() {
             err.kind(),
             AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
         ));
-        assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+        assert!(account.webhooks.store().rows_for_tests().is_empty());
         assert!(
             account
                 .ews
@@ -213,7 +213,7 @@ async fn subscribing_to_no_scopes_is_rejected_in_both_modes() {
             error.kind(),
             AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         ));
-        assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+        assert!(account.webhooks.store().rows_for_tests().is_empty());
         assert!(
             account
                 .ews
@@ -316,7 +316,7 @@ async fn a_ledger_that_cannot_close_leaves_nothing_registered_in_either_mode() {
         &AccountErrorKind::Internal(InternalErrorKind::InvariantViolated)
     );
     assert!(
-        account.webhooks.groups_for_tests().read().await.is_empty(),
+        account.webhooks.store().rows_for_tests().is_empty(),
         "no group may be registered behind an Err that carries no handle"
     );
     let requests = client.take_rest_requests();
@@ -425,7 +425,7 @@ async fn shared_non_mail_scopes_are_refused_before_either_push_transport() {
             ));
             assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
             assert!(client.take_rest_requests().is_empty());
-            assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+            assert!(account.webhooks.store().rows_for_tests().is_empty());
             assert!(
                 account
                     .ews

@@ -1,7 +1,6 @@
 //! The Graph `/subscriptions` arm: resource construction, subscribe with its
-//! rollback, teardown, and the health-latch edge a subscribe publishes on.
-
-use std::collections::HashMap;
+//! rollback, release, and the shared-row ownership a reopen and overlapping
+//! subscribes rely on.
 
 use bifrost_types::{
     AccountErrorKind, AccountId, AccountOperation, CursorScope, FolderId, ObjectType,
@@ -13,18 +12,29 @@ use crate::account::push::common::{
     DecodedHandle, account_binding, decode_handle, ews_handle, graph_handle,
 };
 use crate::account::push::dispatch::{push_subscribe, push_unsubscribe};
-use crate::account::push::renewal::{Replacement, record_recreated_id, replace_gone_subscription};
 use crate::account::push::webhook::{
-    GraphSubscriptionGroup, mark_group_tearing_down, recreated_ids,
-    remove_subscription_from_groups, resource_for_scope, retire_all_graph_subscriptions,
-    unsubscribe_graph,
+    resource_for_scope, retire_all_graph_subscriptions, unsubscribe_graph,
 };
 use crate::account::{GraphAccount, PushMode};
 use crate::client::{GraphClient, ScriptedRestResponse};
 
 use super::fixtures::{
-    created, deleted, email_scope, groups_empty, settle, state, webhook_account,
+    created, deleted, email_scope, lease, reopened, row_ids, rows_empty, settle, webhook_account,
 };
+
+fn server_error() -> ScriptedRestResponse {
+    ScriptedRestResponse::json(
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        serde_json::json!({"error":{"code":"InternalServerError","message":"no"}}),
+    )
+}
+
+fn calendar_scope(id: &str) -> CursorScope {
+    CursorScope::FolderType {
+        folder: FolderId(id.to_string()),
+        ty: ObjectType::CalendarEvent,
+    }
+}
 
 #[test]
 fn graph_subscription_resource_uses_folder_messages() {
@@ -159,7 +169,7 @@ async fn a_permission_refused_create_fails_its_lane_and_keeps_the_rest() {
             failed[0].error.scope(),
             Some(&bifrost_types::ErrorScope::Cursor(refused))
         );
-        assert_eq!(account.webhooks.groups_for_tests().read().await.len(), 1);
+        assert_eq!(row_ids(&account).len(), 1);
     }
 }
 
@@ -193,7 +203,7 @@ async fn webhook_creation_rolls_back_each_already_created_subscription() {
         },
     ];
     assert!(push_subscribe(account.clone(), scopes).await.is_err());
-    assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+    assert!(rows_empty(&account));
     let requests = client.take_rest_requests();
     assert_eq!(
         requests
@@ -214,17 +224,12 @@ async fn unsubscribe_graph_deletes_every_server_row() {
     ]);
     let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
     let handle = SubscriptionHandle("h".to_string());
-    account.webhooks.groups_for_tests().write().await.insert(
-        handle.clone(),
-        GraphSubscriptionGroup::live(vec![
-            state("one", "/me/messages"),
-            state("two", "/me/events"),
-        ]),
-    );
+    lease(&account, "h", "/me/events", "one");
+    lease(&account, "h", "/me/messages", "two");
     unsubscribe_graph(account.clone(), handle)
         .await
         .expect("delete loop succeeds");
-    assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+    assert!(rows_empty(&account));
     let requests = client.take_rest_requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].url.ends_with("/subscriptions/one"));
@@ -242,14 +247,8 @@ async fn close_continues_after_one_subscription_delete_fails() {
         ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
     ]);
     let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
-    let handle = SubscriptionHandle("h".to_string());
-    account.webhooks.groups_for_tests().write().await.insert(
-        handle,
-        GraphSubscriptionGroup::live(vec![
-            state("fails", "/me/messages"),
-            state("succeeds", "/me/events"),
-        ]),
-    );
+    lease(&account, "h", "/me/events", "fails");
+    lease(&account, "h", "/me/messages", "succeeds");
     retire_all_graph_subscriptions(&account).await;
     let requests = client.take_rest_requests();
     assert_eq!(requests.len(), 2);
@@ -275,18 +274,13 @@ async fn unsubscribe_tolerates_a_subscription_the_server_already_dropped() {
     ]);
     let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
     let handle = SubscriptionHandle("h".to_string());
-    account.webhooks.groups_for_tests().write().await.insert(
-        handle.clone(),
-        GraphSubscriptionGroup::live(vec![
-            state("vanished", "/me/messages"),
-            state("live", "/me/events"),
-        ]),
-    );
+    lease(&account, "h", "/me/events", "vanished");
+    lease(&account, "h", "/me/messages", "live");
 
     unsubscribe_graph(account.clone(), handle)
         .await
         .expect("a row the server already dropped is not a teardown failure");
-    assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+    assert!(rows_empty(&account));
     let requests = client.take_rest_requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].url.ends_with("/subscriptions/live"));
@@ -374,60 +368,41 @@ async fn webhook_mode_without_an_endpoint_is_unsupported() {
     ));
 }
 
-/// Teardown removes only the subscription whose DELETE was confirmed.
-/// If the next DELETE fails, the remaining server ids are still in the
-/// group, so retrying the same handle can finish the cleanup rather than
-/// orphaning notifications until Graph's expiry window closes.
-#[test]
-fn unsubscribe_retains_not_yet_deleted_subscriptions_for_retry() {
+/// Release forgets only the rows whose DELETE was confirmed. A failed DELETE
+/// condemns the lease, keeping the row reachable, so retrying the same handle
+/// finishes the cleanup rather than orphaning notifications until Graph's
+/// expiry window closes; the retry re-deletes only what is left.
+#[tokio::test]
+async fn a_failed_release_keeps_the_undeleted_row_for_a_retry() {
+    let client = GraphClient::new("token");
+    client.script_rest([deleted(), server_error(), deleted(), deleted()]);
+    let account = webhook_account(&client);
     let handle = SubscriptionHandle("h".to_string());
-    let mut groups = HashMap::from([(
-        handle.clone(),
-        GraphSubscriptionGroup::live(vec![
-            state("deleted", "/me/mailFolders/inbox/messages"),
-            state("retry-me", "/me/events"),
-            state("not-attempted", "/me/contacts"),
-        ]),
-    )]);
+    lease(&account, "h", "/me/contacts", "deleted");
+    lease(&account, "h", "/me/events", "retry-me");
+    lease(&account, "h", "/me/messages", "deleted-too");
 
-    assert!(!remove_subscription_from_groups(
-        &mut groups,
-        &handle,
-        "deleted"
-    ));
-    let remaining = &groups[&handle].subscriptions;
-    assert_eq!(remaining.len(), 2);
-    assert!(remaining.iter().any(|state| state.server_id == "retry-me"));
-    assert!(
-        remaining
-            .iter()
-            .any(|state| state.server_id == "not-attempted")
+    unsubscribe_graph(account.clone(), handle.clone())
+        .await
+        .expect_err("the failed DELETE is reported");
+    assert_eq!(
+        row_ids(&account),
+        [("/me/events".to_string(), "retry-me".to_string())]
     );
-}
+    let rows = account.webhooks.store().rows_for_tests();
+    assert!(rows["/me/events"].leases[&handle].condemned);
+    assert!(
+        !account.webhooks.has_live(),
+        "a condemned lease is not renewed for"
+    );
 
-/// Condemning is idempotent and monotone: a retry after a failed DELETE
-/// re-marks the same group and returns the ids still to delete, while an
-/// unknown handle stays a no-op (teardown may be retried after a reopen).
-#[test]
-fn marking_teardown_is_idempotent_and_unknown_handles_are_none() {
-    let handle = SubscriptionHandle("h".to_string());
-    let mut groups = HashMap::from([(
-        handle.clone(),
-        GraphSubscriptionGroup::live(vec![state("retry-me", "/me/events")]),
-    )]);
-    assert_eq!(
-        mark_group_tearing_down(&mut groups, &handle),
-        Some(vec!["retry-me".to_string()])
-    );
-    assert!(groups[&handle].tearing_down);
-    assert_eq!(
-        mark_group_tearing_down(&mut groups, &handle),
-        Some(vec!["retry-me".to_string()]),
-        "a teardown retry sees the ids whose DELETE has not been confirmed"
-    );
-    assert!(
-        mark_group_tearing_down(&mut groups, &SubscriptionHandle("never".to_string())).is_none()
-    );
+    unsubscribe_graph(account.clone(), handle)
+        .await
+        .expect("the retry finishes");
+    assert!(rows_empty(&account));
+    let requests = urls(&client);
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    assert!(requests[3].1.ends_with("/subscriptions/retry-me"));
 }
 
 #[tokio::test]
@@ -444,7 +419,7 @@ async fn unsubscribing_an_unknown_handle_is_a_no_op() {
 // ---- cancellation safety of the webhook `push_subscribe` ----------------
 //
 // The scripted-wire helpers (`webhook_account`, `created`, `deleted`,
-// `settle`, `groups_empty`) live in `fixtures`; the renewal suite uses them too.
+// `settle`, `rows_empty`) live in `fixtures`; the renewal suite uses them too.
 
 fn two_resources() -> Vec<CursorScope> {
     vec![
@@ -497,7 +472,7 @@ async fn dropping_subscribe_mid_create_loop_rolls_back_the_earlier_creates() {
     let last = requests.last().expect("requests recorded");
     assert_eq!(last.method.as_str(), "DELETE");
     assert!(last.url.ends_with("/subscriptions/first"));
-    assert!(groups_empty(&account));
+    assert!(rows_empty(&account));
 }
 
 /// A future dropped after the creates but while registration is blocked must
@@ -511,7 +486,7 @@ async fn dropping_subscribe_before_registration_tears_down_the_orphan() {
     client.script_rest([created("first"), created("second"), deleted(), deleted()]);
     let account = webhook_account(&client);
 
-    let registration_blocked = account.webhooks.groups_for_tests().write().await;
+    let registration_blocked = account.webhooks.store().commit_gate.write().await;
     let caller = tokio::spawn(push_subscribe(account.clone(), two_resources()));
     assert!(
         settle(|| client.wire_attempts() == 2).await,
@@ -526,7 +501,7 @@ async fn dropping_subscribe_before_registration_tears_down_the_orphan() {
         "the orphaned group's subscriptions are deleted"
     );
     assert!(
-        settle(|| groups_empty(&account)).await,
+        settle(|| rows_empty(&account)).await,
         "no group stays registered under a handle nobody holds"
     );
 }
@@ -549,13 +524,13 @@ async fn dropping_subscribe_with_the_result_in_flight_tears_down_the_group() {
         "spawned, awaiting"
     );
     assert!(
-        settle(|| !groups_empty(&account)).await,
+        settle(|| !rows_empty(&account)).await,
         "the task registered the group and delivered its result"
     );
     drop(fut);
 
     assert!(
-        settle(|| groups_empty(&account)).await,
+        settle(|| rows_empty(&account)).await,
         "an unreceived handle's group is retired"
     );
     let requests = client.take_rest_requests();
@@ -580,14 +555,7 @@ async fn a_received_subscribe_is_not_torn_down() {
     for _ in 0..200 {
         tokio::task::yield_now().await;
     }
-    assert!(
-        account
-            .webhooks
-            .groups_for_tests()
-            .read()
-            .await
-            .contains_key(&handle)
-    );
+    assert!(!account.webhooks.store().leased_by(&handle).is_empty());
     assert_eq!(client.wire_attempts(), 1, "no DELETE was issued");
 }
 
@@ -604,7 +572,7 @@ async fn a_subscribe_dropped_before_its_first_poll_touches_nothing() {
         tokio::task::yield_now().await;
     }
     assert_eq!(client.wire_attempts(), 0);
-    assert!(groups_empty(&account));
+    assert!(rows_empty(&account));
 }
 
 /// A closed account refuses before creating anything server-side.
@@ -638,7 +606,7 @@ async fn a_subscribe_racing_close_rolls_back_instead_of_registering() {
     client.script_rest([created("only"), deleted()]);
     let account = webhook_account(&client);
 
-    let registration_blocked = account.webhooks.groups_for_tests().write().await;
+    let registration_blocked = account.webhooks.store().commit_gate.write().await;
     let caller = tokio::spawn(push_subscribe(account.clone(), vec![email_scope("inbox")]));
     assert!(settle(|| client.wire_attempts() == 1).await, "create done");
     account.shutdown.cancel();
@@ -647,7 +615,7 @@ async fn a_subscribe_racing_close_rolls_back_instead_of_registering() {
     let result = caller.await.expect("caller not aborted");
     assert!(result.is_err(), "a closing account hands out no handle");
     assert_eq!(client.wire_attempts(), 2, "the create was rolled back");
-    assert!(groups_empty(&account));
+    assert!(rows_empty(&account));
 }
 
 /// `close()`'s retire walk cancels the token first: that is what pairs with
@@ -692,13 +660,8 @@ async fn a_subscribed_handle_embeds_its_account_and_the_created_server_ids() {
         }
     );
     assert!(
-        account
-            .webhooks
-            .groups_for_tests()
-            .read()
-            .await
-            .contains_key(&handle),
-        "the registered key is the returned handle"
+        !account.webhooks.store().leased_by(&handle).is_empty(),
+        "the lease is held under the returned handle"
     );
 }
 
@@ -773,15 +736,7 @@ async fn an_orphan_never_deletes_what_this_instance_owns() {
     client.script_rest([deleted()]);
     let new_instance = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
     let own = graph_handle("cd34", None, ["new-sub"]);
-    new_instance
-        .webhooks
-        .groups_for_tests()
-        .write()
-        .await
-        .insert(
-            own.clone(),
-            GraphSubscriptionGroup::live(vec![state("new-sub", "/me/events")]),
-        );
+    lease(&new_instance, &own.0, "/me/events", "new-sub");
 
     // A stale or forged handle that names both the old id and the live one.
     push_unsubscribe(
@@ -795,153 +750,245 @@ async fn an_orphan_never_deletes_what_this_instance_owns() {
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert!(requests[0].1.ends_with("/subscriptions/old-sub"));
     assert!(
-        new_instance
-            .webhooks
-            .groups_for_tests()
-            .read()
-            .await
-            .contains_key(&own),
-        "the live group is untouched"
+        !new_instance.webhooks.store().leased_by(&own).is_empty(),
+        "the live lease is untouched"
     );
 }
 
-/// The renewal session replaced a vanished subscription under a handle, the
-/// old instance's teardown never landed, and the engine retries the handle on
-/// a reopened instance of the same factory. The handle string names only the
-/// subscribe-time id; the replacement is reached through the factory-shared
-/// ledger, and forgotten once deleted.
+/// The renewal session replaced a vanished row on the old account, that
+/// account's teardown never landed, and the engine retries the handle on a
+/// reopened account of the same factory. The handle string names only the
+/// subscribe-time id; the store knows the row's current id, so the retry
+/// deletes the replacement rather than the long-gone original.
 #[tokio::test]
-async fn an_orphan_teardown_reaches_a_subscription_recreated_on_the_old_instance() {
-    let old_client = GraphClient::new("token");
-    old_client.script_rest([created("recreated")]);
-    let old = webhook_account(&old_client);
-    let handle = graph_handle("ab12", None, ["original"]);
-    old.webhooks.groups_for_tests().write().await.insert(
-        handle.clone(),
-        GraphSubscriptionGroup::live(vec![state("original", "/me/events")]),
-    );
-    let endpoint = old
-        .push_config
-        .endpoint()
-        .cloned()
-        .expect("webhook endpoint");
-    let outcome = replace_gone_subscription(
-        &old,
-        &endpoint,
-        &handle,
-        "original",
-        "/me/events",
-        &[email_scope("/me/events")],
-    )
-    .await
-    .expect("the replacement is created");
-    assert_eq!(outcome, Replacement::Installed);
-
-    let new_client = GraphClient::new("token");
-    new_client.script_rest([deleted(), deleted()]);
-    let mut fresh = GraphAccount::new_for_tests(new_client.clone(), PushMode::GraphSubscriptions);
-    // What `GraphAccountFactory::open` does for every account it opens.
-    fresh
-        .webhooks
-        .set_recreated_ids(std::sync::Arc::clone(old.webhooks.recreated_for_tests()));
-
-    push_unsubscribe(fresh.clone(), handle.clone())
-        .await
-        .expect("orphan teardown succeeds");
-    let requests = urls(&new_client);
-    assert_eq!(requests.len(), 2, "{requests:?}");
-    assert!(requests[0].1.ends_with("/subscriptions/original"));
-    assert!(
-        requests[1].1.ends_with("/subscriptions/recreated"),
-        "the recreated subscription is deleted too: {requests:?}"
-    );
-    assert!(
-        recreated_ids(&fresh).is_empty(),
-        "a completed teardown forgets what it deleted"
-    );
-}
-
-/// A recreate of a recreate replaces the ledger's entry rather than growing
-/// it, and a group whose last subscription is deleted takes its entry along.
-#[tokio::test]
-async fn the_recreated_id_ledger_follows_the_group() {
-    let mut ledger = HashMap::new();
-    let handle = graph_handle("ab12", None, ["original"]);
-    record_recreated_id(&mut ledger, &handle, "original", "first");
-    record_recreated_id(&mut ledger, &handle, "first", "second");
-    assert_eq!(ledger.get(&handle), Some(&vec!["second".to_string()]));
-
+async fn a_retried_release_on_a_reopened_account_deletes_the_recreated_row() {
     let client = GraphClient::new("token");
     client.script_rest([deleted()]);
-    let account = webhook_account(&client);
-    account.webhooks.groups_for_tests().write().await.insert(
-        handle.clone(),
-        GraphSubscriptionGroup::live(vec![state("second", "/me/events")]),
-    );
-    *recreated_ids(&account) = ledger;
-    unsubscribe_graph(account.clone(), handle.clone())
-        .await
-        .expect("teardown succeeds");
-    assert!(recreated_ids(&account).is_empty());
-}
+    let old = webhook_account(&client);
+    let handle = graph_handle("ab12", None, ["original"]);
+    lease(&old, &handle.0, "/me/events", "original");
+    // What a recreate installs.
+    old.webhooks.store().edit_for_tests(|rows| {
+        rows.get_mut("/me/events").expect("row").server_id = "recreated".to_string();
+    });
 
-/// A terminal renewal failure flags a recreated subscription instead of
-/// dropping its row, so the handle's teardown still deletes it and the ledger
-/// forgets it only then.
-#[tokio::test]
-async fn a_recreated_id_flagged_by_a_terminal_renewal_failure_is_still_torn_down() {
-    let client = GraphClient::new("token");
-    client.script_rest([deleted(), deleted()]);
-    let account = webhook_account(&client);
-    let handle = graph_handle("ab12", None, ["other"]);
-    account.webhooks.groups_for_tests().write().await.insert(
-        handle.clone(),
-        GraphSubscriptionGroup::live(vec![
-            state("other", "/me/events"),
-            state("recreated", "/me/contacts"),
-        ]),
-    );
-    record_recreated_id(&mut recreated_ids(&account), &handle, "gone", "recreated");
-    // The renewal session's terminal-failure path.
-    account.webhooks.terminate(&handle, "recreated").await;
-    assert_eq!(
-        recreated_ids(&account).get(&handle),
-        Some(&vec!["recreated".to_string()]),
-        "flagging deletes nothing, so the ledger keeps the id"
-    );
-
-    unsubscribe_graph(account.clone(), handle)
+    let fresh = reopened(&old, &client);
+    push_unsubscribe(fresh, handle)
         .await
-        .expect("teardown succeeds");
+        .expect("the retried release succeeds");
     let requests = urls(&client);
-    assert_eq!(requests.len(), 2, "{requests:?}");
-    assert!(requests[0].1.ends_with("/subscriptions/other"));
-    assert!(requests[1].1.ends_with("/subscriptions/recreated"));
-    assert!(recreated_ids(&account).is_empty());
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(requests[0].1.ends_with("/subscriptions/recreated"));
+    assert!(rows_empty(&old));
 }
 
-/// When the terminated subscription is its group's ONLY one, the group must
-/// survive for `close()` to reach it. Removing the row used to remove the
-/// group, and `close()` - which walks registered groups - never sent the
-/// DELETE while Graph kept delivering until expiry.
+/// A row whose renewal failed terminally stays for `close()` to reach:
+/// a subscription we stopped renewing is one Graph still delivers.
 #[tokio::test]
 async fn close_deletes_a_subscription_whose_renewal_failed_terminally() {
     let client = GraphClient::new("token");
     client.script_rest([deleted()]);
     let account = webhook_account(&client);
-    let handle = graph_handle("ab12", None, ["only"]);
-    account.webhooks.groups_for_tests().write().await.insert(
-        handle.clone(),
-        GraphSubscriptionGroup::live(vec![state("only", "/me/events")]),
-    );
-    account.webhooks.terminate(&handle, "only").await;
+    lease(&account, "h", "/me/events", "only");
+    account.webhooks.store().edit_for_tests(|rows| {
+        rows.get_mut("/me/events").expect("row").terminated = true;
+    });
+    assert!(!account.webhooks.has_live());
 
     retire_all_graph_subscriptions(&account).await;
     let requests = urls(&client);
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(requests[0].0, "DELETE");
     assert!(requests[0].1.ends_with("/subscriptions/only"));
-    assert!(account.webhooks.groups_for_tests().read().await.is_empty());
+    assert!(rows_empty(&account));
+}
+
+// ---- one row per resource, shared by every lease --------------------------
+
+/// The reopen overlap. Graph refuses a second subscription for a resource,
+/// and the engine subscribes on the replacement account BEFORE it tears the
+/// old account's handles down. The replacement must attach to the live row
+/// without a POST, the old handle's release must not delete it, and the old
+/// account's `close()` must leave it to the replacement.
+///
+/// The script holds no 409: a POST for the shared resource would consume the
+/// DELETE meant for the end and fail the assertions.
+#[tokio::test]
+async fn a_reopen_attaches_to_the_old_accounts_rows_and_keeps_them() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("shared"), deleted()]);
+    let old = webhook_account(&client);
+    let old_handle = push_subscribe(old.clone(), vec![email_scope("inbox")])
+        .await
+        .expect("first subscribe")
+        .handle()
+        .cloned()
+        .expect("a handle");
+
+    let new = reopened(&old, &client);
+    let subscription = push_subscribe(new.clone(), vec![email_scope("inbox")])
+        .await
+        .expect("the replacement attaches");
+    let new_handle = subscription.handle().cloned().expect("a handle");
+    assert_eq!(subscription.outcomes().succeeded().len(), 1);
+    assert!(matches!(
+        decode_handle(&new_handle),
+        DecodedHandle::Graph { ids, .. } if ids == ["shared"]
+    ));
+    assert_eq!(client.wire_attempts(), 1, "no second POST");
+
+    // The engine's old-side teardown, then the old account's close.
+    push_unsubscribe(old.clone(), old_handle.clone())
+        .await
+        .expect("release");
+    retire_all_graph_subscriptions(&old).await;
+    assert_eq!(client.wire_attempts(), 1, "the shared row was not deleted");
+    assert_eq!(
+        row_ids(&new),
+        [(
+            "/me/mailFolders/inbox/messages".to_string(),
+            "shared".to_string()
+        )]
+    );
+    assert!(new.webhooks.has_live());
+
+    // A repeated release of the old handle finds no lease and decodes the
+    // shared id, which the store still holds: nothing is deleted.
+    push_unsubscribe(old, old_handle).await.expect("repeat");
+    assert_eq!(client.wire_attempts(), 1);
+
+    push_unsubscribe(new.clone(), new_handle)
+        .await
+        .expect("last release");
+    let requests = urls(&client);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests[1].0, "DELETE");
+    assert!(requests[1].1.ends_with("/subscriptions/shared"));
+    assert!(rows_empty(&new));
+}
+
+/// Two subscribes whose scopes share a resource: every calendar maps to the
+/// mailbox-wide `/events`, so disjoint calendar sets meet on one row. The
+/// second attaches, and each release only drops its own lease until the last.
+#[tokio::test]
+async fn overlapping_subscribes_share_one_row_per_resource() {
+    let client = GraphClient::new("token");
+    client.script_rest([created("events"), deleted()]);
+    let account = webhook_account(&client);
+    let first = push_subscribe(account.clone(), vec![calendar_scope("a")])
+        .await
+        .expect("first")
+        .handle()
+        .cloned()
+        .expect("a handle");
+    let second = push_subscribe(account.clone(), vec![calendar_scope("b")])
+        .await
+        .expect("the second attaches instead of answering 409")
+        .handle()
+        .cloned()
+        .expect("a handle");
+    assert_eq!(client.wire_attempts(), 1);
+    assert_ne!(first, second);
+
+    unsubscribe_graph(account.clone(), first)
+        .await
+        .expect("release first");
+    assert_eq!(client.wire_attempts(), 1, "the other lease keeps the row");
+    let rows = account.webhooks.store().rows_for_tests();
+    assert_eq!(
+        rows["/me/events"].leases[&second].scopes,
+        [calendar_scope("b")]
+    );
+
+    unsubscribe_graph(account.clone(), second)
+        .await
+        .expect("release second");
+    assert_eq!(client.wire_attempts(), 2);
+    assert!(rows_empty(&account));
+}
+
+/// A row left with only condemned leases (its DELETE failed, and may or may
+/// not have taken effect) is not handed to a new subscriber as coverage: the
+/// subscribe finishes the DELETE first, then creates fresh, and the condemned
+/// lease's debt is paid with it.
+#[tokio::test]
+async fn a_subscribe_over_a_condemned_row_finishes_its_delete_first() {
+    let client = GraphClient::new("token");
+    client.script_rest([server_error(), deleted(), created("fresh")]);
+    let account = webhook_account(&client);
+    lease(&account, "old", "/me/mailFolders/inbox/messages", "stale");
+    unsubscribe_graph(account.clone(), SubscriptionHandle("old".to_string()))
+        .await
+        .expect_err("the DELETE failed");
+
+    let handle = push_subscribe(account.clone(), vec![email_scope("inbox")])
+        .await
+        .expect("subscribe")
+        .handle()
+        .cloned()
+        .expect("a handle");
+    let requests = urls(&client);
+    let methods: Vec<&str> = requests.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(methods, ["DELETE", "DELETE", "POST"]);
+    assert!(requests[1].1.ends_with("/subscriptions/stale"));
+    let rows = account.webhooks.store().rows_for_tests();
+    let row = &rows["/me/mailFolders/inbox/messages"];
+    assert_eq!(row.server_id, "fresh");
+    assert_eq!(row.leases.len(), 1, "the condemned lease went with its row");
+    assert!(row.leases.contains_key(&handle));
+}
+
+/// Attaching to a row whose renewal failed terminally must not hand out
+/// coverage nobody renews: the subscribe recovers it with a PATCH, and the
+/// recovered row owes every holder a gap.
+#[tokio::test]
+async fn a_subscribe_over_a_terminated_row_recovers_it() {
+    let client = GraphClient::new("token");
+    client.script_rest([ScriptedRestResponse::json(
+        reqwest::StatusCode::OK,
+        serde_json::json!({"id":"dead","expirationDateTime":"2099-01-01T00:00:00Z"}),
+    )]);
+    let account = webhook_account(&client);
+    lease(&account, "old", "/me/mailFolders/inbox/messages", "dead");
+    account.webhooks.store().edit_for_tests(|rows| {
+        rows.get_mut("/me/mailFolders/inbox/messages")
+            .expect("row")
+            .terminated = true;
+    });
+
+    push_subscribe(account.clone(), vec![email_scope("inbox")])
+        .await
+        .expect("subscribe");
+    let requests = urls(&client);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].0, "PATCH");
+    let rows = account.webhooks.store().rows_for_tests();
+    assert!(!rows["/me/mailFolders/inbox/messages"].terminated);
+    assert!(account.webhooks.has_live());
+    assert_eq!(
+        account.webhooks.events_for_tests(),
+        2,
+        "a gap for the old holder and for the new lease"
+    );
+}
+
+/// An account dropped without `close()` cannot pin a shared row forever: its
+/// leases stop counting as live, so the last real holder's release deletes.
+#[tokio::test]
+async fn a_dropped_accounts_lease_does_not_keep_a_row_alive() {
+    let client = GraphClient::new("token");
+    client.script_rest([deleted()]);
+    let survivor = webhook_account(&client);
+    lease(&survivor, "kept", "/me/events", "shared");
+    {
+        let dropped = reopened(&survivor, &client);
+        lease(&dropped, "abandoned", "/me/events", "shared");
+    }
+    unsubscribe_graph(survivor.clone(), SubscriptionHandle("kept".to_string()))
+        .await
+        .expect("release");
+    assert_eq!(client.wire_attempts(), 1, "the row was deleted");
+    assert!(rows_empty(&survivor));
 }
 
 /// A handle that is not a well-formed webhook handle chooses nothing to

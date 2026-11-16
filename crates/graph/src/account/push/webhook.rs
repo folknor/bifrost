@@ -1,134 +1,40 @@
 //! The Graph `/subscriptions` webhook arm: per-scope resource construction,
-//! subscription creation with rollback, the registered `GraphSubscriptionGroup`
-//! state, and teardown (`push_unsubscribe` plus `close()`'s best-effort walk).
+//! subscribe (attach to a shared row or create it, with rollback), and
+//! release (`push_unsubscribe` plus `close()`'s walk).
 //!
-//! The renewal session that keeps these subscriptions alive lives in
+//! Rows belong to the factory-shared store in `super::registry`; a handle
+//! holds leases. The renewal session that keeps rows alive lives in
 //! `super::renewal`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use bifrost_types::{AccountError, AccountOperation, CursorScope, ErrorScope, SubscriptionHandle};
 
 use crate::account::GraphAccount;
 use crate::account::graph_error::{GraphErrorContext, into_account_error};
-use crate::webhooks::{create_subscription, delete_subscription};
+use crate::webhooks::{
+    create_subscription, delete_subscription, renew_subscription, subscription_is_gone,
+};
 
 use super::common::{
     DecodedHandle, account_closed_error, decode_handle, graph_handle, new_handle_token,
     unsupported_push_error, unsupported_push_scope_error,
 };
 use super::dispatch::{ArmOutcome, finalize_push_outcomes};
+use super::registry::{Exchange, RowStatus};
 
-/// Server ids the renewal session recreated under a handle, which the handle
-/// string itself cannot name.
+type Grouped = BTreeMap<String, Vec<(bifrost_types::SubmissionIndex, CursorScope)>>;
+
+/// The webhook arm of `push_subscribe`: lease one row per resource, close the
+/// ledger, and only then commit the leases and wake the renewal session.
 ///
-/// A handle carries the ids of its subscribe time (`common::graph_handle`),
-/// and the engine stores that string unchanged. When the renewal session
-/// replaces a vanished subscription, the replacement's id lives only in the
-/// instance's group - so if that instance's teardown fails and the engine
-/// retries the handle as an orphan on a reopened instance, the replacement
-/// would be out of reach and live until Graph expired it. The engine reopens
-/// through the same factory, and the factory hands every account it opens
-/// this one ledger, so the orphan path on the new instance finds them here.
+/// The ledger is closed HERE, between the last row step and the commit, not
+/// by the dispatcher afterwards. `finalize` is fallible (an unfiled or
+/// double-filed lane id is this crate's invariant breaking); closed before the
+/// commit, its failure path has leased nothing and only has to roll back the
+/// rows this request created.
 ///
-/// Process-local, like the engine's own subscription registry: nothing
-/// retries a handle across a process restart, and a handle that outlives the
-/// process reaches only the ids it was minted with.
-///
-/// An id enters when a recreate installs it and leaves only when a DELETE of
-/// it succeeds (or a whole orphan teardown does) - never when a terminal
-/// renewal failure drops its group row, since that deletes nothing. Every
-/// write and the teardown snapshot happen under the registry's registration
-/// write lock, so the two never disagree. Never held across an await.
-pub(crate) type RecreatedSubscriptionIds =
-    std::sync::Arc<std::sync::Mutex<HashMap<SubscriptionHandle, Vec<String>>>>;
-
-/// Lock the recreated-id ledger, tolerating poison: every write leaves the
-/// map consistent, so a panic elsewhere does not invalidate it.
-#[cfg(test)]
-pub(super) fn recreated_ids(
-    account: &GraphAccount,
-) -> std::sync::MutexGuard<'_, HashMap<SubscriptionHandle, Vec<String>>> {
-    account.webhooks.recreated_for_test_edit()
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct GraphSubscriptionGroup {
-    pub(crate) subscriptions: Vec<GraphSubscriptionState>,
-    /// Set the moment `push_unsubscribe` starts deleting this group, and
-    /// never cleared - teardown intent is monotone per handle, because a
-    /// later `push_subscribe` mints a fresh handle rather than reviving
-    /// this one.
-    ///
-    /// Teardown deletes over the network, so the group must stay registered
-    /// across those awaits for a failed DELETE to remain retryable. That
-    /// keeps the handle visible to the renewal session, whose recreate path
-    /// would otherwise install a replacement into a group teardown has
-    /// already snapshotted: the removal that follows only knows the stale
-    /// server id, so the replacement would stay registered and live while
-    /// `push_unsubscribe` reported success. The marker is a plain flag
-    /// rather than a lock because the decision it drives is local and
-    /// synchronous - serializing the two paths on a mutex would hold it
-    /// across DELETE and create round trips.
-    pub(crate) tearing_down: bool,
-}
-
-impl GraphSubscriptionGroup {
-    /// A freshly registered group, not yet being torn down.
-    pub(crate) fn live(subscriptions: Vec<GraphSubscriptionState>) -> Self {
-        Self {
-            subscriptions,
-            tearing_down: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct GraphSubscriptionState {
-    pub(crate) server_id: String,
-    // Retain malformed server expiry alongside server_id, rather than fail
-    // creation before registration and orphan a subscription with a known id.
-    // Outlook users expect push to recover: the renewal fallback keeps coverage
-    // alive and this row reachable for close/unsubscribe. Parse-at-receipt must
-    // first preserve both properties on its failure path.
-    pub(crate) expires_at: String,
-    pub(crate) resource: String,
-    /// The cursor scopes this one subscription covers.
-    ///
-    /// Retained so a terminal renewal failure can name what lost coverage.
-    /// `subscribe_graph` groups by resource string and used to discard the
-    /// scopes it grouped, leaving `Terminated` with no scope attribution at
-    /// all - the engine could see that push broke without being able to tell
-    /// which scopes to fall back to polling. Every other error path in this
-    /// crate carries an `ErrorScope`.
-    pub(crate) scopes: Vec<CursorScope>,
-    /// Whether the renewal session has already warned about an unparseable
-    /// `expires_at` for this subscription, so the warning fires once per
-    /// subscription rather than once per renewal tick.
-    pub(crate) warned_unparseable_expiry: bool,
-    /// A renewal of this subscription failed terminally (auth lost,
-    /// permission revoked and the like), so the renewal session no longer
-    /// renews or recreates it. The row stays registered: a subscription we
-    /// stopped renewing is not one that stopped existing, and `close()` and
-    /// `push_unsubscribe` still DELETE it. Removing the row instead took a
-    /// group's last subscription out of `close()`'s reach while Graph still
-    /// held it (ruled 2026-10-04).
-    pub(crate) terminated: bool,
-}
-
-/// The webhook arm of `push_subscribe`: create one server subscription per
-/// resource, close the ledger, and only then register and start renewing.
-///
-/// The ledger is closed HERE, between the last create and the registration,
-/// not by the dispatcher afterwards. `finalize` is fallible (an unfiled or
-/// double-filed lane id is this crate's invariant breaking), and it used to
-/// run after the group was registered and the renewal session started: a
-/// failure returned `Err` - no handle - over subscriptions the sessions kept
-/// renewing and no caller could ever name to unsubscribe. Closed before the
-/// registration, the failure path has registered nothing and only has to
-/// roll back the server-side creates, exactly as a failed create does.
-///
-/// The creates, rollback and registration run in a spawned task so a dropped
+/// The row steps, rollback and commit run in a spawned task so a dropped
 /// caller cannot strand them; see the comments at the spawn and on
 /// `run_subscribe`.
 pub(super) async fn subscribe_graph(
@@ -149,8 +55,7 @@ pub(super) async fn subscribe_graph(
     // where the caller sees exactly which scope was declined and keeps
     // polling coverage for it, while its subscribable siblings still get a
     // live subscription.
-    let mut grouped: HashMap<String, Vec<(bifrost_types::SubmissionIndex, CursorScope)>> =
-        HashMap::new();
+    let mut grouped: Grouped = BTreeMap::new();
     for (item, scope, parsed) in eligible {
         match parsed.subscription_resource(&account) {
             Ok(Some(resource)) => {
@@ -174,22 +79,17 @@ pub(super) async fn subscribe_graph(
         return Ok((None, finalize_push_outcomes(outcomes, expected)?));
     }
 
-    // Mint the handle's random token BEFORE the first create.
+    // Mint the handle's random token BEFORE the first request.
     // `new_handle_token` is fallible (the host entropy source can fail; that
     // is `Internal(RuntimeFailure)`, never retried), and a failure here has
-    // written nothing. Minting it after the creates would return an error
-    // with live server-side subscriptions behind it and no handle any
-    // teardown could name them by, orphaning them until they expire. The
-    // handle itself is assembled after the creates, because it embeds the
-    // server ids they return (see `common::decode_handle`).
+    // written nothing. The handle itself is assembled after the row steps,
+    // because it embeds the server ids (see `common::decode_handle`).
     let token = new_handle_token()?;
 
-    // A closed account must not gain server-side state. `close()` walks the
-    // registered groups once; a create that started after that walk could
-    // only ever be rolled back. Refusing here, before the first POST, keeps
-    // the common case (subscribing on a dead account) from touching the
-    // server at all; the registration step re-checks under the write lock
-    // for the create that was already in flight when `close()` began.
+    // A closed account must not gain leases. Refusing here, before the first
+    // request, keeps the common case (subscribing on a dead account) from
+    // touching the server at all; the task re-checks under the exchange and
+    // again right before the commit.
     if account.shutdown.is_cancelled() {
         return Err(account_closed_error());
     }
@@ -198,10 +98,10 @@ pub(super) async fn subscribe_graph(
     // this future only waits on it. `push_subscribe` is a caller-visible
     // future and callers drop those (a timeout, a `select!`, an aborted
     // reattach); dropped mid-way, a body that ran inline would strand every
-    // server-side create made so far, skip the remaining rollback DELETEs, or
-    // leave a registered group whose handle nobody received. A spawned task
-    // is not torn down by its awaiter going away, so the creates, the
-    // rollback and the registration each run to completion.
+    // server-side create made so far, skip the rollback DELETEs, or leave a
+    // committed lease whose handle nobody received. A spawned task is not torn
+    // down by its awaiter going away, so the steps, the rollback and the
+    // commit each run to completion.
     //
     // Nothing is spawned, and nothing has been written, until this future is
     // first polled and reaches this point, so a future dropped before its
@@ -213,8 +113,8 @@ pub(super) async fn subscribe_graph(
     // receiver's future is then dropped without ever being polled again, and
     // the value dies with it. The waiter therefore acks, in the same
     // synchronous step that takes the result, and the task treats a missing
-    // ack (or a failed send) as "the handle was never received" and tears the
-    // registered group down. Exactly one side ever cleans up.
+    // ack (or a failed send) as "the handle was never received" and releases
+    // it. Exactly one side ever cleans up.
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(run_subscribe(
@@ -248,26 +148,27 @@ pub(super) async fn subscribe_graph(
 /// Everything the spawned subscribe task owns.
 struct SubscribeRequest {
     endpoint: super::common::PushEndpoint,
-    grouped: HashMap<String, Vec<(bifrost_types::SubmissionIndex, CursorScope)>>,
-    /// The random part of the handle, minted before any create.
+    grouped: Grouped,
+    /// The random part of the handle, minted before any request.
     token: String,
     outcomes: bifrost_types::BatchOutcomeBuilder<CursorScope, bifrost_types::SubmissionIndex>,
     expected: Vec<bifrost_types::SubmissionIndex>,
 }
 
-/// The spawned half of the webhook `push_subscribe`: create, register, and
-/// hand the result to the waiter, tearing the group down again if the waiter
-/// never took it.
+/// The spawned half of the webhook `push_subscribe`: lease, commit, and hand
+/// the result to the waiter, releasing the handle again if the waiter never
+/// took it.
 ///
 /// What cannot be made safe, and why:
 /// - A create whose response never arrived (a timeout, a reset) may have
 ///   succeeded on Graph. The subscription id exists only in the response we
 ///   did not read, so there is nothing to DELETE by; it lives until Graph's
 ///   own expiry (up to seven days, as requested for basic notifications) and
-///   posts to the receiver meanwhile. Recovering it would mean listing `/subscriptions` and deleting by resource and
-///   notification URL, which could also delete another process's identical
-///   subscription; that is a product decision, not something to do silently
-///   here.
+///   posts to the receiver meanwhile, and a later create for that resource
+///   answers 409. Recovering it would mean listing `/subscriptions` and
+///   deleting by resource and notification URL, which could also delete
+///   another process's identical subscription; that is a product decision,
+///   not something to do silently here.
 /// - A process exit or runtime shutdown kills this task like any other, with
 ///   the same result for whatever it had created.
 async fn run_subscribe(
@@ -276,10 +177,13 @@ async fn run_subscribe(
     result_tx: tokio::sync::oneshot::Sender<Result<ArmOutcome, AccountError>>,
     ack_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
+    // The exchange is released inside `create_and_register`, before this
+    // waits for the ack: an abandoned or never-polled caller must not hold up
+    // every other row-lifecycle step of the factory.
     let result = create_and_register(&account, request).await;
-    // Only a success registered a group, and the success names its handle.
+    // Only a success committed leases, and the success names its handle.
     let Some(handle) = result.as_ref().ok().and_then(|(handle, _)| handle.clone()) else {
-        // Nothing registered, so nothing to retire; a dropped waiter has
+        // Nothing committed, so nothing to release; a dropped waiter has
         // nobody to tell.
         let _ = result_tx.send(result);
         return;
@@ -288,19 +192,40 @@ async fn run_subscribe(
     if received {
         return;
     }
-    // The group is registered and renewable, but no caller holds
-    // the handle, so no `push_unsubscribe` will ever name it. Retire it the
-    // way a caller would. If a DELETE fails the group stays registered
-    // (marked `tearing_down`), which is exactly what lets `close()` retry it.
+    // The leases are committed and renewable, but no caller holds the
+    // handle, so no `push_unsubscribe` will ever name it. Release it the way
+    // a caller would. A failed DELETE condemns the lease, which is exactly
+    // what lets `close()` retry it.
     if let Err(error) = unsubscribe_graph(account, handle).await {
         let telemetry = error.telemetry_fields();
         tracing::warn!(
             target: "bifrost_graph::push",
             message_key = telemetry.message_key,
             recovery = telemetry.recovery_discriminant,
-            "could not retire a Graph webhook subscription whose subscribe was abandoned"
+            "could not release a Graph webhook subscription whose subscribe was abandoned"
         );
     }
+}
+
+/// How one resource step of a subscribe failed.
+enum StepError {
+    /// The POST for this resource was refused. A permission refusal is the
+    /// resource's lane failure; anything else fails the whole request.
+    Create(AccountError),
+    /// A prerequisite (the DELETE of an unowned row, the recovery PATCH of a
+    /// terminated one) failed. Always whole-request: the permission laning
+    /// rationale is about a standing refusal to SUBSCRIBE, which a failed
+    /// prerequisite does not show.
+    Prerequisite(AccountError),
+}
+
+/// What one resource step leaves for the commit.
+struct Leased {
+    resource: String,
+    covered: Vec<(bifrost_types::SubmissionIndex, CursorScope)>,
+    /// The row was recovered from a terminal failure for this request, so
+    /// the new lease is owed a gap like every other holder.
+    recovered: bool,
 }
 
 async fn create_and_register(
@@ -315,48 +240,35 @@ async fn create_and_register(
         expected,
     } = request;
     let expected = expected.as_slice();
-    let mut subscriptions = Vec::new();
+    let store = std::sync::Arc::clone(account.webhooks.store());
+    // The whole multi-resource transaction holds the exchange until its
+    // leases are committed or rolled back, so no other subscriber can attach
+    // to a row this request created and rollback may treat such a row as its
+    // own.
+    let exchange = store.exchange().await;
+    // Acquisition fence: a `close()` that cancelled while this waited for the
+    // exchange has walked, or will walk, its leases; this must not add one.
+    if account.shutdown.is_cancelled() {
+        return Err(account_closed_error());
+    }
+    let mut created: Vec<String> = Vec::new();
+    let mut leased: Vec<Leased> = Vec::new();
     for (resource, covered) in grouped {
-        match create_subscription(
-            account.mailboxes.primary(),
-            &resource,
-            &endpoint.webhook_url,
-            &endpoint.client_state,
-            None,
-        )
-        .await
-        {
-            Ok(response) => {
+        match lease_row(account, &exchange, &endpoint, &resource).await {
+            Ok(step) => {
+                if step == RowStep::Created {
+                    created.push(resource.clone());
+                }
                 for (item, scope) in &covered {
                     outcomes.push_succeeded(*item, scope.clone());
                 }
-                subscriptions.push(GraphSubscriptionState {
-                    server_id: response.id,
-                    expires_at: response.expiration_date_time,
+                leased.push(Leased {
                     resource,
-                    scopes: covered.into_iter().map(|(_, scope)| scope).collect(),
-                    warned_unparseable_expiry: false,
-                    terminated: false,
+                    covered,
+                    recovered: step == RowStep::Recovered,
                 });
             }
-            Err(error) => {
-                let error = into_account_error(
-                    error,
-                    GraphErrorContext::graph(AccountOperation::PushSubscribe),
-                );
-                if !is_standing_resource_refusal(&error) {
-                    // The handle is never registered on the account and never
-                    // returned on this path, so nothing downstream could ever
-                    // reach these subscriptions to tear them down. Retain none
-                    // of them. Cleanup is best effort: preserve the create
-                    // error the caller needs to act on even if a DELETE fails.
-                    //
-                    // This rolls back only what we hold ids for. THIS create may
-                    // itself have succeeded on Graph (a timeout after the server
-                    // acted): its id is unknowable, see `run_subscribe`.
-                    roll_back_created(account, &subscriptions).await;
-                    return Err(error);
-                }
+            Err(StepError::Create(error)) if is_standing_resource_refusal(&error) => {
                 // A permission refusal names THIS resource: a token that can
                 // list calendars with Calendars.ReadBasic still cannot
                 // subscribe to `/events` without Calendars.Read. It is that
@@ -378,56 +290,191 @@ async fn create_and_register(
                     outcomes.push_failed(item, scoped);
                 }
             }
+            Err(StepError::Create(error) | StepError::Prerequisite(error)) => {
+                // No lease of this request is committed and no handle is
+                // returned, so nothing downstream could reach a row this
+                // request created. Cleanup is best effort: preserve the error
+                // the caller needs to act on even if a DELETE fails (the row
+                // then stays in the store as debt).
+                //
+                // This rolls back only what we hold ids for. THIS create may
+                // itself have succeeded on Graph (a timeout after the server
+                // acted): its id is unknowable, see `run_subscribe`.
+                roll_back_created(account, &exchange, &created).await;
+                return Err(error);
+            }
         }
     }
 
     // Every lane must be filed before anything becomes live. See the
-    // function doc: on this path nothing is registered and no session can
-    // see the rows, so rolling back the creates is the whole cleanup.
+    // function doc: on this path nothing is leased, so rolling back the
+    // creates is the whole cleanup.
     let outcomes = match finalize_push_outcomes(outcomes, expected) {
         Ok(outcomes) => outcomes,
         Err(error) => {
-            roll_back_created(account, &subscriptions).await;
+            roll_back_created(account, &exchange, &created).await;
             return Err(error);
         }
     };
     // Every group refused on permission: the handle-less outcome, which the
     // dispatcher turns into the whole-request refusal carrying each cause.
-    if subscriptions.is_empty() {
+    if leased.is_empty() {
         return Ok((None, outcomes));
     }
 
-    // Mint before registration; the handle carries the original server ids.
+    store.pass_commit_gate().await;
+    // Second acquisition fence, with no await between it and the commit: a
+    // `close()` that cancelled while the requests were in flight either sees
+    // these leases on its walk (it waits for the exchange) or this refuses.
+    if account.shutdown.is_cancelled() {
+        roll_back_created(account, &exchange, &created).await;
+        return Err(account_closed_error());
+    }
+    let ids: Vec<String> = leased
+        .iter()
+        .filter_map(|leased| store.server_id(&exchange, &leased.resource))
+        .collect();
+    // Mint before the commit; the handle carries the server ids.
     let handle = graph_handle(
         &token,
         own_binding(account).as_deref(),
-        subscriptions.iter().map(|state| state.server_id.as_str()),
+        ids.iter().map(String::as_str),
     );
-    if let Err(group) = account
-        .webhooks
-        .register(
-            &account.shutdown,
-            handle.clone(),
-            GraphSubscriptionGroup::live(subscriptions),
-        )
-        .await
+    let mut leases = Vec::with_capacity(leased.len());
+    for Leased {
+        resource,
+        covered,
+        recovered,
+    } in leased
     {
-        roll_back_created(account, &group.subscriptions).await;
-        return Err(account_closed_error());
+        leases.push((
+            resource,
+            covered.into_iter().map(|(_, scope)| scope).collect(),
+            recovered,
+        ));
     }
+    store.commit_leases(&exchange, account.webhooks.sink(), &handle, leases);
+    drop(exchange);
     Ok((Some(handle), outcomes))
+}
+
+/// What a resource step did to the row it leases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowStep {
+    /// A healthy row another lease already holds: no request was sent.
+    Attached,
+    /// A fresh row this request created, provisional until the commit.
+    Created,
+    /// A terminated row brought back for this request.
+    Recovered,
+}
+
+fn push_error(error: crate::error::GraphError) -> AccountError {
+    into_account_error(
+        error,
+        GraphErrorContext::graph(AccountOperation::PushSubscribe),
+    )
+}
+
+fn release_error(error: crate::error::GraphError) -> AccountError {
+    into_account_error(
+        error,
+        GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
+    )
+}
+
+/// Make `resource` leasable for one subscribe, under the exchange.
+///
+/// A healthy shared row is attached to as it is: Graph would refuse a second
+/// subscription for the resource, and the row already delivers to the same
+/// receiver. A terminated row is recovered first (a lease must not be handed
+/// coverage nobody is renewing): a PATCH that succeeds revives it, a 404/410
+/// means it is gone and a fresh create replaces it. A row nobody holds live
+/// (only condemned leases, or a failed rollback's debt) may or may not still
+/// exist on Graph, so it is DELETEd before a fresh create; creating beside it
+/// would answer 409.
+async fn lease_row(
+    account: &GraphAccount,
+    exchange: &Exchange,
+    endpoint: &super::common::PushEndpoint,
+    resource: &str,
+) -> Result<RowStep, StepError> {
+    let store = account.webhooks.store();
+    let client = account.mailboxes.primary();
+    match store.status(exchange, resource) {
+        RowStatus::Live => Ok(RowStep::Attached),
+        RowStatus::Terminated { server_id } => {
+            match renew_subscription(client, &server_id, None).await {
+                Ok(expires_at) => {
+                    store.recover(exchange, resource, None, expires_at);
+                    Ok(RowStep::Recovered)
+                }
+                Err(error) if subscription_is_gone(&error) => {
+                    let response = create_subscription(
+                        client,
+                        resource,
+                        &endpoint.webhook_url,
+                        &endpoint.client_state,
+                        None,
+                    )
+                    .await
+                    .map_err(|error| StepError::Create(push_error(error)))?;
+                    store.recover(
+                        exchange,
+                        resource,
+                        Some(response.id),
+                        response.expiration_date_time,
+                    );
+                    Ok(RowStep::Recovered)
+                }
+                Err(error) => Err(StepError::Prerequisite(push_error(error))),
+            }
+        }
+        RowStatus::Unowned { server_id } => {
+            delete_subscription(client, &server_id)
+                .await
+                .map_err(|error| StepError::Prerequisite(release_error(error)))?;
+            store.remove_row(exchange, resource);
+            create_row(account, exchange, endpoint, resource).await
+        }
+        RowStatus::Absent => create_row(account, exchange, endpoint, resource).await,
+    }
+}
+
+async fn create_row(
+    account: &GraphAccount,
+    exchange: &Exchange,
+    endpoint: &super::common::PushEndpoint,
+    resource: &str,
+) -> Result<RowStep, StepError> {
+    let response = create_subscription(
+        account.mailboxes.primary(),
+        resource,
+        &endpoint.webhook_url,
+        &endpoint.client_state,
+        None,
+    )
+    .await
+    .map_err(|error| StepError::Create(push_error(error)))?;
+    account.webhooks.store().insert_row(
+        exchange,
+        resource.to_string(),
+        response.id,
+        response.expiration_date_time,
+    );
+    Ok(RowStep::Created)
 }
 
 /// Whether a subscription create was refused for lack of permission on its
 /// resource, a standing fact rather than a transport, throttle or server
 /// fault.
 ///
-/// A 409 duplicate-subscription refusal is deliberately NOT laned. Graph
-/// refuses a second subscription with the same resource and changeType, and
-/// reattach creates replacements before deleting the old handle's rows, so a
-/// laned 409 would let reattach commit the other groups and then delete the
-/// old row, dropping coverage that was working. Whole-request failure keeps
-/// the old handle alive instead.
+/// A 409 duplicate-subscription refusal is deliberately NOT laned. Rows are
+/// shared through the store, so a 409 now means a row this store does not
+/// know (left by a previous process, or by a second factory for the same
+/// credentials). Laning it would report the scopes as refused while that
+/// unknown row may still be delivering; whole-request failure keeps the
+/// caller's earlier coverage (a reopen's old handle) installed instead.
 ///
 /// This trusts the classifier's `PermissionDenied`. A Conditional Access
 /// claims challenge (403 with a Bearer `insufficient_claims` challenge) is
@@ -443,85 +490,35 @@ fn is_standing_resource_refusal(error: &AccountError) -> bool {
     )
 }
 
-/// Best-effort DELETE of subscriptions this request created but will never
-/// register or return a handle for.
+/// Best-effort DELETE of the rows this request created and will never lease.
 ///
-/// Nothing downstream can reach these rows once the request fails - they are
-/// in no group, so neither `push_unsubscribe` nor `close()` walks them - so a
-/// DELETE that fails here leaves the subscription to Graph's own expiry.
-/// Failures are logged, not returned: the caller needs the error that failed
-/// the request, not the cleanup's.
-async fn roll_back_created(account: &GraphAccount, subscriptions: &[GraphSubscriptionState]) {
-    for subscription in subscriptions {
-        if let Err(cleanup_error) =
-            delete_subscription(account.mailboxes.primary(), &subscription.server_id).await
-        {
-            tracing::warn!(
-                target: "bifrost_graph::webhooks",
-                server_id = %subscription.server_id,
-                error = ?cleanup_error,
-                "failed to roll back Graph webhook subscription"
-            );
-        }
-    }
-}
-
-/// Delete the subscriptions a handle this instance does not know names.
-///
-/// The engine retries a failed teardown against whatever instance is current,
-/// which after a reopen is a newer connection than the one that subscribed.
-/// The handle carries the Graph ids (`common::decode_handle`), so any instance
-/// can finish the job; 404/410 count as already gone (`delete_subscription`).
-///
-/// What this must not do is delete something a live subscription owns:
-/// - it deletes ONLY the ids decoded from this handle, so a newer instance's
-///   own subscriptions (different ids) are untouched by an older instance's
-///   orphan;
-/// - an id that this instance currently has registered under a group is
-///   skipped, so a forged, stale or recycled handle cannot tear down a
-///   subscription this instance still renews. The registered handle is the
-///   only door to those.
-///
-/// Besides the ids the handle names, it deletes the ones the renewal session
-/// recreated under it on an earlier instance (`RecreatedSubscriptionIds`),
-/// and forgets those once every DELETE has succeeded.
-///
-/// Every id is attempted even when an earlier one fails, and the first
-/// failure is returned: the handle is the engine's only record, and a retry
-/// simply re-deletes (idempotent).
-async fn unsubscribe_orphan(
-    account: &GraphAccount,
-    handle: &SubscriptionHandle,
-    server_ids: Vec<String>,
-) -> Result<(), AccountError> {
-    let server_ids = account.webhooks.orphan_ids(handle, server_ids);
-    let owned = account.webhooks.owned_ids().await;
-    let mut first_error = None;
-    for server_id in server_ids {
-        if owned.contains(&server_id) {
+/// A DELETE that fails leaves the row in the store with no lease: cleanup
+/// debt, which the next subscribe for that resource retries before anything
+/// is created beside it. Failures are logged, not returned: the caller needs
+/// the error that failed the request.
+async fn roll_back_created(account: &GraphAccount, exchange: &Exchange, created: &[String]) {
+    let store = account.webhooks.store();
+    for resource in created {
+        let Some(server_id) = store.server_id(exchange, resource) else {
             continue;
-        }
-        if let Err(error) = delete_subscription(account.mailboxes.primary(), &server_id).await {
-            first_error.get_or_insert_with(|| {
-                into_account_error(
-                    error,
-                    GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
-                )
-            });
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => {
-            account.webhooks.forget_orphan(handle);
-            Ok(())
+        };
+        match delete_subscription(account.mailboxes.primary(), &server_id).await {
+            Ok(()) => store.remove_row(exchange, resource),
+            Err(cleanup_error) => {
+                tracing::warn!(
+                    target: "bifrost_graph::webhooks",
+                    server_id = %server_id,
+                    error = ?cleanup_error,
+                    "failed to roll back Graph webhook subscription; kept as cleanup debt"
+                );
+            }
         }
     }
 }
 
 /// The account binding this instance mints into and checks against handles:
 /// its engine `AccountId`, when an `AccountNet` is attached (always, in
-/// production). With none attached, a bound `graph2:` orphan matches nothing
+/// production). With none attached, a bound `graph2:` handle matches nothing
 /// and is left alone - the fail-safe direction, since this instance cannot
 /// prove the handle is its own.
 fn own_binding(account: &GraphAccount) -> Option<String> {
@@ -532,158 +529,155 @@ fn own_binding(account: &GraphAccount) -> Option<String> {
         .map(|net| super::common::account_binding(net.account()))
 }
 
+/// `push_unsubscribe` for a webhook handle: release its leases.
+///
+/// Runs in an owned task holding the exchange through every DELETE and its
+/// local commit, so a dropped caller cannot leave a DELETE that succeeded
+/// unrecorded or a failed one unflagged.
 pub(super) async fn unsubscribe_graph(
     account: GraphAccount,
     handle: SubscriptionHandle,
 ) -> Result<(), AccountError> {
-    let Some(server_ids) = account.webhooks.begin_teardown(&handle).await else {
-        // Unknown to this instance: an orphan from an earlier connection (or
-        // a handle already torn down here). The handle itself says what to
-        // delete.
-        return match decode_handle(&handle) {
-            DecodedHandle::Graph {
-                account: Some(bound),
-                ..
-            } if own_binding(&account).as_deref() != Some(bound.as_str()) => {
-                // Minted by another account. Its ids are reachable with this
-                // account's credentials when both sit in one tenant, so
-                // deleting them would tear down a subscription this account
-                // never owned. Left alone, like an unrecognized handle: this
-                // instance has nothing of its own to retire.
-                tracing::warn!(
-                    target: "bifrost_graph::push",
-                    "push_unsubscribe was handed a webhook handle minted by another account; \
-                     nothing deleted"
-                );
-                Ok(())
-            }
-            DecodedHandle::Graph { ids, .. } => unsubscribe_orphan(&account, &handle, ids).await,
-            DecodedHandle::Ews | DecodedHandle::Unrecognized => Ok(()),
-        };
-    };
-    for server_id in server_ids {
-        delete_subscription(account.mailboxes.primary(), &server_id)
-            .await
-            .map_err(|e| {
-                into_account_error(
-                    e,
-                    GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
-                )
-            })?;
-        account.webhooks.forget_deleted(&handle, &server_id).await;
-    }
-    account.webhooks.changed();
-    Ok(())
+    let task = tokio::spawn(async move {
+        let store = std::sync::Arc::clone(account.webhooks.store());
+        let exchange = store.exchange().await;
+        release_locked(&account, &exchange, &handle).await
+    });
+    task.await.unwrap_or_else(|_| {
+        Err(push_error(crate::error::GraphError::RuntimeFailure {
+            message: "the push_unsubscribe task ended without an answer".to_string(),
+        }))
+    })
 }
 
-/// Best-effort DELETE of every webhook subscription still registered, for
-/// `close()`.
+/// Release every lease `handle` holds, under the exchange.
 ///
-/// A Graph subscription lives on the server for up to its ~24h expiry and
-/// keeps POSTing to the consumer's HTTPS receiver whether or not this process
-/// still exists. Reopen builds a FRESH `GraphAccount` and the engine
-/// resubscribes, so a `close()` that dropped the local map stranded one live
-/// subscription per resource per reopen. Nothing in the `Account` contract
-/// promises `push_unsubscribe` before `close()`, so `close()` has to do it.
+/// A row some other live lease still holds keeps delivering: only this lease
+/// goes. A row left with no other live holder is DELETEd (404/410 count as
+/// gone) and forgotten with every condemned lease on it; a failed DELETE
+/// condemns this lease so a retry or `close()` can finish. Every row is
+/// attempted and the first failure returned.
 ///
-/// Failures are logged, not returned: `close()` must still settle its
-/// account-owned push tasks, and the engine has no useful
-/// recovery for "the server kept a subscription we asked it to drop".
-pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
-    // Cancel BEFORE the walk: an in-flight `push_subscribe`, and a renewal
-    // recreate's install, check the token under the same write lock they
-    // register under, so a group or replacement they register either
-    // precedes this cancel (and is walked below) or is refused and rolled
-    // back. `close()` relies on this being its only cancel.
-    account.shutdown.cancel();
-    let handles = account.webhooks.handles().await;
-    for handle in handles {
-        let Some(server_ids) = account.webhooks.begin_teardown(&handle).await else {
+/// A handle that holds no lease is an orphan from an earlier process (or one
+/// already released): the handle itself names the server ids, and only ids no
+/// row in the store holds are DELETEd, so a repeated release, or a stale or
+/// forged handle, cannot tear down a row another lease renews. A handle bound
+/// to another account deletes nothing: its ids are reachable with this
+/// account's credentials when both sit in one tenant.
+async fn release_locked(
+    account: &GraphAccount,
+    exchange: &Exchange,
+    handle: &SubscriptionHandle,
+) -> Result<(), AccountError> {
+    let decoded = decode_handle(handle);
+    if let DecodedHandle::Graph {
+        account: Some(bound),
+        ..
+    } = &decoded
+        && own_binding(account).as_deref() != Some(bound.as_str())
+    {
+        tracing::warn!(
+            target: "bifrost_graph::push",
+            "push_unsubscribe was handed a webhook handle minted by another account; \
+             nothing deleted"
+        );
+        return Ok(());
+    }
+    let store = account.webhooks.store();
+    let client = account.mailboxes.primary();
+    let resources = store.leased_by(handle);
+    let mut first_error = None;
+    if resources.is_empty() {
+        let DecodedHandle::Graph { ids, .. } = decoded else {
+            return Ok(());
+        };
+        for server_id in ids {
+            if store.holds_id(exchange, &server_id) {
+                continue;
+            }
+            if let Err(error) = delete_subscription(client, &server_id).await {
+                first_error.get_or_insert_with(|| release_error(error));
+            }
+        }
+        return first_error.map_or(Ok(()), Err);
+    }
+    for resource in resources {
+        if store.shared_with_others(exchange, &resource, handle) {
+            store.remove_lease(exchange, &resource, handle);
+            continue;
+        }
+        let Some(server_id) = store.server_id(exchange, &resource) else {
             continue;
         };
-        for server_id in server_ids {
-            match delete_subscription(account.mailboxes.primary(), &server_id).await {
-                Ok(()) => account.webhooks.forget_deleted(&handle, &server_id).await,
-                Err(error) => {
-                    let error = into_account_error(
-                        error,
-                        GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
-                    );
-                    let telemetry = error.telemetry_fields();
-                    tracing::warn!(
-                        target: "bifrost_graph::push",
-                        message_key = telemetry.message_key,
-                        recovery = telemetry.recovery_discriminant,
-                        "close() could not retire a Graph webhook subscription"
-                    );
-                }
+        match delete_subscription(client, &server_id).await {
+            Ok(()) => store.remove_row(exchange, &resource),
+            Err(error) => {
+                store.condemn(exchange, &resource, handle);
+                first_error.get_or_insert_with(|| release_error(error));
             }
         }
     }
+    account.webhooks.changed();
+    first_error.map_or(Ok(()), Err)
 }
 
-/// Condemn one handle's group and snapshot the server ids teardown must
-/// delete, without retiring their local state.
+/// Best-effort release of every lease this account holds, for `close()`.
 ///
-/// Marking and snapshotting happen under the SAME write lock, which is what
-/// makes the pair race-free against the renewal session: any recreate that
-/// installs before this call is in the snapshot, and any recreate that
-/// resolves after it sees the marker and refuses. The state itself stays
-/// registered so a failed DELETE leaves that id and every later id
-/// reachable under the handle for a retry.
+/// A Graph subscription lives on the server for up to its expiry and keeps
+/// POSTing to the consumer's HTTPS receiver whether or not this process still
+/// exists. Nothing in the `Account` contract promises `push_unsubscribe`
+/// before `close()`, so `close()` has to do it. A row another account of the
+/// same factory still holds live (the replacement of a reopen) keeps
+/// delivering; only this account's leases go.
 ///
-/// Returns `None` for an unknown handle - teardown is idempotent.
-pub(super) fn mark_group_tearing_down(
-    groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
-    handle: &SubscriptionHandle,
-) -> Option<Vec<String>> {
-    let group = groups.get_mut(handle)?;
-    group.tearing_down = true;
-    Some(
-        group
-            .subscriptions
-            .iter()
-            .map(|state| state.server_id.clone())
-            .collect(),
-    )
-}
-
-/// Drop `server_id` from `handle`'s ledger entry, and the entry once empty.
-pub(super) fn forget_recreated_id(
-    ledger: &mut HashMap<SubscriptionHandle, Vec<String>>,
-    handle: &SubscriptionHandle,
-    server_id: &str,
-) {
-    if let Some(ids) = ledger.get_mut(handle) {
-        ids.retain(|id| id != server_id);
-        if ids.is_empty() {
-            ledger.remove(handle);
+/// Failures are logged, not returned: `close()` must still settle its
+/// account-owned push tasks, and the engine has no useful recovery for "the
+/// server kept a subscription we asked it to drop".
+pub(crate) async fn retire_all_graph_subscriptions(account: &GraphAccount) {
+    // Cancel BEFORE taking the exchange: a subscribe checks the token after
+    // it holds the exchange and again just before its commit, so its leases
+    // either precede this walk (and are released below) or are refused.
+    // `close()` relies on this being its only cancel.
+    account.shutdown.cancel();
+    let account = account.clone();
+    let task = tokio::spawn(async move {
+        let store = std::sync::Arc::clone(account.webhooks.store());
+        let exchange = store.exchange().await;
+        // Rows nobody holds live any more (a failed rollback's debt, or
+        // leases whose account was dropped unclosed) have no handle anyone
+        // will release; Graph keeps delivering them until expiry. Any closing
+        // account of the factory retries their DELETE, once. Taken before
+        // this account's own releases, which already attempt their rows. A
+        // subscribe's provisional rows are never seen here: it holds the
+        // exchange.
+        let unowned = store.unowned(&exchange, account.webhooks.instance());
+        for handle in account.webhooks.handles() {
+            if let Err(error) = release_locked(&account, &exchange, &handle).await {
+                let telemetry = error.telemetry_fields();
+                tracing::warn!(
+                    target: "bifrost_graph::push",
+                    message_key = telemetry.message_key,
+                    recovery = telemetry.recovery_discriminant,
+                    "close() could not retire a Graph webhook subscription"
+                );
+            }
         }
-    }
-}
-
-/// Forget one server subscription only after its DELETE has succeeded.
-///
-/// Returns whether this was the group's final subscription. Keeping this
-/// state transition pure pins the teardown invariant without requiring a
-/// live Graph DELETE transport seam.
-pub(super) fn remove_subscription_from_groups(
-    groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
-    handle: &SubscriptionHandle,
-    server_id: &str,
-) -> bool {
-    let remove_group = if let Some(group) = groups.get_mut(handle) {
-        group
-            .subscriptions
-            .retain(|state| state.server_id != server_id);
-        group.subscriptions.is_empty()
-    } else {
-        false
-    };
-    if remove_group {
-        groups.remove(handle);
-    }
-    remove_group
+        for resource in unowned {
+            let Some(server_id) = store.server_id(&exchange, &resource) else {
+                continue;
+            };
+            match delete_subscription(account.mailboxes.primary(), &server_id).await {
+                Ok(()) => store.remove_row(&exchange, &resource),
+                Err(error) => tracing::warn!(
+                    target: "bifrost_graph::push",
+                    server_id = %server_id,
+                    error = ?error,
+                    "close() could not retire an unowned Graph webhook subscription"
+                ),
+            }
+        }
+    });
+    let _ = task.await;
 }
 
 #[cfg(test)]

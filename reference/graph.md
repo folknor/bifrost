@@ -159,9 +159,9 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
 - `push/` - the push subscription surface, split by arm. `mod.rs` declares the
   modules and re-exports the `pub(crate)` doors the rest of `account/` calls
   (`push_subscribe` / `push_unsubscribe`, `retire_all_graph_subscriptions`,
-  `PushEndpoint`, `WebhookRegistry`, `RecreatedSubscriptionIds` and
-  `EwsSubscriptionState` / `EwsSubscriptionScope`). Webhook row types are
-  re-exported only for account tests; arm helpers stay inside `push`.
+  `PushEndpoint`, `WebhookRegistry`, `WebhookStore` and
+  `EwsSubscriptionState` / `EwsSubscriptionScope`). Arm helpers stay inside
+  `push`.
   - `push/dispatch.rs` - the two `Account` doors: the empty-scope refusal, the
     per-scope poll-only split, the `PushConfig` dispatch (`subscribe_eligible`),
     and the positional three-lane outcome ledger (`push_item_ids` /
@@ -172,17 +172,17 @@ resumes within an over-delivered page (see "Bounded `nextLink` traversal").
     the shared `account_closed_error`, and the handle codec
     (`graph_handle` / `ews_handle` / `decode_handle`, `new_handle_token`).
   - `push/webhook.rs` - the Graph `/subscriptions` arm: resources from `GraphScope`,
-    `subscribe_graph` with its create rollback, the per-handle
-    `GraphSubscriptionGroup` / `GraphSubscriptionState`, and teardown -
-    `unsubscribe_graph`, `close()`'s `retire_all_graph_subscriptions`, and the
-    `mark_group_tearing_down` / `remove_subscription_from_groups` pair that
-    makes it race-free against renewal.
-  - `push/registry.rs` - `WebhookRegistry`, the private registration lock,
-    topology watch, gap queue and factory-shared recreated-id ledger. Registration,
-    renewal updates, replacement installation and teardown snapshots are methods;
-    replacement rows, gaps and recreated ids commit under one registration lock.
-  - `push/renewal.rs` - due-row maintenance sessions, account-owned recreate
-    install-or-undo tasks, committed gap obligations and terminal row retirement.
+    `subscribe_graph` (lease a shared row or create it, with rollback of what
+    it created), and release - `unsubscribe_graph` and `close()`'s
+    `retire_all_graph_subscriptions`.
+  - `push/registry.rs` - `WebhookStore`, the factory-shared row store (rows
+    keyed by resource, each with its leases, generation and terminal flag, plus
+    the exchange lock every row-lifecycle effect holds), and `WebhookRegistry`,
+    one opened account's view of it: its instance id, event queue and topology
+    watch.
+  - `push/renewal.rs` - due-row maintenance sessions, account-owned renew,
+    recreate and terminal steps run under the exchange, and per-account event
+    delivery.
   - `push/ews.rs` - the EWS streaming arm: native folder ids from `GraphScope`, the
     `restId` -> `ewsId` translation (`translation_input_chunks` /
     `reconcile_translated_ews_scopes`), and the `EwsSubscriptionState`
@@ -1063,13 +1063,13 @@ those transitions therefore live on the registry holding the relevant lock.
   token, plus `PushTasks` for effects that survive a dropped session.
 - An `Arc<RwLock<CursorIndex>>` (scope list) and `Arc<RwLock<FolderTree>>`
   (parent map).
-- `WebhookRegistry` holds webhook groups, topology, pending coverage gaps and
-  the recreated-id ledger shared by every open from the factory. `EwsRegistry`
-  holds EWS registrations, topology and server subscription release obligations.
-  Registration checks shutdown under its owner's write lock. Replacement install
-  checks both shutdown and teardown intent, and records the row, gap and recreated
-  identity before releasing that same lock. Release claims and task publication
-  retain the ledger-before-task-registry lock order.
+- `WebhookRegistry` is this account's view of the factory's `WebhookStore`
+  (webhook rows and their leases, shared by every account the factory opens),
+  with its own event queue and topology. `EwsRegistry` holds EWS registrations,
+  topology and server subscription release obligations. A webhook lease is
+  committed only after the shutdown check that follows the exchange, with no
+  await between. Release claims and task publication retain the
+  ledger-before-task-registry lock order.
 - A bounded LRU `etag_index` of mail HTTP entity-tags (powering `If-Match`; mutation
   preflight reads refresh recency, `MESSAGE_SELECT` explicitly requests
   `changeKey`; the shared JSON projection prefers `@odata.etag` and otherwise
@@ -1171,10 +1171,14 @@ there is no provider terminal latch or event broadcast adapter.
 `close()` retires SERVER-side state first, because neither kind of
 subscription dies because this process did. In order:
 `retire_all_graph_subscriptions` cancels the shutdown token (its first step,
-before it looks at any group, and `close()`'s only cancel), then walks
-`WebhookRegistry` groups and runs the teardown per handle (best-effort - a DELETE
-failure is logged, never returned, since `close()` must still complete and the
-engine has no recovery for "the server kept a subscription"); `close()` then
+before it takes the store's exchange, and `close()`'s only cancel), then
+releases every lease this account holds, live or condemned (best-effort - a
+DELETE failure is logged, never returned, since `close()` must still complete
+and the engine has no recovery for "the server kept a subscription"). A row
+another account of the factory still holds live - the replacement of a reopen -
+is not deleted; only this account's lease goes. The same walk retries the
+DELETE of every row nobody holds live (a failed rollback's debt, or leases of
+an account dropped unclosed), which no handle will ever release. `close()` then
 marks the EWS release ledger retired and claims a release for every `Live` and
 `Orphaned` streaming subscription (Exchange caps streaming subscriptions per
 mailbox, so a reopen that skipped this burned one until it timed out); and
@@ -1784,10 +1788,50 @@ registered a group teardown could never retire and kept the renewal lane
 believing it had a registration; the engine already skips empty lists at its own reattach
 boundary). It then groups by Graph
 subscription resource, files any scope with no subscribable resource into the
-failed lane, creates one server
-subscription per resource, and best-effort deletes any already-created
-subscriptions if a later create fails or the outcome ledger cannot be closed
-(`roll_back_created`). The one exception is a create refused as
+failed lane, leases one server subscription (a ROW) per resource, and
+best-effort deletes any rows it created if a later step fails or the outcome
+ledger cannot be closed (`roll_back_created`).
+
+Rows are owned by the factory, not by handles. Graph refuses a second
+subscription with the same `resource` and `changeType` with 409 ("Subscription
+Id <> already exists for the requested combination",
+[Create subscription, duplicate subscription behavior](https://learn.microsoft.com/en-us/graph/api/subscription-post-subscriptions)),
+and every create here uses the same `changeType`, so a resource can have one
+row and every consumer must share it. Two consumers meet routinely: the engine's
+reopen subscribes on the replacement account BEFORE it tears the old account's
+handles down (so an aborted swap leaves the old account installed and
+retryable), and two subscribes whose scopes share a resource meet on one
+account (every calendar scope is `/events`). When rows belonged to handles,
+both 409ed and a Graph account with live push could not reopen. Now
+`GraphAccountFactory` holds one `WebhookStore` that every account it opens
+shares (one factory per account is the contract: two factories for the same
+credentials do not share rows). A row is `{server_id, generation, expiry,
+terminated, leases}`; a handle holds a LEASE per row, `{account instance,
+covered scopes, condemned}`. The rules:
+
+- Subscribe, per resource: a healthy row with a live lease is ATTACHED to, no
+  request sent. A terminated row is recovered first (PATCH; on 404/410 a fresh
+  create replaces it), because a lease must not be handed coverage nobody
+  renews. A row with no live lease (only condemned leases, or a failed
+  rollback's debt) may or may not still exist on Graph, so it is DELETEd
+  before a fresh create; creating beside it would 409. No row: create.
+- Release (`push_unsubscribe`, `close()`): a row another live lease holds only
+  loses this lease. A row left with no other live holder is DELETEd (404/410
+  count as gone) and forgotten with every condemned lease on it; a failed
+  DELETE condemns this lease, keeping it reachable for a retry and `close()`.
+  Every row is attempted and the first failure returned.
+- A lease is live only while it is not condemned AND its account is still
+  alive (the store holds accounts weakly), so an account dropped without
+  `close()` cannot pin a shared row: the last real holder's release deletes it.
+- Every row-lifecycle network effect - a subscribe's whole multi-resource
+  transaction, a release, a renewal step, a recreate - runs in a task the
+  account owns, holding the store's exchange lock through its local commit.
+  A dropped caller cannot leave a server effect unrecorded, and two effects on
+  one row never interleave.
+- Generations come from one store-wide counter that never resets, so an event
+  queued against `(resource, generation)` can never match a later incarnation.
+
+The one exception to whole-request failure is a create refused as
 `Authorization(PermissionDenied)` (a token that lists calendars with
 Calendars.ReadBasic but lacks the Calendars.Read an `/events` subscription
 needs): that group's scopes go to the failed lane, scope-correlated, and the
@@ -1795,15 +1839,22 @@ other groups' subscriptions stand, because an Outlook user missing calendar
 consent still expects live mail. Only a permission refusal is laned: it stays
 true until consent changes, while a transient failure filed per lane would
 drop those scopes from the engine's accepted push set with nothing to retry
-them. When every group is refused, the arm returns no handle and the
+them. Only the POST's refusal is laned: a failed prerequisite (the DELETE of an
+unowned row, the recovery PATCH of a terminated one) is always whole-request,
+since it does not show a standing refusal to subscribe. A 409 is not laned
+either: rows are shared, so a 409 now means a row this store does not know
+(left by a previous process, or by a second factory), and whole-request
+failure keeps the caller's earlier coverage installed. When every group is
+refused, the arm returns no handle and the
 dispatcher raises the whole-request refusal. Closing the ledger (`finalize_push_outcomes`) is the
-webhook arm's own step, taken after the last create and BEFORE the group is
-registered or visible to a renewal session. It used to run in the dispatcher
+webhook arm's own step, taken after the last row step and BEFORE any lease is
+committed or visible to a renewal session. It used to run in the dispatcher
 after the arm returned, so a `finalize` failure returned `Err` - no handle -
 over subscriptions the renewer kept renewing and no caller could name to
-unsubscribe. Now that failure path has registered nothing and only rolls back
-the server-side creates; a DELETE that fails there is logged and left to
-Graph's own expiry, since no group holds the row. The EWS arm closes its ledger
+unsubscribe. Now that failure path has leased nothing and only rolls back
+the rows it created; a DELETE that fails there leaves the row in the store
+with no lease, as cleanup debt the next subscribe for that resource retries
+before creating. The EWS arm closes its ledger
 the same way before it installs scopes or bumps the topology; it creates
 nothing server-side beforehand, so there is nothing to undo.
 The arm answers with `(Option<handle>, outcomes)` and the dispatcher only turns
@@ -1813,31 +1864,18 @@ entropy source is `Internal(RuntimeFailure)`, never retried), and a failure
 there has written nothing. Minted afterwards, the same failure would return an
 error over live server-side subscriptions with no handle any teardown could
 name them by, orphaning them until they expire. The handle itself is assembled
-after the creates because it embeds their ids (next paragraph). It stores `(server_id, expires_at)` in a
-`GraphSubscriptionGroup`, and bumps the registration topology. `push_unsubscribe`
-deletes each server subscription BEFORE dropping its local state, so a failed
-DELETE leaves that subscription and every not-yet-attempted sibling reachable
-under the handle for a later retry. Keeping the group registered across those
-awaits means "registered" no longer implies "live", so
-`mark_group_tearing_down` sets a `tearing_down` marker on the group in the
-same write-lock acquisition that snapshots its server ids: a renewal pass
-skips condemned groups in `due_renewals` and `install_replacement` refuses
-them, because a replacement created after the snapshot is one teardown can
-never name - it would stay registered and delivering while
-`push_unsubscribe` reported success. The marker is monotone (a later
-`push_subscribe` mints a new handle) and a plain flag rather than a lock, so
-neither path holds anything across a round trip. Once no live group remains
-the renewal session parks on `graph_topology` instead of running passes;
-condemned groups retained for a DELETE retry do not keep it ticking. Both
-`create_and_register` and `unsubscribe_graph` bump `graph_topology` after
-their committed write, and the session marks the topology seen BEFORE it reads
-the groups, so a registration landing between that read and the wait still
-wakes it. No provider task needs spawning or aborting on either path.
+after the row steps because it embeds the rows' ids (next paragraph); an
+attached row contributes its existing id. The commit records one lease per row
+and bumps the account's topology. A condemned lease (its release failed) is
+never renewed for, never attributed and never keeps a row alive; once an
+account holds no healthy row its renewal session parks on its topology instead
+of running passes.
 
 Handles are self-describing so a teardown retried on a newer account instance
 still works. The engine keeps a handle whose teardown failed and retries
-`push_unsubscribe` on whatever instance is current; after a reopen that
-instance's `WebhookRegistry` groups map has never seen it. A webhook handle is the
+`push_unsubscribe` on whatever instance is current. Within one factory the
+shared store still knows the handle's leases, wherever they were taken; a
+handle from a previous process is unknown to it. A webhook handle is the
 opaque string `graph2:<hex token>:<hex account>:<id>,<id>,...` carrying the
 Graph subscription ids (server-global per tenant; the account's credentials can
 delete them) and the hex-encoded engine `AccountId` that minted it. An orphan
@@ -1851,39 +1889,30 @@ carries nothing: the
 streaming subscription belongs to a push session and the account's release
 ledger, not to the handle, so an unknown EWS handle is correctly a no-op. `push_unsubscribe` routes by the
 decoded handle, not the instance's push mode (a reopen may switch modes), and
-falls back to the mode for a handle of neither shape. For a handle this
-instance knows, `unsubscribe_graph` keeps the registered-group path above. For
-one it does not, `unsubscribe_orphan` DELETEs the ids decoded from that handle
-plus the ids a renewal pass recreated under it on an earlier instance (404/410
-count as gone), attempts every id even after a failure, and returns the first
-failure so the engine keeps the orphan. The recreated ids live in
-`RecreatedSubscriptionIds`, a ledger keyed by handle that `GraphAccountFactory`
-hands to every account it opens, so it survives the reopens the engine retries
-across: a recreate records its new id there under the same write lock as the
-install, and on teardown an id leaves only when its DELETE succeeds, at the
-same point (`WebhookRegistry::forget_deleted`) where its row leaves its group. The
-other exits are not teardown: a later recreate swaps the id for its own, and a
-fully successful orphan teardown clears the handle's entry.
+falls back to the mode for a handle of neither shape. A handle that holds a
+lease in the store takes the release path above, which reaches the row's
+CURRENT id, including one a renewal recreated after the handle was minted. A
+handle holding no lease (from a previous process, or already released) DELETEs
+the ids decoded from it, skipping any id a row in the store still holds, so a
+repeated release, or a stale or forged handle, cannot tear down a row another
+lease renews (404/410 count as gone); it attempts every id even after a failure
+and returns the first failure so the engine keeps the orphan.
 
 A terminal renewal failure (auth lost, permission revoked and the like) does
-not remove the row: it sets `GraphSubscriptionState::terminated`. A renewal
-pass skips a flagged row (`due_renewals`) and a group holding only flagged
-rows leaves the renewal session parked (`has_live_graph_subscription_group`), but
-`push_unsubscribe` and `close()` still DELETE it. Removing the row instead
-took a group's last subscription out of `close()`'s reach - only an explicit
-teardown of the handle could still find it - and Graph kept delivering until
-expiry (ruled 2026-10-04). Two safeguards:
-ids this instance currently has registered are skipped (a stale or forged
-handle cannot tear down what this instance still renews), and decoding is
-all-or-nothing with an id allowlist (alphanumerics, `-`, `_`), so a malformed
-handle deletes nothing and cannot inject path or query text into the DELETE
-URL. An old instance's orphan retried on a new one therefore deletes the old
-ids only. Known limits: the ledger is process-local, like the engine's own
-subscription registry, so a handle that outlives the process (or reaches an
-account built outside the factory) reaches only the ids it was minted with,
-and a recreated subscription it does not name lives until Graph expires it;
-and an unbound `graph1:` handle keeps the old reach, deleting its ids on any
-account it is handed to.
+not remove the row: it sets the row's `terminated` flag and bumps its
+generation. A renewal pass skips a flagged row and an account holding only
+flagged rows leaves its renewal session parked, but `push_unsubscribe` and
+`close()` still DELETE it. Removing the row instead took the last subscription
+out of `close()`'s reach and Graph kept delivering until expiry (ruled
+2026-10-04). Decoding is all-or-nothing with an id allowlist (alphanumerics,
+`-`, `_`), so a malformed handle deletes nothing and cannot inject path or
+query text into the DELETE URL. Known limits: the store is process-local, like
+the engine's own subscription registry, so a handle that outlives the process
+reaches only the ids it was minted with, and a recreated subscription it does
+not name lives until Graph expires it - and, since a row this store does not
+know still occupies its resource, a subscribe for that resource answers 409
+until then; and an unbound `graph1:` handle keeps the old reach, deleting its
+ids on any account it is handed to.
 
 The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the
@@ -1898,9 +1927,10 @@ personal contacts, and a create rejected for anything but permission rolls
 back the whole subscribe group, mail included, so an undocumented
 per-calendar path would risk mail push. Calendars another user shared into
 the mailbox (`isSharedWithMe`) are not discovered at all: `/events` does not
-notify for shared folders, so their scopes would be falsely push-covered. Because `subscribe_graph` groups on the resource string, all calendar
-scopes in one subscribe share one subscription, as do all contact scopes,
-and renewal and recreation carry the whole covered scope list. A
+notify for shared folders, so their scopes would be falsely push-covered. Because rows are keyed on the resource string, all calendar
+scopes share one subscription, as do all contact scopes, across every
+subscribe of the factory's accounts, and a recreate owes a gap to every
+lease's scopes. A
 notification on `/events` or `/contacts` is therefore evidence for every
 calendar or contact scope that subscription covers: the consumer's receiver
 should invalidate each of them (or send an unscoped hint), not try to map
@@ -1929,54 +1959,76 @@ check while the field made the subscription look validated.
 #### Renewal sessions
 
 Webhook mode exposes one Registration lane when an endpoint is configured.
-Subscribe creates and registers rows and bumps `graph_topology`; it spawns no
-worker. Sessions claim the lane lease, mark topology seen before reading the
-groups, and park while no live group exists. They scan due rows immediately,
-then every ten minutes after fully successful passes. Rows inside thirty
-minutes of expiry are renewed once each, after `PushGate::clear`.
+Subscribe leases rows and bumps the account's topology; it spawns no
+worker. Sessions claim the lane lease, mark topology seen before reading
+events and rows, deliver queued events, and park while the account holds no
+healthy row. They scan due rows immediately, then every ten minutes after
+fully successful passes, and also wake on a topology change. A session renews
+only rows its own account holds a live lease on, inside thirty minutes of
+expiry, after `PushGate::clear`.
 
-Every failure is reported as `UnitFailed`, with precise scope attribution
-when the row covers one scope. Terminal rows remain registered for teardown
-but are never renewed again. Any non-terminal failure or still-retired row
+During a reopen the old and the new account may both hold a row, so each
+renewal step runs in an account-owned task under the store's exchange: it
+re-reads the row (same id and generation, still held live by this account,
+still due) and only then PATCHes, committing before it lets go. The second
+account's step finds the fresh expiry and sends nothing, so no row is renewed
+twice and no stale answer is applied. A session dropped mid-step only drops
+the reply.
+
+A non-terminal failure is reported as `UnitFailed`, attributed to the scope
+when this account's live leases on the row cover exactly one. A terminal
+failure flags the row, bumps its generation and queues the verdict to EVERY
+account holding the row live; each session delivers it as `UnitFailed`
+attributed to its own CURRENT live scopes, and drops it if the row has since
+moved on (recovered or released). A session that delivers a queued verdict
+ends `Incomplete` right after it, as if its own pass had found it, even when
+that row was its account's only one. Terminal rows remain for release and close
+but are never renewed again. Any non-terminal failure or still-terminated row
 ends the pass `Incomplete`; only a fully healthy pass yields `Healthy`.
 The engine owns recovery, ten-minute failure pacing and retained lane health.
 A registration established at session start never clears a prior Down state.
 
-Gone rows (404/410) are recreated in account-owned tasks. A successful install
-records every affected scope in `pending_gaps` under the registration lock.
-Sessions pop and yield one invalidation at a time, before scans and after each
-pass, so dropped sessions cannot lose sibling gap obligations. Install uses
-`get_mut`, refuses missing or tearing-down groups, and undoes an unaccepted
-create. Scope attribution and classification use the failure that actually
+Gone rows (404/410) are recreated inside the same step. Admission is "the row
+still has a live lease", of any account, never the initiating account's
+shutdown: a recreate begun by the old account of a reopen that then closes
+still installs for the replacement, and one whose holders all left deletes
+what it created. An install, like a subscribe's recovery of a terminated row,
+queues a gap for every live lease's scopes to that lease's account, because
+Graph does not replay the missing window. Sessions pop and yield one event at a
+time, before scans and after each pass, so a dropped session loses no
+obligation. Scope attribution and classification use the failure that actually
 blocked renewal or recreation. Default and maximum expiry are seven days.
 Renewal and deletion encode opaque subscription ids as single URL path components.
 
 #### Cancellation safety of the webhook `push_subscribe`
 
 `subscribe_graph` does its synchronous work inline (endpoint check, resource
-grouping, handle mint, the closed-account refusal) and then hands the creates,
-the rollback, the ledger close and the registration to a task spawned on the
-runtime (`run_subscribe` / `create_and_register`); the caller's future only
-awaits it. Dropping the caller therefore cannot skip a rollback DELETE, unwind
-the create loop over live creates, or die between the `WebhookRegistry` groups
-insert and the return. Nothing is spawned or written before the first poll, so
+grouping, handle mint, the closed-account refusal) and then hands the row
+steps, the rollback, the ledger close and the lease commit to a task spawned on
+the runtime (`run_subscribe` / `create_and_register`); the caller's future only
+awaits it. The task holds the store's exchange for the whole transaction and
+releases it BEFORE waiting for the caller's ack, so an abandoned caller cannot
+hold up the factory's other row work. Dropping the caller therefore cannot skip
+a rollback DELETE, unwind the loop over live creates, or die between the lease
+commit and the return. Nothing is spawned or written before the first poll, so
 a future dropped before it has nothing to leak; the "guard" is the spawn, not an
 object built inside the async body.
 
 The result hand-off is two-phase: a successful `oneshot::send` is not receipt
 (the value dies with a receiver that is dropped unpolled), so the waiter acks in
 the same synchronous step that takes the result, and the task treats a failed
-send or a missing ack as "no caller holds this handle" and retires the group
-through `unsubscribe_graph`. If a DELETE fails there the group stays registered
-and tearing down, so `close()` retries it. On the normal path the ack disarms
-the cleanup.
+send or a missing ack as "no caller holds this handle" and releases it through
+`unsubscribe_graph`. If a DELETE fails there the lease is condemned, so
+`close()` retries it. On the normal path the ack disarms the cleanup.
 
 `close()` interaction: `retire_all_graph_subscriptions` cancels the account
-shutdown token BEFORE walking the groups, and the registration step checks the
-token under the same write lock it inserts under. A subscribe that registers
-first is walked by the retire; one that registers after sees the cancel, rolls
-back its creates and returns an error. A subscribe on an already closed account
-is refused before its first POST.
+shutdown token BEFORE taking the exchange. The token gates only lease
+ACQUISITION: a subscribe checks it after taking the exchange and again
+immediately before its commit, with no await between that check and the
+commit. A subscribe that commits first is released by the retire; one that
+reaches its commit after sees the cancel, rolls back the rows it created and
+returns an error. Release, rollback and recreate never consult the token. A
+subscribe on an already closed account is refused before its first request.
 
 Not made safe: a create whose response never arrived (timeout, reset) may have
 succeeded on Graph, but the subscription id exists only in the unread response,
@@ -1988,12 +2040,11 @@ The same holds for the renewal recreate below.
 
 #### Cancellation safety of renewal effects
 
-Recreate install-or-undo runs in an account-owned task tracked in `push_tasks`.
-The installation checks shutdown under the group write lock; close cancels
-before walking those rows. A refused install deletes the fresh subscription.
-A dropped session cannot cancel the task or erase its committed gap. Close
-awaits tracked tasks under one bounded join, dropping remaining handles
-without aborting the effects if the bound expires.
+Every renewal step (renew, recreate install-or-undo, terminal flag) runs in an
+account-owned task tracked in `push_tasks`, holding the exchange through its
+commit. A dropped session cannot cancel the task or erase a committed gap or
+verdict. Close awaits tracked tasks under one bounded join, dropping remaining
+handles without aborting the effects if the bound expires.
 
 ### EWS streaming mode (`PushConfig::EwsStreaming`)
 
