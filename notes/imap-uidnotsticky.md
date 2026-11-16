@@ -1,6 +1,7 @@
 # IMAP UIDNOTSTICKY folders: design chain
 
-Status: chain, not started beyond link 0. Owner of the item: BUG-048 in
+Status: links 0 and 1 built; link 2 is the first unbuilt link.
+Owner of the item: BUG-048 in
 `notes/bugs.md`.
 
 ## Problem
@@ -58,15 +59,18 @@ existing unbounded walk and partition planning stays `Full`.
 
 ## Link plan
 
-1. **Stickiness observation in the folder registry.** Today
-   `FolderEntry::observe_selection` folds not-sticky into `inventory_hint =
-   None`, the same value as "never observed". Record an explicit observation
-   (unobserved / sticky-as-of-last-selection / not-sticky). "Sticky" promises
-   nothing about UIDVALIDITY staying put; cached observations never replace
-   epoch validation when redeeming a partition; an older selection finishing
-   after a newer one must not overwrite it. Behaviour-preserving: nothing
-   branches on it yet. First establishment is unobserved, so later links must
-   handle discovering non-stickiness during the first inventory.
+1. **Stickiness observation in the folder registry. Built (small).**
+   The registry records unobserved / sticky-as-of-last-selection / not-sticky
+   explicitly, separately from its optional partition ceiling. Successful
+   selections publish both under one lock. Attempts are numbered on the held
+   registry entry before awaiting SELECT/EXAMINE; an older completion cannot
+   overwrite a newer successful observation. The same entry is retained across
+   the await, so deletion/recreation cannot transfer observations to a new entry.
+   Partition planning and live redemption checks retain their existing policy.
+   Hermetic tests pin all three states, missing ceilings, both transitions and
+   reversed completion order in both directions. No implementation work remains.
+   Both new tests were ablated (not-sticky folded into unobserved, and the
+   ordering guard removed) and each ablation fails them.
 2. **Access model.** Decide and prove how a not-sticky folder's messages are
    enumerated, hydrated and mutated. Leading candidate: retained selection -
    enumerate, hydrate and operate through one held selection, with explicit
@@ -85,13 +89,32 @@ existing unbounded walk and partition planning stays `Full`.
    - Mutation campaigns: stale-generation failures become `BlockedByEngine`
      and a scope restart does not translate campaign ids; read-back and retry
      need the same treatment as first dispatch.
-   This link may itself need engine/types changes.
+   This link may itself need engine/types changes. Remaining size: large.
 3. **Engine/types lifecycle contract** that link 2 requires - recurring
    inventory if that is what it selects, otherwise whatever scheduling and
    expiry contract it does need. Not committed to a shape until link 2 lands.
+   Remaining size: unknown until link 2 settles the contract.
+
+## Link 1 implementation decisions
+
+- Order means attempt admission order on each registry entry, not wall-clock
+  completion or UIDVALIDITY magnitude. Different pooled sessions have no shared
+  server clock, and an epoch is an identity rather than a sortable version.
+  A failed or cancelled newer attempt publishes nothing; the last successful
+  observation remains usable. Numbering and publishing are short lock operations
+  with no lock held over I/O.
+- A successful selection without UIDNOTSTICKY records sticky even if UIDNEXT
+  or UIDVALIDITY is absent; its partition hint remains absent. Stickiness is
+  the server's selection observation, whereas a usable ceiling requires both
+  numbers. Sticky promises no epoch continuity, and every partition redemption
+  still validates its live epoch.
+- The account retains the entry it numbered through completion rather than
+  looking up the folder name again. A concurrently recreated folder starts
+  unobserved; applying the old folder's result would violate that boundary.
 
 ## Open question for the owner
 
-None blocks link 1. Link 2 contains a product question an Outlook-shaped
+No decision was handed back by link 1. Link 2 contains a product question an
+Outlook-shaped
 answer may settle (what a user sees when they open a message whose handle
 expired), recorded here rather than decided.

@@ -295,6 +295,12 @@ impl ImapAccount {
         // not the last command that can discover a withdrawn share. Preserve
         // the raw error here for strategy downgrade and preflight restamping.
         let options = self.select_options(purpose)?;
+        // Retain the numbered entry: a late SELECT for a deleted folder must
+        // not teach a recreated same-name folder its predecessor's state.
+        let observation = self.folders.get(folder).map(|entry| {
+            let sequence = entry.begin_selection();
+            (entry, sequence)
+        });
         let result = conn
             .connection()
             .select_for_sync(&folder, &options, self.command_timeout())
@@ -303,8 +309,8 @@ impl ImapAccount {
         // deselected it, or followed a tagged OK with an incomplete response.
         conn.set_selected_affinity(conn.connection().selected_mailbox());
         let result = result?;
-        if let Some(entry) = self.folders.get(folder) {
-            entry.observe_selection(&result.mailbox);
+        if let Some((entry, sequence)) = observation {
+            entry.observe_selection(sequence, &result.mailbox);
         }
         self.folders.mark_seen(folder);
         Ok(result)

@@ -31,9 +31,24 @@ pub(crate) struct FolderEntry {
     /// authoritative per-operation gate is still the live `NO [ACL]`.
     pub(crate) rights: Option<crate::types::MailboxRights>,
     cursor: RwLock<Option<FolderCursor>>,
-    inventory_hint: RwLock<Option<(crate::types::UidValidity, u32)>>,
+    selection: RwLock<SelectionObservation>,
     modseq_by_uid: RwLock<ModSeqCache>,
     last_seen: Mutex<Option<Instant>>,
+}
+
+/// Sticky describes only the last successful selection, not epoch continuity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UidStickiness {
+    Unobserved,
+    Sticky,
+    NotSticky,
+}
+
+struct SelectionObservation {
+    issued: u64,
+    applied: u64,
+    stickiness: UidStickiness,
+    inventory_hint: Option<(crate::types::UidValidity, u32)>,
 }
 
 /// The mutable, LIST-sourced projection of one folder.
@@ -121,7 +136,12 @@ impl FolderEntry {
             shared_owner,
             rights,
             cursor: RwLock::new(None),
-            inventory_hint: RwLock::new(None),
+            selection: RwLock::new(SelectionObservation {
+                issued: 0,
+                applied: 0,
+                stickiness: UidStickiness::Unobserved,
+                inventory_hint: None,
+            }),
             modseq_by_uid: RwLock::new(ModSeqCache::default()),
             last_seen: Mutex::new(None),
         }
@@ -161,15 +181,35 @@ impl FolderEntry {
             listing_from_info(info, self.rights.as_ref());
     }
 
-    pub(crate) fn observe_selection(&self, selected: &crate::types::SelectedMailbox) {
-        // Only observations made by this account incarnation qualify. A resumed
-        // attach starts without a hint, so an old cached ceiling cannot omit
-        // unchanged mail from its stored baseline. UIDNEXT never goes backwards
-        // within an epoch on a conforming server.
-        *self
-            .inventory_hint
-            .write()
-            .expect("inventory hint lock poisoned") = if selected.uid_not_sticky {
+    /// Number attempts before awaiting SELECT, so completion order cannot
+    /// roll back a newer successful observation. Failed attempts publish nothing.
+    pub(crate) fn begin_selection(&self) -> u64 {
+        let mut observation = self.selection.write().expect("selection lock poisoned");
+        observation.issued = observation
+            .issued
+            .checked_add(1)
+            .expect("selection sequence exhausted");
+        observation.issued
+    }
+
+    pub(crate) fn observe_selection(
+        &self,
+        sequence: u64,
+        selected: &crate::types::SelectedMailbox,
+    ) {
+        let mut observation = self.selection.write().expect("selection lock poisoned");
+        if sequence <= observation.applied {
+            return;
+        }
+        observation.applied = sequence;
+        observation.stickiness = if selected.uid_not_sticky {
+            UidStickiness::NotSticky
+        } else {
+            UidStickiness::Sticky
+        };
+        // Only this incarnation's observations qualify. A missing ceiling
+        // still records stickiness, but cannot authorize UID partition planning.
+        observation.inventory_hint = if selected.uid_not_sticky {
             None
         } else {
             selected
@@ -179,11 +219,19 @@ impl FolderEntry {
         };
     }
 
-    pub(crate) fn inventory_partitioning(&self) -> bifrost_types::InventoryPartitioning {
-        let hint = *self
-            .inventory_hint
+    pub(crate) fn uid_stickiness(&self) -> UidStickiness {
+        self.selection
             .read()
-            .expect("inventory hint lock poisoned");
+            .expect("selection lock poisoned")
+            .stickiness
+    }
+
+    pub(crate) fn inventory_partitioning(&self) -> bifrost_types::InventoryPartitioning {
+        let hint = self
+            .selection
+            .read()
+            .expect("selection lock poisoned")
+            .inventory_hint;
         match hint {
             Some((epoch, mut max_uid)) => {
                 if let Some(cursor) = self.cursor() {
@@ -1735,6 +1783,73 @@ mod role_resolution_tests {
 mod inventory_hint_tests {
     use super::*;
 
+    fn stickiness(entry: &FolderEntry) -> UidStickiness {
+        entry.uid_stickiness()
+    }
+
+    #[test]
+    fn uid_stickiness_records_all_states_without_a_partition_ceiling() {
+        let entry = FolderEntry::from_mailbox(MailboxInfo::default());
+        assert_eq!(stickiness(&entry), UidStickiness::Unobserved);
+        let mut selected = crate::types::SelectedMailbox {
+            uid_not_sticky: true,
+            ..Default::default()
+        };
+        entry.observe_selection(entry.begin_selection(), &selected);
+        assert_eq!(stickiness(&entry), UidStickiness::NotSticky);
+        assert_eq!(
+            entry.inventory_partitioning(),
+            bifrost_types::InventoryPartitioning::Full
+        );
+        selected.uid_not_sticky = false;
+        entry.observe_selection(entry.begin_selection(), &selected);
+        assert_eq!(stickiness(&entry), UidStickiness::Sticky);
+        assert_eq!(
+            entry.inventory_partitioning(),
+            bifrost_types::InventoryPartitioning::Full
+        );
+        selected.uid_not_sticky = true;
+        entry.observe_selection(entry.begin_selection(), &selected);
+        assert_eq!(stickiness(&entry), UidStickiness::NotSticky);
+    }
+
+    #[test]
+    fn uid_stickiness_ignores_older_completions_in_both_directions() {
+        use bifrost_types::InventoryPartitioning;
+        for newer_not_sticky in [true, false] {
+            let entry = FolderEntry::from_mailbox(MailboxInfo::default());
+            let older = entry.begin_selection();
+            let newer = entry.begin_selection();
+            let selected = |uid_not_sticky| crate::types::SelectedMailbox {
+                uid_not_sticky,
+                uid_validity: crate::types::UidValidity::new(5),
+                uid_next: crate::types::Uid::new(101),
+                ..Default::default()
+            };
+            entry.observe_selection(newer, &selected(newer_not_sticky));
+            entry.observe_selection(older, &selected(!newer_not_sticky));
+            assert_eq!(
+                entry.inventory_partitioning(),
+                if newer_not_sticky {
+                    InventoryPartitioning::Full
+                } else {
+                    InventoryPartitioning::UidRange {
+                        max_uid: Some(100),
+                        uid_validity: 5,
+                    }
+                }
+            );
+            assert_eq!(
+                stickiness(&entry),
+                if newer_not_sticky {
+                    UidStickiness::NotSticky
+                } else {
+                    UidStickiness::Sticky
+                }
+            );
+        }
+    }
+
     #[test]
     fn inventory_partition_hint_covers_completed_baseline_and_requires_observation() {
         use bifrost_types::InventoryPartitioning;
@@ -1751,7 +1866,7 @@ mod inventory_hint_tests {
             uid_next: crate::types::Uid::new(101),
             ..Default::default()
         };
-        entry.observe_selection(&selected);
+        entry.observe_selection(entry.begin_selection(), &selected);
         assert_eq!(
             entry.inventory_partitioning(),
             InventoryPartitioning::UidRange {

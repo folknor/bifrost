@@ -1076,6 +1076,17 @@ until inventory, changes, a read or a mutation selects that folder through this
 path. Planning adds no discovery round trips. Missing UIDNEXT or UIDNOTSTICKY
 clears the hint and also plans `Full`.
 
+The registry separately records UID stickiness as unobserved, sticky as of the
+last successful selection, or not-sticky. A successful selection without
+UIDNOTSTICKY records sticky even without a usable partition ceiling; it promises
+no continuity of UIDVALIDITY. Attempts are numbered before awaiting selection,
+and older completions cannot overwrite newer successful observations. Failed
+attempts publish nothing. Observation and ceiling update together under one
+lock on the entry retained across selection, so a deleted and recreated folder
+starts unobserved rather than inheriting a late result for its predecessor.
+An enterprise user expects concurrent reads to preserve the newest observed
+folder state. Cached stickiness never replaces live partition epoch validation.
+
 `FolderEntry::inventory_partitioning` advertises `UidRange` with the observed
 UIDVALIDITY and a ceiling at least SELECT UIDNEXT minus one. A fresh selection
 covers the stored baseline's previously assigned UIDs in that epoch; a cached
