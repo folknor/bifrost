@@ -449,6 +449,11 @@ Narrow edge cases, audits with no known defect, and design work.
   certify that teardown has finished; if so, it is a provider contract plus a
   per-provider fix, since `ClosingAccount` does not own teardown.
 
+- **`WarningKind::Throttled` may have no producer.** Noted by the scout of the
+  clock-skew warning item, unverified. If confirmed, it is the same shape as
+  `ClockSkew`: a published warning nothing emits. Check before treating it as
+  wired.
+
 - **`advertised_partitioning_maps_to_its_windows` does not bite on its
   time-window arm.** In `crates/sync/src/backfill/plan.rs`, the time arm
   compares `backfill_plan_for`'s result against `time_windows` itself, so a
