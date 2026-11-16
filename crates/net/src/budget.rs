@@ -1,7 +1,7 @@
 //! Shared payload admission for HTTP and stream adapters.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -55,7 +55,14 @@ struct State {
 struct BudgetInner {
     state: Mutex<State>,
     changes: watch::Sender<Policy>,
+    // The blocking twin of `changes`: waits on `state`, notified on every
+    // policy change so a blocking waiter re-reads policy as an async one does.
+    policy_changed: Condvar,
     owner: Option<(Weak<BandwidthRegistry>, AccountId)>,
+    // Signalled by a blocking waiter while it holds `state`, immediately
+    // before the condvar wait releases it.
+    #[cfg(test)]
+    blocking_wait_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl Drop for BudgetInner {
@@ -112,7 +119,10 @@ impl BandwidthBudget {
                     outstanding: HashMap::new(),
                 }),
                 changes,
+                policy_changed: Condvar::new(),
                 owner,
+                #[cfg(test)]
+                blocking_wait_started: Mutex::new(None),
             }),
         }
     }
@@ -158,6 +168,8 @@ impl BandwidthBudget {
         }
         state.policy.cap = cap;
         self.inner.changes.send_replace(state.policy);
+        // Every waiter in both directions may hold an invalidated slot.
+        self.inner.policy_changed.notify_all();
     }
 
     /// Issue a fixed slot, bounded by len, one second of cap and MAX_OFFER.
@@ -241,6 +253,69 @@ impl BandwidthBudget {
         loop {
             let mut reservation = self.ready(direction, len).await;
             if reservation.offer() {
+                return reservation;
+            }
+        }
+    }
+
+    /// `admit` for blocking `std::io` adapters: blocks the calling thread
+    /// until an offered slot is granted, with no Tokio runtime required. A
+    /// policy change wakes the waiter at once, exactly as it wakes `ready`;
+    /// a slot whose epoch went stale is discarded and reserved again.
+    ///
+    /// Never call this from an async task: it parks the thread. Paused Tokio
+    /// time does not drive this wait, so it is not a harness for it either.
+    #[must_use]
+    pub fn blocking_admit(&self, direction: BandwidthDirection, len: usize) -> Reservation {
+        self.blocking_admit_with(direction, len, |state, timeout| {
+            #[cfg(test)]
+            if let Some(started) = self
+                .inner
+                .blocking_wait_started
+                .lock()
+                .expect("test hook lock poisoned")
+                .as_ref()
+            {
+                let _ = started.send(());
+            }
+            self.inner
+                .policy_changed
+                .wait_timeout(state, timeout)
+                .expect("bandwidth lock poisoned")
+                .0
+        })
+    }
+
+    /// The blocking wait loop over an injected wait, so the epoch rule is
+    /// testable without real time. `wait` receives the held state lock and
+    /// returns it re-acquired; the predicate is always re-read from state.
+    fn blocking_admit_with<'a>(
+        &'a self,
+        direction: BandwidthDirection,
+        len: usize,
+        mut wait: impl FnMut(MutexGuard<'a, State>, Duration) -> MutexGuard<'a, State>,
+    ) -> Reservation {
+        loop {
+            // `reserve`, `offer` and a dropped reservation all take the state
+            // lock, so the guard below never outlives this check.
+            let mut reservation = self.reserve(direction, len);
+            let mut state = self.inner.state.lock().expect("bandwidth lock poisoned");
+            let current = loop {
+                if state.policy.epoch != reservation.epoch {
+                    break false;
+                }
+                // The same Tokio clock `offer` checks, so a slot judged due
+                // here is due there.
+                let remaining = reservation
+                    .ready_at
+                    .saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break true;
+                }
+                state = wait(state, remaining);
+            };
+            drop(state);
+            if current && reservation.offer() {
                 return reservation;
             }
         }
@@ -674,6 +749,53 @@ mod tests {
         let grant = waiting.await;
         assert_eq!(Instant::now(), now);
         assert_eq!(grant.epoch(), 1);
+    }
+
+    #[test]
+    fn cap_lift_wakes_a_blocked_thread_without_waiting_out_its_slot() {
+        let budget = BandwidthBudget::new(Some(1));
+        commit(&budget, 1);
+        // About a hundred seconds of debt ahead of the blocked waiter.
+        let _queued: Vec<_> = (0..100).map(|_| budget.reserve(Inbound, 1)).collect();
+        let (started_tx, started) = std::sync::mpsc::channel();
+        *budget.inner.blocking_wait_started.lock().unwrap() = Some(started_tx);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let waiter = budget.clone();
+        let thread = std::thread::spawn(move || {
+            let grant = waiter.blocking_admit(Inbound, 1);
+            done_tx.send(grant.epoch()).unwrap();
+        });
+        // Signalled under the state lock, so this cap change can only land
+        // once the condvar wait has released it.
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the waiter blocks on its far slot");
+        budget.set_cap(None);
+        let epoch = done
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a cap lift wakes the blocked waiter");
+        assert_eq!(epoch, 1);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_blocked_waiter_readmits_after_an_unobserved_unlimited_epoch() {
+        let budget = BandwidthBudget::new(Some(10));
+        commit(&budget, 10);
+        let mut waits = 0;
+        let grant = budget.blocking_admit_with(Inbound, 10, |state, _| {
+            waits += 1;
+            drop(state);
+            // Both transitions land before the waiter looks again, so it never
+            // observes the unlimited epoch itself.
+            budget.set_cap(None);
+            budget.set_cap(Some(1));
+            budget.inner.state.lock().unwrap()
+        });
+        assert_eq!(waits, 1);
+        assert_eq!(grant.epoch(), 2);
+        // Reserved again under the new cap, not the stale 10-byte grant.
+        assert_eq!(grant.granted(), 1);
     }
 
     #[tokio::test(start_paused = true)]

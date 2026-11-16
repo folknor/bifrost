@@ -11,16 +11,11 @@ pub const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 // adapter shares those rules and the optional plaintext sink between the
 // published blocking and Tokio transports; it does not own another schedule.
 //
-// The blocking half implements std::io without a Tokio runtime. It uses
-// reserve/offer and sleeps the calling thread in at most one-second slices,
-// rechecking cap and epoch so even an unlimited-then-recapped transition between
-// checks discards the stale slot. Reservation::offer performs the final epoch
-// and readiness validation under the shared budget lock. The polling loop
-// repeats waiter orchestration, not grant pricing or installation policy;
-// blocking_admission_readmits_after_an_unobserved_unlimited_epoch pins it.
-// MeteredStream implements Tokio I/O only and cannot replace this wait path.
-// Moving this orchestration requires a blocking admission API on BandwidthBudget
-// in bifrost-net first; deleting the loop here would remove blocking throttling.
+// The blocking half implements std::io without a Tokio runtime through
+// BandwidthBudget::blocking_admit, which owns the wait: the calling thread
+// parks until its slot is due or a policy change wakes it, and a stale epoch
+// is reserved again. MeteredStream implements Tokio I/O only and cannot
+// replace the blocking stream.
 //
 // The Tokio half explicitly admits each read-buffer fill and write before the
 // connection arms its peer timer. Cumulative reply peer time excludes admission,
@@ -31,9 +26,9 @@ pub const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 // writes and cap retunes, then finishes and observes only successful plaintext
 // I/O. Both directions allow only one outstanding admission on each stream.
 //
-// A shared blocking admission API could replace the wait loop independently;
-// it would not remove these stream and deadline responsibilities. Reuse alone
-// does not justify moving SMTP's I/O state into the shared Tokio stream wrapper.
+// The shared blocking admission did not remove these stream and deadline
+// responsibilities. Reuse alone does not justify moving SMTP's I/O state into
+// the shared Tokio stream wrapper.
 /// Clones share the caller's budget across connections and transport pools.
 #[derive(Clone)]
 pub(crate) struct WireMetering {
@@ -76,41 +71,7 @@ impl WireMetering {
     }
 
     pub(crate) fn blocking_admit(&self, direction: BandwidthDirection, len: usize) -> Reservation {
-        self.blocking_admit_with_wait(direction, len, std::thread::sleep)
-    }
-
-    fn blocking_admit_with_wait(
-        &self,
-        direction: BandwidthDirection,
-        len: usize,
-        mut sleep: impl FnMut(std::time::Duration),
-    ) -> Reservation {
-        loop {
-            let mut reservation = Reservation(self.budget.reserve(direction, len));
-            loop {
-                if reservation.offer() {
-                    return reservation;
-                }
-                // This adapter sleeps on a blocking thread. With the normal
-                // Tokio clock, `into_std()` and `std::Instant::now()` share
-                // the same monotonic clock. Paused Tokio time intentionally
-                // cannot advance a blocking thread's clock, so it is not a
-                // valid harness for this wait path.
-                let wait = reservation
-                    .ready_at()
-                    .into_std()
-                    .saturating_duration_since(std::time::Instant::now());
-                if wait.is_zero()
-                    || self.budget.cap().is_none()
-                    || reservation.epoch() != self.budget.epoch()
-                {
-                    break;
-                }
-                // No Tokio runtime is required by the blocking transport.
-                // Poll policy changes at most one second apart.
-                sleep(wait.min(std::time::Duration::from_secs(1)));
-            }
-        }
+        Reservation(self.budget.blocking_admit(direction, len))
     }
 
     #[cfg(feature = "tokio")]
@@ -282,25 +243,6 @@ mod tests {
             grant.ready_at(),
             Instant::now() + Duration::from_nanos(333_333_334)
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn blocking_admission_readmits_after_an_unobserved_unlimited_epoch() {
-        let (budget, meter) = capped(10);
-        finish(meter.reserve_out(10), 10);
-        let _queued: Vec<_> = (0..10).map(|_| meter.reserve_out(10)).collect();
-        let mut waits = 0;
-        let grant = meter.blocking_admit_with_wait(BandwidthDirection::Outbound, 10, |_| {
-            waits += 1;
-            assert_eq!(waits, 1, "slept again on the invalidated reservation");
-            // Both changes land between blocking policy checks.
-            budget.set_cap(None);
-            budget.set_cap(Some(1));
-        });
-        assert_eq!(waits, 1);
-        assert_eq!(grant.epoch(), budget.epoch());
-        assert_eq!(grant.granted(), 1);
-        grant.finish(1);
     }
 
     #[test]

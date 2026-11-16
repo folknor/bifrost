@@ -1114,6 +1114,18 @@ policy again. Installation and epoch validation use the same mutex. Setting an
 unchanged cap is a no-op, including its watch notification. All admission times
 use the Tokio clock.
 
+`blocking_admit` is the same admission for blocking `std::io` adapters and
+needs no Tokio runtime. The waiter parks on a condvar over the schedule mutex,
+which every policy change notifies alongside the watch, until its slot is due;
+on each wake it re-reads the epoch under that mutex, discards a stale
+reservation and reserves again, then offers as `admit` does. A cap lift wakes
+it at once rather than after its obsolete slot. It parks the calling thread, so
+async code never calls it, and paused Tokio time does not drive it. Its wait
+loop runs over an injected wait in tests, which pins the unlimited-then-recapped
+transition the waiter never observes
+(`a_blocked_waiter_readmits_after_an_unobserved_unlimited_epoch`); a real thread
+pins the condvar wake (`cap_lift_wakes_a_blocked_thread_without_waiting_out_its_slot`).
+
 `MeteredStream<S>` wraps an `AsyncRead + AsyncWrite + Unpin` stream with a
 shared budget. Its read and write lanes each retain at most one admission
 future or offered reservation across Pending. Inner I/O receives at most the
@@ -1156,20 +1168,13 @@ deltas independently of the optional account sink. An account-wide counter
 cannot replace that observation.
 
 SMTP/LMTP share their adapter between the published blocking and Tokio
-transports. Blocking `std::io` admission uses `reserve`/`offer` and
-`std::thread::sleep`, without requiring a Tokio runtime. Waits are sliced to at
-most one second with cap and epoch checks, including unlimited-then-recapped
-transitions between checks. The final offer still validates readiness and epoch
-under the shared budget lock; the private loop neither prices grants nor
-implements refunds. Its transition handling is pinned by
-`blocking_admission_readmits_after_an_unobserved_unlimited_epoch`. This is
-blocking waiter orchestration that a separate blocking budget API could own;
-it is not a reason to replace the stream adapters. The Tokio stream exposes
+transports. Blocking `std::io` admission delegates to
+`BandwidthBudget::blocking_admit`; the adapter owns no wait loop. The Tokio stream exposes
 admission separately so connection code can exclude it from cumulative reply
 peer time and per-write timers while including it in absolute setup deadlines.
 It retains an offered grant and the original native-tls write length across
-Pending and cap retunes. These stream and deadline responsibilities remain
-even if the blocking wait loop moves.
+Pending and cap retunes. These stream and deadline responsibilities stayed
+with the adapter when the blocking wait moved into the budget.
 
 Peer timing alone is composable: ManageSieve already wraps `PeerReadTimeout`
 inside `MeteredStream`, excluding admission from its cumulative line or literal
