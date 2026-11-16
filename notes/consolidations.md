@@ -46,14 +46,15 @@ carries trusted origins, bearer-carrying requests take an `AdmittedUrl` minted b
 net, and each crate contributes only its policy for widening the set (DAV's
 discovered homes, Graph's upload sessions). Related: BUG-075.
 
-## CON-052 - Is a Gmail `NotFound` dischargeable under the cursor bridge?
+## CON-068 - What support detail does a proof of irrelevance carry?
 
-**Reported by:** google.
+**Reported by:** spar (Gmail cursor-bridge absence).
 
-The two inventory sites now share one evidence-producing helper in
-`account/cursor.rs`, and repair reports its evidence. Residue: the inventory
-walk still discharges a proven absence silently, because `InventoryEvent` has
-no per-object evidence variant, so the engine never sees the proof. That needs
-a shared inventory API change in bifrost-types. (Mutation 404 handling stays
-separate on purpose: it proves target absence, not inventory coverage.)
+`crates/sync/src/repair.rs` flattens `DefinitiveIrrelevance` to its `detail`
+string with an `_ => String::new()` arm (the enum is `#[non_exhaustive]` in
+bifrost-types, so the wildcard is forced). A future variant would discharge
+debt with an empty support detail and nothing would notice. The owner of the
+answer is the type: a `DefinitiveIrrelevance::detail()` accessor in
+bifrost-types, exhaustive at home, removes the wildcard. Also unverified:
+`OutOfScope` appears to have no producer in the workspace.
 

@@ -130,7 +130,7 @@ pub(crate) fn repair_inventory(
                         error,
                         error::GmailErrorContext::inventory(),
                     );
-                    if let Some(evidence) = absence_proven_by_cursor_bridge(&account_error) {
+                    if let Some(evidence) = absence_proven_by_cursor_bridge(&account_error, &id.0) {
                         bifrost_types::InventoryRepairOutcome::DefinitivelyIrrelevant {
                             attempt,
                             evidence,
@@ -310,10 +310,26 @@ pub(crate) fn inventory_stream_cancellable(
                             error,
                             error::GmailErrorContext::inventory(),
                         );
-                        if absence_proven_by_cursor_bridge(&account_error).is_some() {
-                            // InventoryEvent has no per-object evidence lane.
-                            // Discharged absence contributes no obligation; do
-                            // not manufacture debt merely to report its repair.
+                        if let Some(evidence) =
+                            absence_proven_by_cursor_bridge(&account_error, &id)
+                        {
+                            // No new obligation is created for an absence
+                            // established during this walk, and the proof is
+                            // deliberately not carried in InventoryEvent. An
+                            // acknowledged complete covering walk settles any
+                            // earlier debt for this id; otherwise that debt
+                            // stays for the repair lane, which reaches the
+                            // same proof and reports it typed. A per-object
+                            // evidence lane would settle such earlier debt
+                            // sooner despite unrelated gaps, but it is not
+                            // needed for enumeration correctness, and
+                            // recording a fresh row only to close it would be
+                            // manufactured debt.
+                            tracing::debug!(
+                                target: "bifrost_google::inventory",
+                                evidence = ?evidence,
+                                "message listed by this walk is gone; discharged"
+                            );
                             continue;
                         }
                         if !account_error.recovery().is_item_local() {
@@ -1330,6 +1346,53 @@ mod tests {
         );
     }
 
+    /// A repair GET that finds the message gone discharges the obligation
+    /// with the typed cursor-bridge proof, correlated to its attempt, and the
+    /// support detail names the message the stored row is about.
+    #[tokio::test]
+    async fn a_repair_get_not_found_is_typed_cursor_bridge_irrelevance() {
+        let client = scripted_client(vec![
+            ok_json(json!({ "labels": [] })),
+            canned(
+                StatusCode::NOT_FOUND,
+                br#"{"error":{"code":404,"message":"Not Found","status":"NOT_FOUND"}}"#,
+            ),
+        ]);
+        let request = bifrost_types::InventoryRepairRequest {
+            attempt: bifrost_types::RepairAttemptId(7),
+            key: bifrost_types::ObligationKey(b"gmail:message:gone".to_vec()),
+            domain: bifrost_types::CoverageDomain::full(CursorScope::Account),
+            target: bifrost_types::InventoryRepairTarget::Object {
+                id: ObjectId("gone".to_owned()),
+                repair: Vec::new(),
+            },
+        };
+        let mut events = repair_inventory(
+            client,
+            Arc::new(super::super::scopes::ScopeCacheState::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            Box::pin(stream::iter([request])),
+        );
+
+        let first = events.next().await.expect("one outcome per request");
+        let bifrost_types::InventoryRepairEvent::Outcome(
+            bifrost_types::InventoryRepairOutcome::DefinitivelyIrrelevant { attempt, evidence },
+        ) = first
+        else {
+            panic!("a vanished message must be proved irrelevant, got {first:?}");
+        };
+        assert_eq!(attempt, bifrost_types::RepairAttemptId(7));
+        let bifrost_types::DefinitiveIrrelevance::AbsentUnderCursorBridge { detail } = &evidence
+        else {
+            panic!("the proof must be the cursor bridge, got {evidence:?}");
+        };
+        assert!(
+            detail.contains("gone"),
+            "detail must name the message: {detail}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn inventory_cancellation_stops_an_inflight_request_without_an_extra_call() {
         let script = ScriptedDispatch::new(vec![Canned::Pending, Canned::Pending]);
@@ -1644,11 +1707,16 @@ mod tests {
         assert!(matches!(batch.page_boundary, PageBoundary::Final));
         assert_eq!(batch.items.len(), 1);
         assert_eq!(batch.items[0].id, ObjectId("live".to_string()));
-        assert!(matches!(
-            &events[1],
-            bifrost_types::InventoryEvent::Done(completion)
-                if completion.checkpoint.accepted(false).is_some()
-        ));
+        // The race is discharged, not deferred: neither the page nor the walk
+        // may carry debt for the vanished id.
+        assert!(batch.coverage.is_complete());
+        assert!(batch.coverage.obligations().is_empty());
+        let bifrost_types::InventoryEvent::Done(completion) = &events[1] else {
+            panic!("the walk must finish: {events:?}");
+        };
+        assert!(completion.checkpoint.accepted(false).is_some());
+        assert!(completion.coverage.is_complete());
+        assert!(completion.coverage.obligations().is_empty());
     }
 
     #[tokio::test]

@@ -12,12 +12,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, GmailCursorFailure, GmailLocalError};
 
-/// Gmail inventory samples its history cursor before listing. A missing
-/// message is therefore already absent or removed by the bridged change log.
-/// Users expect a concurrently deleted message to disappear without repair debt.
+/// Gmail inventory samples its history cursor before listing, so any deletion
+/// after that point is carried by the change stream. Users expect a
+/// concurrently deleted message to disappear without repair debt.
+///
+/// Two premises, only one of which the cursor supplies. The cursor ordering
+/// bridges a SUBSEQUENT deletion; it does not establish why the GET said
+/// not-found. That a `users.messages.get` 404 is authoritative current absence
+/// in the same mailbox is a provider assumption, not a consequence of the
+/// cursor (mailbox identity across a walk rests on the same unbound token
+/// source as every other request; see the changes-poll identity check).
+///
 /// This proof is only for inventory and its repair lane, not mutation success.
 pub(super) fn absence_proven_by_cursor_bridge(
     error: &bifrost_types::AccountError,
+    message_id: &str,
 ) -> Option<bifrost_types::DefinitiveIrrelevance> {
     matches!(
         error.kind(),
@@ -25,9 +34,10 @@ pub(super) fn absence_proven_by_cursor_bridge(
     )
     .then(
         || bifrost_types::DefinitiveIrrelevance::AbsentUnderCursorBridge {
-            detail: "Gmail message absent; the history cursor precedes the inventory walk, \
-                 so the change stream bridges any removal"
-                .to_string(),
+            detail: format!(
+                "Gmail message {message_id} absent; the history cursor precedes the \
+                 inventory walk, so the change stream bridges any removal"
+            ),
         },
     )
 }

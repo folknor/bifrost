@@ -610,7 +610,14 @@ Search translates the shared `SearchRequest` AST into Gmail query
 strings and uses `users.threads.list` for thread-shaped search and
 `users.messages.list` for message-shaped search. `provider_query` is
 appended verbatim so consumers can use Gmail-specific operators such
-as `larger:5M`. Both list endpoints explicitly send
+as `larger:5M`; a `SearchFilter::ProviderQuery` leaf takes the same raw
+query inside the tree, parenthesised, and is `Request(Malformed)` when blank
+or when its parentheses or double quotes do not balance (so it cannot escape
+its group). `Attachment(Any)` is `has:attachment`, `Attachment(Name)` is
+Gmail's `filename:` (name or extension, word matching; blank is
+`Request(Malformed)`), and `Attachment(MediaType)` is `Unsupported`: Gmail
+has no MIME-type operator, and `filename:application/pdf` would be a
+filename search. Both list endpoints explicitly send
 `includeSpamTrash=true`; inventory and search therefore see the same
 first-class Spam and Trash containers that history changes can name.
 The inventory page walk calls the same `mail_list_query` builder as
@@ -1997,10 +2004,23 @@ and selecting a delegated sender must preserve that sender on the message.
 `cursor::absence_proven_by_cursor_bridge` is the common inventory/repair proof
 for `NotFound(Message)`: the history cursor sampled before the walk bridges any
 subsequent deletion. Users expect deleted messages to disappear without repair
-debt. Repair returns the typed evidence. The walk has no per-object evidence
-variant in `InventoryEvent`, so it discharges absence without adding an
-obligation. Mutation 404 isolation proves an operation target is missing, not
-inventory coverage, and deliberately does not use this cursor proof.
+debt. Repair returns the typed evidence, and its support detail names the
+message. The cursor ordering bridges a subsequent deletion but does not itself
+establish why the GET said not-found: treating a `users.messages.get` 404 as
+authoritative current absence in the same mailbox is a provider assumption.
+
+The walk discharges such an absence with a debug trace and no obligation, and
+deliberately carries no per-object evidence in `InventoryEvent`. No new
+obligation is created for an absence established during the walk. An
+acknowledged complete covering walk settles any earlier debt for that id;
+otherwise the earlier debt stays for the repair lane, which reaches the same
+typed proof. A per-object evidence lane would settle such earlier debt sooner
+despite unrelated gaps in the walk, but it is not needed for enumeration
+correctness, and the cost of its absence is conservative stale accounting (an
+earlier row that is operator-blocked or retry-exhausted stays unresolved until
+a complete walk or explicit repair), never lost mail. Mutation 404 isolation
+proves an operation target is missing, not inventory coverage, and
+deliberately does not use this cursor proof.
 
 Structured Gmail search and stored-filter date bounds use Unix seconds,
 preserving time of day without timezone-dependent calendar-date interpretation.
