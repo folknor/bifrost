@@ -268,6 +268,27 @@ async fn run_changes(
     }
 }
 
+/// Classify a walk's raw IMAP failure with the owner captured when the walk
+/// began. Looking the owner up again at the stream boundary would lose a
+/// share deleted mid-walk and escalate its permission denial account-wide.
+/// Already-classified errors pass through untouched, so a retry that began
+/// its own walk keeps its own owner.
+fn walk_error(
+    folder: &MailboxName,
+    owner: Option<&bifrost_types::PrincipalId>,
+    err: ChangeError,
+) -> ChangeError {
+    match err {
+        ChangeError::Imap(err) => ChangeError::Account(super::error::folder_error(
+            err,
+            folder,
+            owner,
+            super::error::ImapErrorContext::operation(bifrost_types::AccountOperation::SyncChanges),
+        )),
+        other => other,
+    }
+}
+
 async fn run_qresync(
     account: ImapAccount,
     folder: MailboxName,
@@ -276,6 +297,22 @@ async fn run_qresync(
     known_uids: UidSet,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
+    let walk = account.begin_walk(&folder);
+    let owner = walk.owner();
+    run_qresync_walk(account, walk, expected_uidvalidity, modseq, known_uids, tx)
+        .await
+        .map_err(|err| walk_error(&folder, owner.as_ref(), err))
+}
+
+async fn run_qresync_walk(
+    account: ImapAccount,
+    walk: super::FolderWalk,
+    expected_uidvalidity: crate::types::UidValidity,
+    modseq: crate::types::ModSeq,
+    known_uids: UidSet,
+    tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
+) -> Result<(), ChangeError> {
+    let folder = walk.name.clone();
     // The caller must extract Complete before dispatch; legacy baselines never
     // reach this path. Enterprise users need re-inventory, not missed removals.
     let cursor = FolderCursor::QResync {
@@ -283,11 +320,11 @@ async fn run_qresync(
         modseq,
         baseline: UidBaseline::Complete(known_uids.clone()),
     };
+    let shared_owner = walk.owner();
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
-    let shared_owner = account.folder_owner(&folder);
     let selected = match account
-        .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
+        .select_walk(&mut conn, &walk, super::SelectPurpose::Sync(&cursor))
         .await
     {
         Ok(selected) => selected,
@@ -345,7 +382,7 @@ async fn run_qresync(
         .await?;
         return run_basic_from_selected(
             account,
-            folder,
+            walk,
             known_uids,
             selected.mailbox,
             conn,
@@ -373,7 +410,7 @@ async fn run_qresync(
             .await?;
         return run_condstore_from_selected(
             account,
-            folder,
+            walk,
             SelectedBaseline {
                 uidvalidity,
                 modseq,
@@ -391,9 +428,7 @@ async fn run_qresync(
     let mut removed_seen = BTreeSet::new();
     let mut changes = Vec::with_capacity(BATCH_ITEMS);
     for range in selected.mailbox.vanished.clone() {
-        account
-            .folders
-            .clear_modseq_ranges(&folder, uidvalidity, &[range]);
+        walk.clear_modseq_ranges(uidvalidity, &[range]);
         let removed = live_uids.remove_range(range);
         for uid in removed.iter() {
             if removed_seen.insert(uid) {
@@ -406,9 +441,7 @@ async fn run_qresync(
     }
     for fetch in selected.mailbox.changed_messages.clone() {
         if let (Some(uid), Some(modseq)) = (fetch.uid, fetch.mod_seq) {
-            account
-                .folders
-                .record_modseq(&folder, uidvalidity, uid, modseq)?;
+            walk.record_modseq(uidvalidity, uid, modseq)?;
         }
         record_fetch_change(
             &folder,
@@ -435,7 +468,7 @@ async fn run_qresync(
             flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
         }
         for uid in diff.removed {
-            account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
+            walk.clear_modseqs(uidvalidity, &[uid]);
             changes.push(removed_change(&folder, uidvalidity, uid));
             flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
         }
@@ -448,7 +481,7 @@ async fn run_qresync(
     warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let next = account.cursor_from_select(&selected.mailbox, Some(live_set))?;
     let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
-    finish_changes(account, folder, next, changes, tx, bytes_in).await
+    finish_changes(walk, next, changes, tx, bytes_in).await
 }
 
 async fn run_condstore(
@@ -466,17 +499,34 @@ async fn run_condstore_with_baseline(
     cursor: FolderCursor,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
+    // A fresh walk: the QRESYNC fallback released its checkout and issues a
+    // new SELECT, so its effects belong to whatever incarnation that SELECT
+    // begins on.
+    let walk = account.begin_walk(&folder);
+    let owner = walk.owner();
+    run_condstore_walk(account, walk, cursor, tx)
+        .await
+        .map_err(|err| walk_error(&folder, owner.as_ref(), err))
+}
+
+async fn run_condstore_walk(
+    account: ImapAccount,
+    walk: super::FolderWalk,
+    cursor: FolderCursor,
+    tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
+) -> Result<(), ChangeError> {
+    let folder = walk.name.clone();
     let FolderCursor::Condstore {
         modseq, known_uids, ..
     } = cursor.clone()
     else {
         return Ok(());
     };
+    let shared_owner = walk.owner();
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
-    let shared_owner = account.folder_owner(&folder);
     let selected = account
-        .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
+        .select_walk(&mut conn, &walk, super::SelectPurpose::Sync(&cursor))
         .await
         .map_err(|err| select_error(&folder, shared_owner.as_ref(), err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
@@ -491,7 +541,7 @@ async fn run_condstore_with_baseline(
         .await?;
         return run_basic_from_selected(
             account,
-            folder,
+            walk,
             known_uids,
             selected.mailbox,
             conn,
@@ -503,7 +553,7 @@ async fn run_condstore_with_baseline(
     validate_modseq_not_reset(&folder, modseq, selected.mailbox.modseq())?;
     run_condstore_from_selected(
         account,
-        folder,
+        walk,
         SelectedBaseline {
             uidvalidity,
             modseq,
@@ -544,12 +594,13 @@ struct SelectedBaseline {
 /// value, so no flag change is skipped.
 async fn run_condstore_from_selected(
     account: ImapAccount,
-    folder: MailboxName,
+    walk: super::FolderWalk,
     baseline: SelectedBaseline,
     conn: super::PooledConn,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
     previous_bytes_in: &mut u64,
 ) -> Result<(), ChangeError> {
+    let folder = walk.name.clone();
     let SelectedBaseline {
         uidvalidity,
         modseq,
@@ -582,9 +633,7 @@ async fn run_condstore_from_selected(
                 let fetch = item?;
                 if let Some(uid) = fetch.uid {
                     if let Some(modseq) = fetch.mod_seq {
-                        account
-                            .folders
-                            .record_modseq(&folder, uidvalidity, uid, modseq)?;
+                        walk.record_modseq(uidvalidity, uid, modseq)?;
                     }
                     // CHANGEDSINCE also returns arrivals. Only a UID in the
                     // complete prior baseline is an update; the live snapshot
@@ -605,13 +654,13 @@ async fn run_condstore_from_selected(
         flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
     }
     for uid in diff.removed {
-        account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
+        walk.clear_modseqs(uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
         flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
     }
     let next = account.cursor_from_select(&selected, Some(live_set))?;
     let bytes_in = super::measured_bytes_in(conn.connection(), previous_bytes_in);
-    finish_changes(account, folder, next, changes, tx, bytes_in).await
+    finish_changes(walk, next, changes, tx, bytes_in).await
 }
 
 async fn run_basic(
@@ -620,16 +669,30 @@ async fn run_basic(
     cursor: FolderCursor,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
+    let walk = account.begin_walk(&folder);
+    let owner = walk.owner();
+    run_basic_walk(account, walk, cursor, tx)
+        .await
+        .map_err(|err| walk_error(&folder, owner.as_ref(), err))
+}
+
+async fn run_basic_walk(
+    account: ImapAccount,
+    walk: super::FolderWalk,
+    cursor: FolderCursor,
+    tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
+) -> Result<(), ChangeError> {
+    let folder = walk.name.clone();
     let known_uids = cursor.known_uids().clone();
     let cursor_uidnext = match cursor {
         FolderCursor::Basic { uidnext, .. } => uidnext,
         _ => None,
     };
+    let shared_owner = walk.owner();
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
-    let shared_owner = account.folder_owner(&folder);
     let selected = account
-        .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
+        .select_walk(&mut conn, &walk, super::SelectPurpose::Sync(&cursor))
         .await
         .map_err(|err| select_error(&folder, shared_owner.as_ref(), err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
@@ -648,9 +711,7 @@ async fn run_basic(
     for fetch in &selected.mailbox.changed_messages {
         if let Some(uid) = fetch.uid {
             if let Some(modseq) = fetch.mod_seq {
-                account
-                    .folders
-                    .record_modseq(&folder, uidvalidity, uid, modseq)?;
+                walk.record_modseq(uidvalidity, uid, modseq)?;
             }
             if let Some(change) =
                 basic_updated_change(&folder, uidvalidity, uid, &known_uids, &live_set)?
@@ -665,7 +726,7 @@ async fn run_basic(
         flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
     }
     for uid in diff.removed {
-        account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
+        walk.clear_modseqs(uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
         flush_page(&tx, &mut changes, conn.connection(), &mut previous_bytes_in).await?;
     }
@@ -675,18 +736,19 @@ async fn run_basic(
         known_uids: live_set,
     };
     let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
-    finish_changes(account, folder, next, changes, tx, bytes_in).await
+    finish_changes(walk, next, changes, tx, bytes_in).await
 }
 
 async fn run_basic_from_selected(
     account: ImapAccount,
-    folder: MailboxName,
+    walk: super::FolderWalk,
     known_uids: UidSet,
     selected: crate::types::SelectedMailbox,
     conn: super::PooledConn,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
     previous_bytes_in: &mut u64,
 ) -> Result<(), ChangeError> {
+    let folder = walk.name.clone();
     let uidvalidity = selected_uidvalidity(&selected)?;
     let live = search_all(&account, conn.connection()).await?;
     let live_set = UidSet::from_numbers(live);
@@ -696,9 +758,7 @@ async fn run_basic_from_selected(
     for fetch in &selected.changed_messages {
         if let Some(uid) = fetch.uid {
             if let Some(modseq) = fetch.mod_seq {
-                account
-                    .folders
-                    .record_modseq(&folder, uidvalidity, uid, modseq)?;
+                walk.record_modseq(uidvalidity, uid, modseq)?;
             }
             if let Some(change) =
                 basic_updated_change(&folder, uidvalidity, uid, &known_uids, &live_set)?
@@ -713,7 +773,7 @@ async fn run_basic_from_selected(
         flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
     }
     for uid in diff.removed {
-        account.folders.clear_modseqs(&folder, uidvalidity, &[uid]);
+        walk.clear_modseqs(uidvalidity, &[uid]);
         changes.push(removed_change(&folder, uidvalidity, uid));
         flush_page(&tx, &mut changes, conn.connection(), previous_bytes_in).await?;
     }
@@ -723,7 +783,7 @@ async fn run_basic_from_selected(
         known_uids: live_set,
     };
     let bytes_in = super::measured_bytes_in(conn.connection(), previous_bytes_in);
-    finish_changes(account, folder, next, changes, tx, bytes_in).await
+    finish_changes(walk, next, changes, tx, bytes_in).await
 }
 
 async fn search_all(
@@ -740,15 +800,14 @@ async fn search_all(
 /// empty final batch purely to decorate the boundary would publish a page that
 /// carries nothing.
 async fn finish_changes(
-    account: ImapAccount,
-    folder: MailboxName,
+    walk: super::FolderWalk,
     cursor: FolderCursor,
     changes: Vec<Change>,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
     bytes_in: u64,
 ) -> Result<(), ChangeError> {
     let checkpoint = Some(Checkpoint::Change(encode_cursor(
-        folder_scope(&folder),
+        folder_scope(&walk.name),
         &cursor,
     )));
     if !changes.is_empty() {
@@ -764,10 +823,12 @@ async fn finish_changes(
     tx.send(SyncEvent::Done(checkpoint))
         .await
         .map_err(|_| ChangeError::ChannelDropped)?;
-    // The in-memory cursor is a hint for later SELECTs. Do not advance it if
-    // this changes stream could not enqueue its terminal checkpoint; the
-    // engine's durable cursor still belongs to the consumer.
-    account.folders.set_cursor(&folder, cursor);
+    // The in-memory cursor is a hint for inventory partition planning (SELECT
+    // builds its QRESYNC parameters from the consumer's cursor, not this
+    // one). Do not advance it if this changes stream could not enqueue its
+    // terminal checkpoint; the engine's durable cursor still belongs to the
+    // consumer. It lands on the walk's own entry, never a fresh lookup.
+    walk.set_cursor(cursor);
     Ok(())
 }
 
@@ -1101,8 +1162,7 @@ mod tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(finish_changes(
-            account.clone(),
-            folder.clone(),
+            account.begin_walk(&folder),
             cursor,
             vec![added_change(
                 &folder,
@@ -1130,7 +1190,7 @@ mod tests {
                 .expect("registered folder")
                 .cursor()
                 .is_none(),
-            "a failed terminal checkpoint send must leave the SELECT hint unchanged"
+            "a failed terminal checkpoint send must leave the cached cursor unchanged"
         );
         account.close().await.expect("account cleanup");
     }

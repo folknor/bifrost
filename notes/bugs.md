@@ -101,32 +101,34 @@ top-level conjunct against `bodyStructure` names. Verification is only exact
 in that position, and `hasAttachment` is not a proven candidate superset of
 named parts, so neither path is a drop-in.
 
-## BUG-212 - IMAP cursor writes resolve the folder by name after the command
+## BUG-214 - Non-sync IMAP lanes still touch the folder cache by name mid-operation
 
-**Reported by:** the folder-registry entry's spar (lateral).
+**Reported by:** the spar on the sync-walk incarnation fix (lateral).
 
-`changes.rs` and `inventory.rs` finish by calling
-`account.folders.set_cursor(&folder, cursor)`, a fresh name lookup. A folder
-deleted and recreated while the walk was in flight receives the old
-incarnation's cursor. The cursor carries its UIDVALIDITY, so
-`inventory_partitioning` falls back to Full on an epoch mismatch, but a
-recreated folder whose server reuses the epoch would inherit a baseline it never
-had. Fix shape: write through the `Arc<FolderEntry>` the walk began on, as
-`select_folder` now does for its observations. This changes a lifetime, so check
-what a late write on an orphaned entry means for the reader before landing.
+The sync walks now resolve a `FolderWalk` once and route owner, SELECT
+observation, MODSEQ and cursor effects through it. Three other lanes keep the
+older shape, where a folder deleted and recreated mid-operation (UIDVALIDITY
+reused, so the epoch check cannot separate them) lets the old operation read or
+write the new incarnation's cache:
 
-## BUG-213 - A shared IMAP folder deleted then created again registers as personal
+- Hydration: `get.rs` `run_folder_get` captures the owner from one lookup,
+  `select_folder` does a second, and the FETCH callback records MODSEQs by
+  name.
+- Mutations: `mutate.rs` `partition_by_modseq` reads `UNCHANGEDSINCE` guards by
+  name, and the mutation paths clear MODSEQs by name, so a mutation selected on
+  the old folder can consume the new one's guard or clear its cache.
+  `open_folder_for_mutation` would need to hand back the entry with the
+  connection.
+- Push: `push.rs` selects directly (not through `select_folder`), and
+  `absorb_idle_event` records FETCH and VANISHED effects by name while a mailbox
+  event can replace the entry under the still-selected session. Its NOTIFY
+  failure path also looks the owner up after the failure.
 
-**Reported by:** the folder-registry entry's spar (lateral).
-
-`FolderRegistry::apply_mailbox_event` inherits owner and MYRIGHTS only from an
-entry still in the map. A delete event removes the shared entry, so a later
-create at the same path installs `shared_owner: None`: a permission denial on
-it then escalates account-wide instead of quarantining the folder, and the role
-resolver treats it as a personal candidate. The existing recreate test passes
-`old_name` equal to the name, which keeps the superseded entry and does not
-exercise delete-then-create. Ownership needs a source that survives the
-incarnation (the NAMESPACE prefixes discovery already read); rights should not
-carry over, since they were observed for a different mailbox.
+Same family: `ImapAccount::folder_pair_error` and `folder_error` look the owner
+up after the command, so a share deleted during a COPY/MOVE or a hydration
+command escalates a denial account-wide. Once these lanes carry an entry, the
+name-keyed `FolderRegistry` cache wrappers (`record_modseq`, `clear_modseqs`,
+`clear_modseq_ranges`, `set_cursor`, `modseq`) have no production caller and
+can go, which would make the compiler hold the rule.
 
 

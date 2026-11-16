@@ -109,11 +109,17 @@ fn inventory_walk(
     let ticket = QresyncWarningTicket::new(account.clone(), tx.clone());
     let ledger = ObligationLedger::default();
     let task_ledger = ledger.clone();
+    let folder = folder.into_mailbox();
+    // Resolved once, before any command: the owner that classifies a
+    // failure and the entry the walk's cache writes land on are the same
+    // incarnation, whatever happens to the name meanwhile.
+    let folder_walk = account.begin_walk(&folder);
+    let owner = folder_walk.owner();
     let task = tokio::spawn(async move {
         match run_inventory(
             account.clone(),
             scope.clone(),
-            folder.clone(),
+            folder_walk,
             tx.clone(),
             &ticket,
             &task_ledger,
@@ -123,9 +129,10 @@ fn inventory_walk(
         {
             Ok(()) | Err(InventoryError::ChannelDropped) => {}
             Err(InventoryError::Imap(err)) => {
-                let error = account.folder_error(
+                let error = super::error::folder_error(
                     err,
                     &folder,
+                    owner.as_ref(),
                     super::error::ImapErrorContext::operation(
                         bifrost_types::AccountOperation::SyncInventory,
                     ),
@@ -300,7 +307,7 @@ const INVENTORY_UID_BAND: u32 = 65_536;
 async fn run_inventory(
     account: ImapAccount,
     scope: CursorScope,
-    folder: super::ImapFolder,
+    walk: super::FolderWalk,
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
     qresync_warning: &QresyncWarningTicket,
     obligations: &ObligationLedger,
@@ -320,15 +327,12 @@ async fn run_inventory(
         .await
         .map_err(|_| ChannelDropped)?;
     }
-    let folder = folder.into_mailbox();
-    let shared_owner = account
-        .folders
-        .get(&folder)
-        .and_then(|entry| entry.shared_owner.clone());
+    let folder = walk.name.clone();
+    let shared_owner = walk.owner();
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
     let selected = match account
-        .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
+        .select_walk(&mut conn, &walk, super::SelectPurpose::Read)
         .await
     {
         Ok(selected) => selected,
@@ -442,9 +446,7 @@ async fn run_inventory(
                                 *uid != 0 && window.is_none_or(|w| u64::from(*uid) >= w.from() && u64::from(*uid) < w.to())
                             }) {
                                 if let Some(modseq) = fetch.mod_seq {
-                                    account
-                                        .folders
-                                        .record_modseq(&folder, uidvalidity, uid, modseq)?;
+                                    walk.record_modseq(uidvalidity, uid, modseq)?;
                                 }
                                 if window.is_none() {
                                     known.push(uid);
@@ -532,28 +534,19 @@ async fn run_inventory(
     let known_uids = UidSet::from_numbers(known);
     let cursor = account.cursor_from_select(&selected.mailbox, Some(known_uids))?;
     let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
-    finish_inventory(
-        &account.folders,
-        &folder,
-        cursor,
-        batch_items,
-        &tx,
-        bytes_in,
-    )
-    .await?;
+    finish_inventory(&walk, cursor, batch_items, &tx, bytes_in).await?;
     Ok(())
 }
 
 async fn finish_inventory(
-    folders: &super::folder_registry::FolderRegistry,
-    folder: &MailboxName,
+    walk: &super::FolderWalk,
     cursor: super::FolderCursor,
     batch_items: Vec<InventoryEntry>,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
     bytes_in: u64,
 ) -> Result<(), ChannelDropped> {
     let checkpoint = Some(Checkpoint::Change(encode_cursor(
-        folder_scope(folder),
+        folder_scope(&walk.name),
         &cursor,
     )));
     if batch_items.is_empty() {
@@ -573,8 +566,10 @@ async fn finish_inventory(
             .await
             .map_err(|_| ChannelDropped)?;
     }
-    // Commit only after the consumer channel accepted the checkpoint.
-    folders.set_cursor(folder, cursor);
+    // Commit only after the consumer channel accepted the checkpoint, and
+    // only to the incarnation the walk enumerated: a folder recreated
+    // mid-walk must not inherit a baseline it never had.
+    walk.set_cursor(cursor);
     Ok(())
 }
 
@@ -932,9 +927,8 @@ mod tests {
             if !has_items {
                 tx.send(SyncEvent::Done(None)).await.unwrap();
             }
-            let mut finish = Box::pin(super::finish_inventory(
-                &folders, &folder, cursor, items, &tx, 0,
-            ));
+            let walk = super::super::FolderWalk::begin(&folders, &folder);
+            let mut finish = Box::pin(super::finish_inventory(&walk, cursor, items, &tx, 0));
             assert!(futures::poll!(finish.as_mut()).is_pending());
             assert!(folders.get(&folder).unwrap().cursor().is_none());
             drop(rx);
@@ -947,7 +941,7 @@ mod tests {
             };
             let (tx, _rx) = tokio::sync::mpsc::channel(2);
             assert!(
-                super::finish_inventory(&folders, &folder, cursor.clone(), Vec::new(), &tx, 0)
+                super::finish_inventory(&walk, cursor.clone(), Vec::new(), &tx, 0)
                     .await
                     .is_ok()
             );

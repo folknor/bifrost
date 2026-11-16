@@ -102,6 +102,77 @@ pub(crate) enum SelectPurpose<'a> {
     Mutate,
 }
 
+/// One sync walk's folder: the name it addresses and the registry entry
+/// (incarnation) it began on, resolved once by `ImapAccount::begin_walk`.
+///
+/// Every cache effect of the walk - MODSEQ records and clears, and the
+/// in-memory cursor commit at the end - lands on that entry, never on a
+/// fresh name lookup. A folder deleted and created again mid-walk is a new
+/// entry; the walk's late writes then land on the orphaned old one, where no
+/// reader can see them, instead of handing the new incarnation a baseline
+/// and MODSEQs it never had. This isolates local observations only: a
+/// recreated mailbox whose server reuses the UIDVALIDITY is still
+/// indistinguishable on the wire, here as in a consumer's checkpoint.
+pub(crate) struct FolderWalk {
+    pub(crate) name: MailboxName,
+    entry: Option<Arc<folder_registry::FolderEntry>>,
+}
+
+impl FolderWalk {
+    pub(crate) fn begin(folders: &FolderRegistry, folder: &MailboxName) -> Self {
+        Self {
+            name: folder.clone(),
+            entry: folders.get(folder),
+        }
+    }
+
+    /// The shared owner of the incarnation the walk began on. Captured
+    /// before any command, so a share removed mid-walk still classifies a
+    /// permission denial as that folder's, not the account's.
+    pub(crate) fn owner(&self) -> Option<bifrost_types::PrincipalId> {
+        self.entry
+            .as_ref()
+            .and_then(|entry| entry.shared_owner.clone())
+    }
+
+    pub(crate) fn record_modseq(
+        &self,
+        uidvalidity: UidValidity,
+        uid: u32,
+        modseq: impl Into<crate::types::ModSeqValzer>,
+    ) -> Result<(), Error> {
+        match &self.entry {
+            Some(entry) => entry.record_modseq(uidvalidity, uid, modseq),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn clear_modseqs(&self, uidvalidity: UidValidity, uids: &[u32]) {
+        if let Some(entry) = &self.entry {
+            entry.clear_modseqs(uidvalidity, uids);
+        }
+    }
+
+    pub(crate) fn clear_modseq_ranges(
+        &self,
+        uidvalidity: UidValidity,
+        ranges: &[crate::types::UidRange],
+    ) {
+        if let Some(entry) = &self.entry {
+            entry.clear_modseq_ranges(uidvalidity, ranges);
+        }
+    }
+
+    /// Commit the walk's in-memory cursor. Its one production reader is
+    /// inventory partition planning; an orphaned entry's cursor is simply
+    /// never read, and planning falls back on its own observations.
+    pub(crate) fn set_cursor(&self, cursor: FolderCursor) {
+        if let Some(entry) = &self.entry {
+            entry.set_cursor(cursor);
+        }
+    }
+}
+
 /// Account policy, distinct from each connection's committed ENABLE profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QresyncNegotiation {
@@ -298,13 +369,47 @@ impl ImapAccount {
         folder: &MailboxName,
         purpose: SelectPurpose<'_>,
     ) -> Result<SyncSelectResult, Error> {
+        let entry = self.folders.get(folder);
+        self.select_on(conn, folder, entry.as_ref(), purpose).await
+    }
+
+    /// Begin a sync walk: resolve the folder's incarnation once, before the
+    /// checkout and SELECT, so the walk's owner, selection observation and
+    /// every cache write it makes belong to the same entry.
+    pub(crate) fn begin_walk(&self, folder: &MailboxName) -> FolderWalk {
+        FolderWalk::begin(&self.folders, folder)
+    }
+
+    /// SELECT for a walk begun with `begin_walk`. An entry absent when the
+    /// walk began stays absent: a folder first registered mid-walk is not
+    /// looked up again and receives none of this walk's observations.
+    pub(crate) async fn select_walk(
+        &self,
+        conn: &mut PooledConn,
+        walk: &FolderWalk,
+        purpose: SelectPurpose<'_>,
+    ) -> Result<SyncSelectResult, Error> {
+        self.select_on(conn, &walk.name, walk.entry.as_ref(), purpose)
+            .await
+    }
+
+    async fn select_on(
+        &self,
+        conn: &mut PooledConn,
+        folder: &MailboxName,
+        entry: Option<&Arc<folder_registry::FolderEntry>>,
+        purpose: SelectPurpose<'_>,
+    ) -> Result<SyncSelectResult, Error> {
         // Classification stays at each operation's error boundary: SELECT is
         // not the last command that can discover a withdrawn share. Preserve
         // the raw error here for strategy downgrade and preflight restamping.
         let options = self.select_options(purpose)?;
         // Retain the numbered entry: a late SELECT for a deleted folder must
         // not teach a recreated same-name folder its predecessor's state.
-        let observation = self.folders.get(folder).map(|entry| {
+        // Numbered here, immediately before the command, not when the entry
+        // was resolved: a checkout wait in between lets another SELECT issue
+        // first.
+        let observation = entry.map(|entry| {
             let sequence = entry.begin_selection();
             (entry, sequence)
         });

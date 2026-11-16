@@ -1218,3 +1218,99 @@ async fn a_folder_recreated_during_select_is_not_marked_seen() {
     assert!(recreated.last_seen().is_none());
     let _server = script.await.unwrap();
 }
+
+/// The walk's cursor commit lands on the incarnation it walked. The server
+/// here even reuses the UIDVALIDITY, so an epoch check could not tell the
+/// recreated folder from the old one: only entry identity keeps the new
+/// folder from inheriting a baseline it never had.
+#[tokio::test]
+async fn a_folder_recreated_during_a_walk_does_not_inherit_its_cursor() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+    let walked = account.folders.get(&inbox()).unwrap();
+    let folders = std::sync::Arc::clone(&account.folders);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}* 2 EXISTS\r\n* OK [UIDVALIDITY 3] ok\r\n\
+                 * OK [UIDNEXT 11] ok\r\n{} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let search = read_line(&mut server).await;
+        assert!(search.contains("UID SEARCH ALL"), "{search}");
+        folders.apply_mailbox_event(deleted(inbox()));
+        folders.apply_mailbox_event(MailboxInfo {
+            name: inbox(),
+            ..MailboxInfo::default()
+        });
+        respond(
+            &mut server,
+            &format!("* SEARCH 1 2 10\r\n{} OK done\r\n", tag_of(&search)),
+        )
+        .await;
+        server
+    });
+    let events = collect_changes(
+        account.clone(),
+        cursor_for(&FolderCursor::Basic {
+            uidvalidity: crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(10),
+            known_uids: UidSet::from_numbers([1, 2]),
+        }),
+    )
+    .await;
+    assert!(
+        matches!(events.last(), Some(SyncEvent::Done(Some(_)))),
+        "{events:?}"
+    );
+    let recreated = account.folders.get(&inbox()).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&walked, &recreated));
+    assert!(walked.cursor().is_some());
+    assert!(recreated.cursor().is_none());
+    let _server = script.await.unwrap();
+}
+
+/// A share withdrawn after SELECT succeeded is still that folder's failure:
+/// the owner the walk began with classifies the later denial, so the
+/// enterprise user loses the folder, not the account.
+#[tokio::test]
+async fn a_share_deleted_mid_walk_still_quarantines_only_that_folder() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, shared_box_registry());
+    let folders = std::sync::Arc::clone(&account.folders);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}* 2 EXISTS\r\n* OK [UIDVALIDITY 3] ok\r\n\
+                 * OK [UIDNEXT 11] ok\r\n{} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        let search = read_line(&mut server).await;
+        folders.apply_mailbox_event(deleted(shared_box()));
+        respond(
+            &mut server,
+            &format!("{} NO [NOPERM] access revoked\r\n", tag_of(&search)),
+        )
+        .await;
+        server
+    });
+    let events = collect_changes(account, shared_box_cursor()).await;
+    let Some(SyncEvent::Terminated(error)) = events.last() else {
+        panic!("a denied SEARCH terminates the stream, got {events:?}");
+    };
+    assert_eq!(
+        error.kind(),
+        &bifrost_types::AccountErrorKind::SyncState(
+            bifrost_types::SyncStateErrorKind::ScopeRevoked
+        )
+    );
+    let _server = script.await.unwrap();
+}

@@ -400,6 +400,128 @@ pub(crate) struct SharedFolderEntry {
     pub(crate) namespace_prefix: String,
 }
 
+/// One namespace root the server advertised in its NAMESPACE answer.
+#[derive(Debug, Clone)]
+pub(crate) struct NamespaceRoot {
+    pub(crate) prefix: String,
+    pub(crate) delimiter: Option<char>,
+}
+
+/// One advertised non-personal namespace root.
+#[derive(Debug, Clone)]
+pub(crate) struct ForeignNamespace {
+    pub(crate) root: NamespaceRoot,
+    /// An other-user root (`#user/`, `~`) names one principal per folder
+    /// path; a shared root (`#shared/`) is one owner for its whole tree.
+    pub(crate) other_user: bool,
+}
+
+impl ForeignNamespace {
+    /// The owning principal of `name`, which the caller has already placed
+    /// inside this namespace by textual prefix.
+    ///
+    /// An other-user prefix need not end on a hierarchy boundary: RFC 2342
+    /// example 5.4 advertises `~` with delimiter `/`, under which
+    /// `~alice/INBOX` belongs to `alice`. The principal is therefore read
+    /// by removing the exact prefix and taking the next hierarchy segment.
+    fn owner_of(&self, name: &str) -> bifrost_types::PrincipalId {
+        let root = &self.root;
+        if !self.other_user {
+            return super::factory::mailbox_owner_for(&root.prefix, root.delimiter);
+        }
+        super::factory::mailbox_owner_from_other_user_path(name, &root.prefix, root.delimiter)
+    }
+}
+
+/// What the account learned from NAMESPACE at open, kept for the life of the
+/// registry so every later registration classifies ownership by the same
+/// rule discovery used.
+///
+/// `Known` describes the ADVERTISED surface only: RFC 2342 lets a server
+/// expose a subset of its namespaces, so a path matching no advertised root
+/// is `Ownership::Unknown`, never proof of a personal folder. Empty foreign
+/// prefixes (RFC 2342 example 5.2) are not represented: discovery has never
+/// enumerated them and they yield no meaningful owner.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum NamespaceKnowledge {
+    /// NAMESPACE unsupported or failed.
+    #[default]
+    Unknown,
+    Known {
+        personal: Vec<NamespaceRoot>,
+        foreign: Vec<ForeignNamespace>,
+    },
+}
+
+/// The registry's ownership verdict for one mailbox path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Ownership {
+    Personal,
+    Foreign {
+        owner: bifrost_types::PrincipalId,
+        /// The winning (most specific) foreign prefix.
+        prefix: String,
+    },
+    Unknown,
+}
+
+impl NamespaceKnowledge {
+    pub(crate) fn from_response(response: &crate::types::NamespaceResponse) -> Self {
+        let root = |descriptor: &crate::types::response::NamespaceDescriptor| NamespaceRoot {
+            prefix: descriptor.prefix.clone(),
+            delimiter: descriptor.delimiter,
+        };
+        let foreign = response
+            .other
+            .iter()
+            .map(|d| (d, true))
+            .chain(response.shared.iter().map(|d| (d, false)))
+            .filter(|(d, _)| !d.prefix.is_empty())
+            .map(|(d, other_user)| ForeignNamespace {
+                root: root(d),
+                other_user,
+            })
+            .collect();
+        Self::Known {
+            personal: response.personal.iter().map(root).collect(),
+            foreign,
+        }
+    }
+
+    /// Classify `name` by the most specific advertised root it lies under,
+    /// by textual prefix (RFC 2342 prefixes need not end on a hierarchy
+    /// boundary). Specificity runs across personal and foreign roots alike,
+    /// so a broad foreign root cannot claim a more specific personal tree;
+    /// a foreign root wins a tie. Exact INBOX is personal by protocol.
+    pub(crate) fn classify(&self, name: &str) -> Ownership {
+        if name.eq_ignore_ascii_case("INBOX") {
+            return Ownership::Personal;
+        }
+        let Self::Known { personal, foreign } = self else {
+            return Ownership::Unknown;
+        };
+        let best_personal = personal
+            .iter()
+            .filter(|root| name.starts_with(root.prefix.as_str()))
+            .map(|root| root.prefix.len())
+            .max();
+        let best_foreign = foreign
+            .iter()
+            .filter(|ns| name.starts_with(ns.root.prefix.as_str()))
+            .max_by_key(|ns| ns.root.prefix.len());
+        match (best_foreign, best_personal) {
+            (Some(ns), personal) if personal.is_none_or(|len| ns.root.prefix.len() >= len) => {
+                Ownership::Foreign {
+                    owner: ns.owner_of(name),
+                    prefix: ns.root.prefix.clone(),
+                }
+            }
+            (_, Some(_)) => Ownership::Personal,
+            (_, None) => Ownership::Unknown,
+        }
+    }
+}
+
 /// Whether a shared-namespace candidate outranks an identically-named entry
 /// the personal LIST already produced.
 ///
@@ -462,6 +584,10 @@ pub(crate) fn shared_folder_is_selectable(
 #[derive(Default)]
 pub(crate) struct FolderRegistry {
     by_name: RwLock<HashMap<MailboxName, Arc<FolderEntry>>>,
+    /// Set once at open. Ownership must survive a folder's incarnations: a
+    /// shared folder deleted and created again has no superseded entry to
+    /// inherit from, and only these roots still say it is not personal.
+    namespaces: NamespaceKnowledge,
 }
 
 fn role_from_special_use(role: crate::types::mailbox::SpecialUse) -> Option<FolderRole> {
@@ -547,10 +673,34 @@ impl FolderRegistry {
     /// carries `Some(owner)` so membership tagging and scoped revocation
     /// can route on the owning mailbox.
     pub(crate) fn from_lists(personal: Vec<MailboxInfo>, shared: Vec<SharedFolderEntry>) -> Self {
-        let registry = Self::default();
+        Self::from_discovery(personal, shared, NamespaceKnowledge::Unknown)
+    }
+
+    /// `from_lists` with the NAMESPACE answer retained. A personal-LIST
+    /// entry that lies under an advertised foreign root registers with that
+    /// root's owner even when the root's own LIST failed: the server's
+    /// declaration is what makes it not personal.
+    pub(crate) fn from_discovery(
+        personal: Vec<MailboxInfo>,
+        shared: Vec<SharedFolderEntry>,
+        namespaces: NamespaceKnowledge,
+    ) -> Self {
+        let registry = Self {
+            by_name: RwLock::default(),
+            namespaces,
+        };
         registry.replace_all(personal);
         registry.ingest_shared(shared);
         registry
+    }
+
+    /// The owner a newly registered entry at `name` starts with, when no
+    /// superseded entry speaks for it.
+    fn derived_owner(&self, name: &MailboxName) -> Option<bifrost_types::PrincipalId> {
+        match self.namespaces.classify(name.as_str()) {
+            Ownership::Foreign { owner, .. } => Some(owner),
+            Ownership::Personal | Ownership::Unknown => None,
+        }
     }
 
     /// Install shared/other-user folders, each tagged with its owning
@@ -624,7 +774,14 @@ impl FolderRegistry {
                 }
                 continue;
             }
-            map.insert(name, Arc::new(FolderEntry::from_mailbox(info)));
+            // A name new to the map is classified, not assumed personal: a
+            // personal LIST may echo the foreign namespaces (RFC 2342), and
+            // a share recreated since open has no entry left to say so.
+            let owner = self.derived_owner(&name);
+            map.insert(
+                name,
+                Arc::new(FolderEntry::from_mailbox_with_owner(info, owner)),
+            );
         }
     }
 
@@ -632,7 +789,8 @@ impl FolderRegistry {
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
         map.clear();
         for info in folders {
-            let entry = Arc::new(FolderEntry::from_mailbox(info));
+            let owner = self.derived_owner(&info.name);
+            let entry = Arc::new(FolderEntry::from_mailbox_with_owner(info, owner));
             map.insert(entry.name.clone(), entry);
         }
     }
@@ -645,24 +803,31 @@ impl FolderRegistry {
             .iter()
             .any(|attr| matches!(attr, MailboxAttribute::NonExistent));
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
-        // Carry the shared-owner tag across a rename/recreate. A LIST/IDLE
-        // `MailboxInfo` does not re-derive the owning mailbox (NAMESPACE
-        // discovery does), so rebuilding the entry with `from_mailbox`
-        // (owner `None`) would silently demote a renamed/recreated shared
-        // folder to personal. A later SELECT denial on that folder would
-        // then escalate account-wide (`NoPermission`) instead of routing
-        // through the scoped `ScopeRevoked` quarantine. Source the owner
-        // from the entry being superseded: the old name on a rename, the
-        // same name on a recreate.
-        // The rights set rides along with the owner tag for the same
-        // reason: a LIST/IDLE `MailboxInfo` carries no MYRIGHTS, so
-        // rebuilding without it would silently drop a shared folder's
-        // read-only marking from `containers_list`.
-        let superseded = old_name
-            .as_ref()
-            .and_then(|old| map.get(old))
-            .or_else(|| map.get(&name));
-        let inherited_owner = superseded.and_then(|entry| entry.shared_owner.clone());
+        // A LIST/IDLE `MailboxInfo` carries no owner, so ownership comes
+        // from the NAMESPACE roots retained at open: they outlive every
+        // incarnation, which is what lets a shared folder deleted and then
+        // created again come back shared. Registered as personal it would
+        // escalate a later permission denial account-wide instead of
+        // quarantining the folder, and be eligible for the account's Sent,
+        // Drafts and Trash roles. A path matching an advertised personal
+        // root is personal even when renamed out of a share. Only when the
+        // roots say nothing (NAMESPACE unavailable, or a path under no
+        // advertised root) does the superseded entry's owner carry over.
+        //
+        // The superseded entry is the rename source when OLDNAME is given,
+        // never the destination: an absent source means nothing is known
+        // about the incoming mailbox. Rights ride only with that same
+        // mailbox. MYRIGHTS was observed for one mailbox, so a create (no
+        // source) starts with rights unreported, which never gates.
+        let superseded = match old_name.as_ref() {
+            Some(old) => map.get(old),
+            None => map.get(&name),
+        };
+        let inherited_owner = match self.namespaces.classify(name.as_str()) {
+            Ownership::Foreign { owner, .. } => Some(owner),
+            Ownership::Personal => None,
+            Ownership::Unknown => superseded.and_then(|entry| entry.shared_owner.clone()),
+        };
         let inherited_rights = superseded.and_then(|entry| entry.rights.clone());
         if let Some(old_name) = old_name {
             map.remove(&old_name);
@@ -830,6 +995,193 @@ mod tests {
     }
 
     use super::*;
+
+    /// Personal root `""`, other-user root `Other/`, shared root `Shared/`,
+    /// all with delimiter `/`.
+    fn known_namespaces() -> NamespaceKnowledge {
+        let root = |prefix: &str| NamespaceRoot {
+            prefix: prefix.to_owned(),
+            delimiter: Some('/'),
+        };
+        NamespaceKnowledge::Known {
+            personal: vec![root("")],
+            foreign: vec![
+                ForeignNamespace {
+                    root: root("Other/"),
+                    other_user: true,
+                },
+                ForeignNamespace {
+                    root: root("Shared/"),
+                    other_user: false,
+                },
+            ],
+        }
+    }
+
+    fn mailbox(name: &str) -> MailboxName {
+        MailboxName::new(name).unwrap()
+    }
+
+    fn principal(name: &str) -> Option<bifrost_types::PrincipalId> {
+        Some(bifrost_types::PrincipalId(name.to_owned()))
+    }
+
+    #[test]
+    fn classification_uses_the_most_specific_advertised_root() {
+        let root = |prefix: &str| NamespaceRoot {
+            prefix: prefix.to_owned(),
+            delimiter: Some('/'),
+        };
+        let knowledge = NamespaceKnowledge::Known {
+            personal: vec![root("Shared/mine/")],
+            foreign: vec![
+                ForeignNamespace {
+                    root: root("~"),
+                    other_user: true,
+                },
+                ForeignNamespace {
+                    root: root("Shared/"),
+                    other_user: false,
+                },
+            ],
+        };
+        // RFC 2342 example 5.4: the user name follows `~` directly.
+        assert_eq!(
+            knowledge.classify("~alice/INBOX"),
+            Ownership::Foreign {
+                owner: bifrost_types::PrincipalId("alice".to_owned()),
+                prefix: "~".to_owned(),
+            }
+        );
+        assert_eq!(
+            knowledge.classify("Shared/team/Sent"),
+            Ownership::Foreign {
+                owner: bifrost_types::PrincipalId("Shared".to_owned()),
+                prefix: "Shared/".to_owned(),
+            }
+        );
+        // A personal root more specific than a foreign one wins.
+        assert_eq!(knowledge.classify("Shared/mine/Notes"), Ownership::Personal);
+        // No advertised root claims it: not proof of a personal folder.
+        assert_eq!(knowledge.classify("Elsewhere"), Ownership::Unknown);
+        assert_eq!(knowledge.classify("INBOX"), Ownership::Personal);
+        assert_eq!(
+            NamespaceKnowledge::Unknown.classify("Shared/team"),
+            Ownership::Unknown
+        );
+    }
+
+    /// The bug this pins: a delete leaves no entry to inherit from, so
+    /// without the retained roots the recreated share came back personal,
+    /// escalating a later denial account-wide and joining role resolution.
+    #[test]
+    fn a_shared_folder_deleted_then_created_comes_back_shared() {
+        let sent = mailbox("Shared/team/Sent");
+        let registry = FolderRegistry::from_discovery(
+            Vec::new(),
+            vec![shared_entry_under(&sent, Some("lrs"), "Shared/")],
+            known_namespaces(),
+        );
+        registry.apply_mailbox_event(MailboxInfo {
+            name: sent.clone(),
+            attributes: vec![MailboxAttribute::NonExistent],
+            ..Default::default()
+        });
+        assert!(registry.get(&sent).is_none());
+        registry.apply_mailbox_event(MailboxInfo {
+            name: sent.clone(),
+            attributes: vec![MailboxAttribute::Sent],
+            ..Default::default()
+        });
+        let recreated = registry.get(&sent).unwrap();
+        assert_eq!(recreated.shared_owner, principal("Shared"));
+        // MYRIGHTS was observed for the deleted mailbox, not this one.
+        assert!(recreated.rights.is_none());
+        assert_eq!(registry.role_folder(FolderRole::Sent), None);
+    }
+
+    #[test]
+    fn a_refresh_registers_a_new_name_under_a_foreign_root_as_shared() {
+        let registry = FolderRegistry::from_discovery(Vec::new(), Vec::new(), known_namespaces());
+        registry.replace_personal(vec![
+            MailboxInfo {
+                name: mailbox("Other/bob/Sent"),
+                ..Default::default()
+            },
+            MailboxInfo {
+                name: mailbox("Projects"),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(
+            registry
+                .get(&mailbox("Other/bob/Sent"))
+                .unwrap()
+                .shared_owner,
+            principal("bob")
+        );
+        assert!(
+            registry
+                .get(&mailbox("Projects"))
+                .unwrap()
+                .shared_owner
+                .is_none()
+        );
+    }
+
+    /// The foreign root's own LIST failed, so no discovery entry exists; the
+    /// personal LIST's echo of the share still registers it shared.
+    #[test]
+    fn a_personal_listing_under_a_foreign_root_registers_shared_at_open() {
+        let registry = FolderRegistry::from_discovery(
+            vec![MailboxInfo {
+                name: mailbox("Shared/team/Sent"),
+                ..Default::default()
+            }],
+            Vec::new(),
+            known_namespaces(),
+        );
+        assert_eq!(
+            registry
+                .get(&mailbox("Shared/team/Sent"))
+                .unwrap()
+                .shared_owner,
+            principal("Shared")
+        );
+    }
+
+    #[test]
+    fn rename_ownership_follows_the_destination_root_and_rights_the_source() {
+        let source = mailbox("Shared/team/Old");
+        let present = mailbox("Shared/team/Present");
+        let registry = FolderRegistry::from_discovery(
+            Vec::new(),
+            vec![
+                shared_entry_under(&source, Some("lrs"), "Shared/"),
+                shared_entry_under(&present, Some("lrswi"), "Shared/"),
+            ],
+            known_namespaces(),
+        );
+        // Renamed into the personal root: the destination is personal.
+        registry.apply_mailbox_event(MailboxInfo {
+            name: mailbox("Mine"),
+            old_name: Some(source.clone()),
+            ..Default::default()
+        });
+        let mine = registry.get(&mailbox("Mine")).unwrap();
+        assert!(mine.shared_owner.is_none());
+        assert_eq!(mine.rights, Some(crate::types::MailboxRights::parse("lrs")));
+        // A rename whose source is unknown never borrows the destination's
+        // rights: they were observed for a different mailbox.
+        registry.apply_mailbox_event(MailboxInfo {
+            name: present.clone(),
+            old_name: Some(mailbox("Shared/team/Gone")),
+            ..Default::default()
+        });
+        let replaced = registry.get(&present).unwrap();
+        assert_eq!(replaced.shared_owner, principal("Shared"));
+        assert!(replaced.rights.is_none());
+    }
 
     /// A shared-namespace discovery entry owned by `alice`, optionally
     /// carrying a MYRIGHTS wire string. Enumerated under `#user/`.

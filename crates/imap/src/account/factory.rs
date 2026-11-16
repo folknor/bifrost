@@ -27,7 +27,7 @@ use super::sieve::ManageSieveConfig;
 use super::submission::{SmtpSubmissionConfig, SubmissionTransport};
 use super::{
     ImapAccount, ImapAccountParts, Pool, account_error_with, capabilities,
-    folder_registry::FolderRegistry,
+    folder_registry::{FolderRegistry, NamespaceKnowledge, Ownership},
 };
 use bifrost_types::AccountOperation;
 
@@ -395,6 +395,7 @@ impl ImapAccountFactory {
             let shared = discover_shared_folders(&conn, &cfg, &profile).await;
             let foreign_namespaces_advertised = shared.foreign_namespaces_advertised;
             let shared_entries = shared.entries;
+            let namespaces = shared.namespaces;
             // Keep mail online during a DAV outage. Enterprise users need one
             // classified missing-scope report, preserved on the open result.
             let mut skipped_scopes = shared.skipped_scopes;
@@ -414,7 +415,11 @@ impl ImapAccountFactory {
             let contact_cursor_folders = dav_cursor_folders(contacts.as_ref()).await;
             let calendar_cursor_folders = dav_cursor_folders(calendars.as_ref()).await;
             let submission = open_submission(&cfg, meter.clone(), bandwidth_budget.clone())?;
-            let registry = Arc::new(FolderRegistry::from_lists(folders, shared_entries));
+            let registry = Arc::new(FolderRegistry::from_discovery(
+                folders,
+                shared_entries,
+                namespaces,
+            ));
             let mut caps = capabilities::build_capabilities_for_registry(
                 &profile,
                 &registry,
@@ -733,26 +738,19 @@ pub(crate) fn mailbox_owner_for(
 /// Falls back to the root-derived owner when the folder path does not sit
 /// under the prefix or has no segment after it (defensive; a well-formed
 /// LIST under the prefix always does). Pure and tested.
+///
+/// Membership is textual: an RFC 2342 prefix need not end on a hierarchy
+/// boundary (example 5.4 advertises `~` with delimiter `/`, so
+/// `~alice/INBOX` belongs to `alice`). Whether a path lies in this
+/// namespace at all is `NamespaceKnowledge::classify`'s decision, made
+/// before this runs.
 pub(crate) fn mailbox_owner_from_other_user_path(
     folder_path: &str,
     prefix: &str,
     delimiter: Option<char>,
 ) -> bifrost_types::PrincipalId {
-    // The prefix only attributes a principal when the folder genuinely
-    // sits *under* it: a bare textual `strip_prefix` would mis-read
-    // `OtherTeam/INBOX` as belonging to the `Other` namespace and invent
-    // owner `Team`. Require the prefix to terminate on a delimiter
-    // boundary (the prefix already ends in the delimiter, or the path's
-    // next character after the prefix is the delimiter). When it does
-    // not, fall back to the root-derived owner rather than fabricating
-    // one from a partial-segment match.
-    let relative = match (folder_path.strip_prefix(prefix), delimiter) {
-        (Some(rest), Some(d)) if prefix.ends_with(d) || rest.starts_with(d) => rest,
-        (Some(rest), None) => rest,
-        // Prefix matched textually but not on a delimiter boundary
-        // (e.g. prefix `Other`, path `OtherTeam/INBOX`): not under the
-        // namespace.
-        _ => return mailbox_owner_for(prefix, delimiter),
+    let Some(relative) = folder_path.strip_prefix(prefix) else {
+        return mailbox_owner_for(prefix, delimiter);
     };
     let segment = match delimiter {
         Some(d) => relative.split(d).find(|s| !s.is_empty()),
@@ -777,6 +775,9 @@ pub(crate) struct SharedDiscovery {
     pub(crate) entries: Vec<super::folder_registry::SharedFolderEntry>,
     pub(crate) skipped_scopes: Vec<SkippedScope>,
     pub(crate) foreign_namespaces_advertised: bool,
+    /// The NAMESPACE answer, retained by the registry so later
+    /// registrations classify ownership by the rule discovery used.
+    pub(crate) namespaces: NamespaceKnowledge,
 }
 
 fn unreadable_share_skip(
@@ -848,6 +849,7 @@ pub(crate) async fn discover_shared_folders(
             entries: Vec::new(),
             skipped_scopes: Vec::new(),
             foreign_namespaces_advertised: false,
+            namespaces: NamespaceKnowledge::Unknown,
         };
     }
     let namespaces = match conn.namespace(cfg.imap.command_timeout).await {
@@ -870,28 +872,25 @@ pub(crate) async fn discover_shared_folders(
                 }],
                 // An unknown namespace is not evidence that no shares exist.
                 foreign_namespaces_advertised: true,
+                namespaces: NamespaceKnowledge::Unknown,
             };
         }
     };
     let foreign_namespaces_advertised = namespaces_advertise_foreign(&namespaces);
+    let knowledge = NamespaceKnowledge::from_response(&namespaces);
     let acl = profile.supports(Capability::Acl);
-    let mut out = Vec::new();
+    let mut out: Vec<super::folder_registry::SharedFolderEntry> = Vec::new();
+    let mut seen: std::collections::HashMap<crate::types::MailboxName, usize> =
+        std::collections::HashMap::new();
     let mut skipped_scopes = Vec::new();
-    // Other-user and shared namespaces are both non-personal, but their
-    // owner derivation differs: an other-user root (`#user/`) carries one
-    // descriptor for ALL users, so the owning principal is read per-folder
-    // (the segment after the root). A shared root (`#shared.`) has no
-    // per-principal segment, so every folder under it shares one owner.
-    let descriptors = namespaces
-        .other
-        .iter()
-        .map(|d| (d, true))
-        .chain(namespaces.shared.iter().map(|d| (d, false)));
-    for (descriptor, is_other_user) in descriptors {
+    // Other-user and shared namespaces are both non-personal; their owner
+    // derivation (per-folder principal vs one owner per root) lives in
+    // `ForeignNamespace::owner_of`, reached through `classify`.
+    let descriptors = namespaces.other.iter().chain(namespaces.shared.iter());
+    for descriptor in descriptors {
         if descriptor.prefix.is_empty() {
             continue;
         }
-        let shared_owner = mailbox_owner_for(&descriptor.prefix, descriptor.delimiter);
         // LIST everything under this prefix. The pattern - NOT the
         // reference - carries the namespace root: `LIST "" "<prefix>*"`.
         // RFC 3501 6.3.8 leaves reference/pattern concatenation
@@ -972,27 +971,19 @@ pub(crate) async fn discover_shared_folders(
             }
         }
         for (info, probe) in listed.into_iter().zip(probed) {
-            let owner = if is_other_user {
-                mailbox_owner_from_other_user_path(
-                    info.name.as_str(),
-                    &descriptor.prefix,
-                    descriptor.delimiter,
-                )
-            } else {
-                shared_owner.clone()
+            // Ownership is the registry's global rule, not this LIST's:
+            // overlapping roots (`Shared/` and `Shared/users/`) can both
+            // return one mailbox, and the most specific root owns it. A
+            // result no foreign root claims is a reference-ignoring server
+            // echoing personal folders, and is dropped.
+            let Ownership::Foreign { owner, prefix } = knowledge.classify(info.name.as_str())
+            else {
+                continue;
             };
             let mut rights = None;
             if let Some(probe) = probe {
                 match probe {
-                    Ok(wire) => {
-                        let parsed = MailboxRights::parse(&wire);
-                        if !parsed.can_read() {
-                            // An enterprise user needs an explicit coverage gap for
-                            // a listed share excluded by ACL, not silent absence.
-                            skipped_scopes.push(unreadable_share_skip(&info.name, &owner));
-                        }
-                        rights = Some(parsed);
-                    }
+                    Ok(wire) => rights = Some(MailboxRights::parse(&wire)),
                     Err(err) => {
                         tracing::debug!(
                             mailbox = %info.name.as_str(),
@@ -1002,18 +993,41 @@ pub(crate) async fn discover_shared_folders(
                     }
                 }
             }
+            // One mailbox listed under two roots: keep the first listing,
+            // but never let an unreported probe hide a reported rights set,
+            // which would leave an unreadable share selectable.
+            if let Some(&index) = seen.get(&info.name) {
+                let existing = &mut out[index];
+                if existing.rights.is_none() {
+                    existing.rights = rights;
+                }
+                continue;
+            }
+            seen.insert(info.name.clone(), out.len());
             out.push(super::folder_registry::SharedFolderEntry {
                 info,
                 owner,
                 rights,
-                namespace_prefix: descriptor.prefix.clone(),
+                namespace_prefix: prefix,
             });
+        }
+    }
+    for entry in &out {
+        if entry
+            .rights
+            .as_ref()
+            .is_some_and(|rights| !rights.can_read())
+        {
+            // An enterprise user needs an explicit coverage gap for a listed
+            // share excluded by ACL, not silent absence.
+            skipped_scopes.push(unreadable_share_skip(&entry.info.name, &entry.owner));
         }
     }
     SharedDiscovery {
         entries: out,
         skipped_scopes,
         foreign_namespaces_advertised,
+        namespaces: knowledge,
     }
 }
 
@@ -1728,13 +1742,12 @@ mod tests {
             mailbox_owner_from_other_user_path("#user/", "#user/", Some('/')),
             bifrost_types::PrincipalId("#user".to_owned())
         );
-        // Delimiter-boundary guard: a prefix that matches textually but
-        // not on a delimiter boundary (`Other` vs `OtherTeam/INBOX`) must
-        // NOT invent a bogus principal (`Team`) from the partial-segment
-        // match; it falls back to the root-derived owner.
+        // RFC 2342 example 5.4: an other-user prefix that does not end on
+        // a hierarchy boundary (`~`, delimiter `/`) is followed directly by
+        // the user name.
         assert_eq!(
-            mailbox_owner_from_other_user_path("OtherTeam/INBOX", "Other", Some('/')),
-            bifrost_types::PrincipalId("Other".to_owned())
+            mailbox_owner_from_other_user_path("~alice/INBOX", "~", Some('/')),
+            bifrost_types::PrincipalId("alice".to_owned())
         );
         // A prefix without a trailing delimiter that DOES terminate on a
         // boundary (next char is the delimiter) still reads the principal.
@@ -1994,6 +2007,78 @@ mod tests {
                 ("Shared/C", Some(true)),
             ]
         );
+    }
+
+    /// Overlapping roots list one mailbox twice. The most specific root owns
+    /// it, an unreported probe cannot hide the reported one (an unreadable
+    /// share must stay unselectable), and a result no foreign root claims
+    /// is dropped rather than registered shared.
+    #[tokio::test]
+    async fn overlapping_roots_register_one_share_with_its_reported_rights() {
+        use crate::connection::test_support::{
+            driver_pair, preauth_greeting, read_line, respond, tag_of,
+        };
+        let (conn, mut peer) = driver_pair(&preauth_greeting("IMAP4rev1 NAMESPACE ACL")).await;
+        let server = tokio::spawn(async move {
+            let command = read_line(&mut peer).await;
+            respond(
+                &mut peer,
+                &format!(
+                    "* NAMESPACE ((\"\" \"/\")) ((\"Shared/users/\" \"/\")) ((\"Shared/\" \"/\"))\r\n\
+                     {} OK done\r\n",
+                    tag_of(&command)
+                ),
+            )
+            .await;
+            let command = read_line(&mut peer).await;
+            assert!(command.contains("Shared/users/*"), "{command}");
+            respond(
+                &mut peer,
+                &format!(
+                    "* LIST () \"/\" \"Shared/users/alice/Sent\"\r\n{} OK done\r\n",
+                    tag_of(&command)
+                ),
+            )
+            .await;
+            let command = read_line(&mut peer).await;
+            respond(&mut peer, &format!("{} NO busy\r\n", tag_of(&command))).await;
+            let command = read_line(&mut peer).await;
+            assert!(command.contains("\"Shared/*\""), "{command}");
+            respond(
+                &mut peer,
+                &format!(
+                    "* LIST () \"/\" \"Shared/users/alice/Sent\"\r\n\
+                     * LIST () \"/\" \"Notes\"\r\n{} OK done\r\n",
+                    tag_of(&command)
+                ),
+            )
+            .await;
+            let first = read_line(&mut peer).await;
+            let second = read_line(&mut peer).await;
+            respond(
+                &mut peer,
+                &format!(
+                    "* MYRIGHTS Shared/users/alice/Sent l\r\n{} OK done\r\n\
+                     * MYRIGHTS Notes lr\r\n{} OK done\r\n",
+                    tag_of(&first),
+                    tag_of(&second)
+                ),
+            )
+            .await;
+        });
+        let discovery =
+            discover_shared_folders(&conn, &bandwidth_config(false), &conn.server_profile()).await;
+        server.await.unwrap();
+        assert_eq!(discovery.entries.len(), 1);
+        let entry = &discovery.entries[0];
+        assert_eq!(entry.info.name.as_str(), "Shared/users/alice/Sent");
+        assert_eq!(entry.owner, bifrost_types::PrincipalId("alice".to_owned()));
+        assert_eq!(entry.namespace_prefix, "Shared/users/");
+        assert_eq!(
+            entry.rights.as_ref().map(MailboxRights::can_read),
+            Some(false)
+        );
+        assert_eq!(discovery.skipped_scopes.len(), 1);
     }
 
     #[tokio::test]
