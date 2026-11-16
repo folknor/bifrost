@@ -309,16 +309,16 @@ impl ManageSieveClient {
 /// failure to reach one.
 ///
 /// A `NO` normally IS the verdict - the server compiled the script and
-/// rejected it - so it becomes diagnostics rather than an error. But a
-/// transient code means the server never judged the script at all.
-/// Reporting that as "your script is invalid" tells the user something
-/// false about their input AND discards the retryable classification, so
-/// it stays an error.
+/// rejected it - so it becomes diagnostics rather than an error. A `NO`
+/// whose code names an operational condition (see
+/// [`SieveResponseCode::is_verdict`]) stays an error, as does every `BYE`:
+/// a server closing the connection has not judged the script.
 fn validation_outcome(status: SieveStatus) -> Result<FilterValidation, Error> {
     match status {
         SieveStatus::Ok => Ok(FilterValidation::default()),
-        SieveStatus::No { code, message } | SieveStatus::Bye { code, message } => {
-            if code.as_ref().is_some_and(SieveResponseCode::is_transient) {
+        SieveStatus::Bye { code, message } => Err(Error::Sieve { code, message }),
+        SieveStatus::No { code, message } => {
+            if code.as_ref().is_some_and(|code| !code.is_verdict()) {
                 return Err(Error::Sieve { code, message });
             }
             Ok(validation_error(message))
@@ -980,10 +980,59 @@ impl SieveResponseCode {
         }
     }
 
-    /// Whether a `NO` carrying this code is a transient condition the
-    /// caller should retry rather than a verdict about the request.
-    fn is_transient(&self) -> bool {
-        matches!(self, Self::TryLater)
+    /// The code as this client understands it. RFC 5804 1.3: a client
+    /// MUST tolerate hierarchical detail it does not recognize, treating
+    /// `QUOTA/MAXFROB` as `QUOTA`. So an unrecognized code resolves to its
+    /// longest recognized slash-delimited ancestor (`QUOTA/MAXSIZE/X` is
+    /// `QUOTA/MAXSIZE`, `TRYLATER/X` is `TRYLATER`). Only the code atom is
+    /// read, never its payload, and only whole segments, so `QUOTAX/MAXSIZE`
+    /// stays unknown. The original stays the wire evidence: callers record
+    /// `code()` of the received value, not of its meaning.
+    pub(crate) fn meaning(&self) -> Self {
+        let Self::Other(raw) = self else {
+            return self.clone();
+        };
+        let mut atom = raw.split(char::is_whitespace).next().unwrap_or(raw);
+        while let Some((parent, _)) = atom.rsplit_once('/') {
+            let resolved = Self::parse(parent);
+            if !matches!(resolved, Self::Other(_)) {
+                return resolved;
+            }
+            atom = parent;
+        }
+        self.clone()
+    }
+
+    /// Whether a CHECKSCRIPT `NO` carrying this code is read as the
+    /// server's verdict on the script.
+    ///
+    /// RFC 5804 2.12: the server checks syntax and MUST NOT check quota,
+    /// so a `NO` normally carries a compile error. A code naming an
+    /// operational condition (busy server, quota, authentication, a missing
+    /// or active script) says the server refused for a reason other than
+    /// the script's content; reporting it as "your script is invalid"
+    /// tells the user something false and discards the classification
+    /// `classify_sieve` gives that code. `WARNINGS` and `TAG` are advisory
+    /// and an unknown extension code says nothing, so those keep the plain
+    /// reading of a `NO`. That is a policy for codes this client cannot
+    /// interpret, not proof the server compiled the script. Exhaustive so
+    /// a new variant has to be placed.
+    fn is_verdict(&self) -> bool {
+        match self.meaning() {
+            Self::Warnings | Self::Tag | Self::Other(_) => true,
+            Self::AuthTooWeak
+            | Self::EncryptNeeded
+            | Self::Quota
+            | Self::QuotaMaxScripts
+            | Self::QuotaMaxSize
+            | Self::Referral
+            | Self::Sasl
+            | Self::TransitionNeeded
+            | Self::TryLater
+            | Self::Active
+            | Self::NonExistent
+            | Self::AlreadyExists => false,
+        }
     }
 }
 
@@ -1492,6 +1541,76 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// RFC 5804 2.12 forbids CHECKSCRIPT from checking quota, so a quota
+    /// code (including unrecognized detail under QUOTA) is not a syntax
+    /// verdict, and neither is a BYE whatever its code.
+    #[test]
+    fn checkscript_operational_refusals_are_errors_not_verdicts() {
+        for raw in [
+            "QUOTA",
+            "QUOTA/MAXSCRIPTS",
+            "QUOTA/MAXSIZE",
+            "QUOTA/MAXFROB",
+            "TRYLATER/FROB",
+            "NONEXISTENT",
+        ] {
+            let code = SieveResponseCode::parse(raw);
+            let error = validation_outcome(SieveStatus::No {
+                code: Some(code.clone()),
+                message: "refused".into(),
+            })
+            .expect_err(raw);
+            assert!(
+                matches!(&error, Error::Sieve { code: Some(c), .. } if *c == code),
+                "{raw}"
+            );
+        }
+        for code in [None, Some(SieveResponseCode::Warnings)] {
+            validation_outcome(SieveStatus::Bye {
+                code,
+                message: "closing".into(),
+            })
+            .expect_err("a closing connection has not judged the script");
+        }
+    }
+
+    /// Advisory and unknown codes keep the plain reading of a NO.
+    #[test]
+    fn checkscript_advisory_or_unknown_code_is_a_verdict() {
+        for raw in [
+            "WARNINGS",
+            "TAG \"x\"",
+            "FROB \"QUOTA/MAXSIZE\"",
+            "QUOTAX/MAXSIZE",
+        ] {
+            let outcome = validation_outcome(SieveStatus::No {
+                code: Some(SieveResponseCode::parse(raw)),
+                message: "line 1: bad".into(),
+            })
+            .expect(raw);
+            assert!(!outcome.is_valid(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn unrecognized_hierarchical_detail_resolves_to_its_ancestor() {
+        use SieveResponseCode as C;
+        for (raw, meaning) in [
+            ("quota/maxsize/frob \"p\"", C::QuotaMaxSize),
+            ("QUOTA/MAXFROB", C::Quota),
+            ("TRYLATER/FROB", C::TryLater),
+            ("WARNINGS/FROB", C::Warnings),
+            ("TAG/FROB \"t\"", C::Tag),
+        ] {
+            let code = C::parse(raw);
+            assert_eq!(code.meaning(), meaning, "{raw}");
+            assert_eq!(code.code(), raw, "wire spelling kept");
+        }
+        for raw in ["QUOTAX/MAXSIZE", "FROB \"QUOTA/MAXSIZE\""] {
+            assert_eq!(C::parse(raw).meaning(), C::Other(raw.into()), "{raw}");
+        }
     }
 
     #[test]

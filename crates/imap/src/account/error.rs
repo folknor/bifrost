@@ -798,7 +798,10 @@ fn classify_sieve(
 ) -> Translation {
     use crate::sieve::SieveResponseCode as Sc;
 
-    let mut t = match code {
+    // Classify by what the code means (unrecognized hierarchical detail
+    // resolves to its recognized ancestor), record what the server sent.
+    let meaning = code.map(Sc::meaning);
+    let mut t = match meaning.as_ref() {
         // Explicitly transient: the server asked to be retried. Deriving
         // this terminal was the imap-S1 defect.
         Some(Sc::TryLater) => Translation::new(PrimaryCause::Server(ServerCause::Unavailable {

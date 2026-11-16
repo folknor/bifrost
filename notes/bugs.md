@@ -38,17 +38,23 @@ or was refused; two design items remain.
   acknowledgement contract. The limitation is now in `supersede`'s rustdoc and
   `reference/sync.md`.
 
-## BUG-202 - ManageSieve CHECKSCRIPT turns a `QUOTA` refusal into a validation verdict
+## BUG-204 - ManageSieve CHECKSCRIPT drops `OK (WARNINGS)` text
 
-**Reported by:** the ManageSieve quota sub-kind split (spar review).
+**Reported by:** the CHECKSCRIPT verdict split (spar review).
 
-`validation_outcome` (`crates/imap/src/sieve.rs`) treats every non-`TRYLATER`
-`NO` to CHECKSCRIPT as the script's validation verdict, so a `QUOTA`,
-`QUOTA/MAXSCRIPTS` or `QUOTA/MAXSIZE` response becomes `FilterValidation`
-diagnostics instead of an error. RFC 5804 section 2.12 forbids CHECKSCRIPT
-from checking quota, so such a response is not a syntax verdict. The fix
-should separate "validation happened" from "retryable" rather than marking the
-quota codes transient.
+`SieveStatus::parse` (`crates/imap/src/sieve.rs`) builds a payload-free `Ok`,
+so the warning text RFC 5804 2.12 lets CHECKSCRIPT return on success never
+reaches `validation_outcome`; the user sees a clean script. It should become
+Warning-severity `FilterValidation` diagnostics (still valid).
+
+## BUG-205 - ManageSieve status line with a literal message is mis-framed
+
+**Reported by:** the CHECKSCRIPT verdict split (spar review).
+
+`read_response` (`crates/imap/src/sieve.rs`) returns on the status line, so a
+legal `NO {n}` followed by an n-octet literal (RFC 5804 allows multiline
+CHECKSCRIPT diagnostics this way) yields `{n}` as the message and leaves the
+literal unread on the stream. Same for an `OK` carrying a literal.
 
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 

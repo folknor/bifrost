@@ -244,6 +244,37 @@ fn sieve_quota_maxsize_is_payload_too_large_and_terminal() {
     );
 }
 
+/// RFC 5804 1.3: unrecognized hierarchical detail is read as its parent
+/// code, while the received spelling stays the wire evidence.
+#[test]
+fn sieve_unrecognized_quota_detail_classifies_as_its_ancestor() {
+    let account = sieve_error(
+        Some(SieveResponseCode::Other("QUOTA/MAXSIZE/FROB".into())),
+        AccountOperation::FilterValidate,
+    );
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
+    ));
+    assert_eq!(
+        account.telemetry_fields().native_code,
+        Some("QUOTA/MAXSIZE/FROB")
+    );
+
+    let account = sieve_error(
+        Some(SieveResponseCode::Other("QUOTA/MAXFROB".into())),
+        AccountOperation::FilterValidate,
+    );
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
+    ));
+    assert_eq!(
+        account.telemetry_fields().native_code,
+        Some("QUOTA/MAXFROB")
+    );
+}
+
 #[test]
 fn sieve_nonexistent_is_a_missing_filter() {
     let account = sieve_error(
