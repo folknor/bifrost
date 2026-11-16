@@ -463,6 +463,13 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
+- **`reference/types.md` implies IMAP search cursors are unbound.** It says
+  other providers keep their existing cursor formats, which reads as though
+  IMAP does not bind its cursors to the query; it does. Reword.
+- **Graph search errors always report the operation as `Search`**, even for
+  `SearchMessages`. Unverified beyond the report of the agent that fixed
+  Graph KQL fragment folding.
+
 - **Concurrent `close` calls do not share one teardown.** Found in the spar of
   the closed-account gate. Google's `close` swaps its closed flag and returns
   `Ok` at once on every later call, while the first may still be awaiting its
