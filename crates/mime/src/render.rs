@@ -25,9 +25,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use base64::Engine;
+#[cfg(test)]
 use base64::engine::general_purpose::STANDARD;
 
+use crate::entity::{
+    EncodingInput, EntityBody, MimeEntity, OutboundEncoding, canonicalize_text_crlf,
+    choose_encoding, contains_delimiter, encode_payload, mint_boundary, write_entity,
+};
 #[cfg(test)]
 use crate::writer::{ENCODED_WORD_MAX, encode_header_value, encode_phrase};
 use crate::writer::{HeaderValue, is_atext, sanitize_header, write_header};
@@ -134,12 +140,15 @@ pub fn send_request_to_rfc5322(
     // disclosed on the wire. The sender's own Sent copy retains it: it is
     // the sender's record of who was blind copied. Only render the second
     // variant when there is actually a Bcc to preserve.
-    let raw = render_rfc5322(&composed)?;
+    // One prepared entity serves both bodies, so they share boundaries and
+    // encodings and differ only in their header block.
+    let entity = build_entity(&composed)?;
+    let raw = serialize(&render_headers(&composed)?, &entity);
     let sent_copy = if request.bcc.is_empty() {
         None
     } else {
         composed.include_bcc_header = true;
-        Some(render_rfc5322(&composed)?)
+        Some(serialize(&render_headers(&composed)?, &entity))
     };
 
     let mut recipients =
@@ -207,6 +216,30 @@ pub struct ComposedMessage<'a> {
 /// years RFC 5322 can express (see [`format_rfc5322_date`]), or an
 /// indivisible structured header token cannot fit the 998-octet line limit.
 pub fn render_rfc5322(msg: &ComposedMessage<'_>) -> Result<Vec<u8>, AccountError> {
+    let headers = render_headers(msg)?;
+    Ok(serialize(&headers, &build_entity(msg)?))
+}
+
+/// Message header block followed by the shared entity serializer. Root
+/// termination is this composer's policy: a final CRLF is added only when
+/// the serialized entity does not already end in one, which happens only
+/// after a multipart close delimiter or a base64 payload, where it is wire
+/// framing and never decoded content (text payloads already end in CRLF,
+/// see `text_entity`).
+fn serialize(headers: &[String], entity: &RenderEntity) -> Vec<u8> {
+    let mut out = Vec::new();
+    for header in headers {
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    write_entity(entity, &mut out);
+    if !out.ends_with(b"\r\n") {
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+fn render_headers(msg: &ComposedMessage<'_>) -> Result<Vec<String>, AccountError> {
     let mut headers = Vec::new();
     if let Some(date) = msg.date {
         headers.push(format!("Date: {}", format_rfc5322_date(date)?));
@@ -257,9 +290,7 @@ pub fn render_rfc5322(msg: &ComposedMessage<'_>) -> Result<Vec<u8>, AccountError
         )?);
     }
     headers.push("MIME-Version: 1.0".to_string());
-
-    let entity = render_entity(msg)?;
-    Ok(format!("{}\r\n{entity}\r\n", headers.join("\r\n")).into_bytes())
+    Ok(headers)
 }
 
 /// Format an instant as an RFC 5322 `date-time` in UTC, whole seconds:
@@ -286,51 +317,108 @@ pub fn format_rfc5322_date(date: jiff::Timestamp) -> Result<String, AccountError
         .map_err(|_| malformed("Date not representable as RFC 5322 date-time"))
 }
 
-fn render_entity(msg: &ComposedMessage<'_>) -> Result<String, AccountError> {
-    if msg.attachments_inline.is_empty() {
-        return Ok(render_body_entity(msg));
-    }
-
-    let boundary = boundary("mixed");
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
-    ));
-    push_part(&mut out, &boundary, &render_body_entity(msg));
-    for attachment in msg.attachments_inline {
-        push_part(&mut out, &boundary, &render_attachment_entity(attachment)?);
-    }
-    out.push_str(&format!("--{boundary}--\r\n"));
-    Ok(out)
+/// A prepared entity for the shared serializer: header fields (each ending
+/// in CRLF) and an encoded payload or a multipart whose boundary has already
+/// been cleared against its children.
+struct RenderEntity {
+    header_fields: String,
+    body: RenderBody,
 }
 
-fn render_body_entity(msg: &ComposedMessage<'_>) -> String {
-    match (msg.body_text, msg.body_html) {
-        (Some(text), Some(html)) => {
-            let boundary = boundary("alternative");
-            let mut out = String::new();
-            out.push_str(&format!(
-                "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n"
-            ));
-            push_part(&mut out, &boundary, &render_text_entity("text/plain", text));
-            push_part(&mut out, &boundary, &render_text_entity("text/html", html));
-            out.push_str(&format!("--{boundary}--\r\n"));
-            out
+enum RenderBody {
+    Leaf(Vec<u8>),
+    Multipart {
+        boundary: String,
+        children: Vec<RenderEntity>,
+    },
+}
+
+impl MimeEntity for RenderEntity {
+    fn write_header_fields(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.header_fields.as_bytes());
+    }
+
+    fn body(&self) -> EntityBody<'_, Self> {
+        match &self.body {
+            RenderBody::Leaf(payload) => EntityBody::Encoded(payload),
+            RenderBody::Multipart { boundary, children } => EntityBody::Multipart {
+                boundary: boundary.into(),
+                children,
+            },
         }
-        (Some(text), None) => render_text_entity("text/plain", text),
-        (None, Some(html)) => render_text_entity("text/html", html),
-        (None, None) => render_text_entity("text/plain", ""),
     }
 }
 
-fn render_text_entity(mime: &str, body: &str) -> String {
-    format!(
-        "Content-Type: {mime}; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
-        wrap_base64(body.as_bytes())
-    )
+fn build_entity(msg: &ComposedMessage<'_>) -> Result<RenderEntity, AccountError> {
+    if msg.attachments_inline.is_empty() {
+        return Ok(body_entity(msg));
+    }
+    let mut children = vec![body_entity(msg)];
+    for attachment in msg.attachments_inline {
+        children.push(attachment_entity(attachment)?);
+    }
+    Ok(multipart_entity("mixed", children))
 }
 
-fn render_attachment_entity(attachment: &AttachmentInline) -> Result<String, AccountError> {
+fn body_entity(msg: &ComposedMessage<'_>) -> RenderEntity {
+    match (msg.body_text, msg.body_html) {
+        (Some(text), Some(html)) => multipart_entity(
+            "alternative",
+            vec![
+                text_entity("text/plain", text),
+                text_entity("text/html", html),
+            ],
+        ),
+        (Some(text), None) => text_entity("text/plain", text),
+        (None, Some(html)) => text_entity("text/html", html),
+        (None, None) => text_entity("text/plain", ""),
+    }
+}
+
+/// Mint the boundary after the children are prepared, re-rolling until no
+/// child's serialized bytes hold a delimiter line for it. Text parts may be
+/// 7bit or quoted-printable, so a collision is possible and is checked
+/// rather than argued away.
+fn multipart_entity(subtype: &str, children: Vec<RenderEntity>) -> RenderEntity {
+    let mut boundary = mint_boundary();
+    while children
+        .iter()
+        .any(|child| contains_delimiter(child, &boundary))
+    {
+        boundary = mint_boundary();
+    }
+    RenderEntity {
+        header_fields: format!("Content-Type: multipart/{subtype}; boundary=\"{boundary}\"\r\n"),
+        body: RenderBody::Multipart { boundary, children },
+    }
+}
+
+/// A text body is composed text, so its line endings are canonicalized to
+/// CRLF (RFC 2045 section 6.8 canonical form) and a nonempty body ends in
+/// CRLF, the way a composed message's last line does. Both happen BEFORE
+/// encoding, so the decoded text is the same whichever encoding the shared
+/// chooser picks (7bit, quoted-printable or base64; never 8bit, since these
+/// composition paths have no negotiated 8BITMIME).
+fn text_entity(mime: &str, body: &str) -> RenderEntity {
+    let mut text = body.as_bytes().to_vec();
+    canonicalize_text_crlf(&mut text);
+    if !text.is_empty() && !text.ends_with(b"\r\n") {
+        text.extend_from_slice(b"\r\n");
+    }
+    // Canonicalization only inserts ASCII CR, so the bytes stay UTF-8.
+    let canonical = String::from_utf8(text).expect("CR insertion keeps UTF-8 valid");
+    let encoding = choose_encoding(EncodingInput::Text(&canonical), false);
+    RenderEntity {
+        header_fields: format!(
+            "Content-Type: {mime}; charset=UTF-8\r\nContent-Transfer-Encoding: {}\r\n",
+            encoding.as_str()
+        ),
+        body: RenderBody::Leaf(encode_payload(canonical.as_bytes(), encoding)),
+    }
+}
+
+/// Attachments are opaque payload: always base64, never canonicalized.
+fn attachment_entity(attachment: &AttachmentInline) -> Result<RenderEntity, AccountError> {
     let disposition = if attachment.inline {
         "inline"
     } else {
@@ -362,15 +450,12 @@ fn render_attachment_entity(attachment: &AttachmentInline) -> Result<String, Acc
         ),
         None => String::new(),
     };
-    Ok(format!(
-        "{content_type}\r\n{disposition}\r\n{content_id}Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
-        wrap_base64(&attachment.data)
-    ))
-}
-
-fn push_part(out: &mut String, boundary: &str, part: &str) {
-    out.push_str(&format!("--{boundary}\r\n"));
-    out.push_str(part);
+    Ok(RenderEntity {
+        header_fields: format!(
+            "{content_type}\r\n{disposition}\r\n{content_id}Content-Transfer-Encoding: base64\r\n"
+        ),
+        body: RenderBody::Leaf(encode_payload(&attachment.data, OutboundEncoding::Base64)),
+    })
 }
 
 fn push_address_header(
@@ -382,35 +467,6 @@ fn push_address_header(
         headers.push(write_header(name, HeaderValue::Addresses(addresses))?);
     }
     Ok(())
-}
-
-fn wrap_base64(bytes: &[u8]) -> String {
-    let encoded = STANDARD.encode(bytes);
-    encoded
-        .as_bytes()
-        .chunks(76)
-        .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\r\n")
-}
-
-/// Mint a multipart boundary token.
-///
-/// The token contains `-` characters, which are absent from the base64
-/// alphabet (`A-Za-z0-9+/=`). Every part this assembler emits is
-/// `Content-Transfer-Encoding: base64`, so a boundary delimiter line can
-/// never collide with part content - the collision the boundary is
-/// supposed to be checked against is structurally impossible here. If a
-/// future part type ever emits non-base64 content (e.g. quoted-printable
-/// or 7bit), reintroduce a content-scan-and-regenerate guard before
-/// trusting this token.
-fn boundary(kind: &str) -> String {
-    static NEXT_BOUNDARY: AtomicU64 = AtomicU64::new(1);
-    let sequence = NEXT_BOUNDARY.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!("bifrost-{kind}-{nanos}-{sequence}")
 }
 
 /// Mint a `Message-ID` value (without angle brackets) whose right-hand
@@ -828,6 +884,110 @@ mod tests {
             bifrost_types::error::AccountErrorKind::Request(
                 bifrost_types::error::RequestErrorKind::Malformed
             )
+        );
+    }
+
+    fn decoded_text_parts(raw: &[u8]) -> Vec<String> {
+        let parsed = crate::parse_message(raw);
+        let mut out = Vec::new();
+        collect_text(&parsed.root, &mut out);
+        out
+    }
+
+    fn collect_text(part: &crate::MimePart, out: &mut Vec<String>) {
+        match &part.body {
+            crate::PartBody::Multipart(children) => {
+                for child in children {
+                    collect_text(child, out);
+                }
+            }
+            crate::PartBody::Leaf(_) if part.content_type.ty == "text" => {
+                out.push(part.text().expect("leaf"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Text is canonicalized and terminated before encoding, and the
+    /// serializer adds no CRLF a decoder would read as content, at the root
+    /// or nested, whichever encoding the chooser picked.
+    #[test]
+    fn text_bodies_decode_exactly_at_root_and_nested() {
+        for (input, expected) in [
+            ("", ""),
+            ("hello", "hello\r\n"),
+            ("hello\n", "hello\r\n"),
+            ("a\n\n\n", "a\r\n\r\n\r\n"),
+            ("caf\u{e9}\nline", "caf\u{e9}\r\nline\r\n"),
+        ] {
+            let root = render_rfc5322(&ComposedMessage {
+                date: None,
+                from: None,
+                to: &[],
+                cc: &[],
+                bcc: &[],
+                reply_to: &[],
+                subject: None,
+                body_text: Some(input),
+                body_html: None,
+                attachments_inline: &[],
+                in_reply_to: None,
+                references: &[],
+                message_id: None,
+                include_bcc_header: false,
+                disposition_notification_to: None,
+            })
+            .expect("renders");
+            assert_eq!(decoded_text_parts(&root), [expected], "root {input:?}");
+
+            let nested = render_rfc5322(&ComposedMessage {
+                date: None,
+                from: None,
+                to: &[],
+                cc: &[],
+                bcc: &[],
+                reply_to: &[],
+                subject: None,
+                body_text: Some(input),
+                body_html: Some(input),
+                attachments_inline: &[],
+                in_reply_to: None,
+                references: &[],
+                message_id: None,
+                include_bcc_header: false,
+                disposition_notification_to: None,
+            })
+            .expect("renders");
+            assert_eq!(
+                decoded_text_parts(&nested),
+                [expected, expected],
+                "nested {input:?}"
+            );
+        }
+    }
+
+    /// The Sent copy is the wire body plus Bcc: one prepared entity, so the
+    /// boundaries and encoded parts are identical.
+    #[test]
+    fn sent_copy_shares_the_wire_entity() {
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.bcc = vec![addr(None, "c@example.com")];
+            r.body_text = Some("plain".to_owned());
+            r.body_html = Some("<p>html</p>".to_owned());
+        });
+        let rendered =
+            send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
+        let body = |raw: &[u8]| {
+            let raw = String::from_utf8(raw.to_vec()).expect("utf8");
+            let start = raw
+                .find("Content-Type: multipart/alternative")
+                .expect("entity");
+            raw[start..].to_owned()
+        };
+        assert_eq!(
+            body(&rendered.raw),
+            body(rendered.sent_copy.as_deref().expect("bcc -> sent copy"))
         );
     }
 

@@ -1,6 +1,22 @@
-use std::{mem, ops::Deref};
+use std::ops::Deref;
+
+use bifrost_mime::entity::{
+    EncodingInput, OutboundEncoding, canonicalize_text_crlf, choose_encoding, encode_payload,
+    encoding_fits,
+};
 
 use crate::message::header::{ContentTransferEncoding, ContentType};
+
+/// The shared outbound encoding behind a header token.
+fn outbound(encoding: ContentTransferEncoding) -> OutboundEncoding {
+    match encoding {
+        ContentTransferEncoding::SevenBit => OutboundEncoding::SevenBit,
+        ContentTransferEncoding::EightBit => OutboundEncoding::EightBit,
+        ContentTransferEncoding::QuotedPrintable => OutboundEncoding::QuotedPrintable,
+        ContentTransferEncoding::Base64 => OutboundEncoding::Base64,
+        ContentTransferEncoding::Binary => OutboundEncoding::Binary,
+    }
+}
 
 /// A [`Message`][super::Message] or [`SinglePart`][super::SinglePart] body that has already been encoded.
 #[derive(Debug, Clone)]
@@ -32,9 +48,10 @@ impl Body {
     ///
     /// If `String` is passed, line endings are converted to `CRLF`.
     ///
-    /// If `buf` is valid utf-8 a `String` should be supplied, as `String`s
-    /// can be encoded as `7bit` or `quoted-printable`, while `Vec<u8>` always
-    /// get encoded as `base64`.
+    /// If `buf` is valid utf-8 a `String` should be supplied: a `String` is
+    /// text and may be encoded as `quoted-printable` when it holds non-ASCII,
+    /// while a `Vec<u8>` is opaque and holding non-ASCII always gets
+    /// `base64` (ASCII bytes may still be `7bit` or `quoted-printable`).
     pub fn new<B: Into<MaybeString>>(buf: B) -> Self {
         let mut buf: MaybeString = buf.into();
         let default_content_type = buf.default_content_type();
@@ -60,22 +77,7 @@ impl Body {
         let mut buf: MaybeString = buf.into();
         let default_content_type = buf.default_content_type();
 
-        let best_encoding = buf.encoding(true);
-        let ok = match (encoding, best_encoding) {
-            (ContentTransferEncoding::SevenBit, ContentTransferEncoding::SevenBit) => true,
-            (
-                ContentTransferEncoding::EightBit,
-                ContentTransferEncoding::SevenBit | ContentTransferEncoding::EightBit,
-            ) => true,
-            (ContentTransferEncoding::SevenBit | ContentTransferEncoding::EightBit, _) => false,
-            (
-                ContentTransferEncoding::QuotedPrintable
-                | ContentTransferEncoding::Base64
-                | ContentTransferEncoding::Binary,
-                _,
-            ) => true,
-        };
-        if !ok {
+        if !encoding_fits(buf.encoding_input(), outbound(encoding)) {
             return Err(buf.into());
         }
 
@@ -97,7 +99,11 @@ impl Body {
         }
     }
 
-    /// Encodes the supplied `buf` using the provided `encoding`
+    /// Encodes the supplied `buf` using the provided `encoding`, through the
+    /// shared `bifrost_mime::entity` encoder. That encoder never rewrites
+    /// line endings; this builder's documented policy that a bare LF is a
+    /// line break under quoted-printable (byte input included) is applied
+    /// here, before encoding.
     fn new_impl(
         buf: Vec<u8>,
         encoding: ContentTransferEncoding,
@@ -112,34 +118,22 @@ impl Body {
                 default_content_type,
             },
             ContentTransferEncoding::QuotedPrintable => {
-                // Quoted-printable text mode only treats CRLF as a hard line
-                // break and escapes a bare LF as `=0A` (quoted_printable 0.5.2
-                // onward), so a bare LF is turned into CRLF first. That keeps
-                // a bare LF as a line break, which is how it was always
-                // emitted before.
+                // The shared encoder escapes a bare LF as `=0A`, so a bare LF
+                // is turned into CRLF first; that keeps it a line break, which
+                // is how this builder has always emitted it.
                 let mut buf = buf;
-                in_place_crlf_bytes(&mut buf);
-                let encoded = quoted_printable::encode(buf);
-
+                canonicalize_text_crlf(&mut buf);
                 Self {
-                    buf: encoded,
-                    encoding: ContentTransferEncoding::QuotedPrintable,
+                    buf: encode_payload(&buf, OutboundEncoding::QuotedPrintable),
+                    encoding,
                     default_content_type,
                 }
             }
-            ContentTransferEncoding::Base64 => {
-                let len = email_encoding::body::base64::encoded_len(buf.len());
-
-                let mut out = String::with_capacity(len);
-                email_encoding::body::base64::encode(&buf, &mut out)
-                    .expect("encode body as base64");
-
-                Self {
-                    buf: out.into_bytes(),
-                    encoding: ContentTransferEncoding::Base64,
-                    default_content_type,
-                }
-            }
+            ContentTransferEncoding::Base64 => Self {
+                buf: encode_payload(&buf, OutboundEncoding::Base64),
+                encoding,
+                default_content_type,
+            },
         }
     }
 
@@ -184,18 +178,20 @@ impl MaybeString {
     ///
     /// The `binary` encoding is never returned
     fn encoding(&self, supports_utf8: bool) -> ContentTransferEncoding {
-        use email_encoding::body::Encoding;
+        match choose_encoding(self.encoding_input(), supports_utf8) {
+            OutboundEncoding::SevenBit => ContentTransferEncoding::SevenBit,
+            OutboundEncoding::EightBit => ContentTransferEncoding::EightBit,
+            OutboundEncoding::QuotedPrintable => ContentTransferEncoding::QuotedPrintable,
+            // The chooser never picks `Binary`.
+            _ => ContentTransferEncoding::Base64,
+        }
+    }
 
-        let output = match self {
-            Self::String(s) => Encoding::choose(s.as_str(), supports_utf8),
-            Self::Binary(b) => Encoding::choose(b.as_slice(), supports_utf8),
-        };
-
-        match output {
-            Encoding::SevenBit => ContentTransferEncoding::SevenBit,
-            Encoding::EightBit => ContentTransferEncoding::EightBit,
-            Encoding::QuotedPrintable => ContentTransferEncoding::QuotedPrintable,
-            Encoding::Base64 => ContentTransferEncoding::Base64,
+    /// The chooser input: a `String` is text, bytes are opaque.
+    fn encoding_input(&self) -> EncodingInput<'_> {
+        match self {
+            Self::String(s) => EncodingInput::Text(s),
+            Self::Binary(b) => EncodingInput::Bytes(b),
         }
     }
 
@@ -225,7 +221,7 @@ impl MaybeString {
                     encoding,
                     ContentTransferEncoding::SevenBit | ContentTransferEncoding::EightBit
                 ) {
-                    in_place_crlf_bytes(bytes);
+                    canonicalize_text_crlf(bytes);
                 }
             }
         }
@@ -342,85 +338,26 @@ impl Deref for MaybeString {
     }
 }
 
-/// In place conversion to CRLF line endings.
-///
-/// Single-pass rebuild like the byte sibling below: per-LF `String::insert`
-/// shifts the whole tail each time, which is quadratic on a large LF-only
-/// body.
+/// In place conversion to CRLF line endings, through the shared text
+/// canonicalization (a CR before every bare LF; a bare CR is kept).
 fn in_place_crlf_line_endings(string: &mut String) {
-    let bare_lf_count = find_all_lf_char_indices(string).len();
-    if bare_lf_count == 0 {
-        return;
-    }
-    let mut normalized = String::with_capacity(string.len() + bare_lf_count);
-    let mut previous = None;
-    for ch in string.chars() {
-        if ch == '\n' && previous != Some('\r') {
-            normalized.push('\r');
-        }
-        normalized.push(ch);
-        previous = Some(ch);
-    }
-    *string = normalized;
-}
-
-/// Convert bare LF bytes to CRLF without interpreting the rest of a raw body.
-fn in_place_crlf_bytes(bytes: &mut Vec<u8>) {
-    if !bytes
-        .iter()
-        .enumerate()
-        .any(|(index, byte)| *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
-    {
-        return;
-    }
-
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut previous = None;
-    for byte in bytes.drain(..) {
-        if byte == b'\n' && previous != Some(b'\r') {
-            normalized.push(b'\r');
-        }
-        normalized.push(byte);
-        previous = Some(byte);
-    }
-    *bytes = normalized;
-}
-
-/// Find indices to all places where `\r` should be inserted
-/// in order to make `s` have CRLF line endings
-///
-/// The list is reversed, which is more efficient.
-fn find_all_lf_char_indices(s: &str) -> Vec<usize> {
-    let mut indices = Vec::new();
-
-    let mut found_lf = false;
-    for (i, c) in s.char_indices().rev() {
-        if mem::take(&mut found_lf) && c != '\r' {
-            // the previous character was `\n`, but this isn't a `\r`
-            indices.push(i + c.len_utf8());
-        }
-
-        found_lf = c == '\n';
-    }
-
-    if found_lf {
-        // the first character is `\n`
-        indices.push(0);
-    }
-
-    indices
+    let mut bytes = std::mem::take(string).into_bytes();
+    canonicalize_text_crlf(&mut bytes);
+    *string = String::from_utf8(bytes).expect("CR insertion keeps UTF-8 valid");
 }
 
 #[cfg(test)]
 mod test {
 
-    use super::{Body, ContentTransferEncoding, in_place_crlf_bytes, in_place_crlf_line_endings};
+    use super::{
+        Body, ContentTransferEncoding, canonicalize_text_crlf, in_place_crlf_line_endings,
+    };
 
     #[test]
     fn raw_byte_message_normalization_converts_only_bare_lf() {
         let mut bytes = b"first\nsecond\r\nthird\n".to_vec();
 
-        in_place_crlf_bytes(&mut bytes);
+        canonicalize_text_crlf(&mut bytes);
 
         assert_eq!(bytes, b"first\r\nsecond\r\nthird\r\n");
     }

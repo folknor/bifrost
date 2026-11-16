@@ -463,18 +463,7 @@ impl MessageBuilder {
         }
         let mut res = self;
 
-        // Fail is missing correct originator (Sender or From)
-        match res.headers.get::<header::From>() {
-            Some(header::From(f)) => {
-                let from: Vec<Mailbox> = f.into();
-                if from.len() > 1 && res.headers.get::<header::Sender>().is_none() {
-                    return Err(EmailError::TooManyFrom);
-                }
-            }
-            None => {
-                return Err(EmailError::MissingFrom);
-            }
-        }
+        validate_originators(&res.headers)?;
 
         if res.generate_message_id && res.headers.get_raw(&header::MessageId::name()).is_none() {
             let from = res
@@ -521,6 +510,7 @@ impl MessageBuilder {
             )))?;
         }
 
+        let envelope_derived = res.envelope.is_none();
         let envelope = match res.envelope {
             Some(e) => e,
             None => Envelope::try_from(&res.headers)?,
@@ -535,6 +525,7 @@ impl MessageBuilder {
             headers: res.headers,
             body,
             envelope,
+            envelope_derived,
         })
     }
 
@@ -586,6 +577,10 @@ pub struct Message {
     headers: Headers,
     body: MessageBody,
     envelope: Envelope,
+    /// The envelope came from the headers at build time rather than from
+    /// `MessageBuilder::envelope`. Recorded, not inferred: a stripped Bcc
+    /// makes comparing the envelope with the headers unreliable.
+    envelope_derived: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -611,7 +606,20 @@ impl Message {
     /// and, for a MIME body, adds no message-level Content-Type or
     /// Content-Transfer-Encoding (the body part writes those itself, so a
     /// second one would give the root entity two conflicting declarations).
-    /// The envelope is not re-derived.
+    ///
+    /// The originator rule the build step enforces still holds afterwards
+    /// (a parseable From; a Sender, if present, is one mailbox; several From
+    /// mailboxes need a Sender). The envelope is never re-derived: the Bcc
+    /// header is usually gone by now, so re-deriving would silently drop
+    /// blind recipients. Instead, when the envelope was derived from the
+    /// headers, the address identities in From, Sender, To, Cc and Bcc are
+    /// frozen per header: display names, folding and order may change, but
+    /// an edit that adds, removes or moves an address is refused. A user
+    /// expects mail to reach exactly the people the message shows, so a
+    /// header that silently disagrees with delivery is not allowed to
+    /// arise; readdressing means rebuilding. With an explicit envelope the
+    /// caller has already separated routing from headers, and address edits
+    /// are allowed.
     ///
     /// # Errors
     ///
@@ -624,6 +632,24 @@ impl Message {
         let mut candidate = self.headers.clone();
         edit(&mut candidate)?;
         check_root_entity_owner(&candidate, &self.body)?;
+        validate_originators(&candidate)?;
+        if self.envelope_derived {
+            for name in [
+                header::From::name(),
+                header::Sender::name(),
+                header::To::name(),
+                header::Cc::name(),
+                header::Bcc::name(),
+            ] {
+                if address_identities(&self.headers, &name)?
+                    != address_identities(&candidate, &name)?
+                {
+                    return Err(EmailError::InvalidInput(format!(
+                        "the envelope was derived from the headers, so the {name} addresses cannot change after build; rebuild the message to readdress it"
+                    )));
+                }
+            }
+        }
         self.headers = candidate;
         Ok(())
     }
@@ -752,6 +778,53 @@ fn check_root_entity_owner(headers: &Headers, body: &MessageBody) -> Result<(), 
     Ok(())
 }
 
+/// The RFC 5322 originator rule, shared by the build step and
+/// `Message::edit_headers`: a present, parseable From with at least one
+/// mailbox; a Sender, when present, parses as exactly one mailbox (an
+/// unparseable one is an error, never treated as absent); several From
+/// mailboxes need a Sender. Applies with an explicit envelope too: an
+/// envelope override changes routing, it does not license malformed
+/// originator headers. Recipient headers are not checked here, so an
+/// explicit-envelope message may keep empty destination headers.
+fn validate_originators(headers: &Headers) -> Result<(), EmailError> {
+    let Some(from) = address_identities(headers, &header::From::name())? else {
+        return Err(EmailError::MissingFrom);
+    };
+    if from.is_empty() {
+        return Err(EmailError::MissingFrom);
+    }
+    let sender = address_identities(headers, &header::Sender::name())?;
+    if sender.as_ref().is_some_and(|sender| sender.len() != 1) {
+        return Err(EmailError::InvalidInput(
+            "Sender must be exactly one mailbox".into(),
+        ));
+    }
+    if from.len() > 1 && sender.is_none() {
+        return Err(EmailError::TooManyFrom);
+    }
+    Ok(())
+}
+
+/// The addr-specs in one address header, sorted, with display names,
+/// folding and comments ignored and duplicates kept (so `From: a, a` still
+/// counts two authors). Identity is the addr-spec exactly as written: no
+/// case folding or alias equivalence is inferred. `None` when the header is
+/// absent; a header that does not parse is an error, never "absent".
+fn address_identities(headers: &Headers, name: &str) -> Result<Option<Vec<String>>, EmailError> {
+    let Some(raw) = headers.get_raw(name) else {
+        return Ok(None);
+    };
+    let mailboxes: Mailboxes = raw
+        .parse()
+        .map_err(|_| EmailError::InvalidInput(format!("the {name} header does not parse")))?;
+    let mut identities: Vec<String> = mailboxes
+        .iter()
+        .map(|mailbox| mailbox.email.to_string())
+        .collect();
+    identities.sort();
+    Ok(Some(identities))
+}
+
 /// Create a random message id.
 /// (Not cryptographically random)
 fn make_message_id() -> String {
@@ -763,7 +836,8 @@ mod test {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        Message, MultiPart, SinglePart, header,
+        EmailError, Message, MultiPart, SinglePart, header,
+        header::Headers,
         mailbox::{Mailbox, Mailboxes},
         make_message_id,
         mimebody::{BodyOk, ChainOk},
@@ -786,6 +860,69 @@ mod test {
                 .to("NoBody <nobody@domain.tld>".parse().unwrap())
                 .body(String::from("Happy new year!"))
                 .is_ok()
+        );
+    }
+
+    /// A derived envelope freezes address identities per header after
+    /// build; presentation edits pass, originator rules still hold, and an
+    /// explicit envelope allows readdressing.
+    #[test]
+    fn post_build_edits_keep_addresses_and_originators_consistent() {
+        let built = || {
+            Message::builder()
+                .from("Me <me@example.org>".parse().unwrap())
+                .to("A <a@example.org>".parse().unwrap())
+                .bcc("hidden@example.org".parse().unwrap())
+                .body(String::from("hi"))
+                .unwrap()
+        };
+        let mut message = built();
+        let before = message.headers().to_string();
+
+        message
+            .edit_headers(|h| h.set(header::To("Renamed <a@example.org>".parse().unwrap())))
+            .unwrap();
+        message
+            .edit_headers(|h| h.set(header::Subject::from(String::from("s"))))
+            .unwrap();
+
+        let mut message = built();
+        type Edit = fn(&mut Headers) -> Result<(), EmailError>;
+        let refused: [Edit; 5] = [
+            |h| h.set(header::To("b@example.org".parse().unwrap())),
+            |h| h.set(header::Cc("hidden@example.org".parse().unwrap())),
+            |h| h.set(header::Bcc("a@example.org".parse().unwrap())),
+            |h| {
+                h.remove::<header::From>();
+                Ok(())
+            },
+            |h| {
+                h.set(header::From(
+                    "me@example.org, other@example.org".parse().unwrap(),
+                ))
+            },
+        ];
+        for edit in refused {
+            assert!(message.edit_headers(edit).is_err());
+            assert_eq!(message.headers().to_string(), before);
+        }
+
+        let mut explicit = Message::builder()
+            .from("me@example.org".parse().unwrap())
+            .to("a@example.org".parse().unwrap())
+            .envelope(message.envelope().clone())
+            .body(String::from("hi"))
+            .unwrap();
+        explicit
+            .edit_headers(|h| h.set(header::To("b@example.org".parse().unwrap())))
+            .unwrap();
+        assert!(
+            explicit
+                .edit_headers(|h| {
+                    h.remove::<header::From>();
+                    Ok(())
+                })
+                .is_err()
         );
     }
 

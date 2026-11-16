@@ -12,8 +12,8 @@ it. The renderer turns a `compose::SendRequest` into wire bytes and reports
 `AccountError`, and its address vocabulary is the contract's
 `compose::Address`, so the contract types stay in the contract crate and
 MIME sits above them. Crates that only need the account contract (JMAP,
-Graph, the DAV crates, sync, net) do not compile MIME or its `base64` and
-`encoding_rs` dependencies. Consumers are `bifrost-imap` (hydration,
+Graph, the DAV crates, sync, net) do not compile MIME or its encoding and
+charset dependencies. Consumers are `bifrost-imap` (hydration,
 BODYSTRUCTURE decoding, composition, raw and draft submission),
 `bifrost-google` (hydration of the Gmail MIME tree, composition) and
 `bifrost-smtp` (header-derived `Envelope::try_from` and the account-side
@@ -88,10 +88,20 @@ composed messages and raw IMAP submissions missing a structural Message-ID.
 `send_request_to_rfc5322` (send) and `render_rfc5322` over a borrowed
 `ComposedMessage` (drafts, Google's `MailDocument`) emit a UTC `Date` first
 header, RFC 2047 display names and Subject, text/html/`multipart/alternative`
-bodies with a `multipart/mixed` wrapper for inline attachments, every part
-base64, and a sender-domain `Message-ID` (never a machine hostname). The send
-path strips `Bcc:` from the wire body and returns a separate Sent copy that
-keeps it; a Bcc-only send carries `To: undisclosed-recipients:;`. Rendering
+bodies with a `multipart/mixed` wrapper for inline attachments, and a
+sender-domain `Message-ID` (never a machine hostname). Text parts are
+canonicalized to CRLF line endings and a nonempty text ends in CRLF, both
+before encoding, then take the shared chooser (7bit, quoted-printable or
+base64; never 8bit, since no composition path has negotiated 8BITMIME), so
+the decoded text does not depend on the chosen encoding. Attachments are
+opaque: always base64, never canonicalized. Root termination: one CRLF is
+appended only when the serialized entity does not already end in one (after
+a multipart close delimiter or a base64 payload), where it is wire framing
+and never decoded content. The send path strips `Bcc:` from the wire body
+and returns a separate Sent copy that keeps it; both are serialized from one
+prepared entity, so they share boundaries and encoded parts and differ only
+in the header block (and, for a Bcc-only send, the wire body's
+`To: undisclosed-recipients:;` placeholder). Rendering
 has no account identity and stamps `Protocol::Unknown`; account boundaries
 stamp their protocol when propagating renderer failures.
 
@@ -138,8 +148,45 @@ encode; an identifier too long for a physical line fails.
 `bifrost-smtp`'s `message` builder writes every header through
 `write_header` (see `reference/smtp.md`), and mints its Date with
 `format_rfc5322_date`. Envelope derivation is shared as well (its
-`Envelope::try_from(&Headers)` delegates to `submission_envelope`). MIME
-entity serialization is still separate in the two composers.
+`Envelope::try_from(&Headers)` delegates to `submission_envelope`), and so
+is MIME entity serialization (below).
+
+## Entity serialization
+
+`bifrost_mime::entity` is the one outbound MIME entity serializer, used by
+the renderer and by `bifrost-smtp`'s builder. It sits below both
+composition interfaces; each composer keeps its own model and policies.
+Three layers, each with one owner:
+
+- Encoding. `choose_encoding` takes `EncodingInput::Text` or `::Bytes`; the
+  distinction is load-bearing (non-ASCII bytes are opaque and choose base64
+  even when they happen to be UTF-8, text may choose quoted-printable or
+  8bit) and must not be recovered by trial UTF-8 decoding. The chooser never
+  picks `binary`. `OutboundEncoding` is separate from the inbound
+  `TransferEncoding`, whose tolerant `Unknown` is never an outbound choice.
+  `encode_payload` is pure and never rewrites line endings: quoted-printable
+  runs in text mode (an existing CRLF is a hard break, a bare CR or LF is
+  escaped), so decoded octets always equal the input. Text canonicalization
+  (`canonicalize_text_crlf`: a CR before every bare LF, bare CR kept) is a
+  separate step a composer applies only to input it knows is text. A
+  composer encodes once and stores the bytes; nothing re-encodes later.
+- Framing. `MimeEntity` (static dispatch, a homogeneous tree) exposes its
+  header fields (each with its CRLF, without the separator) and a body view:
+  `Encoded` payload bytes or a `Multipart` with its boundary and children.
+  `write_entity` writes the header fields, the separator, and then either the
+  payload verbatim or, per child, `--boundary CRLF`, the child and a CRLF,
+  ending with `--boundary--` and NO trailing CRLF. The CRLF before a
+  delimiter belongs to the parent and is never merged with a CRLF a child
+  payload ends in (that one is content); nesting therefore adds no blank
+  line. Root termination is the composer's policy, never the serializer's,
+  because a CRLF after a 7bit or quoted-printable leaf is decoded content.
+- Boundaries. `mint_boundary` gives 40 hex characters from the OS random
+  source. `contains_delimiter(entity, boundary)` scans exactly what
+  `write_entity` emits for an entity (start of buffer or after CRLF, prefix
+  match), so nested delimiters and opaque pre-encoded payloads are covered
+  and collision checking, DKIM signing and delivery read one definition of
+  framing. Every boundary is checked against every child and re-rolled on a
+  collision; no encoding is trusted to make a collision impossible.
 
 ## File map
 
@@ -147,6 +194,7 @@ entity serialization is still separate in the two composers.
 crates/mime/src/
   lib.rs        public surface
   charset.rs    legacy charset decoding (encoding_rs)
+  entity.rs     outbound transfer encoding, framing and boundaries
   header.rs     HeaderMap, address-list parsing, submission envelope, dates
   limits.rs     MimeLimits and Defect hostile-input bounds
   params.rs     Content-Type / Content-Disposition, RFC 2231 parameters

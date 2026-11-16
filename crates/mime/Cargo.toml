@@ -18,6 +18,9 @@ workspace = true
 bifrost-types = { path = "../types" }
 base64 = { workspace = true }
 encoding_rs = { workspace = true }
+email-encoding = "0.4"
+getrandom = { workspace = true }
+quoted_printable = "0.5"
 jiff = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true, features = ["std"] }

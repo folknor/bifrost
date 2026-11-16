@@ -469,6 +469,20 @@ Narrow edge cases, audits with no known defect, and design work.
 - **Graph search errors always report the operation as `Search`**, even for
   `SearchMessages`. Unverified beyond the report of the agent that fixed
   Graph KQL fragment folding.
+- **SMTP builder: a single-part root whose payload ends in CRLF gains a blank
+  line** (small). `Message` with a `SinglePart` body, `SinglePart::formatted`
+  and `MultiPart::formatted` append one CRLF after the root entity
+  unconditionally, so a 7bit or quoted-printable text payload `hello\r\n`
+  decodes as `hello\r\n\r\n`. Pre-existing, kept byte-identical when the
+  shared entity serializer landed (DKIM tests pin these bytes). The renderer
+  already uses the decode-safe rule (append only when the serialized entity
+  does not end in CRLF); adopting it here changes wire bytes, so rule on it.
+- **Two outbound-relevant address-list parsers remain** (medium).
+  `bifrost-mime`'s tolerant `parse_address_list(_checked)` and smtp's nom
+  `Mailbox` / `Mailboxes` `FromStr` (all-or-nothing, validated through
+  `email_address` plus IDNA) have different contracts (tolerant inbound
+  versus validated construction). Whether they should share a grammar is a
+  separate question from the now-unified writer.
 
 - **Concurrent `close` calls do not share one teardown.** Found in the spar of
   the closed-account gate. Google's `close` swaps its closed flag and returns

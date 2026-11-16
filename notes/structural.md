@@ -24,24 +24,6 @@ Each entry names the hunt scope(s) that reported it. Where hunters disagreed,
 both readings are recorded. The raw reports are in the commit that precedes
 this file's.
 
-## STR-014 - There are two RFC 5322 writers (bifrost-mime and bifrost-smtp's builder)
-
-**Reported by:** types, smtp-sasl. Narrowed 2026-11-16: MIME moved out of
-`bifrost-types` into a new `bifrost-mime` crate above it (types no longer
-depends on `base64` or `encoding_rs`; JMAP, Graph, DAV, sync and net no
-longer compile MIME).
-
-Residue: `bifrost-mime`'s renderer and `bifrost-smtp`'s lettre-derived
-`message` builder still decide header encoding, folding, Message-ID
-(sender-domain vs `hostname::get()`), Date and boundaries independently; only
-envelope derivation is shared. The renderer also has wire defects the
-unified writer would fix: address headers and References are never folded
-(998-octet overrun on long lists), non-ASCII display-name folds are
-flattened, non-ASCII attachment filenames go out as raw UTF-8. The chain
-(one structured header writer below both composers, then the builder taking
-it plus Message-ID and Date policy, then one entity serializer) is in
-`notes/mime-writer-unification.md`. The builder is published and stays.
-
 ## STR-071 - The IMAP pipeline has one production caller; the rest of discovery is still sequential
 
 **Reported by:** imap-connection. Narrowed 2026-11-16: the gate bypass and the

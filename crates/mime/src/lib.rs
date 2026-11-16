@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod charset;
+pub mod entity;
 mod header;
 mod limits;
 mod params;

@@ -34,9 +34,7 @@ jiff = { workspace = true }
 httpdate = "1"
 mime = "0.3.4"
 fastrand = "2.0"
-quoted_printable = "0.5"
 base64 = { workspace = true }
-email-encoding = "0.4"
 
 serde = { workspace = true, optional = true }
 

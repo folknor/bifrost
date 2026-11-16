@@ -1,5 +1,8 @@
 use std::io::Write;
 
+use bifrost_mime::entity::{
+    EntityBody, MimeEntity, contains_delimiter, mint_boundary, write_entity, write_multipart_body,
+};
 use mime::Mime;
 
 use crate::message::{
@@ -17,12 +20,36 @@ pub(super) enum Part {
     Multi(MultiPart),
 }
 
+/// Parts serialize through the shared `bifrost_mime::entity` walk, so the
+/// boundary collision scan, DKIM signing and delivery read one definition
+/// of nested framing.
+impl MimeEntity for Part {
+    fn write_header_fields(&self, out: &mut Vec<u8>) {
+        let headers = match self {
+            Part::Single(part) => &part.headers,
+            Part::Multi(part) => &part.headers,
+        };
+        write!(out, "{headers}").expect("A Write implementation panicked while formatting headers");
+    }
+
+    fn body(&self) -> EntityBody<'_, Self> {
+        match self {
+            Part::Single(part) => EntityBody::Encoded(&part.body),
+            Part::Multi(part) => EntityBody::Multipart {
+                boundary: part.boundary().into(),
+                children: &part.parts,
+            },
+        }
+    }
+}
+
+/// This builder's root termination: one CRLF after the root entity,
+/// unconditionally. That is the byte layout it has always emitted (and DKIM
+/// tests pin), for a multipart root and a single-part root alike.
 impl EmailFormat for Part {
     fn format(&self, out: &mut Vec<u8>) {
-        match self {
-            Part::Single(part) => part.format(out),
-            Part::Multi(part) => part.format(out),
-        }
+        write_entity(self, out);
+        out.extend_from_slice(b"\r\n");
     }
 }
 
@@ -147,20 +174,17 @@ impl SinglePart {
         self.format(&mut out);
         out
     }
-
-    /// Format only the signlepart body
-    fn format_body(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.body);
-        out.extend_from_slice(b"\r\n");
-    }
 }
 
+/// The shared leaf framing (header block, separator, the encoded payload
+/// verbatim) plus this builder's root CRLF; see `EmailFormat for Part`.
 impl EmailFormat for SinglePart {
     fn format(&self, out: &mut Vec<u8>) {
         write!(out, "{}", self.headers)
             .expect("A Write implementation panicked while formatting headers");
         out.extend_from_slice(b"\r\n");
-        self.format_body(out);
+        out.extend_from_slice(&self.body);
+        out.extend_from_slice(b"\r\n");
     }
 }
 
@@ -240,17 +264,9 @@ fn with_boundary(source: &str, boundary: &str) -> String {
     format!("{type_unit}; {new};{}", kept.join(";"))
 }
 
-/// Create a cryptographically random MIME boundary.
+/// Create a cryptographically random MIME boundary (the shared minter).
 fn make_boundary() -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut random = [0_u8; 20];
-    getrandom::fill(&mut random).expect("operating system random source is unavailable");
-    let mut boundary = String::with_capacity(random.len() * 2);
-    for byte in random {
-        boundary.push(HEX[usize::from(byte >> 4)] as char);
-        boundary.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    boundary
+    mint_boundary()
 }
 
 impl MultiPartKind {
@@ -415,16 +431,9 @@ fn validate_multipart_headers(
 }
 
 fn children_contain_boundary(children: &[Part], boundary: &str) -> bool {
-    let opening = format!("--{boundary}");
-    let marker = format!("\r\n{opening}");
-    children.iter().any(|part| {
-        let mut formatted = Vec::new();
-        part.format(&mut formatted);
-        formatted.starts_with(opening.as_bytes())
-            || formatted
-                .windows(marker.len())
-                .any(|window| window == marker.as_bytes())
-    })
+    children
+        .iter()
+        .any(|part| contains_delimiter(part, boundary))
 }
 
 /// The delivery gate's structural check, run when a part becomes a
@@ -771,22 +780,6 @@ impl MultiPart {
         out
     }
 
-    /// Format only the multipart body
-    fn format_body(&self, out: &mut Vec<u8>) {
-        let boundary = self.boundary();
-
-        for part in &self.parts {
-            out.extend_from_slice(b"--");
-            out.extend_from_slice(boundary.as_bytes());
-            out.extend_from_slice(b"\r\n");
-            part.format(out);
-        }
-
-        out.extend_from_slice(b"--");
-        out.extend_from_slice(boundary.as_bytes());
-        out.extend_from_slice(b"--\r\n");
-    }
-
     /// Re-roll the boundary when a part added at or after `from` would forge a
     /// delimiter.
     ///
@@ -880,7 +873,8 @@ impl EmailFormat for MultiPart {
         write!(out, "{}", self.headers)
             .expect("A Write implementation panicked while formatting headers");
         out.extend_from_slice(b"\r\n");
-        self.format_body(out);
+        write_multipart_body(&self.boundary(), &self.parts, out);
+        out.extend_from_slice(b"\r\n");
     }
 }
 

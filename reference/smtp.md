@@ -1019,7 +1019,41 @@ owns the root Content-Type and Content-Transfer-Encoding (it writes them in
 the same header block as the message headers), so a message-level copy is
 refused at build and by `Message::edit_headers`, the transactional
 replacement for `Message::headers_mut`; a raw `body` keeps them on the
-message. `Message::edit_headers` does not re-derive the envelope.
+message.
+
+`Message::edit_headers` also keeps the originator rule the build step
+enforces (one shared validator): a present, parseable From with at least one
+mailbox, a Sender that, when present, parses as exactly one mailbox (an
+unparseable Sender is an error, never treated as absent), and a Sender for
+several From mailboxes. This holds with an explicit envelope too: an
+envelope override changes routing, not header validity. The envelope is
+never re-derived after build, since the Bcc header is usually stripped by
+then and re-deriving would silently drop blind recipients. Instead, when the
+envelope was derived from the headers (recorded at build, not inferred),
+the addr-specs of From, Sender, To, Cc and Bcc are frozen per header:
+display names, folding, comments and order may change; adding, removing or
+moving an address between roles is refused (moving a Bcc address into To
+would disclose a blind recipient even though the recipient set is
+unchanged). Identity is the addr-spec as written, no case folding or alias
+inference; a header that does not parse is an error. Adding a Bcc after it
+was stripped is refused like any other change. The user expectation that
+settled it: mail reaches exactly the people the message shows, so a header
+that silently disagrees with delivery may not arise after build;
+readdressing means rebuilding. With an explicit envelope the caller already
+separated routing from headers, so address edits are allowed. A
+display-name edit after signing still invalidates a DKIM signature, as any
+header edit does.
+
+Parts serialize through the shared `bifrost_mime::entity` walk (see
+`reference/mime.md`), and the boundary collision scan uses its
+`contains_delimiter`, so the scan, DKIM and delivery read the same bytes.
+This builder's root termination is one CRLF after the root entity,
+unconditionally (`Message`, `SinglePart::formatted`,
+`MultiPart::formatted`), which is the byte layout it has always emitted. Body
+encoding delegates to the shared chooser and encoder: `String` input is
+`Text`, `Vec<u8>` is `Bytes`, and this builder's own canonicalization
+policy (below) runs before the pure shared encoder, including
+quoted-printable for byte input, where a bare LF stays a line break.
 
 `SinglePartBuilder::body(String)` and `MessageBuilder::body(String)` infer `Content-Type: text/plain; charset=utf-8` when no content type is set.
 
