@@ -890,8 +890,11 @@ the data-only state must serialize, and an impossible encoder failure
 panics instead of minting an empty poisoned cursor. `decode_gmail_state` rejects
 wrong protocol, wrong envelope version, and wrong schema
 version, each translating to `SyncState(SchemaIncompatible)`.
-A payload that fails JSON deserialization translates to
-`SyncState(CursorInvalid)`.
+A payload that fails JSON deserialization takes the shared
+`CursorDecodeFault::Malformed` classification, also `SchemaIncompatible`.
+The shared contract rebuilds unreadable durable state, including dependent
+backfill state. This gives a user with an unreadable saved checkpoint a clean
+resync instead of repeated resume failures.
 
 `decode_gmail_state_for_profile` layers an identity check on top: the decoded
 `profile_email` must equal the open account's `email_address` under an

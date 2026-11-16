@@ -1130,6 +1130,9 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
                 GmailCursorFailure::EnvelopeMismatch | GmailCursorFailure::SchemaMismatch => {
                     bifrost_types::CursorDecodeFault::RetiredVersion
                 }
+                // Shared cursor decoding rebuilds unreadable durable state,
+                // including dependent backfill state. Users expect a clean
+                // resync rather than repeated failures on a poisoned checkpoint.
                 GmailCursorFailure::MalformedPayload => bifrost_types::CursorDecodeFault::Malformed,
             };
             let mut builder = fault

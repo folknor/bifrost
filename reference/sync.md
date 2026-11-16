@@ -4795,10 +4795,15 @@ Contact and event update patches forward optional `expected_version` intact to
 the account. `MutationConcurrency::ExpectedVersion` identifies the individual
 update and conditional delete doors that enforce it.
 `contact_delete_if_version` and `event_delete_if_version` forward the optional
-caller version unchanged. `event_delete` and `event_delete_if_version` are the
-only calendar primitives `SyncEngine` exposes; both resolve the current account
-handle and forward directly. Their account defaults refuse a supplied version
-before I/O and delegate an absent version to the ordinary delete door.
+caller version unchanged, as does `event_rsvp_if_version`. `SyncEngine`
+forwards every calendar `Account` primitive (`calendars_list`,
+`events_in_range`, `event_get`, `event_create`, `event_update`, `event_rsvp`,
+`event_search`, `event_delete` and the two version doors), as it does for contacts, so the
+engine is the consumer's single door for calendar too. Each resolves the
+current account handle and forwards directly; the two paged reads announce
+page-lane loss like `contacts_list`. The account defaults of the version doors
+refuse a supplied version before I/O and delegate an absent version to the
+ordinary door.
 `StateBased` retains its legacy meaning of
 provider-observed guards; it is not a caller-version promise. Bulk mail
 mutations carry caller versions only through the campaigns below; the other

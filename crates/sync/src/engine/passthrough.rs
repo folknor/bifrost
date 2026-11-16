@@ -835,6 +835,100 @@ impl SyncEngine {
         .await
     }
 
+    /// List an account's calendars. Forwards 1:1 to
+    /// [`Account::calendars_list`].
+    pub async fn calendars_list(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Vec<bifrost_types::Calendar>, Error> {
+        self.direct_call(account_id, |account| account.calendars_list())
+            .await
+    }
+
+    /// List events in a provider-side time range. Forwards to
+    /// [`Account::events_in_range`].
+    pub async fn events_in_range(
+        &self,
+        account_id: &AccountId,
+        range: bifrost_types::EventRange,
+    ) -> Result<bifrost_types::Page<bifrost_types::CalendarEvent>, Error> {
+        let page = self
+            .direct_call(account_id, |account| account.events_in_range(range))
+            .await?;
+        self.announce_page_loss(account_id, "events_in_range", &page);
+        Ok(page)
+    }
+
+    /// Fetch one event by engine-facing id. Forwards to
+    /// [`Account::event_get`].
+    pub async fn event_get(
+        &self,
+        account_id: &AccountId,
+        event: bifrost_types::EventId,
+    ) -> Result<bifrost_types::CalendarEvent, Error> {
+        self.direct_call(account_id, |account| account.event_get(event))
+            .await
+    }
+
+    /// Create one event. Forwards to [`Account::event_create`].
+    pub async fn event_create(
+        &self,
+        account_id: &AccountId,
+        event: bifrost_types::EventCreate,
+    ) -> Result<bifrost_types::EventId, Error> {
+        self.direct_call(account_id, |account| account.event_create(event))
+            .await
+    }
+
+    /// Partially update one event. Forwards to [`Account::event_update`].
+    pub async fn event_update(
+        &self,
+        account_id: &AccountId,
+        event: bifrost_types::EventId,
+        patch: bifrost_types::EventPatch,
+    ) -> Result<(), Error> {
+        self.direct_call(account_id, |account| account.event_update(event, patch))
+            .await
+    }
+
+    /// Respond to an invitation. Forwards to [`Account::event_rsvp`].
+    pub async fn event_rsvp(
+        &self,
+        account_id: &AccountId,
+        event: bifrost_types::EventId,
+        status: bifrost_types::RsvpStatus,
+    ) -> Result<(), Error> {
+        self.direct_call(account_id, |account| account.event_rsvp(event, status))
+            .await
+    }
+
+    /// Respond with the caller's optional version, forwarded unchanged.
+    pub async fn event_rsvp_if_version(
+        &self,
+        account_id: &AccountId,
+        event: bifrost_types::EventId,
+        status: bifrost_types::RsvpStatus,
+        expected_version: Option<bifrost_types::ServerVersion>,
+    ) -> Result<(), Error> {
+        self.direct_call(account_id, |account| {
+            account.event_rsvp_if_version(event, status, expected_version)
+        })
+        .await
+    }
+
+    /// Search events. Forwards to [`Account::event_search`].
+    pub async fn event_search(
+        &self,
+        account_id: &AccountId,
+        request: bifrost_types::EventSearchRequest,
+    ) -> Result<bifrost_types::Page<bifrost_types::CalendarEvent>, Error> {
+        let page = self
+            .direct_call(account_id, |account| account.event_search(request))
+            .await?;
+        self.announce_page_loss(account_id, "event_search", &page);
+        Ok(page)
+    }
+
     /// Delete one calendar event. Forwards to [`Account::event_delete`].
     pub async fn event_delete(
         &self,
