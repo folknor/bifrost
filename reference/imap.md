@@ -14,6 +14,12 @@ Explicit account-shutdown guards in send, draft send, raw blob fetch and
 polling EXAMINE use `AccountClosed` / terminal `Cancelled`. Ordinary connection
 closure retains its transport classification and transmission evidence.
 
+The pool's post-close `TransportFailure::Closed` remains a transport failure
+for work admitted before closure or calls that bypass the wrapper. A gated
+method first polled after close cannot reach pool checkout: it refuses with
+`AccountClosed` instead. Folder creation pins this boundary through the real
+IMAP provider and closed pool, including a future constructed before close.
+
 Current architecture of the IMAP client crate. Daaki-derived. Tokio + native-tls only.
 
 The public consumer surface is intentionally small after S1-W3: `ImapAccountFactory`, `ImapAccountConfig`, `ImapConfig`, `ManageSieveConfig`, `Credentials`, `AuthPolicy`. Consumers construct the factory and use it through `Arc<dyn bifrost_types::AccountFactory>`; raw IMAP, ManageSieve, parser, command, protocol-error, and sync-helper surfaces are crate-internal. CardDAV/CalDAV composition (`with_carddav`/`with_caldav`) is under "Account layer".

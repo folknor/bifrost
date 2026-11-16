@@ -19,6 +19,7 @@ use crate::{ChangeCursor, CursorScope, Protocol};
 struct Stub {
     /// Provider invocations of every non-exempt method.
     calls: AtomicUsize,
+    inventory: Mutex<Option<AccountStream<InventoryEvent>>>,
     /// Inventory resume streams the provider constructed.
     resume_built: AtomicUsize,
     /// Provider `close` invocations.
@@ -118,6 +119,15 @@ impl Account for Stub {
         })
     }
 
+    fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<InventoryEvent> {
+        self.hit();
+        self.inventory
+            .lock()
+            .expect("stub lock")
+            .take()
+            .unwrap_or_else(|| Box::pin(futures::stream::empty()))
+    }
+
     fn vacation_get(&self) -> AccountFuture<Result<Option<crate::VacationConfig>, AccountError>> {
         self.hit();
         let release = self
@@ -186,7 +196,7 @@ impl Account for Stub {
         discover_cursor_scopes() -> SyncEvent<CursorScope>;
         discover_memberships() -> SyncEvent<crate::MembershipScope>;
         scope_lifecycle_stream() -> crate::ScopeLifecycleEvent;
-        inventory_stream(_scope: CursorScope) -> InventoryEvent;
+
         changes_stream(_cursor: ChangeCursor) -> SyncEvent<crate::Change>;
         open_blob(_handle: crate::BlobHandle) -> SyncEvent<Bytes>;
         open_blob_range(_handle: crate::BlobHandle, _range: crate::ByteRange) -> SyncEvent<Bytes>;
@@ -492,4 +502,135 @@ fn refusal_shapes_match_each_stream_contract() {
         crate::ScopeLifecycleEvent::refusal(error()),
         crate::ScopeLifecycleEvent::Terminated(_)
     ));
+}
+
+#[test]
+fn admitted_inventory_stops_before_buffered_completion() {
+    let (stub, gate) = gate();
+    *stub.inventory.lock().expect("stub lock") = Some(Box::pin(
+        futures::stream::iter([
+            SyncEvent::Progress(crate::Progress::default()),
+            SyncEvent::Done(None),
+        ])
+        .map(crate::events::lift_complete_walk(
+            crate::CoverageDomain::full(CursorScope::Account),
+        )),
+    ));
+    let mut stream = gate.inventory_stream(CursorScope::Account);
+    assert!(matches!(
+        stream.next().now_or_never(),
+        Some(Some(InventoryEvent::Progress(_)))
+    ));
+    drop(gate.close());
+    assert!(
+        matches!(stream.next().now_or_never(), Some(Some(InventoryEvent::Terminated(error)))
+        if matches!(error.kind(), AccountErrorKind::AccountClosed))
+    );
+    assert!(matches!(stream.next().now_or_never(), Some(None)));
+}
+
+#[test]
+fn admitted_read_kinds_wake_and_terminate_without_polling_provider_again() {
+    fn check<E: Refusal + Send + 'static>() {
+        let admission = super::Admission::default();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let provider = Box::pin(futures::stream::poll_fn(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Pending
+        })) as AccountStream<E>;
+        let mut stream = super::gate_constructed_stream(
+            admission.clone(),
+            AccountOperation::SyncInventory,
+            Protocol::Unknown,
+            provider,
+        );
+        struct Wakes(AtomicUsize);
+        impl futures::task::ArcWake for Wakes {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = futures::task::waker(Arc::clone(&wakes));
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(stream.poll_next_unpin(&mut cx).is_pending());
+        admission.close();
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            stream.poll_next_unpin(&mut cx),
+            std::task::Poll::Ready(Some(_))
+        ));
+        assert!(matches!(
+            stream.poll_next_unpin(&mut cx),
+            std::task::Poll::Ready(None)
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+    check::<SyncEvent<Bytes>>();
+    check::<InventoryEvent>();
+    check::<crate::ScopeLifecycleEvent>();
+    check::<crate::InventoryRepairEvent>();
+}
+
+#[test]
+fn admitted_bulk_and_push_streams_keep_provider_results_after_close() {
+    let admission = super::Admission::default();
+    let (release, held) = oneshot::channel();
+    let mut bulk = super::gate(
+        admission.clone(),
+        AccountOperation::BulkMove,
+        Protocol::Unknown,
+        move || {
+            Box::pin(futures::stream::once(async move {
+                held.await.expect("released");
+                SyncEvent::<crate::ItemOutcome<crate::MutationSuccess>>::Done(None)
+            })) as AccountStream<Outcome>
+        },
+    );
+    let mut push = super::gate(
+        admission.clone(),
+        AccountOperation::PushStream,
+        Protocol::Unknown,
+        || {
+            Box::pin(futures::stream::iter([
+                crate::PushSessionEvent::Established,
+                crate::PushSessionEvent::Ended(crate::PushSessionEnd::Stopped),
+            ])) as AccountStream<crate::PushSessionEvent>
+        },
+    );
+    assert!(bulk.next().now_or_never().is_none());
+    assert!(matches!(
+        push.next().now_or_never(),
+        Some(Some(crate::PushSessionEvent::Established))
+    ));
+    admission.close();
+    release.send(()).expect("bulk was not dropped");
+    assert!(matches!(
+        bulk.next().now_or_never(),
+        Some(Some(SyncEvent::Done(None)))
+    ));
+    assert!(matches!(
+        push.next().now_or_never(),
+        Some(Some(crate::PushSessionEvent::Ended(
+            crate::PushSessionEnd::Stopped
+        )))
+    ));
+}
+
+#[test]
+fn completed_read_does_not_gain_a_second_terminal_event_after_close() {
+    let admission = super::Admission::default();
+    let mut stream = super::gate_constructed_stream(
+        admission.clone(),
+        AccountOperation::SyncChanges,
+        Protocol::Unknown,
+        Box::pin(futures::stream::iter([SyncEvent::<Bytes>::Done(None)])),
+    );
+    assert!(matches!(
+        stream.next().now_or_never(),
+        Some(Some(SyncEvent::Done(None)))
+    ));
+    admission.close();
+    assert!(matches!(stream.next().now_or_never(), Some(None)));
 }

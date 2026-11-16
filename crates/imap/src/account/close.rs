@@ -104,6 +104,52 @@ mod tests {
     use bifrost_types::{Account, DraftHandle, SendRequest};
 
     #[tokio::test]
+    async fn closing_wrapper_refuses_before_closed_pool_transport_failure() {
+        use bifrost_types::{
+            AccountErrorKind, AccountOperation, ClosingAccount, ContainerKind, Protocol,
+            TransportErrorKind,
+        };
+        use std::sync::Arc;
+
+        let (conn, peer) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+        drop(peer);
+        let provider = Arc::new(ImapAccount::new(scripted_account_parts(conn, 1)));
+        let account = ClosingAccount::wrap(Arc::clone(&provider) as Arc<dyn Account>);
+        let before_close =
+            account.container_create(ContainerKind::Folder, "new-folder".into(), None, None);
+        account.close().await.unwrap();
+
+        // The pool remains a second boundary for work admitted before close.
+        // Removing an account must refuse new work before this retryable error.
+        assert!(matches!(
+            provider.pool.checkout_any().await,
+            Err(crate::Error::Transport {
+                kind: crate::error::TransportFailure::Closed,
+                ..
+            })
+        ));
+        let bypass = provider
+            .container_create(ContainerKind::Folder, "new-folder".into(), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            bypass.kind(),
+            &AccountErrorKind::Transport(TransportErrorKind::Network)
+        );
+
+        let after_close =
+            account.container_create(ContainerKind::Folder, "new-folder".into(), None, None);
+        for call in [before_close, after_close] {
+            let error = call.await.unwrap_err();
+            let expected =
+                AccountError::account_closed(AccountOperation::ContainerCreate, Protocol::Imap);
+            assert_eq!(error.kind(), expected.kind());
+            assert_eq!(error.operation(), expected.operation());
+            assert_eq!(error.recovery(), expected.recovery());
+        }
+    }
+
+    #[tokio::test]
     async fn provider_close_panics_do_not_escape_or_skip_the_next_provider() {
         use crate::account::test_support::StubAccount;
         use std::sync::{Arc, atomic::Ordering};

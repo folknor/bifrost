@@ -24,14 +24,8 @@ commit that precedes this file's.
 ## BUG-176 - Open rulings and design residue from the wave 10 to 16 lateral findings
 
 **Reported by:** wave 10 to 16 fixers (lateral). The rest of the bundle landed
-or was refused; two design items remain.
+or was refused; one design item remains.
 
-- Closed-account guards are not universal. Only Google gates every future;
-  IMAP's pool answers a retryable `Transport(Network)` after close; Graph and
-  JMAP gate only push; CalDAV and CardDAV gate nothing. Sparred design, a
-  chain: a shared wrapper in bifrost-types with generated forwarding and
-  admission at first poll, in `notes/closed-account-gate.md` with its link
-  plan.
 - Sync `PendingCoverage::supersede` (standalone public form) cannot update a
   receipt a consumer already saved, and `AckToken` receipts hold the full
   cumulative claim. Bounding either needs a durable evidence owner and a new

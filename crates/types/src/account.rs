@@ -1502,8 +1502,10 @@ pub trait Account: Send + Sync {
     /// each provider: a user who removed an account expects its work to stop.
     /// Every future or stream first polled after `close` is CALLED refuses
     /// with `AccountClosed` before reaching the provider; work admitted before
-    /// that keeps the provider's own result; the synchronous accessors and
-    /// cursor classification (`inventory_resume_stream`'s `Some`/`None`
+    /// that keeps the provider's own result for futures, bulk mutations and
+    /// push cleanup. Admitted read streams terminate with `AccountClosed`
+    /// without completion when close wins their next poll. Synchronous accessors
+    /// and cursor classification (`inventory_resume_stream`'s `Some`/`None`
     /// answer) stay live. Awaiting `close` awaits this provider invocation
     /// only. See the `closing` module for the full statement.
     #[admission(close)]

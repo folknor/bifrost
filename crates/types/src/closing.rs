@@ -15,10 +15,16 @@
 //!   is refused. Admission is decided exactly once per future or stream, at
 //!   the open-state check inside its first poll, and remembered: a call
 //!   admitted while open stays admitted when its first poll was `Pending`.
-//! - **Settle admitted work.** An admitted call keeps the provider's result,
+//! - **Settle admitted futures and writes.** Keep the provider's result,
 //!   including any shutdown error and transmission evidence the provider
 //!   reports when close interrupts it. Replacing it with a refusal could hide
 //!   a committed write.
+//! - **Stop admitted reads.** Discovery, inventory (including resume and
+//!   partition), changes, hydration, blob, repair and lifecycle streams stop
+//!   on one `Terminated(AccountClosed)` when close wins the next poll, dropping
+//!   their provider stream and caller input without draining or claiming `Done`.
+//!   Bulk mutation streams drain to preserve committed-item evidence. Push
+//!   streams drain to preserve provider cleanup and their terminal event.
 //! - **Classification stays live.** The synchronous, pure accessors are
 //!   forwarded after close ([`ClosingAccount::EXEMPT_METHODS`]), and
 //!   `inventory_resume_stream` keeps the provider's `Some`/`None` answer so a
@@ -35,7 +41,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 
 use crate::Protocol;
 use crate::account::{Account, AccountFuture, AccountStream};
@@ -80,14 +86,32 @@ impl<A: ?Sized> std::fmt::Debug for ClosingAccount<A> {
 }
 
 /// Shared open/closed state of one gate.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct Admission {
     closed: Arc<AtomicBool>,
+    stop: Arc<std::sync::Mutex<Option<futures::channel::oneshot::Sender<()>>>>,
+    stopped: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        let (stop, stopped) = futures::channel::oneshot::channel();
+        Self {
+            closed: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(std::sync::Mutex::new(Some(stop))),
+            stopped: stopped.shared(),
+        }
+    }
 }
 
 impl Admission {
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        // Wake outside the lock: a waker may re-enter close synchronously.
+        let stop = self.stop.lock().expect("admission lock").take();
+        if let Some(stop) = stop {
+            let _ = stop.send(());
+        }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
@@ -130,27 +154,60 @@ pub(crate) trait Gated: Sized {
 pub(crate) trait Refusal {
     /// The terminal item carrying `error`. It makes no completeness claim.
     fn refusal(error: AccountError) -> Self;
+
+    fn is_terminal(&self) -> bool;
+
+    /// Reads stop without claiming completeness. Writes retain their actual
+    /// outcomes, and push retains provider-owned cleanup and terminal events.
+    fn drain_after_close(_operation: AccountOperation) -> bool {
+        false
+    }
 }
 
 impl<T> Refusal for SyncEvent<T> {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done(_) | Self::Terminated(_))
+    }
+
+    fn drain_after_close(operation: AccountOperation) -> bool {
+        matches!(
+            operation,
+            AccountOperation::UpdateFlags
+                | AccountOperation::BulkMove
+                | AccountOperation::BulkDestroy
+        )
+    }
+
     fn refusal(error: AccountError) -> Self {
         Self::Terminated(error)
     }
 }
 
 impl Refusal for InventoryEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done(_) | Self::Terminated(_))
+    }
+
     fn refusal(error: AccountError) -> Self {
         Self::Terminated(error)
     }
 }
 
 impl Refusal for crate::cursor::ScopeLifecycleEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Terminated(_))
+    }
+
     fn refusal(error: AccountError) -> Self {
         Self::Terminated(error)
     }
 }
 
 impl Refusal for crate::repair::InventoryRepairEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Terminated(_))
+    }
+
     // The repair contract lets `Terminated` stand without per-request
     // outcomes; the engine defers what is outstanding. The request stream is
     // dropped unpolled rather than drained, so a refused call never drives
@@ -161,6 +218,14 @@ impl Refusal for crate::repair::InventoryRepairEvent {
 }
 
 impl Refusal for crate::PushSessionEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Failed(_) | Self::Ended(_))
+    }
+
+    fn drain_after_close(_operation: AccountOperation) -> bool {
+        true
+    }
+
     // A refused session never started, so it has no cleanup to report and
     // ends on its classified failure without `Established` or `Healthy`.
     fn refusal(error: AccountError) -> Self {
@@ -196,12 +261,47 @@ impl<E: Refusal + Send + 'static> Gated for AccountStream<E> {
                 if admission.is_closed() {
                     refused(operation, protocol)
                 } else {
-                    call()
+                    admitted_stream(admission, operation, protocol, call())
                 }
             })
             .flatten(),
         )
     }
+}
+
+/// Stop reads before polling the provider again, even when buffered output is
+/// ready. Removing an account must not certify an unfinished inventory. Bulk
+/// writes instead drain: dropping them can hide an already committed result.
+fn admitted_stream<E: Refusal + Send + 'static>(
+    admission: Admission,
+    operation: AccountOperation,
+    protocol: Protocol,
+    stream: AccountStream<E>,
+) -> AccountStream<E> {
+    if E::drain_after_close(operation) {
+        return stream;
+    }
+    let mut stream = Some(stream);
+    let mut stopped = admission.stopped.clone();
+    Box::pin(futures::stream::poll_fn(move |cx| {
+        use std::task::Poll;
+        let Some(inner) = stream.as_mut() else {
+            return Poll::Ready(None);
+        };
+        if admission.is_closed() || stopped.poll_unpin(cx).is_ready() {
+            stream.take();
+            return Poll::Ready(Some(E::refusal(AccountError::account_closed(
+                operation, protocol,
+            ))));
+        }
+        let result = inner.poll_next_unpin(cx);
+        if matches!(&result, Poll::Ready(None))
+            || matches!(&result, Poll::Ready(Some(event)) if event.is_terminal())
+        {
+            stream.take();
+        }
+        result
+    }))
 }
 
 fn refused<E: Refusal + Send + 'static>(
@@ -236,7 +336,7 @@ pub(crate) fn gate_constructed_stream<E: Refusal + Send + 'static>(
                 drop(stream);
                 refused(operation, protocol)
             } else {
-                stream
+                admitted_stream(admission, operation, protocol, stream)
             }
         })
         .flatten(),
