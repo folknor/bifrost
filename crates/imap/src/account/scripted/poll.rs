@@ -35,6 +35,17 @@ async fn observe_refuses_a_missing_uidnext_and_a_uidnotsticky_folder() {
         sticky.unwrap_err().kind(),
         &AccountErrorKind::Unsupported(AccountOperation::SearchMessages)
     );
+    // RFC 4315 Section 3 prescribes the NO form; it must be recognized too.
+    let (sticky, _) = poller_transcript(
+        "* 4 EXISTS\r\n* OK [UIDVALIDITY 5] ok\r\n* OK [UIDNEXT 9] ok\r\n* NO [UIDNOTSTICKY] Non-persistent UIDs\r\n",
+        vec![],
+        |poller| async move { poller.observe(&ContainerId("INBOX".into())).await },
+    )
+    .await;
+    assert_eq!(
+        sticky.unwrap_err().kind(),
+        &AccountErrorKind::Unsupported(AccountOperation::SearchMessages)
+    );
 }
 
 /// The listing searches an explicit range bounded by UIDNEXT - 1 (never

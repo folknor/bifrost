@@ -976,22 +976,27 @@ recovery open is a fresh connection, which is safe whatever this one reached.
 
 ## Sync helpers
 
-`SelectConsumer` partitions the SELECT/EXAMINE responses once, at the last `* OK [CLOSED]` marker (RFC 7162 Section 3.2.11): everything before it belongs to the previously selected mailbox and becomes events, and the marker itself is dropped. After it, only the solicited types are consumed into the `SelectedMailbox`; among coded untagged statuses that means only a successful (`OK`) status carrying recognized selection metadata (UIDVALIDITY, UIDNEXT, PERMANENTFLAGS, HIGHESTMODSEQ, NOMODSEQ, UNSEEN, MAILBOXID, UIDNOTSTICKY). A NO/BAD status or an unrecognized code stays an event, so a warning or extension signal that arrived while the folder was opening is not swallowed. Validation and construction read the same partition. A successful selection requires a nonzero UIDVALIDITY, read from the tagged response code when present and otherwise from the last untagged one; a missing or zero value is `ProtocolMissing`. On a validation failure every response is returned as an event in its original order.
+`SelectConsumer` partitions the SELECT/EXAMINE responses once, at the last `* OK [CLOSED]` marker (RFC 7162 Section 3.2.11): everything before it belongs to the previously selected mailbox and becomes events, and the marker itself is dropped. After it, only the solicited types are consumed into the `SelectedMailbox`; among coded untagged statuses that means only a successful (`OK`) status carrying recognized selection metadata (UIDVALIDITY, UIDNEXT, PERMANENTFLAGS, HIGHESTMODSEQ, NOMODSEQ, UNSEEN, MAILBOXID, UIDNOTSTICKY). The one exception is `* NO [UIDNOTSTICKY]`, the form RFC 4315 Section 3 and RFC 9051 Section 7.1 prescribe: it is selection metadata, not a warning, so it is consumed and sets `uid_not_sticky` like the tolerated OK form. Any other NO/BAD status or an unrecognized code stays an event, so a warning or extension signal that arrived while the folder was opening is not swallowed. Validation and construction read the same partition. A successful selection requires a nonzero UIDVALIDITY, read from the tagged response code when present and otherwise from the last untagged one; a missing or zero value is `ProtocolMissing`. On a validation failure every response is returned as an event in its original order.
 
 `select_for_sync()` takes the same `SelectOptions` (`types/request.rs`) as direct SELECT/EXAMINE, with `SelectAccess` choosing EXAMINE, and returns a `SyncSelectResult` carrying the QRESYNC outcome and the VANISHED ranges parsed off the SELECT response.
 
 Inventory and the three change strategies deliberately do NOT refuse a
 UIDNOTSTICKY folder (only the poller does). Refusing would hide that folder's
 mail from the user entirely, which removes a capability and needs an owner
-ruling. Its UIDs do not persist across selections, so its cursor is
-re-established whenever UIDVALIDITY moves. Cursor-free recurring inventory is
-blocked on the shared account/engine contract: `CursorEstablishment` only has
-`Ready` and `EstablishViaInventory`, and `FusionOutcome::NoCursor` does not
-schedule another inventory poll. Simply emitting `Done(None)` would stop
-ongoing synchronization. A complete implementation needs a recurring inventory
-mode, authoritative replacement on every poll, and generation-scoped object
-handles (hydration and mutations must not reuse ephemeral UIDs after another
-selection). This requires changes outside the IMAP account layer.
+ruling. Its UIDs do not persist across selections (RFC 4315 Section 3 says
+its UIDVALIDITY differs on each selection), so a changes poll that re-SELECTs
+reports `CursorInvalid` and the engine's `RestartScope` re-runs inventory. That
+cycle is not a working recurring sync: the restart does not retire the old
+generation's object ids (inventory emits no removals for them), and since
+`select_folder` always issues a fresh SELECT/EXAMINE, hydration and mutation of
+an id minted under one selection fail against the next. Cursor-free recurring
+inventory alone would not fix that: `CursorEstablishment` only has `Ready` and
+`EstablishViaInventory`, `FusionOutcome::NoCursor` schedules no further poll,
+and simply emitting `Done(None)` would stop ongoing synchronization. The
+load-bearing missing piece is an access model for handles that do not survive
+a selection; resolving a stale id by Message-ID is not sound (a different
+message can carry the same Message-ID, or none), so a retained-selection model
+is the leading candidate. This requires changes outside the IMAP account layer.
 
 `SelectedMailbox` carries `uid_validity`, `uid_next`, `modseq_support` (a `ModSeqSupport` of `Unknown`, `NoModSeq` or `Highest`, read through `modseq()`; `NOMODSEQ` or `HIGHESTMODSEQ 0` anywhere in the SELECT wins over any nonzero `HIGHESTMODSEQ`), and the SELECT-side VANISHED list. A zero `UIDVALIDITY` or `UIDNEXT` is recorded as absent. A missing or zero `UIDVALIDITY` is a protocol error rather than a silent 0: the account layer judges it through one helper, `selected_uidvalidity`, at every site (sync lanes, PIM primitives, search, raw-body read), as `ProviderFailure::Missing` (`Protocol(MissingField)`, `ProviderContractViolation`) - the server's omission, never a caller-blaming `Request(Malformed)`. A tolerated `MODSEQ 0` in a FETCH response is ignored by the opportunistic STORE-guard cache; it does not fail the sync walk.
 

@@ -43,16 +43,17 @@ or was refused; two design items remain.
 **Reported by:** imap-account; reopened by the wave 1 review.
 
 Inventory and changes on a `UIDNOTSTICKY` folder mint cursors the next SELECT
-voids, so the scope cycles CursorInvalid -> re-inventory. Refusing the folder
-(as the poller does) was tried and reverted: it would make the folder's mail
-vanish from the user's view, which removes a capability. The remaining fix is a
-cursor-free sync mode for such folders (re-inventory on each poll, no durable
-UID cursor, no CursorInvalid loop); the inventory site and `reference/imap.md`
-say so. It cannot be built inside IMAP alone: it needs a shared
-`CursorEstablishment` variant in bifrost-types and engine scheduling of
-repeated authoritative inventory (today `NoCursor` schedules no further poll),
-plus safe hydration and mutation semantics for UID handles that do not survive
-a re-SELECT. A wave of one owning types, sync and imap.
+voids, so each poll publishes `Terminated(CursorInvalid)` and re-inventories.
+Worse than noise: the restart never retires the old generation's ids, and
+hydration and mutation of any id fail against their own fresh SELECT, so on a
+server that rotates UIDVALIDITY per selection the folder's mail is listed but
+unreadable. Refusing the folder is ruled out (removes a capability). The
+recognition defect (the RFC's `* NO [UIDNOTSTICKY]` form was ignored) is
+fixed. The rest is a chain - stickiness observation, an access model for
+handles that do not survive a selection, then the engine contract it needs -
+in `notes/imap-uidnotsticky.md`, which also records why recurring inventory
+alone, a generation roll in changes, and a Message-ID identity bridge were
+rejected.
 
 ## BUG-190 - A Graph subscription row this process does not know still 409s every subscribe for its resource
 

@@ -196,6 +196,16 @@ fn is_select_solicited_response(
                 | ResponseCode::MailboxId(_)
                 | ResponseCode::UidNotSticky
         ),
+        // RFC 4315 Section 3 and RFC 9051 Section 7.1 prescribe the NO form,
+        // `* NO [UIDNOTSTICKY]`, for this one selection signal. It is metadata
+        // about the mailbox being opened, not a warning, so it is consumed
+        // like the OK-coded metadata above (the OK form stays tolerated). No
+        // other NO-coded status is widened into metadata.
+        UntaggedResponse::Status {
+            status: UntaggedStatus::No,
+            code: Some(ResponseCode::UidNotSticky),
+            ..
+        } => true,
         // RFC 9051 Section6.3.2: rev2 SELECT solicits exactly one LIST for
         // the selected mailbox. Consume the first unmarked LIST
         // matching the command target; reclassify NOTIFY-marked LIST.
@@ -338,6 +348,12 @@ pub(in crate::connection) fn build_selected_mailbox(
                 code: Some(code),
                 ..
             } => builder.apply(code),
+            // The prescribed NO form; see `is_select_solicited_response`.
+            UntaggedResponse::Status {
+                status: UntaggedStatus::No,
+                code: Some(ResponseCode::UidNotSticky),
+                ..
+            } => builder.0.uid_not_sticky = true,
             UntaggedResponse::Vanished {
                 earlier: true,
                 uids,
@@ -520,6 +536,86 @@ mod tests {
                 Some(crate::types::Uid::new(12).expect("valid protocol test value"))
             );
         }
+    }
+
+    /// RFC 4315 Section 3 prescribes `* NO [UIDNOTSTICKY]`. It is consumed as
+    /// selection metadata only inside the new mailbox's partition of a
+    /// successful selection; before `[CLOSED]`, on a tagged NO, or on a
+    /// validation failure it stays an event and sets nothing.
+    #[test]
+    fn no_form_uidnotsticky_is_selection_metadata_only_inside_the_new_mailbox() {
+        fn not_sticky(status: UntaggedStatus) -> UntaggedResponse {
+            UntaggedResponse::Status {
+                status,
+                code: Some(ResponseCode::UidNotSticky),
+                text: "Non-persistent UIDs".into(),
+            }
+        }
+        let closed = UntaggedResponse::Status {
+            status: UntaggedStatus::Ok,
+            code: Some(ResponseCode::Closed),
+            text: String::new(),
+        };
+        let mandatory = || {
+            vec![
+                UntaggedResponse::Flags(vec![]),
+                UntaggedResponse::Exists(0),
+                UntaggedResponse::Recent(0),
+            ]
+        };
+        let tagged = |status, code| TaggedResponse {
+            tag: "A001".into(),
+            status,
+            code,
+            text: String::new(),
+        };
+        let ok = || tagged(StatusKind::Ok, Some(ResponseCode::UidValidity(7)));
+        let run = |responses: Vec<UntaggedResponse>, completion: TaggedResponse, examine| {
+            let mut consumer = Box::new(SelectConsumer::new(examine));
+            for response in responses {
+                assert!(
+                    consumer
+                        .on_response(response, NotifyFlags::default(), &default_ctx())
+                        .is_none()
+                );
+            }
+            consumer.finalize(completion, &default_ctx())
+        };
+
+        for status in [UntaggedStatus::No, UntaggedStatus::Ok] {
+            for examine in [false, true] {
+                let mut responses = mandatory();
+                responses.push(not_sticky(status));
+                let done = run(responses, ok(), examine);
+                assert!(done.output.expect("selection succeeds").uid_not_sticky);
+                assert!(done.reclassified_as_events.is_empty());
+            }
+        }
+
+        let mut responses = vec![not_sticky(UntaggedStatus::No), closed];
+        responses.extend(mandatory());
+        let done = run(responses, ok(), false);
+        assert!(!done.output.expect("selection succeeds").uid_not_sticky);
+        assert_eq!(
+            done.reclassified_as_events,
+            vec![not_sticky(UntaggedStatus::No)]
+        );
+
+        let mut responses = mandatory();
+        responses.push(not_sticky(UntaggedStatus::No));
+        let done = run(responses, tagged(StatusKind::No, None), false);
+        assert!(done.output.is_err());
+        assert!(
+            done.reclassified_as_events
+                .contains(&not_sticky(UntaggedStatus::No))
+        );
+
+        let done = run(vec![not_sticky(UntaggedStatus::No)], ok(), false);
+        assert!(done.output.is_err());
+        assert_eq!(
+            done.reclassified_as_events,
+            vec![not_sticky(UntaggedStatus::No)]
+        );
     }
 
     fn default_ctx() -> ConsumerContext<'static> {
