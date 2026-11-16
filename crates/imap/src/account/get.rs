@@ -117,8 +117,9 @@ async fn flush_get_groups(
         std::mem::take(grouped).into_values().collect();
     groups.sort_by(|a, b| a.0.cmp_account_order(&b.0));
     for (folder, ids) in groups {
+        let walk = account.begin_walk(&folder);
         let mut pending = ids;
-        match run_folder_get(account, &folder, &mut pending, projection, tx).await {
+        match run_folder_get(account, &walk, &mut pending, projection, tx).await {
             Ok(()) => {}
             Err(GetError::ChannelDropped) => return Err(()),
             Err(other) => {
@@ -135,9 +136,8 @@ async fn flush_get_groups(
                 let (account_err, bytes_in) = match other {
                     GetError::Account(err, bytes_in) => (err, bytes_in),
                     GetError::Imap(err, bytes_in) => {
-                        let account_err = account.folder_error(
+                        let account_err = walk.error(
                             err,
-                            &folder,
                             super::error::ImapErrorContext::operation(
                                 bifrost_types::AccountOperation::Hydrate,
                             )
@@ -225,19 +225,17 @@ async fn emit_stale_failures(
 /// `Failed`, breaking the one-outcome-per-id contract the engine holds.
 async fn run_folder_get(
     account: &ImapAccount,
-    folder: &MailboxName,
+    walk: &super::FolderWalk,
     pending: &mut Vec<DecodedObjectId>,
     projection: Projection,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<HydratedObject>>>,
 ) -> Result<(), GetError> {
+    let folder = &walk.name;
     let mut conn = account.checkout_for_folder(folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
-    let folder_entry = account.folders.get(folder);
-    let shared_owner = folder_entry
-        .as_ref()
-        .and_then(|entry| entry.shared_owner.clone());
+    let shared_owner = walk.owner();
     let selected = match account
-        .select_folder(&mut conn, folder, super::SelectPurpose::Read)
+        .select_walk(&mut conn, walk, super::SelectPurpose::Read)
         .await
     {
         Ok(selected) => selected,
@@ -335,9 +333,7 @@ async fn run_folder_get(
         // fields replace it. In particular a later ignored MODSEQ 0 must not
         // erase an earlier valid cache observation.
         if let Some(modseq) = fetch.mod_seq {
-            account
-                .folders
-                .record_modseq(folder, uidvalidity, uid, modseq)?;
+            walk.record_modseq(uidvalidity, uid, modseq)?;
         }
         Ok::<(), crate::Error>(())
     })

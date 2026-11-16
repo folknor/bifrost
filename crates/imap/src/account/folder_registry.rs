@@ -872,12 +872,14 @@ impl FolderRegistry {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_cursor(&self, folder: &MailboxName, cursor: FolderCursor) {
         if let Some(entry) = self.get(folder) {
             entry.set_cursor(cursor);
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn modseq(
         &self,
         folder: &MailboxName,
@@ -888,6 +890,7 @@ impl FolderRegistry {
             .and_then(|entry| entry.modseq(uidvalidity, uid))
     }
 
+    #[cfg(test)]
     pub(crate) fn record_modseq(
         &self,
         folder: &MailboxName,
@@ -899,34 +902,6 @@ impl FolderRegistry {
             return entry.record_modseq(uidvalidity, uid, modseq);
         }
         Ok(())
-    }
-
-    pub(crate) fn clear_modseqs(
-        &self,
-        folder: &MailboxName,
-        uidvalidity: crate::types::UidValidity,
-        uids: &[u32],
-    ) {
-        if let Some(entry) = self.get(folder) {
-            entry.clear_modseqs(uidvalidity, uids);
-        }
-    }
-
-    pub(crate) fn clear_modseq_ranges(
-        &self,
-        folder: &MailboxName,
-        uidvalidity: crate::types::UidValidity,
-        ranges: &[UidRange],
-    ) {
-        if let Some(entry) = self.get(folder) {
-            entry.clear_modseq_ranges(uidvalidity, ranges);
-        }
-    }
-
-    pub(crate) fn mark_seen(&self, folder: &MailboxName) {
-        if let Some(entry) = self.get(folder) {
-            entry.mark_seen();
-        }
     }
 }
 

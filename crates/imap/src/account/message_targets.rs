@@ -90,13 +90,14 @@ pub(super) async fn resolve_thread_members(
     };
     let mut members = Vec::new();
     for folder in native_thread_folders(account.folders.entries(), native.kind, scope) {
-        let preflight = folder_preflight_err(account, &folder, op);
+        let walk = account.begin_walk(&folder);
+        let preflight = folder_preflight_err(&walk, op);
         let mut conn = account
             .checkout_for_folder(&folder)
             .await
             .map_err(preflight)?;
         let selected = account
-            .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
+            .select_walk(&mut conn, &walk, super::SelectPurpose::Read)
             .await
             .map_err(preflight)?;
         let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(preflight)?;

@@ -450,8 +450,8 @@ pub(crate) fn strategy_failure(folder: &MailboxName, downgrade: StrategyDowngrad
 }
 
 /// The one folder-scoped classification every mailbox command uses:
-/// `ImapAccount::folder_error` looks up the folder's registry owner and calls
-/// this, and hermetic tests call it directly with the owner they need. A
+/// `FolderWalk::error` supplies its retained entry's owner; hermetic tests
+/// also call this directly with the owner they need. A
 /// permission denial on a shared folder becomes `SyncState(ScopeRevoked)`
 /// scoped to that folder (deriving `Engine(DisableScope(Folder(id)))`), so a
 /// withdrawn share disables only that folder; every other failure keeps its
@@ -1670,11 +1670,10 @@ pub(super) fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + C
 }
 
 pub(super) fn folder_err<'a>(
-    account: &'a super::ImapAccount,
-    folder: &'a MailboxName,
+    walk: &'a super::FolderWalk,
     op: AccountOperation,
 ) -> impl Fn(Error) -> AccountError + Copy + 'a {
-    move |error| account.folder_error(error, folder, ImapErrorContext::operation(op))
+    move |error| walk.error(error, ImapErrorContext::operation(op))
 }
 
 /// Folder-aware classification for a failure in the PREFLIGHT of a per-folder step - the
@@ -1690,11 +1689,10 @@ pub(super) fn folder_err<'a>(
 /// effects remain in FolderProgress and are attached by the public operation;
 /// an unsent preparation does not erase them.
 pub(super) fn folder_preflight_err<'a>(
-    account: &'a super::ImapAccount,
-    folder: &'a MailboxName,
+    walk: &'a super::FolderWalk,
     op: AccountOperation,
 ) -> impl Fn(Error) -> AccountError + Copy + 'a {
-    move |error| folder_err(account, folder, op)(error.for_unsent_operation())
+    move |error| folder_err(walk, op)(error.for_unsent_operation())
 }
 
 #[cfg(test)]

@@ -101,34 +101,3 @@ top-level conjunct against `bodyStructure` names. Verification is only exact
 in that position, and `hasAttachment` is not a proven candidate superset of
 named parts, so neither path is a drop-in.
 
-## BUG-214 - Non-sync IMAP lanes still touch the folder cache by name mid-operation
-
-**Reported by:** the spar on the sync-walk incarnation fix (lateral).
-
-The sync walks now resolve a `FolderWalk` once and route owner, SELECT
-observation, MODSEQ and cursor effects through it. Three other lanes keep the
-older shape, where a folder deleted and recreated mid-operation (UIDVALIDITY
-reused, so the epoch check cannot separate them) lets the old operation read or
-write the new incarnation's cache:
-
-- Hydration: `get.rs` `run_folder_get` captures the owner from one lookup,
-  `select_folder` does a second, and the FETCH callback records MODSEQs by
-  name.
-- Mutations: `mutate.rs` `partition_by_modseq` reads `UNCHANGEDSINCE` guards by
-  name, and the mutation paths clear MODSEQs by name, so a mutation selected on
-  the old folder can consume the new one's guard or clear its cache.
-  `open_folder_for_mutation` would need to hand back the entry with the
-  connection.
-- Push: `push.rs` selects directly (not through `select_folder`), and
-  `absorb_idle_event` records FETCH and VANISHED effects by name while a mailbox
-  event can replace the entry under the still-selected session. Its NOTIFY
-  failure path also looks the owner up after the failure.
-
-Same family: `ImapAccount::folder_pair_error` and `folder_error` look the owner
-up after the command, so a share deleted during a COPY/MOVE or a hydration
-command escalates a denial account-wide. Once these lanes carry an entry, the
-name-keyed `FolderRegistry` cache wrappers (`record_modseq`, `clear_modseqs`,
-`clear_modseq_ranges`, `set_cursor`, `modseq`) have no production caller and
-can go, which would make the compiler hold the rule.
-
-

@@ -367,6 +367,15 @@ pub(crate) fn push_stream(
                 tokio::select! { () = stop.stopped() => break, () = account.shutdown.cancelled() => break, _ = assignment.changed() => {} }
                 continue;
             };
+            // A pending dial may be reassigned. Snapshot before reservation so
+            // even that target uses the incarnation from admission, and a
+            // folder absent here cannot gain observations from this session.
+            let entries: std::collections::HashMap<_, _> = account.folders.entries().into_iter()
+                .map(|entry| (entry.name.clone(), entry)).collect();
+            let retained = |name: &crate::types::MailboxName| super::FolderWalk {
+                name: name.clone(), entry: entries.get(name).cloned(),
+            };
+            let mut walk = retained(&folder);
             let reservation = reserve_push_session(&account);
             tokio::pin!(reservation);
             let reserved = loop {
@@ -375,7 +384,7 @@ pub(crate) fn push_stream(
                     () = stop.stopped() => break 'assignment,
                     () = account.shutdown.cancelled() => break 'assignment,
                     _ = assignment.changed() => {
-                        match choose_assignment(&account, slot) { Some((current, _)) => folder = current, None => continue 'assignment }
+                        match choose_assignment(&account, slot) { Some((current, _)) => { folder = current; walk = retained(&folder); }, None => continue 'assignment }
                     }
                     result = &mut reservation => break result,
                 }
@@ -387,7 +396,11 @@ pub(crate) fn push_stream(
             };
             let conn = match dialed { Ok(conn) => conn, Err(e) => { yield E::Failed(classify(e, &folder)); return; } };
             assignment.borrow_and_update();
-            let Some((folder, version)) = choose_assignment(&account, slot) else { drop(conn); continue; };
+            let Some((current, version)) = choose_assignment(&account, slot) else { drop(conn); continue; };
+            if current != folder { walk = retained(&current); }
+            let folder = current;
+            drop(entries);
+            let observation = walk.entry.as_ref().map(|entry| (entry, entry.begin_selection()));
             let selected = tokio::select! {
                 () = stop.stopped() => break,
                 () = account.shutdown.cancelled() => break,
@@ -397,12 +410,16 @@ pub(crate) fn push_stream(
                 Ok(selected) => selected,
                 Err(e) => {
                     drop(conn);
-                    let e = account.folder_error(e, &folder, ImapErrorContext::operation(AccountOperation::PushStream));
+                    let e = walk.error(e, ImapErrorContext::operation(AccountOperation::PushStream));
                     if select_excludes(&e, &folder) { exclude(&account, &folder, version); yield E::UnitFailed(e); yield E::Ended(End::Reconfigure); }
                     else { yield E::Failed(e); }
                     return;
                 }
             };
+            if let Some((entry, sequence)) = observation {
+                entry.observe_selection(sequence, &selected);
+                entry.mark_seen();
+            }
             let uidvalidity = selected.uid_validity;
             let mut first = true;
             let mut covered = Vec::new();
@@ -412,7 +429,7 @@ pub(crate) fn push_stream(
                 let registered = match notify {
                     Ok(registered) => registered,
                     Err(e) => {
-                        let owner = account.folders.get(&folder).and_then(|entry| entry.shared_owner.clone());
+                        let owner = walk.owner();
                         let (e, degrade) = notify_failure(e, &folder, owner.as_ref());
                         if matches!(e.recovery(), bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::DisableScope(_))) {
                             drop(conn); exclude(&account, &folder, version);
@@ -459,8 +476,8 @@ pub(crate) fn push_stream(
                         drop(conn);
                         yield E::Ended(End::Stopped); return;
                     }
-                    let event = match result { Ok(event) => event, Err(e) => { drop(conn); yield E::Failed(account.folder_error(e, &folder, ImapErrorContext::operation(AccountOperation::PushStream))); return; } };
-                    if absorb_idle_event(&account, &folder, uidvalidity, &event).is_err() { yield invalidated(HintPayload::Unknown); }
+                    let event = match result { Ok(event) => event, Err(e) => { drop(conn); yield E::Failed(walk.error(e, ImapErrorContext::operation(AccountOperation::PushStream))); return; } };
+                    if absorb_idle_event(&account, &walk, uidvalidity, &event).is_err() { yield invalidated(HintPayload::Unknown); }
                     // RFC 5465: overflow clears NOTIFY. Invalidate all coverage
                     // and redial so the next session re-establishes registration.
                     // Outlook users expect updates outside the selected mailbox
@@ -688,7 +705,7 @@ async fn register_notify(
 
 fn absorb_idle_event(
     account: &ImapAccount,
-    selected: &crate::types::MailboxName,
+    selected: &super::FolderWalk,
     uidvalidity: Option<crate::types::UidValidity>,
     event: &IdleEvent,
 ) -> Result<(), crate::Error> {
@@ -700,16 +717,12 @@ fn absorb_idle_event(
             if let (Some(uidvalidity), Some(uid), Some(modseq)) =
                 (uidvalidity, fetch.uid, fetch.mod_seq)
             {
-                account
-                    .folders
-                    .record_modseq(selected, uidvalidity, uid, modseq)?;
+                selected.record_modseq(uidvalidity, uid, modseq)?;
             }
         }
         TypedEvent::Vanished { uids, .. } => {
             if let Some(uidvalidity) = uidvalidity {
-                account
-                    .folders
-                    .clear_modseq_ranges(selected, uidvalidity, uids);
+                selected.clear_modseq_ranges(uidvalidity, uids);
             }
         }
         TypedEvent::MailboxEvent(info) => account.folders.apply_mailbox_event(info.clone()),

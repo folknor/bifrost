@@ -314,9 +314,9 @@ async fn flush_mutation_groups(
                 // the failure classification but reset its attempt evidence
                 // to the operation that was never sent. Shared ACL denials
                 // become folder-scoped revocations here, before the
-                // account-wide terminal check below.
-                let account_err =
-                    mutation_preflight_error(account, &folder, *error, mutation_operation(kind));
+                // account-wide terminal check below. Classification was captured
+                // against the retained entry before handing the failure back.
+                let account_err = *error;
                 if stream_terminating(&account_err) {
                     let _ = tx.send(SyncEvent::Terminated(account_err)).await;
                     return Err(());
@@ -376,22 +376,9 @@ fn validated_move_destination(
 /// the id vector is still whole, which is what lets the caller move the ids
 /// in rather than clone them for a lane that usually never runs.
 struct FolderMutationFailure {
-    error: Box<crate::Error>,
+    error: Box<AccountError>,
     unaccounted: Vec<DecodedObjectId>,
     bytes_in: u64,
-}
-
-fn mutation_preflight_error(
-    account: &ImapAccount,
-    folder: &MailboxName,
-    error: crate::Error,
-    operation: AccountOperation,
-) -> AccountError {
-    account.folder_error(
-        error.for_unsent_operation(),
-        folder,
-        super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
-    )
 }
 
 struct FolderOpenFailure {
@@ -405,8 +392,9 @@ struct FolderOpenFailure {
 /// handed back untouched when any of them fails.
 async fn open_folder_for_mutation(
     account: &ImapAccount,
-    folder: &MailboxName,
+    walk: &super::FolderWalk,
 ) -> Result<(super::PooledConn, crate::types::UidValidity, u64, bool), FolderOpenFailure> {
+    let folder = &walk.name;
     let mut conn = account
         .checkout_for_folder(folder)
         .await
@@ -417,7 +405,7 @@ async fn open_folder_for_mutation(
     // as the opportunistic STORE guard rather than refreshing it from a
     // mutation's own QRESYNC SELECT before testing for a conflict.
     let selected = account
-        .select_folder(&mut conn, folder, super::SelectPurpose::Mutate)
+        .select_walk(&mut conn, walk, super::SelectPurpose::Mutate)
         .await
         .map_err(|error| FolderOpenFailure {
             bytes_in: conn
@@ -468,12 +456,24 @@ async fn run_folder_mutation_with(
     operation: AccountOperation,
     deferred: Option<&mut Vec<(crate::types::UidValidity, Vec<u32>)>>,
 ) -> Result<(Vec<ItemOutcome<MutationSuccess>>, u64), FolderMutationFailure> {
+    let walk = account.begin_walk(folder);
+    let destination = match kind {
+        MutationKind::Copy(destination) => Some(destination),
+        _ => move_destination,
+    }
+    .map(|folder| account.begin_walk(folder));
     let (conn, uidvalidity, previous_bytes_in, has_modseq) =
-        match open_folder_for_mutation(account, folder).await {
+        match open_folder_for_mutation(account, &walk).await {
             Ok(opened) => opened,
             Err(FolderOpenFailure { error, bytes_in }) => {
                 return Err(FolderMutationFailure {
-                    error: Box::new(error),
+                    error: Box::new(
+                        walk.error(
+                            error.for_unsent_operation(),
+                            super::error::ImapErrorContext::operation(operation)
+                                .with_folder_scope(folder),
+                        ),
+                    ),
                     unaccounted: ids,
                     bytes_in,
                 });
@@ -504,7 +504,7 @@ async fn run_folder_mutation_with(
             run_flag_mutation_groups(
                 account,
                 &conn,
-                folder,
+                &walk,
                 uidvalidity,
                 valid,
                 op,
@@ -524,7 +524,7 @@ async fn run_folder_mutation_with(
             run_destroy_mutation_groups(
                 account,
                 &conn,
-                folder,
+                &walk,
                 uidvalidity,
                 valid,
                 operation,
@@ -576,6 +576,9 @@ async fn run_folder_mutation_with(
         }),
     };
 
+    // Local deletion is not evidence that this command failed or committed.
+    // Enterprise users expect the server's outcome and transmission evidence;
+    // retaining the old entry isolates caches without inventing a new verdict.
     // The wire answer and its folder-level side effect are resolved before
     // the settle: the classifier runs once per target and must decide only
     // that target's lane.
@@ -583,7 +586,7 @@ async fn run_folder_mutation_with(
         None => None,
         Some(Ok(outcome)) => {
             if !matches!(kind, MutationKind::Copy(_)) {
-                account.folders.clear_modseqs(folder, uidvalidity, &uids);
+                walk.clear_modseqs(uidvalidity, &uids);
             }
             Some(Ok(outcome))
         }
@@ -596,16 +599,12 @@ async fn run_folder_mutation_with(
                 } => Some((copy.clone(), *stored_deleted)),
                 _ => None,
             };
-            let leaf = account.folder_pair_error(
+            let leaf = walk.pair_error(
                 err,
-                folder,
                 if progress.is_some() {
                     None
                 } else {
-                    match kind {
-                        MutationKind::Copy(destination) => Some(destination),
-                        _ => move_destination,
-                    }
+                    destination.as_ref()
                 },
                 super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
             );
@@ -672,14 +671,15 @@ fn unusable_checkout_error(
 async fn run_destroy_mutation_groups(
     account: &ImapAccount,
     conn: &super::PooledConn,
-    folder: &MailboxName,
+    walk: &super::FolderWalk,
     uidvalidity: crate::types::UidValidity,
     ids: Vec<DecodedObjectId>,
     operation: AccountOperation,
     mut deferred: Option<&mut Vec<(crate::types::UidValidity, Vec<u32>)>>,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
+    let folder = &walk.name;
     let mut results = Vec::new();
-    for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
+    for (unchanged_since, ids) in partition_by_modseq(walk, uidvalidity, ids) {
         let target_batch = TargetBatch::new(ids);
         let uids: Vec<u32> = target_batch.uids().to_vec();
         let Some(uid_set) = target_batch.uid_set().cloned() else {
@@ -705,11 +705,8 @@ async fn run_destroy_mutation_groups(
         let outcome = match store {
             Ok(result) => {
                 if let Some(error) = store_permission_error(&result, operation) {
-                    let error = account.folder_error(
-                        error,
-                        folder,
-                        super::error::ImapErrorContext::operation(operation),
-                    );
+                    let error =
+                        walk.error(error, super::error::ImapErrorContext::operation(operation));
                     results.extend(target_batch.settle(operation, folder, |target| {
                         target.seal(mutation_error_verdict(&error))
                     }));
@@ -718,9 +715,8 @@ async fn run_destroy_mutation_groups(
                 StoreWireOutcome::from_store_result(&result)
             }
             Err(err) => {
-                let error = account.folder_error(
+                let error = walk.error(
                     err,
-                    folder,
                     super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
                 );
                 results.extend(target_batch.settle(operation, folder, |target| {
@@ -731,9 +727,7 @@ async fn run_destroy_mutation_groups(
             }
         };
         let expunge_uids = applied_uids_after_store(&uids, &outcome);
-        account
-            .folders
-            .clear_modseqs(folder, uidvalidity, &expunge_uids);
+        walk.clear_modseqs(uidvalidity, &expunge_uids);
         if let Some(expunge_set) = target_batch.subset_uid_set(&expunge_uids)
             && let Err(err) = expunge_uids_or_fall_back(
                 account,
@@ -746,11 +740,7 @@ async fn run_destroy_mutation_groups(
             // The expunge failure applies only to the UIDs this round
             // actually marked `\Deleted`; the rest keep the STORE's own
             // verdict.
-            let leaf = account.folder_error(
-                err,
-                folder,
-                super::error::ImapErrorContext::operation(operation),
-            );
+            let leaf = walk.error(err, super::error::ImapErrorContext::operation(operation));
             let expunge_error = if let Some(records) = deferred.as_deref_mut() {
                 records.push((uidvalidity, expunge_uids.clone()));
                 leaf
@@ -778,18 +768,19 @@ async fn run_destroy_mutation_groups(
 async fn run_flag_mutation_groups(
     account: &ImapAccount,
     conn: &super::PooledConn,
-    folder: &MailboxName,
+    walk: &super::FolderWalk,
     uidvalidity: crate::types::UidValidity,
     ids: Vec<DecodedObjectId>,
     op: &FlagOp,
     policy: (Option<crate::types::ModSeq>, AccountOperation),
 ) -> Vec<ItemOutcome<MutationSuccess>> {
+    let folder = &walk.name;
     let (expected, operation) = policy;
     let mut results = Vec::new();
     // A caller guard must never be advanced from a push, SELECT or read cache.
     let groups = match expected {
         Some(modseq) => vec![(Some(modseq), ids)],
-        None => partition_by_modseq(account, folder, uidvalidity, ids),
+        None => partition_by_modseq(walk, uidvalidity, ids),
     };
     for (unchanged_since, ids) in groups {
         let target_batch = TargetBatch::new(ids);
@@ -812,7 +803,7 @@ async fn run_flag_mutation_groups(
                 run_patch_mutation_group(
                     account,
                     conn,
-                    folder,
+                    walk,
                     uidvalidity,
                     PatchMutationWork {
                         targets: target_batch,
@@ -839,18 +830,15 @@ async fn run_flag_mutation_groups(
         let classified = match outcome {
             Ok(outcome) => {
                 let changed_uids = applied_uids_after_store(&uids, &outcome);
-                account
-                    .folders
-                    .clear_modseqs(folder, uidvalidity, &changed_uids);
+                walk.clear_modseqs(uidvalidity, &changed_uids);
                 Ok(outcome)
             }
             Err(err) => {
                 if matches!(op, FlagOp::Patch { .. }) {
-                    account.folders.clear_modseqs(folder, uidvalidity, &uids);
+                    walk.clear_modseqs(uidvalidity, &uids);
                 }
-                Err(account.folder_error(
+                Err(walk.error(
                     err,
-                    folder,
                     super::error::ImapErrorContext::operation(operation).with_folder_scope(folder),
                 ))
             }
@@ -884,10 +872,11 @@ struct PatchMutationWork<'a> {
 async fn run_patch_mutation_group(
     account: &ImapAccount,
     conn: &super::PooledConn,
-    folder: &MailboxName,
+    walk: &super::FolderWalk,
     uidvalidity: crate::types::UidValidity,
     work: PatchMutationWork<'_>,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
+    let folder = &walk.name;
     let target_batch = work.targets;
     let uids: Vec<u32> = target_batch.uids().to_vec();
     let set = target_batch
@@ -910,10 +899,9 @@ async fn run_patch_mutation_group(
         // earlier groups are known truth and may never be downgraded to the
         // folder-wide uncertain lane.
         Err(err) => {
-            account.folders.clear_modseqs(folder, uidvalidity, &uids);
-            let error = account.folder_error(
+            walk.clear_modseqs(uidvalidity, &uids);
+            let error = walk.error(
                 err,
-                folder,
                 super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags),
             );
             return target_batch.settle(AccountOperation::UpdateFlags, folder, |target| {
@@ -923,7 +911,7 @@ async fn run_patch_mutation_group(
         }
     };
     let applied = applied_uids_after_store(&uids, &first);
-    account.folders.clear_modseqs(folder, uidvalidity, &applied);
+    walk.clear_modseqs(uidvalidity, &applied);
 
     let second = match target_batch.subset_uid_set(&applied) {
         Some(set) => store_flags(
@@ -936,9 +924,8 @@ async fn run_patch_mutation_group(
         )
         .await
         .map_err(|err| {
-            account.folder_error(
+            walk.error(
                 err,
-                folder,
                 super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
                     .with_folder_scope(folder),
             )
@@ -997,15 +984,14 @@ fn applied_uids_after_store(requested_uids: &[u32], outcome: &StoreWireOutcome) 
 }
 
 fn partition_by_modseq(
-    account: &ImapAccount,
-    folder: &MailboxName,
+    walk: &super::FolderWalk,
     uidvalidity: crate::types::UidValidity,
     ids: Vec<DecodedObjectId>,
 ) -> Vec<(Option<crate::types::ModSeq>, Vec<DecodedObjectId>)> {
     let mut protected: BTreeMap<crate::types::ModSeq, Vec<DecodedObjectId>> = BTreeMap::new();
     let mut unprotected = Vec::new();
     for id in ids {
-        if let Some(modseq) = account.folders.modseq(folder, uidvalidity, id.uid.get()) {
+        if let Some(modseq) = walk.modseq(uidvalidity, id.uid.get()) {
             protected.entry(modseq).or_default().push(id);
         } else {
             unprotected.push(id);
@@ -1343,12 +1329,7 @@ pub(super) async fn result_folder_mutation(
     .await
     {
         Ok((items, _)) => Ok((items, marked_deleted)),
-        Err(failure) => Err(mutation_preflight_error(
-            account,
-            folder,
-            *failure.error,
-            operation,
-        )),
+        Err(failure) => Err(*failure.error),
     }
 }
 
@@ -2035,7 +2016,7 @@ mod tests {
             2,
         );
         // The same classification `run_patch_mutation_group` applies to a
-        // first-STORE wire error, through `ImapAccount::folder_error`.
+        // first-STORE wire error, through the retained `FolderWalk::error`.
         let error = super::super::error::folder_error(
             crate::Error::Provider(crate::error::ProviderFailure::Protocol(
                 "STORE never answered".into(),

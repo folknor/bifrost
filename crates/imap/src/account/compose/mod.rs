@@ -422,13 +422,14 @@ async fn fetch_full_message(
     account: &ImapAccount,
     decoded: &DecodedObjectId,
 ) -> Result<bytes::Bytes, AccountError> {
-    let err = folder_err(account, &decoded.folder, AccountOperation::DraftSend);
+    let walk = account.begin_walk(&decoded.folder);
+    let err = folder_err(&walk, AccountOperation::DraftSend);
     let mut conn = account
         .checkout_for_folder(&decoded.folder)
         .await
         .map_err(err)?;
     account
-        .select_folder(&mut conn, &decoded.folder, super::SelectPurpose::Read)
+        .select_walk(&mut conn, &walk, super::SelectPurpose::Read)
         .await
         .map_err(err)?;
     let operand = pim_operand([decoded.uid.get()], AccountOperation::DraftSend)?;

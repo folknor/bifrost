@@ -80,10 +80,10 @@ pub(crate) fn container_create(
                 )
             })
             .transpose()?;
+        let walk = account.begin_walk(authority.as_ref().unwrap_or(&full_name));
         let err = |error| {
-            account.folder_error(
+            walk.error(
                 error,
-                authority.as_ref().unwrap_or(&full_name),
                 super::error::ImapErrorContext::operation(AccountOperation::ContainerCreate),
             )
         };
@@ -120,7 +120,8 @@ pub(crate) fn container_rename(
         )?;
         let new_name =
             renamed_sibling(&account, &folder, &name, AccountOperation::ContainerRename)?;
-        let err = folder_err(&account, &folder, AccountOperation::ContainerRename);
+        let walk = account.begin_walk(&folder);
+        let err = folder_err(&walk, AccountOperation::ContainerRename);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
             .await
@@ -165,7 +166,11 @@ pub(crate) fn container_move(
                 folder_from_container(&account.dav_scopes, parent, AccountOperation::ContainerMove)
             })
             .transpose()?;
-        let err = folder_err(&account, &folder, AccountOperation::ContainerMove);
+        let walk = account.begin_walk(&folder);
+        let destination_walk = destination
+            .as_ref()
+            .map(|folder| account.begin_walk(folder));
+        let err = folder_err(&walk, AccountOperation::ContainerMove);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
             .await
@@ -174,10 +179,9 @@ pub(crate) fn container_move(
             .rename(&folder, &new_name, account.command_timeout())
             .await
             .map_err(|error| {
-                account.folder_pair_error(
+                walk.pair_error(
                     error,
-                    &folder,
-                    destination.as_ref(),
+                    destination_walk.as_ref(),
                     super::error::ImapErrorContext::operation(AccountOperation::ContainerMove),
                 )
             })?;
@@ -199,7 +203,8 @@ pub(crate) fn container_delete(
             &container,
             AccountOperation::ContainerDelete,
         )?;
-        let err = folder_err(&account, &folder, AccountOperation::ContainerDelete);
+        let walk = account.begin_walk(&folder);
+        let err = folder_err(&walk, AccountOperation::ContainerDelete);
         let mut conn = account.pool.checkout_any().await.map_err(err)?;
         conn.deselect_target(&folder, account.command_timeout())
             .await

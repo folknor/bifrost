@@ -65,20 +65,11 @@ pub(crate) fn open_raw_rfc822(
                 let _ = tx.send(terminated_event(err)).await;
             }
             Err(BlobError::Imap(err)) => {
-                let error = match super::decode_object_id(&message, AccountOperation::OpenRawRfc822)
-                {
-                    Ok(decoded) => account.folder_error(
-                        err,
-                        &decoded.folder.clone(),
-                        super::error::ImapErrorContext::operation(AccountOperation::OpenRawRfc822)
-                            .with_message_id(scope_id),
-                    ),
-                    Err(_) => super::account_error_with(
-                        err,
-                        super::error::ImapErrorContext::operation(AccountOperation::OpenRawRfc822)
-                            .with_message_id(scope_id),
-                    ),
-                };
+                let error = super::account_error_with(
+                    err,
+                    super::error::ImapErrorContext::operation(AccountOperation::OpenRawRfc822)
+                        .with_message_id(scope_id),
+                );
                 let _ = tx.send(terminated_event(error)).await;
             }
         }
@@ -174,6 +165,47 @@ pub(super) async fn run_fetch(
     persistence: UidPersistence,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
 ) -> Result<RawFetchOutcome, BlobError> {
+    let walk = account.begin_walk(folder);
+    let result = run_fetch_walk(
+        account,
+        &walk,
+        expected_uidvalidity,
+        uid,
+        op,
+        budget,
+        persistence,
+        tx,
+    )
+    .await;
+    result.map_err(|error| match error {
+        BlobError::Imap(error)
+            if walk.owner().is_some()
+                && super::error::permission_denied(
+                    &error,
+                    &super::error::ImapErrorContext::operation(op),
+                ) =>
+        {
+            BlobError::Account(walk.error(
+                error,
+                super::error::ImapErrorContext::operation(op).with_folder_scope(folder),
+            ))
+        }
+        other => other,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_fetch_walk(
+    account: &ImapAccount,
+    walk: &super::FolderWalk,
+    expected_uidvalidity: crate::types::UidValidity,
+    uid: u32,
+    op: AccountOperation,
+    budget: usize,
+    persistence: UidPersistence,
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
+) -> Result<RawFetchOutcome, BlobError> {
+    let folder = &walk.name;
     let attr = FetchAttr::BodySection {
         peek: true,
         section: None,
@@ -187,12 +219,9 @@ pub(super) async fn run_fetch(
     }
     let mut conn = account.checkout_for_folder(folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
-    let folder_entry = account.folders.get(folder);
-    let shared_owner = folder_entry
-        .as_ref()
-        .and_then(|entry| entry.shared_owner.clone());
+    let shared_owner = walk.owner();
     let selected = match account
-        .select_folder(&mut conn, folder, super::SelectPurpose::Read)
+        .select_walk(&mut conn, walk, super::SelectPurpose::Read)
         .await
     {
         Ok(selected) => selected,

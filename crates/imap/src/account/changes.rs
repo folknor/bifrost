@@ -105,12 +105,12 @@ pub(crate) fn changes_stream(
                 let _ = tx.send(terminated_event(err)).await;
             }
             Err(ChangeError::Imap(err)) => {
-                let error = account.folder_error(
+                let error = super::account_error_with(
                     err,
-                    &folder,
                     super::error::ImapErrorContext::operation(
                         bifrost_types::AccountOperation::SyncChanges,
-                    ),
+                    )
+                    .with_folder_scope(&folder),
                 );
                 let _ = tx.send(terminated_event(error)).await;
             }

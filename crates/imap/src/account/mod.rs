@@ -102,7 +102,7 @@ pub(crate) enum SelectPurpose<'a> {
     Mutate,
 }
 
-/// One sync walk's folder: the name it addresses and the registry entry
+/// One folder operation's identity: the name it addresses and the registry entry
 /// (incarnation) it began on, resolved once by `ImapAccount::begin_walk`.
 ///
 /// Every cache effect of the walk - MODSEQ records and clears, and the
@@ -133,6 +133,36 @@ impl FolderWalk {
         self.entry
             .as_ref()
             .and_then(|entry| entry.shared_owner.clone())
+    }
+
+    pub(crate) fn error(&self, error: Error, ctx: error::ImapErrorContext) -> AccountError {
+        error::folder_error(error, &self.name, self.owner().as_ref(), ctx)
+    }
+
+    pub(crate) fn pair_error(
+        &self,
+        error: Error,
+        destination: Option<&Self>,
+        ctx: error::ImapErrorContext,
+    ) -> AccountError {
+        let folder = if self.owner().is_none() && error::permission_denied(&error, &ctx) {
+            destination
+                .filter(|walk| walk.owner().is_some())
+                .unwrap_or(self)
+        } else {
+            self
+        };
+        folder.error(error, ctx)
+    }
+
+    pub(crate) fn modseq(
+        &self,
+        uidvalidity: UidValidity,
+        uid: u32,
+    ) -> Option<crate::types::ModSeq> {
+        self.entry
+            .as_ref()
+            .and_then(|entry| entry.modseq(uidvalidity, uid))
     }
 
     pub(crate) fn record_modseq(
@@ -313,56 +343,7 @@ impl ImapAccount {
         self.pool.checkout_for_folder(folder).await
     }
 
-    /// The registry's shared-ownership fact for `folder`. A SELECT error
-    /// boundary captures this before issuing the command: an entry removed or
-    /// replaced while SELECT is in flight must not erase the command's known
-    /// shared identity.
-    pub(crate) fn folder_owner(&self, folder: &MailboxName) -> Option<bifrost_types::PrincipalId> {
-        self.folders
-            .get(folder)
-            .and_then(|entry| entry.shared_owner.clone())
-    }
-
-    /// Classify every mailbox command, including failures after selection.
-    /// Outlook users expect a revoked share to disable only that folder.
-    pub(crate) fn folder_error(
-        &self,
-        error: Error,
-        folder: &MailboxName,
-        ctx: error::ImapErrorContext,
-    ) -> AccountError {
-        let owner = self.folder_owner(folder);
-        error::folder_error(error, folder, owner.as_ref(), ctx)
-    }
-
-    /// COPY/MOVE can be denied at either endpoint. Prefer a known shared
-    /// source, otherwise quarantine a shared destination on permission loss.
-    /// A user's personal mailbox must remain usable after a share is withdrawn.
-    pub(crate) fn folder_pair_error(
-        &self,
-        error: Error,
-        source: &MailboxName,
-        destination: Option<&MailboxName>,
-        ctx: error::ImapErrorContext,
-    ) -> AccountError {
-        let source_shared = self
-            .folders
-            .get(source)
-            .is_some_and(|entry| entry.shared_owner.is_some());
-        let folder = if !source_shared && error::permission_denied(&error, &ctx) {
-            destination
-                .filter(|folder| {
-                    self.folders
-                        .get(folder)
-                        .is_some_and(|entry| entry.shared_owner.is_some())
-                })
-                .unwrap_or(source)
-        } else {
-            source
-        };
-        self.folder_error(error, folder, ctx)
-    }
-
+    #[cfg(test)]
     pub(crate) async fn select_folder(
         &self,
         conn: &mut PooledConn,
@@ -373,7 +354,7 @@ impl ImapAccount {
         self.select_on(conn, folder, entry.as_ref(), purpose).await
     }
 
-    /// Begin a sync walk: resolve the folder's incarnation once, before the
+    /// Begin a folder operation: resolve the folder's incarnation once, before the
     /// checkout and SELECT, so the walk's owner, selection observation and
     /// every cache write it makes belong to the same entry.
     pub(crate) fn begin_walk(&self, folder: &MailboxName) -> FolderWalk {

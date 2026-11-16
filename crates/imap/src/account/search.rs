@@ -30,13 +30,14 @@ pub(crate) fn search(
             if pager.is_full() {
                 break;
             }
-            let err = folder_err(&account, &folder, AccountOperation::Search);
+            let walk = account.begin_walk(&folder);
+            let err = folder_err(&walk, AccountOperation::Search);
             // Checkout can authenticate a fresh session: its failures are
             // account-level even when a provider reports permission denial.
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let outcome = async {
                 let selected = account
-                    .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
+                    .select_walk(&mut conn, &walk, super::SelectPurpose::Read)
                     .await
                     .map_err(err)?;
                 let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
@@ -141,13 +142,14 @@ pub(crate) fn search_messages(
             if pager.is_full() {
                 break;
             }
-            let err = folder_err(&account, &folder, AccountOperation::SearchMessages);
+            let walk = account.begin_walk(&folder);
+            let err = folder_err(&walk, AccountOperation::SearchMessages);
             // Checkout can authenticate a fresh session: its failures are
             // account-level even when a provider reports permission denial.
             let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let outcome = async {
                 let selected = account
-                    .select_folder(&mut conn, &folder, super::SelectPurpose::Read)
+                    .select_walk(&mut conn, &walk, super::SelectPurpose::Read)
                     .await
                     .map_err(err)?;
                 let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;

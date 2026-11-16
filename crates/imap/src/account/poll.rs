@@ -330,7 +330,7 @@ impl ImapPoller {
     ) -> Result<FolderObservation, AccountError> {
         let op = AccountOperation::SearchMessages;
         let folder = folder_of(container, op)?;
-        let (_conn, selected) = examine(&self.account, &folder, op).await?;
+        let (_conn, selected, _walk) = examine(&self.account, &folder, op).await?;
         observation(&selected, &folder, op)
     }
 
@@ -350,7 +350,7 @@ impl ImapPoller {
     ) -> Result<UidListing, AccountError> {
         let op = AccountOperation::SearchMessages;
         let folder = folder_of(container, op)?;
-        let (conn, selected) = examine(&self.account, &folder, op).await?;
+        let (conn, selected, walk) = examine(&self.account, &folder, op).await?;
         let observation = observation(&selected, &folder, op)?;
         if observation.uid_validity != scan.uid_validity {
             return Ok(UidListing::GenerationChanged { observation });
@@ -378,10 +378,7 @@ impl ImapPoller {
                 .connection()
                 .uid_search(format!("UID {lo}:{hi}"), self.account.command_timeout())
                 .await
-                .map_err(|err| {
-                    self.account
-                        .folder_error(err, &folder, ImapErrorContext::operation(op))
-                })?
+                .map_err(|err| walk.error(err, ImapErrorContext::operation(op)))?
                 .ids;
             found.retain(|uid| (lo..=hi).contains(uid));
             found.sort_unstable();
@@ -471,9 +468,8 @@ impl ImapPoller {
                 Ok(RawMessage::GenerationChanged { observed })
             }
             Err(BlobError::Account(err)) => Err(err),
-            Err(BlobError::Imap(err)) => Err(self.account.folder_error(
+            Err(BlobError::Imap(err)) => Err(super::account_error_with(
                 err,
-                &folder,
                 ImapErrorContext::operation(op).with_message_id(message.object_id().0),
             )),
             Err(BlobError::ChannelDropped) => {
@@ -500,26 +496,24 @@ async fn examine(
     account: &ImapAccount,
     folder: &MailboxName,
     op: AccountOperation,
-) -> Result<(PooledConn, SelectedMailbox), AccountError> {
+) -> Result<(PooledConn, SelectedMailbox, super::FolderWalk), AccountError> {
     if account.shutdown.is_cancelled() {
         return Err(AccountError::account_closed(
             op,
             bifrost_types::Protocol::Imap,
         ));
     }
+    let walk = account.begin_walk(folder);
     let mut conn = account
         .checkout_for_folder(folder)
         .await
         .map_err(|err| folder_error(err, folder, op))?;
-    let shared_owner = account
-        .folders
-        .get(folder)
-        .and_then(|entry| entry.shared_owner.clone());
+    let shared_owner = walk.owner();
     match account
-        .select_folder(&mut conn, folder, super::SelectPurpose::Read)
+        .select_walk(&mut conn, &walk, super::SelectPurpose::Read)
         .await
     {
-        Ok(selected) => Ok((conn, selected.mailbox)),
+        Ok(selected) => Ok((conn, selected.mailbox, walk)),
         Err(err) => Err(super::error::shared_folder_error(
             err,
             folder,
