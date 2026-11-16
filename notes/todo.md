@@ -37,16 +37,13 @@ not verified against the code. Verification happens when an item is worked.
 Items that leak something or report success for something that did not
 happen, plus one surface gap that matters if the consumer relies on it.
 
-- **`SyncEngine` exposes almost no calendar primitives.** It forwards contact
-  primitives, but of the calendar `Account` methods only `event_delete` and
-  `event_delete_if_version` (`crates/sync/src/engine/passthrough.rs`). List,
-  range, get, create, update, RSVP and search have no passthrough, and
-  `event_rsvp_if_version` needs one too:
-  `pub async fn event_rsvp_if_version(&self, account_id: &AccountId, event: EventId, status: RsvpStatus, expected_version: Option<ServerVersion>) -> Result<(), Error>`.
-  An omission only if the engine is meant to be the consumer's single door
-  for calendar, as it is for contacts.
 - **`BatchOutcome::iter()` yields builder push order, not submission order.**
   The docs now say so; whether consumers need submission order is open.
+  **Recommendation (owner-agreed, not a ruling):** no change. Every entry
+  carries its `item` key and the builder enforces each submitted id appears
+  exactly once, so consumers pair by key, never by position. Close-out owes
+  the `iter()` doc a sentence saying so (order is stable but carries no
+  meaning).
 - **`AccountFactory` has no permanent-removal notification.** JMAP's
   per-factory method refusal history (which keeps a server that refuses an
   advertised method from looping account restarts) is pruned only through
@@ -54,9 +51,17 @@ happen, plus one surface gap that matters if the consumer relies on it.
   detach; clearing it on an ordinary account drop would reopen the restart
   loop. Whether the shared factory trait gains a removal hook is an API
   decision.
+  **Recommendation (owner-agreed, not a ruling):** add
+  `AccountFactory::forget_account(&self, id: &AccountId)` with a default no-op,
+  and a `SyncEngine` permanent-removal door beside `detach` that detaches and
+  then calls it. Plain `detach` and reattach keep the history: removing an
+  account forgets it, a reconnect keeps what was learned.
 - **`UnsupportedReason::LabelKind` has no producer.** Its only producers were
   JMAP's label overrides, replaced by declared `LabelShape`s. Keep or remove is
   the owner's call (published variant).
+  **Recommendation (owner-agreed, not a ruling):** remove. Its role moved on
+  purpose to declared `LabelShape`s; a variant nothing produces offers
+  consumers nothing. Reintroduce with a producer if one appears.
 
 ## 2. Blocked on a live probe
 
@@ -123,6 +128,14 @@ face.
   The other recipients' failures are dropped from that `Err`. Decide whether
   "acceptance uncertain, none acknowledged" becomes a receipt state, and if so
   what Sent filing and draft cleanup do for a maybe-sent message.
+  **Recommendation (owner-agreed, not a ruling):** no IMAP-only receipt state;
+  every provider returns `Err` for a send of unknown acceptance. Bring IMAP to
+  Graph's shape (`send_progress_error` in `graph/src/account/pim/send.rs`): a
+  partial-commit record with `ReplaySafety::AfterObservation`, every
+  recipient's outcome including the failures, never terminal advice for an
+  uncertain final reply, draft discard still skipped. Whether "maybe sent"
+  becomes an `Ok` receipt state for all providers is a separate cross-provider
+  question, unbuilt unless the consumer wants that UI state.
 
 - **Gmail and Graph ignore `save_to_sent = false`.** Both file the Sent copy
   server-side unconditionally (`_save_to_sent` is unused in
@@ -130,6 +143,11 @@ face.
   and their `SendReceipt` says `ProviderManaged`. Decide whether a declined Sent
   copy should be refused as `Unsupported`, honoured by a post-send delete, or
   documented as a provider limit on `SendRequest::save_to_sent`.
+  **Recommendation (yardstick, not a ruling):** document it as a provider limit on
+  `SendRequest::save_to_sent` and keep `ProviderManaged` on the receipt. An
+  Outlook user on Exchange or Gmail always gets a Sent copy; refusing the send
+  would block mail, and a post-send delete is a destructive compensation that
+  can race the server's own filing.
 - **`SendReceipt::id` multiplexes three identities.** It is a message id, a
   scheduled-send handle (JMAP returns the EmailSubmission id when scheduled), or
   an IMAP `imapmsgid1:` correlation token that names no addressable object.
@@ -146,6 +164,29 @@ face.
   APPENDUID-derived id or `ObjectId("imapmsgid1:<Message-ID>")` that
   `decode_object_id` rejects, and noted `SentCopy::Filed { id: Option<..> }`
   already carries the addressable case separately.
+  **Recommendation (owner-agreed, "type it properly"; not a ruling):** each
+  identity gets its own type, and nothing converts between them implicitly.
+
+  ```rust
+  #[non_exhaustive]
+  pub enum SubmissionRef {
+      /// The sent message, addressable through the message doors.
+      Message(ObjectId),
+      /// A pending scheduled send; the only key the scheduled doors take.
+      Scheduled(ScheduledSendHandle),
+      /// A correlation token naming no addressable object (IMAP's
+      /// Message-ID based token). Not an `ObjectId`; never decodes as one.
+      Correlation(CorrelationToken),
+  }
+  pub struct ScheduledSendHandle(/* opaque, provider-minted */);
+  pub struct CorrelationToken(/* opaque */);
+  ```
+
+  `SendReceipt::id: SubmissionRef`; `cancel_scheduled_send(ScheduledSendHandle)`
+  and `reschedule_send(ScheduledSendHandle, ..)`; delete
+  `impl From<DraftHandle> for ObjectId` so a draft handle cannot reach a
+  message door. `draft_send` gains a per-call `save_to_sent` matching
+  `send_message`.
 - **A JMAP send's leftover staging Email has no routable handle on the
   receipt.** When the implicit `Email/set` refuses or does not confirm the
   Sent move, the created/imported Email (or, for `draft_send`, the submitted
@@ -159,6 +200,12 @@ face.
   be addressed by a `DraftHandle`. Decide whether `SendReceipt` grows a field
   naming the retained or possibly retained Email with an owner-preserving
   handle, distinguishing refused, uncertain and failed-destroy.
+  **Recommendation (owner unsure, not endorsed; not a ruling):** an optional
+  `SendReceipt` field naming the leftover Email by a properly typed,
+  owner-preserving handle (see the `SubmissionRef` entry), with state
+  `Retained` / `PossiblyRetained` / `DestroyFailed`, so a sent message never
+  sits sendable in Drafts unseen. The low-priority `.ok()` staging-Email entry
+  would fold in as the same record on the failure path. Revisit with the owner.
 - **A proxy 407 maps to `AuthLost`, implying the wrong remedy.** JMAP
   classifies net's typed `TunnelError` (407 ->
   `Authentication(ReauthorizationRequired)` / `AuthLost`, proxy TLS ->
@@ -167,6 +214,10 @@ face.
   account when the proxy's credentials are wrong; only support detail says so.
   Decide whether the taxonomy gains a proxy-credential kind or a different
   existing kind fits better.
+  **Recommendation (yardstick, not a ruling):** not `AuthLost`. Asking for the mail password when
+  the proxy refused is the wrong remedy and invites a lockout loop. Gains a
+  distinct proxy-authentication kind (Transport-side, no reauthorization
+  advice). Adding the kind is a types change, still build work.
 - **`MutationConcurrency::StateBased` has no producer left.** Keep or remove
   is the owner's decision, to be made later. JMAP, CalDAV, CardDAV and Graph
   moved off it, so no provider advertises it. The `IdempotencyKey` doc in
@@ -175,6 +226,9 @@ face.
   scope) confirmed it is constructed nowhere and folded the question into a
   proposal to replace `ExpectedVersion`'s eight bools plus `None` with one
   doors bitset (filed in the hunt's `structural.md`).
+  **Recommendation (owner-agreed, not a ruling):** remove; every provider left
+  it on purpose. Reword the `IdempotencyKey` doc to stand alone. The bitset
+  reshape is independent.
 - **Engine-internal requests on the published `ReopenRequest`.**
   `ScopeDeleted`, `ScopeCreated`, `EstablishIfAbsent` and `SchemaReset` are
   engine plumbing whose epochs and generations mean nothing to a consumer, on
@@ -187,12 +241,22 @@ face.
   carrying a stamp type, `Stamp::{Incarnation(AccountGeneration), Injected}`,
   so the type says only the sink is unstamped, and argued `ReopenRequest`
   belongs to the per-account supervisor rather than to `multiplexer`.
+  **Recommendation (owner tentatively agreed, less sure; not a ruling):** move
+  the four plumbing variants to a crate-private request enum; merge
+  `PushRecovery` into `Recovery` with `Stamp::{Incarnation(AccountGeneration),
+  Injected}`; move `ReopenRequest` to the per-account supervisor.
 - **Caller-version residue.** Ruled (2026-10-21) and largely landed. Still
   open: JMAP PIM reads expose no caller type-state field, so a consumer has
   nothing to hand back, although JMAP capabilities already advertise
   `ExpectedVersion` on those doors (advertising an unusable guarantee is a
   product question); IMAP versioned flag writes are still submitted per
   target; other mutation families have no caller-version surface.
+  **Recommendation (owner-agreed, not a ruling):** JMAP reads return the
+  version its update doors enforce, so the advertised `ExpectedVersion` is
+  usable; where no per-object version exists, that door stops advertising it
+  (check how the doors enforce today first). IMAP per-target versioned writes
+  are performance only: batch later by `UNCHANGEDSINCE`. Other families wait
+  for a consumer; nothing is advertised there.
 - **BulkDestroy PartialResponse derives DedupeByClientId** even though destroy
   has no client-id deduplication. This protects Graph/JMAP's usual ambiguous
   destroy answers from reassertion. An operation-aware derivation requires an
@@ -203,9 +267,18 @@ face.
   all carry `DedupeByClientId`. A reschedule-only partial-commit record with a
   `Cancelled` Uncertain primary would drop it there, but was not built ahead
   of the general ruling.
+  **Recommendation (owner-agreed, not a ruling):** make the central derivation
+  operation-aware. An unanswered destroy-shaped operation means "re-issue the
+  destroy; already gone counts as done" (the absent-target rule), not
+  `DedupeByClientId`. One ruling for the whole destroy family. Give the
+  `RescheduleSend` cancel leg its own partial-commit record.
 - **A dedupe-bearing stream termination leaves same-round per-item
   SameRequest/AfterAuthRefresh blind retry candidates eligible.** Whether
   whole-submission dedupe should suppress these retries needs a ruling.
+  **Recommendation (owner-agreed, low stakes; not a ruling):** the
+  whole-submission "observe first" overrides same-round per-item blind retry
+  candidates. The owner notes duplicates are also acceptable, so this is
+  hygiene, not urgency.
 
 ### Write outcomes and compensation
 
@@ -252,15 +325,26 @@ face.
 - **IMAP container operations return a refresh_folders failure after the
   write commits.** The partial-commit record makes this honest; whether to
   return success with a stale registry is a separate API decision.
+  **Recommendation (yardstick, not a ruling):** return success. The folder was created, renamed or
+  deleted; reporting failure invites a duplicate retry. The stale registry is
+  repaired by the next refresh, and the refresh failure is logged, not
+  returned.
 - **Graph send_message leaves an orphan draft after a refused send;** each
   automatic retry can create another. Accepted Repeatable clutter, bounded by
   retry budgets. Orphan cleanup would be a new compensation; none exists in
   `pim/send.rs`.
+  **Recommendation (owner: "obviously"; not a ruling):** a retry re-sends the
+  draft it already created instead of creating another; on final failure
+  exactly one draft remains, so the user keeps the message and nothing piles
+  up.
 - **Mutation outcomes carry no per-id detail.**
   `MutationCounters::pending_retry` is a single count that lumps unsent work,
   exhausted retries, read-back mismatches and inconclusive read-backs, with no
   object ids. A consumer that wants to replay or report precisely can only
   re-run the whole campaign.
+  **Recommendation (yardstick, not a ruling):** the outcome lists the affected
+  ids grouped by reason (unsent, retries exhausted, unconfirmed), counts kept
+  as a summary, as `BatchOutcome` already does per batch.
 
 ### Engine behaviour
 
@@ -270,20 +354,36 @@ face.
   structured notification; a folder-scoped termination could incorrectly imply
   that folder polling died. Matters if a consumer UI reads it as "account
   dead".
+  **Recommendation (yardstick, not a ruling):** a push-unit failure while polling continues must not
+  read as "account dead". It becomes a degraded-push notification (a warning
+  that live updates fell back to polling), not `Terminated`. Build work.
 - **Push and lifecycle pause policy.** Lifecycle streams continue polling
   while the account boundary is paused; the multiplexer owns their pacing but
   does not consult the boundary. Push sessions gate only directive submission;
   registration maintenance may need to keep server watches alive, while
   Connection lanes retain live transports. Decide their pause semantics
   together.
+  **Recommendation (yardstick, not a ruling):** pause means no new user-visible
+  work and no new traffic beyond keeping server registrations alive: lifecycle
+  polling stops, push stops submitting, watch renewal continues (so resuming
+  does not cost a full resubscribe), idle connections may be released.
+  Resume picks up without a resync.
 - **Scope disable and push subscriptions.** DisableScope quarantines a cursor
   but does not narrow desired push subscriptions. An IMAP folder excluded after
   SELECT refusal remains in the subscription registry until consumer
   unsubscribe or account replacement. Decide whether engine scope quarantine
   should also change desired coverage.
+  **Recommendation (yardstick, not a ruling):** yes. A disabled scope drops out
+  of desired push coverage and rejoins when re-enabled; holding a server watch
+  for a folder the engine will not sync wastes a provider subscription and
+  produces notifications nothing acts on.
 - **Uncertain mutation items carrying Engine recovery are observed but do not
   forward the directive** (`classify_item_outcome` in sync engine bulk). The
   reassertion path protects these ids; forwarding is separate work.
+  **Recommendation (yardstick, not a ruling):** forward it. An item whose
+  error asks the engine to restart a scope or resync is evidence the engine's
+  state is stale; observing it without acting leaves the user looking at that
+  stale state.
 
 ### New capability
 
@@ -292,16 +392,25 @@ face.
   submits later would want the moment the user pressed Send instead; a
   `SendRequest` field (defaulting to now) would carry it. Surfaced by the
   codex spar on bz#1; not built because it is a new consumer-facing knob.
+  **Recommendation (yardstick, not a ruling):** build it, optional, defaulting
+  to now. Outlook stamps a message queued offline with when the user pressed
+  Send.
 - **Gmail `draft_send` and `Date`.** Google drafts are rendered without a
   `Date` and handed to drafts.send as stored. If a live probe shows Gmail
   keeps a missing `Date` missing in the sent copy, `draft_send` could fetch
   the draft and pass replacement `message.raw` stamped with the send time
   in the same drafts.send call.
+  **Recommendation (yardstick, not a ruling):** if the probe shows the Date
+  stays missing, do it; a sent message without a Date shows wrong or blank in
+  recipients' clients. Still blocked on the probe.
 
 - **Graph contact moves.** `crates/graph/src/account/contacts.rs`. A folder
   change is refused as `Unsupported(ContactUpdate)` before I/O. Supporting it
   means folder-aware move routing (Graph lists `parentFolderId` as an update
   field).
+  **Recommendation (yardstick, not a ruling):** build it. Moving a contact
+  between folders is ordinary Outlook behaviour, and the other providers that
+  have folders support it.
 
 - **Graph public-folder mail writes over EWS.** `crates/graph/src/account/mutate.rs`,
   `pim/messages.rs`. Flag writes, moves, destroys and the typed writers refuse
@@ -313,10 +422,17 @@ face.
   completion handling that meet the mutation contracts, and a capability
   story for a namespace-specific write gap. Not built: nobody has ruled
   public folders writable.
+  **Recommendation (yardstick, not a ruling):** build it. In an Exchange shop,
+  Outlook lets users flag, categorize, move and delete public-folder items
+  where their permissions allow; read-only public folders are a visible gap.
+  Large: its own wave.
 - **Undiscovered public-folder move destinations.** A public folder id is a
   bare EWS `FolderId`; only discovery (`is_known_public_folder`) tells it
   apart from a primary folder id, so a move into an undiscovered public
   folder still goes to Graph REST and fails there.
+  **Recommendation (yardstick, not a ruling):** on a Graph REST refusal of an
+  id discovery did not know, run public-folder discovery once and retry the
+  route; part of the public-folder write wave above.
 
 ## 5. Low priority
 
@@ -327,6 +443,8 @@ Narrow edge cases, audits with no known defect, and design work.
   "local JMAP transport failure" for `InvariantViolated` and `LimitExceeded`,
   though those messages are bifrost-authored, not foreign. Decide whether
   support needs the local reason back.
+  **Recommendation (not a ruling):** yes, as `support_only` text. The messages are bifrost-authored,
+  so there is nothing foreign to leak, and support needs the reason.
 - **Lateral findings from the review of the primary-cause builder rewrite.**
   - Several producers mint a scope-directed state cause with a placeholder
     `CursorScope` and rely on a later `.scope(ErrorScope::Cursor(_))` to rebind
@@ -338,6 +456,9 @@ Narrow edge cases, audits with no known defect, and design work.
   - JMAP: shared-account contacts and calendars have no routing door: the
     optional families live once on `Registry::families` and select the primary
     account (capability question).
+    **Recommendation (yardstick, not a ruling):** build routing for them, as
+    mail already has. Outlook shows a colleague's shared calendar and contacts
+    once access is granted.
 - **Lateral findings from deleting the JMAP transport generic.**
   - JMAP: `sync/capability_contract_tests.rs` pins only the false direction
     (a `false` flag refuses locally). A whole `JmapAccount` now opens over a
@@ -362,9 +483,21 @@ Narrow edge cases, audits with no known defect, and design work.
     Folding inside an unbreakable ASCII token changes its value and refusing
     such a message changes what the builder accepts today, so enforcement
     needs a ruling.
+    **Recommendation (yardstick, not a ruling):** batch DATA rejection is
+    reported against every recipient of that batch as a message rejection,
+    not as their RCPT results. BDAT for batches: build when CHUNKING is
+    advertised (it is the better path for large mail). 998 octets: encode an
+    over-long line (quoted-printable or base64 body, encoded-word header)
+    rather than refuse or fold inside a token; servers silently mangle or
+    bounce over-long lines, which a user sees as a broken message.
   - sync: the operator-override warning moved from `user_safe` to
-    `support_only` (ruling).
+    `support_only` (ruling). **Recommendation (yardstick, not a ruling):** keep `support_only`. An
+    operator override is admin configuration; an enterprise user is not shown
+    their IT department's tuning, and support is.
   - Calendars: CalDAV and JMAP normalize floating times to UTC.
+    **Recommendation (yardstick, not a ruling):** a defect. A floating 09:00 event must show at
+    09:00 wherever the user is, as Outlook does; preserve `Floating` end to
+    end (the shared `EventTime` already models it).
 
 - **No persistence contract for a `ChangeCursor` held outside the engine.**
   bifrost#3 offered it as the alternative to the UID polling surface; the
@@ -421,6 +554,13 @@ Narrow edge cases, audits with no known defect, and design work.
     answers to rule on: name it as a consumer assertion path, or refuse a
     `None`-publication backfill acknowledgement (always, by the reasoning
     `completion_refusal` already records, or once an account fence is raised).
+  **Recommendation for all three (not a ruling):** a pre-reset request must
+  never write into post-reset state. Fence `BackfillCheckpointWriter::persist`
+  like every other write; refuse ledger barriers from a walk older than the
+  reset instead of accepting and failing closed; refuse a `None`-publication
+  backfill acknowledgement once an account fence is raised (change-cursor
+  acks without a publication stay a consumer assertion path, documented as
+  such). A reset that old work can undo is a reset the user has to repeat.
 
 ## Coverage gaps from the October 2026 hunt
 

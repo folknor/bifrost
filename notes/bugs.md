@@ -32,18 +32,38 @@ Rulings:
   `Protocol` enum has no ManageSieve variant (documented at
   `imap/src/account/error.rs::oauth_token_error`). Decide whether ManageSieve
   gets its own protocol identity.
+  **Recommendation (owner-agreed, not a ruling):** yes, add
+  `Protocol::ManageSieve` and stamp it on the ManageSieve error path, so filter
+  failures are never attributed or throttled as IMAP mail failures. Additive on
+  a non-exhaustive enum.
 - IMAP `native_code` for an unknown response code is the server's own
   spelling, giving that telemetry field unbounded cardinality. Decide whether
   to bound it (for example a fixed `OTHER` with the spelling in diagnostics).
+  **Recommendation (owner has no preference; not a ruling):** bound it. Known
+  codes keep their canonical name, unknown codes become `OTHER`, and the server
+  spelling moves to `support_only` text. Check other providers' `native_code`
+  for the same shape.
 - Closed-account guards are not universal: the shared `AccountClosed` kind
   replaced existing refusals, but many provider methods have no lifecycle gate.
-  Decide whether every method gains one.
+  **Recommendation (yardstick, not a ruling):** every method gains one. A closed account must refuse
+  uniformly with `AccountClosed` before I/O; a door that silently still works,
+  or fails with a transport error, after close is not what a user who removed
+  an account expects. Would be build work once ruled.
 - Gmail: a malformed cursor payload maps to `SchemaIncompatible` (account
   clear) through `CursorDecodeFault::Malformed`, where it used to be
   `CursorInvalid` with a scope restart. Confirm.
+  **Recommendation (yardstick, not a ruling):** confirm. Gmail has one cursor
+  scope, `CursorScope::Account`, so both mappings end in the same full resync.
+  A draft comment at the mapping in `google/src/account/error.rs` and a
+  corrected line in `reference/google.md` are in the tree, uncommitted.
 - Sync acknowledgement tokens: a wrong or rotated key and a corrupted token
   decode to the same error; a key-identifier byte in the header would separate
   them.
+  **Recommendation (owner-agreed, not a ruling):** add the key-id byte under a
+  header version bump (old tokens decode as "key id unknown" and keep working).
+  Key mismatch and corruption report distinctly, and it opens keyring rotation
+  (accept the previous key, issue under the new) so a secret rotation does not
+  force every account to resync.
 
 Design:
 
@@ -78,26 +98,6 @@ repeated authoritative inventory (today `NoCursor` schedules no further poll),
 plus safe hydration and mutation semantics for UID handles that do not survive
 a re-SELECT. A wave of one owning types, sync and imap.
 
-
-## BUG-190 - Graph webhook subscriptions collide with Graph's duplicate rule across handles and on reattach
-
-**Reported by:** the Graph calendar and contact scope discovery work (spar review).
-
-Graph refuses a second subscription with the same `resource` and `changeType`
-with 409 Conflict ("Subscription Id <> already exists for the requested
-combination", subscription-post-subscriptions, Duplicate subscription
-behavior). The webhook arm owns subscriptions per handle, so two cases fail:
-
-- Reattach (`crates/sync/src/engine/reattach/transaction.rs`) creates the
-  replacement subscriptions BEFORE deleting the old handle's rows, so every
-  replacement create is a duplicate of a live row and 409s; the whole request
-  fails and the old handle survives. Affects mail folder resources too, not
-  only calendars. Not reproduced live; inferred from the documented rule.
-- Two subscribe calls whose scopes share a resource collide. Calendar and
-  contact scopes now all map to the mailbox-wide `/events` and `/contacts`
-  resources (the only documented ones), so two calls over disjoint calendars
-  hit it; before, only two calls over the same mail folder did.
-
 ## BUG-177 - JMAP projects three distinct set-error types onto `JmapMethod::Forbidden`
 
 **Reported by:** the provider-vocabulary consolidation (spar review).
@@ -123,6 +123,26 @@ that as `native_code`. `TelemetryToken::new` admits only `is_ascii_graphic`
 bytes, so the code is dropped from telemetry and demoted to support text. Not
 executed; confirm with a test, then pick a token spelling for the telemetry
 field (the wire cause can keep the RFC spelling).
+
+## BUG-190 - Graph webhook subscriptions collide with Graph's duplicate rule across handles and on reattach
+
+**Reported by:** the Graph calendar and contact scope discovery work (spar review).
+
+Graph refuses a second subscription with the same `resource` and `changeType`
+with 409 Conflict ("Subscription Id <> already exists for the requested
+combination", subscription-post-subscriptions, Duplicate subscription
+behavior). The webhook arm owns subscriptions per handle, so two cases fail:
+
+- Reattach (`crates/sync/src/engine/reattach/transaction.rs`) creates the
+  replacement subscriptions BEFORE deleting the old handle's rows, so every
+  replacement create is a duplicate of a live row and 409s; the whole request
+  fails and the old handle survives. Affects mail folder resources too, not
+  only calendars. Not reproduced live; inferred from the documented rule.
+- Two subscribe calls whose scopes share a resource collide. Calendar and
+  contact scopes now all map to the mailbox-wide `/events` and `/contacts`
+  resources (the only documented ones), so two calls over disjoint calendars
+  hit it; before, only two calls over the same mail folder did.
+
 `create_and_register` treats the 409 as whole-request failure with rollback,
 which keeps the old coverage alive but makes the second subscribe or the
 reattach fail. A fix needs subscription rows owned per account and shared by

@@ -120,3 +120,5 @@ split, and the shared message-error strings landed. One residue needs a
 bifrost-net API first: `client/metering.rs`'s blocking admission loop belongs
 beside `BandwidthBudget` in bifrost-net as a blocking budget API, which does not
 exist yet. (The rest of `authentication.rs` moving to bifrost-sasl is STR-135.)
+
+
