@@ -127,7 +127,20 @@ pub enum DefinitiveIrrelevance {
     AbsentUnderCursorBridge { detail: String },
     /// The object exists but is not a member of this inventory's scope, so the
     /// enumeration never owed an entry for it.
+    /// No workspace account currently produces this evidence; it remains
+    /// available for downstream accounts proving scope non-membership.
     OutOfScope { detail: String },
+}
+
+impl DefinitiveIrrelevance {
+    /// The account's support detail explaining the proof of irrelevance.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::AbsentUnderCursorBridge { detail } => detail,
+            Self::OutOfScope { detail } => detail,
+        }
+    }
 }
 
 /// Proof that a region repair accounted for the whole region.
@@ -235,7 +248,7 @@ pub enum InventoryRepairEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{InventoryRepairTarget, RepairAttemptId};
+    use super::{DefinitiveIrrelevance, InventoryRepairTarget, RepairAttemptId};
     use crate::coverage::{InventoryObligation, ObligationKey, RegionRecovery};
     use crate::error::{AccountErrorBuilder, DiagnosticText, PrimaryCause, RequestCause};
     use crate::ids::ObjectId;
@@ -295,6 +308,18 @@ mod tests {
                 replay: b"replay".to_vec(),
             })
         );
+    }
+
+    #[test]
+    fn definitive_irrelevance_detail_preserves_each_variants_evidence() {
+        let absent = DefinitiveIrrelevance::AbsentUnderCursorBridge {
+            detail: "authoritative absence bridged by history".into(),
+        };
+        let outside = DefinitiveIrrelevance::OutOfScope {
+            detail: "object belongs to another scope".into(),
+        };
+        assert_eq!(absent.detail(), "authoritative absence bridged by history");
+        assert_eq!(outside.detail(), "object belongs to another scope");
     }
 
     #[test]

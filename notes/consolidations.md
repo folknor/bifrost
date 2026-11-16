@@ -46,15 +46,3 @@ carries trusted origins, bearer-carrying requests take an `AdmittedUrl` minted b
 net, and each crate contributes only its policy for widening the set (DAV's
 discovered homes, Graph's upload sessions). Related: BUG-075.
 
-## CON-068 - What support detail does a proof of irrelevance carry?
-
-**Reported by:** spar (Gmail cursor-bridge absence).
-
-`crates/sync/src/repair.rs` flattens `DefinitiveIrrelevance` to its `detail`
-string with an `_ => String::new()` arm (the enum is `#[non_exhaustive]` in
-bifrost-types, so the wildcard is forced). A future variant would discharge
-debt with an empty support detail and nothing would notice. The owner of the
-answer is the type: a `DefinitiveIrrelevance::detail()` accessor in
-bifrost-types, exhaustive at home, removes the wildcard. Also unverified:
-`OutOfScope` appears to have no producer in the workspace.
-

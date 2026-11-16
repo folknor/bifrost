@@ -3517,6 +3517,11 @@ stream stopped and does NOT answer for outstanding requests: those become LOCAL
 deferrals, because recording a conclusion nobody reached is the same invented
 certainty the coverage model exists to prevent.
 
+`DefinitiveIrrelevance::detail()` supplies the account's support detail for
+irrelevant-object resolutions. Its exhaustive match in `bifrost-types` requires
+every new evidence variant to state its detail; the engine retains that text
+rather than substituting an empty fallback.
+
 Ledger entries retain the account-minted `InventoryRepairTarget`. Without it the
 executor cannot reconstruct a request at all - key, domain and error are engine
 or diagnostic facts, and the error in particular must never serve as a repair

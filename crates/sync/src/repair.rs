@@ -268,16 +268,11 @@ pub(crate) async fn run_repair_pass_observed(
                 ));
             }
             InventoryRepairOutcome::DefinitivelyIrrelevant { evidence, .. } => {
-                let detail = match &evidence {
-                    bifrost_types::DefinitiveIrrelevance::AbsentUnderCursorBridge { detail }
-                    | bifrost_types::DefinitiveIrrelevance::OutOfScope { detail } => detail.clone(),
-                    _ => String::new(),
-                };
                 resolutions.push((
                     planned.scope.clone(),
                     RepairResolution::Irrelevant {
                         key: planned.request.key.clone(),
-                        detail,
+                        detail: evidence.detail().to_owned(),
                         generation: planned.generation,
                     },
                 ));
