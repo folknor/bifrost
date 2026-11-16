@@ -195,12 +195,43 @@ pub(crate) fn create(
         let created = response
             .created(&create_id)
             .map_err(super::error::answer_error(AccountOperation::FilterCreate))?;
-        Ok(super::error::created_or_unidentified(
+        let outcome = super::error::created_or_unidentified(
             created.id().map(crate::sieve::SieveScriptId::as_str),
             AccountOperation::FilterCreate,
             "SieveScript/set",
         )
-        .map(ServerFilterId))
+        .map(ServerFilterId);
+        // Activation evidence is judged independently of identity, so an
+        // id-less create still reports an unconfirmed activation. draft-14
+        // requires a script activated by `onSuccessActivateScript` to appear
+        // in `created` with an explicit `isActive: true`, and lets the server
+        // ignore an invalid activation reference, so anything else is a save
+        // whose activation did not happen or was never confirmed. Read the raw
+        // wire value: the `is_active()` accessor folds omission into `false`.
+        // An Outlook user who saved a rule as enabled expects "saved" (the
+        // rule exists, and re-creating it would duplicate it) plus a visible
+        // note that it may not be running.
+        let activation = script
+            .is_active
+            .then(|| created.reported_active())
+            .and_then(|reported| match reported {
+                Some(true) => None,
+                Some(false) => Some("the server saved the filter but left it inactive"),
+                None => Some("the server saved the filter but did not confirm activating it"),
+            });
+        Ok(match activation {
+            None => outcome,
+            Some(detail) => outcome.with_warning(
+                bifrost_types::Warning::user_safe(
+                    bifrost_types::WarningKind::FilterActivationIncomplete,
+                    "The filter was saved, but it may not be active.",
+                )
+                .with_next_action(bifrost_types::DiagnosticText::user_safe(
+                    "Refresh the filter list and enable the filter there; do not create it again.",
+                ))
+                .with_protocol_detail(bifrost_types::DiagnosticText::support_only(detail)),
+            ),
+        })
     })
 }
 
@@ -916,6 +947,64 @@ mod tests {
             .await
             .expect("an acknowledged create is a success");
             crate::sync::error::assert_unidentified_create(&created);
+        }
+    }
+
+    /// A create asked active is plain success only when its `created` entry
+    /// reports `isActive: true`. An explicit `false` or an omitted value is a
+    /// saved filter with a `FilterActivationIncomplete` warning, judged
+    /// independently of identity; a create not asked active never gets one.
+    #[tokio::test]
+    async fn an_active_create_warns_unless_the_server_confirms_activation() {
+        let incomplete = bifrost_types::WarningKind::FilterActivationIncomplete;
+        let identity = bifrost_types::WarningKind::CreatedWithoutIdentity;
+        for (entry, is_active, expected) in [
+            (
+                serde_json::json!({"id": "S1", "isActive": true}),
+                true,
+                vec![],
+            ),
+            (
+                serde_json::json!({"id": "S1", "isActive": false}),
+                true,
+                vec![incomplete.clone()],
+            ),
+            (
+                serde_json::json!({"id": "S1"}),
+                true,
+                vec![incomplete.clone()],
+            ),
+            (
+                serde_json::json!({}),
+                true,
+                vec![identity.clone(), incomplete.clone()],
+            ),
+            (serde_json::json!({"id": "S1"}), false, vec![]),
+        ] {
+            let reply = serde_json::json!({
+                "sessionState": "session-1",
+                "methodResponses": [[
+                    "SieveScript/set",
+                    {"accountId": "primary", "oldState": "s1", "newState": "s2",
+                     "created": {"c0": entry.clone()}},
+                    "s0"
+                ]]
+            })
+            .to_string();
+            let meter = std::sync::Arc::new(DownloadMeter::default());
+            let created = create(
+                Some(sieve_account([reply], &meter)),
+                ServerFilterCreate::Script(bifrost_types::FilterScriptCreate {
+                    name: Some("new".into()),
+                    language: ScriptLanguage::Sieve,
+                    body: "keep;".into(),
+                    is_active,
+                }),
+            )
+            .await
+            .expect("a saved filter is a success");
+            let kinds: Vec<_> = created.warnings().iter().map(|w| w.kind.clone()).collect();
+            assert_eq!(kinds, expected, "{entry} asked active {is_active}");
         }
     }
 

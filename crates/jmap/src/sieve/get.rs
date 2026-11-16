@@ -21,4 +21,10 @@ impl SieveScript {
     pub(crate) fn is_active(&self) -> bool {
         self.is_active.unwrap_or(false)
     }
+
+    /// `isActive` exactly as the server sent it, omission kept distinct from
+    /// `false` for readers that treat its absence as missing evidence.
+    pub(crate) fn reported_active(&self) -> Option<bool> {
+        self.is_active
+    }
 }

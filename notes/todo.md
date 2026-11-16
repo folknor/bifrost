@@ -295,12 +295,6 @@ face.
 
 ### Write outcomes and compensation
 
-- **JMAP filter create ignores its activation answer.** `filters::create`
-  with `is_active` rides `onSuccessActivateScript` in the same request, but
-  never reads the created script's `isActive`; draft-14 ignores an invalid
-  activation reference, so an identified script the server left inactive
-  reports plain success. `Created::with_warning` can now carry "created but
-  not activated".
 - **Graph BulkMove caches an empty Deleted Items folder id.** The
   `deletedItems` lookup in `pim/containers.rs` refuses an answer without an
   `id`, but accepts and caches `{"id":""}`, so later thread deletes route to a
