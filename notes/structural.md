@@ -139,15 +139,6 @@ line-audited" note and a module-wide `allow(dead_code)` over the typed builder
 methods nobody in `account/` calls. Each further caller is a product question
 (what discovery should fetch at open), not a driver change.
 
-## STR-140 - reference/imap.md names NOTIFY effect functions that do not exist
-
-**Reported by:** spar on STR-071 (scout lateral). `reference/imap.md` cites
-`ProtocolState::arm_notify`, `disarm_notify` ("in the pipeline router") and
-`ProtocolState::disarm_pending_effects`; the code has `arm_effect` /
-`disarm_effect` (`connection/state.rs`), and the early-own-OK disarm happens in
-`ReadLoop` (`driver/read_loop.rs`), not in the pipeline router. The doc text
-needs checking against the code and rewording, not just renaming.
-
 ## STR-082 - IMAP does not partition inventory, so large folders get no bounded backfill
 
 **Reported by:** imap-account (not a bug; a gap between vocabulary and its intended producer).
