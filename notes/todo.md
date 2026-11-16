@@ -438,6 +438,13 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
+- **`advertised_partitioning_maps_to_its_windows` does not bite on its
+  time-window arm.** In `crates/sync/src/backfill/plan.rs`, the time arm
+  compares `backfill_plan_for`'s result against `time_windows` itself, so a
+  broken `time_windows` passes it (forcing `time_windows` to return an empty
+  Vec left it green; the UID arm did fail under the same ablation). Pin the
+  time arm to literal expected windows. The planner's own unit tests do bite.
+
 - **JMAP local transport failures lost their reason in diagnostics.**
   `convert_transport` in `crates/jmap/src/sync/error.rs` exports a fixed
   "local JMAP transport failure" for `InvariantViolated` and `LimitExceeded`,
