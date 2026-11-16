@@ -97,6 +97,7 @@ feature_unification = "package"
 name = "install-shape"
 packages = [
     "bifrost-types",
+    "bifrost-types-macros",
     "bifrost-mime",
     "bifrost-net",
     "bifrost-sasl",

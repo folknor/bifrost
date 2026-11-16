@@ -208,19 +208,23 @@ pub fn unsupported_inventory_stream(
 /// All implementations are `Send + Sync`. Construction is consumer-
 /// side via an `AccountFactory`; the engine owns the open
 /// `Arc<dyn Account>` and calls the factory on reopen.
+#[bifrost_types_macros::closing_account]
 pub trait Account: Send + Sync {
     /// Primary account protocol used to stamp inherited default refusals.
     /// Composed implementations retain the actual protocol on errors from
     /// their other legs; this is not a blanket override for every account error.
+    #[admission(exempt)]
     fn protocol(&self) -> crate::Protocol;
 
     /// Read-once snapshot of the account's capabilities. Mid-session
     /// transitions are signaled by ending streams with
     /// a capability-change error that causes an account reopen, never through
     /// a live channel here.
+    #[admission(exempt)]
     fn capabilities(&self) -> &AccountCapabilities;
 
     /// List provider category definitions when the protocol supports them.
+    #[admission(CategoryDefinitionsList)]
     fn category_definitions_list(
         &self,
     ) -> AccountFuture<Result<Vec<CategoryDefinition>, AccountError>> {
@@ -230,6 +234,7 @@ pub trait Account: Send + Sync {
     }
 
     /// Read reaction state. Providers preserving per-item failures override this.
+    #[admission(MessageReactionsRead)]
     fn message_reactions(
         &self,
         _ids: &[ObjectId],
@@ -246,6 +251,7 @@ pub trait Account: Send + Sync {
     /// forward this to `AccountNet::set_priority`. Non-HTTP or
     /// priority-agnostic implementations may store it for their own
     /// scheduler.
+    #[admission(exempt)]
     fn set_priority(&self, priority: Priority);
 
     /// Apply a payload-byte cap in bytes per second, independently per direction.
@@ -260,6 +266,7 @@ pub trait Account: Send + Sync {
     /// This governs payload bytes above TLS, not wire rate. `None` is unlimited;
     /// a finite cap must be positive. See `reference/net.md` for the smoothing
     /// bound and the allowance for outstanding admissions and lower buffering.
+    #[admission(exempt)]
     fn set_bandwidth_cap(&self, bps: Option<crate::BandwidthCap>);
 
     /// The throttle keys `work` consumes, so the engine can hold it while a
@@ -283,6 +290,7 @@ pub trait Account: Send + Sync {
     ///
     /// The default declares nothing: the work waits on account-wide holds
     /// only.
+    #[admission(exempt)]
     fn throttle_keys(
         &self,
         _account: &AccountId,
@@ -293,14 +301,17 @@ pub trait Account: Send + Sync {
 
     /// Cursor introspection. Account-aware because cost depends on
     /// capability state, not the cursor in isolation.
+    #[admission(exempt)]
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor;
 
     /// Cursor-scope discovery: what scopes does the engine multiplex
     /// `changes_stream` over? Bounded; terminates with `Done`.
+    #[admission(DiscoverCursorScopes)]
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>>;
 
     /// Membership-scope discovery: what containers can the consumer
     /// ask about (folder trees, labels, mailboxes, queries)? Bounded.
+    #[admission(DiscoverMemberships)]
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>>;
 
     /// Ongoing scope changes and `Polled` heartbeats after complete successful
@@ -308,12 +319,14 @@ pub trait Account: Send + Sync {
     /// `Terminated` and ends; no provider retry follows it. The engine owns
     /// reconnect, backoff, throttle holds and directive routing. Only `Polled`
     /// or `Lifecycle` resets backoff; account replacement carries the count.
+    #[admission(ScopeLifecycle)]
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent>;
 
     /// Initial cursor establishment. The engine calls this exactly
     /// once per `(account, scope)` pair before its first
     /// `changes_stream(cursor)` call. See `CursorEstablishment` for
     /// the two outcomes.
+    #[admission(EstablishCursor)]
     fn establish_initial_cursor(
         &self,
         scope: CursorScope,
@@ -324,6 +337,7 @@ pub trait Account: Send + Sync {
     /// `CursorEstablishment::EstablishViaInventory`; for those scopes
     /// the terminal `SyncEvent::Done` carries the established cursor
     /// in its checkpoint.
+    #[admission(SyncInventory)]
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent>;
 
     /// Resume an in-progress inventory cursor that was consumer-acknowledged
@@ -334,6 +348,10 @@ pub trait Account: Send + Sync {
     /// cursor is a mid-inventory position, so building the stream must be
     /// free of I/O and of observable side effects: the engine may construct
     /// one purely to classify the cursor and drop it without polling.
+    /// The closed-account gate relies on this too: it calls the provider
+    /// synchronously even after close, keeps its answer, and refuses only the
+    /// stream inside `Some` at its first poll.
+    #[admission(classify, SyncInventory)]
     fn inventory_resume_stream(
         &self,
         _cursor: ChangeCursor,
@@ -349,6 +367,7 @@ pub trait Account: Send + Sync {
     /// and acceptance cannot drift through separately maintained predicates.
     /// An override must preserve this equivalence. The engine checks both
     /// answers and routes disagreement through scoped cursor recovery.
+    #[admission(exempt)]
     fn is_inventory_cursor(&self, cursor: &ChangeCursor) -> bool {
         self.inventory_resume_stream(cursor.clone()).is_some()
     }
@@ -356,6 +375,7 @@ pub trait Account: Send + Sync {
     /// Which inventory partition shape this account can serve for
     /// `scope`. Implementations that do not override this keep the
     /// original full-pass behavior.
+    #[admission(exempt)]
     fn inventory_partitioning(&self, _scope: &CursorScope) -> InventoryPartitioning {
         InventoryPartitioning::Full
     }
@@ -364,6 +384,7 @@ pub trait Account: Send + Sync {
     /// supports only `InventoryPartition::Full`; protocol crates that
     /// advertise a stronger `inventory_partitioning` must override
     /// this to honor the matching partition variants.
+    #[admission(SyncInventory)]
     fn inventory_partition_stream(
         &self,
         scope: CursorScope,
@@ -408,6 +429,7 @@ pub trait Account: Send + Sync {
     /// can classify unsupported repair as `OperatorBlocked` immediately instead
     /// of spending a transient retry budget on a capability that will never
     /// exist.
+    #[admission(SyncInventory)]
     fn repair_inventory(
         &self,
         requests: AccountStream<InventoryRepairRequest>,
@@ -439,6 +461,7 @@ pub trait Account: Send + Sync {
     /// `Failed(Protocol(MissingField | ParseFailed))`, never an empty set. A
     /// provider whose wire legitimately omits an empty flag collection
     /// (Gmail's `labelIds`) reports that omission as the empty set it means.
+    #[admission(Hydrate)]
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,
@@ -456,6 +479,7 @@ pub trait Account: Send + Sync {
     /// The default is [`crate::flag_target_state`]. Providers whose write
     /// translates flags (aliases, label polarity, server-owned flags)
     /// override it.
+    #[admission(exempt)]
     fn flag_target(
         &self,
         target: &ObjectId,
@@ -480,6 +504,7 @@ pub trait Account: Send + Sync {
     /// published cursor, because nothing durable advanced for an item the
     /// engine never saw. Losing an item that was never yielded is expected and
     /// fine; losing the ability to read it again is not.
+    #[admission(SyncChanges)]
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>>;
 
     /// Server-side push subscription CRUD: create.
@@ -513,12 +538,14 @@ pub trait Account: Send + Sync {
     /// rather than becoming invisible. Any future change that lets push
     /// coverage relax polling must first make the uncovered-scope lane
     /// explicit, or it silently reintroduces that hole.
+    #[admission(PushSubscribe)]
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
     ) -> AccountFuture<Result<PushSubscription, AccountError>>;
 
     /// Server-side push subscription CRUD: destroy.
+    #[admission(PushUnsubscribe)]
     fn push_unsubscribe(
         &self,
         handle: SubscriptionHandle,
@@ -527,6 +554,7 @@ pub trait Account: Send + Sync {
     /// The push lanes this account instance runs, constant for its life.
     /// Empty when push is unavailable. Consumers use [`crate::effective_push_lanes`]
     /// to apply the capability gate consistently for this account generation.
+    #[admission(exempt)]
     fn push_lanes(&self) -> Vec<crate::PushLaneSpec> {
         Vec::new()
     }
@@ -574,6 +602,7 @@ pub trait Account: Send + Sync {
     ///   drive and pace every lane itself. `push_subscribe` only registers.
     /// - S13. A `Registration` session awaits `gate.clear()` before every
     ///   maintenance request; `Connection` sessions do not consult the gate.
+    #[admission(PushStream)]
     fn push_stream(
         &self,
         lane: crate::PushLane,
@@ -582,11 +611,13 @@ pub trait Account: Send + Sync {
     ) -> AccountStream<crate::PushSessionEvent>;
 
     /// Open a blob for streaming download.
+    #[admission(OpenBlob)]
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>>;
 
     /// Open a byte range of a blob. Errors with
     /// `AccountErrorKind::Unsupported(OpenBlobRange)` where the blob's
     /// capability flag is false.
+    #[admission(OpenBlobRange)]
     fn open_blob_range(
         &self,
         handle: BlobHandle,
@@ -600,6 +631,7 @@ pub trait Account: Send + Sync {
     /// attachment dedup hashes, and the raw-source viewer. Gated by
     /// `capabilities().pim_methods.open_raw_rfc822`; an account whose
     /// flag is false terminates with `Unsupported(OpenRawRfc822)`.
+    #[admission(OpenRawRfc822)]
     fn open_raw_rfc822(&self, message: ObjectId) -> AccountStream<SyncEvent<Bytes>>;
 
     /// Bulk flag mutation. `targets` is a streaming input so
@@ -614,6 +646,7 @@ pub trait Account: Send + Sync {
     /// items emit `Failed` rather than poisoning the stream. Early
     /// termination via `SyncEvent::Terminated(AccountError)` covers
     /// only already-pulled items.
+    #[admission(UpdateFlags)]
     fn bulk_set_flags(
         &self,
         targets: AccountStream<ObjectId>,
@@ -628,6 +661,7 @@ pub trait Account: Send + Sync {
     /// to express "and leave the label it came from" - see
     /// [`bulk_move_from`](Self::bulk_move_from), which is the surface
     /// to reach for when the consumer knows the source.
+    #[admission(BulkMove)]
     fn bulk_move(
         &self,
         targets: AccountStream<ObjectId>,
@@ -656,6 +690,7 @@ pub trait Account: Send + Sync {
     /// Deliberately not capability-gated: every impl satisfies the
     /// post-condition, so a consumer never has to branch on which
     /// provider it is talking to.
+    #[admission(BulkMove)]
     fn bulk_move_from(
         &self,
         targets: AccountStream<ObjectId>,
@@ -669,6 +704,7 @@ pub trait Account: Send + Sync {
     /// Bulk destroy.
     ///
     /// Same streaming invariants as `bulk_set_flags`.
+    #[admission(BulkDestroy)]
     fn bulk_destroy(
         &self,
         targets: AccountStream<ObjectId>,
@@ -678,6 +714,7 @@ pub trait Account: Send + Sync {
     /// Supplied versions must be enforced atomically or refused per target.
     /// Providers may batch compatible targets without replacing caller versions.
     /// The default submits targets independently; the ordinary door retains batching.
+    #[admission(UpdateFlags)]
     fn bulk_set_flags_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
@@ -701,6 +738,7 @@ pub trait Account: Send + Sync {
     /// Supplied versions must be enforced atomically or refused per target.
     /// Providers may batch compatible targets without replacing caller versions.
     /// The default submits targets independently; the ordinary door retains batching.
+    #[admission(BulkMove)]
     fn bulk_move_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
@@ -727,6 +765,7 @@ pub trait Account: Send + Sync {
     /// Supplied versions must be enforced atomically or refused per target.
     /// Providers may batch compatible targets without replacing caller versions.
     /// The default submits targets independently; the ordinary door retains batching.
+    #[admission(BulkMove)]
     fn bulk_move_from_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
@@ -755,6 +794,7 @@ pub trait Account: Send + Sync {
     /// Supplied versions must be enforced atomically or refused per target.
     /// Providers may batch compatible targets without replacing caller versions.
     /// The default submits targets independently; the ordinary door retains batching.
+    #[admission(BulkDestroy)]
     fn bulk_destroy_if_version(
         self: Arc<Self>,
         targets: AccountStream<crate::MailMutationTarget>,
@@ -785,6 +825,7 @@ pub trait Account: Send + Sync {
     /// Add `target` to `container`. JMAP `Email/set` mailboxIds add;
     /// IMAP `COPY`; Gmail `messages.modify` addLabels; Graph
     /// `POST /messages/{id}/move`.
+    #[admission(AddToContainer)]
     fn add_to_container(
         &self,
         target: MutationTarget,
@@ -795,6 +836,7 @@ pub trait Account: Send + Sync {
     /// remove; IMAP `+FLAGS \Deleted` + `EXPUNGE`; Gmail
     /// `messages.modify` removeLabels; Graph has no symmetric op
     /// (move replaces source).
+    #[admission(RemoveFromContainer)]
     fn remove_from_container(
         &self,
         target: MutationTarget,
@@ -804,6 +846,7 @@ pub trait Account: Send + Sync {
     /// Set or clear a single IMAP / JMAP keyword. Gmail and Graph
     /// return `Err(AccountErrorKind::Unsupported)`; the convenience
     /// layer chooses an alternate primitive instead.
+    #[admission(SetKeyword)]
     fn set_keyword(
         &self,
         target: MutationTarget,
@@ -813,6 +856,7 @@ pub trait Account: Send + Sync {
 
     /// Set or clear membership in a Gmail-style label. JMAP / IMAP /
     /// Graph return `Err(AccountErrorKind::Unsupported)`.
+    #[admission(SetLabelMembership)]
     fn set_label_membership(
         &self,
         target: MutationTarget,
@@ -822,6 +866,7 @@ pub trait Account: Send + Sync {
 
     /// Set or clear a Graph category. JMAP / IMAP / Gmail return
     /// `Err(AccountErrorKind::Unsupported)`.
+    #[admission(SetCategory)]
     fn set_category(
         &self,
         target: MutationTarget,
@@ -831,6 +876,7 @@ pub trait Account: Send + Sync {
 
     /// Set or clear a Graph singleValueExtendedProperty. JMAP / IMAP
     /// / Gmail return `Err(AccountErrorKind::Unsupported)`.
+    #[admission(SetExtendedProperty)]
     fn set_extended_property(
         &self,
         target: MutationTarget,
@@ -847,6 +893,7 @@ pub trait Account: Send + Sync {
     /// `Normal`/`Low` -> clear it. Accounts without an importance concept
     /// clear `set_importance` in `capabilities().pim_methods` and return
     /// `Unsupported(SetImportance)`.
+    #[admission(SetImportance)]
     fn set_importance(
         &self,
         target: MutationTarget,
@@ -855,6 +902,7 @@ pub trait Account: Send + Sync {
 
     /// Mark read state. Every protocol implements this; canonical
     /// across the four.
+    #[admission(SetIsRead)]
     fn set_is_read(
         &self,
         target: MutationTarget,
@@ -872,6 +920,7 @@ pub trait Account: Send + Sync {
     /// `Ok` means the submission was accepted. Follow-up steps that run as
     /// separate requests after it (IMAP's Sent APPEND) report through the
     /// [`SendReceipt`], never through `Err`.
+    #[admission(Send)]
     fn send_message(
         &self,
         request: SendRequest,
@@ -892,6 +941,7 @@ pub trait Account: Send + Sync {
     /// default impl returns `Unsupported(Send)` so non-mail accounts
     /// (CalDAV, CardDAV) inherit it; the four mail protocol crates
     /// override.
+    #[admission(Send)]
     fn send_raw_message(
         &self,
         raw: Bytes,
@@ -909,6 +959,7 @@ pub trait Account: Send + Sync {
     /// attachment.
     // MIME remains the declared wire value; the tolerant inbound MIME parser
     // substitutes text/plain on invalid input and is not an outbound validator.
+    #[admission(AttachmentUpload)]
     fn attachment_upload(
         &self,
         bytes: AccountStream<Result<Bytes, AccountError>>,
@@ -926,6 +977,7 @@ pub trait Account: Send + Sync {
     /// (JMAP, IMAP, CalDAV, CardDAV) means this returns
     /// `Unsupported(HostAttachment)`. Google -> Google Drive resumable upload +
     /// sharing permission; Graph -> OneDrive resumable upload + `createLink`.
+    #[admission(HostAttachment)]
     fn host_attachment(
         &self,
         bytes: Bytes,
@@ -934,6 +986,7 @@ pub trait Account: Send + Sync {
 
     /// Create a new draft. An acknowledged create is `Ok` even when the
     /// server did not identify the draft; see [`crate::Created`].
+    #[admission(DraftCreate)]
     fn draft_create(
         &self,
         patch: DraftPatch,
@@ -941,6 +994,7 @@ pub trait Account: Send + Sync {
 
     /// Update an existing draft. The patch is partial: only `Some`
     /// fields are applied.
+    #[admission(DraftUpdate)]
     fn draft_update(
         &self,
         draft: DraftHandle,
@@ -948,6 +1002,7 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Discard (delete) a draft without sending.
+    #[admission(DraftDiscard)]
     fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>>;
 
     /// Convert a draft into a sent message. The provider chooses
@@ -955,6 +1010,7 @@ pub trait Account: Send + Sync {
     /// implement this as draft fetch + send + discard. A discard that fails
     /// after the send commits is reported in
     /// [`SendReceipt::draft_discard`], not as `Err`.
+    #[admission(DraftSend)]
     fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<SendReceipt, AccountError>>;
 
     /// Cancel a previously scheduled (not yet delivered) send. `handle`
@@ -965,6 +1021,7 @@ pub trait Account: Send + Sync {
     ///
     /// Gated by `capabilities().pim_methods.scheduled_send`; a
     /// `false` flag means this returns `Unsupported`.
+    #[admission(CancelScheduledSend)]
     fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>>;
 
     /// Reschedule a previously scheduled send to a new instant. Same
@@ -975,6 +1032,7 @@ pub trait Account: Send + Sync {
     ///
     /// Gated by `capabilities().pim_methods.scheduled_send`; a
     /// `false` flag means this returns `Unsupported`.
+    #[admission(RescheduleSend)]
     fn reschedule_send(
         &self,
         handle: ObjectId,
@@ -988,10 +1046,12 @@ pub trait Account: Send + Sync {
     /// Thread-shaped search. Returns a page of `ThreadId`. Each
     /// call's page cursor is opaque; pass the previous page's
     /// `next_cursor` back to fetch the next page.
+    #[admission(Search)]
     fn search(&self, request: SearchRequest)
     -> AccountFuture<Result<Page<ThreadId>, AccountError>>;
 
     /// Message-shaped search using the same request AST.
+    #[admission(SearchMessages)]
     fn search_messages(
         &self,
         request: SearchRequest,
@@ -1009,6 +1069,7 @@ pub trait Account: Send + Sync {
     /// [`ContainerList::skipped_scopes`] with their classified errors,
     /// rather than failing the whole enumeration or silently omitting
     /// them. `Err(_)` means the enumeration itself failed.
+    #[admission(ContainersList)]
     fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>>;
 
     /// Create a new container of the given `kind` with `name` under
@@ -1021,6 +1082,7 @@ pub trait Account: Send + Sync {
     ///
     /// Contract: protocols that do not support nesting return
     /// `Err(AccountErrorKind::Unsupported)` when `parent` is `Some`.
+    #[admission(ContainerCreate)]
     fn container_create(
         &self,
         kind: ContainerKind,
@@ -1034,6 +1096,7 @@ pub trait Account: Send + Sync {
     /// `style`, when `Some`, also recolors the container in the same
     /// call (a Gmail label recolor). Folder-shaped protocols with no
     /// color concept accept and ignore it.
+    #[admission(ContainerRename)]
     fn container_rename(
         &self,
         container: ContainerId,
@@ -1043,6 +1106,7 @@ pub trait Account: Send + Sync {
 
     /// Move a container under a new parent. Folder-kind only;
     /// label-kind containers return `Err(AccountErrorKind::Unsupported)`.
+    #[admission(ContainerMove)]
     fn container_move(
         &self,
         container: ContainerId,
@@ -1052,6 +1116,7 @@ pub trait Account: Send + Sync {
     /// Delete a container. Contract: a non-empty container either
     /// fails or moves contents to Trash; protocols MUST NOT silently
     /// drop messages.
+    #[admission(ContainerDelete)]
     fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>>;
 
     // ------------------------------------------------------------
@@ -1059,10 +1124,12 @@ pub trait Account: Send + Sync {
     // ------------------------------------------------------------
 
     /// List all sending identities on this account.
+    #[admission(IdentitiesList)]
     fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>>;
 
     /// Update one identity. `patch` is partial; only `Some` fields
     /// are applied.
+    #[admission(IdentityUpdate)]
     fn identity_update(
         &self,
         identity: IdentityId,
@@ -1070,12 +1137,15 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Read the vacation responder config, when supported.
+    #[admission(VacationGet)]
     fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>>;
 
     /// Replace the vacation responder config.
+    #[admission(VacationSet)]
     fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), AccountError>>;
 
     /// Read the storage quota readout, when supported.
+    #[admission(QuotaGet)]
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>>;
 
     // ------------------------------------------------------------
@@ -1087,16 +1157,19 @@ pub trait Account: Send + Sync {
     // ------------------------------------------------------------
 
     /// List server-side filter rules or scripts.
+    #[admission(FiltersList)]
     fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>>;
 
     /// Create a server-side filter rule or script. An acknowledged create is
     /// `Ok` even when the server did not identify it; see [`crate::Created`].
+    #[admission(FilterCreate)]
     fn filter_create(
         &self,
         filter: ServerFilterCreate,
     ) -> AccountFuture<Result<crate::Created<ServerFilterId>, AccountError>>;
 
     /// Update a server-side filter rule or script.
+    #[admission(FilterUpdate)]
     fn filter_update(
         &self,
         filter: ServerFilterId,
@@ -1104,9 +1177,11 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Delete a server-side filter rule or script.
+    #[admission(FilterDelete)]
     fn filter_delete(&self, filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>>;
 
     /// Validate a server-side filter payload without storing it.
+    #[admission(FilterValidate)]
     fn filter_validate(
         &self,
         filter: ServerFilterCreate,
@@ -1121,11 +1196,13 @@ pub trait Account: Send + Sync {
     // ------------------------------------------------------------
 
     /// List address books or contact folders.
+    #[admission(AddressBooksList)]
     fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>>;
 
     /// List contacts, optionally scoped to one address book. Pagination
     /// cursor bytes are provider-owned and should be passed back from
     /// the previous `Page::next_cursor`.
+    #[admission(ContactsList)]
     fn contacts_list(
         &self,
         address_book: Option<AddressBookId>,
@@ -1133,16 +1210,19 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>>;
 
     /// Fetch one contact card by engine-facing id.
+    #[admission(ContactGet)]
     fn contact_get(&self, contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>>;
 
     /// Create one contact card. An acknowledged create is `Ok` even when the
     /// server did not identify the card; see [`crate::Created`].
+    #[admission(ContactCreate)]
     fn contact_create(
         &self,
         contact: ContactCreate,
     ) -> AccountFuture<Result<crate::Created<ContactId>, AccountError>>;
 
     /// Partially update one contact card.
+    #[admission(ContactUpdate)]
     fn contact_update(
         &self,
         contact: ContactId,
@@ -1150,11 +1230,13 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Delete one contact card.
+    #[admission(ContactDelete)]
     fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>>;
 
     /// Delete with an optional caller version. A supplied version must be
     /// enforced or refused before I/O; it must never become a blind delete.
     /// With no version, delegates to the ordinary delete door.
+    #[admission(ContactDelete)]
     fn contact_delete_if_version(
         &self,
         contact: ContactId,
@@ -1168,6 +1250,7 @@ pub trait Account: Send + Sync {
     }
 
     /// Provider-side contact search.
+    #[admission(ContactSearch)]
     fn contact_search(
         &self,
         request: ContactSearchRequest,
@@ -1187,6 +1270,7 @@ pub trait Account: Send + Sync {
     /// Unsupported before validating a cursor or performing I/O. A provider
     /// without paging rejects a supplied cursor locally. Terminal results may
     /// still be incomplete: inspect `Page::truncated` and the failure lanes.
+    #[admission(DirectorySearch)]
     fn directory_search(
         &self,
         query: String,
@@ -1206,6 +1290,7 @@ pub trait Account: Send + Sync {
     /// and return `Unsupported(DirectoryGroupsList)`. A supporting
     /// protocol on a tenant without directory-group read consent fails
     /// with a `NoPermission` error at call time.
+    #[admission(DirectoryGroupsList)]
     fn directory_groups_list(
         &self,
         page_cursor: Option<crate::PageCursor>,
@@ -1219,6 +1304,7 @@ pub trait Account: Send + Sync {
     ///
     /// Gated by `capabilities().pim_methods.directory_group_expand`,
     /// with the same consent caveat as `directory_groups_list`.
+    #[admission(DirectoryGroupExpand)]
     fn directory_group_expand(
         &self,
         group: DirectoryGroupId,
@@ -1234,25 +1320,30 @@ pub trait Account: Send + Sync {
     // ------------------------------------------------------------
 
     /// List calendars exposed by this account.
+    #[admission(CalendarsList)]
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>>;
 
     /// List events in a provider-side time range.
+    #[admission(EventsInRange)]
     fn events_in_range(
         &self,
         range: EventRange,
     ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>>;
 
     /// Fetch one event by engine-facing id.
+    #[admission(EventGet)]
     fn event_get(&self, event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>>;
 
     /// Create one event. An acknowledged create is `Ok` even when the server
     /// did not identify the event; see [`crate::Created`].
+    #[admission(EventCreate)]
     fn event_create(
         &self,
         event: EventCreate,
     ) -> AccountFuture<Result<crate::Created<EventId>, AccountError>>;
 
     /// Partially update one event.
+    #[admission(EventUpdate)]
     fn event_update(
         &self,
         event: EventId,
@@ -1260,11 +1351,13 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Delete one event.
+    #[admission(EventDelete)]
     fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>>;
 
     /// Delete with an optional caller version. A supplied version must be
     /// enforced or refused before I/O; it must never become a blind delete.
     /// With no version, delegates to the ordinary delete door.
+    #[admission(EventDelete)]
     fn event_delete_if_version(
         &self,
         event: EventId,
@@ -1278,6 +1371,7 @@ pub trait Account: Send + Sync {
     }
 
     /// Update the authenticated user's RSVP status for one event.
+    #[admission(EventRsvp)]
     fn event_rsvp(
         &self,
         event: EventId,
@@ -1285,6 +1379,7 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Respond with a caller version, enforced atomically or refused before I/O.
+    #[admission(EventRsvp)]
     fn event_rsvp_if_version(
         &self,
         event: EventId,
@@ -1304,6 +1399,7 @@ pub trait Account: Send + Sync {
     }
 
     /// Provider-side event search.
+    #[admission(EventSearch)]
     fn event_search(
         &self,
         request: EventSearchRequest,
@@ -1316,12 +1412,14 @@ pub trait Account: Send + Sync {
     /// Hydrate every message in a thread. JMAP `Thread/get` +
     /// `Email/get`; IMAP `THREAD REFERENCES` + per-message FETCH;
     /// Gmail `threads.get`; Graph conversation API.
+    #[admission(HydrateThread)]
     fn thread_hydrate(
         &self,
         thread: ThreadId,
     ) -> AccountFuture<Result<ThreadHydration, AccountError>>;
 
     /// Hydrate one message at a specific projection level.
+    #[admission(HydrateMessage)]
     fn message_hydrate(
         &self,
         message: ObjectId,
@@ -1340,6 +1438,7 @@ pub trait Account: Send + Sync {
     /// `remove_from_container(source)`. Order: add-then-remove so a
     /// failure on the second step leaves the message in both
     /// containers (recoverable) rather than neither (lost).
+    #[admission(MoveThread)]
     fn move_thread_provider(
         &self,
         _thread: ThreadId,
@@ -1352,6 +1451,7 @@ pub trait Account: Send + Sync {
     /// Contact autocomplete convenience for recipient and attendee
     /// pickers. Default implementation returns the first page of
     /// `contact_search`.
+    #[admission(ContactAutocomplete)]
     fn contact_autocomplete_provider(
         &self,
         query: String,
@@ -1362,6 +1462,7 @@ pub trait Account: Send + Sync {
 
     /// Event autocomplete convenience for calendar search boxes.
     /// Default implementation returns the first page of `event_search`.
+    #[admission(EventAutocomplete)]
     fn event_autocomplete_provider(
         &self,
         query: String,
@@ -1380,6 +1481,7 @@ pub trait Account: Send + Sync {
     /// borrowing `&self` across the await boundary into a `'static`
     /// future. Protocol crates ship this convenience using their
     /// own `Arc<Self>`-shaped handle.
+    #[admission(DeleteThread)]
     fn delete_thread_provider(
         &self,
         _thread: ThreadId,
@@ -1395,6 +1497,16 @@ pub trait Account: Send + Sync {
     ///
     /// Does NOT destroy durable server-side push subscriptions; those
     /// go through `push_unsubscribe` explicitly.
+    ///
+    /// Post-close contract, owned by [`crate::ClosingAccount`] rather than by
+    /// each provider: a user who removed an account expects its work to stop.
+    /// Every future or stream first polled after `close` is CALLED refuses
+    /// with `AccountClosed` before reaching the provider; work admitted before
+    /// that keeps the provider's own result; the synchronous accessors and
+    /// cursor classification (`inventory_resume_stream`'s `Some`/`None`
+    /// answer) stay live. Awaiting `close` awaits this provider invocation
+    /// only. See the `closing` module for the full statement.
+    #[admission(close)]
     fn close(&self) -> AccountFuture<Result<(), AccountError>>;
 }
 

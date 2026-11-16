@@ -19,6 +19,8 @@ pub mod account_compose;
 pub mod blob;
 pub mod calendar;
 pub mod capabilities;
+pub mod closing;
+pub use closing::ClosingAccount;
 pub mod cloud;
 pub mod compose;
 pub mod contact;

@@ -191,6 +191,11 @@ top-level taxonomy with per-family subkind enums:
   Recovery is terminal `Cancelled`, with no suggested remediation. An enterprise
   Outlook user closing an account expects its work to stop, without a retry,
   credential prompt, bug report or claim that an advertised feature is unsupported.
+  `bifrost_types::ClosingAccount` is the shared admission boundary that produces it
+  for every `Account` method of the account it wraps: a future or stream first polled after `close` is
+  called refuses before reaching the provider, admitted work keeps the provider's
+  result, and synchronous accessors and cursor classification stay live. The
+  post-close contract is stated on `Account::close`.
   `AccountError::account_closed(operation, protocol)` owns construction, including
   account scope; providers decorate it with their identity. This does not erase
   transmission evidence for operations interrupted after dispatch: those retain

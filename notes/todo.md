@@ -438,6 +438,17 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
+- **Concurrent `close` calls do not share one teardown.** Found in the spar of
+  the closed-account gate. Google's `close` swaps its closed flag and returns
+  `Ok` at once on every later call, while the first may still be awaiting its
+  watch teardown; Graph's `PushTasks::join` takes the task handles out, so a
+  concurrent close sees an empty registry and finishes without waiting, and
+  dropping the first waiter detaches the rest. Not a defect under the current
+  `Account::close` contract (idempotent, safe to call more than once), which
+  promises nothing about completion. Decide whether awaiting any `close` should
+  certify that teardown has finished; if so, it is a provider contract plus a
+  per-provider fix, since `ClosingAccount` does not own teardown.
+
 - **`advertised_partitioning_maps_to_its_windows` does not bite on its
   time-window arm.** In `crates/sync/src/backfill/plan.rs`, the time arm
   compares `backfill_plan_for`'s result against `time_windows` itself, so a

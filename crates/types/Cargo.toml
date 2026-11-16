@@ -20,6 +20,7 @@ futures = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+bifrost-types-macros = { path = "../types-macros" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
