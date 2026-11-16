@@ -1501,6 +1501,45 @@ direct TCP when no proxy applies. Both proxy TLS and origin TLS use the owning
 Net's trust configuration, including an injected Net's roots and certificate
 policy. Proxy credentials are confined to CONNECT. Redirects remain refused.
 
+### Which URLs may carry the credential
+
+The JMAP account handle attaches without `AccountSpec::trusted_origins`, by
+decision, not by omission. Credential destinations are established by
+provenance, not by an origin set:
+
+- Session discovery goes to URLs derived from the consumer-configured factory
+  URL (origin-rooted `/.well-known/jmap`, then the path-mounted fallback).
+- Every other HTTP door (API, upload, download, EventSource) and the WebSocket
+  handshake is handed a URL built from the `SessionState` snapshot its caller
+  holds: `apiUrl` verbatim, the other endpoints by expanding the session's
+  templates, the WebSocket URL from the session's capability. The transport is
+  crate-private and no production caller passes a URL from any other source.
+- Admission is per request snapshot, not per latest session: a request keeps the
+  `SessionState` it was built with through a refresh and sends to that
+  snapshot's `apiUrl`.
+- Redirects are a separate authority, owned by net's redirect policy: same-origin
+  hops keep the credential (and may reach paths the session never named),
+  cross-host hops strip `Authorization`, and the WebSocket handshake refuses
+  redirects.
+- Template variables are encoded with net's component set, which escapes `@`,
+  `:`, `/`, `?`, `#` and `%`, so a value cannot inject userinfo, a port or a
+  path. Dots are not escaped, so a host-position variable may span labels or
+  supply a whole hostname; that is the server's template choice, and its values
+  (`accountId`, `blobId`) come from the same server.
+
+An account-wide origin set is refused in every form. A finite set cannot
+describe a template whose variable falls in the host (refusing such servers
+breaks spec-valid deployments an enterprise user expects to work; admitting any
+host restricts nothing). One replaced on each session install would refuse an
+outstanding request whose snapshot names a superseded endpoint, and the
+WebSocket handshake bypasses net's request pipeline anyway. A JMAP-owned
+destination newtype minted only from the session was also declined: every door
+caller already reads the snapshot it holds, so the type would guard only
+prospective callers without consolidating any rule. Revisit if a feature ever
+fetches an arbitrary resource URL (a calendar attachment href, a link in a
+message) with the account credential; none does today - push subscription URLs
+and `Blob/copy` are method payload, not client HTTP destinations.
+
 ### Cursor scope classification
 
 `sync/state.rs::JmapScopeRepr` is the shared parser into the persisted

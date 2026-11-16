@@ -1076,8 +1076,8 @@ pub struct AccountSpec {
     /// `None` expresses an account that does not use bearer auth.
     pub token_source: Option<Arc<dyn TokenSource>>,
     /// Exact destinations for automatic bearers and caller Authorization headers.
-    /// `None` leaves admission to the protocol leg. Composed handles and
-    /// JMAP session endpoints cannot infer credential authority from redirects.
+    /// `None` leaves admission to the protocol leg; JMAP, whose destinations
+    /// come from session templates no origin set can describe, relies on it.
     /// A configured empty set refuses every such credential destination.
     /// HopPolicy credentials have their own per-leg admission authority.
     pub trusted_origins: Option<crate::TrustedOrigins>,

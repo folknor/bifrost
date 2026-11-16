@@ -1907,14 +1907,15 @@ Making every request constructor require a proof is not implemented, and a
 bare `AdmittedUrl` would not be the right proof: anyone can build a
 `TrustedOrigins`, so the proof shows membership in some policy, not authority
 over this account's credential. The account set on the handle is the check
-that binds. JMAP is the protocol without one: its credential authority is the
-authenticated session document, whose `apiUrl`, upload, download, event-source
-and WebSocket URLs may sit on independent origins and are URL templates whose
-variables may fall in the host. A set filled once per session cannot express
-that, and one widened on every fetch would keep origins of superseded sessions.
-Redirect trust cannot supply the authority either. Enterprise users must retain
-working session endpoint authentication, so JMAP keeps protocol-owned admission
-until a session-scoped, template-aware set is designed. Protocols opt into
+that binds. JMAP is the protocol without one, permanently: its credential destinations
+are the configured discovery URL and URLs built from the session snapshot each
+request holds, whose `apiUrl`, upload, download, event-source and WebSocket
+URLs may sit on independent origins and are URL templates whose variables may
+fall in the host. No origin set can express that, a set replaced per session
+would refuse outstanding requests built on an earlier snapshot, and redirect
+trust cannot supply the authority either. JMAP's provenance rule and the
+refusal of every account-wide set are in `reference/jmap.md` "Which URLs may
+carry the credential". Protocols opt into
 account-wide restrictions when their full credential destination set is known.
 
 `TokenSnapshot::contention_account_error(protocol, operation)` classifies only

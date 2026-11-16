@@ -138,12 +138,17 @@ impl ReqwestTransport {
         default_retry: Option<bifrost_net::RetryPolicy>,
     ) -> Result<Self, TransportError> {
         let redirect_policy = redirect_policy_from_trusted_hosts(&trusted_hosts);
-        // No `trusted_origins`, deliberately, unlike Graph and Google. JMAP's
-        // credential authority is the authenticated session document: its
-        // API, upload, download, event-source and WebSocket URLs may sit on
-        // independent origins and are templates whose variables may fall in
-        // the host, so no origin set fixed at attach can describe them, and
-        // one widened per session fetch would keep superseded origins.
+        // No `trusted_origins`, deliberately and permanently, unlike Graph and
+        // Google. Every door here is handed either a discovery URL derived from
+        // the configured factory URL or a URL built from the SessionState
+        // snapshot its caller holds; that provenance is the admission rule.
+        // An account-wide origin set was refused in every form: templates may
+        // put a variable in the host, so no finite set describes them, and a
+        // set replaced per session would refuse outstanding requests built on
+        // an earlier snapshot. A destination newtype was declined too, as it
+        // would only guard prospective callers. reference/jmap.md "Which URLs
+        // may carry the credential" carries the full reasoning; revisit only
+        // if a feature fetches an arbitrary resource URL with the credential.
         let mut spec = AccountSpec::new(authorization.optional_account_token_source());
         if let Some(policy) = default_retry {
             spec.default_retry = policy;

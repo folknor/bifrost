@@ -544,6 +544,11 @@ impl Client {
             })?
             .trim_start_matches('[')
             .trim_end_matches(']');
+        // This dial bypasses net's request pipeline, so no account origin set
+        // could see it. The credential's admission here is provenance: `url`
+        // is the session capability's own WebSocket URL (see the transport
+        // constructor and reference/jmap.md "Which URLs may carry the
+        // credential").
         let tcp = self
             .transport()
             .websocket_net()
