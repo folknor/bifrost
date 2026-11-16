@@ -68,14 +68,16 @@ struct MailboxWatch {
     holders: Mutex<usize>,
 }
 
-// This registry needs Net-owned typed shared storage before it can move out
-// of process scope. Net's shared_hold and shared_concurrency_limit registries
-// contain only their own concrete payloads, not arbitrary provider state.
-// AccountNet::shares_transport_with can compare live handles, but exposes no
-// weak Net identity or storage. Keeping AccountNet handles in a global map
-// would pin transports; a factory-local map would fail to coordinate accounts
-// opened by separate factories sharing one Net. Preserve coordination until
-// Net exposes a shared-state registry rather than silently weakening it.
+// Process scope is deliberate, not a stand-in for a Net-scoped store. Unlike
+// holds and concurrency limits (local policy, per Net by caller choice), this
+// coordinates remote state: users.stop stops the mailbox's watch whichever Net
+// or factory issued it. Two accounts for one mailbox on different Nets - an
+// injected Net beside Net::shared_default, or the two TLS variants - are not
+// independent at Gmail, so scoping this per Net or per factory would let one
+// stop the other's live watch and silently kill push. Process scope is the
+// widest scope visible here. The address-only key over-approximates across
+// mock backends behind the API-base test seams; that only skips stops, the
+// safe direction. Net identity would not be a better namespace for backends.
 static MAILBOX_WATCHES: LazyLock<
     Mutex<HashMap<super::mailbox::MailboxAddress, Weak<MailboxWatch>>>,
 > = LazyLock::new(Mutex::default);
@@ -1522,7 +1524,9 @@ mod tests {
             Arc::clone(&client),
             Some(PubSubConfig::new("projects/p/topics/t")),
             shutdown,
-            "terminal-renewal@push.test",
+            // Distinct from the sibling terminal-renewal test: the watch
+            // registry is process-wide and libtest runs tests in parallel.
+            "terminal-renewal-failure@push.test",
         ));
         let mut health = test_session(&pubsub);
 

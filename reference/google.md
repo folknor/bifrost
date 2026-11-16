@@ -1323,8 +1323,9 @@ takes no watch identity and stops whatever watch the mailbox has. Two live
 the engine's reopen creates exactly that pair. Uncoordinated, the old account's
 teardown `users.stop` killed the replacement's fresh watch and push stayed
 silently dead until the next renewal, up to six days. A process-wide
-`MailboxWatch`, found through a registry keyed by the lowercased address and
-holding weak references so an idle mailbox's entry is dropped, coordinates
+`MailboxWatch`, found through a registry keyed by the profile
+`MailboxAddress` and holding weak references so an idle mailbox's coordinator
+is freed (the dead entry is pruned on the next lookup), coordinates
 instances:
 
 - `holders` counts the actors in this process that currently own a live watch
@@ -2080,13 +2081,28 @@ uncertain outcomes followed by termination even after shutdown. Input exhaustion
 still emits exactly one Done; termination never adds Done. The obsolete test
 constructing a walking stream without its start id was removed with that state.
 
-Watch coordination remains process-wide. Net currently exposes concrete hold
-and concurrency registries, neither of which can store the mailbox coordinator.
-Moving it requires a Net-owned shared-state registry accessible through
-AccountNet, with typed provider payloads and keys, shared across accounts on the
-same Net and isolated across independent Nets. A factory-local registry would
-lose coordination between factories sharing a Net; retaining account transports
-in a global registry would pin them. No such substitute is installed here.
+Watch coordination is process-wide by design, not pending a Net-scoped store.
+Hold and concurrency registries are per-Net because they model local policy,
+where two Nets being independent is a caller's choice. The watch coordinator
+models remote state: `users.watch` replaces and `users.stop` stops whatever
+watch the mailbox has, whichever Net or factory issued it. Two accounts for one
+mailbox on different Nets (an injected Net beside `Net::shared_default`, or the
+two TLS variants of the shared Net) are not independent at Gmail, and a Net- or
+factory-scoped coordinator would let one send `users.stop` under the other's
+live watch, silently killing push. Process scope is the widest this side can
+observe, so it is the scope that follows the remote collision domain.
+
+The key is the profile address alone, so it can over-approximate that domain:
+two mock backends reached through the API-base test seams that report the same
+address share one coordinator, and one backend's live holder suppresses the
+other's stop. That errs in the documented safe direction (a skipped stop). Net
+identity would be no better a
+namespace, since one backend can span Nets and one Net can reach several
+backends; if backend isolation ever becomes a supported requirement, the key
+gains an explicit remote-authority component. The coordinator prevents
+destructive teardown only: two instances using different topics or label
+filters still replace each other's watch configuration, which no scoping
+choice fixes.
 
 ## Shared upload sequencing
 

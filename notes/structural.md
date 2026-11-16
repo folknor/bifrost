@@ -230,23 +230,6 @@ contact arms; and the inventory tests for all of these. Either calendar and cont
 folder discovery is missing, or the lanes are built ahead of a producer; either
 way a large surface compiles and is tested with no path to it.
 
-## STR-129 - Google's mailbox watch registry is process-global
-
-**Reported by:** google.
-
-`push::MAILBOX_WATCHES` is a `static LazyLock<Mutex<HashMap<String, Weak<..>>>>`,
-process-wide rather than scoped to the `Net` or the factory; the tests mint unique
-mailboxes because of it (`NEXT_MAILBOX` in `mod.rs` tests). bifrost-net already
-offers Net-scoped string-keyed registries (`shared_hold`,
-`shared_concurrency_limit`) for this kind of cross-account coordination; the
-coordinator belongs in one, keyed by the typed mailbox identity (STR-124), so two
-independent `Net`s really are independent.
-
-Blocked on bifrost-net: its hold and concurrency registries cannot store
-arbitrary provider state, and `AccountNet` exposes no Net-owned slot for it. The
-move needs a Net-scoped provider-state store (a typed, keyed slot owned by the
-`Net` and reachable through `AccountNet`) first; the registry site records this.
-
 ## STR-138 - Smaller SMTP axes and placement notes
 
 **Reported by:** smtp-sasl.
