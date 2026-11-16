@@ -302,6 +302,68 @@ fn access_denied_maps_to_permission_denied() {
     ));
 }
 
+const CLAIMS_CHALLENGE: &str = r#"Bearer realm="", authorization_uri="https://login.microsoftonline.com/common/oauth2/authorize", error="insufficient_claims", claims="eyJhY2Nlc3NfdG9rZW4iOnsiYWNycyI6eyJlc3NlbnRpYWwiOnRydWUsInZhbHVlIjoiYzEifX19""#;
+
+fn is_reauth(error: &AccountError) -> bool {
+    matches!(
+        error.kind(),
+        AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
+    ) && matches!(error.recovery(), RecoveryClass::AuthLost)
+}
+
+#[test]
+fn claims_challenge_on_a_403_envelope_maps_to_reauth() {
+    for code in ["AccessDenied", "Forbidden", "SomethingNew"] {
+        let err = classify(
+            StatusCode::FORBIDDEN,
+            &format!(r#"{{"error":{{"code":"{code}","message":"x"}}}}"#),
+            graph_ctx(AccountOperation::Hydrate),
+            &[("www-authenticate", CLAIMS_CHALLENGE)],
+        );
+        assert!(is_reauth(&err), "{code}: {:?}", err.kind());
+    }
+}
+
+#[test]
+fn claims_challenge_on_a_net_403_without_envelope_maps_to_reauth() {
+    let error = into_account_error(
+        GraphError::Net(bifrost_net::Error::Status {
+            code: StatusCode::FORBIDDEN,
+            body: body("<html>Forbidden</html>"),
+            headers: headers(&[("www-authenticate", CLAIMS_CHALLENGE)]),
+        }),
+        graph_ctx(AccountOperation::Discover),
+    );
+    assert!(is_reauth(&error), "{:?}", error.kind());
+}
+
+#[test]
+fn claims_challenge_parsing_reads_only_the_owning_bearer_challenge() {
+    let hit = |value: &str| {
+        let mut map = HeaderMap::new();
+        map.append(WWW_AUTHENTICATE, HeaderValue::from_str(value).unwrap());
+        is_claims_challenge(&map)
+    };
+    assert!(hit(CLAIMS_CHALLENGE));
+    assert!(hit(
+        r#"Basic realm="x", bearer ERROR = insufficient_claims"#
+    ));
+    // The error belongs to another scheme.
+    assert!(!hit(
+        r#"Bearer realm="x", Other error="insufficient_claims""#
+    ));
+    // The text sits inside a quoted value, not in an error parameter.
+    assert!(!hit(
+        r#"Bearer error_description="a, error=\"insufficient_claims\"", error="invalid_token""#
+    ));
+    assert!(!hit(r#"Bearer error="invalid_token""#));
+    // A second header field is read too.
+    let mut map = HeaderMap::new();
+    map.append(WWW_AUTHENTICATE, HeaderValue::from_static("Basic"));
+    map.append(WWW_AUTHENTICATE, HeaderValue::from_static(CLAIMS_CHALLENGE));
+    assert!(is_claims_challenge(&map));
+}
+
 #[test]
 fn forbidden_maps_to_permission_denied() {
     let err = classify(

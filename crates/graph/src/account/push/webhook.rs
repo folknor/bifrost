@@ -430,11 +430,10 @@ async fn create_and_register(
 /// the old handle alive instead.
 ///
 /// This trusts the classifier's `PermissionDenied`. A Conditional Access
-/// claims challenge (403 with `insufficient_claims`) is recoverable by
-/// re-authenticating, but the classifier currently has no signal for it and
-/// falls back to the 403 status, so a challenge confined to one resource
-/// would be laned here as if consent were missing. The fix belongs in the
-/// classifier, which should map the challenge to an authentication kind.
+/// claims challenge (403 with a Bearer `insufficient_claims` challenge) is
+/// recoverable by re-authenticating, not by consent; the classifier maps it to
+/// `Authentication(ReauthorizationRequired)`, so it is never laned here and
+/// fails the whole request instead.
 fn is_standing_resource_refusal(error: &AccountError) -> bool {
     matches!(
         error.kind(),

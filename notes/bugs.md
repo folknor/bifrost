@@ -125,20 +125,24 @@ adopts the old rows instead of recreating them. Laning the 409 per resource
 was tried and rejected: reattach would then commit the other groups and delete
 the old row, silently dropping working coverage.
 
-## BUG-191 - Graph classifies a Conditional Access claims challenge as `PermissionDenied`
+## BUG-191 - A Graph claims challenge's `claims` value never reaches sign-in
 
-**Reported by:** the Graph calendar and contact scope discovery work (spar review).
+**Reported by:** the Graph claims-challenge classification fix (spar review).
 
-Graph answers 403 with `insufficient_claims` (and a `WWW-Authenticate` claims
-challenge) when the token needs extra claims; that is recovered by
-re-authenticating, not by consent. `GraphSignal` has no variant for it, so it
-falls to the 403 status and becomes `Authorization(PermissionDenied)`, which
-reads to the engine and to the user as missing permission. Since the webhook
-arm now files a `PermissionDenied` create as a per-resource lane failure, a
-challenge confined to one resource would drop that resource's push coverage
-until the next subscribe. Fix in `crates/graph/src/account/graph_error.rs`:
-recognise the challenge and map it to an authentication kind. Not fixed with
-the discovery change because that file was mid-edit by another item.
+Graph now classifies a Bearer `WWW-Authenticate` challenge with
+`error="insufficient_claims"` as `Authentication(ReauthorizationRequired)`
+(`is_claims_challenge` in `crates/graph/src/account/graph_error.rs`). That is
+the right kind, but recovery is incomplete: Microsoft requires the challenge's
+`claims` value to be passed into the authorization request, and for an
+authentication-context (`acrs`) step-up an ordinary sign-in can succeed without
+the required claim, so the resource challenges again - a reauth loop. Nothing
+carries the value: `AccountError` has no consumer-readable slot for it,
+`TokenSource` has no refresh-with-claims, and on a 401 bifrost-net spends its
+forced refresh without claims and builds `AuthLost` without reading the
+header (the 401 header survives only as response evidence). A fix needs a
+contract across bifrost-types (structured payload and its export tier),
+bifrost-net (do not silent-refresh a claims 401; keep the claims), the token
+source, and ratatoskr's MSAL call. Covers both the 401 and 403 paths.
 
 ## BUG-199 - Graph's KQL search route has two pre-existing gaps
 

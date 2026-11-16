@@ -2802,6 +2802,17 @@ the engine then records ALONE.
   `Authentication(ReauthorizationRequired)` -> `AuthLost`;
   `AdminConsentRequired` -> `Authorization(AdminConsentRequired)` ->
   `NeedsAdminConsent`.
+- A Conditional Access claims challenge - a Bearer `WWW-Authenticate`
+  challenge with `error="insufficient_claims"` ->
+  `Authentication(ReauthorizationRequired)` -> `AuthLost`, whatever the
+  envelope code and whether or not the body is an envelope. It asks for a new
+  token, not for consent, and an Outlook user expects a sign-in prompt rather
+  than "no permission"; as `PermissionDenied` it would also be laned by the
+  webhook arm and quarantined on a shared scope. The kind does not promise
+  that an ordinary sign-in satisfies it: the `claims` value is not carried to
+  the consumer or the token source, so an authentication-context step-up can
+  be challenged again. A 401 challenge still takes bifrost-net's forced
+  refresh first and surfaces as `AuthLost`.
 - `ConditionalAccessBlocked` / `AccessRestricted` /
   `MailboxNotEnabledForRestApi` -> `Authorization(ConditionalAccessBlocked
   | PolicyBlocked | MailboxNotLicensed)` -> `NeedsPolicyChange`.

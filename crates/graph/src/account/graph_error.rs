@@ -19,7 +19,7 @@ use bifrost_types::{
     TransmissionState, WireCause,
 };
 use reqwest::StatusCode;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::header::{HeaderMap, RETRY_AFTER, WWW_AUTHENTICATE};
 
 use crate::error::{GraphError, GraphInnerError, GraphResponseError};
 use crate::ews::{EwsError, SoapFaultCode};
@@ -239,11 +239,19 @@ fn internal(kind: InternalErrorKind, message: String, ctx: &GraphErrorContext) -
 /// `AuthLost` is deliberately not refined either: it means a 401 survived a
 /// forced token refresh, which is strictly stronger evidence than the
 /// envelope, and Graph's own 401 arm derives the same recovery class.
+///
+/// A Conditional Access claims challenge is the one exception to the
+/// non-envelope rule: the `WWW-Authenticate` header, not the body, is the
+/// evidence, so a 403 carrying it is refined whatever its body is. Left on
+/// bifrost-net's mapping it would read as `PermissionDenied`.
 #[must_use]
 fn net_to_account_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> AccountError {
     if let Some((status, headers, body)) = graph_envelope_evidence(&net) {
         let response = GraphResponseError::from_response(status, headers, body);
-        if response.signal.is_some() || response.body.is_empty() {
+        if response.signal.is_some()
+            || response.body.is_empty()
+            || is_claims_challenge(&response.headers)
+        {
             return response_to_account_error(response, ctx);
         }
     }
@@ -664,9 +672,15 @@ fn response_to_account_error(
     // envelope; that is provider contract violation territory unless
     // the status code itself carries enough information (5xx is enough,
     // regardless of whether an edge server supplied an HTML body).
-    let cause = match signal.as_ref() {
-        Some(signal) => classify(ctx, code, signal, retry_hint),
-        None => classify_no_envelope(ctx, code, retry_hint, &body),
+    let cause = if is_claims_challenge(&headers) {
+        // A claims challenge outranks the envelope code, which on such a
+        // response may be `AccessDenied`, `Forbidden` or anything else.
+        PrimaryCause::Auth(AuthCause::ReauthorizationRequired)
+    } else {
+        match signal.as_ref() {
+            Some(signal) => classify(ctx, code, signal, retry_hint),
+            None => classify_no_envelope(ctx, code, retry_hint, &body),
+        }
     };
 
     let mut builder = base_builder(ctx, cause.clone());
@@ -906,6 +920,110 @@ fn body_diagnostic(body: &bytes::Bytes) -> Option<DiagnosticText> {
 }
 
 /// Preserve absolute HTTP-dates, including elapsed deadlines, for recovery.
+/// Whether any `WWW-Authenticate` field carries a Bearer challenge whose
+/// `error` parameter is `insufficient_claims` (RFC 6750, Microsoft Conditional
+/// Access and Continuous Access Evaluation).
+///
+/// Such a refusal asks for a new token with more claims, not for consent, so
+/// it classifies as `Authentication(ReauthorizationRequired)`: an Outlook user
+/// whose tenant demands a fresh sign-in expects a sign-in prompt, not "you do
+/// not have permission". Classifying it as `PermissionDenied` also made the
+/// webhook arm lane the resource and the shared-scope path quarantine it.
+///
+/// The kind does not promise that an ordinary sign-in satisfies the
+/// challenge. An authentication-context (`acrs`) step-up needs the `claims`
+/// value passed to the authorization request, and no bifrost surface carries
+/// that value to the consumer or the token source yet; an ordinary sign-in can
+/// then be challenged again.
+///
+/// Parameters are only read from the Bearer challenge that owns them: the
+/// header may list several challenges, and a value may be a quoted string
+/// holding commas.
+fn is_claims_challenge(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(bearer_challenge_has_insufficient_claims)
+}
+
+fn bearer_challenge_has_insufficient_claims(field: &str) -> bool {
+    let mut in_bearer = false;
+    for item in split_challenge_items(field) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        // An item opens a new challenge when its first word is not itself
+        // `name=`: `Bearer realm="x"` or a bare `Basic`.
+        let param = match item.split_once([' ', '\t']) {
+            // `name = value` (whitespace is allowed around `=`) is a param.
+            Some((head, rest)) if !head.contains('=') && !rest.trim_start().starts_with('=') => {
+                in_bearer = head.eq_ignore_ascii_case("bearer");
+                rest.trim_start()
+            }
+            None if !item.contains('=') => {
+                in_bearer = item.eq_ignore_ascii_case("bearer");
+                continue;
+            }
+            _ => item,
+        };
+        if !in_bearer {
+            continue;
+        }
+        if let Some((name, value)) = param.split_once('=')
+            && name.trim().eq_ignore_ascii_case("error")
+            && unquote(value.trim()).eq_ignore_ascii_case("insufficient_claims")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Split a header field on the commas that are not inside a quoted string.
+fn split_challenge_items(field: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, c) in field.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quoted && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c == ',' && !quoted {
+            items.push(&field[start..i]);
+            start = i + 1;
+        }
+    }
+    items.push(&field[start..]);
+    items
+}
+
+fn unquote(value: &str) -> String {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return value.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn parse_retry_after_header(headers: &HeaderMap) -> Option<RetryHint> {
     bifrost_net::request::parse_retry_after_hint(headers.get(RETRY_AFTER))
 }
