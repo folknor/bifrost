@@ -617,6 +617,18 @@ fn names(entities: &[AttachmentEntity]) -> Vec<String> {
         .collect()
 }
 
+fn any() -> AttachmentFilter {
+    AttachmentFilter::Any
+}
+
+fn name(value: &str) -> AttachmentFilter {
+    AttachmentFilter::Name(value.to_owned())
+}
+
+fn media(value: &str) -> AttachmentFilter {
+    AttachmentFilter::MediaType(bifrost_types::MediaTypePattern::parse(value).expect(value))
+}
+
 #[test]
 fn a_single_part_root_with_attachment_metadata_is_an_attachment() {
     let s = parse(
@@ -626,10 +638,10 @@ fn a_single_part_root_with_attachment_metadata_is_an_attachment() {
     assert_eq!(names(&attachment_entities(&s)), ["application/pdf:a.pdf"]);
     let plain = parse(b"(\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 10 1)");
     assert!(attachment_entities(&plain).is_empty());
-    assert!(!attachments_match(&attachment_entities(&plain), ""));
+    assert!(!attachments_match(&attachment_entities(&plain), &any()));
     assert!(!attachments_match(
         &attachment_entities(&plain),
-        "text/plain"
+        &media("text/plain")
     ));
 }
 
@@ -645,10 +657,10 @@ fn a_named_multipart_container_is_an_attachment_but_the_root_wrapper_is_not() {
     );
     let entities = attachment_entities(&s);
     assert_eq!(names(&entities), ["multipart/mixed:bundle.mime"]);
-    assert!(attachments_match(&entities, ""));
-    assert!(attachments_match(&entities, "BUNDLE"));
-    assert!(attachments_match(&entities, "multipart/*"));
-    assert!(!attachments_match(&entities, "text/plain"));
+    assert!(attachments_match(&entities, &any()));
+    assert!(attachments_match(&entities, &name("BUNDLE")));
+    assert!(attachments_match(&entities, &media("multipart/*")));
+    assert!(!attachments_match(&entities, &media("text/plain")));
 }
 
 #[test]
@@ -666,11 +678,11 @@ fn embedded_messages_count_and_their_inner_parts_are_judged_too() {
         names(&entities),
         ["message/rfc822:-", "image/png:report.png"]
     );
-    assert!(attachments_match(&entities, "image/"));
-    assert!(attachments_match(&entities, "image/PNG"));
-    assert!(attachments_match(&entities, "report.png"));
-    assert!(!attachments_match(&entities, " "));
-    assert!(!attachments_match(&entities, " report"));
-    assert!(!attachments_match(&entities, "application/pdf"));
-    assert!(!attachments_match(&entities, "invoice"));
+    assert!(attachments_match(&entities, &media("image/*")));
+    assert!(attachments_match(&entities, &media("image/PNG")));
+    assert!(attachments_match(&entities, &name("report.png")));
+    assert!(attachments_match(&entities, &name("PORT")));
+    assert!(!attachments_match(&entities, &name(" report")));
+    assert!(!attachments_match(&entities, &media("application/pdf")));
+    assert!(!attachments_match(&entities, &name("invoice")));
 }

@@ -570,11 +570,11 @@ fn has_compiles_to_an_attachment_plan_with_a_sound_universe() {
     };
 
     // Has never becomes a BODY search.
-    let plan = plan_for(SearchFilter::Has("pdf".into()), None);
+    let plan = plan_for(pdf_name(), None);
     let SearchQuery::Attachment { tree, universe } = &plan.query else {
         panic!("Has must not compile to a single SEARCH: {plan:?}");
     };
-    assert_eq!(*tree, FilterNode::Has("pdf".into()));
+    assert_eq!(*tree, FilterNode::Has(AttachmentFilter::Name("pdf".into())));
     assert_eq!(*universe, "ALL");
 
     // A conjoined server leaf narrows the universe; the provider query is
@@ -582,7 +582,7 @@ fn has_compiles_to_an_attachment_plan_with_a_sound_universe() {
     let plan = plan_for(
         SearchFilter::And(vec![
             SearchFilter::In(ContainerId("Archive".to_owned())),
-            SearchFilter::Has("pdf".into()),
+            pdf_name(),
             SearchFilter::Subject("q".into()),
         ]),
         Some("UNSEEN"),
@@ -599,7 +599,7 @@ fn has_compiles_to_an_attachment_plan_with_a_sound_universe() {
     // A negated attachment subtree cannot narrow the universe.
     let plan = plan_for(
         SearchFilter::Not(Box::new(SearchFilter::And(vec![
-            SearchFilter::Has("pdf".into()),
+            pdf_name(),
             SearchFilter::From("a".into()),
         ]))),
         None,
@@ -620,13 +620,64 @@ fn has_compiles_to_an_attachment_plan_with_a_sound_universe() {
         search_plan(
             &scopes,
             &SearchRequest::filter(SearchFilter::Or(vec![
-                SearchFilter::Has("pdf".into()),
+                pdf_name(),
                 SearchFilter::In(ContainerId("Archive".to_owned())),
             ])),
             op,
         )
         .is_err()
     );
+}
+
+fn pdf_name() -> SearchFilter {
+    SearchFilter::Attachment(AttachmentFilter::Name("pdf".into()))
+}
+
+#[test]
+fn an_empty_attachment_name_is_malformed() {
+    let scopes = super::super::DavScopeIndex::default();
+    for name in ["", "  "] {
+        let err = search_plan(
+            &scopes,
+            &SearchRequest::filter(SearchFilter::Attachment(AttachmentFilter::Name(
+                name.into(),
+            ))),
+            AccountOperation::SearchMessages,
+        )
+        .expect_err("empty name");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
+}
+
+#[test]
+fn a_provider_query_leaf_is_one_grouped_operand() {
+    let scopes = super::super::DavScopeIndex::default();
+    let op = AccountOperation::SearchMessages;
+    let plan = |filter: SearchFilter| search_plan(&scopes, &SearchRequest::filter(filter), op);
+
+    // A multi-key raw operand stays one operand of OR and of NOT.
+    let or = plan(SearchFilter::Or(vec![
+        SearchFilter::ProviderQuery("FROM a UNSEEN".into()),
+        SearchFilter::Subject("q".into()),
+    ]))
+    .expect("plan");
+    assert_eq!(or.criteria(), "OR ((FROM a UNSEEN)) (SUBJECT \"q\")");
+    let not = plan(SearchFilter::Not(Box::new(SearchFilter::ProviderQuery(
+        "FROM a UNSEEN".into(),
+    ))))
+    .expect("plan");
+    assert_eq!(not.criteria(), "NOT ((FROM a UNSEEN))");
+
+    for bad in ["", "  ", "FROM (a", "FROM {3}"] {
+        let err = plan(SearchFilter::ProviderQuery(bad.into())).expect_err(bad);
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
 }
 
 #[test]

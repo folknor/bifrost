@@ -198,7 +198,9 @@ pub use mutation::{
 pub use page::{Page, PageCursor, SkippedScope};
 
 // Search request AST.
-pub use search::{SearchFilter, SearchRequest};
+pub use search::{
+    AttachmentFilter, MediaTypePattern, SearchFilter, SearchRequest, balanced_raw_query,
+};
 
 // Settings: identities, vacation, quota.
 pub use settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};

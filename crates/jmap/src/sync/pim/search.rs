@@ -6,8 +6,8 @@ use crate::core::query;
 use crate::email::{Email, EmailGet, EmailId, Property as EmailProperty};
 use crate::mailbox::MailboxId;
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, LabelId, ObjectId, Page, SearchFilter,
-    SearchRequest, ThreadId,
+    AccountError, AccountFuture, AccountOperation, AttachmentFilter, LabelId, ObjectId, Page,
+    SearchFilter, SearchRequest, ThreadId,
 };
 use std::sync::Arc;
 
@@ -527,15 +527,41 @@ fn search_filter_to_jmap(
         ]),
         SearchFilter::Subject(value) => crate::email::query::Filter::subject(value).into(),
         SearchFilter::Body(value) => crate::email::query::Filter::body(value).into(),
-        SearchFilter::Has(value) if value.is_empty() => {
+        SearchFilter::Attachment(AttachmentFilter::Any) => {
             crate::email::query::Filter::has_attachment(true).into()
         }
-        SearchFilter::Has(value) => {
-            let filters: Vec<query::Filter<crate::email::query::Filter>> = vec![
-                crate::email::query::Filter::has_attachment(true).into(),
-                crate::email::query::Filter::text(value).into(),
-            ];
-            query::Filter::and(filters)
+        // RFC 8621 has no attachment-name or attachment-type condition, and
+        // `text` searches headers and body text rather than names, so
+        // sending `hasAttachment AND text(name)` would answer a different
+        // question (it once did: an Outlook user asking for attachments named
+        // "invoice" got every attachment-bearing message mentioning the
+        // word). Refused instead; that full-text search stays available as
+        // `And(Attachment(Any), ProviderQuery(text))`. A blank name is
+        // malformed on every provider, so it is reported as such here too.
+        SearchFilter::Attachment(AttachmentFilter::Name(name)) if name.trim().is_empty() => {
+            return Err(crate::sync::error::search_malformed(
+                AccountOperation::Search,
+                "attachment name search needs a name",
+            ));
+        }
+        SearchFilter::Attachment(_) => {
+            return Err(crate::sync::error::unsupported_error(
+                AccountOperation::Search,
+                None,
+                bifrost_types::UnsupportedReason::RequestShape,
+                "JMAP has no attachment-name or attachment-type search condition",
+            ));
+        }
+        // The same `text` filter the request-level `provider_query` becomes,
+        // sent verbatim: it is text data, so nothing can escape a group.
+        SearchFilter::ProviderQuery(value) => {
+            if value.trim().is_empty() {
+                return Err(crate::sync::error::search_malformed(
+                    AccountOperation::Search,
+                    "provider query leaf is empty",
+                ));
+            }
+            crate::email::query::Filter::text(value).into()
         }
         // The owner qualifier is stripped here, never sent: `route_search`
         // already selected the owning account handle and refused a filter

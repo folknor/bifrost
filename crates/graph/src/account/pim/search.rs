@@ -8,8 +8,9 @@ use crate::account::graph_error::{
 use crate::client::Resource;
 use crate::types::ODataCollection;
 use bifrost_types::{
-    AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, ErrorScope, LabelId,
-    ObjectId, Page, SearchFilter, SearchRequest, SkippedScope, ThreadId,
+    AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, AttachmentFilter,
+    ErrorScope, LabelId, ObjectId, Page, SearchFilter, SearchRequest, SkippedScope, ThreadId,
+    balanced_raw_query,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -362,13 +363,18 @@ pub(super) fn search_url(prefix: &str, request: &SearchRequest) -> Result<String
     Ok(format!("{prefix}/messages?{}", params.join("&")))
 }
 
-/// True if any leaf of the filter tree is a `From`/`To` substring match.
-/// Graph `$filter` rejects `contains()` on the sender/recipient navigation
-/// properties, so the whole request must route through `$search`/KQL when
-/// one of these is present anywhere in the boolean composition.
+/// True if any leaf of the filter tree exists only in KQL: a `From`/`To`
+/// substring match (Graph `$filter` rejects `contains()` on the
+/// sender/recipient navigation properties), an attachment-name search
+/// (`attachments` is not filterable on messages; KQL has `attachment:`), or a
+/// raw KQL leaf. The whole request then routes through `$search`/KQL when one
+/// of these is present anywhere in the boolean composition.
 pub(super) fn filter_requires_search(filter: &SearchFilter) -> bool {
     match filter {
-        SearchFilter::From(_) | SearchFilter::To(_) => true,
+        SearchFilter::From(_)
+        | SearchFilter::To(_)
+        | SearchFilter::Attachment(AttachmentFilter::Name(_))
+        | SearchFilter::ProviderQuery(_) => true,
         SearchFilter::And(filters) | SearchFilter::Or(filters) => {
             filters.iter().any(filter_requires_search)
         }
@@ -381,8 +387,8 @@ pub(super) fn filter_requires_search(filter: &SearchFilter) -> bool {
 ///
 /// Used only when `filter_requires_search` holds, because Graph cannot mix
 /// `$search` with `$filter`. KQL property restrictions cover sender,
-/// recipient, subject, body, attachment presence, category, and a send-date
-/// range; KQL terms are AND/OR/NOT-composed. The one structured leaf with no
+/// recipient, subject, body, attachment presence and name, category, and a
+/// date range, plus raw KQL leaves; KQL terms are AND/OR/NOT-composed. The one structured leaf with no
 /// KQL equivalent on `/messages?$search` is `In` (folder scoping), which has
 /// no KQL property - rather than silently drop it (returning matches from
 /// other folders) or emit an invalid mixed request, it is a clean
@@ -395,23 +401,59 @@ pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> 
         SearchFilter::To(value) => Ok(format!("(to:{0} OR cc:{0})", kql_quoted(value))),
         SearchFilter::Subject(value) => Ok(format!("subject:{}", kql_quoted(value))),
         SearchFilter::Body(value) => Ok(format!("body:{}", kql_quoted(value))),
-        SearchFilter::Has(value) => {
-            if value.is_empty() {
-                Ok("hasattachment:true".to_string())
-            } else {
-                Err(unsupported_account_error(AccountOperation::Search))
+        SearchFilter::Attachment(AttachmentFilter::Any) => Ok("hasattachment:true".to_string()),
+        // Exchange's own attachment-name search (word matching), which is
+        // what the shared Name form promises.
+        SearchFilter::Attachment(AttachmentFilter::Name(name)) => {
+            if name.trim().is_empty() {
+                return Err(invalid_account_error(
+                    AccountOperation::Search,
+                    "attachment name search needs a name",
+                ));
             }
+            Ok(format!("attachment:{}", kql_quoted(name)))
+        }
+        // No KQL or OData property carries an attachment's MIME type.
+        SearchFilter::Attachment(_) => Err(unsupported_account_error(AccountOperation::Search)),
+        // Raw KQL, escaped as the request-level `provider_query` is and
+        // grouped by `kql_join`/`NOT (...)` like every other leaf; the balance
+        // check stops an unmatched `)` or quote from escaping that group.
+        SearchFilter::ProviderQuery(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return Err(invalid_account_error(
+                    AccountOperation::Search,
+                    "provider query leaf is empty",
+                ));
+            }
+            if !balanced_raw_query(raw) {
+                return Err(invalid_account_error(
+                    AccountOperation::Search,
+                    "provider query leaf has unbalanced parentheses or quotes",
+                ));
+            }
+            Ok(format!("({})", graph_search_escape(raw)))
         }
         SearchFilter::Labeled(label) => {
             Ok(format!("category:{}", kql_quoted(&label_id_native(label))))
         }
+        // The shared range is against send time, as the `$filter` path's
+        // `sentDateTime` is, so KQL uses `sent`, not `received`: a sibling
+        // leaf forcing KQL must not move the clock. KQL takes whole dates, so
+        // the range is rounded outward (after floors, before ceils), which
+        // widens it by under a day and never drops a matching message.
         SearchFilter::DateRange { after, before } => {
             let mut parts = Vec::new();
             if let Some(after) = after {
-                parts.push(format!("received>={}", system_time_date(*after)));
+                parts.push(format!("sent>={}", system_time_date(*after)));
             }
             if let Some(before) = before {
-                parts.push(format!("received<{}", system_time_date(*before)));
+                let ceiled = before
+                    .checked_add(
+                        std::time::Duration::from_secs(86_400) - std::time::Duration::from_nanos(1),
+                    )
+                    .unwrap_or(*before);
+                parts.push(format!("sent<{}", system_time_date(ceiled)));
             }
             Ok(parts.join(" AND "))
         }
@@ -423,8 +465,8 @@ pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> 
         SearchFilter::In(_) => Err(invalid_account_error(
             AccountOperation::Search,
             "Graph search cannot combine a folder restriction with a \
-             sender/recipient substring match (no KQL folder property); \
-             use a folder-scoped search or drop the From/To term",
+             sender/recipient, attachment-name or raw KQL term (no KQL \
+             folder property); drop the folder or that term",
         )),
         _ => Err(unsupported_account_error(AccountOperation::Search)),
     }
@@ -466,12 +508,11 @@ pub(super) fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError
         )),
         SearchFilter::Subject(value) => Ok(format!("contains(subject,{})", odata_quoted(value))),
         SearchFilter::Body(value) => Ok(format!("contains(body/content,{})", odata_quoted(value))),
-        SearchFilter::Has(value) => {
-            if value.is_empty() {
-                Ok("hasAttachments eq true".to_string())
-            } else {
-                Err(unsupported_account_error(AccountOperation::Search))
-            }
+        SearchFilter::Attachment(AttachmentFilter::Any) => Ok("hasAttachments eq true".to_string()),
+        // `Name` and `ProviderQuery` never reach here (`filter_requires_search`
+        // routes them to KQL), and no OData property carries a MIME type.
+        SearchFilter::Attachment(_) | SearchFilter::ProviderQuery(_) => {
+            Err(unsupported_account_error(AccountOperation::Search))
         }
         SearchFilter::In(container) => {
             Ok(format!("parentFolderId eq {}", odata_quoted(&container.0)))

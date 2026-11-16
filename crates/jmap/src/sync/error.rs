@@ -598,6 +598,19 @@ pub(crate) fn search_result_set_superseded(operation: AccountOperation) -> Accou
     .expect("valid account error classification")
 }
 
+/// A search filter leaf whose operand cannot form a query (an empty raw
+/// query leaf). Maps to `Request(Malformed)`.
+#[must_use]
+pub(crate) fn search_malformed(operation: AccountOperation, detail: &'static str) -> AccountError {
+    AccountErrorBuilder::new(PrimaryCause::Request(RequestCause::Malformed {
+        detail: DiagnosticText::support_only(detail),
+    }))
+    .context(ERROR_CONTEXT)
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// A send-as mailbox id that was not present in the successfully seeded
 /// foreign-account routing table. Consumers receive these ids from foreign
 /// membership ownership, so an unknown id is a malformed request.

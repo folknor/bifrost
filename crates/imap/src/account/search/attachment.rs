@@ -1,4 +1,5 @@
-//! Exact evaluation of a search filter that contains `SearchFilter::Has`.
+//! Exact evaluation of a search filter that contains `SearchFilter::Attachment`
+//! (compiled to `FilterNode::Has`).
 //!
 //! IMAP SEARCH cannot see MIME part headers or parameters: no portable
 //! search key matches an attachment's filename or media type, and `BODY`
@@ -28,6 +29,8 @@
 //! for one.
 
 use std::collections::{BTreeSet, HashMap};
+
+use bifrost_types::AttachmentFilter;
 
 use super::FilterNode;
 use crate::connection::ImapConnection;
@@ -62,7 +65,7 @@ pub(super) async fn matching_uids(
     let mut criteria = Vec::new();
     collect_leaves(tree, &mut values, &mut criteria);
 
-    let mut has_sets: HashMap<String, BTreeSet<u32>> = HashMap::new();
+    let mut has_sets: HashMap<AttachmentFilter, BTreeSet<u32>> = HashMap::new();
     if !values.is_empty() && !universe_uids.is_empty() {
         let structures = fetch_attachments(conn, &universe_uids, timeout).await?;
         universe_uids.retain(|uid| structures.contains_key(uid));
@@ -93,7 +96,7 @@ pub(super) async fn matching_uids(
 pub(super) fn evaluate(
     node: &FilterNode,
     universe: &BTreeSet<u32>,
-    has_sets: &HashMap<String, BTreeSet<u32>>,
+    has_sets: &HashMap<AttachmentFilter, BTreeSet<u32>>,
     server_sets: &HashMap<String, BTreeSet<u32>>,
 ) -> BTreeSet<u32> {
     let within = |set: Option<&BTreeSet<u32>>| {
@@ -121,7 +124,11 @@ pub(super) fn evaluate(
     }
 }
 
-fn collect_leaves(node: &FilterNode, values: &mut Vec<String>, criteria: &mut Vec<SearchCriteria>) {
+fn collect_leaves(
+    node: &FilterNode,
+    values: &mut Vec<AttachmentFilter>,
+    criteria: &mut Vec<SearchCriteria>,
+) {
     match node {
         FilterNode::Server(leaf) => criteria.push(leaf.clone()),
         FilterNode::Has(value) => {

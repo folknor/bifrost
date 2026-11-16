@@ -8,7 +8,7 @@ use super::{
 use crate::types::{MailboxName, SearchCriteria, ThreadNode};
 use bifrost_types::ids::{ObjectId, ThreadId};
 use bifrost_types::page::{Page, SkippedScope};
-use bifrost_types::search::{SearchFilter, SearchRequest};
+use bifrost_types::search::{AttachmentFilter, SearchFilter, SearchRequest};
 use bifrost_types::{AccountError, AccountFuture, AccountOperation, LabelId, Protocol};
 use jiff::Timestamp;
 use jiff::tz::Offset;
@@ -197,7 +197,7 @@ pub(crate) fn search_messages(
 #[derive(Debug, Clone, PartialEq)]
 enum FilterNode {
     Server(SearchCriteria),
-    Has(String),
+    Has(AttachmentFilter),
     And(Vec<FilterNode>),
     Or(Vec<FilterNode>),
     Not(Box<FilterNode>),
@@ -413,10 +413,37 @@ fn criteria_from_filter(
         // matches prose, so attachments are judged from BODYSTRUCTURE by
         // `search/attachment.rs`, composed with the rest of the filter as set
         // algebra over UIDs.
-        SearchFilter::Has(value) => Ok(CriteriaPart {
-            node: FilterNode::Has(value.clone()),
-            folder: None,
-        }),
+        SearchFilter::Attachment(attachment) => {
+            match attachment {
+                AttachmentFilter::Name(name) if name.trim().is_empty() => {
+                    return Err(pim_malformed(op, "attachment name search needs a name"));
+                }
+                AttachmentFilter::Any
+                | AttachmentFilter::Name(_)
+                | AttachmentFilter::MediaType(_) => {}
+                _ => return Err(super::error::unsupported(op)),
+            }
+            Ok(CriteriaPart {
+                node: FilterNode::Has(attachment.clone()),
+                folder: None,
+            })
+        }
+        // The same raw SEARCH criteria `provider_query` takes, under the same
+        // validation, grouped so a multi-key operand stays one operand of
+        // the surrounding OR / NOT.
+        SearchFilter::ProviderQuery(raw) => {
+            if raw.trim().is_empty() {
+                return Err(pim_malformed(op, "provider query leaf is empty"));
+            }
+            validate_provider_query(raw, op)?;
+            Ok(CriteriaPart {
+                node: FilterNode::Server(
+                    SearchCriteria::new()
+                        .group(SearchCriteria::raw(raw.trim().to_owned(), Vec::new())),
+                ),
+                folder: None,
+            })
+        }
         SearchFilter::In(container) => Ok(CriteriaPart {
             node: FilterNode::all(),
             folder: Some(folder_from_container(scopes, container, op)?),

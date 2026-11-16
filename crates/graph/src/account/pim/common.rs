@@ -52,7 +52,7 @@ pub(super) fn graph_iso8601_utc(at: std::time::SystemTime) -> String {
     utc_civil(at).strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// KQL date literal (`YYYY-MM-DD`) for the `received` range predicates.
+/// KQL date literal (`YYYY-MM-DD`) for the `sent` range predicates.
 pub(super) fn system_time_date(value: SystemTime) -> String {
     utc_civil(value).strftime("%Y-%m-%d").to_string()
 }

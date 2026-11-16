@@ -724,6 +724,59 @@ fn a_search_query_pins_its_sort_order() {
     assert_eq!(value.get("collapseThreads"), Some(&serde_json::json!(true)));
 }
 
+/// JMAP has no attachment-name or attachment-type condition, so those forms
+/// are refused rather than sent as a `text` search over other fields; the
+/// old full-text behaviour composes as `Attachment(Any)` plus a raw leaf.
+#[test]
+fn attachment_search_maps_only_presence_and_the_raw_leaf_is_text() {
+    use bifrost_types::{AccountErrorKind, AttachmentFilter, MediaTypePattern, RequestErrorKind};
+    let filter_of = |filter: SearchFilter| {
+        build_search_query(SearchRequest::filter(filter), false, 0, 10)
+            .map(|query| serde_json::to_value(&query).expect("serializes")["filter"].clone())
+    };
+
+    let composed = filter_of(SearchFilter::Or(vec![
+        SearchFilter::And(vec![
+            SearchFilter::Attachment(AttachmentFilter::Any),
+            SearchFilter::ProviderQuery(" invoice ".into()),
+        ]),
+        SearchFilter::Subject("urgent".into()),
+    ]))
+    .expect("presence and raw text are supported");
+    assert_eq!(
+        composed,
+        serde_json::json!({"operator": "OR", "conditions": [
+            {"operator": "AND", "conditions": [
+                {"hasAttachment": true},
+                {"text": " invoice "},
+            ]},
+            {"subject": "urgent"},
+        ]})
+    );
+
+    for refused in [
+        AttachmentFilter::Name("invoice".into()),
+        AttachmentFilter::MediaType(MediaTypePattern::parse("application/pdf").unwrap()),
+    ] {
+        let err = filter_of(SearchFilter::Not(Box::new(SearchFilter::Attachment(
+            refused,
+        ))))
+        .expect_err("no JMAP condition");
+        assert!(matches!(err.kind(), AccountErrorKind::Unsupported(_)));
+    }
+
+    for blank in [
+        SearchFilter::ProviderQuery("  ".into()),
+        SearchFilter::Attachment(AttachmentFilter::Name(" ".into())),
+    ] {
+        let err = filter_of(blank).expect_err("blank operand");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
+}
+
 /// Scripted `Email/query` + `Email/get` server for the search routing
 /// tests. Records every request so the account the query addressed and
 /// the ids it carried can be asserted.

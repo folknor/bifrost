@@ -152,7 +152,10 @@ Every IMAP command - APPEND and MULTIAPPEND included - is a `types::Command`, en
 Typed SEARCH string operands use `CommandWriter::string` with the live UTF-8 mode. CR and LF are retained as data and emitted in literals; NUL remains refused. The builder's explicit text view is for callers requesting raw syntax and diagnostics, and does not determine typed command framing. Account filter compilation preserves the operands and Boolean grouping through `SearchPlan`; provider queries enter as raw criteria. A nonblank `SearchRequest::provider_query`
 is trimmed and structurally validated, replaces an `ALL` plan, and otherwise
 is conjoined with the structured filter using IMAP implicit AND. Blank queries
-are ignored. This escape accepts IMAP SEARCH syntax, not Sieve syntax. Raw criteria retain arbitrary extension grammar, caller-written literals and explicit additional capability requirements, so no existing search expression is removed. An enterprise user searching message text expects the same bytes to be searched regardless of connection encoding.
+are ignored. A `SearchFilter::ProviderQuery` leaf takes the same raw criteria
+under the same validation, trimmed and wrapped in one explicit group so a
+multi-key operand stays a single operand of the surrounding `OR` / `NOT`; a
+blank leaf is `Request(Malformed)` rather than ignored. This escape accepts IMAP SEARCH syntax, not Sieve syntax. Raw criteria retain arbitrary extension grammar, caller-written literals and explicit additional capability requirements, so no existing search expression is removed. An enterprise user searching message text expects the same bytes to be searched regardless of connection encoding.
 
 Caller-written literals in raw SEARCH-family criteria are the one place literal syntax enters from outside the encoder. `validate_search_criteria_crlf` judges the caller's ORIGINAL markers first (a `{n+}` the connection cannot take is `MissingCapability`, never silently rewritten); the walk (`write_criteria`) then copies every non-marker byte and every payload verbatim, skipping each payload by its declared length, and re-emits only the marker through the writer - a `~{n}` as literal8, so the literal8 rule applies. Two spellings can therefore differ from the caller's: a count with leading zeros is written canonically, and a `~{n+}` the connection may not send non-synchronizing loses its `+` and becomes a real segment boundary.
 
@@ -1010,7 +1013,7 @@ Submodules:
 - `mail_actions.rs` - direct container-membership and keyword/read/importance mutations, composed thread move/delete actions, and their partial-commit projection over the shared mutation engine. It owns the importance keyword consumed by message hydration.
 - `message_targets.rs` - snapshot and native conversation target resolution, per-folder grouping and the UID operand admission shared by actions, drafts and hydration.
 - `compose/` - SMTP send, raw send, draft create/send/discard and Sent-copy policy. `headers.rs` owns byte-preserving envelope parsing, Bcc stripping and draft Date finalization. Header rewriting stays local to submission rather than expanding the shared MIME surface.
-- `search.rs` - typed filter compilation, provider-query validation and position-based search paging; `search/attachment.rs` evaluates filters containing `SearchFilter::Has`.
+- `search.rs` - typed filter compilation, provider-query validation and position-based search paging; `search/attachment.rs` evaluates filters containing `SearchFilter::Attachment`.
 - `containers.rs` - container snapshots, MYRIGHTS projection and mailbox hierarchy edits. Role classification and account role selection remain owned by the folder registry; rights classification remains owned by `MailboxRights`.
 - `message.rs` - typed message/thread hydration and MIME projection; `hydration.rs` owns the FETCH selector and shared preview floor used by this path and `get.rs`.
 - `settings.rs` - quota, identity/vacation refusals and unsupported primitive results.
@@ -1118,7 +1121,7 @@ race cannot be closed by this client.
 - Read state: `set_is_read` via `\Seen`.
 - Importance: `set_importance` maps onto the `$important` keyword (no native IMAP field). Two-valued/exclusive: `High` sets it, `Normal`/`Low` clear it (one STORE); the read side maps `$important` presence to `Message.importance`.
 - Attachment search: no IMAP SEARCH key sees MIME part headers or parameters,
-  so `SearchFilter::Has` is evaluated from BODYSTRUCTURE
+  so `SearchFilter::Attachment` (compiled to a `Has` node) is evaluated from BODYSTRUCTURE
   (`account/search/attachment.rs`), never as a `BODY` search. A filter with a
   `Has` leaf compiles to a tree whose attachment-free subtrees are each one
   SEARCH; per folder the universe is one SEARCH of an over-approximation (every
@@ -1130,10 +1133,12 @@ race cannot be closed by this client.
   with no response was expunged and leaves the universe (so it never surfaces
   through a negation), a UID answered without BODYSTRUCTURE fails the folder
   rather than reading as "no attachment", and out-of-set or unsolicited
-  responses are ignored. Matching (`parts::attachments_match`): an empty value
-  is "has any attachment", a value with `/` is a MIME type (`type/subtype`, or
-  `type/` / `type/*`), anything else is a case-insensitive substring of the
-  decoded filename. An attachment entity (`parts::attachment_entities`) is any
+  responses are ignored. Matching (`parts::attachments_match`):
+  `AttachmentFilter::Any` is "has any attachment entity", `Name` is a
+  case-insensitive substring of the decoded filename (an empty or
+  whitespace-only name is `Request(Malformed)` at compile time), `MediaType`
+  is the shared `MediaTypePattern` rule (`type/subtype` or `type/*`). IMAP is
+  the only provider that evaluates `MediaType`. An attachment entity (`parts::attachment_entities`) is any
   MIME node with `Content-Disposition: attachment`, a filename, or an embedded
   message type, including named `multipart/*` containers and a single-part
   root; only the outer root `multipart/*` wrapper is excluded. Message search

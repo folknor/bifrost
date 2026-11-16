@@ -59,7 +59,7 @@ async fn negated_has_complements_within_the_surviving_universe() {
         .await;
         server
     });
-    let has = FilterNode::Has("pdf".to_owned());
+    let has = FilterNode::Has(AttachmentFilter::Name("pdf".to_owned()));
     let all = SearchCriteria::new().all();
     let not_has = FilterNode::Not(Box::new(has));
     let result = matching_uids(&conn, Surface::Messages, &not_has, &all, T)
@@ -85,7 +85,7 @@ async fn an_answered_uid_without_bodystructure_fails_rather_than_reads_as_no_att
         .await;
         server
     });
-    let not_has = FilterNode::Not(Box::new(FilterNode::Has(String::new())));
+    let not_has = FilterNode::Not(Box::new(FilterNode::Has(AttachmentFilter::Any)));
     let error = matching_uids(
         &conn,
         Surface::Messages,
@@ -133,10 +133,12 @@ async fn server_subtrees_are_searched_once_and_composed_with_has() {
     // holds for UID 2. UID 7 matched the server leaf but is outside the
     // universe, so it can never surface.
     let tree = FilterNode::Or(vec![
-        FilterNode::Has("application/pdf".to_owned()),
+        FilterNode::Has(AttachmentFilter::MediaType(
+            bifrost_types::MediaTypePattern::parse("application/pdf").unwrap(),
+        )),
         FilterNode::And(vec![
             from.clone(),
-            FilterNode::Not(Box::new(FilterNode::Has(String::new()))),
+            FilterNode::Not(Box::new(FilterNode::Has(AttachmentFilter::Any))),
         ]),
     ]);
     let result = matching_uids(

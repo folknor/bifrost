@@ -67,7 +67,7 @@
 //! silently shortened by the walk.
 
 use bifrost_mime::{TransferEncoding, decode_encoded_words, decode_rfc2231_params};
-use bifrost_types::{AccountError, AccountOperation};
+use bifrost_types::{AccountError, AccountOperation, AttachmentFilter};
 
 use crate::types::body::ContentDisposition;
 use crate::types::{BodyStructure, MailboxName};
@@ -537,35 +537,31 @@ pub(crate) fn attachment_entities(structure: &BodyStructure) -> Vec<AttachmentEn
     out
 }
 
-/// Whether a message's attachments satisfy one `SearchFilter::Has` value.
+/// Whether a message's attachments satisfy one `SearchFilter::Attachment`.
 ///
-/// The shared contract matches the value against "either the filename or the
-/// MIME type". Here: an empty value asks for any attachment at all; a value
-/// containing `/` is a MIME type (`type/subtype` exactly, or `type/` and
-/// `type/*` for the whole top-level type); anything else is a substring of
-/// the decoded filename. Every comparison ignores case, because senders and
-/// servers spell both freely.
-pub(crate) fn attachments_match(entities: &[AttachmentEntity], value: &str) -> bool {
-    // Only the empty value means "any attachment"; whitespace is a literal
-    // part of a filename operand.
-    if value.is_empty() {
-        return !entities.is_empty();
+/// `Any` is any attachment entity at all; `Name` is a substring of the
+/// decoded filename; `MediaType` is the shared `MediaTypePattern` rule. Every
+/// comparison ignores case, because senders and servers spell both freely.
+/// An empty `Name` never reaches here: the compiler refuses it.
+pub(crate) fn attachments_match(entities: &[AttachmentEntity], filter: &AttachmentFilter) -> bool {
+    match filter {
+        AttachmentFilter::Any => !entities.is_empty(),
+        AttachmentFilter::Name(name) => {
+            let needle = name.to_lowercase();
+            entities.iter().any(|entity| {
+                entity
+                    .filename
+                    .as_ref()
+                    .is_some_and(|name| name.to_lowercase().contains(&needle))
+            })
+        }
+        AttachmentFilter::MediaType(pattern) => entities
+            .iter()
+            .any(|entity| pattern.matches(&entity.media_type, &entity.media_subtype)),
+        // A future form this evaluator does not know matches nothing; the
+        // compiler refuses unknown forms before any evaluation.
+        _ => false,
     }
-    if let Some((kind, subtype)) = value.split_once('/') {
-        let kind = kind.trim().to_ascii_lowercase();
-        let subtype = subtype.trim().to_ascii_lowercase();
-        return entities.iter().any(|entity| {
-            entity.media_type == kind
-                && (subtype.is_empty() || subtype == "*" || entity.media_subtype == subtype)
-        });
-    }
-    let needle = value.to_lowercase();
-    entities.iter().any(|entity| {
-        entity
-            .filename
-            .as_ref()
-            .is_some_and(|name| name.to_lowercase().contains(&needle))
-    })
 }
 
 /// A decoded part handle: everything needed to re-issue the FETCH.

@@ -2310,10 +2310,19 @@ Message and thread ids from shared mailboxes are owner-qualified, while
 primary ids remain bare; thread search dedups `conversationId` within each
 page. Graph forbids `$search`+`$filter` together and
 rejects `$filter` `contains()` on sender/recipient (400), so any
-`SearchFilter::{From,To}` leaf (`filter_requires_search`) routes the whole
+KQL-only leaf (`filter_requires_search`: `From`, `To`, `Attachment(Name)`,
+`ProviderQuery`, at any depth including under `Not`) routes the whole
 filter onto `$search`/KQL (`kql_filter`), AND-combining any `provider_query`;
-`In` + From/To is `Request(Malformed)` (no KQL folder property). No-sender
-searches keep the `$filter` path.
+`In` plus a KQL-only leaf is `Request(Malformed)` (no KQL folder property).
+Other searches keep the `$filter` path. A `DateRange` is send time on both
+paths (`sentDateTime` in OData, `sent` in KQL); KQL takes whole dates, so its
+bounds round outward (after floors, before ceils). `Attachment(Any)` is
+`hasAttachments eq true` / KQL `hasattachment:true` (Graph's flag, which
+excludes inline attachments); `Attachment(Name)` is KQL `attachment:`
+(Exchange word matching; blank is `Request(Malformed)`);
+`Attachment(MediaType)` is `Unsupported` (no property carries the type). A
+`ProviderQuery` leaf is raw KQL escaped as `provider_query` is, grouped,
+and `Request(Malformed)` when blank or unbalanced.
 
 Both `pim_methods.directory_search` (non-empty lookup) and
 `pim_methods.directory_enumerate` (empty-query enumeration) are true.

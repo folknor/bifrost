@@ -553,7 +553,43 @@ fn mixed_from_and_date_range_collapses_to_one_kql_search() {
     assert!(!url.contains("$filter="), "{url}");
     assert_eq!(
         search_param(&url),
-        bifrost_net::url::encode_query_value("\"(from:\"alice\") AND (received>=1970-01-01)\"")
+        bifrost_net::url::encode_query_value("\"(from:\"alice\") AND (sent>=1970-01-01)\"")
+    );
+}
+
+#[test]
+fn kql_date_range_is_send_time_rounded_outward() {
+    // The `$filter` path ranges over `sentDateTime`; a KQL-forcing sibling
+    // must not move the range onto the received clock, and whole-date KQL
+    // bounds must not drop a message sent inside the requested interval.
+    let day = std::time::Duration::from_secs(86_400);
+    let midday = SystemTime::UNIX_EPOCH + day + std::time::Duration::from_secs(43_200);
+    let req = SearchRequest::filter(SearchFilter::And(vec![
+        SearchFilter::From("alice".to_string()),
+        SearchFilter::DateRange {
+            after: Some(midday),
+            before: Some(midday),
+        },
+    ]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value(
+            "\"(from:\"alice\") AND (sent>=1970-01-02 AND sent<1970-01-03)\""
+        )
+    );
+    let midnight = SystemTime::UNIX_EPOCH + day + day;
+    let req = SearchRequest::filter(SearchFilter::And(vec![
+        SearchFilter::From("alice".to_string()),
+        SearchFilter::DateRange {
+            after: None,
+            before: Some(midnight),
+        },
+    ]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value("\"(from:\"alice\") AND (sent<1970-01-03)\"")
     );
 }
 
@@ -587,6 +623,81 @@ fn from_combined_with_folder_restriction_is_malformed() {
         bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
     ));
     assert_eq!(err.operation(), Some(AccountOperation::Search));
+}
+
+#[test]
+fn attachment_presence_stays_odata_and_a_name_routes_to_kql() {
+    use bifrost_types::{AttachmentFilter, MediaTypePattern};
+    let any = SearchRequest::filter(SearchFilter::Attachment(AttachmentFilter::Any));
+    let url = search_url("/me", &any).expect("url builds");
+    assert!(url.contains("$filter="), "{url}");
+    assert!(!url.contains("$search="), "{url}");
+
+    // A name leaf forces KQL even beneath Not, and drags its siblings along.
+    let req = SearchRequest::filter(SearchFilter::And(vec![
+        SearchFilter::Subject("q3".to_string()),
+        SearchFilter::Not(Box::new(SearchFilter::Attachment(AttachmentFilter::Name(
+            "report".to_string(),
+        )))),
+    ]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert!(!url.contains("$filter="), "{url}");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value(
+            "\"(subject:\"q3\") AND (NOT (attachment:\"report\"))\""
+        )
+    );
+
+    let malformed = |filter: SearchFilter| {
+        let err = search_url("/me", &SearchRequest::filter(filter)).expect_err("refused");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    };
+    malformed(SearchFilter::Attachment(AttachmentFilter::Name(" ".into())));
+    // No KQL folder property: In plus a name is refused, as with From.
+    malformed(SearchFilter::And(vec![
+        SearchFilter::In(ContainerId("inbox".to_string())),
+        SearchFilter::Attachment(AttachmentFilter::Name("report".into())),
+    ]));
+
+    let pdf = SearchFilter::Attachment(AttachmentFilter::MediaType(
+        MediaTypePattern::parse("application/pdf").unwrap(),
+    ));
+    let err = search_url("/me", &SearchRequest::filter(pdf)).expect_err("no type property");
+    assert!(matches!(
+        err.kind(),
+        bifrost_types::AccountErrorKind::Unsupported(_)
+    ));
+}
+
+#[test]
+fn a_raw_kql_leaf_routes_to_search_and_stays_grouped() {
+    let req = SearchRequest::filter(SearchFilter::Or(vec![
+        SearchFilter::ProviderQuery("importance:high OR size>1000".to_string()),
+        SearchFilter::Subject("q3".to_string()),
+    ]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert!(!url.contains("$filter="), "{url}");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value(
+            "\"((importance:high OR size>1000)) OR (subject:\"q3\")\""
+        )
+    );
+    for bad in ["", "  ", "a) OR (b", "\"open"] {
+        let err = search_url(
+            "/me",
+            &SearchRequest::filter(SearchFilter::ProviderQuery(bad.to_string())),
+        )
+        .expect_err(bad);
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    }
 }
 
 #[test]

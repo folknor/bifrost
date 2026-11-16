@@ -2,7 +2,10 @@
 
 use std::time::SystemTime;
 
-use bifrost_types::{AccountError, AccountOperation, FilterCondition, Provider, SearchFilter};
+use bifrost_types::{
+    AccountError, AccountOperation, AttachmentFilter, FilterCondition, Provider, SearchFilter,
+    balanced_raw_query,
+};
 
 use super::error::{GmailErrorContext, into_account_error};
 
@@ -28,13 +31,51 @@ fn search_condition(filter: &SearchFilter) -> Result<FilterCondition, AccountErr
         SearchFilter::To(value) => FilterCondition::To(value.clone()),
         SearchFilter::Subject(value) => FilterCondition::Subject(value.clone()),
         SearchFilter::Body(value) => FilterCondition::Body(value.clone()),
-        SearchFilter::Has(value) if value.eq_ignore_ascii_case("attachment") => {
-            FilterCondition::HasAttachment(true)
+        SearchFilter::Attachment(AttachmentFilter::Any) => FilterCondition::HasAttachment(true),
+        // Gmail's own attachment-name search (name or extension, word
+        // matching), which is what the shared Name form promises.
+        SearchFilter::Attachment(AttachmentFilter::Name(name)) => {
+            if name.trim().is_empty() {
+                return Err(invalid(
+                    AccountOperation::Search,
+                    "attachment name search needs a name",
+                ));
+            }
+            FilterCondition::ProviderExpression {
+                provider: Provider::Gmail,
+                expression: format!("filename:{}", query_term(name)),
+            }
         }
-        SearchFilter::Has(value) => FilterCondition::ProviderExpression {
-            provider: Provider::Gmail,
-            expression: format!("filename:{}", query_term(value)),
-        },
+        // Gmail has no MIME-type operator; `filename:application/pdf` would
+        // be a filename search, so the type form is refused, not faked.
+        SearchFilter::Attachment(_) => {
+            return Err(into_account_error(
+                crate::Error::unsupported(AccountOperation::Search),
+                GmailErrorContext::base(AccountOperation::Search),
+            ));
+        }
+        // Raw Gmail query, as `provider_query` takes it, parenthesised so an
+        // inner OR or a leading `-` stays inside this leaf. The balance check
+        // stops an unmatched `)` or quote from escaping the group.
+        SearchFilter::ProviderQuery(raw) => {
+            let raw = sanitize_term(raw);
+            if raw.is_empty() {
+                return Err(invalid(
+                    AccountOperation::Search,
+                    "provider query leaf is empty",
+                ));
+            }
+            if !balanced_raw_query(&raw) {
+                return Err(invalid(
+                    AccountOperation::Search,
+                    "provider query leaf has unbalanced parentheses or quotes",
+                ));
+            }
+            FilterCondition::ProviderExpression {
+                provider: Provider::Gmail,
+                expression: format!("({raw})"),
+            }
+        }
         SearchFilter::In(container) => FilterCondition::InContainer(container.clone()),
         SearchFilter::Labeled(label) => FilterCondition::ProviderExpression {
             provider: Provider::Gmail,
@@ -250,7 +291,7 @@ mod tests {
             SearchFilter::From("Ada Example".into()),
             SearchFilter::Or(vec![
                 SearchFilter::In(ContainerId("Archive".into())),
-                SearchFilter::Not(Box::new(SearchFilter::Has("attachment".into()))),
+                SearchFilter::Not(Box::new(SearchFilter::Attachment(AttachmentFilter::Any))),
             ]),
         ]);
         let rule = FilterCondition::And(vec![
@@ -272,5 +313,67 @@ mod tests {
                 container_query("Archive"),
             ),
         );
+    }
+
+    #[test]
+    fn attachment_forms_map_to_gmail_operators_or_are_refused() {
+        let name = |value: &str| SearchFilter::Attachment(AttachmentFilter::Name(value.into()));
+        assert_eq!(
+            filter_query(&SearchFilter::Attachment(AttachmentFilter::Any)).unwrap(),
+            "has:attachment"
+        );
+        // No magic word: a file called "attachment" is a name search.
+        assert_eq!(
+            filter_query(&name("attachment")).unwrap(),
+            "filename:attachment"
+        );
+        assert_eq!(
+            filter_query(&SearchFilter::Not(Box::new(name("q3 report")))).unwrap(),
+            "-(filename:\"q3 report\")"
+        );
+        for empty in ["", "  "] {
+            let err = filter_query(&name(empty)).expect_err("empty name");
+            assert!(matches!(
+                err.kind(),
+                bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                )
+            ));
+        }
+        let pdf = SearchFilter::Attachment(AttachmentFilter::MediaType(
+            bifrost_types::MediaTypePattern::parse("application/pdf").unwrap(),
+        ));
+        assert!(matches!(
+            filter_query(&pdf).expect_err("no type operator").kind(),
+            bifrost_types::AccountErrorKind::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn a_raw_query_leaf_stays_inside_its_group() {
+        let search = SearchFilter::And(vec![
+            SearchFilter::ProviderQuery("from:a OR from:b".into()),
+            SearchFilter::Subject("budget".into()),
+        ]);
+        assert_eq!(
+            filter_query(&search).unwrap(),
+            "(from:a OR from:b) subject:budget"
+        );
+        assert_eq!(
+            filter_query(&SearchFilter::Not(Box::new(SearchFilter::ProviderQuery(
+                "larger:5M".into()
+            ))))
+            .unwrap(),
+            "-((larger:5M))"
+        );
+        for bad in ["", " ", "a) OR (b", "\"open"] {
+            let err = filter_query(&SearchFilter::ProviderQuery(bad.into())).expect_err(bad);
+            assert!(matches!(
+                err.kind(),
+                bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                )
+            ));
+        }
     }
 }

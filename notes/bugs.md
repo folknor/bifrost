@@ -140,20 +140,44 @@ until the next subscribe. Fix in `crates/graph/src/account/graph_error.rs`:
 recognise the challenge and map it to an authentication kind. Not fixed with
 the discovery change because that file was mid-edit by another item.
 
-## BUG-196 - `SearchFilter::Has` means three different things across providers
+## BUG-199 - Graph's KQL search route has two pre-existing gaps
 
-**Reported by:** the IMAP attachment-search fix (lateral).
+**Reported by:** the attachment-search contract fix (spar, lateral). More
+filters now take the route (`Attachment(Name)` and `ProviderQuery` leaves join
+`From`/`To`), so these bite more often. (Its KQL date range, which used the
+received clock, was moved to send time in the same fix.)
 
-The shared doc in `crates/types/src/search.rs` says the value matches "either
-the filename suffix or the MIME type depending on protocol". IMAP now matches
-an empty value as any attachment, a value with `/` as a MIME type, anything
-else as a filename substring. JMAP (`sync/pim/search.rs`) sends
-`hasAttachment AND text(value)`, a full-text match on any attachment-bearing
-message. Gmail (`account/query.rs`) maps `attachment` to `has:attachment` and
-anything else to `filename:`. Graph (`account/pim/search.rs`) supports only
-the empty value and refuses a non-empty one as `Unsupported`. A consumer
-cannot know what `Has("pdf")` will return. Decide one cross-provider meaning
-(the yardstick suggests the IMAP one: an Outlook user typing a filename or a
-type expects attachments that have it), write it on the variant, and bring the
-other providers to it.
+In `crates/graph/src/account/pim/search.rs`: (1) `In` plus any KQL-only leaf
+is refused `Request(Malformed)`, yet Graph supports `$search` on a folder's
+own message collection (`/mailFolders/{id}/messages`), so a positive `In`
+conjunct could become the endpoint scope; (2) `$search` returns at most 1,000
+results, and the search pages hardcode `truncated: false`, so hitting the
+ceiling reads as an exhaustive end.
+
+## BUG-200 - JMAP has no attachment-name search
+
+**Reported by:** the attachment-search contract fix (spar, lateral).
+
+`SearchFilter::Attachment(Name)` is refused `Unsupported` on JMAP because
+RFC 8621 has no attachment-name condition (`text` searches other fields). An
+Outlook user on a JMAP account therefore cannot search attachments by name.
+Candidates: a server extension condition when the session advertises one
+(Cyrus/Fastmail-style `attachmentName`), or client verification of a positive
+top-level conjunct against `bodyStructure` names. Verification is only exact
+in that position, and `hasAttachment` is not a proven candidate superset of
+named parts, so neither path is a drop-in.
+
+## BUG-201 - IMAP search counts named inline parts as attachments; raw-query literal doc mismatch
+
+**Reported by:** the attachment-search contract fix (spar, lateral).
+
+`parts::attachment_entities` counts any part with a filename, so a signature
+logo sent `inline` with a name makes `Attachment(Any)` match on IMAP, while
+Graph's `hasAttachments` excludes inline attachments (an Outlook user's
+paperclip). Whether IMAP should follow the paperclip is a product decision
+over the entity rule ruled on for the BODYSTRUCTURE evaluator. Separately,
+`reference/imap.md` says raw SEARCH criteria "retain caller-written
+literals", but `validate_provider_query` in `crates/imap/src/account/search.rs`
+refuses any IMAP literal in `provider_query` (and now in a `ProviderQuery`
+leaf); one of the two is wrong.
 
