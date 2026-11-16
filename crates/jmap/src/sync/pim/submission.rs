@@ -267,7 +267,9 @@ fn take_implicit_email_set(
     };
     let outcome = match answer {
         Ok(()) => ImplicitOutcome::Applied,
-        Err(error @ crate::Error::IdUnanswered { .. }) => ImplicitOutcome::Unknown(error),
+        Err(error @ (crate::Error::IdUnanswered { .. } | crate::Error::IdContradicted { .. })) => {
+            ImplicitOutcome::Unknown(error)
+        }
         Err(error) => ImplicitOutcome::Refused(error),
     };
     (state, outcome)
@@ -1030,6 +1032,7 @@ pub(crate) fn reschedule_send(
                 crate::Error::EnvelopeDecode(_)
                     | crate::Error::ResultDecode { .. }
                     | crate::Error::IdUnanswered { .. }
+                    | crate::Error::IdContradicted { .. }
                     | crate::Error::CallNotFound(_)
             ) || matches!(&error, crate::Error::Transport(transport) if transport.local_failure().is_none());
             let error = answer_error(AccountOperation::RescheduleSend)(error);

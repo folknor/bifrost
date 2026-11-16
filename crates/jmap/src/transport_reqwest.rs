@@ -1,6 +1,3 @@
-// Standalone constructor kept for consumers that build the transport directly.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,6 +80,9 @@ impl ReqwestTransport {
         Ok(request)
     }
 
+    // Production builds the transport through `new_with_net_and_retry` from
+    // `Client`; these two shorter doors exist for the transport's own tests.
+    #[cfg(test)]
     pub(crate) fn new(
         headers: header::HeaderMap,
         authorization: Authorization,
@@ -102,6 +102,7 @@ impl ReqwestTransport {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_net(
         headers: header::HeaderMap,
         authorization: Authorization,
@@ -123,8 +124,8 @@ impl ReqwestTransport {
         )
     }
 
-    /// As [`Self::new_with_net`], overriding the account's default retry
-    /// policy when `default_retry` is set. Only tests set it, so a scripted
+    /// The transport over the injected `Net` (or the process net when
+    /// `None`), overriding the account's default retry policy when `default_retry` is set. Only tests set it, so a scripted
     /// failure surfaces once instead of being retried with backoff.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_net_and_retry(
@@ -350,6 +351,8 @@ impl ReqwestTransport {
 }
 
 impl ReqwestTransport {
+    /// Unmeasured shorthand for tests; production reads the byte count.
+    #[cfg(test)]
     pub(crate) async fn api_request(
         &self,
         url: &str,
@@ -423,6 +426,8 @@ impl ReqwestTransport {
             .0)
     }
 
+    /// Unmeasured shorthand for tests; production reads the byte count.
+    #[cfg(test)]
     pub(crate) async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
         Ok(self.download_measured(url).await?.0)
     }

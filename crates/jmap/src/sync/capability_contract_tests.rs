@@ -1,18 +1,21 @@
 //! The capability mirror, checked against the account it describes.
 //!
-//! `PimMethodSupport` is a hand-maintained mirror of the `Account` trait: sixty
-//! `bool`s with no mechanical link to the methods they describe. Nothing else
-//! in the workspace checks that a `false` flag implies the method actually
-//! refuses. This drives every gated method on the crate's own `Account` impl
-//! and asserts the flag and the observed result agree.
+//! `PimMethodSupport`'s declaration generates its fields together with the
+//! canonical operation-to-flag gate, but nothing links a flag to how this
+//! crate's `Account` impl actually decides: its doors gate on registry family
+//! presence, not on the flag. This drives every gated method on the crate's
+//! own `Account` impl and asserts the flag and the observed result agree.
 //!
-//! This file pins the false direction: a `false` flag must make the method
-//! refuse locally, without a request. The account below rides a scripted
-//! server that panics on any request, so a driven method that reached the
-//! wire fails loudly rather than answering `Unsupported`. The true direction
-//! needs a scripted server per method; a whole account opened through
-//! `JmapAccountFactory::with_net` over a scripted net reaches it (see
-//! `a_whole_account_opens_and_answers_over_a_scripted_net`).
+//! The false direction: a `false` flag must make the method refuse locally,
+//! without a request. The hand-built account below rides a scripted server
+//! that panics on any request, so a driven method that reached the wire fails
+//! loudly rather than answering `Unsupported`.
+//!
+//! The true direction: a `true` flag must reach the wire. Those tests open the
+//! account through `JmapAccountFactory::with_net`, so the flags and the
+//! registry families come from one discovery, and drive each method to a
+//! named milestone call. They cover the Sieve and VacationResponse families
+//! so far.
 //!
 //! The `PimSupport` fixture deliberately declares NOTHING supported, which is
 //! the widest false set the capability builder can produce and therefore the
@@ -131,9 +134,7 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
     let registry = Arc::new(registry);
     let shutdown = CancellationToken::new();
     let ws = WsState::new(
-        client.clone(),
         false,
-        shutdown.clone(),
         ReconnectPolicy::default(),
         Arc::new(PushRouting::from_registry(Arc::clone(&registry))),
     );
@@ -798,4 +799,213 @@ fn push_lanes_follow_websocket_capability_and_reconnect_policy() {
         std::time::Duration::from_secs(7)
     );
     assert_eq!(lanes[0].backoff.max(), std::time::Duration::from_secs(70));
+}
+
+/// The true direction for the Sieve and VacationResponse families: an account
+/// opened through `JmapAccountFactory::with_net` (so the flags and the
+/// registry families come from the same discovery, the coupling the
+/// hand-built fixture above cannot see) over a session advertising both.
+/// Each driven method must reach its milestone call on the wire, addressed to
+/// the advertising account, and come back with that call's `forbidden`
+/// refusal rather than a local `Unsupported`. `forbidden` is chosen because
+/// it terminates deterministically: it neither retries (`serverFail`) nor
+/// rediscovers (`unknownMethod`) nor maps to `Unsupported` (`unsupportedFilter`).
+/// Prerequisites before a milestone (the script blob upload) succeed.
+///
+/// `filters_list` failing at `SieveScript/query` proves family admission,
+/// not its later get and download path; per-method wire tests cover those.
+#[tokio::test]
+async fn true_sieve_and_vacation_flags_reach_the_wire() {
+    use bifrost_types::AccountFactory as _;
+    use serde_json::{Value, json};
+
+    let session_doc = json!({
+        "capabilities": {
+            "urn:ietf:params:jmap:core": {
+                "maxSizeUpload": 100_000, "maxConcurrentUpload": 2,
+                "maxSizeRequest": 100_000, "maxConcurrentRequests": 4,
+                "maxCallsInRequest": 8, "maxObjectsInGet": 256,
+                "maxObjectsInSet": 256, "collationAlgorithms": []
+            },
+            "urn:ietf:params:jmap:mail": {},
+            "urn:ietf:params:jmap:vacationresponse": {},
+            "urn:ietf:params:jmap:sieve": {}
+        },
+        "accounts": {"primary": {
+            "name": "Primary", "isPersonal": true, "isReadOnly": false,
+            "accountCapabilities": {
+                "urn:ietf:params:jmap:mail": {},
+                "urn:ietf:params:jmap:vacationresponse": {},
+                "urn:ietf:params:jmap:sieve": {}
+            }
+        }},
+        "primaryAccounts": {
+            "urn:ietf:params:jmap:mail": "primary",
+            "urn:ietf:params:jmap:vacationresponse": "primary",
+            "urn:ietf:params:jmap:sieve": "primary"
+        },
+        "username": "user@example.test",
+        "apiUrl": "https://jmap.test/jmap/api",
+        "downloadUrl": "https://jmap.test/download/{accountId}/{blobId}/{name}/{type}",
+        "uploadUrl": "https://jmap.test/upload/{accountId}",
+        "eventSourceUrl": "https://jmap.test/eventsource",
+        "state": "session-1"
+    });
+    let script = crate::test_wire::server(move |request| {
+        let path = request.url.path();
+        if request.method == reqwest::Method::GET && path == "/.well-known/jmap" {
+            return crate::test_wire::ok_json(&session_doc);
+        }
+        if path.starts_with("/upload/") {
+            return crate::test_wire::ok_json(&json!({
+                "accountId": "primary", "blobId": "blob-1",
+                "type": "application/sieve", "size": 5
+            }));
+        }
+        if !crate::test_wire::is_api(request) {
+            return crate::test_wire::unexpected(request);
+        }
+        let body = crate::test_wire::body_json(request);
+        let responses = body["methodCalls"]
+            .as_array()
+            .expect("method calls")
+            .iter()
+            .map(|call| {
+                let name = call[0].as_str().expect("method name");
+                if matches!(name, "Email/get" | "Mailbox/get") {
+                    json!([name, {
+                        "accountId": call[1]["accountId"],
+                        "state": format!("{name}-state"),
+                        "list": [], "notFound": []
+                    }, call[2]])
+                } else {
+                    json!(["error", {"type": "forbidden"}, call[2]])
+                }
+            })
+            .collect::<Vec<_>>();
+        crate::test_wire::ok_json(&json!({
+            "sessionState": "session-1",
+            "methodResponses": responses
+        }))
+    });
+    let factory = super::factory::JmapAccountFactory::builder(
+        "https://jmap.test",
+        super::factory::JmapCredentials::Basic {
+            username: "user".to_owned(),
+            password: "secret".into(),
+        },
+    )
+    .with_net(bifrost_net::test_support::scripted_net(
+        &script,
+        bifrost_net::NetConfig::default(),
+    ))
+    .default_retry(bifrost_net::RetryPolicy::disabled())
+    .build();
+    let opened = factory
+        .open(bifrost_types::AccountId("true-direction".to_owned()))
+        .await
+        .expect("the account opens over the scripted net");
+    let account = opened.account;
+
+    // Assert the flags first, so a regression in capability derivation fails
+    // here instead of silently shrinking the set of driven methods.
+    let pim = &account.capabilities().pim_methods;
+    for (flag, on) in [
+        ("filters_list", pim.filters_list),
+        ("filter_create", pim.filter_create),
+        ("filter_update", pim.filter_update),
+        ("filter_delete", pim.filter_delete),
+        ("filter_validate", pim.filter_validate),
+        ("vacation_get", pim.vacation_get),
+        ("vacation_set", pim.vacation_set),
+    ] {
+        assert!(on, "{flag} is advertised by the session");
+    }
+
+    let last_call = |method: &str| -> Value {
+        crate::test_wire::api_bodies(&script)
+            .into_iter()
+            .flat_map(|body| body["methodCalls"].as_array().cloned().unwrap_or_default())
+            .rfind(|call| call[0] == method)
+            .unwrap_or_else(|| panic!("{method} never reached the wire"))
+    };
+    let refused_remotely = |flag: &str, error: AccountError| {
+        assert!(
+            !matches!(error.kind(), AccountErrorKind::Unsupported(_)),
+            "{flag}: a true flag refused locally: {error:?}"
+        );
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied),
+            "{flag}: the milestone's forbidden refusal: {error:?}"
+        );
+    };
+
+    refused_remotely(
+        "filters_list",
+        account.filters_list().await.expect_err("forbidden query"),
+    );
+    assert_eq!(last_call("SieveScript/query")[1]["accountId"], "primary");
+
+    refused_remotely(
+        "filter_create",
+        account
+            .filter_create(filter_create())
+            .await
+            .expect_err("forbidden set"),
+    );
+    let create = last_call("SieveScript/set");
+    assert_eq!(create[1]["accountId"], "primary");
+    assert!(create[1]["create"].is_object(), "{create}");
+
+    refused_remotely(
+        "filter_update",
+        account
+            .filter_update(
+                ServerFilterId("f1".to_string()),
+                ServerFilterPatch::Script(bifrost_types::FilterScriptPatch {
+                    name: Some(Some("renamed".to_string())),
+                    body: None,
+                    is_active: None,
+                }),
+            )
+            .await
+            .expect_err("forbidden set"),
+    );
+    let update = last_call("SieveScript/set");
+    assert_eq!(update[1]["update"]["f1"]["name"], "renamed", "{update}");
+
+    refused_remotely(
+        "filter_delete",
+        account
+            .filter_delete(ServerFilterId("f1".to_string()))
+            .await
+            .expect_err("forbidden set"),
+    );
+    let delete = last_call("SieveScript/set");
+    assert_eq!(delete[1]["destroy"], json!(["f1"]), "{delete}");
+
+    refused_remotely(
+        "filter_validate",
+        account
+            .filter_validate(filter_create())
+            .await
+            .expect_err("forbidden validate"),
+    );
+    assert_eq!(last_call("SieveScript/validate")[1]["accountId"], "primary");
+
+    refused_remotely(
+        "vacation_get",
+        account.vacation_get().await.expect_err("forbidden get"),
+    );
+    assert_eq!(last_call("VacationResponse/get")[1]["accountId"], "primary");
+
+    refused_remotely(
+        "vacation_set",
+        account
+            .vacation_set(vacation())
+            .await
+            .expect_err("forbidden set"),
+    );
+    assert_eq!(last_call("VacationResponse/set")[1]["accountId"], "primary");
 }

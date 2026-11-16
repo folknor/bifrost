@@ -249,9 +249,16 @@ submission handle for account identity and shared refusal history. In-place remo
 order; swapping the tail into the vacated slot reorders later lookups.
 
 Per-id accounting uses `core/answer.rs::IdAnswer<T>` across set, copy,
-import, upload, parse and read responses: `Ok`, `Refused`, `NotFound` or
-`Unanswered`. A refused set's notFound retains its typed SetError for the
-account's absent-target policy. Only explicit notFound entries establish a miss;
+import, upload, parse and read responses: `Ok`, `Refused`, `NotFound`,
+`Unanswered` or `Contradicted`. An id answered in more than one lane (success
+and refusal, success and `notFound`, refusal and `notFound`) is `Contradicted`
+and surfaces as `Error::IdContradicted`, which the account layer classifies
+exactly like an unanswered id of the same direction (`Protocol(PartialResponse)`,
+acknowledged, guarded writes narrowed to non-idempotent): a provider that
+contradicts itself proves neither outcome, so creates and guarded writes
+reconcile and reads retry, and neither the success nor the retained refusal is
+reported. Raw map iterators (`created_ids` and kin) bypass this algebra.
+A refused set's notFound retains its typed SetError for the account's absent-target policy. Only explicit notFound entries establish a miss;
 an omitted Blob/copy or parse entry is unanswered, never a terminal missing id.
 A Blob/copy response naming different source or destination accounts is a
 ContractViolation, not a blob-format ParseFailed error.
@@ -906,8 +913,9 @@ probe results - the `PimSupport` gates, which depend on which shares actually
 seeded - stays in `build`, which still calls `validate_session` itself so the
 refusal does not depend on the caller having run it. `build` then produces
 `AccountCapabilities` + `ObjectLimits`. It builds the push state (`WsState::new`,
-which spawns nothing: the engine opens push sessions after attach) with a
-`CancellationToken`, and returns `OpenedAccount` (the handle plus the
+which spawns nothing and holds no client or token: the engine opens push
+sessions after attach), hands the account its own shutdown `CancellationToken`,
+and returns `OpenedAccount` (the handle plus the
 foreign-account skip lane; see Foreign accounts below).
 
 The batch is conditional on the session's own numbers. `maxCallsInRequest` and `maxSizeRequest` are hard limits (RFC 8620 §2) the server enforces by rejecting the whole request with a request-level `limit` error, and the commonly quoted 16 calls is the minimum a server is *recommended* to support, never a floor a client may assume. So `batched_open_probes` sends the two-call batch only when the advertised call count allows it and `Request::send_methods_within` finds the encoded request inside `maxSizeRequest`; otherwise nothing is sent and the probes go out one request each. `send_methods_within` takes the size limit as a required argument (and returns `Ok(None)` without sending when the batch does not fit) precisely so a future batching call site cannot forget the question.

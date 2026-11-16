@@ -310,9 +310,10 @@ pim_method_support! {
 ///
 /// What holds it honest is `capability_contract_tests.rs` in each protocol
 /// crate, which drives every gated entry point and asserts the flag agrees.
-/// That coverage is false-direction only: a `false` flag is proven to refuse
-/// without wire contact, while a `true` flag reaching the network is not
-/// asserted, since proving it would need a live seam each crate lacks.
+/// That coverage is mainly false-direction: a `false` flag is proven to refuse
+/// without wire contact. A `true` flag reaching the network needs an account
+/// opened over a scripted network; `bifrost-jmap` has that seam and asserts
+/// the true direction for some method families, and no crate covers it fully.
 ///
 /// Ruled 2026-10-03: the struct stays. The rejected alternative replaced it
 /// with a runtime `supports(&self, op: AccountOperation)` query defaulted from

@@ -210,13 +210,7 @@ impl PushTransport for Client {
 }
 
 impl WsState {
-    pub(crate) fn new(
-        _client: Client,
-        available: bool,
-        _shutdown: CancellationToken,
-        policy: ReconnectPolicy,
-        routing: Arc<PushRouting>,
-    ) -> Self {
+    pub(crate) fn new(available: bool, policy: ReconnectPolicy, routing: Arc<PushRouting>) -> Self {
         Self {
             enabled: Arc::new(Mutex::new(HashSet::new())),
             push_state: Arc::new(Mutex::new(None)),

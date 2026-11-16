@@ -8,9 +8,13 @@ pub(crate) struct AnswerContext {
     pub(crate) write: bool,
 }
 
-/// Every submitted id has one of these four observations. In particular an
+/// Every submitted id has one of these five observations. In particular an
 /// omission is not a server-declared miss: an Outlook user expects an uncertain
 /// write to reconcile rather than disappear as a terminal failure.
+///
+/// This algebra covers readers that extract one id through `from_parts`. Raw
+/// collection iterators on the response types (`created_ids` and kin) bypass
+/// it and see the provider's maps as sent.
 #[derive(Debug)]
 pub(crate) enum IdAnswer<T> {
     Ok(T),
@@ -18,6 +22,41 @@ pub(crate) enum IdAnswer<T> {
     /// A declared miss, optionally retaining the provider's typed set refusal.
     NotFound(Option<crate::Error>),
     Unanswered,
+    /// The id was answered in more than one outcome lane (a success entry and
+    /// a refusal, a success and `notFound`, or a refusal and `notFound`). A
+    /// provider that contradicts itself proves neither outcome, so this is
+    /// uncertain evidence, never success and never the retained refusal: an
+    /// Outlook user whose save the server both accepted and refused expects
+    /// it to reconcile, not a false "saved" or a failure that invites a
+    /// duplicating retry.
+    Contradicted(Lanes),
+}
+
+/// Which outcome lanes answered a contradicted id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Lanes {
+    pub(crate) success: bool,
+    pub(crate) refusal: bool,
+    pub(crate) not_found: bool,
+}
+
+impl std::fmt::Display for Lanes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names = [
+            (self.success, "success"),
+            (self.refusal, "refusal"),
+            (self.not_found, "notFound"),
+        ];
+        let mut first = true;
+        for (_, name) in names.iter().filter(|(present, _)| *present) {
+            if !first {
+                f.write_str(" and ")?;
+            }
+            f.write_str(name)?;
+            first = false;
+        }
+        Ok(())
+    }
 }
 
 impl<T> IdAnswer<T> {
@@ -26,6 +65,14 @@ impl<T> IdAnswer<T> {
         refusal: Option<crate::Error>,
         not_found: bool,
     ) -> Self {
+        let lanes = Lanes {
+            success: success.is_some(),
+            refusal: refusal.is_some(),
+            not_found,
+        };
+        if u8::from(lanes.success) + u8::from(lanes.refusal) + u8::from(lanes.not_found) > 1 {
+            return Self::Contradicted(lanes);
+        }
         if let Some(value) = success {
             Self::Ok(value)
         } else if let Some(error) = refusal {
@@ -51,6 +98,11 @@ impl<T> IdAnswer<T> {
             Self::Unanswered => Err(crate::Error::IdUnanswered {
                 id: id.to_owned(),
                 context,
+            }),
+            Self::Contradicted(lanes) => Err(crate::Error::IdContradicted {
+                id: id.to_owned(),
+                context,
+                lanes,
             }),
         }
     }
@@ -109,6 +161,73 @@ mod tests {
         assert!(matches!(answers[1].1, IdAnswer::NotFound(_)));
         assert!(matches!(answers[2].1, IdAnswer::Unanswered));
         assert!(matches!(answers[3].1, IdAnswer::Ok((Some("wanted"), 2))));
+    }
+
+    #[test]
+    fn an_id_answered_in_more_than_one_lane_is_contradicted() {
+        let refusal = || Some(crate::Error::NotParsable("x".into()));
+        let cases = [
+            (
+                IdAnswer::from_parts(Some(()), refusal(), false),
+                true,
+                true,
+                false,
+            ),
+            (
+                IdAnswer::from_parts(Some(()), None, true),
+                true,
+                false,
+                true,
+            ),
+            (
+                IdAnswer::from_parts(None, refusal(), true),
+                false,
+                true,
+                true,
+            ),
+            (
+                IdAnswer::from_parts(Some(()), refusal(), true),
+                true,
+                true,
+                true,
+            ),
+        ];
+        for (answer, success, refusal, not_found) in cases {
+            let IdAnswer::Contradicted(lanes) = answer else {
+                panic!("contradiction expected: {answer:?}");
+            };
+            assert_eq!(
+                lanes,
+                Lanes {
+                    success,
+                    refusal,
+                    not_found
+                }
+            );
+        }
+        let error = IdAnswer::from_parts(Some(()), None, true)
+            .into_result("x", AnswerContext::default())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Id x answered as success and notFound in one  response"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn a_set_create_in_both_created_and_not_created_is_not_success() {
+        let mut response: crate::core::set::SetResponse<crate::sieve::SieveScript> =
+            serde_json::from_value(serde_json::json!({
+                "accountId": "a", "newState": "s1",
+                "created": {"c0": {"id": "S1"}},
+                "notCreated": {"c0": {"type": "forbidden"}}
+            }))
+            .unwrap();
+        assert!(matches!(
+            response.created("c0"),
+            Err(crate::Error::IdContradicted { .. })
+        ));
     }
 
     #[test]

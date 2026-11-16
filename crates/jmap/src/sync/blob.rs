@@ -167,6 +167,16 @@ fn raw_message_blob(
             .cloned()
             .ok_or_else(|| super::error::raw_message_not_found(consumer_message)),
         IdAnswer::NotFound(_) => Err(super::error::raw_message_not_found(consumer_message)),
+        // A self-contradicting answer proves neither presence nor absence, so
+        // it takes the shared retryable PartialResponse class, not the
+        // terminal contract violation below.
+        IdAnswer::Contradicted(lanes) => Err(super::error::answer_error(
+            AccountOperation::OpenRawRfc822,
+        )(crate::Error::IdContradicted {
+            id: native_message.to_owned(),
+            context: response.answer_context,
+            lanes,
+        })),
         IdAnswer::Unanswered | IdAnswer::Refused(_) => Err(super::error::contract_violation(
             AccountOperation::OpenRawRfc822,
             Some(bifrost_types::ErrorScope::Message {

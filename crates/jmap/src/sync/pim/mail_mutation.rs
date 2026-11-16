@@ -159,7 +159,7 @@ impl SetProgress {
         });
     }
     /// Record one id's `Email/set` answer with its request-stamped guard.
-    /// An unanswered id is `Uncertain` explicitly: for an
+    /// An unanswered or self-contradicted id is `Uncertain` explicitly: for an
     /// idempotent unguarded op its PartialResponse leaf advises a same-request
     /// retry, which `from_leaf` would read as `NotApplied`.
     pub(super) fn item(
@@ -168,7 +168,10 @@ impl SetProgress {
         result: crate::Result<impl Sized>,
         op: AccountOperation,
     ) {
-        let missing = matches!(&result, Err(crate::Error::IdUnanswered { .. }));
+        let missing = matches!(
+            &result,
+            Err(crate::Error::IdUnanswered { .. } | crate::Error::IdContradicted { .. })
+        );
         let outcome = crate::sync::mail_set::classify_set_response(
             result.map(|_| ()),
             ObjectId(self.owner.as_deref().map_or_else(

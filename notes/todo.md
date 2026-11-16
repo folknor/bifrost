@@ -295,13 +295,6 @@ face.
 
 ### Write outcomes and compensation
 
-- **A JMAP create answered in both `created` and `notCreated` reads as
-  success.** `IdAnswer::from_parts` (crates/jmap/src/core/answer.rs) prefers
-  the success entry and drops the refusal. With a usable id that was already
-  success; since the create doors return `Created`, an id-less contradictory
-  entry is now an unidentified success too. A contradiction is a provider
-  defect that proves nothing either way, so it arguably belongs with
-  unreadable answers (Uncertain) for every set reader, not only creates.
 - **JMAP filter create ignores its activation answer.** `filters::create`
   with `is_active` rides `onSuccessActivateScript` in the same request, but
   never reads the created script's `isActive`; draft-14 ignores an invalid
@@ -514,21 +507,29 @@ Narrow edge cases, audits with no known defect, and design work.
     **Recommendation (yardstick, not a ruling):** build routing for them, as
     mail already has. Outlook shows a colleague's shared calendar and contacts
     once access is granted.
-- **Lateral findings from deleting the JMAP transport generic.**
-  - JMAP: `sync/capability_contract_tests.rs` pins only the false direction
-    (a `false` flag refuses locally). A whole `JmapAccount` now opens over a
-    scripted net (`a_whole_account_opens_and_answers_over_a_scripted_net` in
-    `sync/factory.rs`), so the true direction - a `true` flag reaches the wire
-    and the method works - is reachable per method. Design work: one scripted
-    server per gated method, driven through the opened account.
-  - JMAP: the same file's module doc still calls `PimMethodSupport` a
-    hand-maintained mirror of sixty bools; it is macro-generated with a gate
-    per operation.
-  - JMAP: `transport_reqwest.rs` carries a module-wide `#![allow(dead_code)]`
-    justified as a "standalone constructor kept for consumers", but the type
-    is crate-private. Find what the allowance still covers and scope it.
-  - JMAP: `sync/push.rs` `WsState::new` takes a `Client` and a shutdown token
-    it ignores; every caller builds and passes both.
+- **JMAP true-direction capability tests cover only Sieve and
+  VacationResponse.** `true_sieve_and_vacation_flags_reach_the_wire` in
+  `sync/capability_contract_tests.rs` opens the account through
+  `JmapAccountFactory::with_net` (so flags and registry families come from one
+  discovery), asserts the flags true, and drives each method to a named
+  milestone call answered `forbidden` (deterministic: no retry, no
+  rediscovery, never mapped to `Unsupported`), with prerequisites such as the
+  blob upload succeeding. Remaining families, each needing its own milestone
+  script: submission (ordinary send, scheduled send needing positive
+  `maxDelayedSend`, send-as needing a seeded foreign submission account),
+  contacts, calendars (also in the calendars-off sweep), quota, identities,
+  mail mutation and hydration doors, and push streams (polled to their
+  outcome, not merely constructed). Probes must use supported request shapes
+  and effective patches; add targeted capability omissions where family
+  independence matters.
+- **Lateral findings from the JMAP laterals pass, unverified.**
+  - JMAP: reference/jmap.md says the client, transport and WebSocket code
+    keep the dead-code lint, but `client.rs` and `client_ws.rs` still carry
+    module-wide `#![allow(dead_code)]` (as does `sync/state_walk.rs`).
+    `transport_reqwest.rs` now keeps the lint. Measure and scope the others.
+  - JMAP: reference/jmap.md still names `Client<ReqwestTransport>` and calls
+    `ReqwestTransport` a default implementation, wording from before the
+    transport generic was deleted.
 
 - **Lateral findings from the review of the design-hunt batch, unverified.**
   Each wants its own check and, where marked, a ruling.

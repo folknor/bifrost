@@ -291,9 +291,7 @@ impl AccountFactory for JmapAccountFactory {
             let shutdown = CancellationToken::new();
             let push_routing = Arc::new(PushRouting::from_registry(Arc::clone(&registry)));
             let ws = WsState::new(
-                client.clone(),
                 caps.push_in_process(),
-                shutdown.clone(),
                 config.reconnect_policy,
                 push_routing,
             );

@@ -919,6 +919,44 @@ mod tests {
         }
     }
 
+    /// A create the server both created and refused is not success: the
+    /// contradiction reconciles instead of reporting a filter saved.
+    #[tokio::test]
+    async fn a_create_answered_both_created_and_refused_reconciles() {
+        let reply = serde_json::json!({
+            "sessionState": "session-1",
+            "methodResponses": [[
+                "SieveScript/set",
+                {"accountId": "primary", "oldState": "s1", "newState": "s2",
+                 "created": {"c0": {"id": "S1"}},
+                 "notCreated": {"c0": {"type": "forbidden"}}},
+                "s0"
+            ]]
+        })
+        .to_string();
+        let meter = std::sync::Arc::new(DownloadMeter::default());
+        let error = create(
+            Some(sieve_account([reply], &meter)),
+            ServerFilterCreate::Script(bifrost_types::FilterScriptCreate {
+                name: Some("new".into()),
+                language: ScriptLanguage::Sieve,
+                body: "keep;".into(),
+                is_active: false,
+            }),
+        )
+        .await
+        .expect_err("a contradiction is not a saved filter");
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::PartialResponse),
+            "{error:?}"
+        );
+        assert!(
+            matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(_)),
+            "{error:?}"
+        );
+    }
+
     /// A script the `/get` leaves out of `list` used to vanish from the
     /// returned Vec, which reads to the consumer as "that filter does not
     /// exist" - a deletion the response never claimed. `notFound` cannot

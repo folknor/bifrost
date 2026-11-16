@@ -281,6 +281,17 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
                 get_id_unanswered(context.method, &id, ctx)
             }
         }
+        crate::Error::IdContradicted { id, context, lanes } => {
+            let detail = format!(
+                "submitted {} id {id} was answered as {lanes} in one response",
+                context.method
+            );
+            if context.write {
+                set_id_uncertain(detail, ctx, context.guarded)
+            } else {
+                get_id_uncertain(detail, ctx)
+            }
+        }
         crate::Error::UnsupportedFlagOperation(reason) => unsupported_error(
             ctx.operation,
             ctx.scope,
@@ -1787,14 +1798,23 @@ pub(crate) fn get_filter_not_found(id: &str, ctx: JmapErrorContext) -> AccountEr
 /// that comes back with fewer responses than it submitted.
 #[must_use]
 fn get_id_unanswered(method: &str, id: &str, ctx: JmapErrorContext) -> AccountError {
+    get_id_uncertain(
+        format!("requested {method} id {id} appeared in neither `list` nor `notFound`"),
+        ctx,
+    )
+}
+
+/// The read-side uncertain class `get_id_unanswered` documents, with its
+/// diagnostic supplied. A read id the server answered in two lanes at once
+/// (`list` and `notFound`) shares it: the contradiction proves nothing about
+/// the object, and a fresh `/get` normally answers cleanly.
+fn get_id_uncertain(detail: String, ctx: JmapErrorContext) -> AccountError {
     build(
         PrimaryCause::Protocol {
             kind: ProtocolErrorKind::PartialResponse,
             wire: WireCause::MalformedResponse {
                 protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "requested {method} id {id} appeared in neither `list` nor `notFound`"
-                ))),
+                detail: Some(DiagnosticText::support_only(detail)),
             },
         },
         &ctx,
@@ -1904,14 +1924,27 @@ pub(crate) fn set_id_unanswered(
     ctx: JmapErrorContext,
     guarded: bool,
 ) -> AccountError {
+    set_id_uncertain(
+        format!("submitted {method} id {id} appeared in neither a success nor an error map"),
+        ctx,
+        guarded,
+    )
+}
+
+/// The write-side uncertain class `set_id_unanswered` documents, with its
+/// diagnostic supplied. A write id the server answered in more than one lane
+/// (a success entry and a refusal) shares it: the contradiction proves
+/// neither outcome, so the retained refusal is never the classification.
+/// Recovery follows the operation table exactly as for an omission:
+/// non-idempotent operations (every create, send and destroy) and guarded
+/// writes reconcile; an unguarded idempotent update retries the same request.
+fn set_id_uncertain(detail: String, ctx: JmapErrorContext, guarded: bool) -> AccountError {
     let builder = build(
         PrimaryCause::Protocol {
             kind: ProtocolErrorKind::PartialResponse,
             wire: WireCause::MalformedResponse {
                 protocol: Protocol::Jmap,
-                detail: Some(DiagnosticText::support_only(format!(
-                    "submitted {method} id {id} appeared in neither a success nor an error map"
-                ))),
+                detail: Some(DiagnosticText::support_only(detail)),
             },
         },
         &ctx,
@@ -3881,6 +3914,60 @@ mod replay_tests {
             matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget])
         );
     }
+    /// A self-contradicting answer is uncertain on every lane: a guarded
+    /// write and a create reconcile, a read retries. Never the retained
+    /// refusal's class and never success.
+    #[test]
+    fn a_contradicted_id_is_uncertain_on_writes_and_reads() {
+        let contradicted = |method, guarded, write| crate::Error::IdContradicted {
+            id: "x1".into(),
+            context: crate::core::answer::AnswerContext {
+                method,
+                guarded,
+                write,
+            },
+            lanes: crate::core::answer::Lanes {
+                success: true,
+                refusal: true,
+                not_found: false,
+            },
+        };
+        let partial = AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse);
+
+        let guarded = into_account_error(
+            contradicted("Email/set", true, true),
+            JmapErrorContext::new(AccountOperation::UpdateFlags),
+        );
+        assert_eq!(guarded.kind(), &partial);
+        assert!(
+            matches!(guarded.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget]),
+            "{guarded:?}"
+        );
+
+        let create = into_account_error(
+            contradicted("SieveScript/set", false, true),
+            JmapErrorContext::new(AccountOperation::FilterCreate),
+        );
+        assert_eq!(create.kind(), &partial);
+        assert!(
+            matches!(
+                create.recovery(),
+                bifrost_types::RecoveryClass::Reconcile(_)
+            ),
+            "{create:?}"
+        );
+
+        let read = into_account_error(
+            contradicted("Email/get", false, false),
+            JmapErrorContext::new(AccountOperation::OpenRawRfc822),
+        );
+        assert_eq!(read.kind(), &partial);
+        assert!(
+            !matches!(read.recovery(), bifrost_types::RecoveryClass::Reconcile(_)),
+            "{read:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_dropped_set_reconciles_under_an_idempotent_operation() {
         let script = bifrost_net::test_support::ScriptedDispatch::new([

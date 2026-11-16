@@ -406,6 +406,13 @@ pub(crate) enum Error {
         id: String,
         context: core::answer::AnswerContext,
     },
+    /// A submitted id answered in more than one outcome lane. Uncertain: the
+    /// provider contradicted itself, so neither lane is the outcome.
+    IdContradicted {
+        id: String,
+        context: core::answer::AnswerContext,
+        lanes: core::answer::Lanes,
+    },
     /// Not parsable as the expected format.
     ///
     /// Missing provider properties use MissingResponseField instead.
@@ -608,6 +615,11 @@ impl Display for Error {
             Error::IdUnanswered { id, context } => {
                 write!(f, "Id {id} unanswered in {} response", context.method)
             }
+            Error::IdContradicted { id, context, lanes } => write!(
+                f,
+                "Id {id} answered as {lanes} in one {} response",
+                context.method
+            ),
             Error::UnsupportedFlagOperation(reason) => f.write_str(reason),
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
