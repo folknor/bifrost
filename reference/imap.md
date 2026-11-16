@@ -1049,6 +1049,52 @@ baseline. UIDNOTSTICKY retains the existing unbounded walk pending recurring
 inventory support. Bounded requests do not bound baseline memory or provide
 durable positional resume.
 
+### Inventory partition planning and redemption
+
+First inventory remains `EstablishViaInventory`: fusion owns the complete
+bounded walk described above and publishes its change cursor only at terminal
+completion. It does not publish an early `Ready` cursor or durable band-position
+checkpoints. Passes that reach the backfill orchestrator, including resumed
+stored-cursor scopes, can instead use UID partitions.
+
+`ImapAccount::select_folder` records successful SELECT/EXAMINE observations in
+`FolderEntry::observe_selection` (`account/folder_registry.rs`). The hint is
+local to this account incarnation: factory LIST supplies none and storage does
+not restore it. On resumed attach, `inventory_partitioning` returns `Full`
+until inventory, changes, a read or a mutation selects that folder through this
+path. Planning adds no discovery round trips. Missing UIDNEXT or UIDNOTSTICKY
+clears the hint and also plans `Full`.
+
+`FolderEntry::inventory_partitioning` advertises `UidRange` with the observed
+UIDVALIDITY and a ceiling at least SELECT UIDNEXT minus one. A fresh selection
+covers the stored baseline's previously assigned UIDs in that epoch; a cached
+epoch match alone is insufficient. Because subsequent SEARCH/FETCH can discover
+arrivals above SELECT's ceiling, planning also takes the maximum UID in the
+registry's completed same-epoch baseline. A baseline epoch disagreement plans
+`Full` until recovery replaces it. An enterprise user expects unchanged mail
+from the stored baseline to remain eligible for backfill, rather than disappear
+behind an underestimated ceiling.
+
+`inventory_partition_stream` in `account/inventory.rs` redeems a half-open
+`InventoryPartition::Uid` window by selecting once, then issuing exactly
+`UID FETCH from:to-1` (a zero lower endpoint becomes UID 1). Empty windows
+validate the epoch and complete without FETCH; the exclusive endpoint
+`u32::MAX + 1` is supported without wildcard operands. A selected epoch mismatch
+or UIDNOTSTICKY terminates with scoped `CursorInvalid` / `RestartScope` before
+FETCH, including for empty windows: successful coverage must never certify UIDs
+that now name different messages. Responses outside the requested window are
+ignored, and tagged command completion remains authoritative before `Done`.
+
+Partition pages and completion carry the requested epoch-scoped UID coverage
+and object obligations, but no change checkpoint. They neither accumulate a
+partial known-UID baseline nor write a folder cursor. The engine owns backfill
+progress persistence. Composed DAV scopes delegate both planning and partition
+requests to their owning account. These windows preserve the orchestrator's
+existing inventory-versus-live publication ordering limitation: epoch validation
+does not suppress stale inventory after a live removal (see `reference/sync.md`,
+`LiveSupersedes`). Higher UID windows mean later-assigned mail, with server-defined
+response order within each window, rather than strict message-date ordering.
+
 ### CONDSTORE / QRESYNC strategy
 
 `FolderCursor` has three variants and `changes_stream()` dispatches diff strategy by variant:

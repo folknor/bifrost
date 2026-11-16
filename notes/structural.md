@@ -72,23 +72,6 @@ line-audited" note and a module-wide `allow(dead_code)` over the typed builder
 methods nobody in `account/` calls. Each further caller is a product question
 (what discovery should fetch at open), not a driver change.
 
-## STR-082 - IMAP does not partition inventory, so large folders get no bounded backfill
-
-**Reported by:** imap-account (not a bug; a gap between vocabulary and its intended producer).
-
-Still true: every IMAP folder plans `Full`, and both the first (fusion-owned)
-inventory and every later backfill-orchestrator pass (re-incarnations, attaches
-that resume a stored cursor) read the folder as one oldest-first `UID FETCH
-1:*`. The engine side is ready: `backfill::uid_windows` plans newest-first
-epoch-scoped windows from `InventoryPartitioning::UidRange`. Design and link
-plan, sparred 2026-11-16: `notes/imap-partitioned-inventory.md` (bounded
-descending bands inside the fusion walk, plus a `UidRange` producer for
-orchestrator passes whose ceiling must cover the resumed cursor's baseline;
-early `Ready` establishment rejected). Two premises of the original entry were
-wrong: `reference/types.md` never tied the UID vocabulary to IMAP, and the
-bounded lane counts unread pages, not partitions, so it already applies to a
-`Full` plan.
-
 ## STR-147 - Server clock-skew advisory is unbuilt (`clock_skew_warn` unread, `WarningKind::ClockSkew` unproduced)
 
 **Reported by:** the STR-046 collapse (2026-11-16).

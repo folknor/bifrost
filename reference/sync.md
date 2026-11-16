@@ -1430,11 +1430,19 @@ now half-open too. Their endpoints are `u64` rather than `u32` for exactly that 
 has an exclusive end of `u32::MAX + 1`, which a `u32` cannot hold. The UID
 values themselves are still `u32` - `InventoryPartitioning::UidRange`'s
 `max_uid` and `uid_windows`'s `max_uid` stay `u32`, and the widening is only
-in the range endpoints. No protocol crate currently serves
-`InventoryPartition::Uid`, so the only producers and consumers are
-`uid_windows` and `CoverageDomain::for_partition`; `CoverageDomain::covers`
-tests containment (`self_from <= other_from && self_to >= other_to`) and reads
-identically under either convention.
+in the range endpoints. IMAP serves `InventoryPartition::Uid`: its
+incarnation-local SELECT/EXAMINE hint advertises UIDVALIDITY and a ceiling
+covering both UIDNEXT minus one and the completed same-epoch baseline. Without
+that observation, with an epoch disagreement, or for UIDNOTSTICKY it plans
+`Full`. Redemption selects again, refuses an epoch mismatch or UIDNOTSTICKY
+with `CursorInvalid` / `RestartScope`, and fetches the inclusive `from:to-1`
+range without committing a folder change cursor. First inventory remains
+fusion-owned `EstablishViaInventory`, with bounded descending requests and a
+terminal change cursor rather than early `Ready` (see `reference/imap.md`,
+"Inventory partition planning and redemption"). UID partitioning retains the
+existing `LiveSupersedes` ordering limitation described below.
+`CoverageDomain::covers` tests containment
+(`self_from <= other_from && self_to >= other_to`).
 
 UID partition keys include the epoch as `uid:{uid_validity}:{from}:{to}`.
 Legacy keys without an epoch cannot resume a current UID window and re-walk
