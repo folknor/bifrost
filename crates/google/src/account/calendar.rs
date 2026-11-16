@@ -162,7 +162,7 @@ pub(crate) fn get(
 pub(crate) fn create(
     client: Arc<GmailClient>,
     event: EventCreate,
-) -> AccountFuture<Result<EventId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
     Box::pin(async move {
         reject_create_organizer(&event)?;
         reject_unusable_write_times(
@@ -180,14 +180,15 @@ pub(crate) fn create(
             .post(&url, &body, bifrost_net::ReplayPolicy::Never)
             .await
             .map_err(|error| collection_error(error, AccountOperation::EventCreate))?;
-        let id = created.id.ok_or_else(|| {
-            local_error_with_field(
-                AccountOperation::EventCreate,
-                "id",
-                "created Google event has no id".into(),
-            )
-        })?;
-        Ok(EventId(join_event_id(&calendar_id, &id)))
+        // The native id is validated before it is joined, so an empty one
+        // never becomes a composite id that names nothing.
+        Ok(super::created::created_or_unidentified(
+            created.id,
+            "id",
+            "created Google event has no usable id",
+            GmailErrorContext::calendar_collection(AccountOperation::EventCreate),
+        )
+        .map(|id| EventId(join_event_id(&calendar_id, &id))))
     })
 }
 
@@ -2834,12 +2835,13 @@ mod tests {
         assert_eq!(patch.status.as_deref(), Some("tentative"));
     }
 
-    /// A created event with no id names the field Google left out, `id`,
-    /// not the unrelated `calendar` the shared helper once hard-coded.
+    /// A created event with no id is an unidentified success. Its warning's
+    /// leaf names the field Google left out, `id`, not the unrelated
+    /// `calendar` the shared helper once hard-coded.
     #[tokio::test]
-    async fn a_created_event_without_an_id_names_the_missing_id_field() {
+    async fn a_created_event_without_an_id_is_unidentified_and_names_the_missing_id_field() {
         let (client, _script) = scripted_client(vec![canned_json(StatusCode::OK, json!({}))]);
-        let error = create(
+        let created = create(
             client,
             EventCreate {
                 calendar_id: CalendarId("primary".to_string()),
@@ -2857,8 +2859,20 @@ mod tests {
             },
         )
         .await
-        .expect_err("a created event without an id is refused");
+        .expect("an acknowledged create is a success");
 
+        assert!(created.id().is_none());
+        let [warning] = created.warnings() else {
+            panic!("one warning explains the missing identity");
+        };
+        assert_eq!(
+            warning.kind,
+            bifrost_types::WarningKind::CreatedWithoutIdentity
+        );
+        let error = warning
+            .error
+            .as_ref()
+            .expect("the contract violation is kept");
         assert_eq!(
             error.kind(),
             &bifrost_types::AccountErrorKind::Protocol(

@@ -566,9 +566,9 @@ impl Consumer for AppendConsumer {
                 // Single APPEND  -  extract the first UID from the set. Taking
                 // the first UID of an over-long set is deliberate and needs no
                 // cardinality check: nothing is expanded, so it costs nothing,
-                // and refusing it would turn an appended draft into
-                // `draft_create`'s `Unsupported`, inviting a retry that
-                // appends it again.
+                // and refusing it would turn a draft that has an identity into
+                // `draft_create`'s unidentified success, which no later call
+                // can address.
                 crate::types::UidValidity::new(uid_validity).and_then(|validity| {
                     uids.first().map(|r| crate::types::AppendUid {
                         validity,

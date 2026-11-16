@@ -10,6 +10,7 @@ mod categories;
 mod changes;
 mod cloud;
 mod contacts;
+mod created;
 pub(crate) use contacts::DirectoryMode;
 mod cursor;
 mod delta;
@@ -934,7 +935,10 @@ impl Account for GraphAccount {
         cloud::host_attachment(self.clone(), bytes, meta)
     }
 
-    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { pim::draft_create(account, patch).await })
     }
@@ -1027,7 +1031,8 @@ impl Account for GraphAccount {
         name: String,
         parent: Option<bifrost_types::ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<bifrost_types::ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<bifrost_types::ContainerId>, AccountError>>
+    {
         let account = self.clone();
         Box::pin(async move { pim::container_create(account, kind, name, parent, style).await })
     }
@@ -1102,7 +1107,7 @@ impl Account for GraphAccount {
     fn filter_create(
         &self,
         filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { filters::create(account, filter).await })
     }
@@ -1150,7 +1155,7 @@ impl Account for GraphAccount {
     fn contact_create(
         &self,
         contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { contacts::create(account, contact).await })
     }
@@ -1235,7 +1240,10 @@ impl Account for GraphAccount {
         Box::pin(async move { calendar::get(account, event).await })
     }
 
-    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { calendar::create(account, event).await })
     }

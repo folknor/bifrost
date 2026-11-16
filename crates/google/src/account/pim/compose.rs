@@ -80,7 +80,7 @@ pub(crate) fn draft_create(
     client: Arc<GmailClient>,
     default_address: String,
     patch: DraftPatch,
-) -> AccountFuture<Result<DraftHandle, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
     Box::pin(async move {
         let doc = MailDocument::from_draft_patch(patch, &default_address);
         let raw = render_message(&doc, &default_address, false)?;
@@ -93,7 +93,13 @@ pub(crate) fn draft_create(
                     error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftCreate),
                 )
             })?;
-        Ok(DraftHandle(draft.id))
+        Ok(crate::account::created::created_or_unidentified(
+            Some(draft.id),
+            "id",
+            "created Gmail draft has an empty id",
+            error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftCreate),
+        )
+        .map(DraftHandle))
     })
 }
 

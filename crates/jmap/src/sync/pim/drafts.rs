@@ -5,16 +5,12 @@ use super::body::{
 };
 use super::containers::role_mailbox;
 use super::mail_mutation::{destroy_emails, send_email_set};
-use super::submission::require_created_email_id;
 use super::{MailAccount, to_acct_err};
 use crate::core::transport::HttpTransport;
 use crate::email::{EmailId, EmailPatch, EmailSet};
-use crate::sync::error::{answer_error, finish_partial};
+use crate::sync::error::answer_error;
 use crate::sync::state_cache;
-use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AccountStream, FolderRole, PartialCommitBuilder,
-    PrimaryLeg, StepEffect, StepReplay, StepTargets,
-};
+use bifrost_types::{AccountError, AccountFuture, AccountOperation, AccountStream, FolderRole};
 use bytes::Bytes;
 use futures::StreamExt;
 
@@ -62,7 +58,7 @@ pub(crate) fn attachment_upload<T: HttpTransport, C: crate::core::capability::Ca
 pub(crate) fn draft_create<T: HttpTransport>(
     mail: MailAccount<T>,
     patch: bifrost_types::DraftPatch,
-) -> AccountFuture<Result<bifrost_types::DraftHandle, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<bifrost_types::DraftHandle>, AccountError>> {
     let email_states = mail.email_states.clone();
 
     Box::pin(async move {
@@ -91,18 +87,14 @@ pub(crate) fn draft_create<T: HttpTransport>(
         let email = response
             .created(&create_id)
             .map_err(answer_error(AccountOperation::DraftCreate))?;
-        let email_id =
-            require_created_email_id(&email, AccountOperation::DraftCreate).map_err(|error| {
-                let mut record =
-                    PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
-                record.committed(
-                    StepEffect::Created,
-                    StepTargets::unknown(),
-                    StepReplay::Blocking,
-                );
-                finish_partial(error, record)
-            })?;
-        Ok(bifrost_types::DraftHandle(email_id.into_string()))
+        // The draft exists either way: an id-less answer is an unidentified
+        // success, not a failure that invites saving it again.
+        Ok(crate::sync::error::created_or_unidentified(
+            email.id().map(EmailId::as_str),
+            AccountOperation::DraftCreate,
+            "Email/set",
+        )
+        .map(bifrost_types::DraftHandle))
     })
 }
 

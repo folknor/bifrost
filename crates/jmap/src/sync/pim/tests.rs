@@ -398,7 +398,7 @@ async fn shared_child_create_returns_a_qualified_container() {
     .await
     .expect("created");
     assert_eq!(
-        child.0,
+        child.id().expect("the server named the mailbox").0,
         super::super::foreign::encode_foreign("shared", "child").0
     );
 }
@@ -470,11 +470,10 @@ async fn an_omitted_mail_set_answer_is_a_partial_response() {
     assert_eq!(cancel.kind(), &partial, "{cancel:?}");
 }
 
-/// A mailbox create answered in the success map without a usable id is
-/// refused, never handed back as `ContainerId("")`, while the set's new
-/// state still advances the cache.
+/// A mailbox create answered in the success map without a usable id is an
+/// unidentified success, never handed back as `ContainerId("")`.
 #[tokio::test]
-async fn a_created_mailbox_without_a_usable_id_is_refused() {
+async fn a_created_mailbox_without_a_usable_id_is_an_unidentified_success() {
     let run = |created: serde_json::Value| async move {
         let client = crate::client::Client::with_transport(
             OmittingSetTransport {
@@ -494,20 +493,15 @@ async fn a_created_mailbox_without_a_usable_id_is_refused() {
         .await
     };
     for entry in [serde_json::json!({}), serde_json::json!({"id": ""})] {
-        let result = run(serde_json::json!({"c0": entry})).await;
-        let error = result.unwrap_err();
-        assert_eq!(
-            error.kind(),
-            &bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::MissingField
-            ),
-            "{error:?}"
-        );
+        let created = run(serde_json::json!({"c0": entry}))
+            .await
+            .expect("an acknowledged create is a success");
+        crate::sync::error::assert_unidentified_create(&created);
     }
     let result = run(serde_json::json!({"c0": {"id": "mbx-1"}})).await;
     assert_eq!(
-        result.expect("a usable created id"),
-        ContainerId("mbx-1".into())
+        result.expect("a usable created id").id(),
+        Some(&ContainerId("mbx-1".into()))
     );
 }
 
@@ -3611,24 +3605,17 @@ async fn acknowledged_raw_send_with_an_import_missing_its_id_is_partial() {
 }
 
 #[tokio::test]
-async fn created_draft_with_missing_email_id_is_partial() {
+async fn created_draft_with_missing_email_id_is_an_unidentified_success() {
     let mut transport = SendTransport::new(false, false, false, false);
     transport.submission_reply = Some("missing_email_id");
-    let error = draft_create(
+    let created = draft_create(
         crate::sync::registry::Slot::from_test(send_account(transport.clone()), send_state_map()),
         bifrost_types::DraftPatch::default(),
     )
     .await
-    .expect_err("a missing created Email id cannot become an empty DraftHandle");
+    .expect("the draft was saved; a missing id never becomes a failure");
 
-    assert_eq!(
-        error.kind(),
-        &bifrost_types::AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::MissingField)
-    );
-
-    assert!(
-        matches!(error.recovery(), bifrost_types::RecoveryClass::Reconcile(a) if a.reason == bifrost_types::ReconcileReason::PartialCommit && a.guidance.actions == [bifrost_types::ReconcileAction::CheckTarget, bifrost_types::ReconcileAction::DedupeByClientId, bifrost_types::ReconcileAction::ObserveOnly])
-    );
+    crate::sync::error::assert_unidentified_create(&created);
 }
 
 #[tokio::test]

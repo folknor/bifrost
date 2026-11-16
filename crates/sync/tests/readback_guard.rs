@@ -761,7 +761,10 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::HostAttachment)) })
     }
 
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        _patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftCreate)) })
     }
 
@@ -821,7 +824,7 @@ impl Account for FlagsAccount {
         _name: String,
         _parent: Option<ContainerId>,
         _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         Box::pin(async {
             Err(unsupported(
                 bifrost_types::AccountOperation::ContainerCreate,
@@ -889,7 +892,7 @@ impl Account for FlagsAccount {
     fn filter_create(
         &self,
         _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterCreate)) })
     }
 
@@ -935,7 +938,7 @@ impl Account for FlagsAccount {
     fn contact_create(
         &self,
         _contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactCreate)) })
     }
 
@@ -1009,7 +1012,10 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventGet)) })
     }
 
-    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        _event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventCreate)) })
     }
 
@@ -1204,7 +1210,7 @@ fn campaign_account(state: Arc<CampaignState>) -> Arc<FlagsAccount> {
 fn vendor() -> IdempotencyVendor {
     IdempotencyVendor::with_run_id(
         bifrost_types::RunId("boundary-test".into()),
-        Box::new(|_| bifrost_sync::mutation::idempotency::ProtocolSalt::Imap),
+        Box::new(|_| String::new()),
     )
 }
 
@@ -2732,7 +2738,10 @@ impl Account for ReassertAccount {
     ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
         self.inner.host_attachment(_bytes, _meta)
     }
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        _patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         self.inner.draft_create(_patch)
     }
     fn draft_update(
@@ -2779,7 +2788,7 @@ impl Account for ReassertAccount {
         _name: String,
         _parent: Option<ContainerId>,
         _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         self.inner.container_create(_kind, _name, _parent, _style)
     }
     fn container_rename(
@@ -2825,7 +2834,7 @@ impl Account for ReassertAccount {
     fn filter_create(
         &self,
         _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         self.inner.filter_create(_filter)
     }
     fn filter_update(
@@ -2860,7 +2869,7 @@ impl Account for ReassertAccount {
     fn contact_create(
         &self,
         _contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         self.inner.contact_create(_contact)
     }
     fn contact_update(
@@ -2912,7 +2921,10 @@ impl Account for ReassertAccount {
     fn event_get(&self, _event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
         self.inner.event_get(_event)
     }
-    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        _event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         self.inner.event_create(_event)
     }
     fn event_update(

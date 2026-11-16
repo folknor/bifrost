@@ -41,7 +41,7 @@ pub(crate) async fn list(account: GraphAccount) -> Result<Vec<ServerFilter>, Acc
 pub(crate) async fn create(
     account: GraphAccount,
     filter: ServerFilterCreate,
-) -> Result<ServerFilterId, AccountError> {
+) -> Result<bifrost_types::Created<ServerFilterId>, AccountError> {
     let ServerFilterCreate::Rule(rule) = filter else {
         return Err(unsupported_account_error(AccountOperation::FilterCreate));
     };
@@ -57,15 +57,12 @@ pub(crate) async fn create(
                 GraphErrorContext::graph(AccountOperation::FilterCreate),
             )
         })?;
-    let id = created.id.ok_or_else(|| {
-        protocol_violation(
-            ProtocolErrorKind::ContractViolation,
-            AccountOperation::FilterCreate,
-            None,
-            "created Graph message rule did not include an id",
-        )
-    })?;
-    Ok(ServerFilterId(id))
+    Ok(super::created::created_or_unidentified(
+        created.id,
+        AccountOperation::FilterCreate,
+        "created Graph message rule did not include a usable id",
+    )
+    .map(ServerFilterId))
 }
 
 pub(crate) async fn update(

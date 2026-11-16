@@ -897,10 +897,14 @@ Incomplete targets mean unknown identities or at least the supplied identities.
 InFlight, classification-prefix `UnreadableSuccess` answer evidence, or
 reconciling recovery means Uncertain, otherwise NotApplied. NotApplied is the
 absence of evidence that the leg landed, not proof that it did not: a terminal
-leaf on a decoded answer - JMAP's `Protocol(MissingField)` for a create
+leaf on a decoded answer - JMAP's `Protocol(MissingField)` for a send's Email
 answered without a usable id, say - reads NotApplied, and a producer that
 knows the write may have landed raises to Uncertain itself or records the
-effect as committed. Primary and sibling validation and
+effect as committed. A standalone create whose decoded success answer lacks a
+usable id is not an error at all: it returns `Created` without an id and a
+`CreatedWithoutIdentity` warning (see `Created` in `bifrost-types`), because
+reporting a save that worked as failed is the wrong answer for the user and
+invites a duplicate. Primary and sibling validation and
 `CompensationOutcome::from_error` read the same evidence: an unreadable
 success answer makes cleanup Unconfirmed, never Failed.
 Effectless reads/local failures use NotApplicable. Decoration cannot influence

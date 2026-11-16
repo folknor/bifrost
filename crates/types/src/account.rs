@@ -932,8 +932,12 @@ pub trait Account: Send + Sync {
         meta: CloudUploadMeta,
     ) -> AccountFuture<Result<HostedAttachment, AccountError>>;
 
-    /// Create a new draft.
-    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>>;
+    /// Create a new draft. An acknowledged create is `Ok` even when the
+    /// server did not identify the draft; see [`crate::Created`].
+    fn draft_create(
+        &self,
+        patch: DraftPatch,
+    ) -> AccountFuture<Result<crate::Created<DraftHandle>, AccountError>>;
 
     /// Update an existing draft. The patch is partial: only `Some`
     /// fields are applied.
@@ -1008,7 +1012,8 @@ pub trait Account: Send + Sync {
     fn containers_list(&self) -> AccountFuture<Result<ContainerList, AccountError>>;
 
     /// Create a new container of the given `kind` with `name` under
-    /// `parent`. Returns the engine-facing id.
+    /// `parent`. Returns the engine-facing id when the server identified the
+    /// new container; see [`crate::Created`].
     ///
     /// `style` carries an optional initial color. Only Gmail honors it
     /// (labels are colorable); folder-shaped protocols with no color
@@ -1022,7 +1027,7 @@ pub trait Account: Send + Sync {
         name: String,
         parent: Option<ContainerId>,
         style: Option<ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>>;
+    ) -> AccountFuture<Result<crate::Created<ContainerId>, AccountError>>;
 
     /// Rename a container.
     ///
@@ -1084,11 +1089,12 @@ pub trait Account: Send + Sync {
     /// List server-side filter rules or scripts.
     fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>>;
 
-    /// Create a server-side filter rule or script.
+    /// Create a server-side filter rule or script. An acknowledged create is
+    /// `Ok` even when the server did not identify it; see [`crate::Created`].
     fn filter_create(
         &self,
         filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>>;
+    ) -> AccountFuture<Result<crate::Created<ServerFilterId>, AccountError>>;
 
     /// Update a server-side filter rule or script.
     fn filter_update(
@@ -1129,11 +1135,12 @@ pub trait Account: Send + Sync {
     /// Fetch one contact card by engine-facing id.
     fn contact_get(&self, contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>>;
 
-    /// Create one contact card.
+    /// Create one contact card. An acknowledged create is `Ok` even when the
+    /// server did not identify the card; see [`crate::Created`].
     fn contact_create(
         &self,
         contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>>;
+    ) -> AccountFuture<Result<crate::Created<ContactId>, AccountError>>;
 
     /// Partially update one contact card.
     fn contact_update(
@@ -1238,8 +1245,12 @@ pub trait Account: Send + Sync {
     /// Fetch one event by engine-facing id.
     fn event_get(&self, event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>>;
 
-    /// Create one event.
-    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>>;
+    /// Create one event. An acknowledged create is `Ok` even when the server
+    /// did not identify the event; see [`crate::Created`].
+    fn event_create(
+        &self,
+        event: EventCreate,
+    ) -> AccountFuture<Result<crate::Created<EventId>, AccountError>>;
 
     /// Partially update one event.
     fn event_update(

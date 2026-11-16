@@ -696,9 +696,12 @@ names / emails / phones / metadata), stamping each card
 name (`otherContacts/*` -> auto-collected). The discriminator lets the
 consumer route the two corpora to distinct local stores without matching
 on the provider.
-`contact_create` requires the successful response's `resourceName`; an absent
-field is `Protocol(MissingField)` and an empty value is `Protocol(ParseFailed)`,
-both with acknowledged response evidence.
+`contact_create` reads the successful response's `resourceName`; an absent or
+empty value is an acknowledged success without an id (`Created` with a
+`CreatedWithoutIdentity` warning carrying the `Protocol(MissingField)` leaf with
+acknowledged evidence), never a failure. Every Google create door applies the
+same rule (`account::created`): Gmail drafts, labels and filters, Calendar
+events and People contacts.
 Update fetches the raw `Person`, preserves its CONTACT source identity and
 requires that source's ETag, and replaces only
 fields named by the shared `ContactPatch`. Display-name updates rewrite the
@@ -1752,7 +1755,8 @@ clock. There is no separate `retry_not_before` side-channel.
     whose event has no attendee for the account is also `Unsupported(EventRsvp)`;
     the provider event state, not caller syntax, has no target for the action.
   - `MissingField` (a response lacking something it must carry, such as a
-    created event with no id or a live event missing start or end) ->
+    live event missing start or end, or - as warning evidence on an
+    otherwise successful create - a created event with no id) ->
     `Protocol(MissingField)`, with `AttemptCause(Acknowledged)`. Every
     producer raises it after a complete response arrived, so it must never be
     raised for a missing LOCAL value (that is `Internal`) or missing caller
@@ -1948,8 +1952,9 @@ like label-snapshot staleness.
 Calendar move/PATCH, People fields/photo and Drive hosting attach partial-commit
 records. Gmail chunked batchModify already reports per-item success, failure and
 uncertainty, as do bulk mutation streams. Reaction reads have no write effects.
-Single-request event/contact/filter creates are outside this multi-step contract,
-including acknowledged creates without a usable id. Other event/contact writes
+Single-request event/contact/filter creates are outside this multi-step contract;
+an acknowledged create without a usable id is a success, not a partial commit.
+Other event/contact writes
 are single requests and need no multi-step record.
 
 ## Shutdown replay policy and token syntax

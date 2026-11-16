@@ -54,7 +54,8 @@ pub struct AttachmentHandle(pub String);
 
 /// Opaque handle to a server-side draft.
 ///
-/// `draft_create` returns one; `draft_update`, `draft_discard`, and
+/// `draft_create` returns one when the server identifies the draft (see
+/// [`crate::Created`]); `draft_update`, `draft_discard`, and
 /// `draft_send` accept one. Distinct from `ObjectId` so the type
 /// system catches mix-ups between "this is a draft handle" and "this
 /// is a message id".

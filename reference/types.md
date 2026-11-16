@@ -717,6 +717,18 @@ Prerequisites, PlannedDirective and ReplaySafety, plus the export shapes
 PartialCommitTelemetry, PartialCommitExport, StepExport and CompensationExport,
 from the error module and crate root.
 AccountError exposes the record, failed-leg recovery and per-leg throttle
+## Acknowledged creates
+
+`created.rs` exports `Created<T>`, the success of the five create doors
+(`draft_create`, `container_create`, `filter_create`, `contact_create`,
+`event_create`). Holding one means the server acknowledged the create; the
+identity is a separate fact (`id() -> Option<&T>`). Uncertainty stays in
+`Err`. Private fields and two constructors keep the invariant that an
+unidentified create carries a `WarningKind::CreatedWithoutIdentity` warning
+saying why; `with_warning` adds advisory warnings to an identified create for
+an ancillary leg that degraded. Provider boundaries validate the native id
+(absent or empty means unidentified) before wrapping or joining it.
+
 observations. The builder validates application and compensation evidence before
 freezing the derived operation plan. Telemetry and support tiers export the
 record at their respective consent levels; see `reference/error-model.md`.

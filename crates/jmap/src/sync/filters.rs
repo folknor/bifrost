@@ -158,7 +158,7 @@ pub(crate) fn list<T: HttpTransport>(
 pub(crate) fn create<T: HttpTransport>(
     sieve: Option<SieveAccount<T>>,
     filter: ServerFilterCreate,
-) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
     Box::pin(async move {
         let account = require_sieve(sieve, AccountOperation::FilterCreate)?;
         let ServerFilterCreate::Script(script) = filter else {
@@ -196,12 +196,12 @@ pub(crate) fn create<T: HttpTransport>(
         let created = response
             .created(&create_id)
             .map_err(super::error::answer_error(AccountOperation::FilterCreate))?;
-        super::error::require_created_id(
+        Ok(super::error::created_or_unidentified(
             created.id().map(crate::sieve::SieveScriptId::as_str),
             AccountOperation::FilterCreate,
             "SieveScript/set",
         )
-        .map(ServerFilterId)
+        .map(ServerFilterId))
     })
 }
 
@@ -915,7 +915,7 @@ mod tests {
     /// A create answered in the success map without a usable id is refused,
     /// never handed back as `ServerFilterId("")`.
     #[tokio::test]
-    async fn a_created_script_without_a_usable_id_is_refused() {
+    async fn a_created_script_without_a_usable_id_is_an_unidentified_success() {
         for entry in [serde_json::json!({}), serde_json::json!({"id": ""})] {
             let reply = serde_json::json!({
                 "sessionState": "session-1",
@@ -928,7 +928,7 @@ mod tests {
             })
             .to_string();
             let meter = std::sync::Arc::new(DownloadMeter::default());
-            let error = create(
+            let created = create(
                 Some(sieve_account([reply], &meter)),
                 ServerFilterCreate::Script(bifrost_types::FilterScriptCreate {
                     name: Some("new".into()),
@@ -938,12 +938,8 @@ mod tests {
                 }),
             )
             .await
-            .expect_err("an id-less create answer");
-            assert_eq!(
-                error.kind(),
-                &AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
-                "{error:?}"
-            );
+            .expect("an acknowledged create is a success");
+            crate::sync::error::assert_unidentified_create(&created);
         }
     }
 

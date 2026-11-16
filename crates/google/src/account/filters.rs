@@ -43,7 +43,7 @@ pub(crate) fn list(
 pub(crate) fn create(
     client: Arc<GmailClient>,
     filter: ServerFilterCreate,
-) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
     Box::pin(async move {
         let ServerFilterCreate::Rule(rule) = filter else {
             return Err(unsupported(
@@ -56,13 +56,13 @@ pub(crate) fn create(
             .create_filter(&request)
             .await
             .map_err(to_acct_err(AccountOperation::FilterCreate))?;
-        let id = created.id.ok_or_else(|| {
-            into_account_error(
-                crate::error::Error::missing_field("id", "created Gmail filter has no id"),
-                GmailErrorContext::base(AccountOperation::FilterCreate),
-            )
-        })?;
-        Ok(ServerFilterId(id))
+        Ok(super::created::created_or_unidentified(
+            created.id,
+            "id",
+            "created Gmail filter has no usable id",
+            GmailErrorContext::base(AccountOperation::FilterCreate),
+        )
+        .map(ServerFilterId))
     })
 }
 

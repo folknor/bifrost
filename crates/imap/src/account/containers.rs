@@ -59,7 +59,7 @@ pub(crate) fn container_create(
     // IMAP mailboxes carry no container color; accepted for trait
     // parity with the colorable (Gmail) path and ignored.
     _style: Option<bifrost_types::ContainerStyle>,
-) -> AccountFuture<Result<ContainerId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
     Box::pin(async move {
         if !matches!(kind, ContainerKind::Folder) {
             return Err(super::error::unsupported(AccountOperation::ContainerCreate));
@@ -99,7 +99,9 @@ pub(crate) fn container_create(
         )
         .await
         .map_err(|error| container_refresh_error(error, StepEffect::Created, &full_name, None))?;
-        Ok(ContainerId(full_name.account_id()))
+        Ok(bifrost_types::Created::identified(ContainerId(
+            full_name.account_id(),
+        )))
     })
 }
 

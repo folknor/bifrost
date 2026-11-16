@@ -941,7 +941,10 @@ impl Account for JmapAccount {
         Box::pin(async move { Err(err) })
     }
 
-    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         let draft_account = match self.draft_account(AccountOperation::DraftCreate) {
             Ok(account) => account,
             Err(error) => return Box::pin(async move { Err(error) }),
@@ -1064,7 +1067,7 @@ impl Account for JmapAccount {
         name: String,
         parent: Option<ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         let mail = parent
             .as_ref()
             .map_or(&self.registry.primary, |id| self.registry.object(&id.0));
@@ -1158,7 +1161,7 @@ impl Account for JmapAccount {
     fn filter_create(
         &self,
         filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         filters::create(
             self.registry
                 .family(&self.registry.families.sieve)
@@ -1236,7 +1239,7 @@ impl Account for JmapAccount {
     fn contact_create(
         &self,
         contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         contacts::create(
             self.registry
                 .family(&self.registry.families.contacts)
@@ -1365,7 +1368,10 @@ impl Account for JmapAccount {
         )
     }
 
-    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         calendar_ops::create(
             self.registry
                 .family(&self.registry.families.calendars)

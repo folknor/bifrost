@@ -209,24 +209,46 @@ face.
 
 ### Write outcomes and compensation
 
-- **Acknowledged single-request creates without a usable identity can invite
-  a duplicating manual retry:** IMAP draft_create without APPENDUID, Google
-  People contact_create without resourceName, standalone Graph draft_create,
-  Google and Graph filter_create, Google calendar event_create, and JMAP's
-  filter, mailbox, event and contact creates (`error::require_created_id`
-  returns a bare terminal `Protocol(MissingField)` with acknowledged evidence
-  and no record; `Application::from_leaf` would read that leaf NotApplied, but
-  nothing calls it there). The committed-unidentified partial-commit shape can
-  carry them without inventing uncertainty. The November 2026 design hunt
-  (imap-account scope) reported the IMAP case independently: with no APPENDUID
-  (RFC 4315 forbids it for a `UIDNOTSTICKY` mailbox, and servers may omit it)
-  the draft exists and the caller gets `Err(Unsupported(DraftCreate))`, which
-  reads as "nothing happened", so a retry duplicates the draft; the UIDPLUS
-  capability gate does not cover it.
-- **Graph and JMAP judge the same identity-less draft create differently.**
-  Graph `send_created_draft` (crates/graph/src/account/pim/send.rs) records
-  the committed unidentified `Created` as `Repeatable`; JMAP `draft_create`
-  records it `Blocking`. Unreviewed whether the difference is intended.
+- **A required create id that fails to decode is still an `Err`.** The five
+  create doors now return `Created<T>`, so a decoded success answer without a
+  usable id is an unidentified success. Graph mail folder, contact and event
+  creates (`GraphMailFolder.id`, `GraphContact.id`, `GraphEvent.id`) and Gmail
+  draft and label creates (`GmailDraft.id`, `GmailLabel.id`) declare the id a
+  required `String`, so an id-less 2xx body fails JSON decode instead and
+  returns `Protocol(ParseFailed)` with unreadable-success evidence (Uncertain).
+  Making those ids `Option` would route them to the same unidentified success;
+  a wholly unparseable body would rightly stay an `Err`.
+- **A JMAP create answered in both `created` and `notCreated` reads as
+  success.** `IdAnswer::from_parts` (crates/jmap/src/core/answer.rs) prefers
+  the success entry and drops the refusal. With a usable id that was already
+  success; since the create doors return `Created`, an id-less contradictory
+  entry is now an unidentified success too. A contradiction is a provider
+  defect that proves nothing either way, so it arguably belongs with
+  unreadable answers (Uncertain) for every set reader, not only creates.
+- **JMAP filter create ignores its activation answer.** `filters::create`
+  with `is_active` rides `onSuccessActivateScript` in the same request, but
+  never reads the created script's `isActive`; draft-14 ignores an invalid
+  activation reference, so an identified script the server left inactive
+  reports plain success. `Created::with_warning` can now carry "created but
+  not activated".
+- **Graph `protocol_violation` carries no `Attempt` cause.** The Graph send
+  leg's id-less draft leaf (`pim/send.rs` `send_created_draft`) and the
+  warning evidence of every Graph create (`account::created`) come from a
+  decoded answer, yet read as Unsent by the error-model rule that a missing
+  Attempt cause means Unsent. JMAP and Google stamp the equivalent leaf
+  Acknowledged.
+- **IMAP draft_create still requires UIDPLUS.** The gate
+  (`capabilities.rs`, `draft_create: has_drafts && can_identify_append`)
+  existed because the door needed APPENDUID; an APPEND without one is now an
+  unidentified success, so the gate could admit every server with a Drafts
+  role. Whether a draft save that never yields an id is worth advertising is a
+  product decision. The APPEND path also does not consult `UIDNOTSTICKY`
+  (same RFC 4315 condition as BUG-048).
+- **IMAP ManageSieve filter_create is two requests with no record.**
+  `sieve.rs` `filter_create` runs `put_script` then `set_active`; a
+  `set_active` failure after a committed `put_script` returns a bare error for
+  a script that exists. `Created::with_warning` could report it as created
+  but not activated.
 - **IMAP container operations return a refresh_folders failure after the
   write commits.** The partial-commit record makes this honest; whether to
   return success with a stale registry is a separate API decision.

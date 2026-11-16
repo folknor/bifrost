@@ -45,7 +45,7 @@ fn send_as_guard(request: &SendRequest) -> Option<AccountError> {
 pub(crate) fn draft_create(
     account: ImapAccount,
     patch: DraftPatch,
-) -> AccountFuture<Result<DraftHandle, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
     Box::pin(async move {
         account
             .capabilities
@@ -72,14 +72,26 @@ pub(crate) fn draft_create(
             .append_message(&folder, message, account.command_timeout())
             .await
             .map_err(err)?;
-        let Some(crate::types::AppendUid {
-            validity: uidvalidity,
-            uid,
-        }) = appended
-        else {
-            return Err(super::error::unsupported(AccountOperation::DraftCreate));
-        };
-        Ok(DraftHandle(encode_object_id(&folder, uidvalidity, uid).0))
+        // A tagged OK means the draft is saved. Without a usable APPENDUID
+        // (RFC 4315 forbids one for a UIDNOTSTICKY mailbox; servers may
+        // also omit it) the save still succeeded: an enterprise user who
+        // saved a draft expects "saved", and a failure here would invite a
+        // retry that appends the draft again. The missing UID is permitted
+        // by the protocol, so the warning carries no error leaf.
+        Ok(bifrost_types::Created::from_option(
+            appended.map(
+                |crate::types::AppendUid {
+                     validity: uidvalidity,
+                     uid,
+                 }| DraftHandle(encode_object_id(&folder, uidvalidity, uid).0),
+            ),
+            || {
+                bifrost_types::DiagnosticText::support_only(
+                    "IMAP APPEND to Drafts succeeded without a usable APPENDUID",
+                )
+            },
+            || None,
+        ))
     })
 }
 

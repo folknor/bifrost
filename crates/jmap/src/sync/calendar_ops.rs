@@ -142,7 +142,7 @@ pub(crate) fn get<T: HttpTransport>(
 pub(crate) fn create<T: HttpTransport>(
     calendars: Option<CalendarAccount<T>>,
     event: EventCreate,
-) -> AccountFuture<Result<EventId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
     Box::pin(async move {
         let calendars = require_calendars(calendars, AccountOperation::EventCreate)?;
         validate_shared_recurrence(
@@ -164,12 +164,12 @@ pub(crate) fn create<T: HttpTransport>(
         let event = response
             .created(&create_id)
             .map_err(super::error::answer_error(AccountOperation::EventCreate))?;
-        super::error::require_created_id(
+        Ok(super::error::created_or_unidentified(
             event.id().as_ref().map(CalendarEventId::as_str),
             AccountOperation::EventCreate,
             "CalendarEvent/set",
         )
-        .map(EventId)
+        .map(EventId))
     })
 }
 

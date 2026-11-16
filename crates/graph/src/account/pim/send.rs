@@ -318,6 +318,12 @@ fn send_created_draft(created: &Value, detail: &'static str) -> Result<DraftHand
     {
         return Ok(DraftHandle(id.to_owned()));
     }
+    // Repeatable on purpose, and not a divergence from a standalone draft
+    // create (which reports an unidentified draft as success). Here the
+    // operation is Send: it fails because an unidentified draft cannot be
+    // sent, nothing was submitted, and the draft is a by-product. Replaying
+    // the send creates another orphan draft at worst, which `StepReplay`
+    // names an accepted Repeatable by-product; it never sends twice.
     let error = pim_protocol_error(AccountOperation::Send, None, detail);
     let mut record = PartialCommitBuilder::new(PrimaryLeg::effectless(StepTargets::unknown()));
     record.committed(

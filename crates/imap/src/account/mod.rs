@@ -743,7 +743,10 @@ impl Account for ImapAccount {
         settings::unsupported_hosted(AccountOperation::HostAttachment)
     }
 
-    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         compose::draft_create(self.clone(), patch)
     }
 
@@ -801,7 +804,7 @@ impl Account for ImapAccount {
         name: String,
         parent: Option<ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         containers::container_create(self.clone(), kind, name, parent, style)
     }
 
@@ -857,7 +860,7 @@ impl Account for ImapAccount {
     fn filter_create(
         &self,
         filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         sieve::filter_create(self.clone(), filter)
     }
 
@@ -908,7 +911,7 @@ impl Account for ImapAccount {
     fn contact_create(
         &self,
         contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         if let Some(contacts) = &self.contacts {
             return contacts.contact_create(contact);
         }
@@ -1022,7 +1025,10 @@ impl Account for ImapAccount {
         unsupported_future(AccountOperation::EventGet)
     }
 
-    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         if let Some(calendars) = &self.calendars {
             return calendars.event_create(event);
         }

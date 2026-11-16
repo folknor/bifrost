@@ -13,12 +13,10 @@ use bifrost_types::{
 };
 use serde_json::{Map, Value, json};
 
-use super::common::*;
-
 pub(crate) async fn draft_create(
     account: GraphAccount,
     patch: DraftPatch,
-) -> Result<DraftHandle, AccountError> {
+) -> Result<bifrost_types::Created<DraftHandle>, AccountError> {
     if patch
         .attachments_uploaded
         .as_ref()
@@ -281,16 +279,29 @@ pub(super) fn graph_attachment_from_inline(
 pub(super) async fn create_draft_message(
     client: &GraphClient,
     message: Value,
-) -> Result<DraftHandle, AccountError> {
+) -> Result<bifrost_types::Created<DraftHandle>, AccountError> {
     let created = post_draft_message(client, &message, AccountOperation::DraftCreate).await?;
-    let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
-        pim_protocol_error(
-            AccountOperation::DraftCreate,
-            None,
-            "Graph draft create did not return an id",
-        )
-    })?;
-    Ok(DraftHandle(id.to_string()))
+    // Only an absent, null or empty id is an unidentified success. An id of
+    // the wrong JSON type is an answer this client cannot read, so it stays
+    // an error, as a required id that fails to decode does elsewhere.
+    let id = match created.get("id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(id.clone()),
+        Some(_) => {
+            return Err(crate::account::graph_error::protocol_violation(
+                bifrost_types::ProtocolErrorKind::ParseFailed,
+                AccountOperation::DraftCreate,
+                None,
+                "Graph draft create returned a non-string id",
+            ));
+        }
+    };
+    Ok(crate::account::created::created_or_unidentified(
+        id,
+        AccountOperation::DraftCreate,
+        "Graph draft create did not return a usable id",
+    )
+    .map(DraftHandle))
 }
 
 /// POST a new draft and return the raw created resource. `operation` stamps

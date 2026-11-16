@@ -1957,17 +1957,68 @@ pub(crate) fn answer_error(
 /// the kind stays the terminal `Protocol(MissingField)`, since an empty id
 /// handed back as success would be a handle that names nothing. IdAnswer
 /// already proved this request was answered; validating the resulting handle
-/// is a separate invariant and must not be collapsed into Unanswered. Single-set
-/// doors (filter, mailbox, event, contact creates) return it bare: whether
-/// an acknowledged create without identity should also carry a
-/// committed-unidentified partial-commit record is an open cross-provider
-/// question, not settled here. Multi-step doors wrap it in their own record.
+/// is a separate invariant and must not be collapsed into Unanswered. The
+/// standalone create doors (draft, mailbox, filter, event, contact) never
+/// return it: through [`created_or_unidentified`] they report the create as
+/// an unidentified success with this leaf as the warning's evidence. The send
+/// doors return it inside their own partial-commit record, since their
+/// operation did not complete.
 #[must_use]
 pub(crate) fn created_id_unusable(
     operation: AccountOperation,
     method: &'static str,
 ) -> AccountError {
     build(
+/// A standalone create door's result from the id of its `created` entry.
+///
+/// The entry proves the create applied, so an absent or empty id is an
+/// unidentified success, never a failure: an enterprise user whose save
+/// worked expects it reported as saved, and a failure would invite a
+/// duplicating retry. The warning carries [`created_id_unusable`] as evidence.
+pub(crate) fn created_or_unidentified(
+    id: Option<&str>,
+    operation: AccountOperation,
+    method: &'static str,
+) -> bifrost_types::Created<String> {
+    match require_created_id(id, operation, method) {
+        Ok(id) => bifrost_types::Created::identified(id),
+        Err(leaf) => bifrost_types::Created::unidentified_because(
+            DiagnosticText::support_only(format!(
+                "JMAP {method} created the object without a usable id"
+            )),
+            Some(leaf),
+        ),
+    }
+}
+
+/// Test assertion: `created` is an unidentified success explained by one
+/// warning whose evidence is the acknowledged `MissingField` leaf.
+#[cfg(test)]
+pub(crate) fn assert_unidentified_create<T: std::fmt::Debug>(
+    created: &bifrost_types::Created<T>,
+) {
+    assert!(created.id().is_none(), "{created:?}");
+    let [warning] = created.warnings() else {
+        panic!("one warning explains the missing identity: {created:?}");
+    };
+    assert_eq!(
+        warning.kind,
+        bifrost_types::WarningKind::CreatedWithoutIdentity
+    );
+    let leaf = warning
+        .error
+        .as_ref()
+        .expect("the contract violation is kept");
+    assert_eq!(
+        leaf.kind(),
+        &AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::MissingField)
+    );
+    assert!(leaf.chain().iter().any(|cause| matches!(
+        cause,
+        Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged
+    )));
+}
+
         PrimaryCause::Protocol {
             kind: ProtocolErrorKind::MissingField,
             wire: WireCause::MalformedResponse {

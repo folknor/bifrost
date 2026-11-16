@@ -135,6 +135,11 @@ pub enum WarningKind {
     /// something the user can fix, but the user sees a scope that never
     /// finishes and this says why. Minted by both engine inventory front ends.
     InventoryEndedUnannounced,
+    /// A create was acknowledged, but the answer carried no usable identity
+    /// for the new object (IMAP without APPENDUID, a provider answer whose id
+    /// is absent or empty). The object exists; this call cannot address it.
+    /// Explains every [`crate::Created`] without an id.
+    CreatedWithoutIdentity,
     Other,
 }
 

@@ -51,7 +51,7 @@ async fn container_create_completes_under_a_single_permit_pool() {
     .expect("container_create must not deadlock on the pool permit")
     .expect("scripted CREATE + LIST succeed");
 
-    assert_eq!(created.0, "Archive");
+    assert_eq!(created.id().expect("the id is the local name").0, "Archive");
     // The refresh landed: the re-LIST replaced the personal snapshot.
     assert!(account.folders.get(&created_name()).is_some());
     let _server = script.await.unwrap();

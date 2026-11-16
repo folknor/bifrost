@@ -214,7 +214,7 @@ pub(crate) fn get(
 pub(crate) fn create(
     client: Arc<GmailClient>,
     contact: ContactCreate,
-) -> AccountFuture<Result<ContactId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
     Box::pin(async move {
         validate_address_book(
             contact.address_book_id.as_ref(),
@@ -231,26 +231,17 @@ pub(crate) fn create(
             .post(&url, &person, bifrost_net::ReplayPolicy::Never)
             .await
             .map_err(|error| collection_error(error, AccountOperation::ContactCreate))?;
-        let resource_name = person.resource_name.ok_or_else(|| {
-            // A successful People response must identify the created person;
-            // returning an empty id would make every follow-up URL invalid.
-            local_error_with_field(
-                AccountOperation::ContactCreate,
-                "resourceName",
-                "created Google contact has no resource name".to_string(),
-            )
-        })?;
-        if resource_name.is_empty() {
-            // The field was present, but cannot identify a People resource.
-            return Err(error::into_account_error(
-                crate::error::Error::provider_response(
-                    crate::error::ProviderFault::ParseFailed,
-                    "created Google contact has an empty resource name",
-                ),
-                GmailErrorContext::contact_collection(AccountOperation::ContactCreate),
-            ));
-        }
-        Ok(ContactId(resource_name))
+        // A successful People response must identify the created person, but
+        // the person exists either way; an absent or empty resourceName is an
+        // unidentified success (an empty id would make every follow-up URL
+        // invalid, so it is never handed back).
+        Ok(super::created::created_or_unidentified(
+            person.resource_name,
+            "resourceName",
+            "created Google contact has no usable resource name",
+            GmailErrorContext::contact_collection(AccountOperation::ContactCreate),
+        )
+        .map(ContactId))
     })
 }
 
@@ -1122,10 +1113,9 @@ fn contact_error(error: crate::Error, operation: AccountOperation, id: String) -
     error::into_account_error(error, GmailErrorContext::contact(operation, id))
 }
 
-/// The CALLER's input cannot be used - a page cursor that is not UTF-8, an
-/// address book this backend does not have. Refused before the request it
-/// would shape is sent, so never a provider fault: `Request(Malformed)`, per
-/// the local-refusal rule in `reference/error-model.md`.
+/// A People answer lacks a field it must carry (a person read for update with
+/// no etag). A provider fault: `Protocol(MissingField)` with acknowledged
+/// evidence, since the answer arrived.
 fn local_error_with_field(
     operation: AccountOperation,
     field: &'static str,
@@ -1390,20 +1380,34 @@ mod tests {
         assert!(script.requests().is_empty());
     }
 
-    #[tokio::test]
-    async fn contact_create_requires_the_provider_resource_name() {
-        let (client, script) = scripted_client(b"{}");
-        let error = create(client, ContactCreate::default())
+    /// A create answered without a usable resourceName applied: it is an
+    /// unidentified success whose warning carries the acknowledged
+    /// `MissingField` leaf, never an error that invites a duplicating retry.
+    async fn assert_unidentified_contact_create(body: &'static [u8]) {
+        let (client, script) = scripted_client(body);
+        let created = create(client, ContactCreate::default())
             .await
-            .expect_err("a successful response without resourceName is malformed");
+            .expect("an acknowledged create is a success");
 
+        assert!(created.id().is_none());
+        let [warning] = created.warnings() else {
+            panic!("one warning explains the missing identity");
+        };
         assert_eq!(
-            error.kind(),
+            warning.kind,
+            bifrost_types::WarningKind::CreatedWithoutIdentity
+        );
+        let leaf = warning
+            .error
+            .as_ref()
+            .expect("the contract violation is kept");
+        assert_eq!(
+            leaf.kind(),
             &bifrost_types::AccountErrorKind::Protocol(
                 bifrost_types::ProtocolErrorKind::MissingField
             )
         );
-        assert!(error.chain().iter().any(|cause| matches!(
+        assert!(leaf.chain().iter().any(|cause| matches!(
             cause,
             bifrost_types::Cause::Attempt(attempt)
                 if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
@@ -1412,23 +1416,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contact_create_rejects_an_empty_provider_resource_name() {
-        let (client, _script) = scripted_client(br#"{"resourceName":""}"#);
-        let error = create(client, ContactCreate::default())
-            .await
-            .expect_err("an empty resourceName cannot identify a contact");
+    async fn contact_create_without_a_resource_name_is_an_unidentified_success() {
+        assert_unidentified_contact_create(b"{}").await;
+    }
 
-        assert_eq!(
-            error.kind(),
-            &bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::ParseFailed
-            )
-        );
-        assert!(error.chain().iter().any(|cause| matches!(
-            cause,
-            bifrost_types::Cause::Attempt(attempt)
-                if attempt.transmission_state == bifrost_types::TransmissionState::Acknowledged
-        )));
+    #[tokio::test]
+    async fn contact_create_with_an_empty_resource_name_is_an_unidentified_success() {
+        assert_unidentified_contact_create(br#"{"resourceName":""}"#).await;
     }
 
     #[tokio::test]

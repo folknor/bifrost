@@ -254,7 +254,10 @@ impl Account for CalendarAccount {
     ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
         self.inner.host_attachment(_bytes, _meta)
     }
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        _patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         self.inner.draft_create(_patch)
     }
     fn draft_update(
@@ -301,7 +304,7 @@ impl Account for CalendarAccount {
         _name: String,
         _parent: Option<ContainerId>,
         _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         self.inner.container_create(_kind, _name, _parent, _style)
     }
     fn container_rename(
@@ -347,7 +350,7 @@ impl Account for CalendarAccount {
     fn filter_create(
         &self,
         _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         self.inner.filter_create(_filter)
     }
     fn filter_update(
@@ -382,7 +385,7 @@ impl Account for CalendarAccount {
     fn contact_create(
         &self,
         _contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         self.inner.contact_create(_contact)
     }
     fn contact_update(
@@ -428,7 +431,10 @@ impl Account for CalendarAccount {
     fn event_get(&self, _event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
         self.inner.event_get(_event)
     }
-    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        _event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         self.inner.event_create(_event)
     }
     fn event_update(

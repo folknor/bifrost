@@ -39,7 +39,7 @@ pub(crate) fn container_create(
     name: String,
     parent: Option<ContainerId>,
     style: Option<ContainerStyle>,
-) -> AccountFuture<Result<ContainerId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
     Box::pin(async move {
         if parent.is_some() || !matches!(kind, ContainerKind::Label) {
             return Err(unsupported(
@@ -62,7 +62,13 @@ pub(crate) fn container_create(
                 ),
             )
         })?;
-        Ok(ContainerId(label.id))
+        Ok(crate::account::created::created_or_unidentified(
+            Some(label.id),
+            "id",
+            "created Gmail label has an empty id",
+            error::GmailErrorContext::container(bifrost_types::AccountOperation::ContainerCreate),
+        )
+        .map(ContainerId))
     })
 }
 
@@ -379,7 +385,7 @@ mod tests {
         .await
         .expect("label creation succeeds");
 
-        assert_eq!(id.0, "Label_2");
+        assert_eq!(id.id().expect("Gmail named the label").0, "Label_2");
         assert!(snapshot(&cache).is_stale());
         let labels = labels_for_flags(&client, &cache)
             .await

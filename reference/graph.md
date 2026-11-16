@@ -3087,8 +3087,16 @@ by-products relative to hosting, and no pre-authenticated URL enters a scope.
 
 Bulk mutation streams already preserve per-item lanes and do not carry sibling
 records. Reaction reads and single-request event/contact writes have no
-multi-step producer to adopt. Standalone draft/filter creates with missing ids
-are outside the multi-step scope.
+multi-step producer to adopt. Every standalone create door (draft, mail
+folder, message rule, contact, event) applies one rule
+(`account::created::created_or_unidentified`): a decoded create-success answer
+whose id is absent or empty is an acknowledged success, `Created` without an
+id, whose `CreatedWithoutIdentity` warning carries the
+`Protocol(ContractViolation)` leaf - never a failure, since the object exists
+and an enterprise user whose save worked expects "saved". The send leg's
+id-less draft is different: Send fails because that draft cannot be sent, so
+it keeps its Repeatable orphan record above. A required id that fails to
+decode is still an unreadable success (`Err`), not this case.
 
 ## Subscription expiry representation
 

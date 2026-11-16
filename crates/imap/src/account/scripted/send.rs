@@ -1,5 +1,87 @@
 use super::test_support::*;
 
+/// Save a draft against a LITERAL+ UIDPLUS server that answers the APPEND to
+/// Drafts with `reply`.
+async fn draft_create_answered(
+    reply: &'static str,
+) -> bifrost_types::Created<bifrost_types::DraftHandle> {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1 LITERAL+ UIDPLUS")).await;
+    let mut caps = crate::account::test_support::stub_capabilities();
+    caps.pim_methods.draft_create = true;
+    let account = ImapAccount::new(ImapAccountParts {
+        capabilities: caps,
+        folders: Arc::new(FolderRegistry::from_list(vec![crate::types::MailboxInfo {
+            name: crate::types::MailboxName::new("Drafts").unwrap(),
+            delimiter: Some('/'),
+            attributes: vec![crate::types::MailboxAttribute::Drafts],
+            ..crate::types::MailboxInfo::default()
+        }])),
+        ..scripted_account_parts(conn, 1)
+    });
+    let script = tokio::spawn(async move {
+        let header = read_line(&mut server).await;
+        assert!(
+            header.contains("APPEND \"Drafts\""),
+            "expected APPEND, got {header}"
+        );
+        let tag = tag_of(&header).to_owned();
+        let open = header.rfind('{').expect("a literal follows");
+        let len: usize = header[open + 1..]
+            .trim_end_matches(['}', '+', '\r', '\n'])
+            .trim_end_matches(['}', '+'])
+            .parse()
+            .expect("literal length");
+        let _body = crate::connection::test_support::read_exact(&mut server, len).await;
+        let _trailer = read_line(&mut server).await;
+        respond(&mut server, &format!("{tag} {reply}\r\n")).await;
+        server
+    });
+    let created = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::account::compose::draft_create(account, bifrost_types::DraftPatch::default()),
+    )
+    .await
+    .expect("the draft APPEND must finish")
+    .expect("a tagged OK is a saved draft");
+    let _server = script.await.unwrap();
+    created
+}
+
+/// RFC 4315 forbids APPENDUID for a `UIDNOTSTICKY` mailbox and a server may
+/// omit it: the draft is saved all the same, so the result is a success that
+/// names no draft, never the `Unsupported` that invited a duplicating retry.
+#[tokio::test]
+async fn draft_create_without_appenduid_is_an_unidentified_success() {
+    let created = draft_create_answered("OK done").await;
+    assert!(created.id().is_none());
+    let [warning] = created.warnings() else {
+        panic!("one warning explains the missing identity");
+    };
+    assert_eq!(
+        warning.kind,
+        bifrost_types::WarningKind::CreatedWithoutIdentity
+    );
+    assert!(
+        warning.error.is_none(),
+        "a protocol-permitted omission is not a provider fault"
+    );
+}
+
+#[tokio::test]
+async fn draft_create_with_appenduid_names_the_draft() {
+    let created = draft_create_answered("OK [APPENDUID 7 3] done").await;
+    let expected = crate::account::encode_object_id(
+        &crate::types::MailboxName::new("Drafts").unwrap(),
+        crate::types::UidValidity::new(7).expect("nonzero epoch"),
+        crate::types::Uid::new(3).expect("valid protocol test value"),
+    );
+    assert_eq!(
+        created.id().map(|draft| draft.0.as_str()),
+        Some(expected.0.as_str())
+    );
+    assert!(created.warnings().is_empty());
+}
+
 #[tokio::test]
 async fn sent_append_with_appenduid_reports_the_filed_copy() {
     let receipt = sent_append_receipt(Some("OK [APPENDUID 7 3] done")).await;

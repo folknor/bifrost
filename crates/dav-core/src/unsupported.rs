@@ -166,7 +166,10 @@ macro_rules! dav_unsupported_account_methods {
         $crate::collection_account::DavCollectionAccount::<$dialect>::unsupported_future(AccountOperation::HostAttachment)
     }
 
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        _patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         $crate::collection_account::DavCollectionAccount::<$dialect>::unsupported_future(AccountOperation::DraftCreate)
     }
 
@@ -222,7 +225,7 @@ macro_rules! dav_unsupported_account_methods {
         _name: String,
         _parent: Option<ContainerId>,
         _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         $crate::collection_account::DavCollectionAccount::<$dialect>::unsupported_future(AccountOperation::ContainerCreate)
     }
 
@@ -278,7 +281,7 @@ macro_rules! dav_unsupported_account_methods {
     fn filter_create(
         &self,
         _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         $crate::collection_account::DavCollectionAccount::<$dialect>::unsupported_future(AccountOperation::FilterCreate)
     }
 

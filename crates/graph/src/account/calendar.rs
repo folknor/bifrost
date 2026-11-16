@@ -196,7 +196,7 @@ async fn fetch_graph_event(
 pub(crate) async fn create(
     account: GraphAccount,
     event: EventCreate,
-) -> Result<EventId, AccountError> {
+) -> Result<bifrost_types::Created<EventId>, AccountError> {
     public::reject_calendar(&event.calendar_id, AccountOperation::EventCreate)?;
     reject_create_organizer(&event)?;
     reject_unwritable_status(event.status, AccountOperation::EventCreate)?;
@@ -222,7 +222,14 @@ pub(crate) async fn create(
         )
         .await
         .map_err(|error| into_error(error, AccountOperation::EventCreate))?;
-    Ok(EventId(join_event_id(&calendar_id, &created.id)))
+    // The native id is validated before it is joined, so an empty one never
+    // becomes a composite id that names nothing.
+    Ok(super::created::created_or_unidentified(
+        Some(created.id),
+        AccountOperation::EventCreate,
+        "created Graph event has an empty id",
+    )
+    .map(|id| EventId(join_event_id(&calendar_id, &id))))
 }
 
 fn reject_create_organizer(event: &EventCreate) -> Result<(), AccountError> {

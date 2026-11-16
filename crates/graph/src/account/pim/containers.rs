@@ -238,7 +238,7 @@ pub(crate) async fn container_create(
     // are message flags, not containers); accepted for trait parity
     // with the colorable (Gmail) path and ignored.
     _style: Option<bifrost_types::ContainerStyle>,
-) -> Result<ContainerId, AccountError> {
+) -> Result<bifrost_types::Created<ContainerId>, AccountError> {
     if kind != ContainerKind::Folder {
         return Err(unsupported_account_error(AccountOperation::ContainerCreate));
     }
@@ -266,7 +266,12 @@ pub(crate) async fn container_create(
                 GraphErrorContext::graph(AccountOperation::ContainerCreate),
             )
         })?;
-    Ok(ContainerId(folder.id))
+    Ok(crate::account::created::created_or_unidentified(
+        Some(folder.id),
+        AccountOperation::ContainerCreate,
+        "created Graph mail folder has an empty id",
+    )
+    .map(ContainerId))
 }
 
 pub(crate) async fn container_rename(

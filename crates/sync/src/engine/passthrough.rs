@@ -567,7 +567,7 @@ impl SyncEngine {
 
     /// Create a new container of `kind` named `name` under `parent`.
     /// Forwards to [`Account::container_create`]; returns the
-    /// engine-facing id. `style` carries an optional initial color
+    /// engine-facing id when the server identified the container. `style` carries an optional initial color
     /// (Gmail labels only; ignored by folder-shaped protocols).
     pub async fn container_create(
         &self,
@@ -576,7 +576,7 @@ impl SyncEngine {
         name: String,
         parent: Option<bifrost_types::ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
-    ) -> Result<bifrost_types::ContainerId, Error> {
+    ) -> Result<bifrost_types::Created<bifrost_types::ContainerId>, Error> {
         self.direct_call(account_id, |account| {
             account.container_create(kind, name, parent, style)
         })
@@ -666,7 +666,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         patch: bifrost_types::DraftPatch,
-    ) -> Result<bifrost_types::DraftHandle, Error> {
+    ) -> Result<bifrost_types::Created<bifrost_types::DraftHandle>, Error> {
         self.direct_call(account_id, |account| account.draft_create(patch))
             .await
     }
@@ -795,7 +795,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         contact: bifrost_types::ContactCreate,
-    ) -> Result<bifrost_types::ContactId, Error> {
+    ) -> Result<bifrost_types::Created<bifrost_types::ContactId>, Error> {
         self.direct_call(account_id, |account| account.contact_create(contact))
             .await
     }
@@ -875,7 +875,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         event: bifrost_types::EventCreate,
-    ) -> Result<bifrost_types::EventId, Error> {
+    ) -> Result<bifrost_types::Created<bifrost_types::EventId>, Error> {
         self.direct_call(account_id, |account| account.event_create(event))
             .await
     }
@@ -1029,7 +1029,7 @@ impl SyncEngine {
         &self,
         account_id: &AccountId,
         filter: bifrost_types::ServerFilterCreate,
-    ) -> Result<bifrost_types::ServerFilterId, Error> {
+    ) -> Result<bifrost_types::Created<bifrost_types::ServerFilterId>, Error> {
         self.direct_call(account_id, |account| account.filter_create(filter))
             .await
     }

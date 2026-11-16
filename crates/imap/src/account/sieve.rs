@@ -41,7 +41,7 @@ pub(crate) fn filters_list(
 pub(crate) fn filter_create(
     account: ImapAccount,
     filter: ServerFilterCreate,
-) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
     Box::pin(async move {
         let ServerFilterCreate::Script(script) = filter else {
             return Err(super::error::unsupported(AccountOperation::FilterCreate));
@@ -69,7 +69,7 @@ pub(crate) fn filter_create(
                 .await
                 .map_err(to_acct_err(AccountOperation::FilterCreate))?;
         }
-        Ok(ServerFilterId(name))
+        Ok(bifrost_types::Created::identified(ServerFilterId(name)))
     })
 }
 

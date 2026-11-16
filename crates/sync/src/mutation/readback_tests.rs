@@ -226,7 +226,10 @@ impl Account for ScriptAccount {
     ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
         unreachable!("unexpected account door")
     }
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        _patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn draft_update(
@@ -273,7 +276,7 @@ impl Account for ScriptAccount {
         _name: String,
         _parent: Option<ContainerId>,
         _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn container_rename(
@@ -319,7 +322,7 @@ impl Account for ScriptAccount {
     fn filter_create(
         &self,
         _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn filter_update(
@@ -354,7 +357,7 @@ impl Account for ScriptAccount {
     fn contact_create(
         &self,
         _contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn contact_update(
@@ -406,7 +409,10 @@ impl Account for ScriptAccount {
     fn event_get(&self, _event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
         unreachable!("unexpected account door")
     }
-    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        _event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         unreachable!("unexpected account door")
     }
     fn event_update(

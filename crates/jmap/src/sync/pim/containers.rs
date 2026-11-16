@@ -67,7 +67,7 @@ pub(crate) fn container_create<T: HttpTransport>(
     // JMAP mailboxes carry no container color; accepted for trait
     // parity with the colorable (Gmail) path and ignored.
     _style: Option<bifrost_types::ContainerStyle>,
-) -> AccountFuture<Result<ContainerId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
     Box::pin(async move {
         if !matches!(kind, ContainerKind::Folder) {
             return Err(crate::sync::error::unsupported_error(
@@ -91,14 +91,14 @@ pub(crate) fn container_create<T: HttpTransport>(
         let mailbox = response
             .created(&create_id)
             .map_err(answer_error(AccountOperation::ContainerCreate))?;
-        // An id-less success entry is refused, never handed back as an empty
-        // ContainerId.
-        crate::sync::error::require_created_id(
+        // An id-less success entry is an unidentified success, never handed
+        // back as an empty (or empty-wrapped) ContainerId.
+        Ok(crate::sync::error::created_or_unidentified(
             mailbox.id().map(MailboxId::as_str),
             AccountOperation::ContainerCreate,
             "Mailbox/set",
         )
-        .map(|id| ContainerId(crate::sync::foreign::JmapRef::encode(mail.owner(), &id)))
+        .map(|id| ContainerId(crate::sync::foreign::JmapRef::encode(mail.owner(), &id))))
     })
 }
 

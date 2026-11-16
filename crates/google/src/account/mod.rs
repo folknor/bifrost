@@ -6,6 +6,7 @@ mod capability_contract_tests;
 mod changes;
 mod cloud;
 mod contacts;
+mod created;
 mod cursor;
 pub(crate) mod error;
 mod filters;
@@ -839,7 +840,10 @@ impl Account for GoogleAccount {
         )
     }
 
-    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         self.shutdown_future(
             AccountOperation::DraftCreate,
             pim::draft_create(
@@ -932,7 +936,7 @@ impl Account for GoogleAccount {
         name: String,
         parent: Option<ContainerId>,
         style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         self.shutdown_future(
             AccountOperation::ContainerCreate,
             pim::container_create(
@@ -1032,7 +1036,7 @@ impl Account for GoogleAccount {
     fn filter_create(
         &self,
         filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         self.shutdown_future(
             AccountOperation::FilterCreate,
             filters::create(Arc::clone(&self.client), filter),
@@ -1097,7 +1101,7 @@ impl Account for GoogleAccount {
     fn contact_create(
         &self,
         contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         self.shutdown_future(
             AccountOperation::ContactCreate,
             contacts::create(Arc::clone(&self.client), contact),
@@ -1201,7 +1205,10 @@ impl Account for GoogleAccount {
         )
     }
 
-    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         self.shutdown_future(
             AccountOperation::EventCreate,
             calendar::create(Arc::clone(&self.client), event),

@@ -172,7 +172,7 @@ pub(crate) async fn get(
 pub(crate) async fn create(
     account: GraphAccount,
     contact: ContactCreate,
-) -> Result<ContactId, AccountError> {
+) -> Result<bifrost_types::Created<ContactId>, AccountError> {
     if contact
         .address_book_id
         .as_ref()
@@ -194,7 +194,12 @@ pub(crate) async fn create(
         )
         .await
         .map_err(|error| into_error(error, AccountOperation::ContactCreate))?;
-    Ok(ContactId(created.id))
+    Ok(super::created::created_or_unidentified(
+        Some(created.id),
+        AccountOperation::ContactCreate,
+        "created Graph contact has an empty id",
+    )
+    .map(ContactId))
 }
 
 pub(crate) async fn update(

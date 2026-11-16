@@ -147,7 +147,7 @@ pub(crate) fn get<T: HttpTransport>(
 pub(crate) fn create<T: HttpTransport>(
     contacts: Option<ContactAccount<T>>,
     contact: ContactCreate,
-) -> AccountFuture<Result<ContactId, AccountError>> {
+) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
     Box::pin(async move {
         let contacts = require_contacts(contacts, AccountOperation::ContactCreate)?;
         let mut set = ContactCardSet::new();
@@ -159,12 +159,12 @@ pub(crate) fn create<T: HttpTransport>(
         let card = response
             .created(&create_id)
             .map_err(super::error::answer_error(AccountOperation::ContactCreate))?;
-        super::error::require_created_id(
+        Ok(super::error::created_or_unidentified(
             card.id().as_ref().map(ContactCardId::as_str),
             AccountOperation::ContactCreate,
             "ContactCard/set",
         )
-        .map(ContactId)
+        .map(ContactId))
     })
 }
 
@@ -1443,27 +1443,22 @@ mod tests {
     /// A create answered in the success map without a usable id is refused,
     /// never handed back as `ContactId("")`.
     #[tokio::test]
-    async fn a_created_contact_without_a_usable_id_is_refused() {
+    async fn a_created_contact_without_a_usable_id_is_an_unidentified_success() {
         for entry in [json!({}), json!({"id": ""})] {
             let transport =
                 ScriptedQueryTransport::new(Vec::new()).with_created(json!({"c0": entry}));
-            let error = create(Some(transport.account()), ContactCreate::default())
+            let created = create(Some(transport.account()), ContactCreate::default())
                 .await
-                .unwrap_err();
-            assert_eq!(
-                error.kind(),
-                &bifrost_types::AccountErrorKind::Protocol(
-                    bifrost_types::ProtocolErrorKind::MissingField
-                ),
-                "{error:?}"
-            );
+                .expect("an acknowledged create is a success");
+            crate::sync::error::assert_unidentified_create(&created);
         }
         let transport =
             ScriptedQueryTransport::new(Vec::new()).with_created(json!({"c0": {"id": "card-1"}}));
-        let id = create(Some(transport.account()), ContactCreate::default())
+        let created = create(Some(transport.account()), ContactCreate::default())
             .await
             .expect("a usable created id");
-        assert_eq!(id, ContactId("card-1".into()));
+        assert_eq!(created.id(), Some(&ContactId("card-1".into())));
+        assert!(created.warnings().is_empty());
     }
 
     #[tokio::test]

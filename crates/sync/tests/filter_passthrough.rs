@@ -120,7 +120,9 @@ impl FilterAccount {
                     return Err(unsupported(bifrost_types::AccountOperation::FilterCreate));
                 }
                 rec.lock().expect("recorder lock").created = Some(filter);
-                Ok(ServerFilterId("created-id".to_owned()))
+                Ok(bifrost_types::Created::identified(ServerFilterId(
+                    "created-id".to_owned(),
+                )))
             })
         }));
         let config_for_hook = Arc::clone(&config);
@@ -214,7 +216,7 @@ async fn filter_passthroughs_forward_arguments_and_relay_returns() {
         .filter_create(&account_id, create)
         .await
         .expect("filter_create forwards");
-    assert_eq!(new_id, ServerFilterId("created-id".to_owned()));
+    assert_eq!(new_id.id(), Some(&ServerFilterId("created-id".to_owned())));
     match rec.lock().expect("recorder lock").created.clone() {
         Some(ServerFilterCreate::Script(script)) => {
             assert_eq!(script.body, "fileinto \"INBOX\";");

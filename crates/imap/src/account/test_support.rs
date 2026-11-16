@@ -412,7 +412,10 @@ impl Account for StubAccount {
         Box::pin(async { Err(unsupported(AccountOperation::HostAttachment)) })
     }
 
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(
+        &self,
+        _patch: DraftPatch,
+    ) -> AccountFuture<Result<bifrost_types::Created<DraftHandle>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DraftCreate)) })
     }
 
@@ -468,7 +471,7 @@ impl Account for StubAccount {
         _name: String,
         _parent: Option<ContainerId>,
         _style: Option<bifrost_types::ContainerStyle>,
-    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContainerId>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::ContainerCreate)) })
     }
 
@@ -524,7 +527,7 @@ impl Account for StubAccount {
     fn filter_create(
         &self,
         _filter: ServerFilterCreate,
-    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::FilterCreate)) })
     }
 
@@ -566,7 +569,7 @@ impl Account for StubAccount {
     fn contact_create(
         &self,
         _contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::ContactCreate)) })
     }
 
@@ -653,7 +656,10 @@ impl Account for StubAccount {
         Box::pin(async { Err(unsupported(AccountOperation::EventGet)) })
     }
 
-    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        _event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::EventCreate)) })
     }
 

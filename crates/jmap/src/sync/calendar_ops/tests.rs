@@ -387,7 +387,7 @@ async fn an_omitted_event_set_answer_is_a_partial_response() {
 /// A create answered in the success map without a usable id is refused,
 /// never handed back as `EventId("")`.
 #[tokio::test]
-async fn a_created_event_without_a_usable_id_is_refused() {
+async fn a_created_event_without_a_usable_id_is_an_unidentified_success() {
     let call = |created: Value| async move {
         let transport = ScriptedQueryTransport::new(Vec::new()).with_created(created);
         create(
@@ -397,19 +397,15 @@ async fn a_created_event_without_a_usable_id_is_refused() {
         .await
     };
     for entry in [json!({}), json!({"id": ""})] {
-        let error = call(json!({"c0": entry})).await.unwrap_err();
-        assert_eq!(
-            error.kind(),
-            &bifrost_types::AccountErrorKind::Protocol(
-                bifrost_types::ProtocolErrorKind::MissingField
-            ),
-            "{error:?}"
-        );
+        let created = call(json!({"c0": entry}))
+            .await
+            .expect("an acknowledged create is a success");
+        crate::sync::error::assert_unidentified_create(&created);
     }
-    let id = call(json!({"c0": {"id": "event-1"}}))
+    let created = call(json!({"c0": {"id": "event-1"}}))
         .await
         .expect("a usable created id");
-    assert_eq!(id, EventId("event-1".into()));
+    assert_eq!(created.id(), Some(&EventId("event-1".into())));
 }
 
 #[tokio::test]

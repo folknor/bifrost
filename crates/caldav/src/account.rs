@@ -459,7 +459,7 @@ impl Account for CalDavAccount {
     fn contact_create(
         &self,
         _contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         Kernel::unsupported_future(AccountOperation::ContactCreate)
     }
 
@@ -587,7 +587,10 @@ impl Account for CalDavAccount {
         })
     }
 
-    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         let client = Arc::clone(&self.client);
         let default_calendar_url = self.default_calendar_url.clone();
         Box::pin(async move {
@@ -625,7 +628,7 @@ impl Account for CalDavAccount {
                         .try_build()
                         .unwrap_or(error)
                 })?;
-            Ok(EventId(url))
+            Ok(bifrost_types::Created::identified(EventId(url)))
         })
     }
 

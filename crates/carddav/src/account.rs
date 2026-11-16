@@ -633,7 +633,7 @@ impl Account for CardDavAccount {
     fn contact_create(
         &self,
         contact: ContactCreate,
-    ) -> AccountFuture<Result<ContactId, AccountError>> {
+    ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
         let client = Arc::clone(&self.client);
         let default_addressbook_url = self.default_addressbook_url.clone();
         Box::pin(async move {
@@ -673,7 +673,7 @@ impl Account for CardDavAccount {
                         .try_build()
                         .unwrap_or(error)
                 })?;
-            Ok(ContactId(url))
+            Ok(bifrost_types::Created::identified(ContactId(url)))
         })
     }
 
@@ -1000,7 +1000,10 @@ impl Account for CardDavAccount {
         Kernel::unsupported_future(AccountOperation::EventGet)
     }
 
-    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+    fn event_create(
+        &self,
+        _event: EventCreate,
+    ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
         Kernel::unsupported_future(AccountOperation::EventCreate)
     }
 
