@@ -259,9 +259,26 @@ impl CoverageClaim {
 
     /// Absorb a superseded claim. Order is preserved so the older proof is
     /// ingested first.
+    ///
+    /// A maximal run of adjacent `Complete` reports over the SAME
+    /// `CoverageDomain` (snapshot included) collapses to one. A clean
+    /// partition walk stamps every page `Complete(partition)`, so without this
+    /// the survivor of n unacknowledged pages carried n copies of one proof,
+    /// every retained subsumed receipt its own prefix of them, and each saved
+    /// token encoded them all. Ingesting the same proof twice in a row under
+    /// one generation (a claim has one) changes no debt, barrier, policy,
+    /// lineage or discharge: `record_proof` may keep a redundant duplicate in
+    /// `proved`, which no coverage decision counts. Adjacency is the whole
+    /// condition. Any report between two equal proofs - carried debt, a
+    /// degraded page - stays a separator, because `Complete(D); Degraded(a);
+    /// Complete(D)` discharges `a` and the shorter sequence would not.
+    /// Degraded reports are never merged; they are the debt itself.
     pub fn absorb(&mut self, mut other: Self) {
         other.reports.append(&mut self.reports);
         self.reports = other.reports;
+        self.reports.dedup_by(|later, earlier| {
+            later.is_complete() && earlier.is_complete() && later.domain == earlier.domain
+        });
         self.generation = self.generation.max(other.generation);
     }
 
@@ -2321,6 +2338,13 @@ impl PendingCoverage {
     /// replays the receipt as published, without this later fold. Durable
     /// supersession must use `register`'s fold, which happens before the
     /// survivor's receipt is frozen.
+    ///
+    /// Nor does it record the fold the way registration does (no folded
+    /// watermark), so the superseded id is answered differently afterwards:
+    /// [`PendingCoverage::claim`] reports it `Unknown`, while the engine's
+    /// typed acknowledgement path falls back to its own receipt and applies
+    /// that claim again, in this process as after a restart. Ingesting the
+    /// same reports twice is redundant rather than lossy.
     // A receipt already saved in an external transaction cannot be changed by
     // this registry; mutating shared memory would only fix same-process
     // clones, not saved bytes. Bounding receipts or making this fold durable
@@ -3603,6 +3627,47 @@ mod tests {
         };
         assert_eq!(claim.reports.len(), 2);
         assert_eq!(claim.reports[0].obligations()[0].key().0, b"a".to_vec());
+    }
+
+    /// A clean walk's survivor, and the receipt frozen into its token, carry
+    /// ONE proof however many clean pages it superseded. Without the collapse
+    /// both held one `Complete` report per page.
+    #[test]
+    fn superseding_clean_pages_keeps_one_proof_in_claim_and_receipt() {
+        let publications = PendingCoverage::new();
+        let clean = || InventoryCoverageReport::complete(CoverageDomain::full(scope()));
+        let mut survivor = None;
+        for page in 0..5u8 {
+            survivor = Some(publications.register(
+                checkpoint(&[page]),
+                CoverageClaim::new(clean(), crate::cursor::WalkGeneration::for_test(1)),
+            ));
+        }
+        let survivor = survivor.expect("registered");
+        assert_eq!(survivor.1.claim.reports.len(), 1, "the saved receipt");
+        let ClaimLookup::Apply(claim) = publications.claim(survivor) else {
+            panic!("survivor must be acknowledgeable");
+        };
+        assert_eq!(claim.reports.len(), 1, "the live claim");
+    }
+
+    /// Only ADJACENT equal proofs collapse. A degraded report between two
+    /// proofs of the same domain is discharged by the second, so neither proof
+    /// may go, and no degraded report is ever merged.
+    #[test]
+    fn absorb_collapses_only_adjacent_equal_proofs() {
+        let clean = || InventoryCoverageReport::complete(CoverageDomain::full(scope()));
+        let generation = crate::cursor::WalkGeneration::for_test(1);
+        let mut claim = CoverageClaim {
+            reports: vec![clean(), degraded("a"), degraded("a"), clean(), clean()],
+            generation,
+        };
+        claim.absorb(CoverageClaim {
+            reports: vec![clean(), clean()],
+            generation,
+        });
+        let shape: Vec<bool> = claim.reports.iter().map(InventoryCoverageReport::is_complete).collect();
+        assert_eq!(shape, vec![true, false, false, true]);
     }
 
     /// If the survivor cannot absorb it, the claim stays put rather than

@@ -27,10 +27,15 @@ commit that precedes this file's.
 or was refused; one design item remains.
 
 - Sync `PendingCoverage::supersede` (standalone public form) cannot update a
-  receipt a consumer already saved, and `AckToken` receipts hold the full
-  cumulative claim. Bounding either needs a durable evidence owner and a new
-  acknowledgement contract. The limitation is now in `supersede`'s rustdoc and
-  `reference/sync.md`.
+  receipt a consumer already saved, and `AckToken` receipts hold the cumulative
+  claim. Narrowed: `CoverageClaim::absorb` now collapses adjacent identical
+  `Complete` proofs, so a clean single-domain walk is one proof per token and
+  linear retained evidence. Residue: degraded evidence, and clean pages over
+  distinct domains, still accumulate per page. A hard bound needs a durable
+  evidence owner (a store row tokens reference) and a new acknowledgement
+  contract. A cheaper in-process alternative, unbuilt: share report prefixes
+  between receipts (persistent list) so memory is linear while each token
+  still encodes standalone; serialized size stays cumulative.
 
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 

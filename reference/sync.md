@@ -1729,7 +1729,12 @@ That retained history is unbounded PER PARTITION, and for the `Full` plan -
 which is what JMAP Email uses - there is one partition per scope, so it is
 unbounded over the whole scope's backfill: one `AckToken`, its
 `PublicationReceipt` and its coverage claim per page the consumer read and did
-not acknowledge.
+not acknowledge. Each such claim is cumulative, but `CoverageClaim::absorb`
+collapses every maximal run of adjacent `Complete` reports over an identical
+domain to one, so a clean walk over one partition domain holds one proof per
+claim and the retained evidence grows linearly in pages. Degraded reports, and
+proofs separated by any other report, are never merged, so a walk with debt or
+with distinct clean domains still grows faster.
 Marking is keyed on the numbering: a reader the delivery gate never handed out
 is not the acknowledger, and letting its read free the producer would let a walk
 run a whole ring ahead of whoever answers for the pages.
@@ -5273,9 +5278,12 @@ Cursor and backfill inspection contracts:
   usable together, but their receipts are refused by account-bound writers.
 - Standalone `PendingCoverage::supersede` changes live claims only. It cannot
   update token bytes already stored by a consumer. Restart-safe supersession
-  uses registration's fold before the survivor is published. Each token retains
+  uses registration's fold before the survivor is published. It records no
+  folded watermark either, so the engine's acknowledgement of the superseded id
+  falls back to that id's own receipt and re-applies its claim (redundant, not
+  lossy), while `PendingCoverage::claim` reports it unknown. Each token retains
   its cumulative evidence so any saved page can still be acknowledged after
-  restart; replacing that evidence with a compact reference requires a durable
+  restart, less the adjacent duplicate proofs `absorb` collapses; replacing that evidence with a compact reference requires a durable
   evidence owner and a separately defined acknowledgement contract.
 
 ### Change delivery ledger identity
