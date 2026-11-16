@@ -504,6 +504,17 @@ impl DavDispatch {
         operation: AccountOperation,
         timeout: std::time::Duration,
     ) -> Result<DavResponse, AccountError> {
+        self.dispatch_evidenced(request, operation, timeout)
+            .await
+            .map(|evidenced| evidenced.response)
+    }
+
+    async fn dispatch_evidenced(
+        &self,
+        request: &DavRequest,
+        operation: AccountOperation,
+        timeout: std::time::Duration,
+    ) -> Result<Evidenced, AccountError> {
         // A header the record could not carry, and a header value the transport
         // cannot express as text, are the same failure seen one layer apart:
         // the request would go out MISSING something the caller asked for. Both
@@ -625,7 +636,7 @@ impl DavDispatch {
         request: &DavRequest,
         operation: AccountOperation,
         outcome: Result<bifrost_net::Response, NetError>,
-    ) -> Result<DavResponse, AccountError> {
+    ) -> Result<Evidenced, AccountError> {
         let url = request.url.as_ref().map_err(|_| {
             local_error(
                 operation,
@@ -647,25 +658,26 @@ impl DavDispatch {
                     response.status,
                     StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
                 );
-                if !request.replayable() && !response.status.is_success() && !method_refused {
-                    let outcomes = response.evidence().ledger().outcomes();
-                    let mut prior = bifrost_net::AttemptLedger::default();
-                    for outcome in outcomes.iter().take(outcomes.len().saturating_sub(1)) {
-                        prior.record(*outcome, false);
-                    }
-                    if prior.verdict() == bifrost_net::CommitEvidence::MayHaveCommitted {
-                        return Err(into_account_error(
-                            response.into_status_error(),
-                            self.protocol,
-                            operation,
-                        ));
-                    }
+                let earlier_may_have_committed = earlier_attempt_may_have_committed(&response);
+                if !request.replayable()
+                    && !response.status.is_success()
+                    && !method_refused
+                    && earlier_may_have_committed
+                {
+                    return Err(into_account_error(
+                        response.into_status_error(),
+                        self.protocol,
+                        operation,
+                    ));
                 }
-                Ok(DavResponse {
-                    status: response.status,
-                    headers: response.headers,
-                    body: decode_body(&response.body),
-                    url: url.clone(),
+                Ok(Evidenced {
+                    response: DavResponse {
+                        status: response.status,
+                        headers: response.headers,
+                        body: decode_body(&response.body),
+                        url: url.clone(),
+                    },
+                    earlier_may_have_committed,
                 })
             }
             Err(error) => {
@@ -683,6 +695,19 @@ impl DavDispatch {
                 Err(into_account_error(error, self.protocol, operation))
             }
         }
+    }
+
+    /// [`Self::send_raw_request`], also reporting whether an attempt before the
+    /// final answer may have committed the request (net's ledger rule, with
+    /// its proven-refusal predicate). A 404 to a DELETE, or a 412 to an
+    /// `If-Match: *` PUT, is proof of prior absence only when this is false.
+    pub async fn send_evidenced_request(
+        &self,
+        request: DavRequest,
+        operation: AccountOperation,
+    ) -> Result<Evidenced, AccountError> {
+        self.dispatch_evidenced(&request, operation, DAV_CLIENT_TIMEOUT)
+            .await
     }
 
     /// Send through net's one redirect, refresh and deadline engine.
@@ -807,9 +832,11 @@ impl DavDispatch {
     /// alternative, declaring the DELETE unreplayable and sending every drop to
     /// `Reconcile(CheckTarget)`, cost a probe on every drop to keep one signal:
     /// a "resource never existed" for a consumer deleting by a stale id. That
-    /// signal is now absorbed, deliberately; a consumer that needs it reads the
-    /// resource first. CalDAV's `delete_event` and CardDAV's `delete_vcard`
-    /// carry the same rule and must move with this one.
+    /// signal is absorbed here, deliberately. The account doors (CalDAV's
+    /// `delete_event`, CardDAV's `delete_vcard`) keep replay but recover the
+    /// signal from the request's attempt evidence: a 404 with no earlier
+    /// attempt that may have committed is prior absence and is `NotFound`
+    /// under the shared absent-target policy (`collection::DeleteOutcome`).
     pub async fn delete_resource(
         &self,
         url: &str,
@@ -1064,6 +1091,28 @@ impl std::fmt::Debug for DavDispatch {
 /// Whether a DELETE's answer says the target is already gone, which is the end
 /// state the DELETE was asking for. 404 and 410 both say so; nothing else does.
 #[must_use]
+/// A DAV response together with what the attempts before it prove.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Evidenced {
+    pub response: DavResponse,
+    /// An attempt before the final answer may have committed the request.
+    pub earlier_may_have_committed: bool,
+}
+
+/// The one reading of "an earlier attempt may have committed": replay every
+/// outcome before the final one into a fresh ledger as unreplayable, so net's
+/// rule (a proven refusal such as 401 commits nothing) decides. The final
+/// answer is excluded: it is the response being judged.
+fn earlier_attempt_may_have_committed(response: &bifrost_net::Response) -> bool {
+    let outcomes = response.evidence().ledger().outcomes();
+    let mut prior = bifrost_net::AttemptLedger::default();
+    for outcome in outcomes.iter().take(outcomes.len().saturating_sub(1)) {
+        prior.record(*outcome, false);
+    }
+    prior.verdict() == bifrost_net::CommitEvidence::MayHaveCommitted
+}
+
 pub fn delete_target_already_gone(status: StatusCode) -> bool {
     crate::multistatus::is_missing_status(status.as_u16())
 }

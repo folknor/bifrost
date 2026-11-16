@@ -284,6 +284,14 @@ impl AccountErrorBuilder {
         self
     }
 
+    /// The provider's own code for this failure, as received, including
+    /// extension codes no typed vocabulary models. Admission bounds its length
+    /// and charset (`TelemetryToken`), never its cardinality: replacing unknown
+    /// codes with a fixed placeholder would erase the evidence an operator
+    /// needs for an unrecognized code, and the telemetry view already carries
+    /// per-request ids. Metrics that need bounded labels aggregate on
+    /// `kind_discriminant` / `message_key`. A code the token check rejects
+    /// stays in support-only text, which is the designed fallback.
     #[must_use]
     pub fn native_code(mut self, code: impl Into<String>) -> Self {
         self.set_telemetry_token(code.into(), TelemetryField::NativeCode);

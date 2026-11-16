@@ -7,29 +7,124 @@ use super::{
     AckToken, CoverageClaim, DebtLedger, PublicationNumber, PublicationReceipt, UndeliveredMark,
     WalkGeneration, decode_envelope, decode_ledger, encode_envelope, encode_ledger,
 };
-use crate::Error;
+use crate::{AckTokenFault, Error};
 
-// Version 2 authenticates account identity. Only version 2 is readable: version
-// 1 has no account binding and cannot safely be replayed by an account writer.
-const HEADER: &[u8] = b"bifrost-ack\x02";
+// Version 3 names the signing key with one id byte after the header, so a
+// token signed under a retired key reports `KeyUnknown` rather than looking
+// corrupt, and a keyring can accept the previous key while issuing under the
+// current one. Version 2 (account binding, no key id) still decodes by trying
+// each keyring key. Version 1 has no account binding and cannot safely be
+// replayed by an account writer, so it is not readable.
+const PREFIX: &[u8] = b"bifrost-ack";
+const V2: u8 = 2;
+const V3: u8 = 3;
 
-/// Encode the whole token beside the consumer transaction it acknowledges.
-/// `key` is an application-owned persistent secret, stored separately from the
-/// batch store. Use the same key when decoding after a process restart.
-/// The tag authenticates storage; this is not an authority boundary against the
-/// application holding that key. Token payloads are not encrypted.
+/// One application-owned 32-byte token secret and the id tokens name it by.
+#[derive(Clone)]
+pub struct AckKey {
+    id: u8,
+    secret: [u8; 32],
+}
+
+impl AckKey {
+    #[must_use]
+    pub const fn new(id: u8, secret: [u8; 32]) -> Self {
+        Self { id, secret }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> u8 {
+        self.id
+    }
+}
+
+impl std::fmt::Debug for AckKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AckKey")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The keys an application decodes with, and the one it issues under.
+///
+/// Rotation: make the new key `current` and keep the old one in `previous`
+/// for as long as any batch signed under it may still need acknowledgement,
+/// so a secret rotation does not force a resync. Key ids must be unique and
+/// must not be reused for a different secret while tokens signed under the
+/// old secret are retained; a reused id makes those tokens read as `Corrupt`.
+#[derive(Clone, Debug)]
+pub struct AckKeyring {
+    current: AckKey,
+    previous: Vec<AckKey>,
+}
+
+impl AckKeyring {
+    /// A keyring of one key.
+    #[must_use]
+    pub const fn single(current: AckKey) -> Self {
+        Self {
+            current,
+            previous: Vec::new(),
+        }
+    }
+
+    /// Refuses a keyring in which two keys share an id: selection by id
+    /// would then depend on order.
+    pub fn new(current: AckKey, previous: Vec<AckKey>) -> Result<Self, Error> {
+        let mut seen = std::collections::BTreeSet::new();
+        for key in std::iter::once(&current).chain(&previous) {
+            if !seen.insert(key.id) {
+                return Err(Error::Other(format!(
+                    "acknowledgement keyring holds key id {} twice",
+                    key.id
+                )));
+            }
+        }
+        Ok(Self { current, previous })
+    }
+
+    #[must_use]
+    pub fn current(&self) -> &AckKey {
+        &self.current
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &AckKey> {
+        std::iter::once(&self.current).chain(&self.previous)
+    }
+
+    fn key(&self, id: u8) -> Option<&AckKey> {
+        self.keys().find(|key| key.id == id)
+    }
+}
+
+/// Encode the whole token beside the consumer transaction it acknowledges,
+/// signed under the keyring's current key. Keys are application-owned
+/// persistent secrets, stored separately from the batch store. The tag
+/// authenticates storage; this is not an authority boundary against the
+/// application holding a key. Token payloads are not encrypted.
 ///
 /// # Panics
 /// Panics if a token contains a future checkpoint or ledger variant that its
 /// underlying codec cannot encode, or a field exceeds the u32 framing limit.
 #[must_use]
-pub fn encode_ack_token(token: &AckToken, key: &[u8; 32]) -> Vec<u8> {
-    let mut out = HEADER.to_vec();
+pub fn encode_ack_token(token: &AckToken, keys: &AckKeyring) -> Vec<u8> {
+    let key = keys.current();
+    let mut out = PREFIX.to_vec();
+    out.push(V3);
+    out.push(key.id);
+    encode_body(&mut out, token);
+    let tag = authenticate(&key.secret, &out);
+    out.extend_from_slice(&tag);
+    out
+}
+
+fn encode_body(out: &mut Vec<u8>, token: &AckToken) {
     match &token.1.account {
         None => out.push(0),
         Some(account) => {
             out.push(1);
-            blob(&mut out, account.0.as_bytes());
+            blob(out, account.0.as_bytes());
         }
     }
     out.extend_from_slice(&token.0.0.to_le_bytes());
@@ -45,7 +140,7 @@ pub fn encode_ack_token(token: &AckToken, key: &[u8; 32]) -> Vec<u8> {
         None => out.push(0),
         Some(checkpoint) => {
             out.push(1);
-            blob(&mut out, &encode_envelope(checkpoint));
+            blob(out, &encode_envelope(checkpoint));
         }
     }
     let normalized;
@@ -74,33 +169,63 @@ pub fn encode_ack_token(token: &AckToken, key: &[u8; 32]) -> Vec<u8> {
             .to_le_bytes(),
     );
     for report in reports {
-        blob(&mut out, &encode_ledger(report));
+        blob(out, &encode_ledger(report));
     }
-    let tag = authenticate(key, &out);
-    out.extend_from_slice(&tag);
-    out
 }
 
 /// Restore a token without reconstructing coverage reports in application code.
 /// Authentication is checked before parsing any cursor or evidence. Invalid,
 /// truncated, tampered and trailing data are rejected without ledger mutation.
-/// Changing or losing the key makes retained tokens unreadable; retain the key
-/// for as long as any batch may still need acknowledgement.
-pub fn decode_ack_token(bytes: &[u8], key: &[u8; 32]) -> Result<AckToken, Error> {
+///
+/// A version 3 token is opened with the keyring key its id byte names; an id
+/// the keyring lacks is `AckTokenFault::KeyUnknown`, a failed tag or malformed
+/// framing `AckTokenFault::Corrupt`. A version 2 token names no key and is
+/// tried against every key. Authenticated contents whose checkpoint or ledger
+/// schema this engine cannot read are `Error::SchemaIncompatible`, as is an
+/// unknown token version.
+pub fn decode_ack_token(bytes: &[u8], keys: &AckKeyring) -> Result<AckToken, Error> {
     let payload_len = bytes.len().checked_sub(32).ok_or_else(invalid)?;
     let (payload, supplied) = bytes.split_at(payload_len);
-    let expected = authenticate(key, payload);
-    let difference = supplied
-        .iter()
-        .zip(expected)
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-    if difference != 0 {
+    let mut reader = Reader(payload);
+    if reader.take(PREFIX.len())? != PREFIX {
         return Err(invalid());
     }
-    let mut reader = Reader(payload);
-    if reader.take(HEADER.len())? != HEADER {
-        return Err(Error::SchemaIncompatible);
+    match reader.byte()? {
+        V3 => {
+            let key_id = reader.byte()?;
+            let key = keys
+                .key(key_id)
+                .ok_or(Error::AckToken(AckTokenFault::KeyUnknown { key_id }))?;
+            if !tag_matches(&key.secret, payload, supplied) {
+                return Err(invalid());
+            }
+        }
+        V2 => {
+            // Authenticate first, then parse once: a nested schema failure in
+            // an authenticated token must surface, not be masked by trying
+            // the next key.
+            if !keys
+                .keys()
+                .any(|key| tag_matches(&key.secret, payload, supplied))
+            {
+                return Err(invalid());
+            }
+        }
+        _ => return Err(Error::SchemaIncompatible),
     }
+    decode_body(reader)
+}
+
+fn tag_matches(secret: &[u8; 32], payload: &[u8], supplied: &[u8]) -> bool {
+    let expected = authenticate(secret, payload);
+    supplied
+        .iter()
+        .zip(expected)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn decode_body(mut reader: Reader<'_>) -> Result<AckToken, Error> {
     let account = match reader.byte()? {
         0 => None,
         1 => Some(bifrost_types::AccountId(
@@ -170,7 +295,7 @@ fn authenticate(key: &[u8; 32], bytes: &[u8]) -> [u8; 32] {
 }
 
 fn invalid() -> Error {
-    Error::Other("invalid acknowledgement token".into())
+    Error::AckToken(AckTokenFault::Corrupt)
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -212,7 +337,7 @@ mod tests {
         PayloadVersion, PrimaryCause, ProtocolKind, RequestCause, TraitEnvelopeVersion,
     };
 
-    const KEY: [u8; 32] = [7; 32];
+    const KEY: AckKeyring = AckKeyring::single(AckKey::new(0, [7; 32]));
 
     fn checkpoint(state: &[u8]) -> Checkpoint {
         Checkpoint::Change(ChangeCursor {
@@ -371,12 +496,71 @@ mod tests {
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(decode_ack_token(&trailing, &KEY).is_err());
-        assert!(decode_ack_token(&bytes, &[8; 32]).is_err());
+        // Same id, different secret: the named key does not authenticate.
+        assert!(matches!(
+            decode_ack_token(&bytes, &AckKeyring::single(AckKey::new(0, [8; 32]))),
+            Err(Error::AckToken(AckTokenFault::Corrupt))
+        ));
         let restored = decode_ack_token(&bytes, &KEY).expect("repair token");
         assert!(restored.checkpoint().is_none());
         assert!(matches!(
             PendingCoverage::new().claim_repair(restored),
             ClaimLookup::Replay(_)
+        ));
+    }
+
+    #[test]
+    fn a_retired_key_is_reported_apart_from_corruption_and_a_keyring_rotates() {
+        let issuing = PendingCoverage::new();
+        let token = issuing.publish_without_report(issuing.next_generation());
+        let old = AckKey::new(1, [1; 32]);
+        let new = AckKey::new(2, [2; 32]);
+        let bytes = encode_ack_token(&token, &AckKeyring::single(old.clone()));
+        // The key is gone: a distinct fault naming the id the token claims.
+        assert!(matches!(
+            decode_ack_token(&bytes, &AckKeyring::single(new.clone())),
+            Err(Error::AckToken(AckTokenFault::KeyUnknown { key_id: 1 }))
+        ));
+        // Corruption under a held key stays corruption.
+        let mut corrupt = bytes.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(matches!(
+            decode_ack_token(&corrupt, &AckKeyring::single(old.clone())),
+            Err(Error::AckToken(AckTokenFault::Corrupt))
+        ));
+        // Rotation: issue under the new key, still accept the previous one.
+        let rotated = AckKeyring::new(new, vec![old]).expect("distinct ids");
+        assert_eq!(
+            decode_ack_token(&bytes, &rotated).expect("old token"),
+            token
+        );
+        let reissued = encode_ack_token(&token, &rotated);
+        assert_eq!(reissued[PREFIX.len() + 1], 2);
+        assert_eq!(decode_ack_token(&reissued, &rotated).expect("new"), token);
+        assert!(
+            AckKeyring::new(AckKey::new(3, [3; 32]), vec![AckKey::new(3, [4; 32])]).is_err(),
+            "duplicate ids make selection order-dependent"
+        );
+    }
+
+    #[test]
+    fn version_two_tokens_still_decode_under_any_keyring_key() {
+        let issuing = PendingCoverage::new();
+        let token = issuing.publish_without_report(issuing.next_generation());
+        let secret = [5; 32];
+        // A version 2 token: the same body with no key id byte.
+        let mut v2 = PREFIX.to_vec();
+        v2.push(V2);
+        encode_body(&mut v2, &token);
+        let tag = authenticate(&secret, &v2);
+        v2.extend_from_slice(&tag);
+        let keys = AckKeyring::new(AckKey::new(9, [9; 32]), vec![AckKey::new(4, secret)])
+            .expect("distinct ids");
+        assert_eq!(decode_ack_token(&v2, &keys).expect("v2 token"), token);
+        assert!(matches!(
+            decode_ack_token(&v2, &AckKeyring::single(AckKey::new(9, [9; 32]))),
+            Err(Error::AckToken(AckTokenFault::Corrupt))
         ));
     }
 

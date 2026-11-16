@@ -160,6 +160,12 @@ fn new_provider_and_protocol_tags_keep_their_historical_gate() {
         assert_eq!(ledger::decode_protocol(tag, 9).unwrap(), protocol);
         assert!(ledger::decode_protocol(tag, 8).is_err());
     }
+    assert_eq!(ledger::encode_protocol(Protocol::ManageSieve), 13);
+    assert_eq!(
+        ledger::decode_protocol(13, ledger::MANAGE_SIEVE_PROTOCOL_VERSION).unwrap(),
+        Protocol::ManageSieve
+    );
+    assert!(ledger::decode_protocol(13, ledger::MANAGE_SIEVE_PROTOCOL_VERSION - 1).is_err());
 }
 
 #[test]

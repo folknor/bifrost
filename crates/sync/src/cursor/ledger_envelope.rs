@@ -82,6 +82,8 @@
 //! Version 15 adds an optional trailing table of UnsupportedReason values for
 //! entry and barrier error digests. Versions 3-14 restore reasons as unknown.
 //!
+//! Version 16 adds the `Protocol::ManageSieve` tag (13); older rows reject it.
+//!
 //! A `BarrierIncident::resume_from` nests a whole cursor envelope through
 //! `encode_envelope` / `decode_envelope` rather than re-deriving one: the
 //! checkpoint codec owns that layout and its migration chain, and a second
@@ -123,7 +125,8 @@ use bifrost_types::{ObligationKey, wire::Reader};
 /// in a way an older decoder would misread, including a new tag in a
 /// vocabulary an older decoder would refuse.
 // Version 15 retains optional unsupported reasons on durable refusals.
-pub const LEDGER_ENVELOPE_VERSION: u32 = 15;
+// Version 16 adds the ManageSieve protocol tag (13).
+pub const LEDGER_ENVELOPE_VERSION: u32 = 16;
 const _: () = assert!(LEDGER_ENVELOPE_VERSION >= bifrost_types::wire::ledger::VOCABULARY_VERSION);
 
 /// Lowest ledger envelope version still readable by this engine.

@@ -138,8 +138,36 @@ fn sieve_error(
             code,
             message: "sieve says no".into(),
         },
-        ImapErrorContext::operation(op),
+        ImapErrorContext::sieve(op),
     )
+}
+
+/// Every ManageSieve failure names its own leg: a server refusal, a parse
+/// failure and a token lookup routed through the shared IMAP translation.
+#[test]
+fn sieve_failures_carry_the_managesieve_protocol() {
+    let ctx = || ImapErrorContext::sieve(AccountOperation::FilterCreate);
+    let refusal = sieve_error(None, AccountOperation::FilterCreate);
+    let parse = super::sieve_account_error(crate::sieve::Error::Parse("bad".into()), ctx());
+    let token = super::sieve_account_error(
+        crate::sieve::Error::OAuthToken(bifrost_net::Error::AuthLost {
+            transmission_state: None,
+            final_response: None,
+        }),
+        ctx(),
+    );
+    for error in [refusal, parse, token] {
+        assert_eq!(
+            error.protocol(),
+            Some(bifrost_types::Protocol::ManageSieve),
+            "{error:?}"
+        );
+    }
+    let imap = into_account_error(
+        Error::Provider(crate::error::ProviderFailure::Parse("bad".into())),
+        ImapErrorContext::operation(AccountOperation::FilterCreate),
+    );
+    assert_eq!(imap.protocol(), Some(bifrost_types::Protocol::Imap));
 }
 
 /// The imap-S1 defect. `TRYLATER` explicitly means "transient, retry
@@ -1129,10 +1157,13 @@ fn starttls_refusal_does_not_claim_the_capability_was_absent() {
 fn permission_denied_answers_token_failures_without_classifying_them() {
     let ctx = ImapErrorContext::operation(AccountOperation::SyncChanges)
         .with_folder_scope(&mailbox("INBOX"));
-    let tunneled = super::oauth_token_error(bifrost_net::Error::AuthLost {
-        transmission_state: None,
-        final_response: None,
-    });
+    let tunneled = super::oauth_token_error(
+        bifrost_net::Error::AuthLost {
+            transmission_state: None,
+            final_response: None,
+        },
+        bifrost_types::Protocol::Imap,
+    );
     assert!(!super::permission_denied(&tunneled, &ctx));
 }
 
@@ -1157,7 +1188,7 @@ fn oauth_token_failures_preserve_net_classification_and_context() {
         },
     ];
     for error in errors {
-        let tunneled = super::oauth_token_error(error);
+        let tunneled = super::oauth_token_error(error, bifrost_types::Protocol::Imap);
         let Error::OAuthToken(expected) = &tunneled else {
             panic!("token error must retain its classification");
         };

@@ -714,7 +714,11 @@ consent-tier export off `AccountError`:
   Producer-supplied ids and native codes pass through the bounded, single-line
   `TelemetryToken`; rejected values remain support-only text and are omitted
   from telemetry. **No free-form text** (`telemetry_has_no_free_form_text`); safe
-  to ship to metrics unconditionally.
+  to ship to metrics unconditionally. The token bounds length and charset, not
+  cardinality: `request_id` and `trace_id` are per request, and `native_code`
+  keeps a provider's unknown extension codes as received, because a fixed
+  placeholder erased what an operator needs about an unrecognized code. Bounded
+  metric labels come from `kind_discriminant` and `message_key`.
 - `user_safe_text()` -> iterator over only the `UserSafe` strings.
 - `support_consented()` -> `SupportExportConsented`: telemetry +
   user-safe text + support-only text + `scope`. Requires user consent.
@@ -999,6 +1003,10 @@ Non-mail Google errors use Provider::Google and Protocol::{GoogleCalendar,
 GooglePeople, GoogleDrive}, with matching WireCause variants retaining the
 structured Google reason vocabulary currently represented by GmailSignal. Gmail
 retains its existing provider, protocol and wire identities.
+
+ManageSieve failures on an IMAP account use `Protocol::ManageSieve`, so a server
+filter failure is never attributed to the IMAP mail session. A filter request
+on an account with no ManageSieve leg stays `Protocol::Imap`.
 
 `ImapResponseCode::code()` exposes the diagnostic response-code name, including
 the retained server name for `Unknown`. IMAP's protocol type owns conversion

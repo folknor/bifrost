@@ -962,8 +962,10 @@ resolve a sibling response href as a child.
 DAV entity-tag normalization and weak-tag recognition share one `EntityTag`
 parser. `PutCondition::IfMatch` carries a privately constructed `StrongTag`;
 a weak validator cannot become an If-Match header. A server offering only weak
-validators still accepts unconditional edits: an enterprise user must be able
-to save changes, with the accepted loss of HTTP lost-update protection.
+validators still accepts version-unconditional edits: an enterprise user must be
+able to save changes, with the accepted loss of HTTP lost-update protection.
+Those edits carry `If-Match: *` (`PutCondition::IfExists`), so they cannot
+recreate a resource deleted since it was read.
 Shared account reads carry scoped `ServerVersion` values; persisted snapshots
 retain entity-tag bytes. Conditional writes check protocol and object type before
 admitting the validator as a precondition.
@@ -1055,12 +1057,15 @@ transport. HTTP(S) scheme recognition is case-insensitive.
 The shared `AccountOperation::skips_absent_target` returns false for `ContactUpdate`
 and `ContactDelete`. Updates and conditional deletes preserve failures, including
 missing destinations: an Outlook user needs to know that an edit was not applied.
-Unconditional delete currently diverges: the client's `delete_vcard` absorbs
-404/410 before the account door sees them. This is coupled to replay after a
-landed DELETE, which can itself return 404. The account door cannot distinguish
-that committed attempt from prior absence, and a preflight read would add a race.
-Aligning this door requires changing the client/dispatch replay contract, rather
-than manufacturing NotFound or successful writes at the account boundary.
+Unconditional delete conforms too: a contact absent before the request is
+`NotFound`, while a 404 after an earlier attempt that may have committed is
+reported deleted (the DELETE ruling in `reference/caldav.md`, shared through
+`collection::DeleteOutcome`). Updates without a strong validator send
+`If-Match: *` (`PutCondition::IfExists`), so a contact deleted after it was read
+is reported `NotFound` rather than recreated. A precondition makes the PUT
+unreplayable under `IdempotentUnlessConditional`, so a weak-tag update dropped
+mid-flight reconciles like a strong-tag one instead of replaying; an explicit
+`PutCondition::None` write keeps its replay.
 
 Discovery credential scenarios and wire assertions live in dav-core's
 `test_support::discovery`, parameterized by `DavProtocol`. Thin tests in both

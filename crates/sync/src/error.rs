@@ -50,6 +50,11 @@ pub enum Error {
     /// A caller's acknowledgement was rejected before a store write.
     #[error("acknowledgement rejected: {0}")]
     AckRejected(AckRejection),
+    /// A stored acknowledgement token could not be opened. A token whose
+    /// authenticated contents use a schema this engine cannot read is
+    /// `SchemaIncompatible` instead.
+    #[error("acknowledgement token unreadable: {0}")]
+    AckToken(AckTokenFault),
     /// A valid acknowledgement reached the store, which failed. Preserve its
     /// original error without confusing it with a rejected publication token.
     #[error("acknowledgement persistence failed: {0}")]
@@ -133,6 +138,23 @@ pub enum AckRejection {
     UnsupportedCheckpoint,
     #[error("invalid checkpoint envelope")]
     InvalidEnvelope,
+}
+
+/// Why a stored acknowledgement token did not open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AckTokenFault {
+    /// The token names a key id the supplied keyring does not hold. The id is
+    /// read before authentication: this means "the claimed key is not
+    /// available", not proof of a rotation, since corruption can change that
+    /// byte too. Do not discard the batch on it; supply the retired key.
+    #[error("no key with id {key_id} in the keyring")]
+    KeyUnknown { key_id: u8 },
+    /// The bytes fail authentication under the named key, or their framing is
+    /// malformed. For a version 2 token, which names no key, this also covers
+    /// a key the keyring no longer holds; the two are indistinguishable there.
+    #[error("corrupt or tampered token")]
+    Corrupt,
 }
 
 /// Successful acknowledgement does not necessarily advance a checkpoint.

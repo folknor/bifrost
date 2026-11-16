@@ -47,7 +47,8 @@ pub mod url;
 mod xml;
 
 pub use dispatch::{
-    DavByteTally, DavCredentials, DavDispatch, DavRequestGuard, delete_target_already_gone,
+    DavByteTally, DavCredentials, DavDispatch, DavRequestGuard, Evidenced,
+    delete_target_already_gone,
 };
 
 pub use error::{

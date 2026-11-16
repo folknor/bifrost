@@ -2315,14 +2315,16 @@ impl PendingCoverage {
     /// obligations get discarded while the engine believes B accounted for
     /// them. `register` performs this inline for the checkpoint stream; this is
     /// the standalone form.
-    // This standalone operation changes only live evidence: it cannot revise a
-    // survivor receipt already handed to a consumer. Restart replay therefore
-    // cannot recover this later fold. Production checkpoint publication folds
-    // before freezing the receipt in register_stream_in instead.
+    ///
+    /// Live evidence only: this cannot revise a survivor receipt already
+    /// handed to a consumer, so acknowledging the survivor after a restart
+    /// replays the receipt as published, without this later fold. Durable
+    /// supersession must use `register`'s fold, which happens before the
+    /// survivor's receipt is frozen.
     // A receipt already saved in an external transaction cannot be changed by
-    // this registry. Mutating shared memory would only fix same-process clones,
-    // not saved bytes. This method remains a live-registry operation; durable
-    // supersession must use register's fold before publishing the survivor.
+    // this registry; mutating shared memory would only fix same-process
+    // clones, not saved bytes. Bounding receipts or making this fold durable
+    // needs a durable evidence owner and a new acknowledgement contract.
     pub fn supersede(&self, superseded: AckToken, survivor: AckToken) {
         if superseded.1.account != self.account || survivor.1.account != self.account {
             return;

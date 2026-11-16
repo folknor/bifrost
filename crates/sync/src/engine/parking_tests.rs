@@ -140,6 +140,7 @@ impl Harness {
             push_retired_tx: watch::channel(crate::types::AccountGeneration::for_test(0)).0,
             push_topology_tx: watch::channel(crate::engine::PushTopologyGeneration::for_test(0)).0,
             push_drain_wait: Duration::from_secs(5),
+            close_wait: Duration::from_secs(5),
             reopen_lock: Arc::new(AsyncMutex::new(())),
             open_skips: Arc::new(Mutex::new(vec![])),
             shutdown: CancellationToken::new(),

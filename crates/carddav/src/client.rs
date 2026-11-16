@@ -478,21 +478,28 @@ impl CardDavClient {
             .await
     }
 
-    /// `DELETE` one vCard resource. Replayable, and a target already gone is a
-    /// success - the dav-D1 ruling, stated in full at
-    /// `DavDispatch::delete_resource`; twin of `bifrost-caldav`'s
-    /// `delete_event`, and the two must move together. Not a call into
-    /// `delete_resource` itself only because this side hands the response ETag
-    /// back, which a gone target has none of.
+    /// `DELETE` one vCard resource for the account door; twin of
+    /// `bifrost-caldav`'s `delete_event`, and the two must move together.
+    /// Replayable (dav-D1, stated at `DavDispatch::delete_resource`). A contact
+    /// already absent before this request is the item `NotFound` the shared
+    /// absent-target policy keeps for `ContactDelete`; a 404 after an earlier
+    /// attempt that may have landed is a success, because the contact is gone
+    /// and our own delete may be why. Hands back the response ETag, which a
+    /// gone target has none of.
     pub(crate) async fn delete_vcard(
         &self,
         url: &str,
         operation: AccountOperation,
     ) -> Result<Option<String>, AccountError> {
         self.refuse_directory_access(url, operation)?;
-        DavCollectionClient::<CardDavDialect>::new(&self.dav)
+        match DavCollectionClient::<CardDavDialect>::new(&self.dav)
             .delete(url, operation)
-            .await
+            .await?
+        {
+            bifrost_dav_core::collection::DeleteOutcome::Deleted(etag) => Ok(etag),
+            bifrost_dav_core::collection::DeleteOutcome::Absent(error) => Err(error),
+            _ => Ok(None),
+        }
     }
 
     pub(crate) fn observe_directories(&self, urls: impl IntoIterator<Item = String>) {
@@ -1034,6 +1041,36 @@ mod tests {
             assert_eq!(etag, expected, "{label}");
             assert_eq!(transcripts(&script).len(), requests, "{label}");
         }
+    }
+
+    /// Twin of `bifrost-caldav`'s test of the same name: a contact absent
+    /// before the DELETE is the item NotFound of the shared absent-target
+    /// policy. Ablation: absorbing every 404 again returns Ok here.
+    #[tokio::test]
+    async fn deleting_an_already_absent_contact_is_not_found() {
+        let script = dav_script([DavResponse {
+            status: StatusCode::NOT_FOUND,
+            headers: HeaderMap::new(),
+            body: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
+        }]);
+        let client =
+            CardDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let error = client
+            .delete_vcard(
+                "https://dav.example.test/book/one.vcf",
+                AccountOperation::ContactDelete,
+            )
+            .await
+            .expect_err("prior absence is reported");
+        assert!(
+            matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Contact)
+            ),
+            "{error:?}"
+        );
     }
 
     /// A dropped create names the target the consumer is told to check.

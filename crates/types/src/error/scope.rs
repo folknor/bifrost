@@ -505,6 +505,10 @@ pub enum Protocol {
     Graph,
     Ews,
     CalDav,
+    /// RFC 5804 ManageSieve, the server-side filter leg an IMAP account may
+    /// compose. Kept distinct from `Imap` so a filter failure is never
+    /// attributed to the mail session.
+    ManageSieve,
     /// The protocol is not derivable at the point the error was classified.
     ///
     /// Used for engine errors and provider-neutral helpers. Protocol crates

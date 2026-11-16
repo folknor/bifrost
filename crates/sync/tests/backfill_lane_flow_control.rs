@@ -1994,7 +1994,8 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
     .await
     .expect("the walk carries on for the replacement");
     let unflushed = unflushed.expect("one page is kept back");
-    let token_bytes = bifrost_sync::encode_ack_token(&unflushed.2, &[7; 32]);
+    let keys = bifrost_sync::AckKeyring::single(bifrost_sync::AckKey::new(0, [7; 32]));
+    let token_bytes = bifrost_sync::encode_ack_token(&unflushed.2, &keys);
     drop(unflushed);
 
     engine.detach(&account_id).await.expect("detach succeeds");
@@ -2015,7 +2016,7 @@ async fn a_page_ack_replayed_across_a_detach_does_not_rebuild_the_resume_positio
         engine
             .ack(
                 &account_id,
-                bifrost_sync::decode_ack_token(&token_bytes, &[7; 32])
+                bifrost_sync::decode_ack_token(&token_bytes, &keys)
                     .expect("restore the persisted acknowledgement"),
             )
             .await

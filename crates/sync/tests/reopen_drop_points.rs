@@ -195,13 +195,16 @@ async fn a_dropped_reattach_rolls_back_the_cursor_rows_it_inserted() {
 /// not leak that connection, and must NOT roll back the rows the successful
 /// swap installed.
 ///
-/// The gate parks the close, so the dropped attempt's close never returns; the
-/// guard re-issues it. `notify_one` rather than `notify_waiters`: the spawned
-/// close counts on entry but may not have registered as a waiter yet, and a
-/// stored permit reaches it either way.
+/// The gate parks the close. The close runs in a task the guard spawned when it
+/// handed the obligation over, so dropping the reattach does not cancel it and
+/// owes no second close: the one parked close completes once released.
+/// `notify_one` rather than `notify_waiters`: the spawned close counts on entry
+/// but may not have registered as a waiter yet, and a stored permit reaches it
+/// either way.
 ///
-/// Ablation: closing `previous` outside the guard leaves `old.closed` at one,
-/// and `settle` panics.
+/// Ablation: awaiting `close()` inline in `close_owed` (no spawned owner) with
+/// the debt cleared first lets the drop cancel it, and `close_returned` never
+/// reaches one.
 #[tokio::test]
 async fn a_reattach_dropped_while_closing_the_old_account_still_closes_it() {
     let id = AccountId("drop-in-final-close".into());
@@ -220,7 +223,14 @@ async fn a_reattach_dropped_while_closing_the_old_account_still_closes_it() {
     engine.attach(id.clone(), factory).await.expect("attach");
 
     drop_reattach_once(&engine, &id, || old.closed.load(Ordering::SeqCst) == 1).await;
-    settle(|| old.closed.load(Ordering::SeqCst) == 2).await;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        old.closed.load(Ordering::SeqCst),
+        1,
+        "the spawned close owns the obligation; the drop owes no second close"
+    );
     gate.notify_one();
     settle(|| old.close_returned.load(Ordering::SeqCst) == 1).await;
 

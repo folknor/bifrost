@@ -1108,7 +1108,7 @@ under the same write lock.
    `MultiplexerEvent { scope, event, checkpoint }`.
 2. Consumer atomically persists `(items, checkpoint)` in their
    own store.
-3. Persist `encode_ack_token(event.ack_token().expect("token"), key)` with
+3. Persist `encode_ack_token(event.ack_token().expect("token"), keys)` with
    the batch, then call `SyncEngine::ack(account, token)`. Scope, checkpoint
    and acknowledgement lane come from that opaque token. Diagnostic-only
    events have no token.
@@ -3316,12 +3316,23 @@ acknowledging; a foreign account token is refused before live claim lookup or
 receipt replay, including after process restart. Backfill still conservatively
 withholds resume rows issued by a prior attachment.
 
-`encode_ack_token(token, key)` and `decode_ack_token(bytes, key)` live beside
-`encode_envelope` and `encode_ledger`. The application supplies a persistent
-32-byte secret and retains it separately from batch storage for the whole token
-retention period. HMAC-SHA-256 authenticates the versioned framing before decoding;
-this protects stored bytes, not against the application holding the key. The
-payload is not encrypted. Lost or rotated keys make retained tokens unreadable.
+`encode_ack_token(token, keys)` and `decode_ack_token(bytes, keys)` live beside
+`encode_envelope` and `encode_ledger`. The application supplies an `AckKeyring`
+of persistent 32-byte secrets, each with a one-byte id, and retains it
+separately from batch storage for the whole token retention period. Tokens are
+issued under the keyring's current key and name it by id; decoding selects the
+key the token names. Rotation keeps the previous key in the keyring while any
+batch signed under it may still need acknowledgement, so a secret rotation
+does not force a resync. Ids are unique within a keyring and are not reused for
+a different secret while tokens under the old one are retained. HMAC-SHA-256
+authenticates the versioned framing before decoding; this protects stored
+bytes, not against the application holding the key. The payload is not
+encrypted. A token naming a key the keyring lacks is
+`Error::AckToken(AckTokenFault::KeyUnknown)` (the id is an unauthenticated
+selector, so this is "key unavailable", not proof of rotation, and is no reason
+to discard the batch); a failed tag or malformed framing is
+`AckTokenFault::Corrupt`; authenticated contents in a schema this engine cannot
+read are `Error::SchemaIncompatible`.
 The publication freezes its receipt after absorbing carried and superseded claims.
 The standalone `PendingCoverage::supersede` operation updates only live claims,
 not receipts already handed out, so it does not preserve that later fold across
@@ -3959,8 +3970,10 @@ readable window was 3 through 14; that revision did not change the layout.
 Version 15 adds an optional trailing table of `UnsupportedReason` values keyed
 by entry or barrier identity. Writers omit the table when every reason is
 unknown. Versions 3 through 14 still decode with unknown reasons and preserve
-their existing migration checks; the current readable window is 3 through 15.
-Unknown tags, duplicate reason records, missing referenced records and reasons
+their existing migration checks; that window was 3 through 15.
+Version 16 appends protocol tag 13, `Protocol::ManageSieve`
+(`wire::ledger::MANAGE_SIEVE_PROTOCOL_VERSION`); older versions reject it, and
+the current readable window is 3 through 16. Unknown tags, duplicate reason records, missing referenced records and reasons
 attached to non-Unsupported kinds are rejected. Live telemetry and every support
 export tier also carry the optional structured reason.
 
@@ -5231,10 +5244,10 @@ Cursor and backfill inspection contracts:
   through waits and drops on completion, refusal or cancellation.
 - Account writers bind every issued acknowledgement receipt to their account
   id and check that binding before resolving live claims or restart replay.
-  Acknowledgement token format version 2 authenticates this account id.
-  Its decode window is version 2 only: version 1 cannot be migrated safely
-  because it contains no account identity. The ledger envelope layout and
-  decode window are unchanged. Standalone unbound coverage registries remain
+  Acknowledgement token format version 2 authenticates this account id, and
+  version 3 adds the signing key's id. The decode window is versions 2 and 3:
+  a version 2 token names no key and is tried against every keyring key.
+  Version 1 cannot be migrated safely because it contains no account identity. Standalone unbound coverage registries remain
   usable together, but their receipts are refused by account-bound writers.
 - Standalone `PendingCoverage::supersede` changes live claims only. It cannot
   update token bytes already stored by a consumer. Restart-safe supersession
@@ -5268,11 +5281,20 @@ continues its own cleanup after refusal or timeout. The helper neither spawns
 cleanup nor releases lifecycle reservations; the existing owned cleanup tasks
 retain those responsibilities through writer drain and registry cleanup.
 
-Reattach's `close_owed` is not bounded by this helper. It retains the close
-obligation until the provider returns, and cancellation transfers that obligation
-to `retire_stranded`. A timeout that cleared the obligation would introduce a
-new abandonment policy. The push retirement wait is bounded separately and does
-not bound the subsequent provider close.
+Reattach's `close_owed` does not use this helper, because it never abandons the
+close: it hands the obligation to a spawned task in the same synchronous step
+that clears the guard's debt, then waits for that task up to `detach_timeout`.
+A wedged provider close therefore cannot hold the reattach, or the reopen lock
+that detach waits on, forever; on timeout the close carries on detached. The
+task records the close failure's throttle evidence in the shared bucket and
+logs it once; the reattach folds the returned hold deadline into its pacing
+when the task finishes in time. A reattach future dropped before `close_owed`
+first runs still owes the close, and its guard's cleanup task
+(`retire_stranded`) bounds each subscription delete by the same timeout (an
+unanswered delete is retained as an orphan), then starts the owed close in its
+own task before waiting on the reopen lock for the orphan write. The close
+itself is unbounded there: its task is the owner. The push retirement wait is
+bounded separately.
 
 Unfinished inventory establishment that reaches no numbered receiver returns
 `Error::InventoryUndelivered`, rather than a string-valued `Other`. The existing

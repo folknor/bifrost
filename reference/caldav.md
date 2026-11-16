@@ -1250,18 +1250,24 @@ replayed DELETE that had landed answered 404 and the ladder reported a
 successful delete as `ProviderRefused`. That traded away delete resilience: every
 drop, whether the request landed or not, reached the consumer as
 `Reconcile(CheckTarget)` and cost a probe. The ruling takes the other answer.
-`DavDispatch::delete_resource`, `delete_event` and `delete_vcard` absorb a 404
-or 410 (`delete_target_already_gone`) as success under `reference/error-model.md`'s
-"a benign NotFound lives at the call site" rule - a delete whose target is gone
-has reached its intended end state - and the DELETE is left replayable as HTTP
-says. A drop before the server saw it replays and lands; a drop after it landed
-replays to a 404 that reads as done; neither costs a probe. What is given up,
-deliberately, is the "resource never existed" signal for a consumer deleting by
-a stale id; a consumer that needs it reads first. The copy-then-delete leg of
-the MOVE fallback inherits the same rule, so a replayed delete of a source the
-first attempt already removed is the move's end state rather than a failed leg.
-Pinned by `a_dropped_delete_replays_and_a_gone_target_is_a_success` in both
-crates and `a_delete_replays_and_reads_a_gone_target_as_success` in dav-core.
+The DELETE is left replayable as HTTP says. A drop before the server saw it
+replays and lands; a drop after it landed replays to a 404 that reads as done;
+neither costs a probe. `DavDispatch::delete_resource` and the copy-then-delete
+leg of the MOVE fallback absorb every 404 or 410 (`delete_target_already_gone`)
+as their end state. The account doors (`delete_event`, `delete_vcard`) keep the
+"resource never existed" signal by reading the request's attempt evidence
+(`collection::DeleteOutcome`): a 404 or 410 with no earlier attempt that may
+have committed (net's ledger rule, so a 401 before it proves nothing landed) is
+prior absence and returns item `NotFound`, the shared absent-target policy for
+`EventDelete` and `ContactDelete`; after such an attempt the target is gone and
+our own delete may be why, so the door reports success. That second answer was
+chosen for the enterprise user who deleted the item and expects it gone, and it
+accepts one residual: an item already absent before a lost-response attempt
+also reports deleted (for an event, with no cancellation sent). A consumer-level
+retry is a new request with no history of the earlier one, so its 404 is
+`NotFound`. Pinned by `a_dropped_delete_replays_and_a_gone_target_is_a_success`
+in both crates and `a_delete_replays_and_reads_a_gone_target_as_success` in
+dav-core.
 
 The declaration gates wire replay on transport drops and ambiguous retryable
 statuses. Net also narrows classification on possible-commit failures.
@@ -1587,8 +1593,10 @@ resolve a sibling response href as a child.
 DAV entity-tag normalization and weak-tag recognition share one `EntityTag`
 parser. `PutCondition::IfMatch` carries a privately constructed `StrongTag`;
 a weak validator cannot become an If-Match header. A server offering only weak
-validators still accepts unconditional edits: an enterprise user must be able
-to save changes, with the accepted loss of HTTP lost-update protection.
+validators still accepts version-unconditional edits: an enterprise user must be
+able to save changes, with the accepted loss of HTTP lost-update protection.
+Those edits carry `If-Match: *` (`PutCondition::IfExists`), so they cannot
+recreate a resource deleted since it was read.
 Shared account reads carry scoped `ServerVersion` values; persisted snapshots
 retain entity-tag bytes. Conditional writes check protocol and object type before
 admitting the validator as a precondition.
@@ -1701,12 +1709,14 @@ and other relative native hrefs retain their existing resolution rules.
 The shared `AccountOperation::skips_absent_target` returns false for `EventUpdate`
 and `EventDelete`. Updates and conditional deletes preserve failures, including
 missing destinations: an Outlook user needs to know that an edit was not applied.
-Unconditional delete currently diverges: the client's `delete_event` absorbs
-404/410 before the account door sees them. This is coupled to replay after a
-landed DELETE, which can itself return 404. The account door cannot distinguish
-that committed attempt from prior absence, and a preflight read would add a race.
-Aligning this door requires changing the client/dispatch replay contract, rather
-than manufacturing NotFound or successful writes at the account boundary.
+Unconditional delete conforms too: an event absent before the request is
+`NotFound`, told apart from a replay's 404 by the request's attempt evidence
+(see the DELETE ruling above). Updates without a strong validator send
+`If-Match: *` (`PutCondition::IfExists`), so an event deleted after it was read
+is reported `NotFound` (a 412 with no possibly committed earlier attempt) rather
+than recreated. That guards existence only; weak-tag servers still offer no
+lost-update protection. The same condition guards the content write after a
+successful MOVE, where the missing item is the destination.
 
 Discovery credential scenarios and wire assertions live in dav-core's
 `test_support::discovery`, parameterized by `DavProtocol`. Thin tests in both

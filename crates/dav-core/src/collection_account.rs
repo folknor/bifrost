@@ -518,8 +518,10 @@ impl<D: Dialect> DavCollectionAccount<D> {
             if !changed {
                 return Ok(());
             }
+            // `If-Match: *`: a destination deleted elsewhere after the MOVE is
+            // reported missing rather than recreated by this content write.
             return client
-                .put(&destination, body, PutCondition::None, operation)
+                .put(&destination, body, PutCondition::IfExists, operation)
                 .await
                 .map(|_| ())
                 .map_err(|error| RelocateFailure::MovedThenPut { destination, error });
@@ -530,6 +532,8 @@ impl<D: Dialect> DavCollectionAccount<D> {
             .put(&destination, body, PutCondition::IfNoneMatch, operation)
             .await
             .map_err(RelocateFailure::Before)?;
+        // Cleanup's obligation is only that the source is gone after the copy:
+        // a source already absent, for whatever reason, is its end state.
         client
             .delete(source, operation)
             .await

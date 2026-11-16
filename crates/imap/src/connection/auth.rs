@@ -74,7 +74,12 @@ impl ImapConnection {
                 let access_token = tokio::time::timeout(timeout, token_source.current())
                     .await
                     .map_err(|_| Error::timeout())?
-                    .map_err(crate::account::error::oauth_token_error)?;
+                    .map_err(|error| {
+                        crate::account::error::oauth_token_error(
+                            error,
+                            bifrost_types::Protocol::Imap,
+                        )
+                    })?;
                 match mechanism {
                     AuthMechanism::OAuthBearer => {
                         self.authenticate_oauthbearer(identity, access_token.as_str(), timeout)

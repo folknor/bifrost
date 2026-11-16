@@ -61,8 +61,9 @@ pub(super) async fn unwind_replacement_subscriptions(
 ///   record only after its delete answered.
 /// - `close_owed`, the account whose `close()` is still owed: the replacement
 ///   until the swap, and from `swapped` on the previous account. It is closed
-///   through [`Self::close_owed`], which clears the debt only once the close has
-///   RETURNED, so a drop parked inside a close owes it again.
+///   through [`Self::close_owed`], which moves the debt into a spawned close
+///   task in one synchronous step, so the debt is always owned by either the
+///   guard or that task.
 /// - `rollback_owed`, the compensation for rows `reattach_insert` may have
 ///   written. Armed synchronously before the first insert, cleared once
 ///   `reattach_abort` answered.
@@ -111,6 +112,9 @@ pub(in crate::engine) struct ReattachGuard {
     close_owed: Option<Arc<dyn Account>>,
     pub(super) rollback_owed: bool,
     pub(super) commit_owed: bool,
+    /// Bound on each subscription delete a dropped reattach's cleanup runs,
+    /// so a wedged delete cannot keep the owed close from ever starting.
+    delete_wait: Duration,
 }
 
 /// Provisional row owner, minted by replacement-account attempts only.
@@ -146,6 +150,7 @@ impl ReattachGuard {
             live: Vec::new(),
             rollback_owed: false,
             commit_owed: false,
+            delete_wait: ctx.close_wait,
         }
     }
 
@@ -168,20 +173,74 @@ impl ReattachGuard {
         self.commit_owed = true;
     }
 
-    /// Close whatever account is owed, and stop owing it once the close returned.
-    /// Unlike attach/detach best-effort cleanup, this is not a bounded close:
-    /// cancellation leaves the obligation on the guard for retire_stranded.
-    /// Using close_within here would abandon an unfinished close and disarm that
-    /// obligation on timeout. Keep this ownership contract until reattach and
-    /// its dropped-future cleanup have a shared abandonment policy.
-    pub(super) async fn close_owed(&mut self) -> Result<(), AccountError> {
-        let Some(account) = self.close_owed.clone() else {
-            return Ok(());
-        };
-        let result = account.close().await;
-        self.close_owed = None;
-        result
+    /// Close whatever account is owed without letting a wedged provider close
+    /// hold the reattach (and the reopen lock it carries) forever.
+    ///
+    /// The obligation is never abandoned, only handed over: the debt leaves
+    /// the guard in the same synchronous step that spawns the close onto the
+    /// runtime, so from then on the task owns it and a drop of this future
+    /// owes nothing. Until this future is first polled the guard is still
+    /// armed and its `Drop` closes instead. The task records any throttle
+    /// evidence the close reports in the shared bucket and logs a failure
+    /// once; this waits for it up to `wait` and returns the hold deadline it
+    /// recorded, for the repair's own pacing. On timeout the close carries on
+    /// detached, like detach's timed-out close, without being cancelled.
+    pub(super) async fn close_owed(
+        &mut self,
+        wait: Duration,
+        failure: &'static str,
+    ) -> Option<tokio::time::Instant> {
+        let account = self.close_owed.take()?;
+        let close = spawn_owed_close(
+            account,
+            Arc::clone(&self.throttles),
+            self.account_id.clone(),
+            failure,
+        );
+        match tokio::time::timeout(wait, close).await {
+            Ok(Ok(deadline)) => deadline,
+            Ok(Err(join)) => {
+                tracing::warn!(
+                    target: "bifrost.sync.reopen",
+                    account = ?self.account_id,
+                    error = %join,
+                    "owed account close task failed; the close did not complete"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "bifrost.sync.reopen",
+                    account = ?self.account_id,
+                    timeout = ?wait,
+                    "owed account close is still running; continuing while it finishes"
+                );
+                None
+            }
+        }
     }
+}
+
+/// Run one owed `close()` as its own task, which owns the obligation from the
+/// moment it is spawned. A close failure is recorded as throttle evidence and
+/// logged here, exactly once, whoever is (or is no longer) waiting.
+fn spawn_owed_close(
+    account: Arc<dyn Account>,
+    throttles: Arc<crate::throttle::ThrottleBucket>,
+    account_id: AccountId,
+    failure: &'static str,
+) -> tokio::task::JoinHandle<Option<tokio::time::Instant>> {
+    tokio::spawn(async move {
+        let error = account.close().await.err()?;
+        let deadline = crate::throttle::record_repair_throttle(&throttles, &account_id, &error);
+        tracing::warn!(
+            target: "bifrost.sync.reopen",
+            account = ?account_id,
+            error = %error,
+            "{failure}"
+        );
+        deadline
+    })
 }
 
 impl Drop for ReattachGuard {
@@ -223,6 +282,7 @@ impl Drop for ReattachGuard {
                     reopen_lock,
                     live,
                     close,
+                    delete_wait: self.delete_wait,
                 }));
             }
             None => {
@@ -262,6 +322,7 @@ struct Stranded {
     /// The account still owed a `close()`: the replacement before the swap, the
     /// previous account after it.
     close: Option<Arc<dyn Account>>,
+    delete_wait: Duration,
 }
 
 /// Cleanup for a reattach future that was dropped while owing something.
@@ -282,6 +343,14 @@ struct Stranded {
 /// The dropped reattach's own reopen guard cannot deadlock this: the guard is
 /// released by the drop, independently of this task, and this task only ever
 /// waits on the lock asynchronously.
+///
+/// Order: the deletes run first, against the replacement (which may itself be
+/// the account owed the close, so closing first would strand them). Each is
+/// bounded, and a delete that does not answer in time is retained as an orphan
+/// exactly like a refused one. The owed close is then STARTED in its own task
+/// before the reopen lock is awaited, so neither a wedged delete nor another
+/// reattach holding the lock in a provider call can keep it from starting.
+/// The close itself stays unbounded: its task is the obligation's owner.
 async fn retire_stranded(stranded: Stranded) {
     let Stranded {
         account,
@@ -291,31 +360,31 @@ async fn retire_stranded(stranded: Stranded) {
         reopen_lock,
         live,
         close,
+        delete_wait,
     } = stranded;
     let teardown = subscriptions.teardown(&account_id, &throttles);
     let mut refused = Vec::new();
     for record in live {
-        if teardown
-            .delete(account.as_ref(), &record.handle)
-            .await
-            .is_err()
-        {
+        let deleted = tokio::time::timeout(
+            delete_wait,
+            teardown.delete(account.as_ref(), &record.handle),
+        )
+        .await;
+        if !matches!(deleted, Ok(Ok(_))) {
             refused.push(record);
         }
+    }
+    if let Some(owed) = close {
+        drop(spawn_owed_close(
+            owed,
+            Arc::clone(&throttles),
+            account_id.clone(),
+            "account close failed after a dropped reattach",
+        ));
     }
     if !refused.is_empty() {
         let _reopen_guard = reopen_lock.lock().await;
         teardown.retain_orphans(refused);
-    }
-    if let Some(owed) = close
-        && let Err(error) = owed.close().await
-    {
-        tracing::warn!(
-            target: "bifrost.sync.reopen",
-            account = ?account_id,
-            error = %error,
-            "account close failed after a dropped reattach"
-        );
     }
 }
 

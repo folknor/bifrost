@@ -63,7 +63,8 @@ pub use consumer::{
 // account errors are surfaced through `bifrost_types::Fatal` (the
 // engine boundary newtype) via `RecoveryPlan::Terminal`.
 pub use error::{
-    AckOutcome, AckRejection, AdmissionFailure, CompletionRefusal, Error, EstablishFailure, Warning,
+    AckOutcome, AckRejection, AckTokenFault, AdmissionFailure, CompletionRefusal, Error,
+    EstablishFailure, Warning,
 };
 
 // Throttle bucket so consumers / instrumentation can observe engine
@@ -72,12 +73,12 @@ pub use throttle::ThrottleBucket;
 
 // Cursor and checkpoint plumbing.
 pub use cursor::{
-    AckToken, BarrierIncident, BarrierPolicy, CheckpointStore, CheckpointTransition,
-    CursorRegistry, DebtLedger, DischargeEvidence, DynCheckpointStore, ENGINE_VERSION, EntryPolicy,
-    InMemoryCheckpointStore, LEDGER_ENVELOPE_VERSION, LedgerEntry, LineageBudget, MIN_MIGRATABLE,
-    MIN_MIGRATABLE_LEDGER, OperatorId, PendingCoverage, ProofStatus, PublicationReceipt,
-    UnixSeconds, decode_ack_token, decode_envelope, decode_ledger, encode_ack_token,
-    encode_envelope, encode_ledger,
+    AckKey, AckKeyring, AckToken, BarrierIncident, BarrierPolicy, CheckpointStore,
+    CheckpointTransition, CursorRegistry, DebtLedger, DischargeEvidence, DynCheckpointStore,
+    ENGINE_VERSION, EntryPolicy, InMemoryCheckpointStore, LEDGER_ENVELOPE_VERSION, LedgerEntry,
+    LineageBudget, MIN_MIGRATABLE, MIN_MIGRATABLE_LEDGER, OperatorId, PendingCoverage, ProofStatus,
+    PublicationReceipt, UnixSeconds, decode_ack_token, decode_envelope, decode_ledger,
+    encode_ack_token, encode_envelope, encode_ledger,
 };
 
 // Inventory coverage repair.

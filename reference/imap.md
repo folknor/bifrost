@@ -2150,9 +2150,12 @@ refusals use `AccountError::invalid_page_cursor`: restart only the caller's walk
 
 IMAP and ManageSieve token lookups share `account::error::oauth_token_error`,
 which classifies through `bifrost_net::token_source_account_error` - the same
-owner SMTP's token lookup uses. Both currently carry `Protocol::Imap`, matching
-the other ManageSieve translations because the shared `Protocol` taxonomy has no
-ManageSieve variant. The internal `Error::OAuthToken` retains net's preclassified `AccountError`;
+owner SMTP's token lookup uses. Each carries its own leg's protocol: IMAP
+lookups `Protocol::Imap`, ManageSieve lookups `Protocol::ManageSieve`, like
+every other ManageSieve translation (`ImapErrorContext::sieve`). A filter
+failure is never attributed to the mail session. A filter request on an account
+with no ManageSieve configured is refused as `Protocol::Imap`, because no filter
+leg exists to name. The internal `Error::OAuthToken` retains net's preclassified `AccountError`;
 the account boundary decorates it with the caller's operation, provider and
 scope without inventing an IMAP acknowledgement. A token endpoint outage or
 lost refresh driver retains retry recovery; actual credential loss retains

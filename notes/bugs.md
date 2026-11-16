@@ -23,64 +23,46 @@ commit that precedes this file's.
 
 ## BUG-176 - Open rulings and design residue from the wave 10 to 16 lateral findings
 
-**Reported by:** wave 10 to 16 fixers (lateral); everything fixable in those
-bundles landed by wave 16. What remains needs a ruling or a design.
+**Reported by:** wave 10 to 16 fixers (lateral). The rest of the bundle landed
+or was refused; two design items remain.
 
-Rulings:
-
-- ManageSieve errors are stamped `Protocol::Imap` because the shared
-  `Protocol` enum has no ManageSieve variant (documented at
-  `imap/src/account/error.rs::oauth_token_error`). Decide whether ManageSieve
-  gets its own protocol identity.
-  **Recommendation (owner-agreed, not a ruling):** yes, add
-  `Protocol::ManageSieve` and stamp it on the ManageSieve error path, so filter
-  failures are never attributed or throttled as IMAP mail failures. Additive on
-  a non-exhaustive enum.
-- IMAP `native_code` for an unknown response code is the server's own
-  spelling, giving that telemetry field unbounded cardinality. Decide whether
-  to bound it (for example a fixed `OTHER` with the spelling in diagnostics).
-  **Recommendation (owner has no preference; not a ruling):** bound it. Known
-  codes keep their canonical name, unknown codes become `OTHER`, and the server
-  spelling moves to `support_only` text. Check other providers' `native_code`
-  for the same shape.
-- Closed-account guards are not universal: the shared `AccountClosed` kind
-  replaced existing refusals, but many provider methods have no lifecycle gate.
-  **Recommendation (yardstick, not a ruling):** every method gains one. A closed account must refuse
-  uniformly with `AccountClosed` before I/O; a door that silently still works,
-  or fails with a transport error, after close is not what a user who removed
-  an account expects. Would be build work once ruled.
-- Gmail: a malformed cursor payload maps to `SchemaIncompatible` (account
-  clear) through `CursorDecodeFault::Malformed`, where it used to be
-  `CursorInvalid` with a scope restart. Confirm.
-  **Recommendation (yardstick, not a ruling):** confirm. Gmail has one cursor
-  scope, `CursorScope::Account`, so both mappings end in the same full resync.
-  A draft comment at the mapping in `google/src/account/error.rs` and a
-  corrected line in `reference/google.md` are in the tree, uncommitted.
-- Sync acknowledgement tokens: a wrong or rotated key and a corrupted token
-  decode to the same error; a key-identifier byte in the header would separate
-  them.
-  **Recommendation (owner-agreed, not a ruling):** add the key-id byte under a
-  header version bump (old tokens decode as "key id unknown" and keep working).
-  Key mismatch and corruption report distinctly, and it opens keyring rotation
-  (accept the previous key, issue under the new) so a secret rotation does not
-  force every account to resync.
-
-Design:
-
+- Closed-account guards are not universal. Only Google gates every future;
+  IMAP's pool answers a retryable `Transport(Network)` after close; Graph and
+  JMAP gate only push; CalDAV and CardDAV gate nothing. Sparred design, a
+  chain: a shared wrapper in bifrost-types with generated forwarding and
+  admission at first poll, in `notes/closed-account-gate.md` with its link
+  plan.
 - Sync `PendingCoverage::supersede` (standalone public form) cannot update a
-  token a consumer already saved, and `AckToken` receipts hold the full
-  cumulative claim; bounding either needs a new durable evidence owner or an
-  acknowledgement contract (documented in `cursor/coverage.rs`).
-- CalDAV and CardDAV unconditional deletes: the client absorbs 404 and 410
-  under its replay contract before account code sees them, so the shared
-  absent-target policy cannot be applied there without moving that decision
-  (documented in both `account.rs` files).
-- CalDAV and CardDAV updates sent without a strong validator can recreate a
-  resource deleted after it was fetched.
-- Sync `engine/reattach.rs` closes the replaced account (`close_owed`) without
-  a time bound, and `retire_stranded` awaits provider cleanup without one;
-  bounding either means deciding when to abandon an obligation cancellation
-  hands over (attach and detach use `engine::close_within`).
+  receipt a consumer already saved, and `AckToken` receipts hold the full
+  cumulative claim. Bounding either needs a durable evidence owner and a new
+  acknowledgement contract. The limitation is now in `supersede`'s rustdoc and
+  `reference/sync.md`.
+
+## BUG-197 - ManageSieve `QUOTA/MAXSIZE` derives a same-request retry
+
+**Reported by:** the ManageSieve protocol-identity fix (spar review).
+
+`classify_sieve` maps every RFC 5804 `QUOTA` code to
+`Server(QuotaExhausted)`, which derives `Retry(SameRequest)`. `QUOTA/MAXSIZE`
+means the script itself is over a fixed size limit: the unchanged request can
+never succeed, so retrying it is wrong; `QUOTA/MAXSCRIPTS` recovers only once
+the user deletes a script. The sub-kind is parsed away
+(`SieveResponseCode::Quota` covers all three, `crates/imap/src/sieve.rs`). The
+shared model needs a fixed-limit versus recoverable-capacity split that keeps
+the quota evidence; substituting another kind is not the fix. The IMAP
+`OVERQUOTA` mapping should be checked against the same split.
+
+## BUG-198 - Gmail reports a future-version cursor as a retired version
+
+**Reported by:** the closed bundle above (scout, re-checked at HEAD).
+
+`decode_gmail_state` (`crates/google/src/account/cursor.rs`) turns every
+`OpaqueChangeState::open` fault other than `ProtocolMismatch` into
+`GmailCursorFailure::EnvelopeMismatch`, which `translate_local` maps to
+`CursorDecodeFault::RetiredVersion`. A cursor written by a newer bifrost
+(`FutureVersion`) is therefore labelled retired. The recovery class is the same
+(`SchemaIncompatible`), so only the diagnostic is wrong; carrying the shared
+fault through instead of the Gmail-local enum would fix it.
 
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 

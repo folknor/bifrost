@@ -16,7 +16,10 @@ use crate::{
 
 /// Latest ledger version that introduced a shared vocabulary tag.
 /// Advance beyond the current sync ledger version when adding new tags.
-pub const VOCABULARY_VERSION: u32 = 14;
+pub const VOCABULARY_VERSION: u32 = 16;
+
+/// First ledger version that knows `Protocol::ManageSieve` (tag 13).
+pub const MANAGE_SIEVE_PROTOCOL_VERSION: u32 = 16;
 
 /// Append a coverage domain, including its scope and snapshot identity.
 pub fn encode_domain(out: &mut Vec<u8>, domain: &CoverageDomain) {
@@ -552,6 +555,7 @@ pub fn encode_protocol(protocol: Protocol) -> u8 {
         Protocol::GoogleCalendar => 10,
         Protocol::GooglePeople => 11,
         Protocol::GoogleDrive => 12,
+        Protocol::ManageSieve => 13,
     }
 }
 
@@ -571,6 +575,7 @@ pub fn decode_protocol(tag: u8, version: u32) -> Result<Protocol, Error> {
         10 if version >= 9 => Protocol::GoogleCalendar,
         11 if version >= 9 => Protocol::GooglePeople,
         12 if version >= 9 => Protocol::GoogleDrive,
+        13 if version >= MANAGE_SIEVE_PROTOCOL_VERSION => Protocol::ManageSieve,
         other => return Err(unknown_tag("protocol", other)),
     })
 }

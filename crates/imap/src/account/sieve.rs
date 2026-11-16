@@ -44,7 +44,7 @@ pub(crate) fn filter_create(
 ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
     Box::pin(async move {
         let ServerFilterCreate::Script(script) = filter else {
-            return Err(super::error::unsupported(AccountOperation::FilterCreate));
+            return Err(shape_unsupported(&account, AccountOperation::FilterCreate));
         };
         if !matches!(script.language, ScriptLanguage::Sieve) {
             return Err(invalid(
@@ -80,7 +80,7 @@ pub(crate) fn filter_update(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let ServerFilterPatch::Script(patch) = patch else {
-            return Err(super::error::unsupported(AccountOperation::FilterUpdate));
+            return Err(shape_unsupported(&account, AccountOperation::FilterUpdate));
         };
         if patch.name.is_some() {
             return Err(invalid(
@@ -163,13 +163,25 @@ async fn open_client(
 }
 
 fn to_acct_err(op: AccountOperation) -> impl Fn(SieveError) -> AccountError {
-    move |err| super::error::sieve_account_error(err, ImapErrorContext::operation(op))
+    move |err| super::error::sieve_account_error(err, ImapErrorContext::sieve(op))
 }
 
+/// A filter shape ManageSieve cannot carry. Named on the ManageSieve leg when
+/// one is configured; an account without one has no filter leg, so the
+/// refusal stays the IMAP account's.
+fn shape_unsupported(account: &ImapAccount, op: AccountOperation) -> AccountError {
+    if account.config.sieve.is_some() {
+        super::error::sieve_unsupported(op)
+    } else {
+        super::error::unsupported(op)
+    }
+}
+
+/// Input the ManageSieve leg refuses before any request.
 fn invalid(op: AccountOperation, detail: impl Into<String>) -> AccountError {
     let detail: String = detail.into();
     account_error_with(
         Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(detail.into())),
-        ImapErrorContext::operation(op),
+        ImapErrorContext::sieve(op),
     )
 }

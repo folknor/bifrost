@@ -565,6 +565,7 @@ impl SyncEngine {
             push_retired_tx: push_retired_tx.clone(),
             push_topology_tx: push_topology_tx.clone(),
             push_drain_wait: self.config.detach_timeout,
+            close_wait: self.config.detach_timeout,
             reopen_lock: Arc::clone(&reopen_lock),
             open_skips: Arc::clone(&open_skips),
             shutdown: shutdown.clone(),

@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use bifrost_net::ReplayPolicy;
 use bifrost_types::{AccountError, AccountOperation, ErrorScope, ObjectType, ProtocolKind};
 use futures::{StreamExt, stream};
-use reqwest::{Method, header::CONTENT_TYPE};
+use reqwest::{Method, StatusCode, header::CONTENT_TYPE};
 
 use crate::{
     DavDispatch, DavProtocol, Depth, FailedResource, FilteredHrefs, HrefQuery, MultiStatusOutcome,
@@ -345,9 +345,30 @@ impl<'a, D: Dialect> DavCollectionClient<'a, D> {
         if let Some((name, value)) = condition.header() {
             request = request.header(name, value);
         }
-        let response = self.dispatch.send_raw_request(request, operation).await?;
+        let crate::Evidenced {
+            response,
+            earlier_may_have_committed,
+        } = self
+            .dispatch
+            .send_evidenced_request(request, operation)
+            .await?;
         if response.status.is_success() {
             Ok(response_etag(&response.headers))
+        } else if matches!(condition, PutCondition::IfExists)
+            && response.status == StatusCode::PRECONDITION_FAILED
+            && !earlier_may_have_committed
+        {
+            // `If-Match: *` fails only when no current representation exists:
+            // the item was deleted after it was read, and this write did not
+            // recreate it. After a possibly committed earlier attempt the 412
+            // proves nothing about this write, so it keeps the ordinary
+            // classification (an unreplayable request never gets here: dispatch
+            // already returned its ambiguity).
+            Err(absent_item_error::<D>(
+                &response.headers,
+                operation,
+                response.status,
+            ))
         } else {
             Err(item_status_error(
                 &response.headers,
@@ -378,21 +399,41 @@ impl<'a, D: Dialect> DavCollectionClient<'a, D> {
             .await
     }
 
+    /// Unconditional DELETE. It stays replayable, so a 404 or 410 has two
+    /// meanings, told apart by the attempts before it: with no earlier attempt
+    /// that may have committed, the target was already absent
+    /// (`DeleteOutcome::Absent`); after one, our own earlier attempt may be
+    /// why it is gone (`DeleteOutcome::GoneAfterReplay`). Callers decide what
+    /// each means for their operation.
     pub async fn delete(
         &self,
         url: &str,
         operation: AccountOperation,
-    ) -> Result<Option<String>, AccountError> {
+    ) -> Result<DeleteOutcome, AccountError> {
         let request = self
             .dispatch
             .request(Method::DELETE, url)
             .replay(ReplayPolicy::IdempotentUnlessConditional);
-        let response = self.dispatch.send_raw_request(request, operation).await?;
+        let crate::Evidenced {
+            response,
+            earlier_may_have_committed,
+        } = self
+            .dispatch
+            .send_evidenced_request(request, operation)
+            .await?;
         if crate::delete_target_already_gone(response.status) {
-            return Ok(None);
+            return Ok(if earlier_may_have_committed {
+                DeleteOutcome::GoneAfterReplay
+            } else {
+                DeleteOutcome::Absent(absent_item_error::<D>(
+                    &response.headers,
+                    operation,
+                    response.status,
+                ))
+            });
         }
         if response.status.is_success() {
-            Ok(response_etag(&response.headers))
+            Ok(DeleteOutcome::Deleted(response_etag(&response.headers)))
         } else {
             Err(item_status_error(
                 &response.headers,
@@ -403,6 +444,42 @@ impl<'a, D: Dialect> DavCollectionClient<'a, D> {
             ))
         }
     }
+}
+
+/// What an unconditional DELETE found.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DeleteOutcome {
+    /// The server deleted it, with the tombstone ETag if it sent one.
+    Deleted(Option<String>),
+    /// 404/410 with no earlier attempt that may have committed: the target
+    /// was absent before this request. Carries the item `NotFound` an account
+    /// door returns under the shared absent-target policy.
+    Absent(AccountError),
+    /// 404/410 after an earlier attempt that may have committed: the target
+    /// is gone and this request's own landed attempt may be why.
+    GoneAfterReplay,
+}
+
+/// The item `NotFound` for a request whose answer proves the target absent,
+/// recording the status the server actually sent (404, 410, or 412 to
+/// `If-Match: *`). Recovery is derived from the kind, never from the status.
+fn absent_item_error<D: Dialect>(
+    headers: &reqwest::header::HeaderMap,
+    operation: AccountOperation,
+    status: StatusCode,
+) -> AccountError {
+    item_status_error(
+        headers,
+        operation,
+        StatusCode::NOT_FOUND,
+        String::new(),
+        D::DAV,
+    )
+    .into_builder()
+    .status(Some(status.as_u16()))
+    .try_build()
+    .expect("an item NotFound with its observed status stays valid")
 }
 
 fn multiget_body<D: Dialect>(uris: &[String]) -> String {

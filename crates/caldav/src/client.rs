@@ -439,21 +439,27 @@ impl CalDavClient {
             .await
     }
 
-    /// `DELETE` one event resource. Replayable, and a target already gone is a
-    /// success - the dav-D1 ruling, stated in full at
-    /// `DavDispatch::delete_resource`; the two must move together. The
-    /// copy-then-delete leg of the MOVE fallback relies on it as well: a
-    /// replayed delete of a source the first attempt already removed is the
-    /// move's end state, not a failed leg.
+    /// `DELETE` one event resource for the account door. Replayable (dav-D1,
+    /// stated at `DavDispatch::delete_resource`). An event that was already
+    /// absent before this request is the item `NotFound` the shared
+    /// absent-target policy keeps for `EventDelete`. A 404 after an earlier
+    /// attempt that may have landed is a success: the event is gone, our own
+    /// delete may be why, and an Outlook user who deleted it expects it gone
+    /// rather than an error for a delete that probably worked. The residual
+    /// accepted with that choice: an event already absent before a lost-response
+    /// attempt also reports deleted, with no cancellation sent.
     pub(crate) async fn delete_event(
         &self,
         url: &str,
         operation: AccountOperation,
     ) -> Result<(), AccountError> {
-        DavCollectionClient::<CalDavDialect>::new(&self.dav)
+        match DavCollectionClient::<CalDavDialect>::new(&self.dav)
             .delete(url, operation)
-            .await
-            .map(|_| ())
+            .await?
+        {
+            bifrost_dav_core::collection::DeleteOutcome::Absent(error) => Err(error),
+            _ => Ok(()),
+        }
     }
 
     pub(crate) async fn post_schedule_reply(
@@ -1072,6 +1078,83 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{label}: {error:?}"));
             assert_eq!(transcripts(&script).len(), requests, "{label}");
         }
+    }
+
+    /// An event absent before the DELETE, answered 404 or 410 on the first
+    /// attempt, is the item NotFound the shared absent-target policy keeps for
+    /// `EventDelete`. Ablation: absorbing every 404 again returns Ok here.
+    #[tokio::test]
+    async fn deleting_an_already_absent_event_is_not_found() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::GONE] {
+            let script = dav_script([DavResponse {
+                status,
+                headers: HeaderMap::new(),
+                body: String::new(),
+                url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                    .expect("test DAV URL"),
+            }]);
+            let client = CalDavClient::with_account_net(
+                "https://dav.example.test",
+                scripted_dav_net(&script),
+            );
+            let error = client
+                .delete_event(
+                    "https://dav.example.test/cal/one.ics",
+                    AccountOperation::EventDelete,
+                )
+                .await
+                .expect_err("prior absence is reported");
+            assert!(
+                matches!(
+                    error.kind(),
+                    bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Event)
+                ),
+                "{status}: {error:?}"
+            );
+            assert_eq!(error.telemetry_fields().status, Some(status.as_u16()));
+        }
+    }
+
+    /// An update without a strong validator sends `If-Match: *`, and the 412
+    /// a deleted event answers is NotFound, not a recreated event and not a
+    /// refreshable conflict. Ablation: `from_tag` falling back to `None` sends
+    /// no header and the 412 classifies as a conflict.
+    #[tokio::test]
+    async fn a_weak_tag_update_never_recreates_a_deleted_event() {
+        let script = dav_script([DavResponse {
+            status: StatusCode::PRECONDITION_FAILED,
+            headers: HeaderMap::new(),
+            body: String::new(),
+            url: bifrost_dav_core::DavHref::parse("https://dav.example.test/")
+                .expect("test DAV URL"),
+        }]);
+        let client =
+            CalDavClient::with_account_net("https://dav.example.test", scripted_dav_net(&script));
+        let error = client
+            .put_event(
+                "https://dav.example.test/cal/one.ics",
+                "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
+                PutCondition::from_etag(Some("W/\"weak\"")),
+                AccountOperation::EventUpdate,
+            )
+            .await
+            .expect_err("a deleted event is not recreated");
+        let requests = transcripts(&script);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("If-Match")
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        assert!(
+            matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Event)
+            ),
+            "{error:?}"
+        );
     }
 
     /// A dropped create names the target the consumer is told to check.

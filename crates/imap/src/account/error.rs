@@ -57,6 +57,8 @@ pub(crate) struct ImapErrorContext {
     /// classification produces; it never replaces the classification, so
     /// the `RecoveryClass` derivation still sees the real failure.
     pub(crate) extra_text: Vec<DiagnosticText>,
+    /// The failing leg: `Imap`, or `ManageSieve` for the filter connection.
+    protocol: Protocol,
 }
 
 const ERROR_CONTEXT: bifrost_types::AccountErrorContext =
@@ -64,7 +66,7 @@ const ERROR_CONTEXT: bifrost_types::AccountErrorContext =
 
 impl ImapErrorContext {
     fn identity(&self) -> bifrost_types::AccountErrorContext {
-        bifrost_types::AccountErrorContext::new(self.provider, Protocol::Imap)
+        bifrost_types::AccountErrorContext::new(self.provider, self.protocol)
     }
 
     pub(crate) fn operation(operation: AccountOperation) -> Self {
@@ -75,6 +77,16 @@ impl ImapErrorContext {
             idempotency_override: None,
             transmission_state: None,
             extra_text: Vec::new(),
+            protocol: Protocol::Imap,
+        }
+    }
+
+    /// A failure on the ManageSieve leg. Filter failures carry their own
+    /// protocol identity so they are never attributed to the IMAP session.
+    pub(crate) fn sieve(operation: AccountOperation) -> Self {
+        Self {
+            protocol: Protocol::ManageSieve,
+            ..Self::operation(operation)
         }
     }
 
@@ -160,14 +172,12 @@ impl ImapErrorContext {
 }
 
 /// Preserve the shared OAuth classification for IMAP and ManageSieve.
-pub(crate) fn oauth_token_error(error: bifrost_net::Error) -> Error {
-    // Protocol currently has no ManageSieve variant. Keep the account's IMAP
-    // identity consistently with the other ManageSieve translations until the
-    // shared protocol taxonomy can represent that transport distinctly.
+pub(crate) fn oauth_token_error(error: bifrost_net::Error, protocol: Protocol) -> Error {
     // The operation is a placeholder: into_account_error restamps the
-    // caller's operation, scope and provider when it surfaces this error.
+    // caller's operation, scope, provider and protocol when it surfaces this
+    // error.
     let classified =
-        bifrost_net::token_source_account_error(error, Protocol::Imap, AccountOperation::Discover);
+        bifrost_net::token_source_account_error(error, protocol, AccountOperation::Discover);
     Error::OAuthToken(crate::error::OAuthFailure(std::sync::Arc::new(classified)))
 }
 
@@ -328,9 +338,7 @@ pub(crate) fn sieve_account_error(
             Error::LocalRefusal(crate::error::LocalRefusal::AuthPolicy(failure))
         }
         Se::Auth { message, mechanism } => Error::auth_with_mechanism(message, None, mechanism),
-        // The shared protocol taxonomy has no ManageSieve identity; this
-        // retains the same IMAP account identity as other sieve failures.
-        Se::OAuthToken(error) => oauth_token_error(error),
+        Se::OAuthToken(error) => oauth_token_error(error, Protocol::ManageSieve),
         Se::Sasl(error) => Error::from(error),
     };
     into_account_error(common, ctx)
@@ -352,6 +360,13 @@ pub(crate) fn unsupported_with_reason(
 /// in the new contract every unsupported call is structured.
 pub(crate) fn unsupported(operation: AccountOperation) -> AccountError {
     AccountError::unsupported(operation, Protocol::Imap)
+}
+
+/// `unsupported` for a request shape the configured ManageSieve leg cannot
+/// carry. An account with no ManageSieve configured keeps the IMAP refusal:
+/// there is no filter leg to name.
+pub(crate) fn sieve_unsupported(operation: AccountOperation) -> AccountError {
+    AccountError::unsupported(operation, Protocol::ManageSieve)
 }
 
 /// Build a fatal-stream error for UIDVALIDITY change on a folder cursor.
@@ -608,7 +623,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                     RefusalClass::Protocol => PrimaryCause::Protocol {
                         kind: ProtocolErrorKind::ContractViolation,
                         wire: WireCause::MalformedResponse {
-                            protocol: Protocol::Imap,
+                            protocol: ctx.protocol,
                             detail: Some(DiagnosticText::support_only(text.to_owned())),
                         },
                     },
@@ -648,7 +663,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             Translation::new(PrimaryCause::Protocol {
                 kind: ProtocolErrorKind::ContractViolation,
                 wire: WireCause::MalformedResponse {
-                    protocol: Protocol::Imap,
+                    protocol: ctx.protocol,
                     detail: Some(DiagnosticText::support_only(msg.clone())),
                 },
             })
@@ -659,7 +674,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             Translation::new(PrimaryCause::Protocol {
                 kind: ProtocolErrorKind::MissingField,
                 wire: WireCause::MalformedResponse {
-                    protocol: Protocol::Imap,
+                    protocol: ctx.protocol,
                     detail: Some(DiagnosticText::support_only(msg.clone())),
                 },
             })
@@ -668,7 +683,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             Translation::new(PrimaryCause::Protocol {
                 kind: ProtocolErrorKind::ParseFailed,
                 wire: WireCause::MalformedResponse {
-                    protocol: Protocol::Imap,
+                    protocol: ctx.protocol,
                     detail: Some(DiagnosticText::support_only(msg.clone())),
                 },
             })
@@ -917,6 +932,12 @@ fn classify_status(
     };
     if let Some(code) = code {
         let wire_code = ImapResponseCode::from(code);
+        // An unknown extension code keeps the server's own spelling here on
+        // purpose. A fixed `OTHER` was tried and was a defect: it erased the
+        // one fact an operator needs about an unrecognized code. The field is
+        // bounded in length and charset by the telemetry token, not in
+        // cardinality; a spelling the token refuses (an unknown `METADATA`
+        // sub-code with its space, for example) drops to support-only text.
         t.native_code = Some(wire_code.code().to_owned());
         t.wire_code = Some(wire_code);
         // For parameterized codes whose payload is interesting, attach

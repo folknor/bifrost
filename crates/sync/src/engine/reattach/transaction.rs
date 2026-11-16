@@ -124,7 +124,12 @@ pub(in crate::engine) async fn open_replacement_admitted(
                 // abort path here: the alternative is an owner-less connection.
                 // Through the guard, so a drop parked in this close owes it
                 // again rather than abandoning it.
-                let _ = guard.close_owed().await;
+                let _ = guard
+                    .close_owed(
+                        ctx.close_wait,
+                        "replacement account close failed after a detach raced the open",
+                    )
+                    .await;
                 return Err(ReplacementOpen::Detached);
             }
             Ok((
@@ -601,15 +606,10 @@ pub(in crate::engine) async fn reattach_account_paced(
                 "push lanes did not drain within the bound; closing the old account anyway"
             );
         }
-        if let Err(error) = guard.close_owed().await {
-            pacing.record_holds(ctx, &error);
-            tracing::warn!(
-                target: "bifrost.sync.reopen",
-                account = ?&ctx.account_id,
-                error = %error,
-                "old account close failed during reopen"
-            );
-        }
+        let deadline = guard
+            .close_owed(ctx.close_wait, "old account close failed during reopen")
+            .await;
+        pacing.local_deadline = pacing.local_deadline.max(deadline);
         Ok(())
     }
     .await;
@@ -620,16 +620,14 @@ pub(in crate::engine) async fn reattach_account_paced(
             pacing.observe(ctx, error);
         }
     }
-    if result.is_err()
-        && let Err(error) = guard.close_owed().await
-    {
-        pacing.record_holds(ctx, &error);
-        tracing::warn!(
-            target: "bifrost.sync.reopen",
-            account = ?&ctx.account_id,
-            error = %error,
-            "replacement account close failed while unwinding reopen"
-        );
+    if result.is_err() {
+        let deadline = guard
+            .close_owed(
+                ctx.close_wait,
+                "replacement account close failed while unwinding reopen",
+            )
+            .await;
+        pacing.local_deadline = pacing.local_deadline.max(deadline);
     }
     result
 }

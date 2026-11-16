@@ -720,13 +720,12 @@ impl Account for CalDavAccount {
         })
     }
 
-    // AccountOperation::EventDelete.skips_absent_target() is false, but the
-    // client's delete_event absorbs 404/410 before this door sees them. That
-    // is coupled to replay: a retry after a landed DELETE can itself return
-    // 404. Do not fake policy compliance with a preflight existence probe or
-    // turn Ok into NotFound here; neither can distinguish that committed write
-    // from prior absence. Conformance needs a client/dispatch replay change.
-    // Conditional delete below already preserves the caller's failure.
+    // AccountOperation::EventDelete.skips_absent_target() is false: an event
+    // absent before this request is NotFound. The client tells that apart from
+    // a replay's 404 after our own possibly landed attempt (reported deleted)
+    // by the request's attempt evidence; see `CalDavClient::delete_event`. A
+    // preflight existence probe could not, and would add a race. Conditional
+    // delete below preserves the caller's failure as before.
     fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
         let client = Arc::clone(&self.client);
         Box::pin(async move {

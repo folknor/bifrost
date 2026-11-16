@@ -28,6 +28,9 @@ pub(crate) struct AccountSlot {
     pub scope_tokens: crate::multiplexer::ScopeTokens,
     pub backfill_capacity: usize,
     pub push_drain_wait: Duration,
+    /// How long a reattach waits for an owed account close before carrying on
+    /// while the close finishes in its own task.
+    pub close_wait: Duration,
     pub registrations: std::sync::Mutex<Option<SlotRegistrations>>,
     pub deferred_schema_reset: Arc<crate::engine::DeferredSchemaReset>,
     /// Strong owner across replacement opens, released with the slot.

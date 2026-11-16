@@ -11,7 +11,7 @@
 //!    rewrite both the registry and the store atomically.
 
 pub mod ack_token;
-pub use ack_token::{decode_ack_token, encode_ack_token};
+pub use ack_token::{AckKey, AckKeyring, decode_ack_token, encode_ack_token};
 pub mod coverage;
 pub mod envelope;
 pub mod ledger;

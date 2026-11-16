@@ -16,6 +16,11 @@ pub enum PutCondition {
     IfNoneMatch,
     /// The resource must still carry this strong validator.
     IfMatch(StrongTag),
+    /// The resource must still exist (`If-Match: *`), whatever its version.
+    /// An update without a strong validator uses this so it cannot recreate
+    /// a resource deleted after it was read. It is existence protection, not
+    /// lost-update protection.
+    IfExists,
     /// Unconditional.
     None,
 }
@@ -26,24 +31,27 @@ impl PutCondition {
         match self {
             Self::IfNoneMatch => Some(("If-None-Match", "*".to_string())),
             Self::IfMatch(tag) => Some(("If-Match", tag.to_header())),
+            Self::IfExists => Some(("If-Match", "*".to_string())),
             Self::None => None,
         }
     }
 
-    /// A server offering only weak tags cannot protect against lost updates.
-    /// Keep saving the enterprise user's changes, as before, rather than
-    /// refusing every edit on such a server.
+    /// The condition for updating an existing resource. A server offering only
+    /// weak tags cannot protect against lost updates; keep saving the
+    /// enterprise user's changes rather than refusing every edit on such a
+    /// server, but never recreate a resource deleted since it was read.
     #[must_use]
     pub fn from_etag(etag: Option<&str>) -> Self {
         Self::from_tag(etag.map(EntityTag::parse).as_ref())
     }
 
-    /// Use an already classified account validator without reparsing it.
+    /// [`Self::from_etag`] for an already classified validator: a strong tag
+    /// is `IfMatch`, a weak or absent one `IfExists`.
     #[must_use]
     pub fn from_tag(etag: Option<&EntityTag>) -> Self {
         match etag.cloned() {
             Some(EntityTag::Strong(tag)) => Self::IfMatch(tag),
-            _ => Self::None,
+            _ => Self::IfExists,
         }
     }
 }
@@ -69,10 +77,11 @@ pub fn normalize_http_etag(value: &str) -> String {
 /// The `If-Match` value for an etag, or `None` when no conforming one exists.
 ///
 /// RFC 7232 requires STRONG comparison for `If-Match`, so a weak validator has
-/// no conforming conditional form and the write must go out unconditional.
-/// Against a server that only ever emits weak ETags this means updates have no
-/// lost-update protection at all; no better option exists inside HTTP, and a
-/// consumer needing the guarantee needs an application-level revision check.
+/// no conforming version condition. Against a server that only ever emits weak
+/// ETags, updates have no lost-update protection; a consumer needing that
+/// guarantee needs an application-level revision check. HTTP does still offer
+/// existence protection (`If-Match: *`, [`PutCondition::IfExists`]), which
+/// update paths use so a weak-tag write cannot recreate a deleted resource.
 #[must_use]
 pub fn prepare_if_match(etag: &str) -> Option<String> {
     match EntityTag::parse(etag) {
@@ -87,7 +96,16 @@ mod tests {
 
     #[test]
     fn put_conditions_admit_only_strong_validators() {
-        assert_eq!(PutCondition::from_etag(Some("W/\"abc\"")).header(), None);
+        assert_eq!(
+            PutCondition::from_etag(Some("W/\"abc\"")).header(),
+            Some(("If-Match", "*".to_string())),
+            "a weak tag still guards existence"
+        );
+        assert_eq!(
+            PutCondition::from_etag(None).header(),
+            Some(("If-Match", "*".to_string())),
+        );
+        assert_eq!(PutCondition::None.header(), None);
         assert_eq!(
             PutCondition::from_etag(Some("\"abc\"")).header(),
             Some(("If-Match", "\"abc\"".to_string())),
