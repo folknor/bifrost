@@ -8,12 +8,11 @@ use bifrost_types::{
 };
 use futures::StreamExt;
 
-use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId, Property};
 
 use super::inventory::{email_to_inventory, inventory_properties};
 
-type MailAccount<T> = super::registry::Slot<T>;
+type MailAccount = super::registry::Slot;
 
 use super::capabilities::BATCH_MAX_WAIT;
 
@@ -103,10 +102,7 @@ fn flush_order(route: &HydrationRoute) -> (u8, &str) {
 
 /// Hydration keeps departed ids literal on the primary route. Scope and search
 /// doors choose refusal instead; the registry never conflates those cases.
-pub(crate) fn route_for_id<T: HttpTransport>(
-    id: &ObjectId,
-    registry: &super::registry::Registry<T>,
-) -> HydrationRoute {
+pub(crate) fn route_for_id(id: &ObjectId, registry: &super::registry::Registry) -> HydrationRoute {
     match registry.route(super::foreign::JmapRef::parse(&id.0)) {
         super::registry::Route::Shared(slot) => HydrationRoute::Foreign(slot.id_str().to_owned()),
         super::registry::Route::Primary(_) | super::registry::Route::Departed => {
@@ -115,8 +111,8 @@ pub(crate) fn route_for_id<T: HttpTransport>(
     }
 }
 
-pub(crate) fn stream<T: HttpTransport>(
-    foreign_mail: Arc<super::registry::Registry<T>>,
+pub(crate) fn stream(
+    foreign_mail: Arc<super::registry::Registry>,
     mut ids: AccountStream<ObjectId>,
     projection: Projection,
 ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
@@ -208,8 +204,8 @@ pub(crate) fn stream<T: HttpTransport>(
 /// foreign route whose handle vanished mid-stream falls back to the primary
 /// handle rather than dropping the ids silently (the primary `Email/get`
 /// then reports them as not found).
-async fn fetch_route<T: HttpTransport>(
-    foreign_mail: &super::registry::Registry<T>,
+async fn fetch_route(
+    foreign_mail: &super::registry::Registry,
     route: &HydrationRoute,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
@@ -266,8 +262,8 @@ pub(crate) fn wire_object_id<'a>(id: &'a ObjectId, owner: Option<&str>) -> &'a s
 /// Outcome ids are the ids the CALLER submitted, verbatim - the foreign
 /// qualification already rides on them, so nothing is re-encoded from the
 /// native id the server echoed back.
-async fn fetch_batch<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn fetch_batch(
+    mail: &MailAccount,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<HydratedObject>>>> {
@@ -481,13 +477,9 @@ fn properties_for_projection(projection: Projection) -> Vec<Property> {
 #[cfg(test)]
 mod tests {
     use crate::sync::capabilities::ObjectLimits;
-    use std::sync::Mutex;
-
-    use bytes::Bytes;
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::core::transport::{HttpTransport, TransportError};
 
     #[test]
     fn flags_only_email_without_keywords_is_a_missing_field_failure() {
@@ -518,23 +510,9 @@ mod tests {
         assert!(matches!(&items[1], ItemOutcome::Succeeded(_)));
     }
 
-    struct HydrationTransport {
-        requests: Arc<Mutex<Vec<Value>>>,
-    }
-
-    impl HttpTransport for HydrationTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            let request: Value = serde_json::from_slice(&body)
-                .map_err(|error| TransportError::with_source("request is not JSON", error))?;
-            self.requests
-                .lock()
-                .expect("request log")
-                .push(request.clone());
+    /// Answers every `Email/get` with each requested id, seen.
+    fn hydration_server() -> Arc<bifrost_net::test_support::ScriptedDispatch> {
+        crate::test_wire::api_server(|request| {
             let call = &request["methodCalls"][0];
             let args = &call[1];
             let list: Vec<Value> = args["ids"]
@@ -543,7 +521,7 @@ mod tests {
                 .iter()
                 .map(|id| json!({ "id": id, "keywords": { "$seen": true } }))
                 .collect();
-            let response = json!({
+            crate::test_wire::ok_json(&json!({
                 "sessionState": "session-1",
                 "methodResponses": [[
                     call[0],
@@ -555,28 +533,8 @@ mod tests {
                     },
                     call[2]
                 ]]
-            });
-            Ok(Bytes::from(response.to_string()))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("hydration test does not upload"))
-        }
-
-        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("hydration test does not download"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new(
-                "hydration test does not refresh session",
-            ))
-        }
+            }))
+        })
     }
 
     fn hydration_session() -> crate::core::session::Session {
@@ -596,13 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_minted_metadata_versions_retain_the_selected_native_account() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let client = crate::client::Client::with_transport(
-            HydrationTransport { requests },
-            hydration_session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .unwrap();
+        let client = crate::test_wire::client(&hydration_server(), hydration_session());
         let registry = crate::sync::registry::Registry::from_test(
             crate::sync::registry::Slot::new(client.clone(), "primary"),
             Arc::new(HashMap::from([(
@@ -734,15 +686,8 @@ mod tests {
     /// sleeping, and the request remains scoped to the foreign account.
     #[tokio::test(start_paused = true)]
     async fn a_partial_route_flushes_at_max_wait_while_input_is_pending() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let client = crate::client::Client::with_transport(
-            HydrationTransport {
-                requests: Arc::clone(&requests),
-            },
-            hydration_session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let script = hydration_server();
+        let client = crate::test_wire::client(&script, hydration_session());
         let mail = crate::sync::registry::Slot::new(client.clone(), "primary");
         let foreign_mail = Arc::new(HashMap::from([(
             "shared".into(),
@@ -773,7 +718,7 @@ mod tests {
         assert_eq!(batch.items.len(), 1);
         assert_eq!(outcome_id(&batch.items[0]), foreign_id.0.as_str());
 
-        let requests = requests.lock().expect("request log");
+        let requests = crate::test_wire::api_bodies(&script);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["methodCalls"][0][1]["accountId"], "shared");
         assert_eq!(requests[0]["methodCalls"][0][1]["ids"], json!(["M1"]));

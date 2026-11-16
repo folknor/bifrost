@@ -7,17 +7,16 @@ use bifrost_types::{
 };
 
 use crate::core::query;
-use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailQuery, Property as EmailProperty};
 use crate::mailbox::{Mailbox, MailboxGet, MailboxQuery, Property as MailboxProperty};
 
 use super::capabilities::ObjectLimits;
 use super::state_walk::InventoryWalk;
 
-type MailAccount<T> = crate::account::Account<T>;
+type MailAccount = crate::account::Account;
 
-pub(crate) fn stream<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn stream(
+    mail: MailAccount,
     limits: ObjectLimits,
     scope: CursorScope,
     owner: Option<TypesPrincipalId>,
@@ -64,8 +63,8 @@ pub(crate) fn stream<T: HttpTransport>(
     }
 }
 
-pub(crate) fn stream_partition<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn stream_partition(
+    mail: MailAccount,
     limits: ObjectLimits,
     scope: CursorScope,
     partition: InventoryPartition,
@@ -84,8 +83,8 @@ pub(crate) fn stream_partition<T: HttpTransport>(
     }
 }
 
-fn foreign_email_inventory<T: HttpTransport>(
-    mail: MailAccount<T>,
+fn foreign_email_inventory(
+    mail: MailAccount,
     limits: ObjectLimits,
     scope: CursorScope,
     mailbox_id: String,
@@ -103,8 +102,8 @@ fn foreign_email_inventory<T: HttpTransport>(
 /// memberships into the owning account's namespace and routes a permission
 /// denial into a per-scope quarantine; `None` for the primary walk, where
 /// `shared_scope_error` reduces to the plain JMAP error mapping.
-fn email_inventory_loop<T: HttpTransport>(
-    mail: MailAccount<T>,
+fn email_inventory_loop(
+    mail: MailAccount,
     scope: CursorScope,
     filter: Option<crate::email::query::Filter>,
     owner: Option<TypesPrincipalId>,
@@ -296,8 +295,8 @@ pub(crate) fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesPrinc
     }
 }
 
-fn email_inventory<T: HttpTransport>(
-    mail: MailAccount<T>,
+fn email_inventory(
+    mail: MailAccount,
     limits: ObjectLimits,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     email_inventory_loop(
@@ -324,8 +323,8 @@ pub(crate) fn inventory_properties() -> Vec<EmailProperty> {
     ]
 }
 
-fn mailbox_inventory<T: HttpTransport>(
-    mail: MailAccount<T>,
+fn mailbox_inventory(
+    mail: MailAccount,
     page_size: usize,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
@@ -734,13 +733,14 @@ mod tests {
         calls: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
-    impl crate::core::transport::HttpTransport for MailboxInventoryTransport {
-        async fn api_request(
+    // A double's `expect` asserts what the client sent; it is not an error path.
+    #[allow(clippy::unwrap_in_result)]
+    impl crate::test_wire::ServerDouble for MailboxInventoryTransport {
+        fn api_request(
             &self,
             _url: &str,
             body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             let request: serde_json::Value = serde_json::from_slice(&body).expect("request json");
             let call = request["methodCalls"][0].clone();
             self.calls.lock().expect("calls").push(call.clone());
@@ -795,38 +795,16 @@ mod tests {
                 .to_string(),
             ))
         }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no upload"))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no download"))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no session"))
-        }
     }
 
-    impl crate::core::transport::HttpTransport for InventoryTransport {
-        async fn api_request(
+    // A double's `expect` asserts what the client sent; it is not an error path.
+    #[allow(clippy::unwrap_in_result)]
+    impl crate::test_wire::ServerDouble for InventoryTransport {
+        fn api_request(
             &self,
             _url: &str,
             body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let request: serde_json::Value = serde_json::from_slice(&body).expect("request json");
@@ -932,29 +910,6 @@ mod tests {
                 "methodResponses": [[name, arguments, call_id]]
             });
             Ok(bytes::Bytes::from(response.to_string()))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no upload"))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no download"))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no session"))
         }
     }
 

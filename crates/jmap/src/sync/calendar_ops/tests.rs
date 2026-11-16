@@ -22,13 +22,14 @@ fn time(value: &str) -> EventTime {
 /// calendar filter in `search` has something to discard.
 struct SearchTransport;
 
-impl crate::core::transport::HttpTransport for SearchTransport {
-    async fn api_request(
+// A double's `expect` asserts what the client sent; it is not an error path.
+#[allow(clippy::unwrap_in_result)]
+impl crate::test_wire::ServerDouble for SearchTransport {
+    fn api_request(
         &self,
         _url: &str,
         body: Vec<u8>,
-        _replay: bifrost_net::ReplayPolicy,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+    ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
         let request: Value = serde_json::from_slice(&body).expect("request json");
         let call = request["methodCalls"][0].clone();
         let name = call[0].as_str().expect("method name").to_string();
@@ -67,32 +68,9 @@ impl crate::core::transport::HttpTransport for SearchTransport {
         });
         Ok(bytes::Bytes::from(response.to_string()))
     }
-
-    async fn upload(
-        &self,
-        _url: &str,
-        _body: Vec<u8>,
-        _content_type: Option<&str>,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        Err(crate::core::transport::TransportError::new("no upload"))
-    }
-
-    async fn download(
-        &self,
-        _url: &str,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        Err(crate::core::transport::TransportError::new("no download"))
-    }
-
-    async fn get_session(
-        &self,
-        _url: &str,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        Err(crate::core::transport::TransportError::new("no session"))
-    }
 }
 
-fn search_account() -> CalendarAccount<SearchTransport> {
+fn search_account() -> CalendarAccount {
     let session: crate::core::session::Session = serde_json::from_value(json!({
         "capabilities": {
             "urn:ietf:params:jmap:core": {
@@ -1010,7 +988,7 @@ impl ScriptedQueryTransport {
             .collect()
     }
 
-    fn account(&self) -> CalendarAccount<Self> {
+    fn account(&self) -> CalendarAccount {
         let client = crate::client::Client::with_transport(
             self.clone(),
             calendar_session(),
@@ -1021,13 +999,14 @@ impl ScriptedQueryTransport {
     }
 }
 
-impl crate::core::transport::HttpTransport for ScriptedQueryTransport {
-    async fn api_request(
+// A double's `expect` asserts what the client sent; it is not an error path.
+#[allow(clippy::unwrap_in_result)]
+impl crate::test_wire::ServerDouble for ScriptedQueryTransport {
+    fn api_request(
         &self,
         _url: &str,
         body: Vec<u8>,
-        _replay: bifrost_net::ReplayPolicy,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+    ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
         let request: Value = serde_json::from_slice(&body).expect("request json");
         let call = request["methodCalls"][0].clone();
         let name = call[0].as_str().expect("method name").to_string();
@@ -1109,29 +1088,6 @@ impl crate::core::transport::HttpTransport for ScriptedQueryTransport {
             "methodResponses": [[name, arguments, call_id]]
         });
         Ok(bytes::Bytes::from(response.to_string()))
-    }
-
-    async fn upload(
-        &self,
-        _url: &str,
-        _body: Vec<u8>,
-        _content_type: Option<&str>,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        Err(crate::core::transport::TransportError::new("no upload"))
-    }
-
-    async fn download(
-        &self,
-        _url: &str,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        Err(crate::core::transport::TransportError::new("no download"))
-    }
-
-    async fn get_session(
-        &self,
-        _url: &str,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        Err(crate::core::transport::TransportError::new("no session"))
     }
 }
 

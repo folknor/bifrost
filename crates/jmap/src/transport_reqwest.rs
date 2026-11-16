@@ -13,7 +13,7 @@ use bytes::Bytes;
 use reqwest::header;
 
 use crate::client::Authorization;
-use crate::core::transport::{HttpTransport, SseTransport, TransportError};
+use crate::core::transport::TransportError;
 use futures::Stream;
 
 // The transport only issues these two verbs; unsupported verbs cannot enter
@@ -40,6 +40,10 @@ pub(crate) struct ReqwestTransport {
     /// The session's `maxConcurrentUpload`, applied to upload requests
     /// only. `None` until the first session is installed.
     upload_limit: std::sync::Mutex<Option<ConcurrencyLimit>>,
+    /// The scripted server beneath a test transport, so a test holding only
+    /// the client can read what reached the wire.
+    #[cfg(test)]
+    pub(crate) script: Option<Arc<bifrost_net::test_support::ScriptedDispatch>>,
 }
 
 impl ReqwestTransport {
@@ -107,8 +111,37 @@ impl ReqwestTransport {
         trusted_hosts: Arc<HashSet<String>>,
         injected_net: Option<Net>,
     ) -> Result<Self, TransportError> {
+        Self::new_with_net_and_retry(
+            headers,
+            authorization,
+            account_id,
+            timeout,
+            accept_invalid_certs,
+            trusted_hosts,
+            injected_net,
+            None,
+        )
+    }
+
+    /// As [`Self::new_with_net`], overriding the account's default retry
+    /// policy when `default_retry` is set. Only tests set it, so a scripted
+    /// failure surfaces once instead of being retried with backoff.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_net_and_retry(
+        headers: header::HeaderMap,
+        authorization: Authorization,
+        account_id: AccountId,
+        timeout: Duration,
+        accept_invalid_certs: bool,
+        trusted_hosts: Arc<HashSet<String>>,
+        injected_net: Option<Net>,
+        default_retry: Option<bifrost_net::RetryPolicy>,
+    ) -> Result<Self, TransportError> {
         let redirect_policy = redirect_policy_from_trusted_hosts(&trusted_hosts);
         let mut spec = AccountSpec::new(authorization.optional_account_token_source());
+        if let Some(policy) = default_retry {
+            spec.default_retry = policy;
+        }
         spec.request_timeout = Some(timeout);
         spec.user_agent = concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION")).to_string();
         spec.follow_redirects = FollowRedirects::Enabled(redirect_policy);
@@ -127,6 +160,8 @@ impl ReqwestTransport {
             timeout,
             api_limit: std::sync::Mutex::new(None),
             upload_limit: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            script: None,
         })
     }
 
@@ -303,8 +338,8 @@ impl ReqwestTransport {
     }
 }
 
-impl HttpTransport for ReqwestTransport {
-    async fn api_request(
+impl ReqwestTransport {
+    pub(crate) async fn api_request(
         &self,
         url: &str,
         body: Vec<u8>,
@@ -313,7 +348,7 @@ impl HttpTransport for ReqwestTransport {
         Ok(self.api_request_measured(url, body, replay).await?.0)
     }
 
-    async fn api_request_measured(
+    pub(crate) async fn api_request_measured(
         &self,
         url: &str,
         body: Vec<u8>,
@@ -331,7 +366,7 @@ impl HttpTransport for ReqwestTransport {
         .await
     }
 
-    fn set_api_concurrency(&self, max_concurrent_requests: usize) {
+    pub(crate) fn set_api_concurrency(&self, max_concurrent_requests: usize) {
         let mut slot = self
             .api_limit
             .lock()
@@ -344,7 +379,7 @@ impl HttpTransport for ReqwestTransport {
         }
     }
 
-    fn set_upload_concurrency(&self, max_concurrent_upload: usize) {
+    pub(crate) fn set_upload_concurrency(&self, max_concurrent_upload: usize) {
         let mut slot = self
             .upload_limit
             .lock()
@@ -357,7 +392,7 @@ impl HttpTransport for ReqwestTransport {
         }
     }
 
-    async fn upload(
+    pub(crate) async fn upload(
         &self,
         url: &str,
         body: Vec<u8>,
@@ -377,12 +412,14 @@ impl HttpTransport for ReqwestTransport {
             .0)
     }
 
-    async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
+    pub(crate) async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
         Ok(self.download_measured(url).await?.0)
     }
 
-    async fn download_measured(&self, url: &str) -> Result<(bytes::Bytes, u64), TransportError> {
-        use crate::blob::download::BlobTransport;
+    pub(crate) async fn download_measured(
+        &self,
+        url: &str,
+    ) -> Result<(bytes::Bytes, u64), TransportError> {
         use futures::StreamExt;
         let download = self
             .download_stream(url, crate::blob::download::DEFAULT_MAX_BLOB_SIZE)
@@ -395,7 +432,7 @@ impl HttpTransport for ReqwestTransport {
         Ok((body.freeze(), download.bytes_in.bytes_in()))
     }
 
-    async fn get_session(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
+    pub(crate) async fn get_session(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
         self.send(
             HttpMethod::Get,
             url,
@@ -408,8 +445,8 @@ impl HttpTransport for ReqwestTransport {
     }
 }
 
-impl crate::blob::download::BlobTransport for ReqwestTransport {
-    async fn download_stream(
+impl ReqwestTransport {
+    pub(crate) async fn download_stream(
         &self,
         url: &str,
         max_bytes: u64,
@@ -479,14 +516,12 @@ where
     Bytes::from(body)
 }
 
-impl SseTransport for ReqwestTransport {
-    type ByteStream = ReqwestByteStream;
-
-    async fn open_sse(
+impl ReqwestTransport {
+    pub(crate) async fn open_sse(
         &self,
         url: &str,
         last_event_id: Option<&str>,
-    ) -> Result<Self::ByteStream, TransportError> {
+    ) -> Result<ReqwestByteStream, TransportError> {
         let mut request = self
             .net
             .get(url)
@@ -536,9 +571,9 @@ impl SseTransport for ReqwestTransport {
 
 /// Adapter that converts reqwest's `Bytes` stream into `Vec<u8>` chunks.
 ///
-/// Constructed only by the `SseTransport::open_sse` impl, which the
-/// Account impl does not currently drive; kept so the trait surface
-/// stays complete.
+/// Constructed only by `open_sse`, which the Account impl does not
+/// currently drive: EventSource is built and tested as the RFC 8620
+/// mandatory push channel ahead of being wired as the sync-layer fallback.
 #[allow(dead_code)]
 pub(crate) struct ReqwestByteStream {
     inner: bifrost_net::ByteStream,
@@ -616,7 +651,6 @@ mod tests {
 
     #[tokio::test]
     async fn blobs_bypass_json_buffer_limit_and_keep_streaming_and_buffered_doors() {
-        use crate::blob::download::BlobTransport;
         use futures::StreamExt;
         let script = ScriptedDispatch::new((0..3).map(|_| Canned::Stream {
             status: reqwest::StatusCode::OK,
@@ -850,6 +884,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             api_limit: std::sync::Mutex::new(None),
             upload_limit: std::sync::Mutex::new(None),
+            script: None,
         };
 
         transport
@@ -888,6 +923,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             api_limit: std::sync::Mutex::new(None),
             upload_limit: std::sync::Mutex::new(None),
+            script: None,
         };
 
         let err = match transport.open_sse("https://push.test/events", None).await {
@@ -895,7 +931,7 @@ mod tests {
             Ok(_) => panic!("a Location-less 308 cannot open a stream"),
         };
         assert!(matches!(
-            err.net,
+            err.net(),
             Some(bifrost_net::Error::UnexpectedResponse { .. })
         ));
         assert_eq!(
@@ -968,7 +1004,22 @@ impl ReqwestTransport {
             timeout: Duration::from_secs(30),
             api_limit: std::sync::Mutex::new(None),
             upload_limit: std::sync::Mutex::new(None),
+            script: Some(Arc::clone(script)),
         }
+    }
+
+    /// The installed API and upload gates, shared with the transport.
+    pub(crate) fn concurrency_gates(&self) -> (Option<ConcurrencyLimit>, Option<ConcurrencyLimit>) {
+        (self.api_limit(), self.upload_limit())
+    }
+
+    /// The installed API and upload bounds.
+    pub(crate) fn concurrency_limits(&self) -> (Option<usize>, Option<usize>) {
+        let (api, upload) = self.concurrency_gates();
+        (
+            api.as_ref().map(ConcurrencyLimit::limit),
+            upload.as_ref().map(ConcurrencyLimit::limit),
+        )
     }
 }
 

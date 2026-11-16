@@ -1350,27 +1350,29 @@ fn convert_transport(
     transport: crate::core::transport::TransportError,
     ctx: JmapErrorContext,
 ) -> AccountError {
-    // A local failure is authoritative: checked before the net evidence and
-    // the no-evidence fallback, either of which would call it a network
-    // fault and retry it forever.
-    if let Some(local) = transport.local {
-        let kind = match local {
-            crate::core::transport::LocalFailure::InvariantViolated => {
-                InternalErrorKind::InvariantViolated
-            }
-            crate::core::transport::LocalFailure::LimitExceeded => InternalErrorKind::LimitExceeded,
-        };
-        let detail = DiagnosticText::support_only("local JMAP transport failure");
-        return build(
-            PrimaryCause::Internal(InternalCause::new(kind, Some(detail.clone()))),
-            &ctx,
-        )
-        .text(detail)
-        .try_build()
-        .expect("valid account error classification");
-    }
-    if let Some(net) = transport.net {
-        net_into_account_error(
+    // Every transport error carries its provenance by construction: the net
+    // error the wire produced, or a local failure. There is no
+    // unknown-provenance case to guess a classification for.
+    match transport.cause {
+        crate::core::transport::TransportCause::Local(local) => {
+            let kind = match local {
+                crate::core::transport::LocalFailure::InvariantViolated => {
+                    InternalErrorKind::InvariantViolated
+                }
+                crate::core::transport::LocalFailure::LimitExceeded => {
+                    InternalErrorKind::LimitExceeded
+                }
+            };
+            let detail = DiagnosticText::support_only("local JMAP transport failure");
+            build(
+                PrimaryCause::Internal(InternalCause::new(kind, Some(detail.clone()))),
+                &ctx,
+            )
+            .text(detail)
+            .try_build()
+            .expect("valid account error classification")
+        }
+        crate::core::transport::TransportCause::Net(net) => net_into_account_error(
             net,
             NetErrorContext {
                 provider: None,
@@ -1379,36 +1381,7 @@ fn convert_transport(
                 scope: ctx.scope(),
             },
             Some(ThrottleScope::Account),
-        )
-    } else {
-        // The shared transport vocabulary cannot represent unknown provenance:
-        // its kinds are Network, Timeout and Tls. Keep the legacy fallback
-        // until that owner can express the uncertainty; the message is never
-        // parsed for evidence. Removing HttpTransport would also remove an
-        // independent capability and is outside this provenance change.
-        // Custom transport without bifrost-net evidence: no wire-level signal
-        // about transmission, so no attempt cause - except at a send
-        // boundary, which knows the transport was already handed the
-        // submission, so the failure is stamped `InFlight`.
-        let builder = build(
-            PrimaryCause::Transport(TransportCause::new(
-                TransportErrorKind::Network,
-                Some(DiagnosticText::support_only(
-                    "custom JMAP transport failure",
-                )),
-            )),
-            &ctx,
-        );
-        let builder = if matches!(ctx.contract, RequestContract::Send) {
-            builder.push_cause(Cause::Attempt(AttemptCause::new(
-                TransmissionState::InFlight,
-            )))
-        } else {
-            builder
-        };
-        builder
-            .try_build()
-            .expect("valid account error classification")
+        ),
     }
 }
 
@@ -1417,14 +1390,12 @@ fn convert_problem(
     transport: Option<crate::core::transport::TransportError>,
     ctx: JmapErrorContext,
 ) -> AccountError {
-    let net_status = transport
-        .as_ref()
-        .and_then(|t| status_from_net(t.net.as_ref()));
+    let net_status = transport.as_ref().and_then(|t| status_from_net(t.net()));
     let status_u32 = details.status().or(net_status);
     let status_u16 = status_u32.and_then(|s| u16::try_from(s).ok());
     let retry_hint = transport
         .as_ref()
-        .and_then(|t| retry_after_from_net(t.net.as_ref()));
+        .and_then(|t| retry_after_from_net(t.net()));
 
     let primary = match (details.error(), details.limit(), status_u16) {
         // Concurrent uploads and API requests both recover when in-flight work
@@ -1969,56 +1940,6 @@ pub(crate) fn created_id_unusable(
     method: &'static str,
 ) -> AccountError {
     build(
-/// A standalone create door's result from the id of its `created` entry.
-///
-/// The entry proves the create applied, so an absent or empty id is an
-/// unidentified success, never a failure: an enterprise user whose save
-/// worked expects it reported as saved, and a failure would invite a
-/// duplicating retry. The warning carries [`created_id_unusable`] as evidence.
-pub(crate) fn created_or_unidentified(
-    id: Option<&str>,
-    operation: AccountOperation,
-    method: &'static str,
-) -> bifrost_types::Created<String> {
-    match require_created_id(id, operation, method) {
-        Ok(id) => bifrost_types::Created::identified(id),
-        Err(leaf) => bifrost_types::Created::unidentified_because(
-            DiagnosticText::support_only(format!(
-                "JMAP {method} created the object without a usable id"
-            )),
-            Some(leaf),
-        ),
-    }
-}
-
-/// Test assertion: `created` is an unidentified success explained by one
-/// warning whose evidence is the acknowledged `MissingField` leaf.
-#[cfg(test)]
-pub(crate) fn assert_unidentified_create<T: std::fmt::Debug>(
-    created: &bifrost_types::Created<T>,
-) {
-    assert!(created.id().is_none(), "{created:?}");
-    let [warning] = created.warnings() else {
-        panic!("one warning explains the missing identity: {created:?}");
-    };
-    assert_eq!(
-        warning.kind,
-        bifrost_types::WarningKind::CreatedWithoutIdentity
-    );
-    let leaf = warning
-        .error
-        .as_ref()
-        .expect("the contract violation is kept");
-    assert_eq!(
-        leaf.kind(),
-        &AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::MissingField)
-    );
-    assert!(leaf.chain().iter().any(|cause| matches!(
-        cause,
-        Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged
-    )));
-}
-
         PrimaryCause::Protocol {
             kind: ProtocolErrorKind::MissingField,
             wire: WireCause::MalformedResponse {
@@ -2046,6 +1967,54 @@ pub(crate) fn require_created_id(
     id.filter(|id| !id.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| created_id_unusable(operation, method))
+}
+
+/// A standalone create door's result from the id of its `created` entry.
+///
+/// The entry proves the create applied, so an absent or empty id is an
+/// unidentified success, never a failure: an enterprise user whose save
+/// worked expects it reported as saved, and a failure would invite a
+/// duplicating retry. The warning carries [`created_id_unusable`] as evidence.
+pub(crate) fn created_or_unidentified(
+    id: Option<&str>,
+    operation: AccountOperation,
+    method: &'static str,
+) -> bifrost_types::Created<String> {
+    match require_created_id(id, operation, method) {
+        Ok(id) => bifrost_types::Created::identified(id),
+        Err(leaf) => bifrost_types::Created::unidentified_because(
+            DiagnosticText::support_only(format!(
+                "JMAP {method} created the object without a usable id"
+            )),
+            Some(leaf),
+        ),
+    }
+}
+
+/// Test assertion: `created` is an unidentified success explained by one
+/// warning whose evidence is the acknowledged `MissingField` leaf.
+#[cfg(test)]
+pub(crate) fn assert_unidentified_create<T: std::fmt::Debug>(created: &bifrost_types::Created<T>) {
+    assert!(created.id().is_none(), "{created:?}");
+    let [warning] = created.warnings() else {
+        panic!("one warning explains the missing identity: {created:?}");
+    };
+    assert_eq!(
+        warning.kind,
+        bifrost_types::WarningKind::CreatedWithoutIdentity
+    );
+    let leaf = warning
+        .error
+        .as_ref()
+        .expect("the contract violation is kept");
+    assert_eq!(
+        leaf.kind(),
+        &AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::MissingField)
+    );
+    assert!(leaf.chain().iter().any(|cause| matches!(
+        cause,
+        Cause::Attempt(attempt) if attempt.transmission_state == TransmissionState::Acknowledged
+    )));
 }
 
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
@@ -2404,11 +2373,8 @@ mod tests {
         crate::Error::from(crate::core::transport::TransportError::from_net(error))
     }
 
-    /// A local failure the transport marks is authoritative: it classifies
-    /// as the client's own invariant and stops, where the no-evidence
-    /// fallback called it `Transport(Network)` and the engine retried it as
-    /// a network fault forever. An unmarked error with no wire evidence (a
-    /// test stub's missing reply) keeps the fallback.
+    /// A local failure is the client's own invariant and stops; it is never
+    /// classified as a network fault for the engine to retry forever.
     #[test]
     fn a_local_transport_failure_is_internal_not_a_network_retry() {
         use crate::core::transport::TransportError;
@@ -2432,15 +2398,6 @@ mod tests {
                 &bifrost_types::RecoveryClass::InternalFailure
             );
         }
-
-        let unmarked = into_account_error(
-            crate::Error::from(TransportError::new("stub transport has no queued reply")),
-            JmapErrorContext::new(AccountOperation::SyncChanges),
-        );
-        assert_eq!(
-            unmarked.kind(),
-            &AccountErrorKind::Transport(TransportErrorKind::Network)
-        );
     }
 
     /// The EventSource block cap is this crate's bound on a stream the
@@ -3048,7 +3005,9 @@ mod tests {
         );
 
         let caller = into_account_error(
-            crate::Error::InvalidUrl("a custom transport client needs a session URL".to_string()),
+            crate::Error::InvalidUrl(
+                "a pre-built transport client needs a session URL".to_string(),
+            ),
             JmapErrorContext::new(AccountOperation::Discover),
         );
         assert_eq!(
@@ -3904,7 +3863,6 @@ mod replay_tests {
     }
     #[tokio::test]
     async fn a_dropped_set_reconciles_under_an_idempotent_operation() {
-        use crate::core::transport::HttpTransport;
         let script = bifrost_net::test_support::ScriptedDispatch::new([
             bifrost_net::test_support::Canned::Error(bifrost_net::Error::Network {
                 message: "lost".into(),
@@ -4030,22 +3988,21 @@ mod safe_decode_tests {
     use super::*;
 
     #[test]
-    fn decode_and_custom_transport_exports_withhold_foreign_prose() {
+    fn decode_exports_withhold_foreign_prose() {
         let marker = "password=echoed-credential";
         let decode = serde_json::from_value::<u64>(serde_json::json!(marker)).unwrap_err();
-        let ctx = || JmapErrorContext::new(AccountOperation::SyncChanges);
-        for error in [
-            decode_error(decode, Some(marker.into()), &ctx()),
-            convert_transport(crate::core::transport::TransportError::new(marker), ctx()),
-        ] {
-            assert!(!format!("{error:?}").contains(marker));
-            assert!(
-                !error
-                    .support_consented()
-                    .support_text
-                    .iter()
-                    .any(|s| s.contains(marker))
-            );
-        }
+        let error = decode_error(
+            decode,
+            Some(marker.into()),
+            &JmapErrorContext::new(AccountOperation::SyncChanges),
+        );
+        assert!(!format!("{error:?}").contains(marker));
+        assert!(
+            !error
+                .support_consented()
+                .support_text
+                .iter()
+                .any(|s| s.contains(marker))
+        );
     }
 }

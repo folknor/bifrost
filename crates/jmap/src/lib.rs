@@ -502,7 +502,7 @@ impl From<core::transport::TransportError> for Error {
         // Preserve the shared protocol classification even if its body happens
         // to deserialize as Problem Details.
         if matches!(
-            e.net.as_ref().map(bifrost_net::Error::terminal),
+            e.net().map(bifrost_net::Error::terminal),
             Some(bifrost_net::Error::UnexpectedResponse { .. })
         ) {
             return Error::Transport(e);
@@ -656,3 +656,6 @@ mod wire_contract_tests;
 
 #[cfg(test)]
 mod push_tests;
+
+#[cfg(test)]
+pub(crate) mod test_wire;

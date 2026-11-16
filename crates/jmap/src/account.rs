@@ -1,18 +1,18 @@
 use crate::{
     client::Client,
-    core::{capability::Capability, id::AccountId, method::JmapMethod, transport::HttpTransport},
+    core::{capability::Capability, id::AccountId, method::JmapMethod},
 };
 
 /// A capability-scoped account. The capability survives selection so a Mail
 /// handle cannot send Calendar methods to the wrong primary account. Accounts
 /// serving several families expose explicit, session-checked views.
-pub(crate) struct Account<Tr: HttpTransport, C: Capability = crate::core::capability::Mail> {
-    client: Client<Tr>,
+pub(crate) struct Account<C: Capability = crate::core::capability::Mail> {
+    client: Client,
     account_id: AccountId,
     capability: std::marker::PhantomData<fn() -> C>,
 }
 
-impl<Tr: HttpTransport, C: Capability> Clone for Account<Tr, C> {
+impl<C: Capability> Clone for Account<C> {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
@@ -22,7 +22,7 @@ impl<Tr: HttpTransport, C: Capability> Clone for Account<Tr, C> {
     }
 }
 
-impl<Tr: HttpTransport, C: Capability> Account<Tr, C> {
+impl<C: Capability> Account<C> {
     /// An account view whose every `/jmap/api` call reports its inbound
     /// payload bytes into a fresh batch accumulator.
     pub(crate) fn metered(&self) -> (Self, crate::client::ByteTally) {
@@ -41,7 +41,7 @@ impl<Tr: HttpTransport, C: Capability> Account<Tr, C> {
         }
     }
 
-    fn selected(client: Client<Tr>, account_id: AccountId) -> Self {
+    fn selected(client: Client, account_id: AccountId) -> Self {
         Self {
             client,
             account_id,
@@ -50,17 +50,17 @@ impl<Tr: HttpTransport, C: Capability> Account<Tr, C> {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(client: Client<Tr>, account_id: impl Into<AccountId>) -> Self {
+    pub(crate) fn new(client: Client, account_id: impl Into<AccountId>) -> Self {
         Self::selected(client, account_id.into())
     }
 
     /// Keep this exact accountId; never switch to another family's primary.
-    pub(crate) fn view<D: Capability>(&self) -> crate::Result<Account<Tr, D>> {
+    pub(crate) fn view<D: Capability>(&self) -> crate::Result<Account<D>> {
         self.client.account::<D>(self.account_id.clone())
     }
 
     /// Core methods are served by every account, including Blob/copy.
-    pub(crate) fn core(&self) -> Account<Tr, crate::core::capability::Core> {
+    pub(crate) fn core(&self) -> Account<crate::core::capability::Core> {
         Account::selected(self.client.clone(), self.account_id.clone())
     }
 
@@ -75,12 +75,12 @@ impl<Tr: HttpTransport, C: Capability> Account<Tr, C> {
     }
 
     /// Access the underlying client.
-    pub(crate) fn client(&self) -> &Client<Tr> {
+    pub(crate) fn client(&self) -> &Client {
         &self.client
     }
 
     /// Build a request batch scoped to this account.
-    pub(crate) fn build(&self) -> crate::core::request::Request<'_, Tr, C> {
+    pub(crate) fn build(&self) -> crate::core::request::Request<'_, C> {
         crate::core::request::Request::for_account(self)
     }
 
@@ -109,12 +109,12 @@ impl<Tr: HttpTransport, C: Capability> Account<Tr, C> {
     }
 }
 
-impl<Tr: HttpTransport> Client<Tr> {
+impl Client {
     /// Select an explicit account only when the session says it serves C.
     pub(crate) fn account<C: Capability>(
         &self,
         id: impl Into<AccountId>,
-    ) -> crate::Result<Account<Tr, C>> {
+    ) -> crate::Result<Account<C>> {
         let id = id.into();
         crate::core::request::require_capability::<C>(&self.session(), &id)?;
         Ok(Account::selected(self.clone(), id))
@@ -138,7 +138,7 @@ impl<Tr: HttpTransport> Client<Tr> {
     /// let mail = client.primary_account::<capability::Mail>()?;
     /// let cal  = client.primary_account::<capability::Calendars>()?;
     /// ```
-    pub(crate) fn primary_account<C: Capability>(&self) -> crate::Result<Account<Tr, C>> {
+    pub(crate) fn primary_account<C: Capability>(&self) -> crate::Result<Account<C>> {
         let session = self.session();
         let account_id = session
             .primary_accounts()

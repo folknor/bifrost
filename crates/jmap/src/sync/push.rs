@@ -47,7 +47,7 @@ trait RoutingView: Send + Sync {
     fn foreign_scope(&self, account: &str) -> Option<&CursorScope>;
 }
 
-impl<T: crate::core::transport::HttpTransport> RoutingView for super::registry::Registry<T> {
+impl RoutingView for super::registry::Registry {
     fn primary_id(&self) -> &str {
         self.primary.mail.id_str()
     }
@@ -62,9 +62,7 @@ pub(crate) struct PushRouting {
 }
 
 impl PushRouting {
-    pub(crate) fn from_registry<T: crate::core::transport::HttpTransport>(
-        registry: Arc<super::registry::Registry<T>>,
-    ) -> Self {
+    pub(crate) fn from_registry(registry: Arc<super::registry::Registry>) -> Self {
         Self { registry }
     }
 

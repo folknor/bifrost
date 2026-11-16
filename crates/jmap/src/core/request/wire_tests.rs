@@ -40,83 +40,56 @@ mod envelope {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use bytes::Bytes;
+    use bifrost_net::test_support::ScriptedDispatch;
     use serde_json::{Value, json};
 
     use super::{TestGet, TestMailGet, TestObjId, TestQuery};
     use crate::client::Client;
     use crate::core::capability;
     use crate::core::session::Session;
-    use crate::core::transport::{HttpTransport, TransportError};
 
-    /// In-process `HttpTransport`. Captures every outbound API body as
-    /// parsed JSON and answers from a FIFO of canned reply bodies. An
-    /// exhausted queue answers a transport error, which is what a real
+    /// A scripted JMAP server. Answers each API POST from a FIFO of
+    /// canned reply bodies, and every download with a fixed blob. An
+    /// exhausted queue answers a refused connection, which is what a real
     /// connection failure looks like to the caller.
-    struct StubTransport {
-        sent: Arc<Mutex<Vec<Value>>>,
-        policies: Arc<Mutex<Vec<bifrost_net::ReplayPolicy>>>,
-        replies: Arc<Mutex<VecDeque<String>>>,
-    }
-
-    impl HttpTransport for StubTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            self.policies.lock().unwrap().push(replay);
-            let parsed: Value =
-                serde_json::from_slice(&body).expect("client emitted a non-JSON request body");
-            self.sent.lock().expect("stub sent lock").push(parsed);
-            let next = self.replies.lock().expect("stub reply lock").pop_front();
-            match next {
-                Some(reply) => Ok(Bytes::from(reply)),
-                None => Err(TransportError::new("stub transport has no queued reply")),
+    fn stub_server(replies: impl IntoIterator<Item = String>) -> Arc<ScriptedDispatch> {
+        let replies = Mutex::new(replies.into_iter().collect::<VecDeque<_>>());
+        crate::test_wire::server(move |request| match request.method {
+            reqwest::Method::GET => crate::test_wire::ok("blob"),
+            reqwest::Method::POST if request.url.path() == "/jmap/api" => {
+                match replies.lock().expect("stub reply lock").pop_front() {
+                    Some(reply) => crate::test_wire::ok(reply),
+                    None => crate::test_wire::refused("stub server has no queued reply"),
+                }
             }
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not upload"))
-        }
-
-        async fn download(&self, url: &str) -> Result<Bytes, TransportError> {
-            self.sent
-                .lock()
-                .expect("stub sent lock")
-                .push(json!({"downloadUrl": url}));
-            Ok(Bytes::from_static(b"blob"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport has no session route"))
-        }
+            _ => crate::test_wire::unexpected(request),
+        })
     }
 
     /// A stub client plus a handle on everything it sent.
     struct Stub {
-        client: Client<StubTransport>,
-        sent: Arc<Mutex<Vec<Value>>>,
+        client: Client,
+        script: Arc<ScriptedDispatch>,
     }
 
     impl Stub {
-        fn build(&self) -> crate::core::request::Request<'_, StubTransport> {
+        fn build(&self) -> crate::core::request::Request<'_> {
             crate::core::request::Request::test_scoped(&self.client, "A1")
         }
 
-        /// The `n`th request body the client POSTed.
+        /// The `n`th request the client sent: an API body as parsed JSON,
+        /// a download as its URL.
         fn request(&self, n: usize) -> Value {
-            self.sent.lock().expect("stub sent lock")[n].clone()
+            let request = &self.script.requests()[n];
+            if request.method == reqwest::Method::GET {
+                json!({"downloadUrl": request.url.as_str()})
+            } else {
+                crate::test_wire::body_json(request)
+            }
         }
 
         fn request_count(&self) -> usize {
-            self.sent.lock().expect("stub sent lock").len()
+            self.script.requests().len()
         }
     }
 
@@ -239,52 +212,53 @@ mod envelope {
             assert_eq!(request.replay_policy(), bifrost_net::ReplayPolicy::Never);
         }
     }
+    /// The typed batch decides its replay policy, and the policy reaches
+    /// the wire: after a drop that may have reached the server, a read-only
+    /// batch is replayed and a guarded write is not.
     #[tokio::test]
     async fn send_request_hands_the_typed_batch_policy_to_the_transport() {
-        let policies = Arc::new(Mutex::new(Vec::new()));
+        let reply = json!({"methodResponses": [], "sessionState": "session-1"});
+        let script = ScriptedDispatch::new([
+            crate::test_wire::lost("dropped"),
+            crate::test_wire::ok_json(&reply),
+            crate::test_wire::lost("dropped"),
+        ]);
+        let mut policy = bifrost_net::RetryPolicy::default();
+        policy.max_attempts = 2;
+        policy.initial_backoff = std::time::Duration::ZERO;
+        policy.max_backoff = std::time::Duration::ZERO;
         let client = Client::with_transport(
-            StubTransport {
-                sent: Arc::new(Mutex::new(Vec::new())),
-                replies: Arc::new(Mutex::new(VecDeque::new())),
-                policies: Arc::clone(&policies),
-            },
+            crate::transport_reqwest::ReqwestTransport::scripted_with_retry(&script, policy),
             session(mail_primary()),
-            "https://example.test/.well-known/jmap",
+            crate::test_wire::SESSION_URL,
         )
         .unwrap();
         let mut request =
-            crate::core::request::Request::<_, capability::Core>::test_scoped(&client, "A1");
+            crate::core::request::Request::<capability::Core>::test_scoped(&client, "A1");
         request.call(TestGet::new()).unwrap();
-        assert!(client.send_request(&request).await.is_err());
+        client
+            .send_request(&request)
+            .await
+            .expect("an idempotent read replays after the drop");
+        assert_eq!(script.requests().len(), 2);
         let mut request =
-            crate::core::request::Request::<_, capability::Core>::test_scoped(&client, "A1");
+            crate::core::request::Request::<capability::Core>::test_scoped(&client, "A1");
         request
             .call(ReplayTestSet::new().if_in_state("caller-old"))
             .unwrap();
         assert!(client.send_request(&request).await.is_err());
         assert_eq!(
-            *policies.lock().unwrap(),
-            [
-                bifrost_net::ReplayPolicy::Idempotent,
-                bifrost_net::ReplayPolicy::Never
-            ]
+            script.requests().len(),
+            3,
+            "a write that may have committed is never replayed"
         );
+        assert_eq!(script.remaining(), 0);
     }
 
     fn stub(primary_accounts: Value, replies: impl IntoIterator<Item = String>) -> Stub {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let transport = StubTransport {
-            sent: Arc::clone(&sent),
-            policies: Arc::new(Mutex::new(Vec::new())),
-            replies: Arc::new(Mutex::new(replies.into_iter().collect())),
-        };
-        let client = Client::with_transport(
-            transport,
-            session(primary_accounts),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("stub client builds");
-        Stub { client, sent }
+        let script = stub_server(replies);
+        let client = crate::test_wire::client(&script, session(primary_accounts));
+        Stub { client, script }
     }
 
     fn stub_with_max_calls(
@@ -292,19 +266,10 @@ mod envelope {
         max_calls: usize,
         replies: impl IntoIterator<Item = String>,
     ) -> Stub {
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let transport = StubTransport {
-            sent: Arc::clone(&sent),
-            policies: Arc::new(Mutex::new(Vec::new())),
-            replies: Arc::new(Mutex::new(replies.into_iter().collect())),
-        };
-        let client = Client::with_transport(
-            transport,
-            session_with_max_calls(primary_accounts, max_calls),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("stub client builds");
-        Stub { client, sent }
+        let script = stub_server(replies);
+        let client =
+            crate::test_wire::client(&script, session_with_max_calls(primary_accounts, max_calls));
+        Stub { client, script }
     }
 
     #[cfg(feature = "blob")]
@@ -479,7 +444,7 @@ mod envelope {
 
         // An explicit override wins over the client default.
         let mut request =
-            crate::core::request::Request::<_, capability::Core>::test_scoped(&stub.client, "B2");
+            crate::core::request::Request::<capability::Core>::test_scoped(&stub.client, "B2");
         let _ = request.call(TestGet::new()).expect("encodes");
         request.send().await.expect("stub replies");
         assert_eq!(
@@ -668,9 +633,9 @@ mod envelope {
             }),
             [],
         );
-        let mail: crate::account::Account<_, capability::Mail> =
+        let mail: crate::account::Account<capability::Mail> =
             stub.client.primary_account::<capability::Mail>().unwrap();
-        let calendar: crate::account::Account<_, capability::Calendars> = stub
+        let calendar: crate::account::Account<capability::Calendars> = stub
             .client
             .primary_account::<capability::Calendars>()
             .unwrap();
@@ -713,19 +678,9 @@ mod envelope {
             "read-only-share": { "name": "Share", "isPersonal": false, "isReadOnly": false,
                 "accountCapabilities": {"urn:ietf:params:jmap:mail": {}} }
         });
-        let source = stub(mail_primary(), []);
-        let client = Client::with_transport(
-            StubTransport {
-                sent: Arc::clone(&source.sent),
-                policies: Arc::new(Mutex::new(Vec::new())),
-                replies: Arc::new(Mutex::new(VecDeque::new())),
-            },
-            serde_json::from_value(session).unwrap(),
-            "https://example.test/session",
-        )
-        .unwrap();
+        let client = crate::test_wire::client_json(&stub_server([]), session);
         let shared = client.account::<capability::Mail>("shared").unwrap();
-        let submission: crate::account::Account<_, capability::Submission> = shared.view().unwrap();
+        let submission: crate::account::Account<capability::Submission> = shared.view().unwrap();
         assert_eq!(submission.id_str(), "shared");
         let mut request = shared.build();
         request.call(TestMailGet::new()).unwrap();

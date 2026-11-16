@@ -2,7 +2,6 @@
 
 use super::containers::role_mailbox;
 use super::{MailAccount, to_acct_err};
-use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailId, EmailSet, Property as EmailProperty};
 use crate::mailbox::MailboxId;
 use crate::sync::error::finish_partial;
@@ -16,8 +15,8 @@ use std::collections::HashSet;
 
 const SEEN_KEYWORD: &str = "$seen";
 const IMPORTANT_KEYWORD: &str = "$important";
-pub(crate) fn add_to_container<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn add_to_container(
+    mail: MailAccount,
     target: MutationTarget,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -33,8 +32,8 @@ pub(crate) fn add_to_container<T: HttpTransport>(
     })
 }
 
-pub(crate) fn remove_from_container<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn remove_from_container(
+    mail: MailAccount,
     target: MutationTarget,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -50,8 +49,8 @@ pub(crate) fn remove_from_container<T: HttpTransport>(
     })
 }
 
-pub(crate) fn set_keyword<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn set_keyword(
+    mail: MailAccount,
     target: MutationTarget,
     keyword: bifrost_types::Flag,
     value: bool,
@@ -97,8 +96,8 @@ pub(crate) fn set_keyword<T: HttpTransport>(
     })
 }
 
-pub(crate) fn set_is_read<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn set_is_read(
+    mail: MailAccount,
     target: MutationTarget,
     is_read: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -108,8 +107,8 @@ pub(crate) fn set_is_read<T: HttpTransport>(
 /// Exclusive importance overwrite via the `$important` keyword. JMAP's
 /// model is two-valued: `High` sets `$important`, `Normal`/`Low` clear
 /// it. One `Email/set` keyword update, no expand-into-two.
-pub(crate) fn set_importance<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn set_importance(
+    mail: MailAccount,
     target: MutationTarget,
     level: Importance,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -267,8 +266,8 @@ impl SetProgress {
     }
 }
 
-pub(crate) fn move_thread<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn move_thread(
+    mail: MailAccount,
     thread: ThreadId,
     target: ContainerId,
     source: Option<ContainerId>,
@@ -309,8 +308,8 @@ pub(crate) fn move_thread<T: HttpTransport>(
     })
 }
 
-pub(crate) fn delete_thread<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn delete_thread(
+    mail: MailAccount,
     thread: ThreadId,
     current: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -406,8 +405,8 @@ pub(crate) fn delete_thread<T: HttpTransport>(
     })
 }
 
-async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn resolve_thread_emails_in_mailbox(
+    mail: &MailAccount,
     ids: &[EmailId],
     mailbox: &MailboxId,
     op: AccountOperation,
@@ -474,8 +473,8 @@ async fn resolve_thread_emails_in_mailbox<T: HttpTransport>(
     Ok((in_mailbox, read_state))
 }
 
-pub(super) async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn destroy_thread_emails_if_unchanged(
+    mail: &MailAccount,
     owner: Option<String>,
     ids: Vec<EmailId>,
     read_state: Option<crate::core::id::ObjectState<Email>>,
@@ -531,8 +530,8 @@ pub(super) async fn destroy_thread_emails_if_unchanged<T: HttpTransport>(
     Ok(progress)
 }
 
-async fn patch_mailbox_membership<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn patch_mailbox_membership(
+    mail: &MailAccount,
     target: MutationTarget,
     container: ContainerId,
     value: bool,
@@ -559,8 +558,8 @@ async fn patch_mailbox_membership<T: HttpTransport>(
 /// The caller performs the cross-account container check for each
 /// container it passes; the ids themselves are already in this account's
 /// namespace.
-pub(super) async fn patch_mailbox_membership_of<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn patch_mailbox_membership_of(
+    mail: &MailAccount,
     ids: &[EmailId],
     container: ContainerId,
     value: bool,
@@ -604,8 +603,8 @@ pub(super) async fn patch_mailbox_membership_of<T: HttpTransport>(
     Ok(progress)
 }
 
-async fn resolve_target<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn resolve_target(
+    mail: &MailAccount,
     target: MutationTarget,
     op: AccountOperation,
 ) -> Result<Vec<EmailId>, AccountError> {
@@ -706,8 +705,8 @@ pub(super) fn cross_account_container(
     ))
 }
 
-pub(super) async fn destroy_emails<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn destroy_emails(
+    mail: &MailAccount,
     ids: impl IntoIterator<Item = EmailId> + Clone + Send + 'static,
     op: AccountOperation,
 ) -> Result<(), AccountError> {
@@ -735,8 +734,8 @@ pub(super) async fn destroy_emails<T: HttpTransport>(
     Ok(())
 }
 
-pub(super) async fn send_email_set<T: HttpTransport, F>(
-    mail: &MailAccount<T>,
+pub(super) async fn send_email_set<F>(
+    mail: &MailAccount,
     op: AccountOperation,
     make_set: F,
 ) -> Result<crate::core::set::SetResponse<Email>, AccountError>

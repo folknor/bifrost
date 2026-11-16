@@ -173,59 +173,6 @@ designed with IMAP in mind (`types.md` says as much), and the bounded backfill
 lane depends on partitions, but no production crate mints a `Uid` partition.
 Related: STR-046.
 
-## STR-091 - Delete JMAP's `HttpTransport` generic; it is a test seam above `AccountNet`
-
-**Reported by:** jmap-protocol (its top-ranked move; "the largest single simplification available in the crate").
-
-`core/transport.rs::HttpTransport` has one production implementor
-(`ReqwestTransport`) and about thirty-five test implementors across `client.rs`,
-`core/tests.rs`, `blob/`, `event_source/`, and twenty more in `sync/`. Each double
-stubs `upload`, `download`, `get_session` and `api_request` and returns
-`TransportError::new("...")` with no `net` evidence - exactly the shape
-`reference/net.md` says each crate grew and should not have. Consequences:
-
-- A classification path only tests reach: `sync/error.rs::convert_transport`'s
-  "custom transport without bifrost-net evidence" branch classifies those errors
-  as `Transport(Network)`; production never produces a `TransportError` without
-  `net` or `local`. The doubles exercise a copy of the status contract instead of
-  bifrost-net's - the situation `bifrost_net::test_support` was published to end.
-- The generic is why `JmapAccount` is "undrivable": the comment above
-  `MailAccount` in `sync/account.rs` says no scripted transport can be installed
-  at that level and closing it "means threading the transport generic through
-  `JmapAccount`". It does not: `ReqwestTransport::scripted_with_retry`
-  (cfg(test), in `transport_reqwest.rs`) already builds the production transport
-  over `ScriptedDispatch`, and `capability_contract_tests.rs` already constructs a
-  real `ReqwestTransport` for a whole `JmapAccount`. A scripted net there makes
-  every `Account` door drivable hermetically through the real retry budget, replay
-  policy, concurrency gate and bandwidth meter.
-- Three traits for one transport: `SseTransport` and
-  `blob::download::BlobTransport` exist so the generic can be partially
-  implemented; both have only the reqwest implementor.
-- Every type carries `T`: `Client<T>`, `Request<'x, T>`, `Account<Tr>`,
-  `MethodTuple::add_to_request<T>`, and every generic helper in `sync/`.
-
-Proposal: make `Client` concrete over `ReqwestTransport` (or `AccountNet`
-directly), delete the three traits, `convert_transport`'s no-net branch and the
-doubles, and port tests to `scripted_net`. The WebSocket push lane keeps its own
-seam (`sync/push.rs::PushTransport`), the genuinely non-HTTP part.
-
-**The jmap-account hunter reached the opposite remedy for the same symptom.** It
-reports that `JmapAccount` hardwires `MailAccount = Account<ReqwestTransport>`
-because WebSocket push is reqwest-specific, and that as a consequence
-`capability_contract_tests.rs` can only check the false direction;
-`route_object_id`, `route_mutation_target`, `draft_route_account` are generic over
-a handle type `H` "purely so they can be exercised"; `foreign_account_id_for_object`
-exists only under `#[cfg(test)]` as a test pin for a rule production implements
-elsewhere (`route_object_id`) - a copy kept alive by its own test; and the account
-methods are one-line delegations "to keep the pin meaningful", which is why logic
-lives in free functions taking six to eight parameters. Its proposal: make
-`JmapAccount<T: HttpTransport>` generic (with `Client<T>: PushTransport` as a
-bound, or push behind its own injected `Arc<dyn>` seam), as the code comment
-estimates, so whole-`Account` tests replace the scaffolding. The jmap-protocol
-hunter's reading is that the generic is unnecessary because a scripted
-`ReqwestTransport` already exists; both readings agree the current pin is what
-makes `JmapAccount` hard to drive.
-
 ## STR-138 - Smaller SMTP axes and placement notes
 
 **Reported by:** smtp-sasl.

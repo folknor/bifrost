@@ -22,7 +22,6 @@ use crate::{
         request::{self, Request},
         response,
         session::{Session, URLPart},
-        transport::HttpTransport,
     },
     transport_reqwest::ReqwestTransport,
 };
@@ -288,8 +287,8 @@ struct SessionCell {
 
 /// Internal shared state of a [`Client`]. Stored behind an `Arc` so the
 /// client itself is cheap to clone and pass around.
-pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
-    transport: T,
+pub(crate) struct ClientInner {
+    transport: ReqwestTransport,
     session_cell: SessionCell,
 
     pub(crate) timeout: Duration,
@@ -304,8 +303,8 @@ pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
 /// (when enabled) WebSocket connection. There is no public lifetime
 /// parameter, so `Client` can be stored in long-lived structs and moved
 /// across tasks freely.
-pub(crate) struct Client<T: HttpTransport = ReqwestTransport> {
-    inner: Arc<ClientInner<T>>,
+pub(crate) struct Client {
+    inner: Arc<ClientInner>,
     /// Where this handle reports request-local inbound bytes, if
     /// anywhere. `None` on every ordinary client; a sync stream that
     /// needs per-batch accounting takes a metered handle via
@@ -394,7 +393,7 @@ impl ByteTally {
     }
 }
 
-impl<T: HttpTransport> Clone for Client<T> {
+impl Clone for Client {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -404,8 +403,8 @@ impl<T: HttpTransport> Clone for Client<T> {
     }
 }
 
-impl<T: HttpTransport> Deref for Client<T> {
-    type Target = ClientInner<T>;
+impl Deref for Client {
+    type Target = ClientInner;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
@@ -419,6 +418,8 @@ pub(crate) struct ClientBuilder {
     forwarded_for: Option<String>,
     accept_invalid_certs: bool,
     timeout: Duration,
+    /// Test-only override of the account's default retry policy.
+    default_retry: Option<bifrost_net::RetryPolicy>,
 }
 
 impl Default for ClientBuilder {
@@ -437,7 +438,16 @@ impl ClientBuilder {
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             forwarded_for: None,
             accept_invalid_certs: false,
+            default_retry: None,
         }
+    }
+
+    /// Override the account's default retry policy. Test-only: a scripted
+    /// failure must surface once rather than be retried with backoff.
+    #[cfg(test)]
+    pub(crate) fn default_retry(mut self, policy: bifrost_net::RetryPolicy) -> Self {
+        self.default_retry = Some(policy);
+        self
     }
 
     pub(crate) fn credentials(mut self, credentials: impl Into<Credentials>) -> Self {
@@ -508,7 +518,7 @@ impl ClientBuilder {
 
         let trusted_hosts = Arc::new(self.trusted_hosts);
 
-        let transport = ReqwestTransport::new_with_net(
+        let transport = ReqwestTransport::new_with_net_and_retry(
             headers.clone(),
             authorization,
             self.net_account_id,
@@ -516,6 +526,7 @@ impl ClientBuilder {
             self.accept_invalid_certs,
             Arc::clone(&trusted_hosts),
             self.net,
+            self.default_retry,
         )
         .map_err(crate::Error::from)?;
 
@@ -585,14 +596,14 @@ fn well_known_session_urls(url: &str) -> Vec<String> {
 
 fn is_not_found(error: &crate::core::transport::TransportError) -> bool {
     matches!(
-        error.net.as_ref(),
+        error.net(),
         Some(bifrost_net::Error::Status { code, .. })
             if *code == reqwest::StatusCode::NOT_FOUND
     )
 }
 
-async fn fetch_session<T: HttpTransport>(
-    transport: &T,
+async fn fetch_session(
+    transport: &ReqwestTransport,
     configured_base: &str,
 ) -> Result<(String, bytes::Bytes), crate::core::transport::TransportError> {
     let mut urls = well_known_session_urls(configured_base).into_iter();
@@ -618,18 +629,18 @@ async fn fetch_session<T: HttpTransport>(
 
 #[cfg(test)]
 mod session_state_tests {
-    use std::collections::VecDeque;
     use std::sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     };
 
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bytes::Bytes;
     use serde_json::json;
     use tokio::sync::{Notify, Semaphore};
 
     use super::{Client, Session, fetch_session, well_known_session_urls};
-    use crate::core::transport::{HttpTransport, TransportError};
+    use crate::test_wire;
 
     fn session_json(tag: &str, account: &str, state: &str) -> String {
         json!({
@@ -658,9 +669,7 @@ mod session_state_tests {
         let session: Session = serde_json::from_str(&session_json("old", "A1", "session-1"))
             .expect("session fixture parses");
         let client = Client::with_transport(
-            RefreshingTransport {
-                api_urls: Arc::new(Mutex::new(Vec::new())),
-            },
+            test_wire::transport(&refreshing_server()),
             session,
             "https://example.test/.well-known/jmap",
         )
@@ -695,9 +704,7 @@ mod session_state_tests {
         }))
         .expect("session parses");
         let client = Client::with_transport(
-            RefreshingTransport {
-                api_urls: Arc::new(Mutex::new(Vec::new())),
-            },
+            test_wire::transport(&refreshing_server()),
             session,
             "https://example.test/.well-known/jmap",
         )
@@ -735,9 +742,7 @@ mod session_state_tests {
             let session: Session = serde_json::from_value(session).expect("session parses");
 
             let error = Client::with_transport(
-                RefreshingTransport {
-                    api_urls: Arc::new(Mutex::new(Vec::new())),
-                },
+                test_wire::transport(&refreshing_server()),
                 session,
                 "https://example.test/.well-known/jmap",
             )
@@ -774,9 +779,7 @@ mod session_state_tests {
             let session: Session = serde_json::from_value(session).expect("session parses");
 
             let client = Client::with_transport(
-                RefreshingTransport {
-                    api_urls: Arc::new(Mutex::new(Vec::new())),
-                },
+                test_wire::transport(&refreshing_server()),
                 session,
                 "https://example.test/.well-known/jmap",
             )
@@ -798,15 +801,13 @@ mod session_state_tests {
         let session =
             serde_json::from_str(&session_json("old", "a", "s1")).expect("session parses");
         let client = Client::with_transport(
-            RefreshingTransport {
-                api_urls: Arc::new(Mutex::new(Vec::new())),
-            },
+            test_wire::transport(&refreshing_server()),
             session,
             "https://example.test/.well-known/jmap",
         )
         .expect("client builds");
         let account =
-            crate::account::Account::<_, crate::core::capability::Blob>::new(client.clone(), "a");
+            crate::account::Account::<crate::core::capability::Blob>::new(client.clone(), "a");
         let mut request = account.build();
         request
             .call(
@@ -850,9 +851,7 @@ mod session_state_tests {
             session["uploadUrl"] = json!(bad);
             let session: Session = serde_json::from_value(session).expect("session parses");
             let client = Client::with_transport(
-                RefreshingTransport {
-                    api_urls: Arc::new(Mutex::new(Vec::new())),
-                },
+                test_wire::transport(&refreshing_server()),
                 session,
                 "https://example.test/.well-known/jmap",
             )
@@ -928,9 +927,7 @@ mod session_state_tests {
         session["downloadUrl"] = json!("dl/{accountId}/{blobId}/{name}/{type}");
         let session: Session = serde_json::from_value(session).expect("session parses");
         let error = Client::with_transport(
-            RefreshingTransport {
-                api_urls: Arc::new(Mutex::new(Vec::new())),
-            },
+            test_wire::transport(&refreshing_server()),
             session,
             "https://example.test/.well-known/jmap",
         )
@@ -993,129 +990,63 @@ mod session_state_tests {
         }
     }
 
-    /// Serves a second, entirely different session on refresh, and
-    /// records which `apiUrl` requests actually went to.
-    struct RefreshingTransport {
-        api_urls: Arc<Mutex<Vec<String>>>,
+    /// A server that serves a second, entirely different session on
+    /// refresh and refuses every API request; the requests it saw record
+    /// which `apiUrl` they actually went to.
+    fn refreshing_server() -> Arc<ScriptedDispatch> {
+        snapshot_server(session_json("new", "B2", "session-2"))
     }
 
-    impl HttpTransport for RefreshingTransport {
-        async fn api_request(
-            &self,
-            url: &str,
-            _body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            self.api_urls
-                .lock()
-                .expect("api url lock")
-                .push(url.to_string());
-            Err(TransportError::new("stub transport returns no response"))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not upload"))
-        }
-
-        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not download"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Ok(Bytes::from(session_json("new", "B2", "session-2")))
-        }
+    /// Serves `refreshed_session` on every session GET and refuses every
+    /// API request without answering it.
+    fn snapshot_server(refreshed_session: String) -> Arc<ScriptedDispatch> {
+        test_wire::server(move |request| match request.method {
+            reqwest::Method::GET => test_wire::ok(refreshed_session.clone()),
+            reqwest::Method::POST => test_wire::refused("the test does not need a response"),
+            _ => test_wire::unexpected(request),
+        })
     }
 
-    struct RequestSnapshotTransport {
-        requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
-        refreshed_session: String,
+    /// The API requests a server saw, as `(url, body)`.
+    fn api_requests(script: &ScriptedDispatch) -> Vec<(String, serde_json::Value)> {
+        script
+            .requests()
+            .iter()
+            .filter(|request| request.method == reqwest::Method::POST)
+            .map(|request| (request.url.to_string(), test_wire::body_json(request)))
+            .collect()
     }
 
-    impl HttpTransport for RequestSnapshotTransport {
-        async fn api_request(
-            &self,
-            url: &str,
-            body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            let request = serde_json::from_slice(&body).expect("request body is JSON");
-            self.requests
-                .lock()
-                .expect("request log")
-                .push((url.to_string(), request));
-            Err(TransportError::new(
-                "snapshot test does not need a response",
-            ))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("snapshot test does not upload"))
-        }
-
-        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("snapshot test does not download"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Ok(Bytes::from(self.refreshed_session.clone()))
-        }
-    }
-
-    struct GatedRefreshTransport {
+    /// The first session GET waits on `release_first`, after notifying
+    /// `first_started`; later ones answer at once with a newer session.
+    fn gated_refresh_server(
         calls: Arc<AtomicUsize>,
         first_started: Arc<Notify>,
         release_first: Arc<Semaphore>,
-    }
-
-    impl HttpTransport for GatedRefreshTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new(
-                "refresh test does not send API requests",
-            ))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("refresh test does not upload"))
-        }
-
-        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("refresh test does not download"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 {
-                self.first_started.notify_one();
-                self.release_first
-                    .acquire()
-                    .await
-                    .expect("refresh release semaphore remains open")
-                    .forget();
-                Ok(Bytes::from(session_json("middle", "B2", "session-2")))
-            } else {
-                Ok(Bytes::from(session_json("latest", "C3", "session-3")))
+    ) -> Arc<ScriptedDispatch> {
+        test_wire::async_server(move |request| {
+            assert_eq!(
+                request.method,
+                reqwest::Method::GET,
+                "only refreshes reach this server"
+            );
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            let first_started = Arc::clone(&first_started);
+            let release_first = Arc::clone(&release_first);
+            async move {
+                if call == 0 {
+                    first_started.notify_one();
+                    release_first
+                        .acquire()
+                        .await
+                        .expect("refresh release semaphore remains open")
+                        .forget();
+                    test_wire::ok(session_json("middle", "B2", "session-2"))
+                } else {
+                    test_wire::ok(session_json("latest", "C3", "session-3"))
+                }
             }
-        }
+        })
     }
 
     fn session_with_call_limit(tag: &str, account: &str, state: &str, max_calls: usize) -> String {
@@ -1182,19 +1113,11 @@ mod session_state_tests {
 
     #[tokio::test]
     async fn oversized_http_request_is_refused_before_transport() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
         let mut session: serde_json::Value =
             serde_json::from_str(&session_with_call_limit("old", "A1", "session-1", 10)).unwrap();
         session["capabilities"]["urn:ietf:params:jmap:core"]["maxSizeRequest"] = json!(1);
-        let client = Client::with_transport(
-            RequestSnapshotTransport {
-                requests: Arc::clone(&requests),
-                refreshed_session: session_with_call_limit("new", "B2", "session-2", 10),
-            },
-            serde_json::from_value(session).unwrap(),
-            "https://example.test/.well-known/jmap",
-        )
-        .unwrap();
+        let script = snapshot_server(session_with_call_limit("new", "B2", "session-2", 10));
+        let client = test_wire::client_json(&script, session);
         let request = client.build();
         // A refresh must not replace the size bound attached to this request.
         client.refresh_session().await.unwrap();
@@ -1202,9 +1125,9 @@ mod session_state_tests {
             client.send_request(&request).await,
             Err(crate::Error::RequestSizeLimit { max: 1, .. })
         ));
-        assert!(requests.lock().unwrap().is_empty());
+        assert!(api_requests(&script).is_empty());
         let _ = client.send_request(&client.build()).await;
-        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(api_requests(&script).len(), 1);
     }
 
     /// A Request must keep one session view for its default account, call
@@ -1213,18 +1136,13 @@ mod session_state_tests {
     #[cfg(feature = "mail")]
     #[tokio::test]
     async fn a_request_keeps_its_session_snapshot_through_refresh_and_send() {
-        let requests = Arc::new(Mutex::new(Vec::new()));
         let old_session = session_with_call_limit("old", "A1", "session-1", 1);
         let new_session = session_with_call_limit("new", "B2", "session-2", 2);
-        let client = Client::with_transport(
-            RequestSnapshotTransport {
-                requests: Arc::clone(&requests),
-                refreshed_session: new_session,
-            },
+        let script = snapshot_server(new_session);
+        let client = test_wire::client(
+            &script,
             serde_json::from_str(&old_session).expect("session parses"),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        );
 
         let account = client
             .primary_account::<crate::core::capability::Mail>()
@@ -1252,7 +1170,7 @@ mod session_state_tests {
         assert_eq!(encoded["methodCalls"][0][1]["accountId"], "A1");
 
         let _ = client.send_request(&request).await;
-        let requests = requests.lock().expect("request log");
+        let requests = api_requests(&script);
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, "https://old.example.test/api");
         assert_eq!(requests[0].1["methodCalls"][0][1]["accountId"], "A1");
@@ -1266,16 +1184,14 @@ mod session_state_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let first_started = Arc::new(Notify::new());
         let release_first = Arc::new(Semaphore::new(0));
-        let client = Client::with_transport(
-            GatedRefreshTransport {
-                calls: Arc::clone(&calls),
-                first_started: Arc::clone(&first_started),
-                release_first: Arc::clone(&release_first),
-            },
+        let client = test_wire::client(
+            &gated_refresh_server(
+                Arc::clone(&calls),
+                Arc::clone(&first_started),
+                Arc::clone(&release_first),
+            ),
             serde_json::from_str(&session_json("old", "A1", "session-1")).expect("session parses"),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        );
 
         let started = first_started.notified();
         let first_client = client.clone();
@@ -1300,13 +1216,6 @@ mod session_state_tests {
         assert_eq!(client.session().state(), "session-3");
     }
 
-    /// Records every API and upload concurrency bound the client hands it,
-    /// and serves a refreshed session advertising different ones.
-    struct LimitRecordingTransport {
-        api_limits: Arc<Mutex<Vec<usize>>>,
-        upload_limits: Arc<Mutex<Vec<usize>>>,
-    }
-
     fn session_with_limits(api_limit: usize, upload_limit: usize, state: &str) -> String {
         let mut session: serde_json::Value =
             serde_json::from_str(&session_json("limit", "A1", state)).expect("fixture parses");
@@ -1323,75 +1232,25 @@ mod session_state_tests {
         session.to_string()
     }
 
-    impl HttpTransport for LimitRecordingTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport returns no response"))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not upload"))
-        }
-
-        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not download"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Ok(Bytes::from(session_with_limits(5, 4, "session-2")))
-        }
-
-        fn set_api_concurrency(&self, max_concurrent_requests: usize) {
-            self.api_limits
-                .lock()
-                .expect("limit lock")
-                .push(max_concurrent_requests);
-        }
-
-        fn set_upload_concurrency(&self, max_concurrent_upload: usize) {
-            self.upload_limits
-                .lock()
-                .expect("upload limit lock")
-                .push(max_concurrent_upload);
-        }
-    }
-
     /// Every session the client installs hands both concurrency limits to
     /// the transport: the one it is built with, and each refresh, since RFC
     /// 8620 lets any session property change.
     #[tokio::test]
     async fn every_installed_session_updates_the_transports_concurrency_limits() {
-        let api_limits = Arc::new(Mutex::new(Vec::new()));
-        let upload_limits = Arc::new(Mutex::new(Vec::new()));
         let session: Session =
             serde_json::from_str(&session_with_limits(3, 2, "session-1")).expect("session parses");
-        let client = Client::with_transport(
-            LimitRecordingTransport {
-                api_limits: Arc::clone(&api_limits),
-                upload_limits: Arc::clone(&upload_limits),
-            },
-            session,
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
-        assert_eq!(*api_limits.lock().expect("limit lock"), vec![3]);
-        assert_eq!(*upload_limits.lock().expect("upload limit lock"), vec![2]);
+        let script = snapshot_server(session_with_limits(5, 4, "session-2"));
+        let client = test_wire::client(&script, session);
+        assert_eq!(client.transport().concurrency_limits(), (Some(3), Some(2)));
+        let (api_gate, upload_gate) = client.transport().concurrency_gates();
 
         client.refresh_session().await.expect("refresh succeeds");
-        assert_eq!(*api_limits.lock().expect("limit lock"), vec![3, 5]);
-        assert_eq!(
-            *upload_limits.lock().expect("upload limit lock"),
-            vec![2, 4]
-        );
+        assert_eq!(client.transport().concurrency_limits(), (Some(5), Some(4)));
+        // Resized in place rather than replaced, so a request already
+        // holding a slot of the old gate keeps counting against the new
+        // bound: the gate taken before the refresh sees the new limits.
+        assert_eq!(api_gate.expect("API gate installed").limit(), 5);
+        assert_eq!(upload_gate.expect("upload gate installed").limit(), 4);
     }
 
     /// A session that omits `maxConcurrentRequests` gates the API transport
@@ -1399,8 +1258,6 @@ mod session_state_tests {
     /// field is omitted.
     #[test]
     fn unadvertised_concurrency_limits_gate_the_transport_at_one() {
-        let api_limits = Arc::new(Mutex::new(Vec::new()));
-        let upload_limits = Arc::new(Mutex::new(Vec::new()));
         let mut session: serde_json::Value =
             serde_json::from_str(&session_with_limits(3, 2, "session-1")).expect("fixture parses");
         session["capabilities"]["urn:ietf:params:jmap:core"]
@@ -1414,17 +1271,8 @@ mod session_state_tests {
         let session: Session = serde_json::from_value(session).expect("session parses");
         assert_eq!(session.api_request_concurrency(), 1);
         assert_eq!(session.upload_concurrency(), 1);
-        Client::with_transport(
-            LimitRecordingTransport {
-                api_limits: Arc::clone(&api_limits),
-                upload_limits: Arc::clone(&upload_limits),
-            },
-            session,
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
-        assert_eq!(*api_limits.lock().expect("limit lock"), vec![1]);
-        assert_eq!(*upload_limits.lock().expect("upload limit lock"), vec![1]);
+        let client = test_wire::client(&test_wire::server(test_wire::unexpected), session);
+        assert_eq!(client.transport().concurrency_limits(), (Some(1), Some(1)));
     }
 
     /// RFC 8620 §2 lets any Session property change. A refresh that only
@@ -1434,17 +1282,10 @@ mod session_state_tests {
     /// every request still went to the old one.
     #[tokio::test]
     async fn refresh_replaces_the_session_and_everything_derived_from_it() {
-        let api_urls = Arc::new(Mutex::new(Vec::new()));
         let old: Session = serde_json::from_str(&session_json("old", "A1", "session-1"))
             .expect("session fixture parses");
-        let client = Client::with_transport(
-            RefreshingTransport {
-                api_urls: Arc::clone(&api_urls),
-            },
-            old,
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let script = refreshing_server();
+        let client = test_wire::client(&script, old);
 
         assert_eq!(
             client
@@ -1485,7 +1326,10 @@ mod session_state_tests {
         );
 
         let _ = client.send_request(&client.build()).await;
-        let urls = api_urls.lock().expect("api url lock").clone();
+        let urls: Vec<String> = api_requests(&script)
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect();
         assert_eq!(
             urls,
             vec![
@@ -1517,70 +1361,27 @@ mod session_state_tests {
         );
     }
 
-    struct DiscoveryTransport {
-        urls: Arc<Mutex<Vec<String>>>,
-        replies: Mutex<VecDeque<Result<Bytes, TransportError>>>,
+    /// A session-discovery server answering each GET from `replies` in
+    /// order; the requests it saw are the URLs discovery probed.
+    fn discovery_server(replies: impl IntoIterator<Item = Canned>) -> Arc<ScriptedDispatch> {
+        ScriptedDispatch::new(replies)
     }
 
-    impl DiscoveryTransport {
-        fn new(replies: impl IntoIterator<Item = Result<Bytes, TransportError>>) -> Self {
-            Self {
-                urls: Arc::new(Mutex::new(Vec::new())),
-                replies: Mutex::new(replies.into_iter().collect()),
-            }
-        }
-
-        fn status(code: reqwest::StatusCode) -> TransportError {
-            TransportError::from_net(bifrost_net::Error::Status {
-                code,
-                body: Bytes::new(),
-                headers: reqwest::header::HeaderMap::new(),
+    fn discovery_urls(script: &ScriptedDispatch) -> Vec<String> {
+        script
+            .requests()
+            .iter()
+            .map(|request| {
+                assert_eq!(request.method, reqwest::Method::GET);
+                request.url.to_string()
             })
-        }
-    }
-
-    impl HttpTransport for DiscoveryTransport {
-        async fn api_request(
-            &self,
-            _: &str,
-            _: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            unreachable!("session discovery does not make API requests")
-        }
-
-        async fn upload(
-            &self,
-            _: &str,
-            _: Vec<u8>,
-            _: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            unreachable!("session discovery does not upload")
-        }
-
-        async fn download(&self, _: &str) -> Result<Bytes, TransportError> {
-            unreachable!("session discovery does not download")
-        }
-
-        async fn get_session(&self, url: &str) -> Result<Bytes, TransportError> {
-            self.urls
-                .lock()
-                .expect("discovery URL lock")
-                .push(url.to_string());
-            self.replies
-                .lock()
-                .expect("discovery reply lock")
-                .pop_front()
-                .expect("a scripted discovery reply")
-        }
+            .collect()
     }
 
     #[tokio::test]
     async fn session_discovery_uses_the_path_only_after_an_origin_404() {
-        let transport = DiscoveryTransport::new([
-            Err(DiscoveryTransport::status(reqwest::StatusCode::NOT_FOUND)),
-            Ok(Bytes::from_static(b"session")),
-        ]);
+        let script = discovery_server([test_wire::status(404), test_wire::ok("session")]);
+        let transport = test_wire::transport(&script);
 
         let (url, bytes) = fetch_session(&transport, "https://example.test/jmap/")
             .await
@@ -1589,7 +1390,7 @@ mod session_state_tests {
         assert_eq!(url, "https://example.test/jmap/.well-known/jmap");
         assert_eq!(bytes, Bytes::from_static(b"session"));
         assert_eq!(
-            *transport.urls.lock().expect("discovery URL lock"),
+            discovery_urls(&script),
             vec![
                 "https://example.test/.well-known/jmap",
                 "https://example.test/jmap/.well-known/jmap"
@@ -1599,13 +1400,9 @@ mod session_state_tests {
 
     #[tokio::test]
     async fn session_discovery_does_not_mask_origin_failures_or_bad_success_bodies() {
-        for status in [
-            reqwest::StatusCode::UNAUTHORIZED,
-            reqwest::StatusCode::FORBIDDEN,
-            reqwest::StatusCode::FOUND,
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-        ] {
-            let transport = DiscoveryTransport::new([Err(DiscoveryTransport::status(status))]);
+        for status in [401, 403, 302, 500] {
+            let script = discovery_server([test_wire::status(status)]);
+            let transport = test_wire::transport(&script);
             assert!(
                 fetch_session(&transport, "https://example.test/jmap")
                     .await
@@ -1613,39 +1410,39 @@ mod session_state_tests {
                 "origin HTTP {status} must be preserved"
             );
             assert_eq!(
-                *transport.urls.lock().expect("discovery URL lock"),
+                discovery_urls(&script),
                 vec!["https://example.test/.well-known/jmap"]
             );
         }
 
-        let malformed = DiscoveryTransport::new([Ok(Bytes::from_static(b"not a session"))]);
+        let script = discovery_server([test_wire::ok("not a session")]);
+        let malformed = test_wire::transport(&script);
         let (url, bytes) = fetch_session(&malformed, "https://example.test/jmap")
             .await
             .expect("a successful origin response remains authoritative");
         assert_eq!(url, "https://example.test/.well-known/jmap");
         assert!(serde_json::from_slice::<Session>(&bytes).is_err());
         assert_eq!(
-            *malformed.urls.lock().expect("discovery URL lock"),
+            discovery_urls(&script),
             vec!["https://example.test/.well-known/jmap"]
         );
 
-        let root_transport = DiscoveryTransport::new([Err(DiscoveryTransport::status(
-            reqwest::StatusCode::NOT_FOUND,
-        ))]);
+        let script = discovery_server([test_wire::status(404)]);
+        let root_transport = test_wire::transport(&script);
         assert!(
             fetch_session(&root_transport, "https://example.test/")
                 .await
                 .is_err()
         );
         assert_eq!(
-            *root_transport.urls.lock().expect("discovery URL lock"),
+            discovery_urls(&script),
             vec!["https://example.test/.well-known/jmap"]
         );
     }
 }
 
 /// Default client using reqwest. Use `Client::new()` / `ClientBuilder` to construct.
-pub(crate) type DefaultClient = Client<ReqwestTransport>;
+pub(crate) type DefaultClient = Client;
 
 impl Client {
     /// Create a new client builder (uses reqwest transport by default).
@@ -1655,17 +1452,21 @@ impl Client {
     }
 }
 
-impl<T: HttpTransport> Client<T> {
-    /// Create a client with a custom transport and pre-fetched session.
+impl Client {
+    /// Create a client over an already-built transport and a pre-fetched
+    /// session, skipping discovery. Tests build the transport over a
+    /// scripted net (see `crate::test_wire`).
+    #[cfg(test)]
     pub(crate) fn with_transport(
-        transport: T,
+        transport: impl Into<ReqwestTransport>,
         session: Session,
         session_url: impl Into<String>,
     ) -> crate::Result<Self> {
+        let transport = transport.into();
         let session_url = session_url.into();
         if session_url.is_empty() {
             return Err(crate::Error::InvalidUrl(
-                "a custom transport client needs a session URL".to_string(),
+                "a pre-built transport client needs a session URL".to_string(),
             ));
         }
         let state = Arc::new(SessionState::derive(session)?);
@@ -1691,7 +1492,7 @@ impl<T: HttpTransport> Client<T> {
         })
     }
 
-    pub(crate) fn build(&self) -> Request<'_, T> {
+    pub(crate) fn build(&self) -> Request<'_> {
         Request::new(self)
     }
 
@@ -1723,7 +1524,7 @@ impl<T: HttpTransport> Client<T> {
     /// Send a JMAP request and get a typed Response.
     pub(crate) async fn send_request<C: crate::core::capability::Capability>(
         &self,
-        request: &request::Request<'_, T, C>,
+        request: &request::Request<'_, C>,
     ) -> crate::Result<response::Response> {
         let body = serde_json::to_vec(request).map_err(crate::Error::RequestEncode)?;
         // Enforce the advertised bound before transport, using the same session
@@ -1898,7 +1699,7 @@ impl<T: HttpTransport> Client<T> {
     }
 
     /// Access the underlying transport.
-    pub(crate) fn transport(&self) -> &T {
+    pub(crate) fn transport(&self) -> &ReqwestTransport {
         &self.inner.transport
     }
 }

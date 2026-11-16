@@ -14,12 +14,11 @@ use tokio_util::sync::CancellationToken;
 
 type FactoryRefusals = Arc<std::sync::Mutex<HashMap<AccountId, crate::client::MethodRefusals>>>;
 
-type JmapMailAccount<T> = crate::account::Account<T, capability::Mail>;
+type JmapMailAccount = crate::account::Account<capability::Mail>;
 use crate::client::{Client, Credentials};
 use crate::core::capability;
 use crate::core::capability::Capability;
 use crate::core::id::AccountId as JmapAccountId;
-use crate::core::transport::HttpTransport;
 use crate::email::{EmailGet, EmailId};
 use crate::mailbox::{MailboxGet, Property as MailboxProperty};
 use crate::principal::PrincipalGet;
@@ -47,6 +46,8 @@ pub struct JmapAccountFactoryBuilder {
     accept_invalid_certs: bool,
     reconnect_policy: ReconnectPolicy,
     method_refusals: FactoryRefusals,
+    #[cfg(test)]
+    default_retry: Option<bifrost_net::RetryPolicy>,
 }
 
 impl std::fmt::Debug for JmapAccountFactoryBuilder {
@@ -165,7 +166,19 @@ impl JmapAccountFactoryBuilder {
             accept_invalid_certs: false,
             reconnect_policy: ReconnectPolicy::default(),
             method_refusals: Default::default(),
+            #[cfg(test)]
+            default_retry: None,
         }
+    }
+
+    /// Override the opened account's default retry policy. Test-only: a
+    /// whole account over a scripted net scripts transient failures that
+    /// must surface once rather than be retried with backoff.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn default_retry(mut self, policy: bifrost_net::RetryPolicy) -> Self {
+        self.default_retry = Some(policy);
+        self
     }
 
     /// Use an application-owned transport for JMAP HTTP requests.
@@ -309,10 +322,10 @@ impl AccountFactory for JmapAccountFactory {
 /// Everything the open sequence reads off the wire before it can build an
 /// account: the primary account's two states, and one probe per foreign
 /// (shared/delegate) mail account.
-struct SeededOpenState<Tr: HttpTransport> {
+struct SeededOpenState {
     lifecycle_mailbox_state: crate::core::id::ObjectState<crate::mailbox::Mailbox>,
     mailbox_names: HashMap<String, String>,
-    registry: Registry<Tr>,
+    registry: Registry,
     skipped_scopes: Vec<SkippedScope>,
 }
 
@@ -328,10 +341,10 @@ struct SeededOpenState<Tr: HttpTransport> {
 /// needs nothing from the wire, so it is decided first and the probes never
 /// go out. The half that DOES need probe results - the `PimSupport` gates,
 /// which depend on which shares actually seeded - stays in `build`.
-async fn validate_and_seed<Tr: HttpTransport>(
-    client: &Client<Tr>,
-    mail: &JmapMailAccount<Tr>,
-) -> Result<SeededOpenState<Tr>, AccountError> {
+async fn validate_and_seed(
+    client: &Client,
+    mail: &JmapMailAccount,
+) -> Result<SeededOpenState, AccountError> {
     let session = client.session();
     let limits = capabilities::validate_session(&session)?;
 
@@ -473,13 +486,13 @@ pub(super) fn api_request_concurrency(session: &crate::core::session::Session) -
 /// capability - or a `true` capability in front of a handle whose
 /// capability object is gibberish - is a guaranteed `Unsupported` (or
 /// worse, a request built from limits nobody could read) one layer up.
-struct OptionalFamilies<Tr: HttpTransport> {
-    submission: Option<crate::account::Account<Tr, capability::Submission>>,
-    vacation: Option<crate::account::Account<Tr, capability::VacationResponseCap>>,
-    quota: Option<crate::account::Account<Tr, capability::Quota>>,
-    sieve: Option<crate::account::Account<Tr, capability::Sieve>>,
-    contacts: Option<crate::account::Account<Tr, capability::Contacts>>,
-    calendars: Option<crate::account::Account<Tr, capability::Calendars>>,
+struct OptionalFamilies {
+    submission: Option<crate::account::Account<capability::Submission>>,
+    vacation: Option<crate::account::Account<capability::VacationResponseCap>>,
+    quota: Option<crate::account::Account<capability::Quota>>,
+    sieve: Option<crate::account::Account<capability::Sieve>>,
+    contacts: Option<crate::account::Account<capability::Contacts>>,
+    calendars: Option<crate::account::Account<capability::Calendars>>,
     /// RFC 8621 `maxDelayedSend`, in seconds. Non-zero only when the
     /// selected account's Submission block is parseable and advertises a window.
     max_delayed_send: usize,
@@ -514,7 +527,7 @@ fn family_block_is_usable<T>(
     }
 }
 
-fn resolve_optional_families<Tr: HttpTransport>(client: &Client<Tr>) -> OptionalFamilies<Tr> {
+fn resolve_optional_families(client: &Client) -> OptionalFamilies {
     let session = client.session();
 
     let submission_usable = family_block_is_usable(
@@ -608,10 +621,7 @@ fn account_advertises_submission(session: &crate::core::session::Session, id: &s
     })
 }
 
-async fn fetch_self_emails<Tr: HttpTransport>(
-    client: &Client<Tr>,
-    credentials: &JmapCredentials,
-) -> Vec<String> {
+async fn fetch_self_emails(client: &Client, credentials: &JmapCredentials) -> Vec<String> {
     let mut emails = Vec::new();
     if let Some(email) = credentials.configured_email() {
         push_email_alias(&mut emails, email);
@@ -652,10 +662,10 @@ fn primary_mail_owner(
     session.account(id)?.principals_owner_capabilities()
 }
 
-fn self_principal_lookup<Tr: HttpTransport>(
-    client: &Client<Tr>,
+fn self_principal_lookup(
+    client: &Client,
 ) -> Option<(
-    crate::account::Account<Tr, capability::Principals>,
+    crate::account::Account<capability::Principals>,
     crate::principal::PrincipalId,
 )> {
     let session = client.session();
@@ -729,9 +739,7 @@ struct ForeignSeed {
 /// Probe one foreign account's `Email` / `Mailbox` states. Mirrors the
 /// primary probes (the `Mailbox/get` also proves the grant reaches the
 /// account's mailboxes, not just its Email state).
-async fn seed_foreign_account<T: HttpTransport>(
-    mail: &JmapMailAccount<T>,
-) -> crate::Result<ForeignSeed> {
+async fn seed_foreign_account(mail: &JmapMailAccount) -> crate::Result<ForeignSeed> {
     let (email_state, _mailbox_state, _mailbox_names) = seed_account_state(mail).await?;
     Ok(ForeignSeed { email_state })
 }
@@ -744,12 +752,12 @@ async fn seed_foreign_account<T: HttpTransport>(
 /// account-wide, so per-mailbox cursors would each replay the identical
 /// change set and a foreign push would fan out to every one of them.
 /// The installer is generic over transport so tests probe and inspect the real slot.
-fn foreign_seed_slot<T: HttpTransport>(
-    mail: JmapMailAccount<T>,
+fn foreign_seed_slot(
+    mail: JmapMailAccount,
     limits: capabilities::ObjectLimits,
     seed: ForeignSeed,
     submission: bool,
-) -> Slot<T> {
+) -> Slot {
     let scope = CursorScope::Folder(foreign::encode_foreign_account(mail.id_str()));
     let encoded = state::encode_for_scope(&scope, seed.email_state.clone().into_string())
         .expect("foreign account scope is supported");
@@ -773,9 +781,9 @@ fn foreign_seed_slot<T: HttpTransport>(
 /// share for the session, the original G8 defect). The skip's scope
 /// names the foreign accountId so the consumer knows WHICH share is
 /// degraded and the recovery class says whether a reopen can heal it.
-async fn seed_foreign_account_or_skip<T: HttpTransport>(
+async fn seed_foreign_account_or_skip(
     foreign_id: &str,
-    mail: &JmapMailAccount<T>,
+    mail: &JmapMailAccount,
 ) -> Result<ForeignSeed, SkippedScope> {
     match seed_foreign_account(mail).await {
         Ok(seed) => Ok(seed),
@@ -823,9 +831,7 @@ fn open_probe_methods() -> (EmailGet, MailboxGet) {
 /// to support, never a floor a client may assume, so batching without
 /// checking would fail a primary account's open outright and silently
 /// drop every foreign account against a conservative server.
-async fn open_probes<T: HttpTransport>(
-    mail: &JmapMailAccount<T>,
-) -> crate::Result<OpenProbeResponses> {
+async fn open_probes(mail: &JmapMailAccount) -> crate::Result<OpenProbeResponses> {
     if let Some(responses) = batched_open_probes(mail).await? {
         return Ok(responses);
     }
@@ -835,9 +841,7 @@ async fn open_probes<T: HttpTransport>(
 
 /// The batched leg. Returns `Ok(None)` without sending anything when
 /// the advertised limits cannot hold both calls in one request.
-async fn batched_open_probes<T: HttpTransport>(
-    mail: &JmapMailAccount<T>,
-) -> crate::Result<Option<OpenProbeResponses>> {
+async fn batched_open_probes(mail: &JmapMailAccount) -> crate::Result<Option<OpenProbeResponses>> {
     let session = mail.client().session();
     // Opening validates before probes. Bare protocol tests can still reach
     // this helper with an incomplete session, so batch only known bounds.
@@ -861,8 +865,8 @@ async fn batched_open_probes<T: HttpTransport>(
 /// Read the two states needed at open. Mailbox names ride the
 /// Mailbox/get already needed for its state, so both the primary and
 /// shared-account paths use exactly the same request shape.
-async fn seed_account_state<T: HttpTransport>(
-    mail: &JmapMailAccount<T>,
+async fn seed_account_state(
+    mail: &JmapMailAccount,
 ) -> crate::Result<(
     crate::core::id::ObjectState<crate::email::Email>,
     crate::core::id::ObjectState<crate::mailbox::Mailbox>,
@@ -897,6 +901,10 @@ async fn connect(
     }
     if let Some(timeout) = config.timeout {
         builder = builder.timeout(timeout);
+    }
+    #[cfg(test)]
+    if let Some(policy) = config.default_retry {
+        builder = builder.default_retry(policy);
     }
     let mut client = builder.connect(&config.url).await?;
     client.method_refusals = refusals;
@@ -950,7 +958,6 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::core::session::Session;
-    use crate::core::transport::TransportError;
 
     #[test]
     fn factory_accepts_an_application_net() {
@@ -985,23 +992,17 @@ mod tests {
         }
     }
 
-    /// Scripted JMAP HTTP boundary with the same contract as
-    /// `ReqwestTransport`.
+    /// A scripted JMAP server: each API request takes the next scripted
+    /// reply, in order.
     ///
-    /// Fidelity is the whole point: a fixture states a status and a body,
-    /// and the seam derives the error shape from the same decision table
-    /// `crates/net/src/request.rs` walks, so a test cannot pin behaviour
-    /// against a response shape the production stack is incapable of
-    /// producing. Once armed, the script is closed: an unplanned request
-    /// reports its ordinal instead of ever reaching a real HTTP transport.
-    struct ScriptedTransport {
-        requests: Mutex<Vec<Value>>,
-        replies: Mutex<VecDeque<ScriptedReply>>,
-    }
-
+    /// A reply is a WIRE outcome - a status, headers and a body, or a
+    /// connection failure - and the production transport classifies it,
+    /// so a test cannot pin behaviour against a response shape the
+    /// production stack is incapable of producing. Once armed, the script
+    /// is closed: an unplanned request panics with its ordinal.
     struct ScriptedReply {
-        kind: ScriptedReplyKind,
-        /// Opt-in routing guard. The transport answers positionally and
+        canned: bifrost_net::test_support::Canned,
+        /// Opt-in routing guard. The server answers positionally and
         /// never checks WHOM a request addresses, so a test that does
         /// not explicitly assert the recorded request can pass while
         /// the code under test talked to the wrong account. When set,
@@ -1012,17 +1013,6 @@ mod tests {
         expect_account: Option<String>,
     }
 
-    enum ScriptedReplyKind {
-        /// A server response, classified on delivery.
-        Response {
-            status: reqwest::StatusCode,
-            body: Bytes,
-            headers: reqwest::header::HeaderMap,
-        },
-        /// A transport failure with no HTTP response behind it.
-        Error(TransportError),
-    }
-
     impl ScriptedReply {
         fn ok(body: impl Into<Bytes>) -> Self {
             Self::status(reqwest::StatusCode::OK, body)
@@ -1030,24 +1020,21 @@ mod tests {
 
         fn status(status: reqwest::StatusCode, body: impl Into<Bytes>) -> Self {
             Self {
-                kind: ScriptedReplyKind::Response {
-                    status,
-                    body: body.into(),
-                    headers: reqwest::header::HeaderMap::new(),
-                },
+                canned: bifrost_net::test_support::canned_owned(status, body),
                 expect_account: None,
             }
         }
 
-        fn error(error: TransportError) -> Self {
+        /// A connection failure with no HTTP response behind it.
+        fn error(error: bifrost_net::Error) -> Self {
             Self {
-                kind: ScriptedReplyKind::Error(error),
+                canned: bifrost_net::test_support::Canned::Error(error),
                 expect_account: None,
             }
         }
 
         fn header(mut self, name: &'static str, value: &str) -> Self {
-            if let ScriptedReplyKind::Response { headers, .. } = &mut self.kind {
+            if let bifrost_net::test_support::Canned::Response { headers, .. } = &mut self.canned {
                 headers.insert(
                     name,
                     reqwest::header::HeaderValue::from_str(value).expect("test header value"),
@@ -1062,164 +1049,31 @@ mod tests {
             self.expect_account = Some(account_id.to_string());
             self
         }
-
-        /// Reproduce what the production stack hands the JMAP layer for
-        /// this response. Follows `crates/net/src/request.rs`:
-        ///
-        /// - 2xx: the body reaches the protocol decoder.
-        /// - 3xx: bifrost-net returns 304 / 305 / 306 and `Location`-less
-        ///   redirects as `Ok`, and the redirect loop's `PassThrough` arm
-        ///   hands the BODY up rather than discarding it, so
-        ///   `ReqwestTransport::handle_response` turns them into a
-        ///   `TransportError` carrying that body and no net evidence.
-        ///   The fixture preserves the scripted body for the same
-        ///   reason: production can deliver one. It used to blank the
-        ///   body, matching an older `PassThrough` arm that dropped it -
-        ///   a double that keeps mirroring behavior the transport has
-        ///   stopped having makes every test built on it confidently
-        ///   wrong.
-        /// - 401: the forced refresh retries once, and the second 401 is
-        ///   `AuthLost` with acknowledged transmission evidence.
-        /// - Retryable per `RetryPolicy::default()` - 429 plus the whole
-        ///   5xx family, read off the policy rather than restated: the
-        ///   retry budget is spent and the loop surfaces `RateLimited`
-        ///   for 429 and `RetryBudgetExhausted` for the rest, each with
-        ///   the final response preserved. When the batch's replay policy
-        ///   forbids replay (any write), a retryable status other than 429
-        ///   stops at once and arrives wrapped in an empty-attempt
-        ///   `AttemptHistory` with a `MayHaveCommitted` ledger verdict, as net's
-        ///   status gate produces it.
-        /// - Any other 4xx: terminal `Error::Status`.
-        ///
-        /// So a `Status` fixture for a retryable code is not something a
-        /// test author can write by accident.
-        fn into_transport_result(
-            self,
-            replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            let (status, body, headers) = match self.kind {
-                ScriptedReplyKind::Error(error) => return Err(error),
-                ScriptedReplyKind::Response {
-                    status,
-                    body,
-                    headers,
-                } => (status, body, headers),
-            };
-            if status.is_success() {
-                return Ok(body);
-            }
-            if status.is_redirection() {
-                return Err(TransportError::with_body(status, body));
-            }
-            let final_response = bifrost_net::FinalResponse {
-                status,
-                headers: headers.clone(),
-                body: body.clone(),
-            };
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                return Err(TransportError::from_net(bifrost_net::Error::AuthLost {
-                    transmission_state: Some(bifrost_types::TransmissionState::Acknowledged),
-                    final_response: Some(final_response),
-                }));
-            }
-            let policy = bifrost_net::RetryPolicy::default();
-            if policy.statuses.contains(&status) || status.is_server_error() {
-                let retry_after = bifrost_net::request::parse_retry_after_hint(
-                    headers.get(reqwest::header::RETRY_AFTER),
-                );
-                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    return Err(TransportError::from_net(bifrost_net::Error::RateLimited {
-                        retry_after,
-                        final_response,
-                    }));
-                }
-                let replayable = bifrost_net::request_is_replayable(
-                    Some(replay),
-                    &reqwest::Method::POST,
-                    &reqwest::header::HeaderMap::new(),
-                );
-                let exhausted = bifrost_net::Error::RetryBudgetExhausted {
-                    final_response: Some(final_response),
-                    retry_after_history: retry_after.into_iter().collect(),
-                    stop_reason: if replayable {
-                        bifrost_net::error::RetryStopReason::AttemptBudget
-                    } else {
-                        bifrost_net::error::RetryStopReason::ReplayForbidden
-                    },
-                };
-                if !replayable {
-                    return Err(TransportError::from_net(
-                        bifrost_net::Error::AttemptHistory {
-                            source: Box::new(exhausted),
-                            evidence: bifrost_net::RequestEvidence::new(
-                                Vec::new(),
-                                bifrost_net::CommitEvidence::MayHaveCommitted,
-                            ),
-                        },
-                    ));
-                }
-                return Err(TransportError::from_net(exhausted));
-            }
-            Err(TransportError::from_net(bifrost_net::Error::Status {
-                code: status,
-                body,
-                headers,
-            }))
-        }
     }
 
-    impl ScriptedTransport {
-        fn new(replies: impl IntoIterator<Item = ScriptedReply>) -> Self {
-            Self {
-                requests: Mutex::new(Vec::new()),
-                replies: Mutex::new(replies.into_iter().collect()),
-            }
-        }
-
-        fn requests(&self) -> Vec<Value> {
-            self.requests.lock().expect("script requests lock").clone()
-        }
-
-        fn api_reply(
-            &self,
-            body: Vec<u8>,
-            replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            let request = serde_json::from_slice(&body).map_err(|error| {
-                TransportError::with_source("JMAP client emitted a non-JSON API request", error)
-            })?;
-            let request_number = {
-                let mut requests = self
-                    .requests
-                    .lock()
-                    .map_err(|_| TransportError::new("script requests lock poisoned"))?;
-                requests.push(request);
-                requests.len()
-            };
-            let reply = self
-                .replies
+    fn scripted_server(
+        replies: impl IntoIterator<Item = ScriptedReply>,
+    ) -> Arc<bifrost_net::test_support::ScriptedDispatch> {
+        let replies = Mutex::new(replies.into_iter().collect::<VecDeque<_>>());
+        let served = std::sync::atomic::AtomicUsize::new(0);
+        crate::test_wire::api_server(move |request| {
+            let request_number = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let reply = replies
                 .lock()
-                .map_err(|_| TransportError::new("script replies lock poisoned"))?
+                .expect("script replies lock")
                 .pop_front()
-                .ok_or_else(|| {
-                    TransportError::new(format!(
-                        "scripted JMAP transport exhausted at API request #{request_number}"
-                    ))
-                })?;
+                .unwrap_or_else(|| {
+                    panic!("scripted JMAP server exhausted at API request #{request_number}")
+                });
             if let Some(expected) = &reply.expect_account {
-                let requests = self
-                    .requests
-                    .lock()
-                    .map_err(|_| TransportError::new("script requests lock poisoned"))?;
-                let request = &requests[request_number - 1];
                 let calls = request["methodCalls"]
                     .as_array()
                     .unwrap_or_else(|| panic!("request #{request_number} has no methodCalls"));
                 for call in calls {
-                    // Panic rather than return an error: a routing
-                    // mismatch answered with a TransportError could be
-                    // swallowed by an error-tolerant code path, and the
-                    // whole point of the guard is a loud failure.
+                    // Panic rather than answer: a routing mismatch answered
+                    // with an error could be swallowed by an error-tolerant
+                    // code path, and the whole point of the guard is a loud
+                    // failure.
                     assert_eq!(
                         call[1]["accountId"].as_str(),
                         Some(expected.as_str()),
@@ -1228,42 +1082,93 @@ mod tests {
                     );
                 }
             }
-            reply.into_transport_result(replay)
-        }
+            reply.canned
+        })
     }
 
-    impl HttpTransport for ScriptedTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            self.api_reply(body, replay)
-        }
+    /// Every API request body the client's scripted server received.
+    fn requests(client: &Client) -> Vec<Value> {
+        crate::test_wire::api_bodies(crate::test_wire::script_of(client))
+    }
 
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new(
-                "scripted JMAP transport has no upload reply",
-            ))
-        }
+    /// The engine-facing account is driven the way a consumer builds it:
+    /// `with_net` over a scripted net, so session discovery, the open
+    /// probes and a later `Account` door all cross the production transport
+    /// to a scripted server. No transport generic is needed for this.
+    #[tokio::test]
+    async fn a_whole_account_opens_and_answers_over_a_scripted_net() {
+        let mut session_doc = serde_json::to_value(session()).expect("session serializes");
+        session_doc["apiUrl"] = json!("https://jmap.test/jmap/api");
+        let script = crate::test_wire::server(move |request| {
+            if request.method == reqwest::Method::GET && request.url.path() == "/.well-known/jmap" {
+                return crate::test_wire::ok_json(&session_doc);
+            }
+            if !crate::test_wire::is_api(request) {
+                return crate::test_wire::unexpected(request);
+            }
+            let body = crate::test_wire::body_json(request);
+            let responses = body["methodCalls"]
+                .as_array()
+                .expect("method calls")
+                .iter()
+                .map(|call| {
+                    let name = call[0].as_str().expect("method name");
+                    assert!(
+                        matches!(name, "Email/get" | "Mailbox/get"),
+                        "unexpected method {name}"
+                    );
+                    json!([name, {
+                        "accountId": call[1]["accountId"],
+                        "state": format!("{name}-state"),
+                        "list": [],
+                        "notFound": []
+                    }, call[2]])
+                })
+                .collect::<Vec<_>>();
+            crate::test_wire::ok_json(&json!({
+                "sessionState": "session-1",
+                "methodResponses": responses
+            }))
+        });
+        let factory = JmapAccountFactory::builder(
+            "https://jmap.test",
+            JmapCredentials::Basic {
+                username: "user".to_owned(),
+                password: "secret".into(),
+            },
+        )
+        .with_net(bifrost_net::test_support::scripted_net(
+            &script,
+            bifrost_net::NetConfig::default(),
+        ))
+        .default_retry(bifrost_net::RetryPolicy::disabled())
+        .build();
 
-        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new(
-                "scripted JMAP transport has no download reply",
-            ))
-        }
+        let opened = factory
+            .open(AccountId("whole-account".to_owned()))
+            .await
+            .expect("the account opens over the scripted net");
+        let before = script.requests().len();
+        assert!(
+            before >= 2,
+            "discovery and the open probes reached the wire"
+        );
 
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new(
-                "scripted JMAP transport has no session reply",
+        let established = opened
+            .account
+            .establish_initial_cursor(bifrost_types::CursorScope::Type(
+                bifrost_types::ObjectType::Email,
             ))
-        }
+            .await
+            .expect("an Email cursor establishes");
+        assert!(matches!(
+            established,
+            bifrost_types::CursorEstablishment::Ready(_)
+        ));
+        assert!(
+            script.requests().len() > before,
+            "the Account door reached the scripted server"
+        );
     }
 
     fn session() -> Session {
@@ -1393,9 +1298,7 @@ mod tests {
         ]
     }
 
-    fn scripted_client(
-        replies: impl IntoIterator<Item = ScriptedReply>,
-    ) -> Client<ScriptedTransport> {
+    fn scripted_client(replies: impl IntoIterator<Item = ScriptedReply>) -> Client {
         scripted_client_with_session(session(), replies)
     }
 
@@ -1653,12 +1556,10 @@ mod tests {
             "eventSourceUrl": "https://example.test/events", "state": "s1"
         }))
         .unwrap();
-        let client = Client::with_transport(
-            super::super::registry::RegistryTransport,
+        let client = crate::test_wire::client(
+            &crate::test_wire::server(crate::test_wire::unexpected),
             session,
-            "https://example.test/session",
-        )
-        .unwrap();
+        );
         let mail = client.primary_account::<capability::Mail>().unwrap();
         let limits = mail.client().session().object_limits();
         let mut registry = Registry::new(Slot::from_mail(mail, limits));
@@ -1769,7 +1670,7 @@ mod tests {
                 scripted_client_with_session(serde_json::from_value(doc).unwrap(), [response]);
             let emails = fetch_self_emails(&client, &JmapCredentials::bearer("token")).await;
             assert_eq!(emails, ["self@example.test", "alias@example.test"]);
-            let requests = client.transport().requests.lock().unwrap();
+            let requests = requests(&client);
             assert_eq!(
                 requests[0]["methodCalls"][0][1]["ids"],
                 json!([principal_id])
@@ -1794,7 +1695,7 @@ mod tests {
                 bifrost_types::ProtocolErrorKind::ContractViolation,
             )
         );
-        assert!(client.transport().requests.lock().unwrap().is_empty());
+        assert!(requests(&client).is_empty());
     }
 
     #[test]
@@ -2040,7 +1941,7 @@ mod tests {
             )
         );
         assert!(
-            client.transport().requests().is_empty(),
+            requests(&client).is_empty(),
             "a session the contract already condemns must cost zero requests, \
              not two primary probes and one per share"
         );
@@ -2049,13 +1950,8 @@ mod tests {
     fn scripted_client_with_session(
         session: Session,
         replies: impl IntoIterator<Item = ScriptedReply>,
-    ) -> Client<ScriptedTransport> {
-        Client::with_transport(
-            ScriptedTransport::new(replies),
-            session,
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("scripted client builds")
+    ) -> Client {
+        crate::test_wire::client(&scripted_server(replies), session)
     }
 
     fn assert_open_batch(request: &Value, account_id: &str) {
@@ -2199,7 +2095,7 @@ mod tests {
 
         assert_eq!(primary_seed.0, "email-p");
         assert_eq!(shared_seed.email_state, "email-s");
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 2);
         assert_open_batch(&requests[0], "primary");
         assert_open_batch(&requests[1], "shared");
@@ -2323,7 +2219,7 @@ mod tests {
             Some(bifrost_types::SyncEvent::Done(None))
         ));
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 3);
         for request in [&requests[0], &requests[2]] {
             let query = &request["methodCalls"][0];
@@ -2400,7 +2296,7 @@ mod tests {
             stream.next().await,
             Some(bifrost_types::SyncEvent::Done(None))
         ));
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 5);
         assert_eq!(requests[0]["methodCalls"][0][1]["position"], 0);
         assert_eq!(requests[2]["methodCalls"][0][1]["anchor"], "M1");
@@ -2473,7 +2369,7 @@ mod tests {
             stream.next().await,
             Some(bifrost_types::SyncEvent::Done(None))
         ));
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 5);
         assert_eq!(requests[0]["methodCalls"][0][1]["position"], 0);
         assert_eq!(requests[2]["methodCalls"][0][1]["anchor"], "M1");
@@ -2546,7 +2442,7 @@ mod tests {
             }
         }
         assert!(ids.is_empty());
-        assert!(client.transport().requests().is_empty());
+        assert!(requests(&client).is_empty());
     }
 
     /// Refusal is independent of the scripted response shape: no positional
@@ -2614,7 +2510,7 @@ mod tests {
             }
         }
         assert!(ids.is_empty());
-        assert!(client.transport().requests().is_empty());
+        assert!(requests(&client).is_empty());
     }
 
     /// The consolidated inventory loop must still qualify foreign ids,
@@ -2736,7 +2632,7 @@ mod tests {
             let events: Vec<_> = stream.collect().await;
 
             assert!(
-                client.transport().requests().is_empty(),
+                requests(&client).is_empty(),
                 "{op:?}: an empty flag op must never touch the wire"
             );
             assert_eq!(events.len(), 1, "{op:?}");
@@ -2753,11 +2649,9 @@ mod tests {
         }
     }
 
-    /// The production factory still calls `connect()` and therefore
-    /// hardwires `ReqwestTransport`; this test deliberately exercises the
-    /// generic sync request helper below that boundary. The scripted seam
-    /// records the full Email/set request and returns the same response shape
-    /// bifrost-net gives the JMAP decoder.
+    /// Exercises the sync request helper directly, below the factory. The
+    /// scripted server records the full Email/set request, and its answer
+    /// reaches the JMAP decoder through the production transport.
     #[tokio::test]
     async fn foreign_bulk_flags_use_the_foreign_account_native_id_and_state() {
         let client = scripted_client([email_set_reply(
@@ -2804,7 +2698,7 @@ mod tests {
             Some(bifrost_types::SyncEvent::Done(None))
         ));
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 1);
         let call = &requests[0]["methodCalls"][0];
         assert_eq!(call[0], "Email/set");
@@ -2871,7 +2765,7 @@ mod tests {
         .await
         .expect("foreign keyword mutation succeeds");
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 1);
         let call = &requests[0]["methodCalls"][0];
         assert_eq!(call[0], "Email/set");
@@ -2956,7 +2850,7 @@ mod tests {
             Some(bifrost_types::SyncEvent::Done(None))
         ));
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(
             requests.len(),
             1,
@@ -3020,7 +2914,7 @@ mod tests {
             other => panic!("expected the foreign move batch, got {other:?}"),
         }
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 1);
         let call = &requests[0]["methodCalls"][0];
         assert_eq!(call[1]["accountId"], "shared");
@@ -3061,7 +2955,7 @@ mod tests {
             &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         );
         assert!(
-            client.transport().requests().is_empty(),
+            requests(&client).is_empty(),
             "the rejection has to happen before the Email/set is sent"
         );
     }
@@ -3109,7 +3003,7 @@ mod tests {
             );
         }
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         let accounts: Vec<Value> = requests
             .iter()
             .map(|request| request["methodCalls"][0][1]["accountId"].clone())
@@ -3121,7 +3015,11 @@ mod tests {
         );
     }
 
+    /// An armed script is closed: the first unplanned request panics with its
+    /// ordinal rather than being answered, so no error-tolerant code path can
+    /// swallow it.
     #[tokio::test]
+    #[should_panic(expected = "scripted JMAP server exhausted at API request #2")]
     async fn armed_open_script_fails_at_the_unexpected_request() {
         let client = scripted_client([open_reply("primary", "p")]);
         let primary = client
@@ -3131,16 +3029,7 @@ mod tests {
         seed_account_state(&primary)
             .await
             .expect("first scripted request");
-        let error = seed_account_state(&primary)
-            .await
-            .expect_err("second unscripted request must fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("scripted JMAP transport exhausted at API request #2")
-        );
-        assert_eq!(client.transport().requests().len(), 2);
+        let _ = seed_account_state(&primary).await;
     }
 
     /// `maxCallsInRequest` is a hard limit. RFC 8620 §2 recommends
@@ -3162,7 +3051,7 @@ mod tests {
 
         assert_eq!(seed.0, "email-p");
         assert_eq!(seed.1, "mailbox-p");
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 2, "one request per probe");
         for request in &requests {
             assert_eq!(request["methodCalls"].as_array().map(Vec::len), Some(1));
@@ -3216,7 +3105,7 @@ mod tests {
             .expect("probes must not be refused for want of an advertised limit");
 
         assert_eq!(seed.0, "email-p");
-        assert_eq!(client.transport().requests().len(), 2, "one per probe");
+        assert_eq!(requests(&client).len(), 2, "one per probe");
 
         let error = crate::sync::capabilities::build(
             &client.session(),
@@ -3262,7 +3151,7 @@ mod tests {
             .expect("a zero limit must not brick the probe");
 
         assert_eq!(seed.1, "mailbox-p");
-        assert_eq!(client.transport().requests().len(), 2, "one per probe");
+        assert_eq!(requests(&client).len(), 2, "one per probe");
 
         let error = crate::sync::capabilities::build(
             &client.session(),
@@ -3321,7 +3210,7 @@ mod tests {
         let seed = seed_account_state(&primary).await.expect("serial seed");
 
         assert_eq!(seed.0, "email-p");
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 2, "one request per probe");
     }
 
@@ -3356,7 +3245,7 @@ mod tests {
         };
         assert!(
             matches!(
-                transport.net,
+                transport.net(),
                 Some(bifrost_net::Error::RateLimited {
                     retry_after: Some(_),
                     ..
@@ -3391,7 +3280,7 @@ mod tests {
         };
         assert!(
             matches!(
-                transport.net,
+                transport.net(),
                 Some(bifrost_net::Error::RetryBudgetExhausted { .. })
             ),
             "production never produces Error::Status for a 5xx"
@@ -3422,7 +3311,7 @@ mod tests {
             panic!("a 400 carrying a problem document is a Problem error");
         };
         assert!(matches!(
-            transport.net,
+            transport.net(),
             Some(bifrost_net::Error::Status {
                 code: reqwest::StatusCode::BAD_REQUEST,
                 ..
@@ -3432,9 +3321,11 @@ mod tests {
 
     #[tokio::test]
     async fn scripted_typed_error_reaches_the_sync_request_unchanged() {
-        let client = scripted_client([ScriptedReply::error(TransportError::new(
-            "scripted connection reset",
-        ))]);
+        let client = scripted_client([ScriptedReply::error(bifrost_net::Error::Network {
+            message: "scripted connection reset".into(),
+            transmission_state: bifrost_types::TransmissionState::InFlight,
+            source: None,
+        })]);
         let primary = client
             .primary_account::<capability::Mail>()
             .expect("primary mail account");
@@ -3598,8 +3489,8 @@ mod tests {
 
     fn foreign_map(
         account_id: &str,
-        account: JmapMailAccount<ScriptedTransport>,
-    ) -> Arc<HashMap<crate::core::id::AccountId, JmapMailAccount<ScriptedTransport>>> {
+        account: JmapMailAccount,
+    ) -> Arc<HashMap<crate::core::id::AccountId, JmapMailAccount>> {
         Arc::new(HashMap::from([(account_id.into(), account)]))
     }
 
@@ -3655,7 +3546,7 @@ mod tests {
             other => panic!("expected a schema-incompatible termination, got {other:?}"),
         }
         assert!(
-            client.transport().requests().is_empty(),
+            requests(&client).is_empty(),
             "a stale cursor must not reach Email/changes at all"
         );
     }
@@ -3726,7 +3617,7 @@ mod tests {
                 other => panic!("expected a cursor-invalid termination, got {other:?}"),
             }
             assert!(
-                client.transport().requests().is_empty(),
+                requests(&client).is_empty(),
                 "a mis-keyed cursor must not reach Email/changes at all"
             );
         }
@@ -3777,7 +3668,7 @@ mod tests {
             ]
         );
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 2);
         let thread_get = &requests[0]["methodCalls"][0];
         assert_eq!(thread_get[0], "Thread/get");
@@ -3828,7 +3719,7 @@ mod tests {
             )]
         );
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests[0]["methodCalls"][0][1]["accountId"], "primary");
         assert_eq!(requests[0]["methodCalls"][0][1]["ids"][0], "T9");
     }
@@ -3858,7 +3749,7 @@ mod tests {
         .await
         .expect("the share accepts a keyword on its own thread");
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 2);
         let thread_get = &requests[0]["methodCalls"][0];
         assert_eq!(thread_get[0], "Thread/get");
@@ -3917,7 +3808,7 @@ mod tests {
             Some(bifrost_types::AccountOperation::SetKeyword)
         );
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(
             requests.len(),
             1,
@@ -3950,7 +3841,7 @@ mod tests {
         .await
         .expect("a share-local move is expressible");
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0]["methodCalls"][0][1]["accountId"], "shared");
         assert_eq!(requests[0]["methodCalls"][0][1]["ids"][0], "T9");
@@ -3993,7 +3884,7 @@ mod tests {
             &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         );
         assert!(
-            client.transport().requests().is_empty(),
+            requests(&client).is_empty(),
             "the owner disagreement is caught before anything is sent"
         );
     }
@@ -4029,7 +3920,7 @@ mod tests {
         .await
         .expect("the share trashes its own thread");
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 3);
         for request in &requests {
             assert_eq!(
@@ -4100,7 +3991,7 @@ mod tests {
         .await
         .expect("the share destroys its own trashed thread");
 
-        let requests = client.transport().requests();
+        let requests = requests(&client);
         assert_eq!(requests.len(), 4);
         for request in &requests {
             assert_eq!(
@@ -4138,7 +4029,7 @@ mod tests {
         )
         .await
         .expect("script acknowledges the submitted identity");
-        let calls = client.transport().requests();
+        let calls = requests(&client);
         assert!(
             calls[0]["methodCalls"][0][1]["update"]
                 .get(&qualified)
@@ -4162,7 +4053,7 @@ mod tests {
         )
         .await
         .expect("script acknowledges the submitted container");
-        let calls = client.transport().requests();
+        let calls = requests(&client);
         assert!(
             calls[0]["methodCalls"][0][1]["update"]
                 .get(&qualified)

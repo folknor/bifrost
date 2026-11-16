@@ -6,17 +6,13 @@
 //! refuses. This drives every gated method on the crate's own `Account` impl
 //! and asserts the flag and the observed result agree.
 //!
-//! **Coverage here is one-directional, and in this crate that is forced rather
-//! than chosen.** `JmapAccount` hardwires `ReqwestTransport` in its
-//! `MailAccount` type alias, so there is no seam through which a whole
-//! `Account` call can be driven to a scripted server: the true direction is
-//! simply unreachable from here, and the per-method tests that do exist reach
-//! the generic `pim`/`contacts`/`calendar_ops` helpers instead. What IS
-//! reachable, and is what this file pins, is the false direction: a `false`
-//! flag must make the method refuse locally, without a request. The account
-//! below is built around a real `ReqwestTransport` pointed at an unroutable
-//! host - if any driven method actually issued a request, it would fail with a
-//! transport error rather than `Unsupported`, and the assertion would catch it.
+//! This file pins the false direction: a `false` flag must make the method
+//! refuse locally, without a request. The account below rides a scripted
+//! server that panics on any request, so a driven method that reached the
+//! wire fails loudly rather than answering `Unsupported`. The true direction
+//! needs a scripted server per method; a whole account opened through
+//! `JmapAccountFactory::with_net` over a scripted net reaches it (see
+//! `a_whole_account_opens_and_answers_over_a_scripted_net`).
 //!
 //! The `PimSupport` fixture deliberately declares NOTHING supported, which is
 //! the widest false set the capability builder can produce and therefore the
@@ -26,7 +22,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use bifrost_types::AccountConveniences;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bifrost_types::{
@@ -43,9 +39,7 @@ use tokio_util::sync::CancellationToken;
 use super::account::JmapAccount;
 use super::capabilities::{self, PimSupport};
 use super::push::{PushRouting, ReconnectPolicy, WsState};
-use crate::client::{Authorization, Client};
 use crate::core::session::Session;
-use crate::transport_reqwest::ReqwestTransport;
 
 /// A session advertising the core capability (the builder refuses without it)
 /// and nothing else - no submission, no sieve, no contacts, no calendars, no
@@ -98,17 +92,11 @@ fn account_with_submission(foreign_submission_id: Option<&str>) -> JmapAccount {
 
 fn account_with(submission_available: bool, foreign_submission_id: Option<&str>) -> JmapAccount {
     let session: Session = serde_json::from_str(SESSION).expect("session fixture parses");
-    let transport = ReqwestTransport::new(
-        reqwest::header::HeaderMap::new(),
-        Authorization::Basic(Default::default()),
-        bifrost_types::AccountId("jmap-capability-contract".to_string()),
-        std::time::Duration::from_secs(5),
-        false,
-        Arc::new(HashSet::new()),
-    )
-    .expect("transport builds");
-    let client = Client::with_transport(transport, session.clone(), "https://jmap.invalid/session")
-        .expect("client builds");
+    // No request may reach the wire: every door of this server panics.
+    let client = crate::test_wire::client(
+        &crate::test_wire::server(crate::test_wire::unexpected),
+        session.clone(),
+    );
     let mail = crate::account::Account::new(client.clone(), "acct-1");
 
     let support = PimSupport {
@@ -137,7 +125,6 @@ fn account_with(submission_available: bool, foreign_submission_id: Option<&str>)
     if submission_available {
         registry.families.submission =
             Some(registry.install_family(crate::account::Account::<
-                _,
                 crate::core::capability::Submission,
             >::new(client.clone(), "acct-1")));
     }
@@ -194,9 +181,7 @@ fn send_as_request() -> SendRequest {
 ///
 /// The true direction needs no network seam, because the behaviour under test
 /// IS a local refusal: `route_send_as` runs before a foreign `MailAccount` is
-/// selected. That matters more here than elsewhere, because this crate's
-/// `MailAccount = Account<ReqwestTransport>` alias means no scripted seam
-/// exists at the `Account` level at all.
+/// selected.
 ///
 /// The expected kind is DERIVED from the crate's own flag rather than written
 /// down, which is the whole point: a backend whose flag and behaviour drift

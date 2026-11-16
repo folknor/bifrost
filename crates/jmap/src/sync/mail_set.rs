@@ -1,12 +1,11 @@
 //! Email/set execution and per-target answers shared by bulk and single doors.
 use super::state_cache;
-use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailId, EmailSet};
 use bifrost_types::{
     AccountOperation, BatchFailure, BatchSuccess, ErrorScope, ItemOutcome, MutationSuccess,
     ObjectId,
 };
-type MailAccount<T> = super::registry::Slot<T>;
+type MailAccount = super::registry::Slot;
 
 /// Outlook users expect narrow edits to survive unrelated mailbox activity.
 /// Whole-property replacements use a cached guard with one refusal-only refresh.
@@ -25,8 +24,8 @@ impl Guard<'_> {
     }
 }
 
-pub(super) async fn execute<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn execute(
+    mail: &MailAccount,
     guard: Guard<'_>,
     mut make_set: impl FnMut() -> crate::Result<EmailSet>,
 ) -> crate::Result<crate::core::set::SetResponse<Email>> {
@@ -106,8 +105,8 @@ pub(super) fn classify_set_response(
     }
 }
 
-async fn current_or_probe_state<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn current_or_probe_state(
+    mail: &MailAccount,
 ) -> crate::Result<crate::core::id::ObjectState<Email>> {
     let email_states = &mail.email_states;
 
@@ -118,8 +117,8 @@ async fn current_or_probe_state<T: HttpTransport>(
     Ok(email_states.observe_probe(None, state).await)
 }
 
-pub(crate) async fn probe_email_state<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(crate) async fn probe_email_state(
+    mail: &MailAccount,
 ) -> crate::Result<crate::core::id::ObjectState<Email>> {
     let state = mail
         .call(EmailGet::new().ids(Vec::<EmailId>::new()))

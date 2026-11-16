@@ -9,7 +9,6 @@ use bifrost_types::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::transport::HttpTransport;
 use crate::mailbox::{Mailbox, MailboxChanges, MailboxGet, MailboxId, Property};
 
 use super::capabilities::ObjectLimits;
@@ -26,7 +25,7 @@ pub(crate) struct LifecycleTopology {
 
 type Topology = Arc<Mutex<LifecycleTopology>>;
 
-type MailAccount<T> = crate::account::Account<T, crate::core::capability::Mail>;
+type MailAccount = crate::account::Account<crate::core::capability::Mail>;
 
 pub(crate) fn cursor_scopes(scopes: Vec<CursorScope>) -> AccountStream<SyncEvent<CursorScope>> {
     Box::pin(async_stream::stream! {
@@ -46,8 +45,8 @@ pub(crate) fn cursor_scopes(scopes: Vec<CursorScope>) -> AccountStream<SyncEvent
     })
 }
 
-pub(crate) fn memberships<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn memberships(
+    mail: MailAccount,
     foreign_owners: Vec<MembershipScope>,
 ) -> AccountStream<SyncEvent<MembershipScope>> {
     Box::pin(async_stream::stream! {
@@ -100,8 +99,8 @@ pub(crate) fn memberships<T: HttpTransport>(
     })
 }
 
-pub(crate) async fn fetch_mailbox_names<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(crate) async fn fetch_mailbox_names(
+    mail: &MailAccount,
 ) -> crate::Result<(String, HashMap<String, String>)> {
     let response = mail
         .call(MailboxGet::new().properties([Property::Id, Property::Name]))
@@ -140,12 +139,12 @@ async fn poll_pause(
 
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
 
-pub(crate) fn scope_lifecycle<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn scope_lifecycle(
+    mail: MailAccount,
     limits: ObjectLimits,
     topology: Topology,
     shutdown: CancellationToken,
-    client: crate::client::Client<T>,
+    client: crate::client::Client,
 ) -> AccountStream<ScopeLifecycleEvent> {
     Box::pin(async_stream::stream! {
         let mut session_changes = client.session_changes();
@@ -488,8 +487,8 @@ struct FetchedMailboxes {
 /// function may assume. RFC 8620 s5.1 lets a server refuse a `/get` with
 /// `requestTooLarge` on its own advertised `maxObjectsInGet`, so the
 /// batching is done here, where the limit is known.
-async fn fetch_mailboxes<'a, T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn fetch_mailboxes<'a>(
+    mail: &MailAccount,
     limits: &ObjectLimits,
     ids: impl Iterator<Item = &'a MailboxId>,
 ) -> crate::Result<FetchedMailboxes> {
@@ -528,82 +527,38 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
-    use crate::core::transport::TransportError;
 
-    /// A JMAP HTTP boundary answering a fixed script of response bodies.
-    /// Requests are recorded; an unscripted request is an error rather
-    /// than a plausible answer, so a loop that polls more than the test
-    /// planned for cannot pass quietly.
-    type Recorder = Arc<StdMutex<Vec<serde_json::Value>>>;
+    /// A JMAP server answering a fixed script of response bodies. The
+    /// server's own request record is the test's view of what was sent; an
+    /// unscripted request is an error rather than a plausible answer, so a
+    /// loop that polls more than the test planned for cannot pass quietly.
+    type Recorder = Arc<bifrost_net::test_support::ScriptedDispatch>;
 
-    struct ScriptTransport {
-        replies: StdMutex<VecDeque<String>>,
-        requests: Recorder,
-    }
-
-    impl ScriptTransport {
-        fn new(replies: impl IntoIterator<Item = String>) -> Self {
-            Self::recording(replies, &Recorder::default())
-        }
-
-        fn recording(replies: impl IntoIterator<Item = String>, requests: &Recorder) -> Self {
-            Self {
-                replies: StdMutex::new(replies.into_iter().collect()),
-                requests: Arc::clone(requests),
-            }
-        }
-    }
-
-    impl HttpTransport for ScriptTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, TransportError> {
-            let request: serde_json::Value =
-                serde_json::from_slice(&body).expect("client emits JSON");
-            self.requests
-                .lock()
-                .expect("recorded requests")
-                .push(request);
+    fn script_server(replies: impl IntoIterator<Item = String>) -> Recorder {
+        let replies = StdMutex::new(replies.into_iter().collect::<VecDeque<_>>());
+        crate::test_wire::api_server(move |_| {
             // Exhaustion answers a TERMINAL JMAP error rather than a
             // transport failure. The lifecycle loop retries transport
             // hiccups forever by design, so a transport-shaped
             // exhaustion would turn "the loop polled more than planned"
             // into a hang instead of a failed assertion.
-            match self.replies.lock().expect("script").pop_front() {
-                Some(reply) => Ok(bytes::Bytes::from(reply)),
-                None => Ok(bytes::Bytes::from(
-                    serde_json::json!({
-                        "sessionState": "session-1",
-                        "methodResponses": [[
-                            "error",
-                            {"type": "invalidArguments", "description": "script exhausted"},
-                            "s0"
-                        ]]
-                    })
-                    .to_string(),
-                )),
-            }
-        }
+            crate::test_wire::ok(match replies.lock().expect("script").pop_front() {
+                Some(reply) => reply,
+                None => serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [[
+                        "error",
+                        {"type": "invalidArguments", "description": "script exhausted"},
+                        "s0"
+                    ]]
+                })
+                .to_string(),
+            })
+        })
+    }
 
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, TransportError> {
-            Err(TransportError::new("no upload reply"))
-        }
-
-        async fn download(&self, _url: &str) -> Result<bytes::Bytes, TransportError> {
-            Err(TransportError::new("no download reply"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<bytes::Bytes, TransportError> {
-            Err(TransportError::new("no session reply"))
-        }
+    fn recorded(requests: &Recorder) -> Vec<serde_json::Value> {
+        crate::test_wire::api_bodies(requests)
     }
 
     fn test_session() -> crate::core::session::Session {
@@ -731,13 +686,8 @@ mod tests {
         Topology,
         Recorder,
     ) {
-        let recorder = Recorder::default();
-        let client = crate::client::Client::with_transport(
-            ScriptTransport::recording(replies, &recorder),
-            test_session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let recorder = script_server(replies);
+        let client = crate::test_wire::client(&recorder, test_session());
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
             position: Some("mbx-1".into()),
@@ -798,7 +748,7 @@ mod tests {
             stream.next().await,
             Some(ScopeLifecycleEvent::Polled)
         ));
-        assert_eq!(requests.lock().expect("requests").len(), 2);
+        assert_eq!(recorded(&requests).len(), 2);
         assert_eq!(states.lock().await.position.as_ref(), Some(&"mbx-3".into()));
         shutdown.cancel();
         assert!(stream.next().await.is_none());
@@ -889,7 +839,7 @@ mod tests {
                 Some("mbx-fresh")
             );
             {
-                let requests = requests.lock().expect("requests");
+                let requests = recorded(&requests);
                 assert_eq!(requests.len(), 4);
                 assert_eq!(requests[1]["methodCalls"][0][0], "Mailbox/get");
                 assert!(requests[1]["methodCalls"][0][1]["ids"].is_null());
@@ -918,7 +868,7 @@ mod tests {
                 Some(ScopeLifecycleEvent::Terminated(_))
             ));
             assert_eq!(started.elapsed(), std::time::Duration::ZERO);
-            assert_eq!(requests.lock().expect("requests").len(), expected_requests);
+            assert_eq!(recorded(&requests).len(), expected_requests);
             assert_eq!(
                 states.lock().await.position.clone().as_deref(),
                 Some("mbx-1"),
@@ -948,24 +898,22 @@ mod tests {
             states.lock().await.position.clone().as_deref(),
             Some("mbx-1")
         );
-        assert_eq!(requests.lock().expect("requests").len(), 2);
+        assert_eq!(recorded(&requests).len(), 2);
         assert!(stream.next().await.is_none());
         shutdown.cancel();
     }
 
     #[tokio::test]
     async fn dropping_a_partial_reseed_does_not_hide_undelivered_events() {
-        let client = crate::client::Client::with_transport(
-            ScriptTransport::new([
+        let client = crate::test_wire::client(
+            &script_server([
                 method_failure("cannotCalculateChanges"),
                 snapshot_reply("mbx-fresh", &[("a-new", "New"), ("b-new", "New")]),
                 method_failure("cannotCalculateChanges"),
                 snapshot_reply("mbx-fresh", &[("a-new", "New"), ("b-new", "New")]),
             ]),
             test_session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        );
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
             position: Some("mbx-1".into()),
@@ -1017,17 +965,15 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_partial_changes_page_preserves_names_and_position() {
-        let client = crate::client::Client::with_transport(
-            ScriptTransport::new([
+        let client = crate::test_wire::client(
+            &script_server([
                 changes_reply(&[], &["a-new", "b-new"], &[]),
                 snapshot_reply("mbx-fresh", &[("a-new", "New"), ("b-new", "New")]),
                 changes_reply(&[], &["a-new", "b-new"], &[]),
                 snapshot_reply("mbx-fresh", &[("a-new", "New"), ("b-new", "New")]),
             ]),
             test_session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        );
         let mail = crate::account::Account::new(client.clone(), "primary");
         let states = Arc::new(Mutex::new(LifecycleTopology {
             position: Some("mbx-1".into()),
@@ -1297,7 +1243,7 @@ mod tests {
         // again immediately (`hasMoreChanges` is true and there is no
         // pause), forever against a real server.
         assert_eq!(
-            requests.lock().expect("recorded requests").len(),
+            recorded(&requests).len(),
             1,
             "the poller must not ask again after a page that did not move"
         );
@@ -1328,7 +1274,7 @@ mod tests {
             other => panic!("expected a contract-violation termination, got {other:?}"),
         }
         assert_eq!(
-            requests.lock().expect("recorded requests").len(),
+            recorded(&requests).len(),
             2,
             "the walk stops at the repeat rather than paginating on"
         );
@@ -1364,9 +1310,7 @@ mod tests {
         shutdown.cancel();
         let _drained: Vec<_> = stream.collect().await;
 
-        let gets: Vec<Vec<String>> = requests
-            .lock()
-            .expect("recorded requests")
+        let gets: Vec<Vec<String>> = recorded(&requests)
             .iter()
             .filter_map(|request| {
                 let call = request.get("methodCalls")?.get(0)?;

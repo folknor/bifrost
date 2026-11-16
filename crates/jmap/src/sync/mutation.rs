@@ -8,16 +8,15 @@ use bifrost_types::{
 };
 use futures::StreamExt;
 
-use crate::core::transport::HttpTransport;
 use crate::email::{EmailId, EmailPatch, EmailSet};
 use crate::mailbox::MailboxId;
 
 use super::mail_set::classify_set_response;
 
-type MailAccount<T> = super::registry::Slot<T>;
+type MailAccount = super::registry::Slot;
 
-pub(crate) fn set_flags<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(crate) fn set_flags(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
@@ -44,8 +43,8 @@ pub(crate) fn set_flags<T: HttpTransport>(
     }
 }
 
-pub(crate) fn move_to<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(crate) fn move_to(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
@@ -65,8 +64,8 @@ pub(crate) fn move_to<T: HttpTransport>(
     mutation_stream(foreign_mail, targets, kind)
 }
 
-pub(crate) fn destroy<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(crate) fn destroy(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     targets: AccountStream<ObjectId>,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(foreign_mail, targets, MutationKind::Destroy)
@@ -90,8 +89,8 @@ pub(super) fn caller_state<'a>(
         .transpose()
 }
 
-pub(super) fn versioned_stream<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(super) fn versioned_stream(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     targets: AccountStream<bifrost_types::MailMutationTarget>,
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
@@ -327,8 +326,8 @@ impl RouteBuffers {
     }
 }
 
-fn mutation_stream<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+fn mutation_stream(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     mut targets: AccountStream<ObjectId>,
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
@@ -443,16 +442,16 @@ fn destination_rejection(
     )))
 }
 
-async fn apply_batch<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn apply_batch(
+    mail: &MailAccount,
     kind: &MutationKind,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<MutationSuccess>>>> {
     apply_batch_with_version(mail, kind, batch, None).await
 }
 
-async fn apply_batch_with_version<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn apply_batch_with_version(
+    mail: &MailAccount,
     kind: &MutationKind,
     batch: &mut Vec<ObjectId>,
     expected: Option<&str>,
@@ -693,13 +692,14 @@ mod tests {
     #[derive(Clone)]
     struct FailingSetTransport;
 
-    impl HttpTransport for FailingSetTransport {
-        async fn api_request(
+    // A double's `expect` asserts what the client sent; it is not an error path.
+    #[allow(clippy::unwrap_in_result)]
+    impl crate::test_wire::ServerDouble for FailingSetTransport {
+        fn api_request(
             &self,
             _url: &str,
             body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             let request: serde_json::Value =
                 serde_json::from_slice(&body).expect("request is JSON");
             let calls = request["methodCalls"].as_array().expect("method calls");
@@ -714,35 +714,6 @@ mod tests {
                 .to_string(),
             ))
         }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no upload reply",
-            ))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no download reply",
-            ))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no session reply",
-            ))
-        }
     }
 
     #[derive(Clone)]
@@ -750,13 +721,14 @@ mod tests {
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
     }
 
-    impl HttpTransport for SuccessfulSetTransport {
-        async fn api_request(
+    // A double's `expect` asserts what the client sent; it is not an error path.
+    #[allow(clippy::unwrap_in_result)]
+    impl crate::test_wire::ServerDouble for SuccessfulSetTransport {
+        fn api_request(
             &self,
             _url: &str,
             body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             let request: serde_json::Value =
                 serde_json::from_slice(&body).expect("request is JSON");
             self.requests
@@ -780,42 +752,13 @@ mod tests {
                 .to_string(),
             ))
         }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no upload reply",
-            ))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no download reply",
-            ))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no session reply",
-            ))
-        }
     }
 
-    fn mutation_accounts<T: HttpTransport>(
-        transport: T,
+    fn mutation_accounts(
+        transport: impl Into<crate::transport_reqwest::ReqwestTransport>,
     ) -> (
-        MailAccount<T>,
-        Arc<HashMap<crate::core::id::AccountId, MailAccount<T>>>,
+        MailAccount,
+        Arc<HashMap<crate::core::id::AccountId, MailAccount>>,
     ) {
         let session = serde_json::from_value(serde_json::json!({
             "capabilities": {
@@ -897,13 +840,14 @@ mod tests {
         requests: Arc<StdMutex<Vec<serde_json::Value>>>,
     }
 
-    impl HttpTransport for CallerStateTransport {
-        async fn api_request(
+    // A double's `expect` asserts what the client sent; it is not an error path.
+    #[allow(clippy::unwrap_in_result)]
+    impl crate::test_wire::ServerDouble for CallerStateTransport {
+        fn api_request(
             &self,
             _url: &str,
             body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
             self.requests.lock().unwrap().push(request.clone());
             let call = &request["methodCalls"][0];
@@ -935,24 +879,7 @@ mod tests {
                 .to_string(),
             ))
         }
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            unreachable!()
-        }
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            unreachable!()
-        }
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        fn download(&self, _url: &str) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             unreachable!()
         }
     }

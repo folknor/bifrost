@@ -3,7 +3,6 @@
 use super::checked_timestamp;
 use super::{MailAccount, to_acct_err};
 use crate::core::query;
-use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailGet, EmailId, Property as EmailProperty};
 use crate::mailbox::MailboxId;
 use bifrost_types::{
@@ -74,11 +73,11 @@ fn search_owner(
 /// hydration, there is no stay-literal fallback available here: the id is a
 /// filter operand, so the primary account would answer "no such mailbox"
 /// as an empty page rather than a miss.
-fn route_search<'a, T: HttpTransport>(
-    foreign_mail: &'a crate::sync::registry::Registry<T>,
+fn route_search<'a>(
+    foreign_mail: &'a crate::sync::registry::Registry,
     filter: Option<&SearchFilter>,
     op: AccountOperation,
-) -> Result<(&'a MailAccount<T>, Option<String>), AccountError> {
+) -> Result<(&'a MailAccount, Option<String>), AccountError> {
     let owner = search_owner(filter, op)?;
     match owner {
         None => Ok((&foreign_mail.primary, None)),
@@ -131,8 +130,8 @@ pub(super) fn qualify(owner: Option<&str>, native: String) -> String {
     }
 }
 
-pub(crate) fn search<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(crate) fn search(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
@@ -251,8 +250,8 @@ pub(super) fn reconcile_search_threads(
     (items, failed_ids)
 }
 
-pub(crate) fn search_messages<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(crate) fn search_messages(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
@@ -275,8 +274,8 @@ pub(crate) fn search_messages<T: HttpTransport>(
     })
 }
 
-pub(super) async fn search_email_ids<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn search_email_ids(
+    mail: &MailAccount,
     request: SearchRequest,
     collapse_threads: bool,
     owner: Option<&str>,

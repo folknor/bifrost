@@ -2,7 +2,6 @@
 
 use super::body::address_from_jmap;
 use super::{to_acct_err, unix_to_system_time};
-use crate::core::transport::HttpTransport;
 use crate::email::{
     BodyProperty, Email, EmailBodyPart, EmailGet, EmailId, Property as EmailProperty,
 };
@@ -15,8 +14,8 @@ use bifrost_types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) fn thread_hydrate<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(crate) fn thread_hydrate(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     thread: ThreadId,
 ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
     Box::pin(async move {
@@ -142,8 +141,8 @@ pub(super) fn qualify_foreign_message_ids(
     }
 }
 
-pub(crate) fn message_hydrate<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(crate) fn message_hydrate(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
     message: ObjectId,
     projection: HydrationProjection,
 ) -> AccountFuture<Result<Message, AccountError>> {

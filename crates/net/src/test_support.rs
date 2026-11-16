@@ -157,11 +157,17 @@ pub struct RequestSnapshot {
 /// would let it reach a real socket.
 pub struct ScriptedDispatch {
     steps: Arc<Mutex<VecDeque<Canned>>>,
+    responder: Option<Arc<Responder>>,
     requests: Arc<Mutex<Vec<RequestSnapshot>>>,
     in_flight: Arc<AtomicUsize>,
     peak_in_flight: Arc<AtomicUsize>,
     yield_before_answering: bool,
 }
+
+/// The future a [`ScriptedDispatch::responding`] callback returns.
+pub type ResponderFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Canned> + Send>>;
+
+type Responder = dyn Fn(RequestSnapshot) -> ResponderFuture + Send + Sync;
 
 impl ScriptedDispatch {
     /// Build a dispatcher that answers the given outcomes in order.
@@ -169,6 +175,38 @@ impl ScriptedDispatch {
     pub fn new(steps: impl IntoIterator<Item = Canned>) -> Arc<Self> {
         Arc::new(Self {
             steps: Arc::new(Mutex::new(steps.into_iter().collect())),
+            responder: None,
+            requests: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
+            yield_before_answering: false,
+        })
+    }
+
+    /// Build a dispatcher that computes each outcome from the request.
+    ///
+    /// For a server whose answer depends on what was asked - a protocol
+    /// that echoes request identifiers, or routes on the request body -
+    /// where a fixed order would have to predict the caller's fan-out.
+    /// The answer is still a WIRE outcome, so everything above the wire
+    /// stays the production pipeline; a responder that translated
+    /// statuses into transport errors itself would be restating this
+    /// crate's contract, which is what this module exists to prevent.
+    ///
+    /// The request is recorded at arrival exactly as an ordered script
+    /// records it. The responder then runs once the body has been read,
+    /// with no lock of this dispatcher held, so it may call
+    /// [`Self::requests`]. Its future may wait (on a gate a test
+    /// releases, say), which is how a test holds one request outstanding
+    /// while another proceeds. [`Self::remaining`] is always 0.
+    #[must_use]
+    pub fn responding<F>(responder: F) -> Arc<Self>
+    where
+        F: Fn(RequestSnapshot) -> ResponderFuture + Send + Sync + 'static,
+    {
+        Arc::new(Self {
+            steps: Arc::new(Mutex::new(VecDeque::new())),
+            responder: Some(Arc::new(responder)),
             requests: Arc::new(Mutex::new(Vec::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             peak_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -188,6 +226,7 @@ impl ScriptedDispatch {
     pub fn yielding(steps: impl IntoIterator<Item = Canned>) -> Arc<Self> {
         Arc::new(Self {
             steps: Arc::new(Mutex::new(steps.into_iter().collect())),
+            responder: None,
             requests: Arc::new(Mutex::new(Vec::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             peak_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -211,7 +250,16 @@ impl ScriptedDispatch {
     /// test (one call per wire surface, say) and which need all of them
     /// answered by the single dispatcher their client is attached to.
     /// Appending keeps one total order, which is what the wire has.
+    ///
+    /// # Panics
+    /// Panics on a [`Self::responding`] dispatcher, which never consumes
+    /// ordered steps: appending one would be a scripting mistake silently
+    /// ignored.
     pub fn extend(&self, steps: impl IntoIterator<Item = Canned>) {
+        assert!(
+            self.responder.is_none(),
+            "a responding dispatcher answers from its callback, not from ordered steps"
+        );
         self.steps
             .lock()
             .expect("scripted step lock poisoned")
@@ -262,6 +310,7 @@ impl Dispatch for ScriptedDispatch {
         let in_flight = Arc::clone(&self.in_flight);
         let peak_in_flight = Arc::clone(&self.peak_in_flight);
         let yield_before_answering = self.yield_before_answering;
+        let responder = self.responder.clone();
         Box::pin(async move {
             let mut request = request.build().map_err(send_error_to_error)?;
             // Consume the real Body so admission and framing are exercised
@@ -282,11 +331,19 @@ impl Dispatch for ScriptedDispatch {
                     emitted_body_bytes: 0,
                     timeout: request.timeout().copied(),
                 });
-                let step = steps
-                    .lock()
-                    .expect("scripted step lock poisoned")
-                    .pop_front()
-                    .expect("scripted dispatch exhausted");
+                // A responder computes its step once the body is read; an
+                // ordered script reserves its step at arrival.
+                let step = if responder.is_some() {
+                    None
+                } else {
+                    Some(
+                        steps
+                            .lock()
+                            .expect("scripted step lock poisoned")
+                            .pop_front()
+                            .expect("scripted dispatch exhausted"),
+                    )
+                };
                 (index, step)
             };
             let _in_flight = InFlightGuard::enter(&in_flight, &peak_in_flight);
@@ -322,6 +379,15 @@ impl Dispatch for ScriptedDispatch {
             if yield_before_answering {
                 tokio::task::yield_now().await;
             }
+            let step = match (step, responder) {
+                (Some(step), _) => step,
+                (None, Some(responder)) => {
+                    let snapshot =
+                        requests.lock().expect("scripted request lock poisoned")[index].clone();
+                    responder(snapshot).await
+                }
+                (None, None) => unreachable!("an ordered script reserves its step at arrival"),
+            };
             match step {
                 Canned::Response {
                     status,
@@ -425,6 +491,17 @@ pub fn canned(status: StatusCode, body: &'static [u8]) -> Canned {
     }
 }
 
+/// A canned response with an owned body, for answers computed at run
+/// time (a [`ScriptedDispatch::responding`] callback, typically).
+#[must_use]
+pub fn canned_owned(status: StatusCode, body: impl Into<Bytes>) -> Canned {
+    Canned::Response {
+        status,
+        headers: HeaderMap::new(),
+        body: body.into(),
+    }
+}
+
 /// A canned response carrying headers - `Retry-After`, `Location`,
 /// `WWW-Authenticate`, and friends.
 #[must_use]
@@ -491,5 +568,25 @@ mod cancellation_tests {
         drop(future);
         assert_eq!(script.remaining(), 1);
         assert!(script.requests().is_empty());
+    }
+
+    /// A responder sees the request body it is answering, after the body
+    /// was read, and the request is on the record before it answers.
+    #[tokio::test]
+    async fn a_responder_answers_from_the_request_it_received() {
+        let script = ScriptedDispatch::responding(|request| {
+            let echo = request.body.clone().expect("the body was read first");
+            Box::pin(async move { canned_owned(StatusCode::CREATED, echo) })
+        });
+        let client = reqwest::Client::new();
+        let response = Dispatch::send(&*script, client.post("https://respond.test/").body("ping"))
+            .await
+            .expect("the responder answers");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.bytes().await.expect("body"), "ping");
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body.as_deref(), Some(&b"ping"[..]));
+        assert_eq!(script.remaining(), 0);
     }
 }

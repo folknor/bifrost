@@ -294,11 +294,24 @@ contract for those paths, so the existing boolean operation is kept until it
 is known; switching `false` to `null` alone would leave the array-versus-path
 mismatch in place.
 
-## Internal transport abstraction
+## Transport
 
-`Client<T: HttpTransport = ReqwestTransport>` is generic over transport.
+There is one JMAP transport, `ReqwestTransport` over `bifrost-net`, and
+`Client`, `Request`, `Account<C>` and the sync registry are concrete over it.
+A consumer chooses the HTTP stack by injecting a `bifrost_net::Net`
+(`JmapAccountFactory::with_net`); nothing else is pluggable. The crate once
+carried an `HttpTransport` trait (with `SseTransport` and `BlobTransport`
+beside it) whose only non-reqwest implementors were test doubles. Those
+doubles sat above bifrost-net, so each restated net's status contract, and one
+classification branch existed only for their evidence-free errors. Tests now
+script the wire beneath the production transport instead (see Testing below),
+and every `TransportError` carries its provenance by construction:
+`TransportCause::Net` (the net error) or `TransportCause::Local` (a
+`LocalFailure`), never neither.
 
-- `HttpTransport` - api_request, upload, download, get_session (returns `Bytes`).
+- `ReqwestTransport` doors: `api_request` / `api_request_measured`, `upload`,
+  `download` / `download_measured`, `download_stream`, `get_session` and
+  `open_sse`.
 - `ClientBuilder::connect` probes the RFC 8620 origin-rooted
   `/.well-known/jmap` URL first. If the configured base has a path, only an
   origin 404 triggers a second probe below that path. Other origin errors are
@@ -306,7 +319,7 @@ mismatch in place.
   a malformed body does not trigger a path fallback. The URL that succeeds is
   retained for session refresh. Query and fragment components do not take part
   in discovery.
-- `SseTransport` - open_sse (EventSource, with `last_event_id` support).
+- `open_sse` - EventSource, with `last_event_id` support.
   `Client::event_source()` and everything in `event_source/` (WHATWG-conformant
   SSE parser plus stream driver, hermetically pinned) are `pub(crate)`: they are
   internal surface, not published API, and are kept built and tested even though
@@ -373,8 +386,7 @@ mismatch in place.
   It owns the credential used by HTTP, SSE and WebSocket; HTTP and SSE share
   authorization preparation, and WebSocket reads the transport credential and
   retains its one-shot bearer refresh retry.
-- `blob::download::BlobTransport` extends the buffered transport with an
-  incremental download door. `Client::download_stream(blob, max_bytes)` yields
+- `download_stream` is the incremental download door. `Client::download_stream(blob, max_bytes)` yields
   byte chunks and records request-local inbound traffic as they are polled.
   Production uses net's `send_streaming` with JMAP headers and authorization,
   without the total request deadline. Both buffered production download doors
@@ -382,7 +394,7 @@ mismatch in place.
   net's 64 MiB JSON buffer ceiling. Streaming callers supply their own ceiling;
   the first chunk exceeding it fails with a local limit error and terminates
   the stream. Earlier chunks are incomplete data and must be discarded on error.
-  Buffered custom transports retain their existing contract. The engine-facing
+  The engine-facing
   blob and raw-message facades consume this incremental door with the separate
   512 MiB ceiling. Each transport chunk becomes one batch; one prior chunk is
   held while polling its successor so the final successful batch can carry
@@ -398,8 +410,8 @@ mismatch in place.
   transfer take longer than the small JSON request deadline, while bifrost-net
   still enforces its response-header and body-inactivity bounds. EventSource
   uses the same no-total-deadline policy for its long-lived stream.
-- `Client::with_transport(transport, session, session_url)` - crate-internal custom transport injection. The session URL is required and rejected when empty (`Error::InvalidUrl`, the caller's fault): a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
-- WebSocket remains reqwest-specific (documented).
+- `Client::with_transport(transport, session, session_url)` - test-only construction over a pre-built transport and session, skipping discovery. The session URL is required and rejected when empty (`Error::InvalidUrl`, the caller's fault): a client built without one could never re-fetch its session, so `refresh_session` was a silent no-op against the wrong (empty) URL.
+- WebSocket rides the same transport's credential and net.
 
 The session and everything derived from it (`apiUrl`, cached core limits, and
 the upload / download / EventSource templates parsed into `URLPart`s) live
@@ -459,9 +471,8 @@ normalization; query dots remain literal. Other values are percent-encoded per R
 sufficient here: `+` in a query-position `{type}` would otherwise decode
 server-side as a space, turning `application/ld+json` into `application/ld json`.
 
-All convenience helpers are `impl<Tr: HttpTransport> Client<Tr>` so custom transports get the full API.
-`Client::primary_account::<C>()` returns `Account<Tr, C>` and
-`Account::build()` returns `Request<Tr, C>`. Their ordinary `call` doors and
+`Client::primary_account::<C>()` returns `Account<C>` and
+`Account::build()` returns `Request<C>`. Their ordinary `call` doors and
 request tuple batches require methods with `Cap = C`. There is no generic
 primary-account fallback or production account-id override: selecting Mail
 cannot silently address the Calendars primary, or vice versa.
@@ -516,29 +527,28 @@ one - an absent `pref` is least preferred, never promoted. Reading
 outside 1-100 is not a ranking and reads as absent, so `pref: 0` cannot
 beat every legal rank.
 
-The sync request helpers likewise take capability-scoped `Account<Tr, C>` / `Client<Tr>` with
-`Tr: HttpTransport`; the engine-facing `JmapAccount` remains the reqwest
-production specialization because WebSocket push is reqwest-specific. Factory
-tests use an armed scripted transport that records exact API JSON and derives
-each reply's error shape from the same decision table `crates/net/src/request.rs`
-walks. A 2xx body reaches the protocol decoder. At the net layer, a
-passed-through 3xx carries status + headers AND its body (bifrost-net's redirect
-`PassThrough` arm hands the body up through the same `into_byte_stream` the
-redirects-disabled arm uses, rather than discarding it; a `Location`-less
-redirect carrying an explanatory document therefore arrives intact). The
-production `ReqwestTransport` preserves that evidence, then wraps
-streamed 3xx results in `bifrost_net::Error::UnexpectedResponse`, as described
-under HTTP redirect handling below. The scripted dispatcher pins the net decision and
-response evidence, not the final classification through that JMAP wrapper. A
-second 401 is `AuthLost`; statuses retryable under `RetryPolicy::default()` (429
-plus the 5xx family, read off the policy rather than restated) come back as
-`RateLimited` / `RetryBudgetExhausted` with their final response preserved;
-only a genuinely non-retryable 4xx is returned by bifrost-net itself as
-`Error::Status`. An exhausted script reports the request ordinal rather than
-falling through to a network. Despite the test module's location,
-`AccountFactory::open` itself is not hermetically reachable: its `connect()`
-call hardwires `ReqwestTransport`. The seam covers the generic sync request
-helpers beneath that boundary, not factory connection establishment.
+The sync request helpers take capability-scoped `Account<C>` / `Client`.
+
+## Testing over a scripted wire
+
+Tests drive the production `ReqwestTransport` over
+`bifrost_net::test_support::scripted_net`; a server double (crate-private
+`test_wire`) answers each request the wire received with a wire outcome - a
+status, headers and a body, or a connection failure - and never with a
+transport error. Retry, replay policy, 401 recovery, the concurrency gates and
+the byte meter between the script and the assertion are therefore production
+code, and no double restates net's status contract: a 429 or 5xx reaches the
+JMAP layer as `RateLimited` / `RetryBudgetExhausted` because net produced it.
+Test clients default to `RetryPolicy::disabled()`, so a scripted failure
+surfaces once. A server answering from the request (echoing call ids,
+branching on the method) uses `ScriptedDispatch::responding`; a door a double
+does not serve panics, as an exhausted script does. The engine-facing
+`JmapAccount` is reached the way a consumer builds it:
+`JmapAccountFactory::with_net` over a scripted net opens a whole account
+whose session discovery, open probes and later `Account` doors all cross the
+scripted wire. Only the WebSocket push lane keeps a seam of its own
+(`sync/push.rs::PushTransport`), because its frames do not cross the HTTP
+dispatch a scripted net replaces.
 
 ## Protocol test layout
 
@@ -547,7 +557,7 @@ Wire tests live beside the object or core module they exercise, usually in a
 envelope tests therefore follow their production owners rather than a crate-wide
 review ledger. `core/test_support.rs` contains only the minimal object and method
 doubles shared by the core tests; the request transcript suite owns its own
-in-process transport.
+scripted server.
 
 Feature-local tests inherit the owning module's feature gate. Calendar and
 contact membership, extension and query contracts run independently rather than
@@ -566,7 +576,7 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 - `get.rs` - getters on `T<Get>`, GetObject impl.
 - `set.rs` - builder methods on `T<Set>`, SetObject + SetObjectCreatable impls.
 - `query.rs` - Filter/Comparator enums, QueryObject impl.
-- `helpers.rs` - `impl<Tr: HttpTransport> Client<Tr>` convenience methods.
+- `helpers.rs` - `impl Client` convenience methods.
 
 ## Two data models
 
@@ -593,9 +603,9 @@ object's vocabulary; the two JSON-backed objects retain extension round-trip tes
 - `Field<T>` - three-state nullable: `Omitted` / `Null` / `Value(T)`. Use instead of `Option<Option<T>>`, and instead of sentinels: an empty collection, an empty string and an epoch date are real values, never a stand-in for "clear". At a setter boundary `From<Option<T>>` maps `None` to an explicit `Null`; an untouched property stays `Omitted`. Mailbox role setters and `Filter::role` take `Option<Role>`, where `None` is the explicit null role.
 - `core::patch` - the one owner of PatchObject path handling. `PatchPath::new` builds a path from literal segments with RFC 6901 escaping, so an id containing `/` or `~` cannot retarget the edit; `From<&str>` / `From<String>` accept an already-encoded path as is. `patch::insert` applies RFC 8620's no-overlap rule as latest-setter-wins: an edit removes any earlier edit on the same path, a parent of it or a child of it, while sibling paths survive. `IdSet` builds complete create-time `Id[Boolean]` sets (memberships, keywords) holding only `true` members; `IdSetPatch` edits them by per-member path (`true` to add, `null` to remove) or replaces the whole set. The generated `set_property` goes through `patch::insert`; the raw JSON-map escape hatches (`properties_mut` on `json_object_struct!` types) bypass overlap handling, and a caller writing paths through them owns RFC 8620 overlap validation.
 - `Id<T>` - phantom-typed string ID: `AccountId`, `BlobId`, `State`. Available for incremental adoption.
-- `Account<Tr, C>` - internal capability-scoped account view of `Client`. Use `account.build()` for scoped requests inside the crate.
+- `Account<C>` - internal capability-scoped account view of `Client`. Use `account.build()` for scoped requests inside the crate.
 - `Capability` trait - typed URIs with associated `Config` type.
-- `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. A local failure is marked explicitly (the private `LocalFailure`, set only by the dedicated constructors) and classifies as `Internal(_)` before the net evidence or the no-evidence `Transport(Network)` fallback is consulted; an unmarked error with no net evidence (for example, an in-crate test stub) keeps the fallback. The shared transport kind vocabulary has no unknown-provenance variant, so this legacy custom-transport fallback remains; classification never parses its message. A passed-through 3xx from either default transport door carries net `Status` evidence and is classified as a terminal HTTP failure (see HTTP redirect handling below). Two marks exist. `LocalFailure::InvariantViolated` (`TransportError::invariant` / `invariant_with_source`) is a state impossible by construction, raised before anything was sent, and classifies `Internal(InvariantViolated)`. `LocalFailure::LimitExceeded` (`TransportError::limit_exceeded`) is a bound this crate imposes on a response the protocol leaves unbounded - today only the EventSource over-long block cap - and classifies `Internal(LimitExceeded)`. The central mapping never retries an `Internal` kind. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever, and a tripped EventSource cap classified as a retryable network fault too.
+- `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing. Its `TransportCause` is either `Net` (the bifrost-net error, classified through the shared net mapping) or `Local` (a `LocalFailure`, set only by the dedicated constructors, classified `Internal(_)`). There is no third, evidence-free state, so the shared transport vocabulary never needs an unknown-provenance kind and classification never parses a message. A passed-through 3xx from either default transport door carries net `Status` evidence and is classified as a terminal HTTP failure (see HTTP redirect handling below). Two marks exist. `LocalFailure::InvariantViolated` (`TransportError::invariant` / `invariant_with_source`) is a state impossible by construction, raised before anything was sent, and classifies `Internal(InvariantViolated)`. `LocalFailure::LimitExceeded` (`TransportError::limit_exceeded`) is a bound this crate imposes on a response the protocol leaves unbounded - today only the EventSource over-long block cap - and classifies `Internal(LimitExceeded)`. The central mapping never retries an `Internal` kind. Without the mark, impossible-by-construction states (an unsupported method, an invalid default header, missing credentials) were retried as network faults forever, and a tripped EventSource cap classified as a retryable network fault too.
 
 ## Capabilities
 
@@ -687,7 +697,7 @@ RFC 8620 advertises is on the server's view of the account's concurrent API
 requests, and several call sites - a sync engine running inventory, hydration
 and mutation at once, plus the fan-outs themselves - overlap. So the HTTP
 transport also holds one `bifrost_net::ConcurrencyLimit` sized to the session's
-`maxConcurrentRequests`: `HttpTransport::set_api_concurrency` is called with
+`maxConcurrentRequests`: `ReqwestTransport::set_api_concurrency` is called with
 every session the client installs (`connect`, `with_transport`,
 `refresh_session`), and `ReqwestTransport` gates every `api_request` by it. Only
 the API endpoint is gated - uploads and downloads have their own RFC limits.
@@ -796,7 +806,6 @@ RFC 8620: `null` removes map keys, not `false`. Email `patch` field uses `HashMa
 - `#[serde(skip_serializing_if = "...")]` on optional fields.
 - `Field::is_omitted` for `skip_serializing_if` on `Field<T>` fields (with `#[serde(default)]`).
 - `SetObjectCreatable::new()` initializes optional fields to `None`/`Omitted`, not empty collections.
-- Helper impl blocks use `impl<Tr: HttpTransport> Client<Tr>` (not bare `impl Client`).
 - Dead-code allowances are module-scoped, not crate-wide. Each per-RFC protocol module (object modules, `core`, `blob`, `event_source`, the mailbox rights vocabulary) carries its own `#![allow(dead_code)]` with a one-line reason, because it holds method shapes and builders the Account layer uses only in part. The client, transport, WebSocket and `sync` code keep the lint, and `sync/error.rs` enables it explicitly so an unreachable translation path is reported. The crate root allows dead code only when `sync` is off: without it the crate has no public items, so every crate-private item is unreachable by construction.
 
 ## Account layer
@@ -932,7 +941,7 @@ spawned task behind a shared completion; later callers await that same result.
 
 `Client` carries an optional `ByteTally`; `Client::metered()` / `Account::metered()` hand back a handle over the same transport and session state that reports inbound request bytes into a fresh accumulator, which each sync stream takes at construction and each emitted batch `take`s. `Client::metered_into(&tally)` / `Account::metered_into(&tally)` report into an existing accumulator when one batch crosses differently scoped handles. The tally lives outside `ClientInner` deliberately: forking the inner would fork the session-state mutex, and two clients with independent session state is a correctness bug rather than an accounting detail.
 
-Buffered request counts reach the client through `HttpTransport::api_request_measured` and `HttpTransport::download_measured`, both defaulted trait methods. Their default reports decoded body length, and `ReqwestTransport` overrides them with bifrost-net's request-local counter across retries, redirects and 401 recovery. The incremental `BlobTransport::download_stream` door reports its request-local counter as body chunks are polled. The sync blob and raw-message facades choose the 512 MiB ceiling and take the tally once per emitted chunk batch; for raw reads, the preceding `Email/get` bytes are attributed to the first chunk or, for an empty body, its empty final batch. They retain one prior chunk while polling its successor for final-boundary lookahead. A transfer error terminates without `Done`, so the consumer discards any incomplete prefix. Uploads stay unmetered: the tally is inbound-only, and an upload's inbound leg is the small JSON acknowledgement already counted by the API door.
+Buffered request counts reach the client through `ReqwestTransport::api_request_measured` and `ReqwestTransport::download_measured`, which report bifrost-net's request-local counter across retries, redirects and 401 recovery rather than the decoded body length. The incremental `ReqwestTransport::download_stream` door reports its request-local counter as body chunks are polled. The sync blob and raw-message facades choose the 512 MiB ceiling and take the tally once per emitted chunk batch; for raw reads, the preceding `Email/get` bytes are attributed to the first chunk or, for an empty body, its empty final batch. They retain one prior chunk while polling its successor for final-boundary lookahead. A transfer error terminates without `Done`, so the consumer discards any incomplete prefix. Uploads stay unmetered: the tally is inbound-only, and an upload's inbound leg is the small JSON acknowledgement already counted by the API door.
 
 A guarded bulk batch can require up to four API requests: an initial state probe, `Email/set`, a re-probe after `stateMismatch`, and one retry. For JSON sync paths, each batch emitted after a method-level error carries the measured response bytes; a transport-level error terminates without a batch. Blob streams instead account complete chunks as they are yielded and leave any failed tail out of batch accounting. See "Foreign (shared/delegate) accounts" below.
 
@@ -1755,10 +1764,8 @@ Discovery reads seeded scopes and owner memberships directly from slots, with
 Email then Mailbox first when seeded, followed by shared accounts in lexical
 order. PushRouting is a view holding the same registry Arc; it has no separate
 foreign-scope map. A share added after open is absent from both until reopen.
-The transport-generic registry, including state isolation and optional-family
-selection, is exercised directly by hermetic tests. The engine-facing
-JmapAccount remains pinned to ReqwestTransport; protocol request helpers retain
-their scripted-transport seam.
+The registry, including state isolation and optional-family selection, is
+exercised directly by hermetic tests over a scripted wire.
 
 `containers_list` appends each foreign account's mailboxes with
 `namespace = Shared`, `owner = PrincipalId(accountId)`,
@@ -1923,8 +1930,8 @@ The public operation attaches once; transport and set helpers return typed
 progress. Primary application comes from Application::from_leaf. An unreadable
 send envelope or missing/malformed submission result raises application to
 Uncertain, preserving the protocol leaf and recording the observation barrier.
-Custom transports lacking net evidence are marked InFlight only at the invoked
-send/raw-send/draft-send boundaries. Decode provenance is explicit at the
+Every transport failure carries net or local evidence, so no boundary
+guesses a transmission state for one. Decode provenance is explicit at the
 source: `EnvelopeDecode` covers HTTP envelopes, session/upload documents and
 correlated WebSocket envelopes; `ResultDecode` retains the call id from typed
 method extraction. Both carry acknowledged unreadable-success evidence at every
@@ -2150,7 +2157,7 @@ capability, and the HTTP/WebSocket consumers still need the encoded value.
 Bearer sources continue to use net's shared coordination. The encoded Basic
 value remains reusable credential material despite being base64.
 
-Reusable pre-encoded Basic authorization values use the shared zeroizing `bifrost_net::credentials::Secret`. Problem and method formatting omits raw descriptions and unknown identifiers. Decode diagnostics retain JSON positions and categories without rejected values. Custom transport messages remain private; exact known problem limit names remain available to support.
+Reusable pre-encoded Basic authorization values use the shared zeroizing `bifrost_net::credentials::Secret`. Problem and method formatting omits raw descriptions and unknown identifiers. Decode diagnostics retain JSON positions and categories without rejected values. Exact known problem limit names remain available to support.
 
 WebSocket runtime, frame-write and handshake diagnostics use fixed categories
 instead of formatting foreign errors or their sources. Handshake refusal status

@@ -338,6 +338,21 @@ Narrow edge cases, audits with no known defect, and design work.
   - JMAP: shared-account contacts and calendars have no routing door: the
     optional families live once on `Registry::families` and select the primary
     account (capability question).
+- **Lateral findings from deleting the JMAP transport generic.**
+  - JMAP: `sync/capability_contract_tests.rs` pins only the false direction
+    (a `false` flag refuses locally). A whole `JmapAccount` now opens over a
+    scripted net (`a_whole_account_opens_and_answers_over_a_scripted_net` in
+    `sync/factory.rs`), so the true direction - a `true` flag reaches the wire
+    and the method works - is reachable per method. Design work: one scripted
+    server per gated method, driven through the opened account.
+  - JMAP: the same file's module doc still calls `PimMethodSupport` a
+    hand-maintained mirror of sixty bools; it is macro-generated with a gate
+    per operation.
+  - JMAP: `transport_reqwest.rs` carries a module-wide `#![allow(dead_code)]`
+    justified as a "standalone constructor kept for consumers", but the type
+    is crate-private. Find what the allowance still covers and scope it.
+  - JMAP: `sync/push.rs` `WsState::new` takes a `Client` and a shutdown token
+    it ignores; every caller builds and passes both.
 
 - **Lateral findings from the review of the design-hunt batch, unverified.**
   Each wants its own check and, where marked, a ruling.

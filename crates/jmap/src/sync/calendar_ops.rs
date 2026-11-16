@@ -8,19 +8,18 @@ use crate::calendar_event::{
     CalendarEvent as JmapCalendarEvent, CalendarEventGet, CalendarEventId, CalendarEventSet,
 };
 use crate::core::query::Filter as QueryFilter;
-use crate::core::transport::HttpTransport;
 use crate::sync::page_cursor::PageKind;
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, Calendar, CalendarEvent, EventCreate, EventId,
     EventPatch, EventRange, EventSearchRequest, EventStatus, Page, RsvpStatus,
 };
 
-type CalendarAccount<T> = JmapProtoAccount<T, crate::core::capability::Calendars>;
+type CalendarAccount = JmapProtoAccount<crate::core::capability::Calendars>;
 
 const PAGE_LIMIT: usize = 250;
 
-pub(crate) fn calendars_list<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn calendars_list(
+    calendars: Option<CalendarAccount>,
 ) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
     Box::pin(async move {
         let calendars = require_calendars(calendars, AccountOperation::CalendarsList)?;
@@ -36,8 +35,8 @@ pub(crate) fn calendars_list<T: HttpTransport>(
     })
 }
 
-pub(crate) fn events_in_range<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn events_in_range(
+    calendars: Option<CalendarAccount>,
     range: EventRange,
 ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
     Box::pin(async move {
@@ -115,8 +114,8 @@ fn range_filter(range: &EventRange) -> Result<QueryFilter<EventFilter>, AccountE
     ]))
 }
 
-pub(crate) fn get<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn get(
+    calendars: Option<CalendarAccount>,
     event: EventId,
 ) -> AccountFuture<Result<CalendarEvent, AccountError>> {
     Box::pin(async move {
@@ -139,8 +138,8 @@ pub(crate) fn get<T: HttpTransport>(
     })
 }
 
-pub(crate) fn create<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn create(
+    calendars: Option<CalendarAccount>,
     event: EventCreate,
 ) -> AccountFuture<Result<bifrost_types::Created<EventId>, AccountError>> {
     Box::pin(async move {
@@ -173,8 +172,8 @@ pub(crate) fn create<T: HttpTransport>(
     })
 }
 
-pub(crate) fn update<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn update(
+    calendars: Option<CalendarAccount>,
     event: EventId,
     patch: EventPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -231,15 +230,15 @@ pub(crate) fn update<T: HttpTransport>(
     })
 }
 
-pub(crate) fn delete<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn delete(
+    calendars: Option<CalendarAccount>,
     event: EventId,
 ) -> AccountFuture<Result<(), AccountError>> {
     delete_if_version(calendars, event, None)
 }
 
-pub(crate) fn delete_if_version<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn delete_if_version(
+    calendars: Option<CalendarAccount>,
     event: EventId,
     expected_version: Option<bifrost_types::ServerVersion>,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -265,8 +264,8 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
     })
 }
 
-pub(crate) fn rsvp<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn rsvp(
+    calendars: Option<CalendarAccount>,
     self_emails: Vec<String>,
     event: EventId,
     status: RsvpStatus,
@@ -274,8 +273,8 @@ pub(crate) fn rsvp<T: HttpTransport>(
     rsvp_if_version(calendars, self_emails, event, status, None)
 }
 
-pub(crate) fn rsvp_if_version<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn rsvp_if_version(
+    calendars: Option<CalendarAccount>,
     self_emails: Vec<String>,
     event: EventId,
     status: RsvpStatus,
@@ -309,8 +308,8 @@ pub(crate) fn rsvp_if_version<T: HttpTransport>(
     })
 }
 
-pub(crate) fn search<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+pub(crate) fn search(
+    calendars: Option<CalendarAccount>,
     request: EventSearchRequest,
 ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
     Box::pin(async move {
@@ -402,8 +401,8 @@ struct HydratedEvents {
     failed_ids: Vec<String>,
 }
 
-async fn get_events<T: HttpTransport>(
-    calendars: &CalendarAccount<T>,
+async fn get_events(
+    calendars: &CalendarAccount,
     ids: Vec<CalendarEventId>,
     operation: AccountOperation,
 ) -> Result<HydratedEvents, AccountError> {
@@ -482,8 +481,8 @@ fn reconcile_events(
     HydratedEvents { events, failed_ids }
 }
 
-async fn get_raw_event<T: HttpTransport>(
-    calendars: &CalendarAccount<T>,
+async fn get_raw_event(
+    calendars: &CalendarAccount,
     id: CalendarEventId,
     operation: AccountOperation,
 ) -> Result<(JmapCalendarEvent, bifrost_types::ServerVersion), AccountError> {
@@ -558,10 +557,10 @@ fn usize_to_u64(value: usize, operation: AccountOperation) -> Result<u64, Accoun
     })
 }
 
-fn require_calendars<T: HttpTransport>(
-    calendars: Option<CalendarAccount<T>>,
+fn require_calendars(
+    calendars: Option<CalendarAccount>,
     operation: AccountOperation,
-) -> Result<CalendarAccount<T>, AccountError> {
+) -> Result<CalendarAccount, AccountError> {
     calendars.ok_or_else(|| {
         super::error::unsupported_error(
             operation,

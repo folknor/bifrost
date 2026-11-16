@@ -4,7 +4,6 @@ use serde::ser::{SerializeStruct, SerializeTuple};
 use serde::{Serialize, Serializer};
 
 use crate::client::{Client, SessionState};
-use crate::core::transport::HttpTransport;
 
 use super::capability::{Capability, Core};
 use super::id::AccountId;
@@ -65,12 +64,8 @@ impl Serialize for RawMethodCall {
 }
 
 /// A JMAP request batch.
-pub(crate) struct Request<
-    'x,
-    T: HttpTransport = crate::transport_reqwest::ReqwestTransport,
-    C: Capability = Core,
-> {
-    client: &'x Client<T>,
+pub(crate) struct Request<'x, C: Capability = Core> {
+    client: &'x Client,
     session_state: std::sync::Arc<SessionState>,
     account_id: AccountId,
     capability: PhantomData<fn() -> C>,
@@ -79,7 +74,7 @@ pub(crate) struct Request<
     pub(crate) created_ids: Option<std::collections::HashMap<String, String>>,
 }
 
-impl<T: HttpTransport, C: Capability> Serialize for Request<'_, T, C> {
+impl<C: Capability> Serialize for Request<'_, C> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let field_count = if self.created_ids.is_some() { 3 } else { 2 };
         let mut s = serializer.serialize_struct("Request", field_count)?;
@@ -92,8 +87,8 @@ impl<T: HttpTransport, C: Capability> Serialize for Request<'_, T, C> {
     }
 }
 
-impl<'x, T: HttpTransport, C: Capability> Request<'x, T, C> {
-    fn scoped(client: &'x Client<T>, account_id: AccountId) -> Self {
+impl<'x, C: Capability> Request<'x, C> {
+    fn scoped(client: &'x Client, account_id: AccountId) -> Self {
         let session_state = client.session_state();
         Request {
             using: vec!["urn:ietf:params:jmap:core"],
@@ -131,12 +126,12 @@ impl<'x, T: HttpTransport, C: Capability> Request<'x, T, C> {
         }
     }
 
-    pub(crate) fn for_account(account: &'x crate::account::Account<T, C>) -> Self {
+    pub(crate) fn for_account(account: &'x crate::account::Account<C>) -> Self {
         Self::scoped(account.client(), account.id().clone())
     }
 
     #[cfg(test)]
-    pub(crate) fn test_scoped(client: &'x Client<T>, account_id: impl Into<AccountId>) -> Self {
+    pub(crate) fn test_scoped(client: &'x Client, account_id: impl Into<AccountId>) -> Self {
         Self::scoped(client, account_id.into())
     }
 
@@ -324,9 +319,9 @@ type MethodTupleExtractor<R> = Box<dyn FnOnce(Response) -> crate::Result<R> + Se
 pub(crate) trait MethodTuple<C: Capability>: Sized {
     type Responses;
 
-    fn add_to_request<T: HttpTransport>(
+    fn add_to_request(
         self,
-        request: &mut Request<'_, T, C>,
+        request: &mut Request<'_, C>,
     ) -> Result<MethodTupleExtractor<Self::Responses>, crate::Error>;
 }
 
@@ -338,9 +333,9 @@ macro_rules! impl_method_tuple {
         {
             type Responses = ($($M::Response,)+);
 
-            fn add_to_request<TR: HttpTransport>(
+            fn add_to_request(
                 self,
-                request: &mut Request<'_, TR, C>,
+                request: &mut Request<'_, C>,
             ) -> Result<MethodTupleExtractor<Self::Responses>, crate::Error> {
                 #[allow(non_snake_case)]
                 let ($($M,)+) = self;
@@ -365,7 +360,7 @@ impl_method_tuple!(M1, M2, M3, M4, M5, M6);
 impl_method_tuple!(M1, M2, M3, M4, M5, M6, M7);
 impl_method_tuple!(M1, M2, M3, M4, M5, M6, M7, M8);
 
-impl<T: HttpTransport, C: Capability> Request<'_, T, C> {
+impl<C: Capability> Request<'_, C> {
     /// Send a tuple of methods in one batch and return their typed
     /// responses as a tuple. See the module-level note on result
     /// references.
@@ -395,7 +390,7 @@ impl<T: HttpTransport, C: Capability> Request<'_, T, C> {
 }
 
 #[cfg(feature = "websockets")]
-impl<C: Capability> Request<'_, crate::transport_reqwest::ReqwestTransport, C> {
+impl<C: Capability> Request<'_, C> {
     pub(crate) async fn send_ws(self) -> crate::Result<String> {
         self.client.send_ws(self).await
     }
@@ -408,9 +403,9 @@ impl<C: Capability> Request<'_, crate::transport_reqwest::ReqwestTransport, C> {
     }
 }
 
-impl<'x, T: HttpTransport> Request<'x, T, Core> {
+impl<'x> Request<'x, Core> {
     /// Accountless core requests (Echo and PushSubscription) need no primary.
-    pub(crate) fn new(client: &'x Client<T>) -> Self {
+    pub(crate) fn new(client: &'x Client) -> Self {
         Self::scoped(client, AccountId::new(""))
     }
 }

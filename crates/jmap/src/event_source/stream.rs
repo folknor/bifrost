@@ -3,10 +3,7 @@ use crate::event_source::CalendarAlert;
 use crate::{
     DataType, PushObject,
     client::Client,
-    core::{
-        session::{TemplateValue, expand},
-        transport::{HttpTransport, SseTransport},
-    },
+    core::session::{TemplateValue, expand},
     event_source::{
         Changes, PushNotification,
         parser::{EventParser, EventType},
@@ -97,7 +94,7 @@ fn flatten_push_object(object: PushObject, id: Option<&str>) -> Vec<PushNotifica
     notifications
 }
 
-impl<T: HttpTransport + SseTransport> Client<T> {
+impl Client {
     pub(crate) async fn event_source(
         &self,
         types: Option<impl IntoIterator<Item = DataType>>,
@@ -266,80 +263,35 @@ impl<T: HttpTransport + SseTransport> Client<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_net::test_support::{Canned, ScriptedDispatch};
     use bytes::Bytes;
-    use futures::stream;
     use serde_json::json;
     use std::sync::Arc;
 
-    use crate::core::{
-        session::Session,
-        transport::{HttpTransport, TransportError},
-    };
+    use crate::core::session::Session;
 
-    /// A transport that replays a canned list of SSE frames and refuses
-    /// every other request. One frame per element, so a test can also pin
-    /// how the parser behaves across frame boundaries.
-    struct ScriptedTransport {
-        frames: Vec<Vec<u8>>,
-        opened_urls: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl ScriptedTransport {
-        fn new(frames: Vec<Vec<u8>>) -> Self {
-            Self {
-                frames,
-                opened_urls: Arc::new(std::sync::Mutex::new(Vec::new())),
+    /// A server that answers every EventSource GET with the given frames,
+    /// one wire chunk per element, so a test can also pin how the parser
+    /// behaves across frame boundaries. Any other door panics.
+    fn sse_server(frames: Vec<Vec<u8>>) -> Arc<ScriptedDispatch> {
+        crate::test_wire::server(move |request| {
+            if request.method != reqwest::Method::GET || !request.url.path().starts_with("/es") {
+                return crate::test_wire::unexpected(request);
             }
-        }
+            Canned::Stream {
+                status: reqwest::StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                chunks: frames.iter().cloned().map(Bytes::from).collect(),
+            }
+        })
     }
 
-    impl HttpTransport for ScriptedTransport {
-        async fn api_request(
-            &self,
-            _: &str,
-            _: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            unreachable!("the EventSource test does not make API requests")
-        }
-
-        async fn upload(
-            &self,
-            _: &str,
-            _: Vec<u8>,
-            _: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            unreachable!("the EventSource test does not upload")
-        }
-
-        async fn download(&self, _: &str) -> Result<Bytes, TransportError> {
-            unreachable!("the EventSource test does not download")
-        }
-
-        async fn get_session(&self, _: &str) -> Result<Bytes, TransportError> {
-            unreachable!("the EventSource test receives a pre-fetched session")
-        }
-    }
-
-    impl SseTransport for ScriptedTransport {
-        type ByteStream = stream::Iter<std::vec::IntoIter<Result<Vec<u8>, TransportError>>>;
-
-        async fn open_sse(
-            &self,
-            url: &str,
-            _: Option<&str>,
-        ) -> Result<Self::ByteStream, TransportError> {
-            self.opened_urls
-                .lock()
-                .expect("opened URL lock")
-                .push(url.to_string());
-            Ok(stream::iter(
-                self.frames
-                    .iter()
-                    .map(|frame| Ok(frame.clone()))
-                    .collect::<Vec<_>>(),
-            ))
-        }
+    fn opened_urls(script: &ScriptedDispatch) -> Vec<String> {
+        script
+            .requests()
+            .iter()
+            .map(|request| request.url.to_string())
+            .collect()
     }
 
     const STATE_CHANGE: &str = "data: {\"@type\": \"StateChange\", \"changed\": {}}\n\n";
@@ -347,21 +299,16 @@ mod tests {
     /// The client has to outlive the stream it opens - `event_source` borrows
     /// `&self` - so the two cannot come from one helper without a
     /// self-referential return. Each test binds the client, then the stream.
-    fn client(script: &[&str]) -> Client<ScriptedTransport> {
+    fn client(script: &[&str]) -> Client {
         client_frames(script.iter().map(|f| f.as_bytes().to_vec()).collect())
     }
 
-    fn client_frames(script: Vec<Vec<u8>>) -> Client<ScriptedTransport> {
-        Client::with_transport(
-            ScriptedTransport::new(script),
-            session(),
-            "https://example.org/.well-known/jmap",
-        )
-        .expect("client accepts the test session")
+    fn client_frames(script: Vec<Vec<u8>>) -> Client {
+        crate::test_wire::client(&sse_server(script), session())
     }
 
     async fn events(
-        client: &Client<ScriptedTransport>,
+        client: &Client,
     ) -> impl Stream<Item = crate::Result<PushNotification>> + Unpin {
         client
             .event_source(None::<Vec<DataType>>, false, None, None)
@@ -419,12 +366,8 @@ mod tests {
             "state": "s0"
         }))
         .expect("test session decodes");
-        let client = Client::with_transport(
-            ScriptedTransport::new(vec![STATE_CHANGE.as_bytes().to_vec()]),
-            session,
-            "https://example.org/.well-known/jmap",
-        )
-        .expect("an unusable eventSourceUrl does not stop the client building");
+        let client =
+            crate::test_wire::client(&sse_server(vec![STATE_CHANGE.as_bytes().to_vec()]), session);
 
         match client
             .event_source(None::<Vec<DataType>>, false, None, None)
@@ -441,18 +384,15 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_types_are_expanded_and_dot_path_values_are_encoded() {
-        let transport = ScriptedTransport::new(Vec::new());
-        let opened_urls = Arc::clone(&transport.opened_urls);
+        let script = sse_server(Vec::new());
         let mut session = serde_json::to_value(session()).expect("session serializes");
         session["eventSourceUrl"] = json!(
             "https://example.org/es/{types}?types={types}&closeafter={closeafter}&ping={ping}"
         );
-        let client = Client::with_transport(
-            transport,
+        let client = crate::test_wire::client(
+            &script,
             serde_json::from_value(session).expect("session parses"),
-            "https://example.org/.well-known/jmap",
-        )
-        .expect("client builds");
+        );
 
         let _events = client
             .event_source(
@@ -468,23 +408,20 @@ mod tests {
             .expect("non-empty type list opens EventSource");
 
         assert_eq!(
-            *opened_urls.lock().expect("opened URL lock"),
+            opened_urls(&script),
             vec!["https://example.org/es/%252E%252E,Email?types=..,Email&closeafter=no&ping=0"]
         );
     }
 
     #[tokio::test]
     async fn dot_only_type_is_encoded_in_a_path_substitution() {
-        let transport = ScriptedTransport::new(Vec::new());
-        let opened_urls = Arc::clone(&transport.opened_urls);
+        let script = sse_server(Vec::new());
         let mut session = serde_json::to_value(session()).expect("session serializes");
         session["eventSourceUrl"] = json!("https://example.org/es/{types}");
-        let client = Client::with_transport(
-            transport,
+        let client = crate::test_wire::client(
+            &script,
             serde_json::from_value(session).expect("session parses"),
-            "https://example.org/.well-known/jmap",
-        )
-        .expect("client builds");
+        );
 
         let _events = client
             .event_source(
@@ -496,7 +433,7 @@ mod tests {
             .await
             .expect("non-empty type list opens EventSource");
 
-        let opened = opened_urls.lock().expect("opened URL lock");
+        let opened = opened_urls(&script);
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].as_str(), "https://example.org/es/%252E%252E");
         assert_eq!(
@@ -513,11 +450,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_types_list_is_refused_before_opening_eventsource() {
-        let transport = ScriptedTransport::new(Vec::new());
-        let opened_urls = Arc::clone(&transport.opened_urls);
-        let client =
-            Client::with_transport(transport, session(), "https://example.org/.well-known/jmap")
-                .expect("client builds");
+        let script = sse_server(Vec::new());
+        let client = crate::test_wire::client(&script, session());
 
         let error = client
             .event_source(Some(Vec::<DataType>::new()), false, None, None)
@@ -526,7 +460,7 @@ mod tests {
             .expect("an empty type set has no valid RFC 8620 representation");
 
         assert!(matches!(error, crate::Error::InvalidUrl(_)));
-        assert!(opened_urls.lock().expect("opened URL lock").is_empty());
+        assert!(script.requests().is_empty());
     }
 
     #[tokio::test]

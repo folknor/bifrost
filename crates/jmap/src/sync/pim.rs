@@ -27,10 +27,10 @@ pub(crate) use submission::{
     cancel_scheduled_send, draft_send, reschedule_send, send_message, send_raw_message,
 };
 
-type MailAccount<T> = super::registry::Slot<T>;
-type SubmissionAccount<T> = super::registry::Slot<T, crate::core::capability::Submission>;
-type VacationAccount<T> = super::registry::Slot<T, crate::core::capability::VacationResponseCap>;
-type QuotaAccount<T> = super::registry::Slot<T, crate::core::capability::Quota>;
+type MailAccount = super::registry::Slot;
+type SubmissionAccount = super::registry::Slot<crate::core::capability::Submission>;
+type VacationAccount = super::registry::Slot<crate::core::capability::VacationResponseCap>;
+type QuotaAccount = super::registry::Slot<crate::core::capability::Quota>;
 
 use bifrost_types::{AccountError, AccountOperation};
 use std::time::{SystemTime, UNIX_EPOCH};

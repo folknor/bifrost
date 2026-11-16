@@ -7,7 +7,6 @@ use crate::{
     core::{
         id::{AccountId, BlobId},
         session::{TemplateValue, expand},
-        transport::HttpTransport,
     },
 };
 
@@ -33,7 +32,7 @@ pub(crate) struct UploadResponse {
     size: usize,
 }
 
-impl<Tr: HttpTransport> Client<Tr> {
+impl Client {
     /// Upload `data` to the named account's blob store. Lower-level
     /// counterpart to [`Account::upload`] for callers that need the
     /// raw [`UploadResponse`] (echoing server-reported size, etc.).
@@ -72,7 +71,7 @@ impl<Tr: HttpTransport> Client<Tr> {
     }
 }
 
-impl<Tr: HttpTransport, C: crate::core::capability::Capability> Account<Tr, C> {
+impl<C: crate::core::capability::Capability> Account<C> {
     /// Upload `data` to this account's blob store.
     ///
     /// The returned [`BlobRef`] is bound to this account and carries
@@ -129,51 +128,24 @@ impl UploadResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use bytes::Bytes;
     use serde_json::json;
 
     use crate::{
         client::Client,
-        core::{
-            id::AccountId,
-            session::Session,
-            transport::{HttpTransport, TransportError},
-        },
+        core::{id::AccountId, session::Session},
     };
 
-    struct UrlCapture(Arc<Mutex<Option<String>>>);
-
-    impl HttpTransport for UrlCapture {
-        async fn api_request(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not call the API"))
-        }
-
-        async fn upload(
-            &self,
-            url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            *self.0.lock().expect("capture lock") = Some(url.to_string());
-            Ok(Bytes::from_static(
-                br#"{"accountId":"a","blobId":"b","type":"text/plain","size":4}"#,
-            ))
-        }
-
-        async fn download(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not download"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport has no session route"))
-        }
+    fn upload_server() -> std::sync::Arc<bifrost_net::test_support::ScriptedDispatch> {
+        crate::test_wire::server(|request| {
+            assert_eq!(
+                request.method,
+                reqwest::Method::POST,
+                "only uploads reach this server"
+            );
+            crate::test_wire::ok(
+                &br#"{"accountId":"a","blobId":"b","type":"text/plain","size":4}"#[..],
+            )
+        })
     }
 
     fn session() -> Session {
@@ -213,35 +185,26 @@ mod tests {
     /// percent-encoded, not just the two query delimiters.
     #[tokio::test]
     async fn account_id_is_rfc6570_level_one_encoded() {
-        let captured = Arc::new(Mutex::new(None));
-        let client = Client::with_transport(
-            UrlCapture(Arc::clone(&captured)),
-            session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let script = upload_server();
+        let client: Client = crate::test_wire::client(&script, session());
 
         client
             .upload_to(&AccountId::new("a&b=c+d;e@f"), b"data".to_vec(), None)
             .await
             .expect("upload runs");
 
-        let url = captured.lock().expect("capture lock").clone().expect("url");
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
         assert_eq!(
-            url,
+            requests[0].url.as_str(),
             "https://example.test/upload?account=a%26b%3Dc%2Bd%3Be%40f"
         );
     }
 
     #[tokio::test]
     async fn upload_larger_than_the_session_limit_never_reaches_the_transport() {
-        let captured = Arc::new(Mutex::new(None));
-        let client = Client::with_transport(
-            UrlCapture(Arc::clone(&captured)),
-            session_with_upload_limit(3),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let script = upload_server();
+        let client: Client = crate::test_wire::client(&script, session_with_upload_limit(3));
 
         let error = client
             .upload_to(&AccountId::new("a"), b"four".to_vec(), None)
@@ -251,23 +214,18 @@ mod tests {
             error,
             crate::Error::UploadSizeLimit { max: 3, size: 4 }
         ));
-        assert_eq!(*captured.lock().expect("capture lock"), None);
+        assert!(script.requests().is_empty());
     }
 
     #[tokio::test]
     async fn upload_equal_to_the_session_limit_is_allowed() {
-        let captured = Arc::new(Mutex::new(None));
-        let client = Client::with_transport(
-            UrlCapture(Arc::clone(&captured)),
-            session_with_upload_limit(4),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let script = upload_server();
+        let client: Client = crate::test_wire::client(&script, session_with_upload_limit(4));
 
         client
             .upload_to(&AccountId::new("a"), b"four".to_vec(), None)
             .await
             .expect("an upload at the advertised maximum is allowed");
-        assert!(captured.lock().expect("capture lock").is_some());
+        assert_eq!(script.requests().len(), 1);
     }
 }

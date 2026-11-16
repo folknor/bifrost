@@ -55,7 +55,7 @@ struct WebSocketRequest<'a, 'client, C: crate::core::capability::Capability> {
     // Request owns the envelope schema for both HTTP and WebSocket. Flattening
     // adds only RFC 8887 metadata without a second method-call encoder.
     #[serde(flatten)]
-    request: &'a Request<'client, crate::transport_reqwest::ReqwestTransport, C>,
+    request: &'a Request<'client, C>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -605,7 +605,7 @@ impl Client {
     /// Use [`Client::send_ws_awaiting`] to get the correlated response.
     pub(crate) async fn send_ws<C: crate::core::capability::Capability>(
         &self,
-        request: Request<'_, crate::transport_reqwest::ReqwestTransport, C>,
+        request: Request<'_, C>,
     ) -> crate::Result<String> {
         let (frame, request_id) = self.encode_ws_request(request)?;
         let mut sink = self.connection.sink.lock().await;
@@ -632,7 +632,7 @@ impl Client {
     /// account currently uses the WebSocket connection only for push.
     pub(crate) async fn send_ws_awaiting<C: crate::core::capability::Capability>(
         &self,
-        request: Request<'_, crate::transport_reqwest::ReqwestTransport, C>,
+        request: Request<'_, C>,
     ) -> crate::Result<PendingResponse> {
         let (frame, request_id) = self.encode_ws_request(request)?;
         let mut sink = self.connection.sink.lock().await;
@@ -660,7 +660,7 @@ impl Client {
     /// the frame, envelope and `requestId` included.
     fn encode_ws_request<C: crate::core::capability::Capability>(
         &self,
-        request: Request<'_, crate::transport_reqwest::ReqwestTransport, C>,
+        request: Request<'_, C>,
     ) -> crate::Result<(String, String)> {
         // Assign a request id. The counter is the CLIENT's, so ids do not
         // repeat across reconnects: a per-connection counter restarted at
@@ -1006,9 +1006,9 @@ mod tests {
         assert_eq!(push_state.as_deref(), Some("ps-9"));
     }
 
-    /// Stub read half of a JMAP WebSocket. Same shape as the stub
-    /// `HttpTransport` / `SseTransport` doubles the blob and EventSource
-    /// tests use: a canned transcript replayed in order, no socket.
+    /// Stub read half of a JMAP WebSocket: a canned transcript replayed in
+    /// order, no socket. WebSocket frames do not cross the HTTP dispatch a
+    /// scripted net replaces, so this lane keeps a stub of its own.
     struct StubWsTransport {
         frames: Vec<Result<Message, tokio_websockets::Error>>,
     }
@@ -1780,10 +1780,7 @@ mod tests {
     impl Client {
         /// A request whose encoded frame comfortably exceeds a 400-byte
         /// limit, built from ordinary method calls.
-        fn build_oversized_request(
-            &self,
-        ) -> Request<'_, crate::transport_reqwest::ReqwestTransport, crate::core::capability::Mail>
-        {
+        fn build_oversized_request(&self) -> Request<'_, crate::core::capability::Mail> {
             let mut request = Request::test_scoped(self, "A1");
             for _ in 0..16 {
                 request

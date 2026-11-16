@@ -9,13 +9,13 @@ use bifrost_types::{
 };
 
 use crate::blob::BlobRef;
-use crate::blob::download::{BlobStream, BlobTransport, DEFAULT_MAX_BLOB_SIZE};
+use crate::blob::download::{BlobStream, DEFAULT_MAX_BLOB_SIZE};
 use crate::client::ByteTally;
 use crate::core::id::BlobId;
 use crate::email::{EmailGet, EmailId, Property};
 
-pub(crate) fn open<T: BlobTransport>(
-    foreign_accounts: Arc<super::registry::Registry<T>>,
+pub(crate) fn open(
+    foreign_accounts: Arc<super::registry::Registry>,
     handle: BlobHandle,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
@@ -59,8 +59,8 @@ pub(crate) fn open<T: BlobTransport>(
 /// of that blob. The `hydrate.rs` raw-projection fatal is intentionally
 /// untouched: hydration's raw projection is A1's concern; this is the
 /// dedicated raw read.
-pub(crate) fn open_raw_rfc822<T: BlobTransport>(
-    foreign_accounts: Arc<super::registry::Registry<T>>,
+pub(crate) fn open_raw_rfc822(
+    foreign_accounts: Arc<super::registry::Registry>,
     message: ObjectId,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
@@ -271,7 +271,7 @@ pub(crate) fn open_range(
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use bifrost_types::{PageBoundary, SyncEvent};
@@ -351,101 +351,65 @@ mod tests {
         }
     }
 
-    /// A boundary that answers one `Email/get` and then streams its blob.
-    struct MeteredBlobTransport;
-
-    /// What the API leg reports as its request-local inbound total.
-    const API_BYTES_IN: u64 = 4_096;
     const RAW: &[u8] = b"From: a@example.test\r\n\r\nbody";
+    const REDIRECT_BODY: &[u8] = b"moved: see the Location header";
 
-    impl crate::core::transport::HttpTransport for MeteredBlobTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            let request: serde_json::Value =
-                serde_json::from_slice(&body).expect("the client emits JSON");
-            let call = &request["methodCalls"][0];
-            assert_eq!(call[0], "Email/get");
-            let call_id = call[2].clone();
-            let response = serde_json::json!({
-                "sessionState": "session-1",
-                "methodResponses": [[
-                    "Email/get",
-                    {
-                        "accountId": "primary",
-                        "state": "s1",
-                        "list": [{"id": "M1", "blobId": "B1"}],
-                        "notFound": []
-                    },
-                    call_id
-                ]]
-            });
-            Ok(bytes::Bytes::from(response.to_string()))
-        }
-
-        async fn api_request_measured(
-            &self,
-            url: &str,
-            body: Vec<u8>,
-            replay: bifrost_net::ReplayPolicy,
-        ) -> Result<(bytes::Bytes, u64), crate::core::transport::TransportError> {
-            Ok((self.api_request(url, body, replay).await?, API_BYTES_IN))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no upload"))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "the sync blob facade must use the streaming door",
-            ))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no session"))
-        }
+    /// A server that answers one `Email/get` and streams its blob in
+    /// five-byte wire chunks. `api_len` records the length of the API
+    /// answer it sent, which is what the production meter must count.
+    fn metered_server(api_len: Arc<AtomicU64>) -> Arc<bifrost_net::test_support::ScriptedDispatch> {
+        let redirected = std::sync::atomic::AtomicBool::new(false);
+        crate::test_wire::server(move |request| match request.method {
+            // The first API POST is redirected with a body, which the
+            // redirect walk drains: request-local wire bytes the decoded
+            // answer cannot see, and which the meter must still count.
+            reqwest::Method::POST if !redirected.swap(true, Ordering::SeqCst) => {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    reqwest::header::LOCATION,
+                    reqwest::header::HeaderValue::from_static("https://example.test/jmap/api"),
+                );
+                api_len.fetch_add(REDIRECT_BODY.len() as u64, Ordering::SeqCst);
+                bifrost_net::test_support::Canned::Response {
+                    status: reqwest::StatusCode::TEMPORARY_REDIRECT,
+                    headers,
+                    body: bytes::Bytes::from_static(REDIRECT_BODY),
+                }
+            }
+            reqwest::Method::POST => {
+                let call = &crate::test_wire::body_json(request)["methodCalls"][0];
+                assert_eq!(call[0], "Email/get");
+                let response = serde_json::json!({
+                    "sessionState": "session-1",
+                    "methodResponses": [[
+                        "Email/get",
+                        {
+                            "accountId": "primary",
+                            "state": "s1",
+                            "list": [{"id": "M1", "blobId": "B1"}],
+                            "notFound": []
+                        },
+                        call[2].clone()
+                    ]]
+                })
+                .to_string();
+                api_len.fetch_add(response.len() as u64, Ordering::SeqCst);
+                crate::test_wire::ok(response)
+            }
+            reqwest::Method::GET => bifrost_net::test_support::Canned::Stream {
+                status: reqwest::StatusCode::OK,
+                headers: reqwest::header::HeaderMap::new(),
+                chunks: RAW.chunks(5).map(bytes::Bytes::copy_from_slice).collect(),
+            },
+            _ => crate::test_wire::unexpected(request),
+        })
     }
 
-    impl crate::blob::download::BlobTransport for MeteredBlobTransport {
-        async fn download_stream(
-            &self,
-            _url: &str,
-            max_bytes: u64,
-        ) -> Result<crate::blob::download::BlobDownload, crate::core::transport::TransportError>
-        {
-            assert!(RAW.len() as u64 <= max_bytes);
-            let chunks = RAW
-                .chunks(5)
-                .map(bytes::Bytes::copy_from_slice)
-                .collect::<Vec<_>>();
-            let body = futures::stream::iter(
-                chunks
-                    .into_iter()
-                    .map(Ok::<_, crate::core::transport::TransportError>),
-            );
-            Ok(crate::blob::download::BlobDownload {
-                body: Box::pin(body),
-                bytes_in: bifrost_net::RequestByteCounter::new(),
-            })
-        }
+    fn metered_client() -> crate::client::Client {
+        metered_client_recording(Arc::new(AtomicU64::new(0)))
     }
 
-    fn metered_client() -> crate::client::Client<MeteredBlobTransport> {
+    fn metered_client_recording(api_len: Arc<AtomicU64>) -> crate::client::Client {
         let session: crate::core::session::Session = serde_json::from_value(serde_json::json!({
             "capabilities": {
                 "urn:ietf:params:jmap:core": {
@@ -473,12 +437,7 @@ mod tests {
             "state": "session-1"
         }))
         .expect("session parses");
-        crate::client::Client::with_transport(
-            MeteredBlobTransport,
-            session,
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds")
+        crate::test_wire::client(&metered_server(api_len), session)
     }
 
     fn batches(events: &[SyncEvent<bytes::Bytes>]) -> Vec<&bifrost_types::Batch<bytes::Bytes>> {
@@ -515,7 +474,7 @@ mod tests {
                 ),
                 std::sync::Arc::new(std::collections::HashMap::<
                     crate::core::id::AccountId,
-                    crate::sync::registry::Slot<_>,
+                    crate::sync::registry::Slot,
                 >::new()),
             )),
             handle,
@@ -547,17 +506,19 @@ mod tests {
 
     /// A raw RFC822 read is two requests. The Email/get bytes are attributed
     /// once, to the first streamed chunk batch, and are not repeated on later
-    /// batches.
+    /// batches; each batch also carries the blob bytes the wire delivered
+    /// for its own chunk, as the production meter counts them.
     #[tokio::test]
     async fn a_raw_read_accounts_for_the_api_leg_once_across_chunk_batches() {
-        let client = metered_client();
+        let api_len = Arc::new(AtomicU64::new(0));
+        let client = metered_client_recording(Arc::clone(&api_len));
         let mail = crate::sync::registry::Slot::new(client.clone(), "primary");
         let events = super::open_raw_rfc822(
             std::sync::Arc::new(crate::sync::registry::Registry::from_test(
                 mail,
                 std::sync::Arc::new(std::collections::HashMap::<
                     crate::core::id::AccountId,
-                    crate::sync::registry::Slot<_>,
+                    crate::sync::registry::Slot,
                 >::new()),
             )),
             bifrost_types::ObjectId("M1".to_string()),
@@ -566,19 +527,27 @@ mod tests {
         .await;
 
         let batches = batches(&events);
-        assert_eq!(batches.len(), RAW.chunks(5).count());
-        assert_eq!(batches[0].bytes_in, API_BYTES_IN);
-        assert!(batches[1..].iter().all(|batch| batch.bytes_in == 0));
+        let api_len = api_len.load(Ordering::SeqCst);
+        assert!(api_len > 0, "the Email/get leg reached the server");
+        let chunk_lens = RAW
+            .chunks(5)
+            .map(|chunk| chunk.len() as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), chunk_lens.len());
+        assert_eq!(batches[0].bytes_in, api_len + chunk_lens[0]);
+        for (batch, chunk_len) in batches[1..].iter().zip(&chunk_lens[1..]) {
+            assert_eq!(batch.bytes_in, *chunk_len, "the API leg is counted once");
+        }
         assert_eq!(
             batches.iter().map(|batch| batch.bytes_in).sum::<u64>(),
-            API_BYTES_IN,
+            api_len + RAW.len() as u64,
         );
     }
 
     #[tokio::test]
     async fn an_empty_stream_preserves_the_api_count_in_its_final_batch() {
         let (metered, tally) = metered_client().metered();
-        metered.record_bytes_in(API_BYTES_IN);
+        metered.record_bytes_in(4_096);
         let body = futures::stream::empty::<
             Result<bytes::Bytes, crate::core::transport::TransportError>,
         >();
@@ -595,7 +564,7 @@ mod tests {
             panic!("expected an empty final batch and Done, got {events:?}");
         };
         assert_eq!(batch.items, vec![bytes::Bytes::new()]);
-        assert_eq!(batch.bytes_in, API_BYTES_IN);
+        assert_eq!(batch.bytes_in, 4_096);
         assert_eq!(batch.page_boundary, PageBoundary::Final);
     }
 

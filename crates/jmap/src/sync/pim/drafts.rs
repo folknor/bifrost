@@ -6,7 +6,6 @@ use super::body::{
 use super::containers::role_mailbox;
 use super::mail_mutation::{destroy_emails, send_email_set};
 use super::{MailAccount, to_acct_err};
-use crate::core::transport::HttpTransport;
 use crate::email::{EmailId, EmailPatch, EmailSet};
 use crate::sync::error::answer_error;
 use crate::sync::state_cache;
@@ -14,8 +13,8 @@ use bifrost_types::{AccountError, AccountFuture, AccountOperation, AccountStream
 use bytes::Bytes;
 use futures::StreamExt;
 
-pub(crate) fn attachment_upload<T: HttpTransport, C: crate::core::capability::Capability>(
-    mail: crate::sync::registry::Slot<T, C>,
+pub(crate) fn attachment_upload<C: crate::core::capability::Capability>(
+    mail: crate::sync::registry::Slot<C>,
     mut bytes: AccountStream<Result<Bytes, AccountError>>,
     mime: String,
 ) -> AccountFuture<Result<bifrost_types::AttachmentHandle, AccountError>> {
@@ -55,8 +54,8 @@ pub(crate) fn attachment_upload<T: HttpTransport, C: crate::core::capability::Ca
     })
 }
 
-pub(crate) fn draft_create<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn draft_create(
+    mail: MailAccount,
     patch: bifrost_types::DraftPatch,
 ) -> AccountFuture<Result<bifrost_types::Created<bifrost_types::DraftHandle>, AccountError>> {
     let email_states = mail.email_states.clone();
@@ -98,8 +97,8 @@ pub(crate) fn draft_create<T: HttpTransport>(
     })
 }
 
-pub(crate) fn draft_update<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn draft_update(
+    mail: MailAccount,
     draft: bifrost_types::DraftHandle,
     patch: bifrost_types::DraftPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -129,8 +128,8 @@ pub(crate) fn draft_update<T: HttpTransport>(
     })
 }
 
-pub(crate) fn draft_discard<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn draft_discard(
+    mail: MailAccount,
     draft: bifrost_types::DraftHandle,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {

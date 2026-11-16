@@ -819,7 +819,7 @@ mod tests {
                 other => panic!("{site}: expected a transport error, got {other:?}"),
             };
             assert_eq!(
-                transport.local,
+                transport.local_failure(),
                 Some(crate::core::transport::LocalFailure::LimitExceeded),
                 "{site}"
             );

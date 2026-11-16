@@ -10,8 +10,6 @@ use bifrost_types::{CursorScope, MembershipScope, OpaqueChangeState};
 use crate::account::Account;
 use crate::core::capability::{self, Capability};
 use crate::core::id::AccountId;
-use crate::core::transport::HttpTransport;
-use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::ObjectLimits;
 use super::foreign;
@@ -41,8 +39,8 @@ impl std::borrow::Borrow<str> for AccountKey {
 
 /// A handle and its observation cache travel together. Network metering may
 /// fork a handle, but must never fork its account's observations.
-pub(crate) struct Slot<T: HttpTransport = ReqwestTransport, C: Capability = capability::Mail> {
-    pub(crate) mail: Account<T, C>,
+pub(crate) struct Slot<C: Capability = capability::Mail> {
+    pub(crate) mail: Account<C>,
     pub(crate) limits: ObjectLimits,
     pub(crate) email_states: StateCache,
     pub(crate) scopes: Vec<(CursorScope, OpaqueChangeState)>,
@@ -50,7 +48,7 @@ pub(crate) struct Slot<T: HttpTransport = ReqwestTransport, C: Capability = capa
     shared: bool,
 }
 
-impl<T: HttpTransport, C: Capability> Clone for Slot<T, C> {
+impl<C: Capability> Clone for Slot<C> {
     fn clone(&self) -> Self {
         Self {
             mail: self.mail.clone(),
@@ -63,8 +61,8 @@ impl<T: HttpTransport, C: Capability> Clone for Slot<T, C> {
     }
 }
 
-impl<T: HttpTransport, C: Capability> Slot<T, C> {
-    pub(crate) fn from_mail(mail: Account<T, C>, limits: ObjectLimits) -> Self {
+impl<C: Capability> Slot<C> {
+    pub(crate) fn from_mail(mail: Account<C>, limits: ObjectLimits) -> Self {
         Self {
             mail,
             limits,
@@ -76,7 +74,7 @@ impl<T: HttpTransport, C: Capability> Slot<T, C> {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(client: crate::client::Client<T>, id: impl Into<AccountId>) -> Self {
+    pub(crate) fn new(client: crate::client::Client, id: impl Into<AccountId>) -> Self {
         let mail = Account::new(client, id);
         let limits = mail.client().session().object_limits();
         let primary = mail
@@ -92,7 +90,7 @@ impl<T: HttpTransport, C: Capability> Slot<T, C> {
     }
 
     /// Cross-family views keep the exact account, limits and observation cell.
-    pub(crate) fn view<D: Capability>(&self) -> crate::Result<Slot<T, D>> {
+    pub(crate) fn view<D: Capability>(&self) -> crate::Result<Slot<D>> {
         Ok(Slot {
             mail: self.mail.view()?,
             limits: self.limits,
@@ -142,31 +140,18 @@ impl<T: HttpTransport, C: Capability> Slot<T, C> {
 // are not optional fields of a Mail slot: Contacts and Calendars can belong to
 // accounts with no Mail capability at all. Shared Mail submission support lives
 // on the selected Mail slot and does not change these primary-family doors.
-pub(crate) struct Families<T: HttpTransport = ReqwestTransport> {
-    pub(crate) submission: Option<Slot<T, capability::Submission>>,
-    pub(crate) vacation: Option<Slot<T, capability::VacationResponseCap>>,
-    pub(crate) quota: Option<Slot<T, capability::Quota>>,
-    pub(crate) sieve: Option<Slot<T, capability::Sieve>>,
-    pub(crate) contacts: Option<Slot<T, capability::Contacts>>,
-    pub(crate) calendars: Option<Slot<T, capability::Calendars>>,
+#[derive(Default)]
+pub(crate) struct Families {
+    pub(crate) submission: Option<Slot<capability::Submission>>,
+    pub(crate) vacation: Option<Slot<capability::VacationResponseCap>>,
+    pub(crate) quota: Option<Slot<capability::Quota>>,
+    pub(crate) sieve: Option<Slot<capability::Sieve>>,
+    pub(crate) contacts: Option<Slot<capability::Contacts>>,
+    pub(crate) calendars: Option<Slot<capability::Calendars>>,
     pub(crate) max_delayed_send: usize,
 }
 
-impl<T: HttpTransport> Default for Families<T> {
-    fn default() -> Self {
-        Self {
-            submission: None,
-            vacation: None,
-            quota: None,
-            sieve: None,
-            contacts: None,
-            calendars: None,
-            max_delayed_send: 0,
-        }
-    }
-}
-
-impl<T: HttpTransport> Families<T> {
+impl Families {
     fn states(&self, id: &AccountId) -> Option<StateCache> {
         macro_rules! find {
             ($($field:ident),+) => { $(if let Some(slot) = &self.$field {
@@ -180,14 +165,14 @@ impl<T: HttpTransport> Families<T> {
 
 /// The only owner lookup. Departed is deliberately distinct from Primary:
 /// scope and search doors refuse it, object doors preserve the literal id.
-pub(crate) enum Route<'a, T: HttpTransport> {
-    Primary(&'a Slot<T>),
-    Shared(&'a Slot<T>),
+pub(crate) enum Route<'a> {
+    Primary(&'a Slot),
+    Shared(&'a Slot),
     Departed,
 }
 
-impl<'a, T: HttpTransport> Route<'a, T> {
-    pub(crate) fn reachable(self) -> Option<&'a Slot<T>> {
+impl<'a> Route<'a> {
+    pub(crate) fn reachable(self) -> Option<&'a Slot> {
         match self {
             Self::Primary(slot) | Self::Shared(slot) => Some(slot),
             Self::Departed => None,
@@ -195,14 +180,14 @@ impl<'a, T: HttpTransport> Route<'a, T> {
     }
 }
 
-pub(crate) struct Registry<T: HttpTransport = ReqwestTransport> {
-    pub(crate) primary: Slot<T>,
-    accounts: BTreeMap<AccountKey, Slot<T>>,
-    pub(crate) families: Families<T>,
+pub(crate) struct Registry {
+    pub(crate) primary: Slot,
+    accounts: BTreeMap<AccountKey, Slot>,
+    pub(crate) families: Families,
 }
 
-impl<T: HttpTransport> Registry<T> {
-    pub(crate) fn new(primary: Slot<T>) -> Self {
+impl Registry {
+    pub(crate) fn new(primary: Slot) -> Self {
         Self {
             primary,
             accounts: BTreeMap::new(),
@@ -210,7 +195,7 @@ impl<T: HttpTransport> Registry<T> {
         }
     }
 
-    pub(crate) fn insert_shared(&mut self, mut slot: Slot<T>) {
+    pub(crate) fn insert_shared(&mut self, mut slot: Slot) {
         slot.shared = true;
         self.accounts
             .insert(AccountKey(slot.mail.id().clone()), slot);
@@ -219,7 +204,7 @@ impl<T: HttpTransport> Registry<T> {
     /// Optional families keep typed handles, sharing an observation cell with
     /// any family already installed for the same accountId. Never manufacture a
     /// Mail handle for a contacts-only or calendars-only account.
-    pub(crate) fn install_family<C: Capability>(&mut self, handle: Account<T, C>) -> Slot<T, C> {
+    pub(crate) fn install_family<C: Capability>(&mut self, handle: Account<C>) -> Slot<C> {
         let mut slot = Slot::from_mail(handle, self.primary.limits);
         if let Some(existing) = self.slot_by_id(slot.id()) {
             slot.email_states = existing.email_states.clone();
@@ -231,7 +216,7 @@ impl<T: HttpTransport> Registry<T> {
         slot
     }
 
-    pub(crate) fn slot_by_id(&self, id: &AccountId) -> Option<&Slot<T>> {
+    pub(crate) fn slot_by_id(&self, id: &AccountId) -> Option<&Slot> {
         if id == self.primary.mail.id() {
             Some(&self.primary)
         } else {
@@ -241,27 +226,27 @@ impl<T: HttpTransport> Registry<T> {
 
     pub(crate) fn family<'a, C: Capability>(
         &self,
-        family: &'a Option<Slot<T, C>>,
-    ) -> Option<&'a Slot<T, C>> {
+        family: &'a Option<Slot<C>>,
+    ) -> Option<&'a Slot<C>> {
         family.as_ref()
     }
 
-    pub(crate) fn shared(&self) -> impl Iterator<Item = (&AccountId, &Slot<T>)> {
+    pub(crate) fn shared(&self) -> impl Iterator<Item = (&AccountId, &Slot)> {
         self.accounts
             .iter()
             .filter(|(_, slot)| slot.shared)
             .map(|(key, slot)| (&key.0, slot))
     }
 
-    pub(crate) fn shared_slot(&self, id: &str) -> Option<&Slot<T>> {
+    pub(crate) fn shared_slot(&self, id: &str) -> Option<&Slot> {
         self.accounts.get(id).filter(|slot| slot.shared)
     }
 
-    pub(crate) fn route(&self, id: JmapRef<'_>) -> Route<'_, T> {
+    pub(crate) fn route(&self, id: JmapRef<'_>) -> Route<'_> {
         self.route_owner(id.owner)
     }
 
-    pub(crate) fn route_owner(&self, owner: Owner<'_>) -> Route<'_, T> {
+    pub(crate) fn route_owner(&self, owner: Owner<'_>) -> Route<'_> {
         match owner {
             Owner::Primary => Route::Primary(&self.primary),
             Owner::Shared(owner) => match self.shared_slot(owner) {
@@ -274,14 +259,14 @@ impl<T: HttpTransport> Registry<T> {
     /// Object lookup's departed policy: keep the complete consumer id on the
     /// primary wire. An Outlook user must never see a colliding primary item
     /// as the vanished shared item.
-    pub(crate) fn object(&self, raw: &str) -> &Slot<T> {
+    pub(crate) fn object(&self, raw: &str) -> &Slot {
         match self.route(JmapRef::parse(raw)) {
             Route::Primary(slot) | Route::Shared(slot) => slot,
             Route::Departed => &self.primary,
         }
     }
 
-    pub(crate) fn scope(&self, scope: &CursorScope) -> Route<'_, T> {
+    pub(crate) fn scope(&self, scope: &CursorScope) -> Route<'_> {
         match scope {
             CursorScope::Folder(folder) => self.route(JmapRef::parse(&folder.0)),
             _ => Route::Primary(&self.primary),
@@ -321,24 +306,24 @@ impl<T: HttpTransport> Registry<T> {
     }
 }
 
-impl<T: HttpTransport, C: Capability> std::ops::Deref for Slot<T, C> {
-    type Target = Account<T, C>;
+impl<C: Capability> std::ops::Deref for Slot<C> {
+    type Target = Account<C>;
     fn deref(&self) -> &Self::Target {
         &self.mail
     }
 }
 
 #[cfg(test)]
-impl<T: HttpTransport, C: Capability> From<Account<T, C>> for Slot<T, C> {
-    fn from(mail: Account<T, C>) -> Self {
+impl<C: Capability> From<Account<C>> for Slot<C> {
+    fn from(mail: Account<C>) -> Self {
         Self::new(mail.client().clone(), mail.id().clone())
     }
 }
 
 #[cfg(test)]
-impl<T: HttpTransport> Registry<T> {
-    pub(crate) fn from_test<H: Clone + Into<Slot<T>>>(
-        primary: impl Into<Slot<T>>,
+impl Registry {
+    pub(crate) fn from_test<H: Clone + Into<Slot>>(
+        primary: impl Into<Slot>,
         shared: Arc<HashMap<AccountId, H>>,
     ) -> Self {
         let mut primary = primary.into();
@@ -358,8 +343,8 @@ impl<T: HttpTransport> Registry<T> {
         self
     }
 
-    pub(crate) fn from_test_states<H: Clone + Into<Slot<T>>>(
-        primary: impl Into<Slot<T>>,
+    pub(crate) fn from_test_states<H: Clone + Into<Slot>>(
+        primary: impl Into<Slot>,
         shared: Arc<HashMap<AccountId, H>>,
         limits: ObjectLimits,
         states: StateMap,
@@ -374,43 +359,7 @@ impl<T: HttpTransport> Registry<T> {
 }
 
 #[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct RegistryTransport;
-
-#[cfg(test)]
-impl HttpTransport for RegistryTransport {
-    async fn api_request(
-        &self,
-        _: &str,
-        _: Vec<u8>,
-        _: bifrost_net::ReplayPolicy,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        panic!("registry fixture must not perform I/O")
-    }
-    async fn upload(
-        &self,
-        _: &str,
-        _: Vec<u8>,
-        _: Option<&str>,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        panic!("registry fixture must not upload")
-    }
-    async fn download(
-        &self,
-        _: &str,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        panic!("registry fixture must not download")
-    }
-    async fn get_session(
-        &self,
-        _: &str,
-    ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-        panic!("registry fixture must not fetch a session")
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_registry(primary: &str, scopes: &[CursorScope]) -> Registry<RegistryTransport> {
+pub(crate) fn test_registry(primary: &str, scopes: &[CursorScope]) -> Registry {
     let session = serde_json::from_value(serde_json::json!({
         "capabilities": {}, "accounts": {}, "primaryAccounts": {"urn:ietf:params:jmap:mail": primary},
         "username": "test", "apiUrl": "https://example.test/jmap",
@@ -418,12 +367,11 @@ pub(crate) fn test_registry(primary: &str, scopes: &[CursorScope]) -> Registry<R
         "uploadUrl": "https://example.test/{accountId}",
         "eventSourceUrl": "https://example.test/events", "state": "s1"
     })).unwrap();
-    let client = crate::client::Client::with_transport(
-        RegistryTransport,
+    // The fixture must not perform I/O: every door panics.
+    let client = crate::test_wire::client(
+        &crate::test_wire::server(crate::test_wire::unexpected),
         session,
-        "https://example.test/session",
-    )
-    .unwrap();
+    );
     let mut registry = Registry::new(Slot::new(client.clone(), primary));
     for kind in [
         bifrost_types::ObjectType::Email,
@@ -586,7 +534,6 @@ mod tests {
             Some("primary-state")
         );
         registry.families.submission = Some(registry.install_family(Account::<
-            _,
             capability::Submission,
         >::new(
             registry.primary.client().clone(),
@@ -602,7 +549,7 @@ mod tests {
                 .as_deref(),
             Some("primary-state")
         );
-        let other = Account::<_, capability::Submission>::new(
+        let other = Account::<capability::Submission>::new(
             registry.primary.client().clone(),
             "submission-only",
         );

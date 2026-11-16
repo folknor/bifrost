@@ -2,7 +2,6 @@
 
 use super::{MailAccount, to_acct_err};
 use crate::core::SetCreate;
-use crate::core::transport::HttpTransport;
 use crate::email::{
     DRAFT_KEYWORD, EmailAddress as JmapEmailAddress, EmailBodyPart, EmailBodyValue, EmailPatch,
 };
@@ -13,8 +12,8 @@ use std::collections::HashMap;
 
 const ATTACHMENT_HANDLE_PREFIX: &str = "jmap:";
 
-pub(super) async fn build_email_create_from_send<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn build_email_create_from_send(
+    mail: &MailAccount,
     request: bifrost_types::SendRequest,
     mailbox: MailboxId,
 ) -> Result<crate::email::EmailCreate, AccountError> {
@@ -55,8 +54,8 @@ pub(super) async fn build_email_create_from_send<T: HttpTransport>(
     Ok(create)
 }
 
-pub(super) async fn build_email_create_from_draft<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn build_email_create_from_draft(
+    mail: &MailAccount,
     patch: bifrost_types::DraftPatch,
     mailbox: MailboxId,
     op: AccountOperation,
@@ -95,8 +94,8 @@ pub(super) async fn build_email_create_from_draft<T: HttpTransport>(
     Ok(create)
 }
 
-async fn apply_body_to_create<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn apply_body_to_create(
+    mail: &MailAccount,
     create: &mut crate::email::EmailCreate,
     patch: bifrost_types::DraftPatch,
     op: AccountOperation,
@@ -128,8 +127,8 @@ async fn apply_body_to_create<T: HttpTransport>(
     Ok(())
 }
 
-pub(super) async fn apply_draft_patch_to_email_patch<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn apply_draft_patch_to_email_patch(
+    mail: &MailAccount,
     email_patch: &mut EmailPatch,
     patch: bifrost_types::DraftPatch,
     op: AccountOperation,
@@ -249,8 +248,8 @@ pub(super) struct BuiltBody {
     pub(super) attachments: Vec<EmailBodyPart>,
 }
 
-pub(super) async fn build_body<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn build_body(
+    mail: &MailAccount,
     text: Option<String>,
     html: Option<String>,
     inline: Vec<bifrost_types::AttachmentInline>,
@@ -375,8 +374,8 @@ pub(super) fn decode_attachment_handle(handle: &str) -> Option<(String, String, 
     Some((account, blob, mime))
 }
 
-async fn copy_attachment_blob<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn copy_attachment_blob(
+    mail: &MailAccount,
     source_account: &str,
     blob_id: String,
     op: AccountOperation,

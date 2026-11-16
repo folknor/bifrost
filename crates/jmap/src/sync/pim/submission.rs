@@ -5,7 +5,6 @@ use super::containers::{missing_role_mailbox, role_mailboxes};
 use super::mail_mutation::destroy_emails;
 use super::settings::{foreign_sending_identity, primary_sending_identity};
 use super::{MailAccount, SubmissionAccount, checked_timestamp, to_acct_err};
-use crate::core::transport::HttpTransport;
 use crate::email::{DRAFT_KEYWORD, Email, EmailGet, EmailId, EmailSet, Property as EmailProperty};
 use crate::email_submission::{Address as SubmissionAddress, EmailSubmissionSet, UndoStatus};
 use crate::identity::IdentityId as JmapIdentityId;
@@ -317,8 +316,8 @@ fn implicit_sent_copy(
     }
 }
 
-pub(crate) fn send_message<T: HttpTransport>(
-    mail: SubmissionAccount<T>,
+pub(crate) fn send_message(
+    mail: SubmissionAccount,
     max_delayed_send: usize,
     foreign: Option<ForeignSubmission>,
     mut request: bifrost_types::SendRequest,
@@ -607,8 +606,8 @@ pub(crate) fn send_message<T: HttpTransport>(
     })
 }
 
-pub(crate) fn send_raw_message<T: HttpTransport>(
-    mail: SubmissionAccount<T>,
+pub(crate) fn send_raw_message(
+    mail: SubmissionAccount,
     raw: Bytes,
     save_to_sent: Option<bool>,
 ) -> AccountFuture<Result<bifrost_types::SendReceipt, AccountError>> {
@@ -785,10 +784,7 @@ pub(crate) fn send_raw_message<T: HttpTransport>(
 /// (mapped to `Protocol(PartialResponse)`, which `from_error` would call
 /// `Failed` for its acknowledged evidence) is `Unconfirmed` - the destroy may
 /// have applied.
-async fn discard_created_send_email<T: HttpTransport>(
-    mail: &MailAccount<T>,
-    email_id: &EmailId,
-) -> CompensationOutcome {
+async fn discard_created_send_email(mail: &MailAccount, email_id: &EmailId) -> CompensationOutcome {
     match destroy_emails(mail, [email_id.clone()], AccountOperation::Send).await {
         Ok(()) => CompensationOutcome::Succeeded,
         Err(error)
@@ -805,8 +801,8 @@ async fn discard_created_send_email<T: HttpTransport>(
     }
 }
 
-pub(crate) fn draft_send<T: HttpTransport>(
-    mail: SubmissionAccount<T>,
+pub(crate) fn draft_send(
+    mail: SubmissionAccount,
     draft: bifrost_types::DraftHandle,
 ) -> AccountFuture<Result<bifrost_types::SendReceipt, AccountError>> {
     let email_states = mail.email_states.clone();
@@ -894,8 +890,8 @@ fn submission_address_from_compose(address: &bifrost_types::Address) -> Submissi
 
 /// Cancel a scheduled JMAP submission by id: `EmailSubmission/set`
 /// update setting `undoStatus: canceled`.
-pub(crate) fn cancel_scheduled_send<T: HttpTransport>(
-    submission_account: SubmissionAccount<T>,
+pub(crate) fn cancel_scheduled_send(
+    submission_account: SubmissionAccount,
     handle: ObjectId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -927,8 +923,8 @@ pub(crate) fn cancel_scheduled_send<T: HttpTransport>(
 /// reschedule: cancel the existing submission and create a new one
 /// referencing the same `emailId` with the new `holduntil`. Returns the
 /// new submission id.
-pub(crate) fn reschedule_send<T: HttpTransport>(
-    submission_account: SubmissionAccount<T>,
+pub(crate) fn reschedule_send(
+    submission_account: SubmissionAccount,
     max_delayed_send: usize,
     handle: ObjectId,
     scheduled: SystemTime,
@@ -1025,8 +1021,8 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
         // The replacement create's application: `from_leaf` (a `notCreated`
         // refusal is `NotApplied`; a transport drop or `serverPartialFail`
         // is already `Uncertain`), raised to `Uncertain` only for an
-        // undecodable or missing result, or an evidence-less transport
-        // failure, and never over explicit `Unsent` evidence: a refused
+        // undecodable or missing result, or a wire transport failure, and
+        // never over explicit `Unsent` evidence: a refused
         // connection on the create must not be declared uncertain.
         let replacement_error = |error: crate::Error| {
             let raisable = matches!(
@@ -1035,7 +1031,7 @@ pub(crate) fn reschedule_send<T: HttpTransport>(
                     | crate::Error::ResultDecode { .. }
                     | crate::Error::IdUnanswered { .. }
                     | crate::Error::CallNotFound(_)
-            ) || matches!(&error, crate::Error::Transport(transport) if transport.local.is_none());
+            ) || matches!(&error, crate::Error::Transport(transport) if transport.local_failure().is_none());
             let error = answer_error(AccountOperation::RescheduleSend)(error);
             let unsent = error.chain().iter().any(|cause| {
                 matches!(

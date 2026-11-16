@@ -23,15 +23,14 @@ use crate::contact_card::{
     ContactCardPatch, ContactCardQuery, ContactCardSet,
 };
 use crate::core::SetCreate;
-use crate::core::transport::HttpTransport;
 use crate::sync::page_cursor::PageKind;
 
-type ContactAccount<T> = JmapProtoAccount<T, crate::core::capability::Contacts>;
+type ContactAccount = JmapProtoAccount<crate::core::capability::Contacts>;
 
 const PAGE_LIMIT: usize = 100;
 
-pub(crate) fn address_books_list<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+pub(crate) fn address_books_list(
+    contacts: Option<ContactAccount>,
 ) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
     Box::pin(async move {
         let contacts = require_contacts(contacts, AccountOperation::AddressBooksList)?;
@@ -47,8 +46,8 @@ pub(crate) fn address_books_list<T: HttpTransport>(
     })
 }
 
-pub(crate) fn list<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+pub(crate) fn list(
+    contacts: Option<ContactAccount>,
     address_book: Option<SharedAddressBookId>,
     page_cursor: Option<bifrost_types::PageCursor>,
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
@@ -107,8 +106,8 @@ pub(crate) fn list<T: HttpTransport>(
     })
 }
 
-pub(crate) fn get<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+pub(crate) fn get(
+    contacts: Option<ContactAccount>,
     contact: ContactId,
 ) -> AccountFuture<Result<ContactCard, AccountError>> {
     Box::pin(async move {
@@ -144,8 +143,8 @@ pub(crate) fn get<T: HttpTransport>(
     })
 }
 
-pub(crate) fn create<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+pub(crate) fn create(
+    contacts: Option<ContactAccount>,
     contact: ContactCreate,
 ) -> AccountFuture<Result<bifrost_types::Created<ContactId>, AccountError>> {
     Box::pin(async move {
@@ -168,8 +167,8 @@ pub(crate) fn create<T: HttpTransport>(
     })
 }
 
-pub(crate) fn update<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+pub(crate) fn update(
+    contacts: Option<ContactAccount>,
     contact: ContactId,
     patch: ContactPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -232,15 +231,15 @@ pub(crate) fn update<T: HttpTransport>(
     })
 }
 
-pub(crate) fn delete<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+pub(crate) fn delete(
+    contacts: Option<ContactAccount>,
     contact: ContactId,
 ) -> AccountFuture<Result<(), AccountError>> {
     delete_if_version(contacts, contact, None)
 }
 
-pub(crate) fn delete_if_version<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+pub(crate) fn delete_if_version(
+    contacts: Option<ContactAccount>,
     contact: ContactId,
     expected_version: Option<bifrost_types::ServerVersion>,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -266,8 +265,8 @@ pub(crate) fn delete_if_version<T: HttpTransport>(
     })
 }
 
-pub(crate) fn search<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+pub(crate) fn search(
+    contacts: Option<ContactAccount>,
     request: ContactSearchRequest,
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
     Box::pin(async move {
@@ -336,8 +335,8 @@ struct HydratedCards {
     failed_ids: Vec<String>,
 }
 
-async fn get_cards<T: HttpTransport>(
-    contacts: &ContactAccount<T>,
+async fn get_cards(
+    contacts: &ContactAccount,
     ids: Vec<ContactCardId>,
     operation: AccountOperation,
 ) -> Result<HydratedCards, AccountError> {
@@ -1043,10 +1042,10 @@ fn usize_to_u64(value: usize, operation: AccountOperation) -> Result<u64, Accoun
     })
 }
 
-fn require_contacts<T: HttpTransport>(
-    contacts: Option<ContactAccount<T>>,
+fn require_contacts(
+    contacts: Option<ContactAccount>,
     operation: AccountOperation,
-) -> Result<ContactAccount<T>, AccountError> {
+) -> Result<ContactAccount, AccountError> {
     contacts.ok_or_else(|| {
         super::error::unsupported_error(
             operation,
@@ -1121,13 +1120,14 @@ mod tests {
         sets: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
-    impl crate::core::transport::HttpTransport for UnansweredGetTransport {
-        async fn api_request(
+    // A double's `expect` asserts what the client sent; it is not an error path.
+    #[allow(clippy::unwrap_in_result)]
+    impl crate::test_wire::ServerDouble for UnansweredGetTransport {
+        fn api_request(
             &self,
             _url: &str,
             body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             let request: Value = serde_json::from_slice(&body).expect("request json");
             let call = request["methodCalls"][0].clone();
             let name = call[0].as_str().expect("method name").to_string();
@@ -1157,29 +1157,6 @@ mod tests {
                 "methodResponses": [[name, arguments, call_id]]
             });
             Ok(bytes::Bytes::from(response.to_string()))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no upload"))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no download"))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no session"))
         }
     }
 
@@ -1236,7 +1213,7 @@ mod tests {
                 .collect()
         }
 
-        fn account(&self) -> ContactAccount<Self> {
+        fn account(&self) -> ContactAccount {
             let client = crate::client::Client::with_transport(
                 self.clone(),
                 contacts_session(),
@@ -1247,13 +1224,14 @@ mod tests {
         }
     }
 
-    impl crate::core::transport::HttpTransport for ScriptedQueryTransport {
-        async fn api_request(
+    // A double's `expect` asserts what the client sent; it is not an error path.
+    #[allow(clippy::unwrap_in_result)]
+    impl crate::test_wire::ServerDouble for ScriptedQueryTransport {
+        fn api_request(
             &self,
             _url: &str,
             body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             let request: Value = serde_json::from_slice(&body).expect("request json");
             let call = request["methodCalls"][0].clone();
             let name = call[0].as_str().expect("method name").to_string();
@@ -1321,29 +1299,6 @@ mod tests {
                 "methodResponses": [[name, arguments, call_id]]
             });
             Ok(bytes::Bytes::from(response.to_string()))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no upload"))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no download"))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no session"))
         }
     }
 
@@ -1814,13 +1769,14 @@ mod tests {
     #[derive(Clone)]
     struct AnchorLostTransport;
 
-    impl crate::core::transport::HttpTransport for AnchorLostTransport {
-        async fn api_request(
+    // A double's `expect` asserts what the client sent; it is not an error path.
+    #[allow(clippy::unwrap_in_result)]
+    impl crate::test_wire::ServerDouble for AnchorLostTransport {
+        fn api_request(
             &self,
             _url: &str,
             body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+        ) -> Result<bytes::Bytes, crate::test_wire::Refused> {
             let request: Value = serde_json::from_slice(&body).expect("request json");
             let call_id = request["methodCalls"][0][2]
                 .as_str()
@@ -1832,32 +1788,9 @@ mod tests {
             });
             Ok(bytes::Bytes::from(response.to_string()))
         }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no upload"))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no download"))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no session"))
-        }
     }
 
-    fn anchor_lost_account() -> ContactAccount<AnchorLostTransport> {
+    fn anchor_lost_account() -> ContactAccount {
         let client = crate::client::Client::with_transport(
             AnchorLostTransport,
             contacts_session(),

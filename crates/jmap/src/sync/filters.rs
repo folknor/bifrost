@@ -9,13 +9,12 @@ use crate::blob::BlobRef;
 use crate::core::SetCreate;
 use crate::core::id::BlobId;
 use crate::core::set::SetError;
-use crate::core::transport::HttpTransport;
 use crate::sieve::validate::SieveScriptValidateRequest;
 use crate::sieve::{
     Property as SieveProperty, SieveScriptGet, SieveScriptId, SieveScriptQuery, SieveScriptSet,
 };
 
-type SieveAccount<T> = crate::account::Account<T, crate::core::capability::Sieve>;
+type SieveAccount = crate::account::Account<crate::core::capability::Sieve>;
 
 const SIEVE_MIME: &str = "application/sieve";
 const SIEVE_DOWNLOAD_NAME: &str = "filter.sieve";
@@ -34,10 +33,10 @@ fn unsupported(op: AccountOperation, detail: &'static str) -> AccountError {
     )
 }
 
-fn require_sieve<T: HttpTransport>(
-    account: Option<SieveAccount<T>>,
+fn require_sieve(
+    account: Option<SieveAccount>,
     op: AccountOperation,
-) -> Result<SieveAccount<T>, AccountError> {
+) -> Result<SieveAccount, AccountError> {
     account.ok_or_else(|| {
         super::error::unsupported_error(
             op,
@@ -55,8 +54,8 @@ fn require_sieve<T: HttpTransport>(
 // on any provider does. Revisit if a consumer needs per-call byte attribution
 // for passthrough operations, or a production transport bypasses AccountNet
 // without equivalent accounting and bandwidth admission.
-pub(crate) fn list<T: HttpTransport>(
-    sieve: Option<SieveAccount<T>>,
+pub(crate) fn list(
+    sieve: Option<SieveAccount>,
 ) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
     Box::pin(async move {
         let account = require_sieve(sieve, AccountOperation::FiltersList)?;
@@ -155,8 +154,8 @@ pub(crate) fn list<T: HttpTransport>(
     })
 }
 
-pub(crate) fn create<T: HttpTransport>(
-    sieve: Option<SieveAccount<T>>,
+pub(crate) fn create(
+    sieve: Option<SieveAccount>,
     filter: ServerFilterCreate,
 ) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
     Box::pin(async move {
@@ -205,8 +204,8 @@ pub(crate) fn create<T: HttpTransport>(
     })
 }
 
-pub(crate) fn update<T: HttpTransport>(
-    sieve: Option<SieveAccount<T>>,
+pub(crate) fn update(
+    sieve: Option<SieveAccount>,
     filter: ServerFilterId,
     patch: ServerFilterPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -322,8 +321,8 @@ pub(crate) fn update<T: HttpTransport>(
     })
 }
 
-pub(crate) fn delete<T: HttpTransport>(
-    sieve: Option<SieveAccount<T>>,
+pub(crate) fn delete(
+    sieve: Option<SieveAccount>,
     filter: ServerFilterId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -339,8 +338,8 @@ pub(crate) fn delete<T: HttpTransport>(
     })
 }
 
-pub(crate) fn validate<T: HttpTransport>(
-    sieve: Option<SieveAccount<T>>,
+pub(crate) fn validate(
+    sieve: Option<SieveAccount>,
     filter: ServerFilterCreate,
 ) -> AccountFuture<Result<FilterValidation, AccountError>> {
     Box::pin(async move {
@@ -386,8 +385,8 @@ fn validation_from_error(error: Option<SetError<String>>) -> FilterValidation {
     }
 }
 
-async fn upload_script_body<T: HttpTransport>(
-    account: &SieveAccount<T>,
+async fn upload_script_body(
+    account: &SieveAccount,
     body: String,
     op: AccountOperation,
 ) -> Result<BlobId, AccountError> {
@@ -398,8 +397,8 @@ async fn upload_script_body<T: HttpTransport>(
     Ok(blob.blob_id)
 }
 
-async fn download_script_body<T: HttpTransport>(
-    account: &SieveAccount<T>,
+async fn download_script_body(
+    account: &SieveAccount,
     blob_id: &BlobId,
     op: AccountOperation,
 ) -> Result<String, AccountError> {
@@ -428,7 +427,6 @@ mod tests {
     use bifrost_types::{AccountErrorKind, ProtocolErrorKind};
 
     use super::*;
-    use crate::core::transport::TransportError;
 
     /// A JMAP boundary that answers a scripted API sequence and serves
     /// blob downloads keyed by the blob id in the URL, while recording
@@ -441,87 +439,67 @@ mod tests {
 
     type Recorder = std::sync::Arc<StdMutex<Vec<serde_json::Value>>>;
 
-    struct BlobTransport {
-        api: StdMutex<VecDeque<String>>,
+    /// The server: a scripted API sequence (each request recorded) and
+    /// blob downloads keyed by the blob id in the URL.
+    fn blob_server(
+        api: impl IntoIterator<Item = String>,
         meter: std::sync::Arc<DownloadMeter>,
         requests: Recorder,
-    }
+    ) -> std::sync::Arc<bifrost_net::test_support::ScriptedDispatch> {
+        let api = std::sync::Arc::new(StdMutex::new(api.into_iter().collect::<VecDeque<_>>()));
+        crate::test_wire::async_server(move |request| {
+            let api = std::sync::Arc::clone(&api);
+            let meter = std::sync::Arc::clone(&meter);
+            let requests = std::sync::Arc::clone(&requests);
+            async move {
+                if crate::test_wire::is_api(&request) {
+                    requests
+                        .lock()
+                        .expect("recorded requests")
+                        .push(crate::test_wire::body_json(&request));
+                    return match api.lock().expect("script").pop_front() {
+                        Some(reply) => crate::test_wire::ok(reply),
+                        None => crate::test_wire::refused("api script exhausted"),
+                    };
+                }
+                if request.method == reqwest::Method::POST {
+                    let content_type = request
+                        .headers
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("application/octet-stream")
+                        .to_owned();
+                    return crate::test_wire::ok_json(&serde_json::json!({
+                        "accountId": "primary",
+                        "blobId": "b-uploaded",
+                        "type": content_type,
+                        "size": crate::test_wire::body_bytes(&request).len()
+                    }));
+                }
+                let url = request.url.to_string();
+                // Answered without ever yielding, so its failure ARRIVES
+                // before any download that parks below. Ordering that is
+                // arrival-driven rather than submission-driven reports this
+                // one; the ordering test exists to catch exactly that.
+                if url.contains("/b-broken/") {
+                    return crate::test_wire::status(404);
+                }
 
-    impl BlobTransport {
-        fn new(
-            api: impl IntoIterator<Item = String>,
-            meter: std::sync::Arc<DownloadMeter>,
-            requests: Recorder,
-        ) -> Self {
-            Self {
-                api: StdMutex::new(api.into_iter().collect()),
-                meter,
-                requests,
+                let now = meter.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                meter.peak.fetch_max(now, Ordering::SeqCst);
+                // Under `start_paused` the runtime auto-advances, so this is
+                // a scheduling point rather than wall-clock time: every
+                // download that MAY overlap is parked here at once, and the
+                // peak counter above records how many that was.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                meter.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+                if url.contains("/b-badutf8/") {
+                    return crate::test_wire::ok(&[0xff_u8, 0xfe][..]);
+                }
+                crate::test_wire::ok(format!("# body for {url}"))
             }
-        }
-    }
-
-    impl HttpTransport for BlobTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, TransportError> {
-            self.requests
-                .lock()
-                .expect("recorded requests")
-                .push(serde_json::from_slice(&body).expect("the client emits JSON"));
-            match self.api.lock().expect("script").pop_front() {
-                Some(reply) => Ok(bytes::Bytes::from(reply)),
-                None => Err(TransportError::new("api script exhausted")),
-            }
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, TransportError> {
-            Ok(bytes::Bytes::from(
-                serde_json::json!({
-                    "accountId": "primary",
-                    "blobId": "b-uploaded",
-                    "type": content_type.unwrap_or("application/octet-stream"),
-                    "size": body.len()
-                })
-                .to_string(),
-            ))
-        }
-
-        async fn download(&self, url: &str) -> Result<bytes::Bytes, TransportError> {
-            // Answered without ever yielding, so its failure ARRIVES
-            // before any download that parks below. Ordering that is
-            // arrival-driven rather than submission-driven reports this
-            // one; the ordering test exists to catch exactly that.
-            if url.contains("/b-broken/") {
-                return Err(TransportError::new("blob unavailable"));
-            }
-
-            let now = self.meter.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.meter.peak.fetch_max(now, Ordering::SeqCst);
-            // Under `start_paused` the runtime auto-advances, so this is
-            // a scheduling point rather than wall-clock time: every
-            // download that MAY overlap is parked here at once, and the
-            // peak counter above records how many that was.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            self.meter.in_flight.fetch_sub(1, Ordering::SeqCst);
-
-            if url.contains("/b-badutf8/") {
-                return Ok(bytes::Bytes::from_static(&[0xff, 0xfe]));
-            }
-            Ok(bytes::Bytes::from(format!("# body for {url}")))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<bytes::Bytes, TransportError> {
-            Err(TransportError::new("no session reply"))
-        }
+        })
     }
 
     fn sieve_session() -> crate::core::session::Session {
@@ -599,7 +577,7 @@ mod tests {
     fn sieve_account(
         api: impl IntoIterator<Item = String>,
         meter: &std::sync::Arc<DownloadMeter>,
-    ) -> SieveAccount<BlobTransport> {
+    ) -> SieveAccount {
         sieve_account_with_session(api, meter, sieve_session(), &Recorder::default())
     }
 
@@ -608,17 +586,15 @@ mod tests {
         meter: &std::sync::Arc<DownloadMeter>,
         session: crate::core::session::Session,
         requests: &Recorder,
-    ) -> SieveAccount<BlobTransport> {
-        let client = crate::client::Client::with_transport(
-            BlobTransport::new(
+    ) -> SieveAccount {
+        let client = crate::test_wire::client(
+            &blob_server(
                 api,
                 std::sync::Arc::clone(meter),
                 std::sync::Arc::clone(requests),
             ),
             session,
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        );
         crate::account::Account::new(client, "primary")
     }
 

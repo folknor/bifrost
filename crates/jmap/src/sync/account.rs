@@ -23,8 +23,6 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
-use crate::core::transport::HttpTransport;
-use crate::transport_reqwest::ReqwestTransport;
 
 use super::{
     blob, calendar_ops, changes, contacts, discover, filters, hydrate, inventory, mutation, pim,
@@ -58,25 +56,15 @@ where
     })
 }
 
-/// The engine-facing account is pinned to the production transport, not
-/// generic over one: WebSocket push is reqwest-specific, so `JmapAccount`
-/// cannot be parameterized without either dropping push or growing a second
-/// transport trait for it.
-///
-/// The accepted cost is a testing one, and it is a known, bounded residual
-/// rather than an oversight. Because no scripted transport can be installed
-/// at this level, a WHOLE `Account` call - `capabilities()`,
-/// `describe_cursor`, the mutation doors - is undrivable hermetically; only
-/// the false direction (a refusal that never reaches the wire) can be pinned
-/// here, which is what `capability_contract_tests.rs` documents and does.
-/// Everything pure is instead extracted into free functions and tested
-/// directly, and the sync request helpers below this struct stay generic over
-/// `HttpTransport` so a scripted transport reaches them. Closing the residual
-/// means threading the transport generic through `JmapAccount` (and giving
-/// push its own seam), not adding a test-support type elsewhere.
-type MailAccount<T = ReqwestTransport> = super::registry::Slot<T>;
-type SubmissionAccount<T = ReqwestTransport> =
-    super::registry::Slot<T, crate::core::capability::Submission>;
+/// The account rides the one JMAP transport, `ReqwestTransport` over
+/// `bifrost-net`, and is driven hermetically the way a consumer builds it:
+/// `JmapAccountFactory::with_net` over a scripted `bifrost_net::Net` opens a
+/// whole account whose every HTTP door reaches a scripted server through the
+/// production retry, replay, concurrency and metering pipeline. Only the
+/// WebSocket push lane needs its own seam (`push::PushTransport`), because
+/// its frames do not cross the HTTP dispatch a scripted net replaces.
+type MailAccount = super::registry::Slot;
+type SubmissionAccount = super::registry::Slot<crate::core::capability::Submission>;
 
 pub(crate) struct JmapAccount {
     pub(crate) client: Client,
@@ -207,8 +195,8 @@ fn partitioning_for_scope(
 /// The open-time seed is only the membership gate: reusing its state for a
 /// later `RestartScope` can repeat `cannotCalculateChanges` forever after the
 /// server expires that old position.
-async fn fresh_cursor_establishment<T: HttpTransport>(
-    mail: MailAccount<T>,
+async fn fresh_cursor_establishment(
+    mail: MailAccount,
     scope: CursorScope,
 ) -> Result<CursorEstablishment, AccountError> {
     let email_states = mail.email_states.clone();
@@ -277,11 +265,11 @@ fn unseeded_scope_error(scope: CursorScope) -> AccountError {
 
 /// A draft must live where it will be submitted. Refuse a Submission account
 /// without Mail instead of silently creating the draft in another namespace.
-fn draft_mail_account<T: HttpTransport>(
-    mail: &MailAccount<T>,
-    submission: Option<&SubmissionAccount<T>>,
+fn draft_mail_account(
+    mail: &MailAccount,
+    submission: Option<&SubmissionAccount>,
     op: AccountOperation,
-) -> Result<MailAccount<T>, AccountError> {
+) -> Result<MailAccount, AccountError> {
     match submission {
         Some(slot) => slot
             .view::<crate::core::capability::Mail>()
@@ -293,9 +281,9 @@ fn draft_mail_account<T: HttpTransport>(
 }
 
 /// Uploaded blob ids are account scoped, just like the drafts consuming them.
-fn upload_draft_attachment<T: crate::core::transport::HttpTransport>(
-    mail: &MailAccount<T>,
-    submission: Option<&SubmissionAccount<T>>,
+fn upload_draft_attachment(
+    mail: &MailAccount,
+    submission: Option<&SubmissionAccount>,
     bytes: AccountStream<Result<bytes::Bytes, AccountError>>,
     mime: String,
 ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
@@ -1744,63 +1732,27 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct CursorProbeTransport {
-        calls: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    }
-
-    impl crate::core::transport::HttpTransport for CursorProbeTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            let request: serde_json::Value = serde_json::from_slice(&body).expect("request JSON");
-            let call = request["methodCalls"][0].clone();
-            self.calls.lock().expect("calls").push(call.clone());
+    /// Answers each state probe with a fresh state naming its account.
+    fn cursor_probe_server() -> Arc<bifrost_net::test_support::ScriptedDispatch> {
+        crate::test_wire::api_server(|request| {
+            let call = &request["methodCalls"][0];
             let method = call[0].as_str().expect("method name").to_string();
-            let call_id = call[2].as_str().expect("call id").to_string();
             let account = call[1]["accountId"].as_str().expect("account id");
             let state = match method.as_str() {
                 "Email/get" => format!("fresh-email-{account}"),
                 "Mailbox/get" => format!("fresh-mailbox-{account}"),
                 other => panic!("unexpected method {other}"),
             };
-            let response = serde_json::json!({
+            crate::test_wire::ok_json(&serde_json::json!({
                 "sessionState": "session-1",
                 "methodResponses": [[method, {
                     "accountId": account,
                     "state": state,
                     "list": [],
                     "notFound": []
-                }, call_id]]
-            });
-            Ok(bytes::Bytes::from(response.to_string()))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no upload"))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no download"))
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new("no session"))
-        }
+                }, call[2].clone()]]
+            }))
+        })
     }
 
     fn cursor_probe_session() -> crate::core::session::Session {
@@ -1837,15 +1789,8 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_establishment_probes_fresh_state_for_each_seeded_scope() {
-        let transport = CursorProbeTransport {
-            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
-        };
-        let client = crate::client::Client::with_transport(
-            transport.clone(),
-            cursor_probe_session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let script = cursor_probe_server();
+        let client = crate::test_wire::client(&script, cursor_probe_session());
         let email_states: super::super::state_cache::StateMap =
             crate::sync::state_cache::seeded(HashMap::from([
                 ("primary".to_string(), Some("open-email".into())),
@@ -1896,7 +1841,10 @@ mod tests {
             }
         }
 
-        let calls = transport.calls.lock().expect("calls").clone();
+        let calls = crate::test_wire::api_bodies(&script)
+            .into_iter()
+            .map(|body| body["methodCalls"][0].clone())
+            .collect::<Vec<_>>();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0][0], "Email/get");
         assert_eq!(calls[0][1]["ids"], serde_json::json!([]));
@@ -1926,57 +1874,40 @@ mod tests {
         );
     }
 
-    #[derive(Clone)]
-    struct DraftUploadTransport {
+    /// Accepts one attachment upload into `expected_account`.
+    fn draft_upload_server(
         expected_account: &'static str,
-    }
-
-    impl crate::core::transport::HttpTransport for DraftUploadTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            panic!("attachment upload needs no API request");
-        }
-
-        async fn upload(
-            &self,
-            url: &str,
-            body: Vec<u8>,
-            content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
+    ) -> Arc<bifrost_net::test_support::ScriptedDispatch> {
+        crate::test_wire::server(move |request| {
             assert_eq!(
-                url,
-                format!("https://example.test/upload/{}", self.expected_account)
+                request.method,
+                reqwest::Method::POST,
+                "only the upload is expected"
             );
-            assert_eq!(body, b"attachment bytes");
-            assert_eq!(content_type, Some("text/plain"));
-            Ok(bytes::Bytes::from(
-                serde_json::json!({
-                    "accountId": self.expected_account,
-                    "blobId": "uploaded-blob",
-                    "type": "text/plain",
-                    "size": body.len()
-                })
-                .to_string(),
-            ))
-        }
-
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            panic!("attachment upload needs no download");
-        }
-
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            panic!("session is supplied in memory");
-        }
+            assert!(
+                !crate::test_wire::is_api(request),
+                "attachment upload needs no API request"
+            );
+            assert_eq!(
+                request.url.as_str(),
+                format!("https://example.test/upload/{expected_account}")
+            );
+            let body = crate::test_wire::body_bytes(request);
+            assert_eq!(&body[..], b"attachment bytes");
+            assert_eq!(
+                request
+                    .headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .map(reqwest::header::HeaderValue::as_bytes),
+                Some(&b"text/plain"[..])
+            );
+            crate::test_wire::ok_json(&serde_json::json!({
+                "accountId": expected_account,
+                "blobId": "uploaded-blob",
+                "type": "text/plain",
+                "size": body.len()
+            }))
+        })
     }
 
     #[tokio::test]
@@ -2005,12 +1936,7 @@ mod tests {
                 "state": "session-1"
             }))
             .expect("session parses");
-            let client = crate::client::Client::with_transport(
-                DraftUploadTransport { expected_account },
-                session,
-                "https://example.test/session",
-            )
-            .expect("client builds");
+            let client = crate::test_wire::client(&draft_upload_server(expected_account), session);
             let mail = crate::sync::registry::Slot::new(client.clone(), "mail");
             let submission = SubmissionAccount::new(client, "submission");
             let selected = has_submission.then_some(&submission);
@@ -2053,14 +1979,10 @@ mod tests {
             "state": "session-1"
         }))
         .expect("session parses");
-        let client = crate::client::Client::with_transport(
-            DraftUploadTransport {
-                expected_account: "unused",
-            },
+        let client = crate::test_wire::client(
+            &crate::test_wire::server(crate::test_wire::unexpected),
             session,
-            "https://example.test/session",
-        )
-        .expect("client builds");
+        );
         let mail = crate::sync::registry::Slot::new(client.clone(), "mail");
         let submission = SubmissionAccount::new(client, "submission");
         for op in [

@@ -4,15 +4,14 @@ use super::body::{address_from_jmap, address_to_jmap};
 use super::checked_timestamp;
 use super::unix_to_system_time;
 use super::{MailAccount, QuotaAccount, SubmissionAccount, VacationAccount, to_acct_err};
-use crate::core::transport::HttpTransport;
 use crate::identity::{IdentityGet, IdentityId as JmapIdentityId, IdentitySet};
 use crate::quota::{Property as QuotaProperty, QuotaGet};
 use crate::sync::error::answer_error;
 use crate::vacation_response::{VacationResponseGet, VacationResponseId, VacationResponseSet};
 use bifrost_types::{AccountError, AccountFuture, AccountOperation, QuotaInfo, VacationConfig};
 
-pub(crate) fn identities_list<T: HttpTransport>(
-    submission: Option<SubmissionAccount<T>>,
+pub(crate) fn identities_list(
+    submission: Option<SubmissionAccount>,
 ) -> AccountFuture<Result<Vec<bifrost_types::Identity>, AccountError>> {
     Box::pin(async move {
         let Some(account) = submission else {
@@ -69,8 +68,8 @@ pub(super) struct SendingIdentity {
 /// identity, so the first concrete address returned by the server is the
 /// documented best-effort convention. Wildcard identities cannot be used in
 /// an RFC 5322 From header.
-pub(super) async fn foreign_sending_identity<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn foreign_sending_identity(
+    mail: &MailAccount,
     requested: Option<&bifrost_types::IdentityId>,
 ) -> Result<SendingIdentity, AccountError> {
     let get = IdentityGet::new().properties([
@@ -102,8 +101,8 @@ pub(super) async fn foreign_sending_identity<T: HttpTransport>(
 /// Resolve only a caller-selected primary identity for scheduled envelope
 /// fallback. JMAP has no default identity, and Identity/get order is not a
 /// selection contract.
-pub(super) async fn primary_sending_identity<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn primary_sending_identity(
+    mail: &MailAccount,
     requested: &bifrost_types::IdentityId,
 ) -> Result<SendingIdentity, AccountError> {
     let submission = mail
@@ -155,8 +154,8 @@ pub(super) fn select_concrete_identity(
     ))
 }
 
-pub(crate) fn identity_update<T: HttpTransport>(
-    submission: Option<SubmissionAccount<T>>,
+pub(crate) fn identity_update(
+    submission: Option<SubmissionAccount>,
     identity: bifrost_types::IdentityId,
     patch: bifrost_types::IdentityPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -214,8 +213,8 @@ pub(crate) fn identity_update<T: HttpTransport>(
     })
 }
 
-pub(crate) fn vacation_get<T: HttpTransport>(
-    vacation: Option<VacationAccount<T>>,
+pub(crate) fn vacation_get(
+    vacation: Option<VacationAccount>,
 ) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
     Box::pin(async move {
         let Some(account) = vacation else {
@@ -244,8 +243,8 @@ pub(crate) fn vacation_get<T: HttpTransport>(
     })
 }
 
-pub(crate) fn vacation_set<T: HttpTransport>(
-    vacation: Option<VacationAccount<T>>,
+pub(crate) fn vacation_set(
+    vacation: Option<VacationAccount>,
     config: VacationConfig,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -288,8 +287,8 @@ pub(crate) fn vacation_set<T: HttpTransport>(
     })
 }
 
-pub(crate) fn quota_get<T: HttpTransport>(
-    quota: Option<QuotaAccount<T>>,
+pub(crate) fn quota_get(
+    quota: Option<QuotaAccount>,
 ) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
     Box::pin(async move {
         let Some(account) = quota else {

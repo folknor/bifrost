@@ -1,10 +1,7 @@
 use crate::{
     blob::BlobRef,
     client::Client,
-    core::{
-        session::{TemplateValue, expand},
-        transport::HttpTransport,
-    },
+    core::session::{TemplateValue, expand},
 };
 
 /// Blob buffering has its own bound, independent of small JSON responses.
@@ -21,18 +18,6 @@ pub(crate) type BlobStream = std::pin::Pin<
 pub(crate) struct BlobDownload {
     pub(crate) body: BlobStream,
     pub(crate) bytes_in: bifrost_net::RequestByteCounter,
-}
-
-/// Kept separate from HttpTransport so buffered custom transports retain
-/// their existing contract without pretending to support incremental reads.
-pub(crate) trait BlobTransport: HttpTransport {
-    fn download_stream(
-        &self,
-        url: &str,
-        max_bytes: u64,
-    ) -> impl std::future::Future<
-        Output = Result<BlobDownload, crate::core::transport::TransportError>,
-    > + Send;
 }
 
 pub(crate) fn bounded_stream(mut source: bifrost_net::ByteStream, max_bytes: u64) -> BlobStream {
@@ -61,7 +46,7 @@ pub(crate) fn bounded_stream(mut source: bifrost_net::ByteStream, max_bytes: u64
     })
 }
 
-impl<Tr: BlobTransport> Client<Tr> {
+impl Client {
     /// Download incrementally, rejecting a chunk that would exceed the caller's
     /// ceiling. A failure after earlier chunks leaves an incomplete blob; the
     /// caller must discard it. Dropping the stream cancels the body read.
@@ -94,7 +79,7 @@ impl<Tr: BlobTransport> Client<Tr> {
     }
 }
 
-impl<Tr: HttpTransport> Client<Tr> {
+impl Client {
     /// Download a blob.
     ///
     /// The account ID, blob ID, and (when the server's download URL
@@ -140,8 +125,6 @@ impl<Tr: HttpTransport> Client<Tr> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use bytes::Bytes;
     use serde_json::json;
 
@@ -151,7 +134,6 @@ mod tests {
         core::{
             id::{AccountId, BlobId},
             session::Session,
-            transport::{HttpTransport, TransportError},
         },
     };
 
@@ -192,38 +174,6 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
-    /// Captures the URL the client asked to download from.
-    struct UrlCapture(Arc<Mutex<Option<String>>>);
-
-    impl HttpTransport for UrlCapture {
-        async fn api_request(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not call the API"))
-        }
-
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport does not upload"))
-        }
-
-        async fn download(&self, url: &str) -> Result<Bytes, TransportError> {
-            *self.0.lock().expect("capture lock") = Some(url.to_string());
-            Ok(Bytes::from_static(b"blob"))
-        }
-
-        async fn get_session(&self, _url: &str) -> Result<Bytes, TransportError> {
-            Err(TransportError::new("stub transport has no session route"))
-        }
-    }
-
     fn session() -> Session {
         serde_json::from_value(json!({
             "capabilities": {},
@@ -246,13 +196,8 @@ mod tests {
     /// `application/ld json`.
     #[tokio::test]
     async fn template_values_are_rfc6570_level_one_encoded() {
-        let captured = Arc::new(Mutex::new(None));
-        let client = Client::with_transport(
-            UrlCapture(Arc::clone(&captured)),
-            session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let script = crate::test_wire::server(|_| crate::test_wire::ok("blob"));
+        let client: Client = crate::test_wire::client(&script, session());
 
         let blob = BlobRef::new(AccountId::new("a c!count"), BlobId::new("b;lob@1"))
             .with_name("re,port+final.txt")
@@ -260,9 +205,11 @@ mod tests {
 
         client.download(&blob).await.expect("download runs");
 
-        let url = captured.lock().expect("capture lock").clone().expect("url");
+        let requests = script.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, reqwest::Method::GET);
         assert_eq!(
-            url,
+            requests[0].url.as_str(),
             "https://example.test/dl/a%20c%21count/b%3Blob%401\
              ?name=re%2Cport%2Bfinal.txt&type=application%2Fld%2Bjson"
         );

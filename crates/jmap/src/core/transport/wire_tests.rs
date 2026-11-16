@@ -83,7 +83,11 @@ fn auth_lost_stays_a_transport_error() {
 fn transport_error_without_body_stays_transport() {
     use crate::core::transport::TransportError;
 
-    let err = TransportError::new("connection refused");
+    let err = TransportError::from_net(bifrost_net::Error::Network {
+        message: "connection refused".into(),
+        transmission_state: bifrost_net::TransmissionState::Unsent,
+        source: None,
+    });
     let error: Error = err.into();
     assert!(matches!(error, Error::Transport(_)));
 }

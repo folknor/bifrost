@@ -42,11 +42,10 @@ the sub-microsecond level.
 
 ### SSE `Bytes` -> `Vec<u8>` copy at the parser boundary
 
-`transport_reqwest.rs:177` wraps reqwest's `bytes::Bytes` stream and
-calls `.to_vec()` per chunk (`transport_reqwest.rs:192`). The SSE
-parser in `event_source/parser.rs` consumes owned `Vec<u8>`.
-`HttpTransport` returns `Bytes` directly elsewhere; only the SSE path
-still copies.
+`ReqwestByteStream` in `transport_reqwest.rs` wraps net's `bytes::Bytes`
+stream and calls `.to_vec()` per chunk. The SSE parser in
+`event_source/parser.rs` consumes owned `Vec<u8>`. The other transport
+doors return `Bytes` directly; only the SSE path still copies.
 
 **Why accepted:** True zero-copy SSE would require rewriting the
 parser to use `Bytes` with an offset cursor. SSE chunks are short

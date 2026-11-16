@@ -432,8 +432,9 @@ The scripted dispatcher is published to downstream crates under the
 (one scripted wire outcome: a buffered or streamed response, a body
 that fails or stalls after its chunks, a transport error, or a request
 that never answers), `ScriptedDispatch`
-(answers a script in order, records every `RequestSnapshot`), the
-`canned` / `canned_with_headers` constructors, and the `scripted_net`
+(answers a script in order, or from a responder callback, and records
+every `RequestSnapshot`), the `canned` / `canned_owned` /
+`canned_with_headers` constructors, and the `scripted_net`
 / `scripted_account` builders. Consumers enable it as a
 dev-dependency.
 
@@ -477,6 +478,19 @@ the exact size hint is hyper's framing input; Body::wrap_stream would lose it.
 Outcomes are consumed at arrival under the snapshot lock, even when the dispatch
 is later cancelled. Both DAV crates use it to pin their multiget leg
 concurrency; ablating the bound reads 10 against a bound of 4.
+
+`ScriptedDispatch::responding` is the double for a server whose answer depends
+on the request - a protocol that echoes request identifiers or routes on the
+body, where a fixed order would have to predict the caller's fan-out. Its
+callback receives an owned `RequestSnapshot` and returns a future of a `Canned`,
+so it still answers with a wire outcome and never restates the status
+contract. The request is recorded at arrival exactly as an ordered script
+records it; the callback runs only after the body has been read and with no
+dispatcher lock held, so it may read `requests()`, and its future may wait on a
+gate a test releases, holding one request outstanding while another proceeds.
+`remaining()` is always 0 for it, and `extend()` on it panics rather than
+queue steps it would never consume. `canned_owned` builds a response from a body
+computed at run time. JMAP scripts every test through it.
 
 `AccountNet` exposes `get`, `post`, `put`, `patch`, `delete`, plus
 `request(http::Method, url)` for extension methods such as WebDAV's

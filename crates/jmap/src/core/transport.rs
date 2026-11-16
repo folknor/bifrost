@@ -1,30 +1,33 @@
-use std::future::Future;
-
 use bytes::Bytes;
 
 /// Transport-level error. Wraps the underlying HTTP client error
 /// without leaking it into the crate's public error model.
-// types: crate-owned so custom transports can still carry response bodies for ProblemDetails.
+///
+/// Every value carries its provenance: either the `bifrost-net` error the
+/// wire produced, or a local failure this crate raised itself. There is no
+/// third, unknown-provenance state. The one transport is `ReqwestTransport`
+/// over `bifrost-net`, and tests script the wire beneath it rather than
+/// replacing it, so nothing can build an error that says neither.
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) struct TransportError {
     pub(crate) message: String,
     /// HTTP response body, if available (for parsing ProblemDetails).
     pub(crate) body: Option<Bytes>,
-    /// Original net error, when the default reqwest-backed transport
-    /// produced this `TransportError`. Custom transports leave this
-    /// `None`; the conversion boundary falls back to a generic
-    /// `Transport(Network)` classification when absent.
-    pub(crate) net: Option<bifrost_net::Error>,
-    /// Set only when this crate failed locally rather than on the wire: an
-    /// invariant broken before anything was sent, or a client-side safety
-    /// limit tripped while reading a response. Authoritative over the
-    /// no-`net` fallback: without it, a local failure fell through to
-    /// `Transport(Network)` and was retried as a network fault forever.
-    /// Only the dedicated constructors set it. HTTP refusals retain net
-    /// status evidence; a test stub's missing reply keeps the fallback.
-    pub(crate) local: Option<LocalFailure>,
+    pub(crate) cause: TransportCause,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+/// Where a [`TransportError`] came from.
+#[derive(Debug)]
+pub(crate) enum TransportCause {
+    /// The net pipeline's own error, classified through
+    /// `bifrost_net::into_account_error_with_throttle_scope`.
+    Net(bifrost_net::Error),
+    /// This crate failed locally rather than on the wire: an invariant
+    /// broken before anything was sent, or a client-side safety limit
+    /// tripped while reading a response. Never a network fault to retry.
+    Local(LocalFailure),
 }
 
 /// What failed locally in a [`TransportError`]. Semantic rather than a flag,
@@ -57,33 +60,32 @@ impl std::error::Error for TransportError {
 }
 
 impl TransportError {
-    // No status or transmission evidence can be inferred from this message.
-    // Preserve this custom-transport door until the account error boundary
-    // supports an explicit unknown-provenance failure; inventing net evidence
-    // here would mislead retry and partial-commit decisions. The shared
-    // TransportErrorKind and TransportErrorKind vocabularies have only Network,
-    // Timeout and Tls; none represents unknown provenance. Replacing this
-    // fallback requires that shared owner, not message parsing in JMAP.
-    pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            body: None,
-            net: None,
-            local: None,
-            source: None,
-        }
-    }
-
-    pub(crate) fn with_source(
+    fn local(
+        failure: LocalFailure,
         message: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     ) -> Self {
         Self {
             message: message.into(),
             body: None,
-            net: None,
-            local: None,
-            source: Some(Box::new(source)),
+            cause: TransportCause::Local(failure),
+            source,
+        }
+    }
+
+    /// The net error, when the wire produced this failure.
+    pub(crate) fn net(&self) -> Option<&bifrost_net::Error> {
+        match &self.cause {
+            TransportCause::Net(error) => Some(error),
+            TransportCause::Local(_) => None,
+        }
+    }
+
+    /// The local failure, when this crate raised it itself.
+    pub(crate) fn local_failure(&self) -> Option<LocalFailure> {
+        match self.cause {
+            TransportCause::Local(failure) => Some(failure),
+            TransportCause::Net(_) => None,
         }
     }
 
@@ -100,10 +102,7 @@ impl TransportError {
     /// before anything was sent: `Internal(InvariantViolated)`, never a
     /// network fault.
     pub(crate) fn invariant(message: impl Into<String>) -> Self {
-        Self {
-            local: Some(LocalFailure::InvariantViolated),
-            ..Self::new(message)
-        }
+        Self::local(LocalFailure::InvariantViolated, message, None)
     }
 
     /// As [`TransportError::invariant`], keeping the underlying error.
@@ -111,19 +110,17 @@ impl TransportError {
         message: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
-        Self {
-            local: Some(LocalFailure::InvariantViolated),
-            ..Self::with_source(message, source)
-        }
+        Self::local(
+            LocalFailure::InvariantViolated,
+            message,
+            Some(Box::new(source)),
+        )
     }
 
     /// A client-side safety limit on a response the protocol leaves
     /// unbounded: `Internal(LimitExceeded)`, never a network fault.
     pub(crate) fn limit_exceeded(message: impl Into<String>) -> Self {
-        Self {
-            local: Some(LocalFailure::LimitExceeded),
-            ..Self::new(message)
-        }
+        Self::local(LocalFailure::LimitExceeded, message, None)
     }
 
     /// Construct a `TransportError` from a `bifrost_net::Error`,
@@ -132,30 +129,19 @@ impl TransportError {
     /// `bifrost_net::into_account_error_with_throttle_scope` with its
     /// explicit account throttle scope.
     pub(crate) fn from_net(error: bifrost_net::Error) -> Self {
-        let message = error.to_string();
-        match error {
-            bifrost_net::Error::Status {
-                code,
-                body,
-                headers,
-            } => Self {
-                message: format!("HTTP {code}"),
-                body: Some(body.clone()),
-                net: Some(bifrost_net::Error::Status {
-                    code,
-                    body,
-                    headers,
-                }),
-                local: None,
-                source: None,
-            },
-            other => Self {
-                message,
-                body: preserved_response_body(&other),
-                net: Some(other),
-                local: None,
-                source: None,
-            },
+        let message = match &error {
+            bifrost_net::Error::Status { code, .. } => format!("HTTP {code}"),
+            other => other.to_string(),
+        };
+        let body = match &error {
+            bifrost_net::Error::Status { body, .. } => Some(body.clone()),
+            other => preserved_response_body(other),
+        };
+        Self {
+            message,
+            body,
+            cause: TransportCause::Net(error),
+            source: None,
         }
     }
 }
@@ -185,121 +171,6 @@ fn preserved_response_body(error: &bifrost_net::Error) -> Option<Bytes> {
         } => Some(final_response.body.clone()),
         _ => None,
     }
-}
-
-/// HTTP transport abstraction.
-///
-/// Implement this trait to use a custom HTTP client. The default
-/// implementation uses `reqwest`.
-pub(crate) trait HttpTransport: Send + Sync + 'static {
-    /// Send a JMAP API request (POST with JSON body).
-    fn api_request(
-        &self,
-        url: &str,
-        body: Vec<u8>,
-        replay: bifrost_net::ReplayPolicy,
-    ) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
-
-    /// Send a JMAP API request, also reporting the inbound payload
-    /// bytes the transport read to produce the answer.
-    ///
-    /// Defaulted so no implementor is forced to grow a byte counter it
-    /// has no way to produce: the default reports the DECODED body
-    /// length, which is what a transport that hands back only `Bytes`
-    /// can honestly know. The production `reqwest` transport overrides
-    /// it with `bifrost_net`'s request-local counter, which is the real
-    /// inbound total across retries, redirects and 401 recovery - a
-    /// figure the decoded length cannot see.
-    fn api_request_measured(
-        &self,
-        url: &str,
-        body: Vec<u8>,
-        replay: bifrost_net::ReplayPolicy,
-    ) -> impl Future<Output = Result<(Bytes, u64), TransportError>> + Send {
-        async move {
-            let bytes = self.api_request(url, body, replay).await?;
-            let measured = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            Ok((bytes, measured))
-        }
-    }
-
-    /// Upload a blob (POST with binary body).
-    fn upload(
-        &self,
-        url: &str,
-        body: Vec<u8>,
-        content_type: Option<&str>,
-    ) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
-
-    /// Download a blob (GET, returns raw bytes).
-    fn download(&self, url: &str) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
-
-    /// Download a blob, also reporting the inbound payload bytes the
-    /// transport read to produce the answer.
-    ///
-    /// Defaulted on the same terms as [`Self::api_request_measured`]:
-    /// the default reports the DECODED body length, and the production
-    /// `reqwest` transport overrides it with `bifrost_net`'s
-    /// request-local counter. Blob bytes are the bulk of the traffic a
-    /// raw-message or blob read causes, so a batch emitted by one of
-    /// those paths cannot report an honest count without this door.
-    fn download_measured(
-        &self,
-        url: &str,
-    ) -> impl Future<Output = Result<(Bytes, u64), TransportError>> + Send {
-        async move {
-            let bytes = self.download(url).await?;
-            let measured = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            Ok((bytes, measured))
-        }
-    }
-
-    /// Fetch the session resource (GET, returns JSON).
-    fn get_session(&self, url: &str) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
-
-    /// Bound the API requests this transport has in flight at once to the
-    /// session's `maxConcurrentRequests`, as `Session::api_request_concurrency`
-    /// reads it. Called with every session the client installs.
-    ///
-    /// RFC 8620 limits the API endpoint only - uploads and downloads have
-    /// their own limits - so only `api_request` traffic is gated. Defaulted
-    /// to a no-op for transports with nothing to bound.
-    ///
-    /// The setter is synchronous. During a refresh it is called while the
-    /// client holds its session lock; at initial install it runs before the
-    /// client is returned. An implementation must not read the client's
-    /// session from here.
-    fn set_api_concurrency(&self, _max_concurrent_requests: usize) {}
-
-    /// Bound upload requests to the session's `maxConcurrentUpload`, as
-    /// `Session::upload_concurrency` reads it. Called with every session the
-    /// client installs. Defaulted to a no-op for transports with nothing to
-    /// bound.
-    ///
-    /// The setter is synchronous. During a refresh it is called while the
-    /// client holds its session lock; at initial install it runs before the
-    /// client is returned. An implementation must not read the client's
-    /// session from here.
-    fn set_upload_concurrency(&self, _max_concurrent_upload: usize) {}
-}
-
-/// Streaming transport for Server-Sent Events (EventSource).
-///
-/// Implement this to provide EventSource support with a custom HTTP client.
-/// The default implementation uses reqwest's byte streaming.
-pub(crate) trait SseTransport: Send + Sync + 'static {
-    /// The byte stream type returned by the SSE connection.
-    type ByteStream: futures::Stream<Item = Result<Vec<u8>, TransportError>> + Send + Unpin;
-
-    /// Open an SSE connection to the given URL.
-    ///
-    /// If `last_event_id` is provided, the transport should send it as the
-    /// `Last-Event-ID` HTTP header, allowing the server to replay missed events.
-    fn open_sse(
-        &self,
-        url: &str,
-        last_event_id: Option<&str>,
-    ) -> impl Future<Output = Result<Self::ByteStream, TransportError>> + Send;
 }
 
 #[cfg(test)]

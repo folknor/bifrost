@@ -6,7 +6,6 @@ use bifrost_types::{
 };
 
 use crate::core::changes::{ChangesMethod, ChangesObject, ChangesResponse};
-use crate::core::transport::HttpTransport;
 use crate::email::{Email, EmailChanges};
 use crate::mailbox::{Mailbox, MailboxChanges};
 
@@ -17,12 +16,9 @@ use super::state_cache::StateCache;
 use super::state_cache::StateMap;
 use super::state_walk::ChangesWalk;
 
-type MailAccount<T> = super::registry::Slot<T>;
+type MailAccount = super::registry::Slot;
 
-pub(crate) fn stream<T: HttpTransport>(
-    mail: MailAccount<T>,
-    cursor: ChangeCursor,
-) -> AccountStream<SyncEvent<Change>> {
+pub(crate) fn stream(mail: MailAccount, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
     let limits = mail.limits;
     let owner = mail
         .owner()
@@ -43,7 +39,7 @@ pub(crate) fn stream<T: HttpTransport>(
     };
 
     match scope {
-        JmapScopeRepr::Email => changes_walk::<T, EmailChanges, Email>(
+        JmapScopeRepr::Email => changes_walk::<EmailChanges, Email>(
             mail,
             limits,
             cursor.scope.clone(),
@@ -51,7 +47,7 @@ pub(crate) fn stream<T: HttpTransport>(
             None,
             Some(email_states),
         ),
-        JmapScopeRepr::Mailbox => changes_walk::<T, MailboxChanges, Mailbox>(
+        JmapScopeRepr::Mailbox => changes_walk::<MailboxChanges, Mailbox>(
             mail,
             limits,
             cursor.scope.clone(),
@@ -80,7 +76,7 @@ pub(crate) fn stream<T: HttpTransport>(
         // needed). A legacy per-mailbox `Folder` cursor still lands here
         // and still advances correctly; it just is not seeded or
         // discovered anymore.
-        JmapScopeRepr::Folder { .. } => changes_walk::<T, EmailChanges, Email>(
+        JmapScopeRepr::Folder { .. } => changes_walk::<EmailChanges, Email>(
             mail,
             limits,
             cursor.scope.clone(),
@@ -116,8 +112,8 @@ pub(crate) fn stream<T: HttpTransport>(
 /// restarts a durable change scope, lifecycle reconciles a fresh name snapshot,
 /// and anchored inventory allows queryState churn but restarts on a lost
 /// anchor. The callers retain their distinct event and coverage behavior.
-fn changes_walk<T, M, O>(
-    mail: MailAccount<T>,
+fn changes_walk<M, O>(
+    mail: MailAccount,
     limits: ObjectLimits,
     scope: CursorScope,
     mut since_state: crate::core::id::ObjectState<O>,
@@ -125,7 +121,6 @@ fn changes_walk<T, M, O>(
     states: Option<StateCache<O>>,
 ) -> AccountStream<SyncEvent<Change>>
 where
-    T: HttpTransport,
     O: ChangesObject + Send + 'static,
     O::Id: ToString + Send,
     O::ChangesResponse: Send,
@@ -347,96 +342,28 @@ mod tests {
         }
     }
 
-    /// A JMAP HTTP boundary that records every request and answers any
-    /// `*/changes` call with an empty, terminal change page echoing the
-    /// method name and call id it was asked for. Enough to observe WHICH
-    /// method a cursor scope routed to without pinning any payload.
-    struct RecordingTransport {
-        requests: RequestLog,
-        /// When set, answer every `*/changes` call with `newState ==
-        /// sinceState` and `hasMoreChanges: true` - a stuck server that
-        /// would drive an unguarded loop forever.
-        stuck: bool,
-        /// When set, alternate `newState` between two values, always with
-        /// `hasMoreChanges: true`. Every single step "moves" the state, so
-        /// the single-step guard sees progress; only a cycle guard can end
-        /// the walk.
-        oscillating: bool,
-    }
-
-    /// Shared handle on the recorded requests. The transport is moved
-    /// into the client, so the log has to be held separately.
-    #[derive(Clone)]
-    struct RequestLog(std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
-
-    impl RequestLog {
-        fn new() -> Self {
-            Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
-        }
-
-        fn methods(&self) -> Vec<String> {
-            self.0
-                .lock()
-                .expect("recorded requests")
-                .iter()
-                .flat_map(|request| {
-                    request["methodCalls"]
-                        .as_array()
-                        .expect("methodCalls array")
-                        .iter()
-                        .map(|call| call[0].as_str().expect("method name").to_string())
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        }
-
-        fn account_ids(&self) -> Vec<String> {
-            self.0
-                .lock()
-                .expect("recorded requests")
-                .iter()
-                .flat_map(|request| {
-                    request["methodCalls"]
-                        .as_array()
-                        .expect("methodCalls array")
-                        .iter()
-                        .map(|call| call[1]["accountId"].as_str().unwrap_or("").to_string())
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        }
-
-        fn push(&self, request: serde_json::Value) {
-            self.0.lock().expect("recorded requests").push(request);
-        }
-    }
-
-    impl RecordingTransport {
-        fn reply(
-            &self,
-            body: Vec<u8>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            let request: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
-                crate::core::transport::TransportError::with_source(
-                    "JMAP client emitted a non-JSON API request",
-                    error,
-                )
-            })?;
+    /// A JMAP server that answers any `*/changes` call with an empty,
+    /// terminal change page echoing the method name and call id it was
+    /// asked for. Enough to observe WHICH method a cursor scope routed to
+    /// without pinning any payload.
+    ///
+    /// `stuck` answers every call with `newState == sinceState` and
+    /// `hasMoreChanges: true` - a stuck server that would drive an
+    /// unguarded loop forever. `oscillating` alternates `newState` between
+    /// two values, always with `hasMoreChanges: true`: every single step
+    /// "moves" the state, so the single-step guard sees progress and only
+    /// a cycle guard can end the walk.
+    fn recording_server(stuck: bool, oscillating: bool) -> RequestLog {
+        RequestLog(crate::test_wire::api_server(move |request| {
             let call = request["methodCalls"][0].clone();
-            self.requests.push(request);
             let name = call[0]
                 .as_str()
                 .unwrap_or_else(|| panic!("request has no method name: {call}"))
                 .to_string();
-            let call_id = call[2]
-                .as_str()
-                .unwrap_or_else(|| panic!("request has no call id: {call}"))
-                .to_string();
-            let account_id = call[1]["accountId"].clone();
             let since = call[1]["sinceState"].clone();
-            let new_state = if self.stuck {
+            let new_state = if stuck {
                 since.clone()
-            } else if self.oscillating {
+            } else if oscillating {
                 if since == serde_json::json!("state-2") {
                     serde_json::json!("state-1")
                 } else {
@@ -445,63 +372,58 @@ mod tests {
             } else {
                 serde_json::json!("state-2")
             };
-            let response = serde_json::json!({
+            crate::test_wire::ok_json(&serde_json::json!({
                 "sessionState": "session-1",
                 "methodResponses": [[
                     name,
                     {
-                        "accountId": account_id,
+                        "accountId": call[1]["accountId"],
                         "oldState": since,
                         "newState": new_state,
-                        "hasMoreChanges": self.stuck || self.oscillating,
+                        "hasMoreChanges": stuck || oscillating,
                         "created": [],
                         "updated": [],
                         "destroyed": []
                     },
-                    call_id
+                    call[2]
                 ]]
-            });
-            Ok(bytes::Bytes::from(response.to_string()))
-        }
+            }))
+        }))
     }
 
-    impl HttpTransport for RecordingTransport {
-        async fn api_request(
-            &self,
-            _url: &str,
-            body: Vec<u8>,
-            _replay: bifrost_net::ReplayPolicy,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            self.reply(body)
+    /// The scripted server and its view of the requests it received.
+    #[derive(Clone)]
+    struct RequestLog(std::sync::Arc<bifrost_net::test_support::ScriptedDispatch>);
+
+    impl RequestLog {
+        fn calls(&self) -> Vec<serde_json::Value> {
+            crate::test_wire::api_bodies(&self.0)
+                .iter()
+                .flat_map(|request| {
+                    request["methodCalls"]
+                        .as_array()
+                        .expect("methodCalls array")
+                        .clone()
+                })
+                .collect()
         }
 
-        async fn upload(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-            _content_type: Option<&str>,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no upload reply",
-            ))
+        fn methods(&self) -> Vec<String> {
+            self.calls()
+                .iter()
+                .map(|call| call[0].as_str().expect("method name").to_string())
+                .collect()
         }
 
-        async fn download(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no download reply",
-            ))
+        fn account_ids(&self) -> Vec<String> {
+            self.calls()
+                .iter()
+                .map(|call| call[1]["accountId"].as_str().unwrap_or("").to_string())
+                .collect()
         }
 
-        async fn get_session(
-            &self,
-            _url: &str,
-        ) -> Result<bytes::Bytes, crate::core::transport::TransportError> {
-            Err(crate::core::transport::TransportError::new(
-                "no session reply",
-            ))
+        fn client(&self) -> crate::client::Client {
+            crate::test_wire::client(&self.0, test_session())
         }
     }
 
@@ -553,17 +475,8 @@ mod tests {
         cursor: ChangeCursor,
         owner: Option<TypesPrincipalId>,
     ) -> (Vec<SyncEvent<Change>>, RequestLog) {
-        let log = RequestLog::new();
-        let client = crate::client::Client::with_transport(
-            RecordingTransport {
-                requests: log.clone(),
-                stuck: false,
-                oscillating: false,
-            },
-            test_session(),
-            "https://example.test/.well-known/jmap",
-        )
-        .expect("client builds");
+        let log = recording_server(false, false);
+        let client = log.client();
         let mail = crate::sync::registry::Slot::new(client, account_id);
         assert_eq!(
             mail.owner().shared(),
@@ -655,17 +568,8 @@ mod tests {
             (CursorScope::Type(bifrost_types::ObjectType::Email), 1),
             (CursorScope::Type(bifrost_types::ObjectType::Mailbox), 1),
         ] {
-            let log = RequestLog::new();
-            let client = crate::client::Client::with_transport(
-                RecordingTransport {
-                    requests: log.clone(),
-                    stuck: true,
-                    oscillating: false,
-                },
-                test_session(),
-                "https://example.test/.well-known/jmap",
-            )
-            .expect("client builds");
+            let log = recording_server(true, false);
+            let client = log.client();
             let mail = crate::sync::registry::Slot::new(client, "primary");
             let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
             let events = stream(
@@ -710,17 +614,8 @@ mod tests {
             CursorScope::Type(bifrost_types::ObjectType::Email),
             CursorScope::Type(bifrost_types::ObjectType::Mailbox),
         ] {
-            let log = RequestLog::new();
-            let client = crate::client::Client::with_transport(
-                RecordingTransport {
-                    requests: log.clone(),
-                    stuck: false,
-                    oscillating: true,
-                },
-                test_session(),
-                "https://example.test/.well-known/jmap",
-            )
-            .expect("client builds");
+            let log = recording_server(false, true);
+            let client = log.client();
             let mail = crate::sync::registry::Slot::new(client, "primary");
             let cursor = state::cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
             let events = stream(

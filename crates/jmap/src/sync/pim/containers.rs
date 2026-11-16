@@ -2,7 +2,6 @@
 
 use super::{MailAccount, to_acct_err};
 use crate::core::SetCreate;
-use crate::core::transport::HttpTransport;
 use crate::mailbox::{
     Mailbox, MailboxGet, MailboxId, MailboxRights, MailboxSet, Property as MailboxProperty, Role,
 };
@@ -24,8 +23,8 @@ use std::sync::Arc;
 /// account and carries the classified error, so the consumer can tell
 /// "share degraded" from "share deleted". A primary enumeration
 /// failure still fails the call.
-pub(crate) fn containers_list<T: HttpTransport>(
-    foreign_mail: Arc<crate::sync::registry::Registry<T>>,
+pub(crate) fn containers_list(
+    foreign_mail: Arc<crate::sync::registry::Registry>,
 ) -> AccountFuture<Result<ContainerList, AccountError>> {
     let mail = foreign_mail.primary.clone();
 
@@ -52,15 +51,12 @@ pub(crate) fn containers_list<T: HttpTransport>(
     })
 }
 
-pub(super) fn container_wire_id<T: HttpTransport>(
-    id: &ContainerId,
-    slot: &MailAccount<T>,
-) -> MailboxId {
+pub(super) fn container_wire_id(id: &ContainerId, slot: &MailAccount) -> MailboxId {
     MailboxId::new(slot.wire(&id.0))
 }
 
-pub(crate) fn container_create<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn container_create(
+    mail: MailAccount,
     kind: ContainerKind,
     name: String,
     parent: Option<ContainerId>,
@@ -102,8 +98,8 @@ pub(crate) fn container_create<T: HttpTransport>(
     })
 }
 
-pub(crate) fn container_rename<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn container_rename(
+    mail: MailAccount,
     container: ContainerId,
     name: String,
     // JMAP has no mailbox recolor; accepted for trait parity and ignored.
@@ -126,8 +122,8 @@ pub(crate) fn container_rename<T: HttpTransport>(
     })
 }
 
-pub(crate) fn container_move<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn container_move(
+    mail: MailAccount,
     container: ContainerId,
     new_parent: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -161,8 +157,8 @@ pub(crate) fn container_move<T: HttpTransport>(
     })
 }
 
-pub(crate) fn container_delete<T: HttpTransport>(
-    mail: MailAccount<T>,
+pub(crate) fn container_delete(
+    mail: MailAccount,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -184,8 +180,8 @@ pub(crate) fn container_delete<T: HttpTransport>(
     })
 }
 
-pub(super) async fn role_mailbox<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn role_mailbox(
+    mail: &MailAccount,
     role: FolderRole,
     op: AccountOperation,
 ) -> Result<MailboxId, AccountError> {
@@ -200,8 +196,8 @@ pub(super) async fn role_mailbox<T: HttpTransport>(
 /// caller decides which of them are required. Batching matters because
 /// the submission paths need Drafts and Sent together and
 /// `fetch_mailboxes` is an uncached round trip.
-pub(super) async fn role_mailboxes<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn role_mailboxes(
+    mail: &MailAccount,
     roles: &[FolderRole],
     op: AccountOperation,
 ) -> Result<HashMap<FolderRole, MailboxId>, AccountError> {
@@ -231,8 +227,8 @@ pub(super) fn missing_role_mailbox(op: AccountOperation) -> AccountError {
     )
 }
 
-async fn fetch_containers<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn fetch_containers(
+    mail: &MailAccount,
     op: AccountOperation,
 ) -> Result<Vec<Container>, AccountError> {
     Ok(fetch_mailboxes(mail, op)
@@ -366,9 +362,9 @@ pub(super) fn owner_email_plans(
 /// Resolve owner emails for the foreign accounts, once per account.
 /// Returns only the resolved entries; every failure lands as an absent
 /// key (fail-soft, mandatory - see `containers_list`).
-async fn resolve_owner_emails<T: HttpTransport>(
-    mail: &MailAccount<T>,
-    foreign_mail: &crate::sync::registry::Registry<T>,
+async fn resolve_owner_emails(
+    mail: &MailAccount,
+    foreign_mail: &crate::sync::registry::Registry,
 ) -> HashMap<String, String> {
     let mut resolved = HashMap::new();
     if foreign_mail.shared().next().is_none() {
@@ -455,8 +451,8 @@ pub(super) fn owner_email_from_lookup(
 ///
 /// Still fail-soft - no error escapes - but the failure is now
 /// classified rather than flattened.
-async fn fetch_principal_email<T: HttpTransport>(
-    mail: &MailAccount<T>,
+async fn fetch_principal_email(
+    mail: &MailAccount,
     principals_account_id: Option<&str>,
     principal_id: &str,
 ) -> PrincipalEmail {
@@ -498,8 +494,8 @@ async fn fetch_principal_email<T: HttpTransport>(
 /// carrying the classified error) plus the remaining containers -
 /// matching the shape open-time seeding uses for an unreachable share.
 /// One unreachable share must not blank the whole sidebar.
-pub(super) async fn fetch_foreign_containers<T: HttpTransport>(
-    foreign_mail: &crate::sync::registry::Registry<T>,
+pub(super) async fn fetch_foreign_containers(
+    foreign_mail: &crate::sync::registry::Registry,
     owner_emails: &HashMap<String, String>,
     op: AccountOperation,
 ) -> (Vec<Container>, Vec<SkippedScope>) {
@@ -543,8 +539,8 @@ pub(super) async fn fetch_foreign_containers<T: HttpTransport>(
     (containers, skipped)
 }
 
-pub(super) async fn fetch_mailboxes<T: HttpTransport>(
-    mail: &MailAccount<T>,
+pub(super) async fn fetch_mailboxes(
+    mail: &MailAccount,
     op: AccountOperation,
 ) -> Result<Vec<Mailbox>, AccountError> {
     Ok(mail
