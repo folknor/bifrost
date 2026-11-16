@@ -322,6 +322,18 @@ face.
   `set_active` failure after a committed `put_script` returns a bare error for
   a script that exists. `Created::with_warning` could report it as created
   but not activated.
+- **ManageSieve data responses are read line by line, not as records.**
+  `read_response` (`crates/imap/src/sieve.rs`) pushes a data literal as an
+  item and the rest of its line (the CRLF, or ` ACTIVE` after a literal
+  LISTSCRIPTS name) as a separate `Line`, so `list_scripts` fails with
+  "invalid LISTSCRIPTS line" on a literal script name, and a GETSCRIPT literal
+  is allocated at the server's count with no cap. Status lines are already
+  read as whole records (`read_status`); data responses need the same.
+- **ManageSieve PUTSCRIPT / SETACTIVE `OK (WARNINGS)` text is discarded.**
+  `SieveStatus::Ok` now keeps the code and text, but `ensure_ok` drops them
+  and `filter_create` / `filter_update` have no channel for warnings
+  (`Created::with_warning` exists for create). Product question whether a
+  saved-with-warnings script should say so.
 - **IMAP container operations return a refresh_folders failure after the
   write commits.** The partial-commit record makes this honest; whether to
   return success with a stale registry is a separate API decision.

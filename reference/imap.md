@@ -1322,8 +1322,20 @@ binding), PLAIN, XOAUTH2 or OAUTHBEARER, and maps scripts to `FilterScript { lan
 ManageSieve prefers OAUTHBEARER over XOAUTH2 when both are advertised.
 It uses the same OAuth field validation and error-continuation handling as IMAP.
 ManageSieve frames quoted or literal base64 challenges and quoted client replies.
-SCRAM server-final can arrive as a challenge or in `OK (SASL "...")` success
-data; success requires shared verification in both forms. Certificate binding
+SCRAM server-final can arrive as a challenge or in `OK (SASL string)` success
+data (quoted or literal; a `SASL` code without exactly one string argument is
+a parse error); success requires shared verification in both forms.
+Every status line (`OK` / `NO` / `BYE`, in `read_response` and in the SASL
+loop alike) is read as a whole record by `read_status`: any string in it -
+the trailing message or a response-code argument - may be a literal (`{n}`
+CRLF, n octets), and the code ends at the `)` that balances its `(`, outside
+quoted strings, so nested extension data and quoted parens do not cut it
+short. One 64 KiB allowance covers the whole record, lines and literals
+together, and an oversized or unparseable literal count is `Error::Parse`;
+the per-operation client is dropped on any error, so nothing reads the
+stream past a refusal. A single-line record keeps two tolerances (an
+unbalanced `(` is message text, an unquoted message is trimmed raw text);
+once a literal has been read, malformed structure is refused. Certificate binding
 resolution preserves a present but unusable certificate as a hard error.
 
 
@@ -1695,7 +1707,7 @@ CHECKSCRIPT diagnostics are described below.
 
 Unrecognized hierarchical detail is read as its longest recognized ancestor (RFC 5804 1.3: `QUOTA/MAXFROB` is `QUOTA`, `QUOTA/MAXSIZE/X` is `QUOTA/MAXSIZE`), by whole slash-delimited segments of the code atom only; `native_code` still records the received spelling.
 
-CHECKSCRIPT is the one path where a `NO` is normally not an error: it IS the validation verdict, so it becomes `FilterValidation` diagnostics. `validation_outcome` keeps that reading only for a `NO` with no code, an advisory code (`WARNINGS`, `TAG`) or an unknown one. A `NO` whose (resolved) code names an operational condition - `TRYLATER`, any `QUOTA` form (RFC 5804 2.12 forbids CHECKSCRIPT from checking quota), authentication, `REFERRAL`, `NONEXISTENT`, `ALREADYEXISTS`, `ACTIVE` - and every `BYE` is an error classified by `classify_sieve`: the server did not judge the script, and reporting it as invalid would tell the user something false and discard the classification. `SieveResponseCode::is_verdict` is an exhaustive match, so a new code must be placed. Known gaps: an `OK (WARNINGS)` text is dropped (the parsed `OK` carries no payload), and a status line whose message is a literal (`NO {n}`) is not read past the count.
+CHECKSCRIPT is the one path where a `NO` is normally not an error: it IS the validation verdict, so it becomes `FilterValidation` diagnostics. `validation_outcome` keeps that reading only for a `NO` with no code, an advisory code (`WARNINGS`, `TAG`) or an unknown one. A `NO` whose (resolved) code names an operational condition - `TRYLATER`, any `QUOTA` form (RFC 5804 2.12 forbids CHECKSCRIPT from checking quota), authentication, `REFERRAL`, `NONEXISTENT`, `ALREADYEXISTS`, `ACTIVE` - and every `BYE` is an error classified by `classify_sieve`: the server did not judge the script, and reporting it as invalid would tell the user something false and discard the classification. `SieveResponseCode::is_verdict` is an exhaustive match, so a new code must be placed. An `OK` whose code resolves to `WARNINGS` is a valid script the server still has something to say about (RFC 5804 2.12); an enterprise user checking a rule expects to see those warnings rather than a clean result, so the text becomes one `Warning`-severity diagnostic (whole, not split per line, since server text is not a structured list; a generic text when the server sent none), which keeps `is_valid()` true. Any other `OK` text is informational and dropped. `PUTSCRIPT` / `SETACTIVE` warnings are not surfaced: their account operations return no diagnostics.
 
 A `Transport(_)` kind must never carry an `Acknowledged` attempt - `try_build` rejects the pair (`TransportAcknowledged`) and this boundary `.expect`s, so producing it panics. `into_account_error` demotes it to `InFlight` rather than dropping the cause, since dropping would leave `derive` on its `Unsent` default and blind-retry a non-idempotent operation. Nothing builds the pair today, but `Error::with_attempt` permits it on the transport variants and the driver stamps `Acknowledged` after a tagged response.
 

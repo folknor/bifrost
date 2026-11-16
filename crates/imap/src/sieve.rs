@@ -313,9 +313,33 @@ impl ManageSieveClient {
 /// whose code names an operational condition (see
 /// [`SieveResponseCode::is_verdict`]) stays an error, as does every `BYE`:
 /// a server closing the connection has not judged the script.
+///
+/// An `OK (WARNINGS)` is a valid script the server still has something to
+/// say about (RFC 5804 2.12). An Outlook user checking a rule expects to see
+/// those warnings, not a clean bill, so the text becomes one Warning
+/// diagnostic, which leaves the script valid. Server text is human-readable,
+/// not a structured diagnostic list, so it is kept whole rather than split
+/// per line. Any other `OK` text is informational and dropped.
 fn validation_outcome(status: SieveStatus) -> Result<FilterValidation, Error> {
     match status {
-        SieveStatus::Ok => Ok(FilterValidation::default()),
+        SieveStatus::Ok { code, message } => {
+            if code.as_ref().map(SieveResponseCode::meaning) != Some(SieveResponseCode::Warnings) {
+                return Ok(FilterValidation::default());
+            }
+            let message = if message.trim().is_empty() {
+                "Script compiled with warnings".to_owned()
+            } else {
+                message
+            };
+            Ok(FilterValidation {
+                diagnostics: vec![FilterDiagnostic {
+                    severity: FilterDiagnosticSeverity::Warning,
+                    message,
+                    line: None,
+                    column: None,
+                }],
+            })
+        }
         SieveStatus::Bye { code, message } => Err(Error::Sieve { code, message }),
         SieveStatus::No { code, message } => {
             if code.as_ref().is_some_and(|code| !code.is_verdict()) {
@@ -468,11 +492,12 @@ async fn authenticate(
     write_command(stream, timeout, command.as_bytes()).await?;
     loop {
         let line = read_line(stream, timeout).await?;
-        if let Some(status) = SieveStatus::parse(&line) {
-            return match status {
-                SieveStatus::Ok => {
+        if is_status_line(&line) {
+            let record = read_status(stream, timeout, line).await?;
+            return match record.status {
+                SieveStatus::Ok { code, .. } => {
                     // RFC 5804 permits SASL success data in the terminal OK.
-                    if let Some(data) = sasl_success_data(&line)? {
+                    if let Some(data) = sasl_success_data(code.as_ref(), &record.code_args)? {
                         match client.step(&data)? {
                             bifrost_sasl::Step::Done => {}
                             _ => {
@@ -541,20 +566,19 @@ async fn authenticate(
     }
 }
 
-fn sasl_success_data(line: &str) -> Result<Option<Vec<u8>>, Error> {
-    let (_, rest) = split_token(line);
-    let Some(rest) = rest.trim_start().strip_prefix('(') else {
-        return Ok(None);
-    };
-    let (code, rest) = split_token(rest);
-    if !code.eq_ignore_ascii_case("SASL") {
+/// The SASL success data of a terminal `OK (SASL string)`. The code takes
+/// exactly one string argument (quoted or literal); a bare `SASL` or one
+/// with other arguments is malformed, not absent.
+fn sasl_success_data(
+    code: Option<&SieveResponseCode>,
+    args: &[Option<String>],
+) -> Result<Option<Vec<u8>>, Error> {
+    if code != Some(&SieveResponseCode::Sasl) {
         return Ok(None);
     }
-    let (encoded, end) =
-        parse_quoted(rest, 0).ok_or_else(|| Error::Parse("invalid SASL success data".into()))?;
-    if !rest[end..].trim_start().starts_with(')') {
+    let [Some(encoded)] = args else {
         return Err(Error::Parse("invalid SASL success code".into()));
-    }
+    };
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .map(Some)
@@ -686,7 +710,8 @@ async fn read_response(
     let mut items = Vec::new();
     loop {
         let line = read_line(stream, timeout).await?;
-        if let Some(status) = SieveStatus::parse(&line) {
+        if is_status_line(&line) {
+            let status = read_status(stream, timeout, line).await?.status;
             return Ok(SieveResponse { items, status });
         }
         if let Some(len) = literal_len(&line) {
@@ -696,6 +721,339 @@ async fn read_response(
             items.push(SieveResponseItem::Line(line));
         }
     }
+}
+
+/// The most a whole status record may occupy: every line plus every
+/// literal it pulls in. The same bound `read_line` puts on one line; it is
+/// cumulative so an extension code cannot stream unbounded data through
+/// many small literals.
+const STATUS_RECORD_LIMIT: usize = 64 * 1024;
+
+/// Whether a line opens a status record (`OK`, `NO` or `BYE`).
+fn is_status_line(line: &str) -> bool {
+    let (token, _) = split_token(line);
+    ["OK", "NO", "BYE"]
+        .iter()
+        .any(|status| token.eq_ignore_ascii_case(status))
+}
+
+/// Read one complete status record whose first line is `first`.
+///
+/// RFC 5804 lets any string in a status line be a literal (`{n}` CRLF then
+/// n octets), both the trailing message and arguments inside the response
+/// code (`SASL`, `TAG`, extension data). Returning on the first line would
+/// leave those octets on the stream to be misread as the next response, so
+/// the whole record is read here, for every caller, before it is parsed.
+/// A refusal (`Error::Parse`) leaves the stream unusable; every client is
+/// per-operation and dropped on error, so nothing reads past it.
+async fn read_status(
+    stream: &mut SieveStream,
+    timeout: Duration,
+    first: String,
+) -> Result<StatusRecord, Error> {
+    let mut used = first.len();
+    let mut segments = Vec::new();
+    let mut line = first;
+    loop {
+        let Some((prefix, len)) = trailing_literal(&line)? else {
+            segments.push(StatusSegment::Text(line));
+            break;
+        };
+        used = used.saturating_add(len);
+        if used > STATUS_RECORD_LIMIT {
+            return Err(Error::Parse(
+                "ManageSieve status response exceeded 64KiB".into(),
+            ));
+        }
+        line.truncate(prefix);
+        segments.push(StatusSegment::Text(line));
+        segments.push(StatusSegment::Literal(
+            read_exact_len(stream, timeout, len).await?,
+        ));
+        line = read_line(stream, timeout).await?;
+        used = used.saturating_add(line.len());
+        if used > STATUS_RECORD_LIMIT {
+            return Err(Error::Parse(
+                "ManageSieve status response exceeded 64KiB".into(),
+            ));
+        }
+    }
+    parse_status(&segments)
+}
+
+/// If `line` ends in a server literal marker `{n}` outside a quoted string,
+/// the byte offset where the marker starts and `n`. A marker whose digits do
+/// not fit is a refusal, never message text.
+fn trailing_literal(line: &str) -> Result<Option<(usize, usize)>, Error> {
+    let Some(body) = line.strip_suffix('}') else {
+        return Ok(None);
+    };
+    let Some(open) = body.rfind('{') else {
+        return Ok(None);
+    };
+    let digits = &body[open + 1..];
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    if open > 0 && !matches!(line.as_bytes()[open - 1], b' ' | b'(') {
+        return Ok(None);
+    }
+    // The marker holds no quote, so the quote state at its start is the
+    // state at the end of the line.
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in line[..open].bytes() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            _ => {}
+        }
+    }
+    if quoted {
+        return Ok(None);
+    }
+    let len = digits
+        .parse()
+        .map_err(|_| Error::Parse(format!("ManageSieve literal length {digits} overflows")))?;
+    Ok(Some((open, len)))
+}
+
+/// A status record as read off the wire: text runs with the literals that
+/// interrupt them, in order.
+#[derive(Debug)]
+enum StatusSegment {
+    Text(String),
+    Literal(Vec<u8>),
+}
+
+/// A parsed status line with its response-code arguments.
+#[derive(Debug)]
+struct StatusRecord {
+    status: SieveStatus,
+    /// The response code's top-level arguments: `Some` for a string,
+    /// `None` for an atom or a parenthesized list.
+    code_args: Vec<Option<String>>,
+}
+
+#[derive(Debug)]
+enum StatusToken {
+    Str(String),
+    Atom(String),
+    Open,
+    Close,
+}
+
+/// Walks the segments of a status record token by token. A literal segment
+/// is one string token; text is split per RFC 5804 lexical rules.
+struct StatusCursor<'a> {
+    segments: &'a [StatusSegment],
+    index: usize,
+    offset: usize,
+}
+
+impl<'a> StatusCursor<'a> {
+    /// The unread text, when only the final text segment remains.
+    fn rest_of_last_text(&self) -> Option<&'a str> {
+        if self.index + 1 != self.segments.len() {
+            return None;
+        }
+        match &self.segments[self.index] {
+            StatusSegment::Text(text) => Some(&text[self.offset.min(text.len())..]),
+            StatusSegment::Literal(_) => None,
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<StatusToken>, Error> {
+        loop {
+            let Some(segment) = self.segments.get(self.index) else {
+                return Ok(None);
+            };
+            let text = match segment {
+                StatusSegment::Literal(bytes) => {
+                    self.index += 1;
+                    self.offset = 0;
+                    let text = String::from_utf8(bytes.clone()).map_err(|_| {
+                        Error::Parse("ManageSieve status literal is not UTF-8".into())
+                    })?;
+                    return Ok(Some(StatusToken::Str(text)));
+                }
+                StatusSegment::Text(text) => text,
+            };
+            let bytes = text.as_bytes();
+            while bytes.get(self.offset).is_some_and(u8::is_ascii_whitespace) {
+                self.offset += 1;
+            }
+            let Some(&byte) = bytes.get(self.offset) else {
+                self.index += 1;
+                self.offset = 0;
+                continue;
+            };
+            return Ok(Some(match byte {
+                b'(' => {
+                    self.offset += 1;
+                    StatusToken::Open
+                }
+                b')' => {
+                    self.offset += 1;
+                    StatusToken::Close
+                }
+                b'"' => {
+                    let (value, end) = parse_quoted(text, self.offset).ok_or_else(|| {
+                        Error::Parse("unterminated ManageSieve quoted string".into())
+                    })?;
+                    self.offset = end;
+                    StatusToken::Str(value)
+                }
+                _ => {
+                    let start = self.offset;
+                    while bytes.get(self.offset).is_some_and(|b| {
+                        !b.is_ascii_whitespace() && !matches!(b, b'(' | b')' | b'"')
+                    }) {
+                        self.offset += 1;
+                    }
+                    StatusToken::Atom(text[start..self.offset].to_owned())
+                }
+            }));
+        }
+    }
+}
+
+/// Parse a complete status record.
+///
+/// RFC 5804 1.3 and 4:
+///   response-oknobye = ("OK"/"NO"/"BYE") [SP "(" resp-code ")"]
+///                      [SP string] CRLF
+/// The parenthesized code comes BEFORE the human-readable string, so it has
+/// to be lifted off first or it lands inside the message as opaque text and
+/// its semantics are lost. Code arguments may be strings (quoted or
+/// literal) or nested parenthesized extension data, so the code ends at the
+/// `)` that balances its `(`, not at the first one.
+///
+/// A single-line record keeps two tolerances: an unbalanced `(` is message
+/// text rather than an invented code, and an unquoted message is taken as
+/// trimmed raw text. Once a literal has been read the record is committed,
+/// and malformed structure is a refusal.
+fn parse_status(segments: &[StatusSegment]) -> Result<StatusRecord, Error> {
+    let lenient = segments.len() == 1;
+    let mut cursor = StatusCursor {
+        segments,
+        index: 0,
+        offset: 0,
+    };
+    let Some(StatusToken::Atom(word)) = cursor.next()? else {
+        return Err(Error::Parse("ManageSieve status line has no status".into()));
+    };
+    let raw_rest = cursor
+        .rest_of_last_text()
+        .map(str::trim_start)
+        .unwrap_or_default();
+
+    let mut code = None;
+    let mut code_args = Vec::new();
+    let mut token = cursor.next()?;
+    let mut unbalanced = false;
+    if matches!(token, Some(StatusToken::Open)) {
+        match parse_code(&mut cursor) {
+            Ok((parsed, args)) => {
+                code = Some(parsed);
+                code_args = args;
+                token = cursor.next()?;
+            }
+            Err(_) if lenient => unbalanced = true,
+            Err(error) => return Err(error),
+        }
+    }
+    let message = if unbalanced {
+        status_message(raw_rest)
+    } else {
+        match token {
+            None => String::new(),
+            Some(StatusToken::Str(text)) if cursor.next()?.is_none() => text,
+            _ if lenient => status_message(text_after_code(raw_rest)),
+            _ => {
+                return Err(Error::Parse("malformed ManageSieve status message".into()));
+            }
+        }
+    };
+    let status = if word.eq_ignore_ascii_case("OK") {
+        SieveStatus::Ok { code, message }
+    } else if word.eq_ignore_ascii_case("NO") {
+        SieveStatus::No { code, message }
+    } else if word.eq_ignore_ascii_case("BYE") {
+        SieveStatus::Bye { code, message }
+    } else {
+        return Err(Error::Parse(format!("not a ManageSieve status: {word}")));
+    };
+    Ok(StatusRecord { status, code_args })
+}
+
+/// What follows a balanced leading code in a single-line remainder, for the
+/// raw-text message tolerance.
+fn text_after_code(rest: &str) -> &str {
+    let Some(after) = rest.strip_prefix('(') else {
+        return rest;
+    };
+    let mut depth = 1_usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in after.bytes().enumerate() {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return after[index + 1..].trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    rest
+}
+
+/// Parse a response code after its opening `(`, through its balancing `)`.
+/// Returns the code (built from its on-wire spelling, arguments re-quoted)
+/// and its top-level arguments.
+fn parse_code(
+    cursor: &mut StatusCursor<'_>,
+) -> Result<(SieveResponseCode, Vec<Option<String>>), Error> {
+    let unbalanced = || Error::Parse("unbalanced ManageSieve response code".into());
+    let Some(StatusToken::Atom(atom)) = cursor.next()? else {
+        return Err(unbalanced());
+    };
+    let mut raw = atom;
+    let mut args = Vec::new();
+    let mut depth = 0_usize;
+    loop {
+        let token = cursor.next()?.ok_or_else(unbalanced)?;
+        let piece = match &token {
+            StatusToken::Str(text) => {
+                format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+            StatusToken::Atom(atom) => atom.clone(),
+            StatusToken::Open => "(".to_owned(),
+            StatusToken::Close if depth == 0 => break,
+            StatusToken::Close => ")".to_owned(),
+        };
+        if depth == 0 {
+            args.push(match token {
+                StatusToken::Str(text) => Some(text),
+                _ => None,
+            });
+        }
+        match piece.as_str() {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            _ => {}
+        }
+        raw.push(' ');
+        raw.push_str(&piece);
+    }
+    Ok((SieveResponseCode::parse(&raw), args))
 }
 
 // This adapter sits below admission, so its timer exists only while peer I/O
@@ -819,7 +1177,7 @@ struct SieveResponse {
 impl SieveResponse {
     fn ensure_ok(self) -> Result<Self, Error> {
         match self.status {
-            SieveStatus::Ok => Ok(self),
+            SieveStatus::Ok { .. } => Ok(self),
             // Both carry the ManageSieve code so the account boundary can
             // classify it; a `BYE` additionally means the server is
             // closing the connection, but the rejection reason is what
@@ -857,7 +1215,12 @@ enum SieveResponseItem {
 
 #[derive(Debug)]
 enum SieveStatus {
-    Ok,
+    /// Success. The code and text are kept: `OK (WARNINGS)` on CHECKSCRIPT
+    /// carries the warnings the user must see.
+    Ok {
+        code: Option<SieveResponseCode>,
+        message: String,
+    },
     No {
         code: Option<SieveResponseCode>,
         message: String,
@@ -866,34 +1229,6 @@ enum SieveStatus {
         code: Option<SieveResponseCode>,
         message: String,
     },
-}
-
-impl SieveStatus {
-    fn parse(line: &str) -> Option<Self> {
-        let (token, rest) = split_token(line);
-        // RFC 5804 1.3:
-        //   response-oknobye = ("OK"/"NO"/"BYE") [SP "(" resp-code ")"]
-        //                      [SP string] CRLF
-        // The parenthesized code comes BEFORE the human-readable string,
-        // so it has to be lifted off first or it lands inside the message
-        // as opaque text and its semantics are lost.
-        let (code, rest) = split_response_code(rest);
-        if token.eq_ignore_ascii_case("OK") {
-            Some(Self::Ok)
-        } else if token.eq_ignore_ascii_case("NO") {
-            Some(Self::No {
-                code,
-                message: status_message(rest),
-            })
-        } else if token.eq_ignore_ascii_case("BYE") {
-            Some(Self::Bye {
-                code,
-                message: status_message(rest),
-            })
-        } else {
-            None
-        }
-    }
 }
 
 /// A ManageSieve response code (RFC 5804 1.3).
@@ -1034,21 +1369,6 @@ impl SieveResponseCode {
             | Self::AlreadyExists => false,
         }
     }
-}
-
-/// Split a leading `"(" resp-code ")"` off a status line remainder.
-/// Returns the remainder unchanged when no code is present.
-fn split_response_code(rest: &str) -> (Option<SieveResponseCode>, &str) {
-    let Some(after_paren) = rest.strip_prefix('(') else {
-        return (None, rest);
-    };
-    let Some(close) = after_paren.find(')') else {
-        // Unbalanced - treat the whole thing as message text rather than
-        // inventing a code.
-        return (None, rest);
-    };
-    let (raw, tail) = after_paren.split_at(close);
-    (Some(SieveResponseCode::parse(raw)), tail[1..].trim_start())
 }
 
 #[derive(Default)]
@@ -1450,10 +1770,186 @@ mod tests {
     use super::*;
 
     fn no_status(line: &str) -> (Option<SieveResponseCode>, String) {
-        match SieveStatus::parse(line).expect("status parses") {
+        match parse_status(&[StatusSegment::Text(line.to_owned())])
+            .expect("status parses")
+            .status
+        {
             SieveStatus::No { code, message } => (code, message),
             other => panic!("expected NO, got {other:?}"),
         }
+    }
+
+    /// Feed `wire` to `read_response` and return its status plus whatever
+    /// the reader left unread on the stream.
+    async fn read_wire(wire: &[u8]) -> (Result<SieveStatus, Error>, Vec<u8>) {
+        let (client, mut peer) = tokio::io::duplex(256 * 1024);
+        let mut stream = SieveStream {
+            transport: SieveTransport::Memory(client),
+            budget: bifrost_net::BandwidthBudget::default(),
+            sink: None,
+        };
+        peer.write_all(wire).await.unwrap();
+        drop(peer);
+        let result = read_response(&mut stream, Duration::from_secs(5))
+            .await
+            .map(|response| response.status);
+        let mut rest = Vec::new();
+        if let SieveTransport::Memory(client) = &mut stream.transport {
+            client.read_to_end(&mut rest).await.unwrap();
+        }
+        (result, rest)
+    }
+
+    /// RFC 5804 lets the message be a literal. The octets and the closing
+    /// CRLF belong to this response; left on the stream they would be read
+    /// as the next one.
+    #[tokio::test]
+    async fn a_literal_status_message_is_read_whole() {
+        let (status, rest) = read_wire(b"NO {15}\r\nline 1: bad\r\nx;\r\nNEXT\r\n").await;
+        match status.unwrap() {
+            SieveStatus::No { code, message } => {
+                assert_eq!(code, None);
+                assert_eq!(message, "line 1: bad\r\nx;");
+            }
+            other => panic!("expected NO, got {other:?}"),
+        }
+        assert_eq!(rest, b"NEXT\r\n");
+
+        let (status, rest) = read_wire(b"OK (WARNINGS) {7}\r\nline 2\n\r\nNEXT\r\n").await;
+        match status.unwrap() {
+            SieveStatus::Ok { code, message } => {
+                assert_eq!(code, Some(SieveResponseCode::Warnings));
+                assert_eq!(message, "line 2\n");
+            }
+            other => panic!("expected OK, got {other:?}"),
+        }
+        assert_eq!(rest, b"NEXT\r\n");
+    }
+
+    /// A quoted "{3}" is a string, not a literal marker.
+    #[tokio::test]
+    async fn a_quoted_brace_message_is_not_a_literal() {
+        let (status, rest) = read_wire(b"NO \"{3}\"\r\nNEXT\r\n").await;
+        assert!(matches!(status.unwrap(), SieveStatus::No { message, .. } if message == "{3}"));
+        assert_eq!(rest, b"NEXT\r\n");
+    }
+
+    /// Code arguments may be literals and nested lists; the code ends at
+    /// the `)` that balances its `(`.
+    #[tokio::test]
+    async fn code_arguments_may_be_literals_and_nested_lists() {
+        let (status, rest) =
+            read_wire(b"NO (FROB (\"x\" {3}\r\nabc) \"y\") \"rejected\"\r\nNEXT\r\n").await;
+        match status.unwrap() {
+            SieveStatus::No { code, message } => {
+                assert_eq!(
+                    code,
+                    Some(SieveResponseCode::Other(
+                        "FROB ( \"x\" \"abc\" ) \"y\"".to_owned()
+                    ))
+                );
+                assert_eq!(message, "rejected");
+            }
+            other => panic!("expected NO, got {other:?}"),
+        }
+        assert_eq!(rest, b"NEXT\r\n");
+    }
+
+    #[tokio::test]
+    async fn a_status_record_is_bounded_in_total() {
+        let mut wire = b"NO (FROB".to_vec();
+        for _ in 0..3 {
+            wire.extend_from_slice(b" {30000}\r\n");
+            wire.extend(std::iter::repeat_n(b'a', 30000));
+        }
+        wire.extend_from_slice(b") \"x\"\r\n");
+        assert!(matches!(read_wire(&wire).await.0, Err(Error::Parse(_))));
+        let (status, _) = read_wire(b"NO {99999999999999999999999}\r\n").await;
+        assert!(matches!(status, Err(Error::Parse(_))));
+    }
+
+    /// SASL success data may arrive as a literal; a SASL code without its
+    /// one string argument is malformed, not absent.
+    #[test]
+    fn sasl_success_data_takes_exactly_one_string_argument() {
+        let record = parse_status(&[
+            StatusSegment::Text("OK (SASL ".to_owned()),
+            StatusSegment::Literal(b"dj14".to_vec()),
+            StatusSegment::Text(") \"authenticated\"".to_owned()),
+        ])
+        .unwrap();
+        let SieveStatus::Ok { code, message } = &record.status else {
+            panic!("expected OK");
+        };
+        assert_eq!(message, "authenticated");
+        assert_eq!(
+            sasl_success_data(code.as_ref(), &record.code_args).unwrap(),
+            Some(b"v=x".to_vec())
+        );
+        for line in ["OK (SASL)", "OK (SASL atom \"dj14\")"] {
+            let record = parse_status(&[StatusSegment::Text(line.to_owned())]).unwrap();
+            let SieveStatus::Ok { code, .. } = &record.status else {
+                panic!("expected OK");
+            };
+            assert!(
+                sasl_success_data(code.as_ref(), &record.code_args).is_err(),
+                "{line}"
+            );
+        }
+    }
+
+    /// A quoted `)` inside a code argument does not close the code.
+    #[test]
+    fn a_quoted_paren_does_not_close_the_code() {
+        let record = parse_status(&[StatusSegment::Text(
+            r#"OK (TAG ")") "informational""#.to_owned(),
+        )])
+        .unwrap();
+        let SieveStatus::Ok { code, message } = record.status else {
+            panic!("expected OK");
+        };
+        assert_eq!(
+            code.map(|code| code.meaning()),
+            Some(SieveResponseCode::Tag)
+        );
+        assert_eq!(message, "informational");
+    }
+
+    /// `OK (WARNINGS)` on CHECKSCRIPT is a valid script with something to
+    /// say; the user must see it rather than a clean result.
+    #[test]
+    fn checkscript_ok_warnings_become_warning_diagnostics() {
+        for (code, message, expected) in [
+            (
+                SieveResponseCode::Warnings,
+                "line 3: deprecated",
+                "line 3: deprecated",
+            ),
+            (
+                SieveResponseCode::parse("WARNINGS/FROB"),
+                "",
+                "Script compiled with warnings",
+            ),
+        ] {
+            let outcome = validation_outcome(SieveStatus::Ok {
+                code: Some(code),
+                message: message.into(),
+            })
+            .unwrap();
+            assert!(outcome.is_valid());
+            assert_eq!(outcome.diagnostics.len(), 1);
+            assert_eq!(
+                outcome.diagnostics[0].severity,
+                FilterDiagnosticSeverity::Warning
+            );
+            assert_eq!(outcome.diagnostics[0].message, expected);
+        }
+        let clean = validation_outcome(SieveStatus::Ok {
+            code: None,
+            message: "Script is fine".into(),
+        })
+        .unwrap();
+        assert!(clean.diagnostics.is_empty());
     }
 
     /// RFC 5804 puts the parenthesized code BEFORE the human string, so a
@@ -1621,7 +2117,10 @@ mod tests {
                 SieveResponseItem::Line("\"SASL\" \"PLAIN XOAUTH2\"".to_string()),
                 SieveResponseItem::Line("\"STARTTLS\"".to_string()),
             ],
-            status: SieveStatus::Ok,
+            status: SieveStatus::Ok {
+                code: None,
+                message: String::new(),
+            },
         };
         let caps = response.capabilities();
         assert!(caps.starttls);

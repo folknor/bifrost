@@ -38,24 +38,6 @@ or was refused; two design items remain.
   acknowledgement contract. The limitation is now in `supersede`'s rustdoc and
   `reference/sync.md`.
 
-## BUG-204 - ManageSieve CHECKSCRIPT drops `OK (WARNINGS)` text
-
-**Reported by:** the CHECKSCRIPT verdict split (spar review).
-
-`SieveStatus::parse` (`crates/imap/src/sieve.rs`) builds a payload-free `Ok`,
-so the warning text RFC 5804 2.12 lets CHECKSCRIPT return on success never
-reaches `validation_outcome`; the user sees a clean script. It should become
-Warning-severity `FilterValidation` diagnostics (still valid).
-
-## BUG-205 - ManageSieve status line with a literal message is mis-framed
-
-**Reported by:** the CHECKSCRIPT verdict split (spar review).
-
-`read_response` (`crates/imap/src/sieve.rs`) returns on the status line, so a
-legal `NO {n}` followed by an n-octet literal (RFC 5804 allows multiline
-CHECKSCRIPT diagnostics this way) yields `{n}` as the message and leaves the
-literal unread on the stream. Same for an `OK` carrying a literal.
-
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 
 **Reported by:** imap-account; reopened by the wave 1 review.
