@@ -83,9 +83,6 @@ pub use cursor::{
 // Inventory coverage repair.
 pub use repair::{DEFAULT_REPAIR_BUDGET, RepairResolution, run_repair_pass};
 
-// Backfill policy types.
-pub use backfill::{BackfillPolicy, BackfillStrategy};
-
 // Engine configuration knobs.
 pub use scheduler::{BudgetGate, ConcurrencyBudget, Scheduler, WorkKind};
 pub use types::{

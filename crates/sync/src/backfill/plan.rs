@@ -1,5 +1,5 @@
 //! Partition planning and durable resume decisions.
-use super::{BackfillPolicy, BackfillStrategy};
+use super::partitioner::{default_time_boundaries, page_windows, time_windows, uid_windows};
 use crate::types::BackfillConfig;
 use bifrost_types::{BackfillCheckpoint, CursorScope, InventoryPartition, InventoryPartitioning};
 
@@ -162,34 +162,12 @@ pub(crate) fn backfill_plan_for(
     match partitioning {
         InventoryPartitioning::Full => BackfillPlan::Fixed(vec![InventoryPartition::Full]),
         InventoryPartitioning::TimeWindowed => {
-            let policy = BackfillPolicy::default();
-            let plan = crate::backfill::partitioner::plan(&policy, now, 0);
-            BackfillPlan::Fixed(
-                plan.partitions
-                    .iter()
-                    .map(crate::backfill::partitioner::inventory_partition_for)
-                    .collect(),
-            )
+            BackfillPlan::Fixed(time_windows(&default_time_boundaries(), now))
         }
         InventoryPartitioning::UidRange {
             max_uid: Some(max_uid),
             uid_validity,
-        } => {
-            let policy = BackfillPolicy {
-                strategy: BackfillStrategy::UidRange {
-                    chunk_size: config.uid_range_chunk,
-                    uid_validity,
-                },
-                clock_skew: std::time::Duration::ZERO,
-            };
-            let plan = crate::backfill::partitioner::plan(&policy, now, max_uid);
-            BackfillPlan::Fixed(
-                plan.partitions
-                    .iter()
-                    .map(crate::backfill::partitioner::inventory_partition_for)
-                    .collect(),
-            )
-        }
+        } => BackfillPlan::Fixed(uid_windows(config.uid_range_chunk, max_uid, uid_validity)),
         InventoryPartitioning::UidRange { max_uid: None, .. } => {
             tracing::warn!(
                 target: "bifrost.sync.backfill",
@@ -201,21 +179,10 @@ pub(crate) fn backfill_plan_for(
         InventoryPartitioning::PageCount {
             total: Some(total),
             page_size,
-        } => {
-            let policy = BackfillPolicy {
-                strategy: BackfillStrategy::PageCount {
-                    items_per_partition: page_size.unwrap_or(config.page_count_chunk).max(1),
-                },
-                clock_skew: std::time::Duration::ZERO,
-            };
-            let plan = crate::backfill::partitioner::plan(&policy, now, total);
-            BackfillPlan::Fixed(
-                plan.partitions
-                    .iter()
-                    .map(crate::backfill::partitioner::inventory_partition_for)
-                    .collect(),
-            )
-        }
+        } => BackfillPlan::Fixed(page_windows(
+            page_size.unwrap_or(config.page_count_chunk).max(1),
+            total,
+        )),
         InventoryPartitioning::PageCount {
             total: None,
             page_size,
@@ -416,6 +383,81 @@ mod tests {
             )),
             "a failed read restarts at page 0, never at a guessed offset"
         );
+    }
+
+    /// Every advertised partitioning reaches its planner with the engine's
+    /// chunk sizes; no test went through `backfill_plan_for` before the
+    /// planner chain was collapsed into it.
+    #[test]
+    fn advertised_partitioning_maps_to_its_windows() {
+        let scope = CursorScope::Type(ObjectType::Email);
+        let config = BackfillConfig {
+            uid_range_chunk: 10,
+            page_count_chunk: 4,
+            ..BackfillConfig::default()
+        };
+        let now = jiff::Timestamp::from_second(1_800_000_000).unwrap();
+        let fixed = |partitioning| match backfill_plan_for(partitioning, &scope, config, now) {
+            BackfillPlan::Fixed(partitions) => partitions,
+            BackfillPlan::OpenPages { .. } => panic!("expected a fixed plan"),
+        };
+        let uid =
+            |from, to| InventoryPartition::Uid(bifrost_types::UidWindow::new(7, from, to).unwrap());
+        let page =
+            |from, to| InventoryPartition::Page(bifrost_types::PageWindow::new(from, to).unwrap());
+
+        assert_eq!(
+            fixed(InventoryPartitioning::Full),
+            vec![InventoryPartition::Full]
+        );
+        assert_eq!(
+            fixed(InventoryPartitioning::UidRange {
+                max_uid: Some(25),
+                uid_validity: 7
+            }),
+            vec![uid(16, 26), uid(6, 16), uid(1, 6)]
+        );
+        assert_eq!(
+            fixed(InventoryPartitioning::UidRange {
+                max_uid: None,
+                uid_validity: 7
+            }),
+            vec![InventoryPartition::Full]
+        );
+        assert_eq!(
+            fixed(InventoryPartitioning::PageCount {
+                total: Some(6),
+                page_size: None
+            }),
+            vec![page(0, 4), page(4, 6)]
+        );
+        assert_eq!(
+            fixed(InventoryPartitioning::PageCount {
+                total: Some(6),
+                page_size: Some(3)
+            }),
+            vec![page(0, 3), page(3, 6)]
+        );
+        let time = fixed(InventoryPartitioning::TimeWindowed);
+        assert_eq!(
+            time,
+            crate::backfill::partitioner::time_windows(
+                &crate::backfill::partitioner::default_time_boundaries(),
+                now
+            )
+        );
+        assert!(matches!(
+            backfill_plan_for(
+                InventoryPartitioning::PageCount {
+                    total: None,
+                    page_size: Some(0)
+                },
+                &scope,
+                config,
+                now
+            ),
+            BackfillPlan::OpenPages { chunk: 1 }
+        ));
     }
 
     #[test]

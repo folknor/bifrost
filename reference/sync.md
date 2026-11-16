@@ -1394,12 +1394,19 @@ a one-time wait for a FIRST subscriber before the walk starts, while the lane
 bounds how far ahead of that subscriber the walk may run. A subscriber that
 arrives, satisfies the gate, and then leaves is handled by the lane's release
 paths, not by re-entering the gate - the walk keeps running and its pages are
-retired as undelivered, which is the pre-lane behaviour. The partitioner
-(`backfill/partitioner.rs::plan`) handles three strategies:
-`TimeWindowed` (boundaries plus a final open-ended partition),
-`UidRange` (newest-first chunking), and `PageCount` (page-size
-chunking). `Full` falls through as a single partition. No protocol crate
-in this workspace currently advertises `PageCount`: JMAP Email used to,
+retired as undelivered, which is the pre-lane behaviour. Planning
+(`backfill/plan.rs::backfill_plan_for`) maps the account's advertised
+`InventoryPartitioning` straight to a list of `InventoryPartition`s through
+three pure, published window planners in `backfill/partitioner.rs`:
+`time_windows` for `TimeWindowed` (the default boundaries back from the
+planning instant, plus a final window open at its lower end), `uid_windows`
+for `UidRange` (newest-first chunks of `BackfillConfig::uid_range_chunk`), and
+`page_windows` for a `PageCount` with a known total (forward chunks).
+`Full` falls through as a single partition. There is no engine-side policy
+object: the account is the only party that knows which dimension its
+inventory can be cut along, and server clock skew, where a consumer calls a
+planner itself, is applied by shifting the instant it passes in. No protocol
+crate in this workspace currently advertises `PageCount`: JMAP Email used to,
 and now reports `Full`, because its inventory pages `Email/query` by
 `anchor` rather than by integer position and an engine partition
 boundary would discard that anchor (see `reference/jmap.md`). The
@@ -1407,18 +1414,16 @@ boundary would discard that anchor (see `reference/jmap.md`). The
 for a protocol whose paging really is positionally stable.
 
 Every range partition in this workspace is HALF-OPEN, `[from, to)`, with no
-exceptions. `PartitionBounds::Time`, `PartitionBounds::Page`,
-`InventoryPartition::Time`, `InventoryPartition::Page` and
-`CoverageCoordinate::PageRange` always were; `PartitionBounds::Uid`,
-`InventoryPartition::Uid` and `CoverageCoordinate::UidRange` were inclusive
-until this was unified, and are now half-open too. Their endpoints are `u64`
-rather than `u32` for exactly that reason: a walk covering the whole UID space
+exceptions. `InventoryPartition::Time`, `InventoryPartition::Page` and
+`CoverageCoordinate::PageRange` always were; `InventoryPartition::Uid` and
+`CoverageCoordinate::UidRange` were inclusive until this was unified, and are
+now half-open too. Their endpoints are `u64` rather than `u32` for exactly that reason: a walk covering the whole UID space
 has an exclusive end of `u32::MAX + 1`, which a `u32` cannot hold. The UID
 values themselves are still `u32` - `InventoryPartitioning::UidRange`'s
-`max_uid` and the partitioner's `total` stay `u32`, and the widening is only
+`max_uid` and `uid_windows`'s `max_uid` stay `u32`, and the widening is only
 in the range endpoints. No protocol crate currently serves
-`InventoryPartition::Uid`, so the only producers and consumers are the
-partitioner and `CoverageDomain::for_partition`; `CoverageDomain::covers`
+`InventoryPartition::Uid`, so the only producers and consumers are
+`uid_windows` and `CoverageDomain::for_partition`; `CoverageDomain::covers`
 tests containment (`self_from <= other_from && self_to >= other_to`) and reads
 identically under either convention.
 
@@ -4679,12 +4684,12 @@ crates/sync/src/
     fusion.rs             // InventoryFusion::run_with_broadcast
     poll.rs               // adaptive cadence helper
   backfill/
-    mod.rs                // account-keyed read-only BackfillRegistry projection,
-                          // BackfillPolicy / Strategy
+    mod.rs                // account-keyed read-only BackfillRegistry projection
     runner.rs             // BackfillRunner::run_partition,
                           // LiveSupersedes (ring-evicting, default
                           // cap LIVE_SUPERSEDES_DEFAULT_CAP)
-    partitioner.rs        // plan() for TimeWindowed / UidRange / PageCount
+    partitioner.rs        // time_windows / uid_windows / page_windows,
+                          // durable partition key helpers
     checkpoint.rs         // BackfillCheckpointWriter wrapper
     plan.rs               // partitioning -> BackfillPlan -> ScopeResume;
                           // durable completion and open-page resume decisions

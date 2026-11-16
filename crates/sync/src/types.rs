@@ -107,9 +107,11 @@ impl Default for MultiplexerConfig {
 /// Backfill partitioner / runner config.
 #[derive(Debug, Clone, Copy)]
 pub struct BackfillConfig {
-    /// IMAP-on-Basic fallback chunk size for `UidRange` strategy.
+    /// UIDs per window when an account advertises
+    /// `InventoryPartitioning::UidRange`.
     pub uid_range_chunk: u32,
-    /// JMAP `PageCount` strategy page size.
+    /// Items per window when an account advertises
+    /// `InventoryPartitioning::PageCount` without its own page size.
     pub page_count_chunk: u32,
     /// Clock-skew threshold above which a `Warning::ClockSkew` is
     /// emitted.

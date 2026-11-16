@@ -1,56 +1,28 @@
-//! Backfill partitioner.
+//! Backfill window planners and durable partition keys.
 //!
-//! Plans newest-first partitions for a backfill pass. Three strategies:
-//! - `TimeWindowed` (default): exponentially-widening (7d, 30d, 90d,
-//!   180d, 365d, then yearly).
-//! - `UidRange` (IMAP-on-Basic fallback): walks UID 1:N in fixed-size
-//!   chunks.
-//! - `PageCount` (JMAP optimization): walks a page count instead of a
-//!   time / UID dimension.
+//! Three pure planners turn an account's advertised
+//! `InventoryPartitioning` facts into the `InventoryPartition` list the
+//! runner requests, with no intermediate representation:
+//! - `time_windows`: newest-first, exponentially-widening time windows
+//!   ending in an open-ended tail.
+//! - `uid_windows`: newest-first half-open UID windows of one UIDVALIDITY
+//!   epoch, walking from the advertised maximum UID down to 1.
+//! - `page_windows`: forward page-count windows over a positionally
+//!   stable result set.
 //!
-//! The planner is pure; the runner consumes a `PartitionPlan`.
+//! `plan.rs` chooses among them from `Account::inventory_partitioning`;
+//! there is deliberately no engine-side policy object, because the account
+//! is the only party that knows which dimension its inventory can be cut
+//! along.
 
 use std::time::Duration;
 
-use bifrost_types::{InventoryPartition, Partition};
+use bifrost_types::{InventoryPartition, PageWindow, Partition, TimeWindow, UidWindow};
 use jiff::{SignedDuration, Timestamp};
 
-/// Account-level backfill policy.
-#[derive(Debug, Clone)]
-pub struct BackfillPolicy {
-    pub strategy: BackfillStrategy,
-    /// Server-vs-client clock skew applied to time-windowed bounds.
-    /// Positive means the server is ahead of the client.
-    pub clock_skew: Duration,
-}
-
-impl Default for BackfillPolicy {
-    fn default() -> Self {
-        Self {
-            strategy: BackfillStrategy::TimeWindowed {
-                boundaries: default_time_boundaries(),
-            },
-            clock_skew: Duration::ZERO,
-        }
-    }
-}
-
-/// Partitioning strategy chosen per account.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum BackfillStrategy {
-    /// Exponentially-widening time partitions.
-    TimeWindowed { boundaries: Vec<Duration> },
-    /// IMAP-on-Basic fallback. Walks UID 1:N in chunks.
-    UidRange { chunk_size: u32, uid_validity: u32 },
-    /// JMAP `queryChanges` page count. Walks a count over the result
-    /// set rather than a time/UID dimension.
-    PageCount { items_per_partition: u32 },
-}
-
-/// Default time-windowed boundaries from `bifrost-sync.md`:
-/// `[7d, 30d, 90d, 180d, 365d, 2y, 3y, 4y, 5y]`. Anything older than
-/// the last boundary falls into a final open partition.
+/// Default time-window boundaries, measured back from the planning
+/// instant: `[7d, 30d, 90d, 180d, 365d, 2y, 3y, 4y, 5y]`. Anything older
+/// than the last boundary falls into a final open partition.
 #[must_use]
 pub fn default_time_boundaries() -> Vec<Duration> {
     const DAY: u64 = 24 * 60 * 60;
@@ -67,55 +39,86 @@ pub fn default_time_boundaries() -> Vec<Duration> {
     ]
 }
 
-/// A concrete partition plan. The runner walks `partitions` newest-first.
-#[derive(Debug, Clone)]
-pub struct PartitionPlan {
-    pub partitions: Vec<PartitionBounds>,
-}
-
-/// One partition's bounds. Three variants matching `BackfillStrategy`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PartitionBounds {
-    /// `[from, to)` inclusive-exclusive time window.
-    Time { from: Timestamp, to: Timestamp },
-    /// `[from, to)` inclusive-exclusive UID range.
-    Uid {
-        uid_validity: u32,
-        from: u64,
-        to: u64,
-    },
-    /// `[from, to)` page-count range.
-    Page { from: u32, to: u32 },
-}
-
-/// Convert planner bounds into the protocol-neutral Account trait
-/// partition shape.
+/// Plan newest-first time windows ending at `now`, one per boundary plus a
+/// final window open at its lower end. Windows chain back to back: each
+/// window's `from` is the next window's `to`.
+///
+/// Server clock skew is expressed by shifting `now` before calling; there
+/// is no separate skew parameter because skew only ever moved the anchor.
+/// Window edges are whole seconds, the resolution `TimeWindow` carries.
+/// A boundary that runs off the start of the representable range leaves
+/// that window open at its lower end.
+///
+/// # Panics
+/// If `boundaries` is not ascending, a window would be reversed.
 #[must_use]
-pub fn inventory_partition_for(bounds: &PartitionBounds) -> InventoryPartition {
-    match bounds {
-        PartitionBounds::Time { from, to } => InventoryPartition::Time(
-            bifrost_types::TimeWindow::new(
-                if *from == Timestamp::MIN {
-                    None
-                } else {
-                    Some(from.as_second())
-                },
-                Some(to.as_second()),
-            )
-            .expect("ordered window"),
-        ),
-        PartitionBounds::Uid {
-            uid_validity,
-            from,
-            to,
-        } => InventoryPartition::Uid(
-            bifrost_types::UidWindow::new(*uid_validity, *from, *to).expect("ordered window"),
-        ),
-        PartitionBounds::Page { from, to } => InventoryPartition::Page(
-            bifrost_types::PageWindow::new(*from, *to).expect("ordered window"),
-        ),
+pub fn time_windows(boundaries: &[Duration], now: Timestamp) -> Vec<InventoryPartition> {
+    let mut partitions = Vec::with_capacity(boundaries.len() + 1);
+    let mut prev_to = now;
+    for boundary in boundaries {
+        let from = SignedDuration::try_from(*boundary)
+            .ok()
+            .and_then(|d| now.checked_sub(d).ok())
+            .unwrap_or(Timestamp::MIN);
+        partitions.push(time_window(from, prev_to));
+        prev_to = from;
     }
+    partitions.push(time_window(Timestamp::MIN, prev_to));
+    partitions
+}
+
+/// Only the LOWER edge is open at the minimum instant; an upper edge that
+/// reached it stays a concrete bound, as it always has.
+fn time_window(from: Timestamp, to: Timestamp) -> InventoryPartition {
+    let from = (from != Timestamp::MIN).then(|| from.as_second());
+    InventoryPartition::Time(
+        TimeWindow::new(from, Some(to.as_second())).expect("time boundaries must be ascending"),
+    )
+}
+
+/// Plan newest-first half-open UID windows `[from, to)` of `chunk` UIDs
+/// covering `1..=max_uid` in epoch `uid_validity`. Ends are `u64` so the
+/// exclusive end of `u32::MAX` is representable. Empty when `max_uid` or
+/// `chunk` is zero; the scope walk turns an empty fixed plan into one
+/// `Full` request rather than trusting a zero hint.
+#[must_use]
+pub fn uid_windows(chunk: u32, max_uid: u32, uid_validity: u32) -> Vec<InventoryPartition> {
+    if max_uid == 0 || chunk == 0 {
+        return Vec::new();
+    }
+    let mut partitions = Vec::new();
+    let mut to = u64::from(max_uid) + 1;
+    let chunk = u64::from(chunk);
+    while to > 1 {
+        let from = to.saturating_sub(chunk).max(1);
+        partitions.push(InventoryPartition::Uid(
+            UidWindow::new(uid_validity, from, to).expect("ordered window"),
+        ));
+        if from == 1 {
+            break;
+        }
+        to = from;
+    }
+    partitions
+}
+
+/// Plan forward page windows `[from, to)` of `chunk` items over a result
+/// set of `total` items. Empty when either is zero.
+#[must_use]
+pub fn page_windows(chunk: u32, total: u32) -> Vec<InventoryPartition> {
+    if total == 0 || chunk == 0 {
+        return Vec::new();
+    }
+    let mut partitions = Vec::new();
+    let mut from: u32 = 0;
+    while from < total {
+        let to = from.saturating_add(chunk).min(total);
+        partitions.push(InventoryPartition::Page(
+            PageWindow::new(from, to).expect("ordered window"),
+        ));
+        from = to;
+    }
+    partitions
 }
 
 pub use super::marker::BackfillKey;
@@ -163,91 +166,6 @@ pub fn is_completion_partition(partition: &Partition) -> bool {
     BackfillKey::decode(partition).is_completion()
 }
 
-/// Plan a partition list for the given policy.
-///
-/// `now` is taken as a parameter so tests are deterministic. The
-/// `total_for_uid_or_page` parameter is the upper bound for `UidRange`
-/// (total UIDs in folder) and `PageCount` (total items in query).
-#[must_use]
-pub fn plan(policy: &BackfillPolicy, now: Timestamp, total_for_uid_or_page: u32) -> PartitionPlan {
-    match &policy.strategy {
-        BackfillStrategy::TimeWindowed { boundaries } => {
-            plan_time(boundaries, now, policy.clock_skew)
-        }
-        BackfillStrategy::UidRange {
-            chunk_size,
-            uid_validity,
-        } => plan_uid(*chunk_size, total_for_uid_or_page, *uid_validity),
-        BackfillStrategy::PageCount {
-            items_per_partition,
-        } => plan_page(*items_per_partition, total_for_uid_or_page),
-    }
-}
-
-fn plan_time(boundaries: &[Duration], now: Timestamp, skew: Duration) -> PartitionPlan {
-    let now_skewed = SignedDuration::try_from(skew)
-        .ok()
-        .and_then(|d| now.checked_add(d).ok())
-        .unwrap_or(now);
-    let mut partitions = Vec::with_capacity(boundaries.len() + 1);
-    let mut prev_to = now_skewed;
-    for boundary in boundaries {
-        // A boundary that runs off the start of the representable range
-        // saturates to the same sentinel the final open-ended partition uses.
-        let from = SignedDuration::try_from(*boundary)
-            .ok()
-            .and_then(|d| now_skewed.checked_sub(d).ok())
-            .unwrap_or(Timestamp::MIN);
-        partitions.push(PartitionBounds::Time { from, to: prev_to });
-        prev_to = from;
-    }
-    // Final open-ended partition: from the minimum representable instant
-    // to the oldest boundary. Only the lower bound is a fixed sentinel;
-    // every absolute time window still changes with the planning instant.
-    partitions.push(PartitionBounds::Time {
-        from: Timestamp::MIN,
-        to: prev_to,
-    });
-    PartitionPlan { partitions }
-}
-
-fn plan_uid(chunk: u32, total: u32, uid_validity: u32) -> PartitionPlan {
-    if total == 0 || chunk == 0 {
-        return PartitionPlan { partitions: vec![] };
-    }
-    let mut partitions = Vec::new();
-    // Newest-first: walk high UIDs down.
-    let mut to = u64::from(total) + 1;
-    let chunk = u64::from(chunk);
-    while to > 1 {
-        let from = to.saturating_sub(chunk).max(1);
-        partitions.push(PartitionBounds::Uid {
-            uid_validity,
-            from,
-            to,
-        });
-        if from == 1 {
-            break;
-        }
-        to = from;
-    }
-    PartitionPlan { partitions }
-}
-
-fn plan_page(chunk: u32, total: u32) -> PartitionPlan {
-    if total == 0 || chunk == 0 {
-        return PartitionPlan { partitions: vec![] };
-    }
-    let mut partitions = Vec::new();
-    let mut from: u32 = 0;
-    while from < total {
-        let to = from.saturating_add(chunk).min(total);
-        partitions.push(PartitionBounds::Page { from, to });
-        from = to;
-    }
-    PartitionPlan { partitions }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,114 +179,77 @@ mod tests {
             .timestamp()
     }
 
+    fn uid(from: u64, to: u64) -> InventoryPartition {
+        InventoryPartition::Uid(UidWindow::new(1, from, to).unwrap())
+    }
+
+    fn page(from: u32, to: u32) -> InventoryPartition {
+        InventoryPartition::Page(PageWindow::new(from, to).unwrap())
+    }
+
     #[test]
     fn time_windowed_default_partitions_in_order() {
-        let policy = BackfillPolicy::default();
-        let plan = plan(&policy, now(), 0);
+        let plan = time_windows(&default_time_boundaries(), now());
         // 9 boundaries + 1 open-ended tail.
-        assert_eq!(plan.partitions.len(), 10);
-        // Newest first; each partition's `to` equals the previous
-        // partition's `from`.
-        for window in plan.partitions.windows(2) {
-            let (
-                PartitionBounds::Time { from: f0, to: _ },
-                PartitionBounds::Time { from: _, to: t1 },
-            ) = (&window[0], &window[1])
+        assert_eq!(plan.len(), 10);
+        let InventoryPartition::Time(first) = &plan[0] else {
+            panic!("expected time partitions");
+        };
+        assert_eq!(first.to(), Some(now().as_second()));
+        for window in plan.windows(2) {
+            let (InventoryPartition::Time(newer), InventoryPartition::Time(older)) =
+                (&window[0], &window[1])
             else {
                 panic!("expected time partitions");
             };
-            assert_eq!(f0, t1, "partitions must chain back-to-back");
+            assert_eq!(
+                newer.from(),
+                older.to(),
+                "partitions must chain back-to-back"
+            );
         }
+        let InventoryPartition::Time(tail) = plan.last().unwrap() else {
+            panic!("expected time partitions");
+        };
+        assert_eq!(tail.from(), None, "the oldest window is open below");
+    }
+
+    #[test]
+    fn a_saturated_boundary_opens_only_the_lower_edge() {
+        let plan = time_windows(&[Duration::MAX, Duration::MAX], now());
+        assert_eq!(
+            plan,
+            vec![
+                InventoryPartition::Time(TimeWindow::new(None, Some(now().as_second())).unwrap()),
+                InventoryPartition::Time(
+                    TimeWindow::new(None, Some(Timestamp::MIN.as_second())).unwrap()
+                ),
+                InventoryPartition::Time(
+                    TimeWindow::new(None, Some(Timestamp::MIN.as_second())).unwrap()
+                ),
+            ]
+        );
     }
 
     #[test]
     fn uid_range_chunks_newest_first() {
-        let policy = BackfillPolicy {
-            strategy: BackfillStrategy::UidRange {
-                uid_validity: 1,
-                chunk_size: 1000,
-            },
-            clock_skew: Duration::ZERO,
-        };
-        let plan = plan(&policy, now(), 2500);
         assert_eq!(
-            plan.partitions,
-            vec![
-                PartitionBounds::Uid {
-                    uid_validity: 1,
-                    from: 1501,
-                    to: 2501
-                },
-                PartitionBounds::Uid {
-                    uid_validity: 1,
-                    from: 501,
-                    to: 1501
-                },
-                PartitionBounds::Uid {
-                    uid_validity: 1,
-                    from: 1,
-                    to: 501
-                },
-            ]
+            uid_windows(1000, 2500, 1),
+            vec![uid(1501, 2501), uid(501, 1501), uid(1, 501)]
         );
+    }
+
+    #[test]
+    fn uid_windows_reach_the_top_of_the_uid_space() {
+        let plan = uid_windows(u32::MAX, u32::MAX, 1);
+        assert_eq!(plan, vec![uid(1, u64::from(u32::MAX) + 1)]);
     }
 
     #[test]
     fn page_count_walks_in_order() {
-        let policy = BackfillPolicy {
-            strategy: BackfillStrategy::PageCount {
-                items_per_partition: 250,
-            },
-            clock_skew: Duration::ZERO,
-        };
-        let plan = plan(&policy, now(), 700);
         assert_eq!(
-            plan.partitions,
-            vec![
-                PartitionBounds::Page { from: 0, to: 250 },
-                PartitionBounds::Page { from: 250, to: 500 },
-                PartitionBounds::Page { from: 500, to: 700 },
-            ]
-        );
-    }
-
-    #[test]
-    fn bounds_convert_to_account_partitions() {
-        let time = PartitionBounds::Time {
-            from: date(2026, 5, 1)
-                .at(0, 0, 0, 0)
-                .in_tz("UTC")
-                .unwrap()
-                .timestamp(),
-            to: date(2026, 5, 2)
-                .at(0, 0, 0, 0)
-                .in_tz("UTC")
-                .unwrap()
-                .timestamp(),
-        };
-        assert_eq!(
-            inventory_partition_for(&time),
-            InventoryPartition::Time(
-                bifrost_types::TimeWindow::new(Some(1_777_593_600), Some(1_777_680_000))
-                    .expect("ordered window")
-            )
-        );
-
-        assert_eq!(
-            inventory_partition_for(&PartitionBounds::Uid {
-                uid_validity: 1,
-                from: 10,
-                to: 20
-            }),
-            InventoryPartition::Uid(
-                bifrost_types::UidWindow::new(1, 10, 20).expect("ordered window")
-            )
-        );
-        assert_eq!(
-            inventory_partition_for(&PartitionBounds::Page { from: 0, to: 50 }),
-            InventoryPartition::Page(
-                bifrost_types::PageWindow::new(0, 50).expect("ordered window")
-            )
+            page_windows(250, 700),
+            vec![page(0, 250), page(250, 500), page(500, 700)]
         );
     }
 
@@ -379,34 +260,23 @@ mod tests {
             BackfillKey::Full.encode()
         );
         assert_eq!(
-            partition_key(&InventoryPartition::Page(
-                bifrost_types::PageWindow::new(25, 50).expect("ordered window")
-            )),
+            partition_key(&page(25, 50)),
             Partition(b"page:25:50".to_vec())
         );
-        assert_eq!(
-            partition_key(&InventoryPartition::Uid(
-                bifrost_types::UidWindow::new(1, 7, 9).expect("ordered window")
-            )),
-            Partition(b"uid:1:7:9".to_vec())
-        );
+        assert_eq!(partition_key(&uid(7, 9)), Partition(b"uid:1:7:9".to_vec()));
         assert_eq!(
             partition_key(&InventoryPartition::Time(
-                bifrost_types::TimeWindow::new(None, Some(123)).expect("ordered window")
+                TimeWindow::new(None, Some(123)).expect("ordered window")
             )),
             Partition(b"time::123".to_vec())
         );
         for partition in [
             InventoryPartition::Full,
-            InventoryPartition::Time(bifrost_types::TimeWindow::new(None, None).unwrap()),
-            InventoryPartition::Time(bifrost_types::TimeWindow::new(Some(-456), None).unwrap()),
-            InventoryPartition::Time(
-                bifrost_types::TimeWindow::new(Some(-456), Some(123)).unwrap(),
-            ),
-            InventoryPartition::Uid(
-                bifrost_types::UidWindow::new(99, 1, u64::from(u32::MAX) + 1).unwrap(),
-            ),
-            InventoryPartition::Page(bifrost_types::PageWindow::new(0, u32::MAX).unwrap()),
+            InventoryPartition::Time(TimeWindow::new(None, None).unwrap()),
+            InventoryPartition::Time(TimeWindow::new(Some(-456), None).unwrap()),
+            InventoryPartition::Time(TimeWindow::new(Some(-456), Some(123)).unwrap()),
+            InventoryPartition::Uid(UidWindow::new(99, 1, u64::from(u32::MAX) + 1).unwrap()),
+            InventoryPartition::Page(PageWindow::new(0, u32::MAX).unwrap()),
         ] {
             let key = partition_key(&partition);
             assert!(!matches!(BackfillKey::decode(&key), BackfillKey::Opaque(_)));
@@ -416,21 +286,13 @@ mod tests {
 
     #[test]
     fn page_partition_key_round_trips() {
-        let partition = InventoryPartition::Page(
-            bifrost_types::PageWindow::new(500, 1000).expect("ordered window"),
-        );
-        let key = partition_key(&partition);
+        let key = partition_key(&page(500, 1000));
         assert_eq!(parse_page_partition(&key), Some((500, 1000)));
     }
 
     #[test]
     fn parse_page_partition_rejects_other_kinds() {
-        assert_eq!(
-            parse_page_partition(&partition_key(&InventoryPartition::Uid(
-                bifrost_types::UidWindow::new(1, 7, 9).expect("ordered window")
-            ))),
-            None
-        );
+        assert_eq!(parse_page_partition(&partition_key(&uid(7, 9))), None);
         assert_eq!(
             parse_page_partition(&partition_key(&InventoryPartition::Full)),
             None
@@ -444,29 +306,14 @@ mod tests {
         let complete = completion_partition();
         assert!(is_completion_partition(&complete));
         assert_eq!(parse_page_partition(&complete), None);
-        assert!(!is_completion_partition(&partition_key(
-            &InventoryPartition::Page(
-                bifrost_types::PageWindow::new(0, 500).expect("ordered window")
-            )
-        )));
+        assert!(!is_completion_partition(&partition_key(&page(0, 500))));
     }
 
     #[test]
     fn empty_inputs_yield_empty_plan() {
-        let policy = BackfillPolicy {
-            strategy: BackfillStrategy::UidRange {
-                uid_validity: 1,
-                chunk_size: 100,
-            },
-            clock_skew: Duration::ZERO,
-        };
-        assert!(plan(&policy, now(), 0).partitions.is_empty());
-        let policy = BackfillPolicy {
-            strategy: BackfillStrategy::PageCount {
-                items_per_partition: 50,
-            },
-            clock_skew: Duration::ZERO,
-        };
-        assert!(plan(&policy, now(), 0).partitions.is_empty());
+        assert!(uid_windows(100, 0, 1).is_empty());
+        assert!(uid_windows(0, 100, 1).is_empty());
+        assert!(page_windows(50, 0).is_empty());
+        assert!(page_windows(0, 50).is_empty());
     }
 }

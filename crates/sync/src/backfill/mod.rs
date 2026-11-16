@@ -5,9 +5,10 @@
 //! history), and the runner emits a consumer-ack-deferred checkpoint
 //! at every partition boundary.
 //!
-//! `BackfillPolicy` is configurable per account; the default is
-//! `TimeWindowed` with exponentially-widening windows per
-//! `bifrost-sync.md` -> Default partition policy.
+//! The partitioning is whatever the account advertises through
+//! `Account::inventory_partitioning`; `plan.rs` maps it straight to a list
+//! of `InventoryPartition`s using the pure window planners in
+//! `partitioner`. There is no separate engine-side policy to configure.
 
 pub mod checkpoint;
 pub(crate) mod marker;
@@ -20,7 +21,7 @@ pub mod scope_walk;
 use bifrost_types::{AccountId, CursorScope};
 
 pub use checkpoint::{BackfillCheckpointTarget, BackfillCheckpointWriter};
-pub use partitioner::{BackfillPolicy, BackfillStrategy, PartitionPlan, default_time_boundaries};
+pub use partitioner::{default_time_boundaries, page_windows, time_windows, uid_windows};
 pub use runner::{
     BackfillPartitionOutcome, BackfillRunner, LiveSupersedes, PartitionVerdict, ScopeWalkStep,
 };

@@ -53,28 +53,6 @@ builder becomes a typed facade over bifrost-types' header and body writers (it
 already depends on bifrost-types), with the DKIM signer staying in bifrost-smtp, so
 header encoding, folding, Message-ID, Date and Bcc stripping are decided once.
 
-## STR-046 - A partitioning framework with no producer imposes its costs on every consumer
-
-**Reported by:** sync-lanes (published; not a deletion recommendation).
-
-`BackfillPolicy`, `BackfillStrategy`, `PartitionPlan`, `PartitionBounds`,
-`plan_time` / `plan_uid` / `plan_page`, `OpenPages`, `parse_page_partition`,
-the page tie-break in `get_backfill`, and `open_pages_resume` all serve
-`TimeWindowed`, `UidRange` and `PageCount`; no in-tree provider returns any of
-them. `BackfillPolicy` is documented as "configurable per account" but never
-configured (`backfill_plan_for` builds `BackfillPolicy::default()` or a literal
-with `clock_skew: Duration::ZERO`). `BackfillStrategy` duplicates
-`InventoryPartitioning` and `PartitionBounds` duplicates `InventoryPartition`
-(using a `Timestamp::MIN` sentinel for "open" where `InventoryPartition::Time`
-uses `Option`). The hunter's narrower points: the chain
-`InventoryPartitioning -> BackfillPolicy -> plan -> PartitionBounds ->
-InventoryPartition` has two redundant middle layers, and collapsing it to
-`InventoryPartitioning -> Vec<InventoryPartition>` (or `OpenPages`) in
-`backfill/plan.rs` keeps every behaviour (owner ruling for the middle types);
-and the durable cost of the unexercised machinery (the selection rule every
-store implements, the time-key compaction contract) is paid now by every backend
-for producers that do not exist yet.
-
 ## STR-062 - Protocol-value behaviour lives in IMAP `account/`, and account identity lives in `types/`
 
 **Reported by:** imap-protocol, imap-account.
@@ -109,12 +87,29 @@ methods nobody in `account/` calls. Each further caller is a product question
 
 **Reported by:** imap-account (not a bug; a gap between vocabulary and its intended producer).
 
-`inventory_partitioning` is not overridden, so IMAP folders inventory as one `UID
-FETCH 1:*` that also accumulates every UID in a `Vec<u32>` before minting the
-cursor. The half-open `u64`-ended `InventoryPartition::Uid` vocabulary was
-designed with IMAP in mind (`types.md` says as much), and the bounded backfill
-lane depends on partitions, but no production crate mints a `Uid` partition.
-Related: STR-046.
+Still true: every IMAP folder plans `Full`, and both the first (fusion-owned)
+inventory and every later backfill-orchestrator pass (re-incarnations, attaches
+that resume a stored cursor) read the folder as one oldest-first `UID FETCH
+1:*`. The engine side is ready: `backfill::uid_windows` plans newest-first
+epoch-scoped windows from `InventoryPartitioning::UidRange`. Design and link
+plan, sparred 2026-11-16: `notes/imap-partitioned-inventory.md` (bounded
+descending bands inside the fusion walk, plus a `UidRange` producer for
+orchestrator passes whose ceiling must cover the resumed cursor's baseline;
+early `Ready` establishment rejected). Two premises of the original entry were
+wrong: `reference/types.md` never tied the UID vocabulary to IMAP, and the
+bounded lane counts unread pages, not partitions, so it already applies to a
+`Full` plan.
+
+## STR-147 - `BackfillConfig::clock_skew_warn` has no reader and `Warning::ClockSkew` no producer
+
+**Reported by:** the STR-046 collapse (2026-11-16).
+
+`BackfillConfig::clock_skew_warn` (crates/sync/src/types.rs) is documented as
+the threshold above which a `Warning::ClockSkew` is emitted, but nothing reads
+it and nothing constructs `Warning::ClockSkew`. The planners take skew by
+shifting the planning instant, and the engine has no measured server skew to
+shift by (the original design read it from a STATUS timestamp at account open).
+Either measure skew and emit the warning, or say plainly the knob is reserved.
 
 ## STR-138 - Smaller SMTP axes and placement notes
 
