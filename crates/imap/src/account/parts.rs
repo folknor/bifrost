@@ -4,7 +4,8 @@
 //! the blob openers yet, and `AccountCapabilities::blob_range` deliberately
 //! stays `BlobRangeSupport::No` until a projection actually mints these
 //! handles: a capability that claims a byte path before handles exist is a
-//! promise the crate cannot keep.
+//! promise the crate cannot keep. (The separate [`attachment_entities`]
+//! visitor is wired: attachment search evaluates `SearchFilter::Has` with it.)
 //!
 //! Two pieces:
 //!
@@ -434,6 +435,137 @@ fn lookup(params: &[(String, String)], key: &str) -> Option<String> {
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(key))
         .map(|(_, value)| value.clone())
+}
+
+/// One MIME entity a user would see as an attachment, as described by
+/// BODYSTRUCTURE.
+///
+/// This is a different enumeration from [`walk_bodystructure`]: that walk
+/// lists *fetchable parts* and so never emits a `multipart/*` container,
+/// whereas an attachment can be a container (a forwarded
+/// `multipart/mixed` carrying `Content-Disposition: attachment;
+/// filename="bundle.mime"` whose children have no names of their own).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttachmentEntity {
+    /// Lowercased media type.
+    pub(crate) media_type: String,
+    /// Lowercased media subtype.
+    pub(crate) media_subtype: String,
+    /// Decoded filename, by the same rule [`MessagePart::filename`] uses.
+    pub(crate) filename: Option<String>,
+}
+
+/// Every attachment entity in a message's BODYSTRUCTURE, in document order.
+///
+/// An entity is an attachment when it carries `Content-Disposition:
+/// attachment`, carries a filename (disposition `filename` or content-type
+/// `name`), or is an embedded message (`message/rfc822`, `message/global`).
+/// The one node excluded outright is the outer message's own root
+/// `multipart/*` wrapper, which is the message, not something attached to it;
+/// a single-part root with attachment metadata (a bare `application/pdf`
+/// message) does count. Entering an embedded message does not reset that:
+/// its inner root is an entity inside an attachment and is judged by the
+/// same rule as any other node.
+///
+/// Descent stops at [`MAX_PART_DEPTH`], which a wire-parsed structure cannot
+/// reach (the parser refuses deeper input); a hand-built deeper structure
+/// reports only the entities above the bound.
+pub(crate) fn attachment_entities(structure: &BodyStructure) -> Vec<AttachmentEntity> {
+    let mut out = Vec::new();
+    let mut pending = vec![(structure, true, 0usize)];
+    while let Some((node, outer_root, depth)) = pending.pop() {
+        if depth > MAX_PART_DEPTH {
+            continue;
+        }
+        let (media_type, media_subtype, params, disposition) = match node {
+            BodyStructure::Basic {
+                media_type,
+                media_subtype,
+                params,
+                disposition,
+                ..
+            } => (media_type.as_str(), media_subtype, params, disposition),
+            BodyStructure::Text {
+                media_subtype,
+                params,
+                disposition,
+                ..
+            } => ("text", media_subtype, params, disposition),
+            BodyStructure::Message {
+                media_subtype,
+                params,
+                disposition,
+                body,
+                ..
+            } => {
+                pending.push((body, false, depth + 1));
+                ("message", media_subtype, params, disposition)
+            }
+            BodyStructure::Multipart {
+                media_subtype,
+                params,
+                disposition,
+                bodies,
+                ..
+            } => {
+                // Reverse so the stack pops children in document order.
+                for child in bodies.iter().rev() {
+                    pending.push((child, false, depth + 1));
+                }
+                if outer_root {
+                    continue;
+                }
+                ("multipart", media_subtype, params, disposition)
+            }
+        };
+        let media_type = media_type.to_ascii_lowercase();
+        let media_subtype = media_subtype.to_ascii_lowercase();
+        let filename = filename_of(disposition.as_ref(), params);
+        let attached = disposition
+            .as_ref()
+            .is_some_and(|d| d.disposition_type.eq_ignore_ascii_case("attachment"));
+        let embedded =
+            media_type == "message" && (media_subtype == "rfc822" || media_subtype == "global");
+        if attached || filename.is_some() || embedded {
+            out.push(AttachmentEntity {
+                media_type,
+                media_subtype,
+                filename,
+            });
+        }
+    }
+    out
+}
+
+/// Whether a message's attachments satisfy one `SearchFilter::Has` value.
+///
+/// The shared contract matches the value against "either the filename or the
+/// MIME type". Here: an empty value asks for any attachment at all; a value
+/// containing `/` is a MIME type (`type/subtype` exactly, or `type/` and
+/// `type/*` for the whole top-level type); anything else is a substring of
+/// the decoded filename. Every comparison ignores case, because senders and
+/// servers spell both freely.
+pub(crate) fn attachments_match(entities: &[AttachmentEntity], value: &str) -> bool {
+    // Only the empty value means "any attachment"; whitespace is a literal
+    // part of a filename operand.
+    if value.is_empty() {
+        return !entities.is_empty();
+    }
+    if let Some((kind, subtype)) = value.split_once('/') {
+        let kind = kind.trim().to_ascii_lowercase();
+        let subtype = subtype.trim().to_ascii_lowercase();
+        return entities.iter().any(|entity| {
+            entity.media_type == kind
+                && (subtype.is_empty() || subtype == "*" || entity.media_subtype == subtype)
+        });
+    }
+    let needle = value.to_lowercase();
+    entities.iter().any(|entity| {
+        entity
+            .filename
+            .as_ref()
+            .is_some_and(|name| name.to_lowercase().contains(&needle))
+    })
 }
 
 /// A decoded part handle: everything needed to re-issue the FETCH.

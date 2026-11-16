@@ -49,7 +49,8 @@ mod message;
 mod message_targets;
 mod mutate;
 /// BODYSTRUCTURE part traversal + durable part-handle codec (imap-G1 stage 1).
-/// Not wired into any projection or opener yet; see the module docs.
+/// Not wired into any projection or opener yet; see the module docs. Its
+/// attachment visitor serves attachment search.
 mod parts;
 mod poll;
 mod pool;

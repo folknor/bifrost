@@ -358,7 +358,7 @@ fn search_plan_defaults_to_all_and_carries_the_folder_restriction() {
         AccountOperation::SearchMessages,
     )
     .expect("plan");
-    assert_eq!(plan.criteria, "ALL");
+    assert_eq!(plan.criteria(), "ALL");
     assert!(plan.folder.is_none());
 
     let plan = search_plan(
@@ -367,7 +367,7 @@ fn search_plan_defaults_to_all_and_carries_the_folder_restriction() {
         AccountOperation::SearchMessages,
     )
     .expect("plan");
-    assert_eq!(plan.criteria, "ALL", "In contributes no criteria");
+    assert_eq!(plan.criteria(), "ALL", "In contributes no criteria");
     assert_eq!(
         plan.folder.as_ref().map(MailboxName::as_str),
         Some("Archive")
@@ -382,7 +382,7 @@ fn search_plan_quotes_filter_operands() {
         AccountOperation::SearchMessages,
     )
     .expect("plan");
-    assert_eq!(plan.criteria, "SUBJECT \"quarterly \\\"report\\\"\"");
+    assert_eq!(plan.criteria(), "SUBJECT \"quarterly \\\"report\\\"\"");
 }
 
 #[test]
@@ -394,7 +394,7 @@ fn search_plan_substitutes_or_conjoins_the_provider_query() {
         AccountOperation::SearchMessages,
     )
     .expect("plan");
-    assert_eq!(plan.criteria, "UNSEEN", "the raw query is trimmed");
+    assert_eq!(plan.criteria(), "UNSEEN", "the raw query is trimmed");
 
     // With a structured filter the two are juxtaposed, which is
     // IMAP's implicit AND (RFC 3501 Section 6.4.4).
@@ -406,7 +406,7 @@ fn search_plan_substitutes_or_conjoins_the_provider_query() {
         AccountOperation::SearchMessages,
     )
     .expect("plan");
-    assert_eq!(plan.criteria, "FROM \"a@b.test\" UNSEEN");
+    assert_eq!(plan.criteria(), "FROM \"a@b.test\" UNSEEN");
 
     // A whitespace-only raw query is ignored entirely.
     let plan = search_plan(
@@ -415,7 +415,7 @@ fn search_plan_substitutes_or_conjoins_the_provider_query() {
         AccountOperation::SearchMessages,
     )
     .expect("plan");
-    assert_eq!(plan.criteria, "ALL");
+    assert_eq!(plan.criteria(), "ALL");
 }
 
 #[test]
@@ -438,7 +438,10 @@ fn search_plan_rejects_structurally_unsafe_provider_queries() {
         AccountOperation::SearchMessages,
     )
     .expect("balanced query");
-    assert_eq!(plan.criteria, "OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")");
+    assert_eq!(
+        plan.criteria(),
+        "OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")"
+    );
     let plan = search_plan(
         &super::super::DavScopeIndex::default(),
         &SearchRequest::provider("FROM"),
@@ -446,7 +449,8 @@ fn search_plan_rejects_structurally_unsafe_provider_queries() {
     )
     .expect("plan");
     assert_eq!(
-        plan.criteria, "FROM",
+        plan.criteria(),
+        "FROM",
         "the structural guard does not attempt operand-arity parsing"
     );
 }
@@ -462,7 +466,7 @@ fn and_and_or_combinators_produce_the_expected_criteria_shapes() {
         AccountOperation::SearchMessages,
     )
     .expect("and");
-    assert_eq!(and.criteria, "FROM \"a@b.test\" SUBJECT \"hi\"");
+    assert_eq!(and.criteria(), "FROM \"a@b.test\" SUBJECT \"hi\"");
 
     // An `In`-only conjunction degenerates to ALL plus the folder.
     let folder_only = combine_and(
@@ -471,7 +475,7 @@ fn and_and_or_combinators_produce_the_expected_criteria_shapes() {
         AccountOperation::SearchMessages,
     )
     .expect("and");
-    assert_eq!(folder_only.criteria, "ALL");
+    assert_eq!(folder_only.criteria(), "ALL");
     assert_eq!(
         folder_only.folder.as_ref().map(MailboxName::as_str),
         Some("Archive")
@@ -490,7 +494,7 @@ fn and_and_or_combinators_produce_the_expected_criteria_shapes() {
     )
     .expect("or");
     assert_eq!(
-        or.criteria,
+        or.criteria(),
         "OR (OR (FROM \"a@b.test\") (FROM \"c@d.test\")) (FROM \"e@f.test\")"
     );
 
@@ -501,7 +505,7 @@ fn and_and_or_combinators_produce_the_expected_criteria_shapes() {
             AccountOperation::SearchMessages
         )
         .expect("empty or")
-        .criteria,
+        .criteria(),
         "ALL"
     );
 }
@@ -548,10 +552,80 @@ fn not_wraps_its_inner_criteria_and_keeps_the_folder() {
         AccountOperation::SearchMessages,
     )
     .expect("not");
-    assert_eq!(part.criteria, "NOT (FROM \"a@b.test\")");
+    assert_eq!(part.criteria(), "NOT (FROM \"a@b.test\")");
     assert_eq!(
         part.folder.as_ref().map(MailboxName::as_str),
         Some("Archive")
+    );
+}
+
+#[test]
+fn has_compiles_to_an_attachment_plan_with_a_sound_universe() {
+    let scopes = super::super::DavScopeIndex::default();
+    let op = AccountOperation::SearchMessages;
+    let plan_for = |filter: SearchFilter, provider: Option<&str>| {
+        let mut request = SearchRequest::filter(filter);
+        request.provider_query = provider.map(str::to_owned);
+        search_plan(&scopes, &request, op).expect("plan")
+    };
+
+    // Has never becomes a BODY search.
+    let plan = plan_for(SearchFilter::Has("pdf".into()), None);
+    let SearchQuery::Attachment { tree, universe } = &plan.query else {
+        panic!("Has must not compile to a single SEARCH: {plan:?}");
+    };
+    assert_eq!(*tree, FilterNode::Has("pdf".into()));
+    assert_eq!(*universe, "ALL");
+
+    // A conjoined server leaf narrows the universe; the provider query is
+    // conjoined into it exactly once; the folder restriction survives.
+    let plan = plan_for(
+        SearchFilter::And(vec![
+            SearchFilter::In(ContainerId("Archive".to_owned())),
+            SearchFilter::Has("pdf".into()),
+            SearchFilter::Subject("q".into()),
+        ]),
+        Some("UNSEEN"),
+    );
+    let SearchQuery::Attachment { universe, .. } = &plan.query else {
+        panic!("attachment plan expected");
+    };
+    assert_eq!(*universe, "SUBJECT \"q\" UNSEEN");
+    assert_eq!(
+        plan.folder.as_ref().map(MailboxName::as_str),
+        Some("Archive")
+    );
+
+    // A negated attachment subtree cannot narrow the universe.
+    let plan = plan_for(
+        SearchFilter::Not(Box::new(SearchFilter::And(vec![
+            SearchFilter::Has("pdf".into()),
+            SearchFilter::From("a".into()),
+        ]))),
+        None,
+    );
+    let SearchQuery::Attachment { tree, universe } = &plan.query else {
+        panic!("attachment plan expected");
+    };
+    assert_eq!(*universe, "ALL");
+    assert!(matches!(tree, FilterNode::Not(_)));
+
+    // Has-free filters keep their single server command.
+    assert_eq!(
+        plan_for(SearchFilter::Body("pdf".into()), None).criteria(),
+        "BODY \"pdf\""
+    );
+    // An In inside an Or is still refused when the Or carries a Has.
+    assert!(
+        search_plan(
+            &scopes,
+            &SearchRequest::filter(SearchFilter::Or(vec![
+                SearchFilter::Has("pdf".into()),
+                SearchFilter::In(ContainerId("Archive".to_owned())),
+            ])),
+            op,
+        )
+        .is_err()
     );
 }
 

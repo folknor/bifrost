@@ -41,23 +41,64 @@ pub(crate) fn search(
                     .map_err(err)?;
                 let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
                 pager.check_epoch(&folder, uidvalidity)?;
-                let roots = conn
-                    .connection()
-                    .uid_thread(
-                        "REFERENCES",
-                        "UTF-8",
-                        &plan.criteria,
-                        account.command_timeout(),
-                    )
-                    .await
-                    .map_err(err)?;
+                let timeout = account.command_timeout();
+                let (roots, matching) = match &plan.query {
+                    SearchQuery::Server(criteria) => (
+                        conn.connection()
+                            .uid_thread("REFERENCES", "UTF-8", criteria, timeout)
+                            .await
+                            .map_err(err)?,
+                        None,
+                    ),
+                    // Attachment-aware thread search groups the matching
+                    // messages by the folder's conversations: the whole
+                    // folder is threaded and each thread keeps only its
+                    // matching members. Threading the matching set itself
+                    // would need a `UID <set>` operand of unbounded length,
+                    // and threading the over-approximation would make the
+                    // grouping depend on how the filter was compiled (RFC
+                    // 5256 dummy pruning and subject grouping change with
+                    // the input set). Against a Has-free search, which
+                    // threads only the matching messages, grouping can
+                    // differ only in those RFC 5256 edge cases.
+                    SearchQuery::Attachment { tree, universe } => {
+                        let matching = attachment::matching_uids(
+                            conn.connection(),
+                            attachment::Surface::Threads,
+                            tree,
+                            universe,
+                            timeout,
+                        )
+                        .await
+                        .map_err(err)?;
+                        let roots = if matching.is_empty() {
+                            Vec::new()
+                        } else {
+                            conn.connection()
+                                .uid_thread(
+                                    "REFERENCES",
+                                    "UTF-8",
+                                    SearchCriteria::new().all(),
+                                    timeout,
+                                )
+                                .await
+                                .map_err(err)?
+                        };
+                        (roots, Some(matching))
+                    }
+                };
                 // A thread's position is its lowest member UID: member sets are
                 // disjoint, so the minima order the folder's threads totally,
                 // and an expunge elsewhere cannot move an untouched thread.
+                // The key is taken after pruning to matching members, so a
+                // matching message below the cursor still anchors its thread.
                 let mut threads = Vec::new();
                 for root in roots {
                     let mut uids = Vec::new();
                     flatten_thread(&root, &mut uids);
+                    if let Some(matching) = &matching {
+                        uids.retain(|uid| matching.contains(uid));
+                    }
                     if let Some(&key) = uids.iter().min() {
                         threads.push((key, uids));
                     }
@@ -111,12 +152,27 @@ pub(crate) fn search_messages(
                     .map_err(err)?;
                 let uidvalidity = selected_uidvalidity(&selected.mailbox).map_err(err)?;
                 pager.check_epoch(&folder, uidvalidity)?;
-                let result = conn
-                    .connection()
-                    .uid_search(&plan.criteria, account.command_timeout())
+                let ids: Vec<u32> = match &plan.query {
+                    SearchQuery::Server(criteria) => {
+                        conn.connection()
+                            .uid_search(criteria, account.command_timeout())
+                            .await
+                            .map_err(err)?
+                            .ids
+                    }
+                    SearchQuery::Attachment { tree, universe } => attachment::matching_uids(
+                        conn.connection(),
+                        attachment::Surface::Messages,
+                        tree,
+                        universe,
+                        account.command_timeout(),
+                    )
                     .await
-                    .map_err(err)?;
-                let uids = result.ids.into_iter().map(|uid| (uid, uid)).collect();
+                    .map_err(err)?
+                    .into_iter()
+                    .collect(),
+                };
+                let uids = ids.into_iter().map(|uid| (uid, uid)).collect();
                 pager.accept(&folder, uidvalidity, uids, |uid| {
                     encode_object_id(
                         &folder,
@@ -135,10 +191,87 @@ pub(crate) fn search_messages(
     })
 }
 
+/// A compiled filter. Every maximal attachment-free subtree collapses into
+/// one `Server` SEARCH criteria; only `Has` and the boolean nodes above it
+/// survive as structure, because IMAP SEARCH cannot evaluate them.
+#[derive(Debug, Clone, PartialEq)]
+enum FilterNode {
+    Server(SearchCriteria),
+    Has(String),
+    And(Vec<FilterNode>),
+    Or(Vec<FilterNode>),
+    Not(Box<FilterNode>),
+}
+
+impl FilterNode {
+    fn all() -> Self {
+        Self::Server(SearchCriteria::new().all())
+    }
+
+    fn is_all(&self) -> bool {
+        matches!(self, Self::Server(criteria) if *criteria == "ALL")
+    }
+
+    /// A SEARCH criteria every match of this node satisfies: `Has` widens to
+    /// `ALL`, and so does any negation over an attachment subtree, since
+    /// the complement of an over-approximation is not one.
+    fn over_approximation(&self) -> SearchCriteria {
+        match self {
+            Self::Server(criteria) => criteria.clone(),
+            Self::Has(_) | Self::Not(_) => SearchCriteria::new().all(),
+            Self::And(nodes) => {
+                let parts: Vec<_> = nodes
+                    .iter()
+                    .map(Self::over_approximation)
+                    .filter(|criteria| *criteria != "ALL")
+                    .collect();
+                if parts.is_empty() {
+                    SearchCriteria::new().all()
+                } else {
+                    parts
+                        .into_iter()
+                        .fold(SearchCriteria::new(), SearchCriteria::and)
+                }
+            }
+            Self::Or(nodes) => {
+                let parts: Vec<_> = nodes.iter().map(Self::over_approximation).collect();
+                if parts.is_empty() || parts.iter().any(|criteria| *criteria == "ALL") {
+                    return SearchCriteria::new().all();
+                }
+                or_chain(parts)
+            }
+        }
+    }
+}
+
+/// How a request runs against one folder.
+#[derive(Debug)]
+enum SearchQuery {
+    /// One server command, as for any filter without `Has`.
+    Server(SearchCriteria),
+    /// Attachment-aware set evaluation (see `search/attachment.rs`):
+    /// `universe` is the over-approximation conjoined with the provider
+    /// query, and `tree` is evaluated exactly inside it.
+    Attachment {
+        tree: FilterNode,
+        universe: SearchCriteria,
+    },
+}
+
 #[derive(Debug)]
 struct SearchPlan {
-    criteria: SearchCriteria,
+    query: SearchQuery,
     folder: Option<MailboxName>,
+}
+
+#[cfg(test)]
+impl SearchPlan {
+    fn criteria(&self) -> SearchCriteria {
+        match &self.query {
+            SearchQuery::Server(criteria) => criteria.clone(),
+            SearchQuery::Attachment { .. } => panic!("attachment plan has no single criteria"),
+        }
+    }
 }
 
 fn search_plan(
@@ -146,12 +279,16 @@ fn search_plan(
     request: &SearchRequest,
     op: AccountOperation,
 ) -> Result<SearchPlan, AccountError> {
-    let mut plan = match &request.filter {
+    let plan = match &request.filter {
         Some(filter) => criteria_from_filter(scopes, filter, op)?,
         None => CriteriaPart {
-            criteria: SearchCriteria::new().all(),
+            node: FilterNode::all(),
             folder: None,
         },
+    };
+    let (mut criteria, tree) = match plan.node {
+        FilterNode::Server(criteria) => (criteria, None),
+        tree => (tree.over_approximation(), Some(tree)),
     };
     if let Some(raw) = request
         .provider_query
@@ -159,19 +296,24 @@ fn search_plan(
         .filter(|raw| !raw.trim().is_empty())
     {
         validate_provider_query(raw, op)?;
-        if plan.criteria == "ALL" {
-            plan.criteria = SearchCriteria::raw(raw.trim().to_owned(), Vec::new());
+        if criteria == "ALL" {
+            criteria = SearchCriteria::raw(raw.trim().to_owned(), Vec::new());
         } else {
-            plan.criteria = plan
-                .criteria
-                .and(SearchCriteria::raw(raw.trim().to_owned(), Vec::new()));
+            criteria = criteria.and(SearchCriteria::raw(raw.trim().to_owned(), Vec::new()));
         }
     }
-    if plan.criteria.trim().is_empty() {
-        plan.criteria = SearchCriteria::new().all();
+    if criteria.trim().is_empty() {
+        criteria = SearchCriteria::new().all();
     }
+    let query = match tree {
+        None => SearchQuery::Server(criteria),
+        Some(tree) => SearchQuery::Attachment {
+            tree,
+            universe: criteria,
+        },
+    };
     Ok(SearchPlan {
-        criteria: plan.criteria,
+        query,
         folder: plan.folder,
     })
 }
@@ -242,8 +384,18 @@ fn validate_provider_query(raw: &str, op: AccountOperation) -> Result<(), Accoun
 
 #[derive(Debug)]
 struct CriteriaPart {
-    criteria: SearchCriteria,
+    node: FilterNode,
     folder: Option<MailboxName>,
+}
+
+#[cfg(test)]
+impl CriteriaPart {
+    fn criteria(&self) -> SearchCriteria {
+        match &self.node {
+            FilterNode::Server(criteria) => criteria.clone(),
+            _ => panic!("attachment part has no single criteria"),
+        }
+    }
 }
 
 fn criteria_from_filter(
@@ -256,18 +408,17 @@ fn criteria_from_filter(
         SearchFilter::From(value) => leaf(SearchCriteria::new().from(value), op),
         SearchFilter::To(value) => leaf(SearchCriteria::new().to(value), op),
         SearchFilter::Subject(value) => leaf(SearchCriteria::new().subject(value), op),
-        // Has currently preserves the existing BODY approximation, which can
-        // match prose and miss encoded attachment filenames. It does not meet
-        // the attachment filename/type contract: enterprise users expect actual
-        // attachments. Correct support needs attachment-aware evaluation (also
-        // through AND/OR/NOT and pagination), not another SEARCH string alias.
-        // Do not replace this with Unsupported without owner authorization:
-        // that would remove the existing search path rather than repair it.
-        SearchFilter::Body(value) | SearchFilter::Has(value) => {
-            leaf(SearchCriteria::new().body(value), op)
-        }
+        SearchFilter::Body(value) => leaf(SearchCriteria::new().body(value), op),
+        // No IMAP SEARCH key sees MIME part headers or parameters, and BODY
+        // matches prose, so attachments are judged from BODYSTRUCTURE by
+        // `search/attachment.rs`, composed with the rest of the filter as set
+        // algebra over UIDs.
+        SearchFilter::Has(value) => Ok(CriteriaPart {
+            node: FilterNode::Has(value.clone()),
+            folder: None,
+        }),
         SearchFilter::In(container) => Ok(CriteriaPart {
-            criteria: SearchCriteria::new().all(),
+            node: FilterNode::all(),
             folder: Some(folder_from_container(scopes, container, op)?),
         }),
         SearchFilter::Labeled(LabelId(label)) => leaf(SearchCriteria::new().keyword(label), op),
@@ -284,16 +435,24 @@ fn criteria_from_filter(
                     .map_err(|e| pim_malformed(op, e.to_string()))?;
             }
             Ok(CriteriaPart {
-                criteria: empty_to_all(criteria),
+                node: FilterNode::Server(empty_to_all(criteria)),
                 folder: None,
             })
         }
         SearchFilter::And(filters) => combine_and(scopes, filters, op),
         SearchFilter::Or(filters) => combine_or(scopes, filters, op),
         SearchFilter::Not(filter) => {
+            // The folder restriction is metadata on the whole search, not a
+            // set the negation complements: it is carried out unchanged.
             let inner = criteria_from_filter(scopes, filter, op)?;
+            let node = match inner.node {
+                FilterNode::Server(criteria) => FilterNode::Server(
+                    SearchCriteria::new().not(&SearchCriteria::new().group(criteria)),
+                ),
+                tree => FilterNode::Not(Box::new(tree)),
+            };
             Ok(CriteriaPart {
-                criteria: SearchCriteria::new().not(&SearchCriteria::new().group(inner.criteria)),
+                node,
                 folder: inner.folder,
             })
         }
@@ -307,7 +466,7 @@ fn leaf(
 ) -> Result<CriteriaPart, AccountError> {
     let criteria = result.map_err(|e| pim_malformed(op, e.to_string()))?;
     Ok(CriteriaPart {
-        criteria: empty_to_all(criteria),
+        node: FilterNode::Server(empty_to_all(criteria)),
         folder: None,
     })
 }
@@ -318,25 +477,52 @@ fn combine_and(
     filters: &[SearchFilter],
     op: AccountOperation,
 ) -> Result<CriteriaPart, AccountError> {
-    let mut criteria = Vec::new();
+    let mut nodes = Vec::new();
     let mut folder = None;
     for filter in filters {
         let part = criteria_from_filter(scopes, filter, op)?;
         folder = merge_folder(folder, part.folder, op)?;
-        if part.criteria != "ALL" {
-            criteria.push(part.criteria);
+        if !part.node.is_all() {
+            nodes.push(part.node);
         }
     }
-    Ok(CriteriaPart {
-        criteria: if criteria.is_empty() {
+    let node = if nodes
+        .iter()
+        .all(|node| matches!(node, FilterNode::Server(_)))
+    {
+        let criteria: Vec<SearchCriteria> = nodes
+            .into_iter()
+            .filter_map(|node| match node {
+                FilterNode::Server(criteria) => Some(criteria),
+                _ => None,
+            })
+            .collect();
+        FilterNode::Server(if criteria.is_empty() {
             SearchCriteria::new().all()
         } else {
             criteria
                 .into_iter()
                 .fold(SearchCriteria::new(), SearchCriteria::and)
-        },
-        folder,
-    })
+        })
+    } else if nodes.len() == 1 {
+        nodes.remove(0)
+    } else {
+        FilterNode::And(nodes)
+    };
+    Ok(CriteriaPart { node, folder })
+}
+
+/// RFC 3501 OR takes exactly two search keys, so a longer OR nests.
+fn or_chain(parts: Vec<SearchCriteria>) -> SearchCriteria {
+    let mut iter = parts.into_iter();
+    let mut criteria = iter.next().unwrap_or_else(|| SearchCriteria::new().all());
+    for next in iter {
+        criteria = SearchCriteria::new().or(
+            &SearchCriteria::new().group(criteria),
+            &SearchCriteria::new().group(next),
+        );
+    }
+    criteria
 }
 
 fn combine_or(
@@ -347,7 +533,7 @@ fn combine_or(
 ) -> Result<CriteriaPart, AccountError> {
     if filters.is_empty() {
         return Ok(CriteriaPart {
-            criteria: SearchCriteria::new().all(),
+            node: FilterNode::all(),
             folder: None,
         });
     }
@@ -365,18 +551,25 @@ fn combine_or(
         if part.folder.is_some() {
             return Err(or_folder_restriction_error(op));
         }
-        parts.push(part.criteria);
+        parts.push(part.node);
     }
-    let folder = None;
-    let mut iter = parts.into_iter();
-    let mut criteria = iter.next().unwrap_or_else(|| SearchCriteria::new().all());
-    for next in iter {
-        criteria = SearchCriteria::new().or(
-            &SearchCriteria::new().group(criteria),
-            &SearchCriteria::new().group(next),
-        );
-    }
-    Ok(CriteriaPart { criteria, folder })
+    let node = if parts
+        .iter()
+        .all(|node| matches!(node, FilterNode::Server(_)))
+    {
+        FilterNode::Server(or_chain(
+            parts
+                .into_iter()
+                .filter_map(|node| match node {
+                    FilterNode::Server(criteria) => Some(criteria),
+                    _ => None,
+                })
+                .collect(),
+        ))
+    } else {
+        FilterNode::Or(parts)
+    };
+    Ok(CriteriaPart { node, folder: None })
 }
 
 #[allow(clippy::unwrap_in_result)]
@@ -834,6 +1027,8 @@ fn flatten_thread(node: &ThreadNode, out: &mut Vec<u32>) {
         pending.extend(node.children.iter().rev());
     }
 }
+
+mod attachment;
 
 #[cfg(test)]
 mod tests;

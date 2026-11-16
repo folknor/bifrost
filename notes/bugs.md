@@ -21,17 +21,6 @@ an entry wrong.
 Each entry names the hunt scope(s) that reported it. The raw reports are in the
 commit that precedes this file's.
 
-## BUG-055 - IMAP `SearchFilter::Has` (attachment filename or type) compiles to a full-text `BODY` search
-
-**Reported by:** imap-account.
-
-It returns messages that merely mention the string. Refusing the filter as
-`Unsupported` would take away a search path that works today; a correct fix
-needs attachment-aware evaluation that composes with boolean filters and
-position paging (for example BODYSTRUCTURE-based post-filtering of the
-candidate set). The defect is now documented at the `pim.rs` arm and in
-`reference/imap.md`.
-
 ## BUG-176 - Open rulings and design residue from the wave 10 to 16 lateral findings
 
 **Reported by:** wave 10 to 16 fixers (lateral); everything fixable in those
@@ -131,3 +120,21 @@ challenge confined to one resource would drop that resource's push coverage
 until the next subscribe. Fix in `crates/graph/src/account/graph_error.rs`:
 recognise the challenge and map it to an authentication kind. Not fixed with
 the discovery change because that file was mid-edit by another item.
+
+## BUG-196 - `SearchFilter::Has` means three different things across providers
+
+**Reported by:** the IMAP attachment-search fix (lateral).
+
+The shared doc in `crates/types/src/search.rs` says the value matches "either
+the filename suffix or the MIME type depending on protocol". IMAP now matches
+an empty value as any attachment, a value with `/` as a MIME type, anything
+else as a filename substring. JMAP (`sync/pim/search.rs`) sends
+`hasAttachment AND text(value)`, a full-text match on any attachment-bearing
+message. Gmail (`account/query.rs`) maps `attachment` to `has:attachment` and
+anything else to `filename:`. Graph (`account/pim/search.rs`) supports only
+the empty value and refuses a non-empty one as `Unsupported`. A consumer
+cannot know what `Has("pdf")` will return. Decide one cross-provider meaning
+(the yardstick suggests the IMAP one: an Outlook user typing a filename or a
+type expects attachments that have it), write it on the variant, and bring the
+other providers to it.
+

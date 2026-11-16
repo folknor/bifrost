@@ -602,3 +602,75 @@ fn every_modelled_encoding_token_round_trips() {
         assert_eq!(encoding_from_token(token), Some(encoding), "token {token}");
     }
 }
+
+fn names(entities: &[AttachmentEntity]) -> Vec<String> {
+    entities
+        .iter()
+        .map(|e| {
+            format!(
+                "{}/{}:{}",
+                e.media_type,
+                e.media_subtype,
+                e.filename.as_deref().unwrap_or("-")
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_single_part_root_with_attachment_metadata_is_an_attachment() {
+    let s = parse(
+        b"(\"application\" \"pdf\" NIL NIL NIL \"base64\" 100 NIL \
+          (\"attachment\" (\"filename\" \"a.pdf\")) NIL NIL)",
+    );
+    assert_eq!(names(&attachment_entities(&s)), ["application/pdf:a.pdf"]);
+    let plain = parse(b"(\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 10 1)");
+    assert!(attachment_entities(&plain).is_empty());
+    assert!(!attachments_match(&attachment_entities(&plain), ""));
+    assert!(!attachments_match(
+        &attachment_entities(&plain),
+        "text/plain"
+    ));
+}
+
+#[test]
+fn a_named_multipart_container_is_an_attachment_but_the_root_wrapper_is_not() {
+    // multipart/mixed root holding a body text and a forwarded
+    // multipart/mixed bundle whose children carry no names.
+    let s = parse(
+        b"((\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 10 1)\
+          ((\"text\" \"plain\" NIL NIL NIL \"7bit\" 1 1)(\"text\" \"html\" NIL NIL NIL \"7bit\" 1 1) \
+          \"mixed\" (\"boundary\" \"b\") (\"attachment\" (\"filename\" \"bundle.mime\")) NIL NIL) \
+          \"mixed\" (\"boundary\" \"a\") NIL NIL NIL)",
+    );
+    let entities = attachment_entities(&s);
+    assert_eq!(names(&entities), ["multipart/mixed:bundle.mime"]);
+    assert!(attachments_match(&entities, ""));
+    assert!(attachments_match(&entities, "BUNDLE"));
+    assert!(attachments_match(&entities, "multipart/*"));
+    assert!(!attachments_match(&entities, "text/plain"));
+}
+
+#[test]
+fn embedded_messages_count_and_their_inner_parts_are_judged_too() {
+    let s = parse(
+        b"((\"text\" \"plain\" NIL NIL NIL \"7bit\" 1 1)\
+          (\"message\" \"rfc822\" NIL NIL NIL \"7bit\" 300 \
+          (NIL \"inner\" NIL NIL NIL NIL NIL NIL NIL NIL) \
+          ((\"text\" \"plain\" NIL NIL NIL \"7bit\" 1 1)\
+          (\"image\" \"png\" (\"name\" \"=?utf-8?B?cmVwb3J0LnBuZw==?=\") NIL NIL \"base64\" 10) \"mixed\") 9) \
+          \"mixed\")",
+    );
+    let entities = attachment_entities(&s);
+    assert_eq!(
+        names(&entities),
+        ["message/rfc822:-", "image/png:report.png"]
+    );
+    assert!(attachments_match(&entities, "image/"));
+    assert!(attachments_match(&entities, "image/PNG"));
+    assert!(attachments_match(&entities, "report.png"));
+    assert!(!attachments_match(&entities, " "));
+    assert!(!attachments_match(&entities, " report"));
+    assert!(!attachments_match(&entities, "application/pdf"));
+    assert!(!attachments_match(&entities, "invoice"));
+}

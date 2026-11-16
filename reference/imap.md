@@ -1009,7 +1009,7 @@ Submodules:
 - `mail_actions.rs` - direct container-membership and keyword/read/importance mutations, composed thread move/delete actions, and their partial-commit projection over the shared mutation engine. It owns the importance keyword consumed by message hydration.
 - `message_targets.rs` - snapshot and native conversation target resolution, per-folder grouping and the UID operand admission shared by actions, drafts and hydration.
 - `compose/` - SMTP send, raw send, draft create/send/discard and Sent-copy policy. `headers.rs` owns byte-preserving envelope parsing, Bcc stripping and draft Date finalization. Header rewriting stays local to submission rather than expanding the shared MIME surface.
-- `search.rs` - typed filter compilation, provider-query validation and position-based search paging.
+- `search.rs` - typed filter compilation, provider-query validation and position-based search paging; `search/attachment.rs` evaluates filters containing `SearchFilter::Has`.
 - `containers.rs` - container snapshots, MYRIGHTS projection and mailbox hierarchy edits. Role classification and account role selection remain owned by the folder registry; rights classification remains owned by `MailboxRights`.
 - `message.rs` - typed message/thread hydration and MIME projection; `hydration.rs` owns the FETCH selector and shared preview floor used by this path and `get.rs`.
 - `settings.rs` - quota, identity/vacation refusals and unsupported primitive results.
@@ -1116,12 +1116,33 @@ race cannot be closed by this client.
 - Keywords: `set_keyword` via UID STORE; convenience keywords `$flagged`/`$answered`/`$seen` map to `\Flagged`/`\Answered`/`\Seen`. `$forwarded` and `$MDNSent` stay IMAP keywords; `mdn_sent_keyword` is `Some("$MDNSent")`, so `mark_mdn_sent` flips `$MDNSent`.
 - Read state: `set_is_read` via `\Seen`.
 - Importance: `set_importance` maps onto the `$important` keyword (no native IMAP field). Two-valued/exclusive: `High` sets it, `Normal`/`Low` clear it (one STORE); the read side maps `$important` presence to `Message.importance`.
-- Attachment search limitation: `SearchFilter::Has` currently compiles to BODY,
-  so prose can match and encoded attachment names can be missed. This does not
-  satisfy the filename/type contract. Enterprise users expect actual attachment
-  matches. Repair requires attachment-aware evaluation through boolean filters
-  and paging; replacing the existing path with Unsupported requires an owner
-  decision because it removes behavior.
+- Attachment search: no IMAP SEARCH key sees MIME part headers or parameters,
+  so `SearchFilter::Has` is evaluated from BODYSTRUCTURE
+  (`account/search/attachment.rs`), never as a `BODY` search. A filter with a
+  `Has` leaf compiles to a tree whose attachment-free subtrees are each one
+  SEARCH; per folder the universe is one SEARCH of an over-approximation (every
+  `Has`, and every negation over an attachment subtree, widened to `ALL`)
+  conjoined once with the provider query, `Has` leaves come from a chunked
+  `UID FETCH (UID BODYSTRUCTURE)` over the universe, and the tree is evaluated
+  as set algebra with `Not` complementing within the universe. FETCH
+  observations are aggregated per requested UID over the whole command: a UID
+  with no response was expunged and leaves the universe (so it never surfaces
+  through a negation), a UID answered without BODYSTRUCTURE fails the folder
+  rather than reading as "no attachment", and out-of-set or unsolicited
+  responses are ignored. Matching (`parts::attachments_match`): an empty value
+  is "has any attachment", a value with `/` is a MIME type (`type/subtype`, or
+  `type/` / `type/*`), anything else is a case-insensitive substring of the
+  decoded filename. An attachment entity (`parts::attachment_entities`) is any
+  MIME node with `Content-Disposition: attachment`, a filename, or an embedded
+  message type, including named `multipart/*` containers and a single-part
+  root; only the outer root `multipart/*` wrapper is excluded. Message search
+  issues its SEARCHes as `UID SEARCH`, thread search as `UID THREAD REFERENCES
+  UTF-8` flattened, so each surface keeps its charset handling. Thread search
+  with `Has` threads the whole folder and keeps each thread's matching members
+  (key = lowest surviving member), so grouping is by the folder's
+  conversations; a Has-free thread search threads only the matching messages,
+  and the two can differ only in RFC 5256 dummy-pruning and subject-grouping
+  edge cases. The leaf SEARCHes are not one atomic snapshot.
 - FETCH thread keys in inventory and PIM messages are redeemable,
   account-scoped `imapnative2:<kind>:<key>` handles: key kind and server key
   only, no folder and no UIDVALIDITY. OBJECTID takes precedence over Gmail's
@@ -1336,8 +1357,9 @@ Output ordering is therefore input-window order, then folder display-name order 
 `AccountCapabilities::blob_range` is `BlobRangeSupport::No` and `open_blob` / `open_blob_range` return `Unsupported`. IMAP can fetch a `BODY[]` section by range, but nothing in inventory or hydration mints a `BlobHandle` for a MIME part, so there is no handle a caller could hand back to an opener. `blob.rs` therefore serves only `open_raw_rfc822`, which streams the whole message via `BODY.PEEK[]`: the FETCH runs through the bounded streaming lane (`uid_fetch_stream_budgeted`), passing the remaining `RAW_FETCH_BUDGET` to the reader. The wire parser charges all literals in each FETCH response against that remaining amount before decoding, so an over-budget response is rejected before the literal is materialized. The consumer's back-pressure still reaches the socket through the driver's `OwnedPermit` reservation. The account drain retains a post-decode `ResultLimit::Fetch` check as a defensive guard. The whole body (`BODY[]`, no origin) of the requested UID is emitted as one `Bytes` page after its FETCH response has been buffered and decoded. The outcome is judged over the whole command after the tagged completion, not per response: responses for other UIDs are ignored, a body-less fragment for the UID (an unsolicited FLAGS update) beside the body is fine, an identical repeated body is emitted once, and a conflicting repeat, a NIL body, or the UID answered with no body at all is `ProviderFailure::Protocol`. A tagged OK with no response for the UID means the message was expunged: the stream terminates `NotFound(Message)` keyed by the submitted id, never `Done` with zero batches. A zero-octet body is a delivered message. The command future stays authoritative for the wire outcome, as in inventory / CONDSTORE. Decoded attachment bytes nevertheless reach `FullWithBlobs` inline; that is not a resumable blob lane. Building the real capability is filed as imap-G1 and is being built in stages.
 
 **imap-G1 stage 1 (`account/parts.rs`) - foundation, deliberately unwired.**
-Two pieces exist and are exercised by tests, but nothing calls them: no
-projection mints a handle, `blob_range` stays `BlobRangeSupport::No`, and the
+Two pieces exist and are exercised by tests, but nothing in the blob lane calls
+them (the module's separate attachment visitor serves attachment search, see
+above): no projection mints a handle, `blob_range` stays `BlobRangeSupport::No`, and the
 openers stay `Unsupported`. Flipping the capability before a projection mints
 handles would advertise a byte path the crate cannot serve, which is the
 defect shape this crate has already paid for once.
@@ -1894,13 +1916,14 @@ crates/imap/src/
 |   |-- inventory.rs       - inventory + initial cursor establishment
 |   |-- mod.rs             - ImapAccount trait impl, helpers
 |   |-- mutate.rs          - bulk_set_flags, bulk_move, bulk_destroy
-|   |-- parts.rs           - BODYSTRUCTURE part traversal + part-handle codec (unwired)
+|   |-- parts.rs           - BODYSTRUCTURE part traversal + part-handle codec (unwired), attachment visitor for search
 |   |-- compose/           - send, drafts, Sent copies; headers.rs preserves raw bytes
 |   |-- containers.rs      - container snapshots and mailbox hierarchy edits
 |   |-- mail_actions.rs    - direct/composed mutations and partial-commit projection
 |   |-- message.rs         - typed message/thread hydration and MIME projection
 |   |-- message_targets.rs - message/conversation target resolution and UID operands
 |   |-- search.rs          - criteria compilation and search paging
+|   |-- search/attachment.rs - BODYSTRUCTURE evaluation of attachment filters
 |   |-- settings.rs        - quota and unsupported primitive results
 |   |-- pool.rs            - per-folder connection checkout
 |   |-- push.rs            - IDLE-driven push sessions
