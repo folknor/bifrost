@@ -170,7 +170,7 @@ impl TryFrom<&Headers> for Envelope {
         // for a shared mailbox expects bounces at the mailbox); this reverses
         // the inherited lettre Sender-first rule on purpose.
         let raw = headers.to_string();
-        let headers = bifrost_types::mime::HeaderMap::parse(raw.as_bytes());
+        let headers = bifrost_mime::HeaderMap::parse(raw.as_bytes());
         let (from, recipients) = headers
             .submission_envelope()
             .map_err(|detail| Error::InvalidInput(detail.to_owned()))?;

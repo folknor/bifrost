@@ -381,7 +381,7 @@ pub(super) enum SendCall {
 pub(super) struct SentThrough {
     pub(super) outcome: Result<bifrost_types::SendReceipt, bifrost_types::AccountError>,
     /// The real renderer's output, for a `send_message` call.
-    pub(super) rendered: Option<bifrost_types::RenderedMessage>,
+    pub(super) rendered: Option<bifrost_mime::RenderedMessage>,
     /// The APPEND literal the IMAP peer received, when it read one.
     pub(super) appended: Option<Vec<u8>>,
 }
@@ -403,7 +403,7 @@ pub(super) async fn send_through_peers(
     use bifrost_smtp::transport::smtp::extension::ClientId;
     use bifrost_smtp::transport::smtp::{PoolConfig, ScriptedConnector, Transcript};
 
-    let rendered: Arc<std::sync::Mutex<Option<bifrost_types::RenderedMessage>>> = Arc::default();
+    let rendered: Arc<std::sync::Mutex<Option<bifrost_mime::RenderedMessage>>> = Arc::default();
     let raw_wire = match &call {
         SendCall::Message(_) => None,
         SendCall::Raw { wire, .. } => Some(*wire),
@@ -509,7 +509,7 @@ pub(super) async fn send_through_peers(
                 account,
                 *request,
                 move |request, from| {
-                    let out = bifrost_types::send_request_to_rfc5322(request, from)?;
+                    let out = bifrost_mime::send_request_to_rfc5322(request, from)?;
                     *record.lock().unwrap() = Some(out.clone());
                     Ok(out)
                 },

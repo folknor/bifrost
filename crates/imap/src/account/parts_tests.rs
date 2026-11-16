@@ -19,7 +19,7 @@
 //! asserts the parser consumed the whole fixture, which is what catches this
 //! class of mistake instead of quietly walking a prefix.
 
-use bifrost_types::mime::TransferEncoding;
+use bifrost_mime::TransferEncoding;
 use bifrost_types::{AccountErrorKind, AccountOperation, RequestErrorKind};
 
 use super::*;

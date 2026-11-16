@@ -5,7 +5,7 @@ use bifrost_types::{AccountError, AccountOperation};
 
 #[derive(Debug)]
 pub(super) struct ParsedDraft {
-    pub(super) envelope: bifrost_types::SubmissionEnvelope,
+    pub(super) envelope: bifrost_mime::SubmissionEnvelope,
     pub(super) body: Vec<u8>,
     pub(super) message_id: String,
 }
@@ -30,7 +30,7 @@ pub(super) fn parse_draft_for_submission(
     let (header_end, body_start) = split_header_body(raw);
     let header_block = &raw[..header_end];
 
-    let headers = bifrost_types::mime::HeaderMap::parse(header_block);
+    let headers = bifrost_mime::HeaderMap::parse(header_block);
 
     let (from, recipients) = headers
         .submission_envelope()
@@ -41,12 +41,12 @@ pub(super) fn parse_draft_for_submission(
         .message_ids("message-id")
         .into_iter()
         .next()
-        .unwrap_or_else(|| bifrost_types::mime::generate_message_id(&from));
+        .unwrap_or_else(|| bifrost_mime::generate_message_id(&from));
 
     let body = strip_bcc_header(header_block, &raw[body_start..]);
 
     Ok(ParsedDraft {
-        envelope: bifrost_types::SubmissionEnvelope { from, recipients },
+        envelope: bifrost_mime::SubmissionEnvelope { from, recipients },
         body,
         message_id,
     })
@@ -218,7 +218,7 @@ pub(super) fn restamp_draft_date(
             "draft header block opens with a continuation line",
         ));
     }
-    let date = bifrost_types::format_rfc5322_date(now).map_err(stamp_imap_protocol)?;
+    let date = bifrost_mime::format_rfc5322_date(now).map_err(stamp_imap_protocol)?;
     Ok(rewrite_header_block(
         header_block,
         &raw[body_start..],

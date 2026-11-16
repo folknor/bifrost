@@ -24,34 +24,23 @@ Each entry names the hunt scope(s) that reported it. Where hunters disagreed,
 both readings are recorded. The raw reports are in the commit that precedes
 this file's.
 
-## STR-014 - MIME lives in `bifrost-types`, and there are two RFC 5322 renderers
+## STR-014 - There are two RFC 5322 writers (bifrost-mime and bifrost-smtp's builder)
 
-**Reported by:** types.
+**Reported by:** types, smtp-sasl. Narrowed 2026-11-16: MIME moved out of
+`bifrost-types` into a new `bifrost-mime` crate above it (types no longer
+depends on `base64` or `encoding_rs`; JMAP, Graph, DAV, sync and net no
+longer compile MIME).
 
-`src/mime/` (parser, header decoder, transfer decoding, body selection,
-renderer, about 4,000 lines with tests) is why the contract crate depends on
-`base64`, `encoding_rs` and `jiff` for MIME. Its consumers are essentially IMAP
-and Google. `bifrost-smtp` carries a second, lettre-derived builder
-(`smtp/src/message/`), so header encoding, address formatting and boundary
-generation are decided by two published renderers. Proposal: a `bifrost-mime`
-crate (depended on by types for `Address`, or the reverse) and an explicit
-ruling on how `smtp::message` relates to it.
-
-The smtp-sasl hunter (needs owner on direction; no deletion implied) shows the two
-composers already hold opposite Message-ID policies: bifrost-smtp's
-`MessageBuilder::message_id(None)` generates `<36 alphanumerics@HOSTNAME>` from
-`hostname::get()`, while bifrost-types' `mime::render` documents "a deterministic,
-controlled-domain Message-ID (the sender's domain, never a leaked machine
-hostname)". The workspace also has two address-list parsers (bifrost-smtp
-`Mailbox`/`Mailboxes` FromStr with `message/mailbox/parsers/rfc2822.rs` vs
-`bifrost_types::Address::parse_list`), and two Date formatters; `account_error.rs`
-notes nothing in the workspace builds a bifrost-smtp `Message`. bifrost-types'
-renderer is what every account crate's send path uses (IMAP, Google drafts);
-bifrost-smtp's `message/` is a richer published builder (DKIM, attachments, typed
-headers) used by nobody in the workspace. A plausible direction: bifrost-smtp's
-builder becomes a typed facade over bifrost-types' header and body writers (it
-already depends on bifrost-types), with the DKIM signer staying in bifrost-smtp, so
-header encoding, folding, Message-ID, Date and Bcc stripping are decided once.
+Residue: `bifrost-mime`'s renderer and `bifrost-smtp`'s lettre-derived
+`message` builder still decide header encoding, folding, Message-ID
+(sender-domain vs `hostname::get()`), Date and boundaries independently; only
+envelope derivation is shared. The renderer also has wire defects the
+unified writer would fix: address headers and References are never folded
+(998-octet overrun on long lists), non-ASCII display-name folds are
+flattened, non-ASCII attachment filenames go out as raw UTF-8. The chain
+(one structured header writer below both composers, then the builder taking
+it plus Message-ID and Date policy, then one entity serializer) is in
+`notes/mime-writer-unification.md`. The builder is published and stays.
 
 ## STR-062 - Protocol-value behaviour lives in IMAP `account/`, and account identity lives in `types/`
 

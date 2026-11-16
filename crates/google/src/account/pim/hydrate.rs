@@ -141,12 +141,12 @@ fn hydrated_address_list(
         .iter()
         .filter(|header| header.name.eq_ignore_ascii_case(name))
     {
-        match Address::parse_list_checked(&header.value) {
+        match bifrost_mime::parse_address_list_checked(&header.value) {
             Ok(parsed) => addresses.extend(parsed),
             Err(_) => {
                 *incomplete = true;
                 // The checked API does not expose accepted siblings on failure.
-                addresses.extend(Address::parse_list(&header.value));
+                addresses.extend(bifrost_mime::parse_address_list(&header.value));
             }
         }
     }
@@ -160,7 +160,7 @@ pub(super) fn body_parts(payload: Option<&GmailPayload>) -> (Option<String>, Opt
 
 // Gmail adapts payload topology only; the shared selector owns body policy.
 fn selected_body_parts(payload: Option<&GmailPayload>) -> (Option<String>, Option<String>, bool) {
-    use bifrost_types::mime::{ParsedMessage, select_body};
+    use bifrost_mime::{ParsedMessage, select_body};
 
     let Some(payload) = payload else {
         return (None, None, true);
@@ -178,10 +178,8 @@ fn selected_body_parts(payload: Option<&GmailPayload>) -> (Option<String>, Optio
 
 /// Gmail has already decoded Content-Transfer-Encoding. Preserve MIME metadata
 /// and topology, but feed the selector those decoded bytes without decoding twice.
-fn gmail_mime_part(part: &GmailPayload, incomplete: &mut bool) -> bifrost_types::mime::MimePart {
-    use bifrost_types::mime::{
-        HeaderMap, MimePart, PartBody, TransferEncoding, parse_content_type,
-    };
+fn gmail_mime_part(part: &GmailPayload, incomplete: &mut bool) -> bifrost_mime::MimePart {
+    use bifrost_mime::{HeaderMap, MimePart, PartBody, TransferEncoding, parse_content_type};
 
     let header_block = part
         .headers

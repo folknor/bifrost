@@ -1,7 +1,7 @@
 //! Shared RFC 5322 / MIME assembler for the send and draft paths.
 //!
 //! This is the single message serializer the protocol crates compose
-//! through. It operates entirely in [`Address`](crate::compose::Address)
+//! through. It operates entirely in [`Address`](bifrost_types::compose::Address)
 //! space - no protocol-specific mailbox type is constructed here - so
 //! every account crate (Google, IMAP, and any future SMTP-backed
 //! provider) shares one body-building path instead of maintaining a
@@ -28,8 +28,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
-use crate::compose::{Address, AttachmentInline, SendRequest};
-use crate::error::{
+use bifrost_types::compose::{Address, AttachmentInline, SendRequest};
+use bifrost_types::error::{
     AccountError, AccountErrorBuilder, AccountOperation, DiagnosticText, PrimaryCause, RequestCause,
 };
 
@@ -97,7 +97,7 @@ pub fn send_request_to_rfc5322(
     if !request.attachments_uploaded.is_empty() {
         return Err(unsupported(AccountOperation::AttachmentUpload));
     }
-    request.validate_recipients(crate::Protocol::Unknown)?;
+    request.validate_recipients(bifrost_types::Protocol::Unknown)?;
 
     let from = request.from.clone().unwrap_or_else(|| default_from.clone());
     let message_id = generate_message_id(&from);
@@ -619,7 +619,7 @@ fn sanitize_msg_id_domain(domain: &str) -> String {
 fn unsupported(operation: AccountOperation) -> AccountError {
     // Rendering has no account identity. The consuming account stamps its
     // protocol at the boundary, just as it does for malformed render inputs.
-    AccountError::unsupported(operation, crate::Protocol::Unknown)
+    AccountError::unsupported(operation, bifrost_types::Protocol::Unknown)
 }
 
 // Provider-neutral: this assembler is shared (IMAP today, any future
@@ -641,6 +641,14 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
+    /// `SendRequest` is `#[non_exhaustive]`, so tests outside bifrost-types
+    /// build it by mutating a default.
+    fn send_request(fill: impl FnOnce(&mut SendRequest)) -> SendRequest {
+        let mut request = SendRequest::default();
+        fill(&mut request);
+        request
+    }
+
     fn addr(name: Option<&str>, address: &str) -> Address {
         Address {
             name: name.map(ToOwned::to_owned),
@@ -650,20 +658,19 @@ mod tests {
 
     #[test]
     fn send_request_builds_multipart_mixed_with_alternative() {
-        let request = SendRequest {
-            to: vec![addr(Some("Hei There"), "hei@example.com")],
-            subject: Some("Happy new year".to_owned()),
-            body_text: Some("plain body".to_owned()),
-            body_html: Some("<p>html body</p>".to_owned()),
-            attachments_inline: vec![AttachmentInline {
+        let request = send_request(|r| {
+            r.to = vec![addr(Some("Hei There"), "hei@example.com")];
+            r.subject = Some("Happy new year".to_owned());
+            r.body_text = Some("plain body".to_owned());
+            r.body_html = Some("<p>html body</p>".to_owned());
+            r.attachments_inline = vec![AttachmentInline {
                 filename: "a.txt".to_owned(),
                 mime: "text/plain".to_owned(),
                 data: Bytes::from_static(b"hello"),
                 inline: false,
                 content_id: None,
-            }],
-            ..SendRequest::default()
-        };
+            }];
+        });
         let default_from = addr(None, "me@sender.test");
         let rendered = send_request_to_rfc5322(&request, &default_from).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");
@@ -686,13 +693,12 @@ mod tests {
 
     #[test]
     fn send_request_envelope_unions_recipients() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            cc: vec![addr(None, "b@example.com")],
-            bcc: vec![addr(None, "c@example.com")],
-            body_text: Some("hi".to_owned()),
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.cc = vec![addr(None, "b@example.com")];
+            r.bcc = vec![addr(None, "c@example.com")];
+            r.body_text = Some("hi".to_owned());
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let recipients: Vec<&str> = rendered
@@ -718,11 +724,10 @@ mod tests {
 
     #[test]
     fn send_request_without_bcc_has_no_separate_sent_copy() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            body_text: Some("hi".to_owned()),
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.body_text = Some("hi".to_owned());
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         // No Bcc -> the two bodies would be identical, so no separate copy.
@@ -731,30 +736,30 @@ mod tests {
 
     #[test]
     fn send_request_rejects_uploaded_attachments() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            attachments_uploaded: vec![crate::compose::AttachmentHandle("h".to_owned())],
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.attachments_uploaded = vec![bifrost_types::compose::AttachmentHandle("h".to_owned())];
+        });
         let err = send_request_to_rfc5322(&request, &addr(None, "me@sender.test"))
             .expect_err("uploaded handles rejected");
         assert_eq!(
             *err.kind(),
-            crate::error::AccountErrorKind::Unsupported(AccountOperation::AttachmentUpload)
+            bifrost_types::error::AccountErrorKind::Unsupported(AccountOperation::AttachmentUpload)
         );
     }
 
     #[test]
     fn send_request_requires_recipient() {
-        let request = SendRequest {
-            body_text: Some("hi".to_owned()),
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.body_text = Some("hi".to_owned());
+        });
         let err = send_request_to_rfc5322(&request, &addr(None, "me@sender.test"))
             .expect_err("no recipient");
         assert_eq!(
             *err.kind(),
-            crate::error::AccountErrorKind::Request(crate::error::RequestErrorKind::Malformed)
+            bifrost_types::error::AccountErrorKind::Request(
+                bifrost_types::error::RequestErrorKind::Malformed
+            )
         );
     }
 
@@ -822,12 +827,11 @@ mod tests {
 
     #[test]
     fn folded_subject_obeys_998_octet_line_limit() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            subject: Some("é".repeat(500)),
-            body_text: Some("hi".to_owned()),
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.subject = Some("é".repeat(500));
+            r.body_text = Some("hi".to_owned());
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");
@@ -842,18 +846,17 @@ mod tests {
 
     #[test]
     fn attachment_filename_quotes_are_escaped() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            body_text: Some("hi".to_owned()),
-            attachments_inline: vec![AttachmentInline {
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.body_text = Some("hi".to_owned());
+            r.attachments_inline = vec![AttachmentInline {
                 filename: "evil\"; x=\"y.txt".to_owned(),
                 mime: "text/plain".to_owned(),
                 data: Bytes::from_static(b"x"),
                 inline: false,
                 content_id: None,
-            }],
-            ..SendRequest::default()
-        };
+            }];
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");
@@ -866,12 +869,11 @@ mod tests {
     fn message_id_strips_odd_domain_chars() {
         let from = addr(None, "user@ex ample<>.com");
         let rendered = send_request_to_rfc5322(
-            &SendRequest {
-                to: vec![addr(None, "a@example.com")],
-                body_text: Some("hi".to_owned()),
-                from: Some(from),
-                ..SendRequest::default()
-            },
+            &send_request(|r| {
+                r.to = vec![addr(None, "a@example.com")];
+                r.body_text = Some("hi".to_owned());
+                r.from = Some(from);
+            }),
             &addr(None, "me@sender.test"),
         )
         .expect("renders");
@@ -886,18 +888,17 @@ mod tests {
 
     #[test]
     fn inline_attachment_content_id_emits_header() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            body_html: Some("<img src=\"cid:logo@x\">".to_owned()),
-            attachments_inline: vec![AttachmentInline {
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.body_html = Some("<img src=\"cid:logo@x\">".to_owned());
+            r.attachments_inline = vec![AttachmentInline {
                 filename: "logo.png".to_owned(),
                 mime: "image/png".to_owned(),
                 data: Bytes::from_static(b"img"),
                 inline: true,
                 content_id: Some("logo@x".to_owned()),
-            }],
-            ..SendRequest::default()
-        };
+            }];
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");
@@ -908,18 +909,17 @@ mod tests {
 
     #[test]
     fn no_content_id_emits_no_header() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            body_text: Some("hi".to_owned()),
-            attachments_inline: vec![AttachmentInline {
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.body_text = Some("hi".to_owned());
+            r.attachments_inline = vec![AttachmentInline {
                 filename: "a.txt".to_owned(),
                 mime: "text/plain".to_owned(),
                 data: Bytes::from_static(b"x"),
                 inline: false,
                 content_id: None,
-            }],
-            ..SendRequest::default()
-        };
+            }];
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");
@@ -928,13 +928,12 @@ mod tests {
 
     #[test]
     fn read_receipt_request_emits_disposition_notification_header() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            from: Some(addr(Some("Me"), "me@sender.test")),
-            body_text: Some("hi".to_owned()),
-            request_read_receipt: true,
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.from = Some(addr(Some("Me"), "me@sender.test"));
+            r.body_text = Some("hi".to_owned());
+            r.request_read_receipt = true;
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "default@sender.test")).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");
@@ -944,11 +943,10 @@ mod tests {
 
     #[test]
     fn no_read_receipt_request_omits_header() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            body_text: Some("hi".to_owned()),
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.body_text = Some("hi".to_owned());
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");
@@ -957,12 +955,11 @@ mod tests {
 
     #[test]
     fn send_request_stamps_one_date_on_wire_and_sent_copy() {
-        let request = SendRequest {
-            to: vec![addr(None, "a@example.com")],
-            bcc: vec![addr(None, "c@example.com")],
-            body_text: Some("hi".to_owned()),
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.to = vec![addr(None, "a@example.com")];
+            r.bcc = vec![addr(None, "c@example.com")];
+            r.body_text = Some("hi".to_owned());
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let wire = String::from_utf8(rendered.raw).expect("utf8");
@@ -993,17 +990,18 @@ mod tests {
         let err = format_rfc5322_date(ts).expect_err("pre-1900 rejected");
         assert_eq!(
             *err.kind(),
-            crate::error::AccountErrorKind::Request(crate::error::RequestErrorKind::Malformed)
+            bifrost_types::error::AccountErrorKind::Request(
+                bifrost_types::error::RequestErrorKind::Malformed
+            )
         );
     }
 
     #[test]
     fn bcc_only_send_emits_undisclosed_recipients() {
-        let request = SendRequest {
-            bcc: vec![addr(None, "secret@example.com")],
-            body_text: Some("hi".to_owned()),
-            ..SendRequest::default()
-        };
+        let request = send_request(|r| {
+            r.bcc = vec![addr(None, "secret@example.com")];
+            r.body_text = Some("hi".to_owned());
+        });
         let rendered =
             send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
         let raw = String::from_utf8(rendered.raw).expect("utf8");

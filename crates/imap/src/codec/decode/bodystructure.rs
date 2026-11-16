@@ -6,7 +6,7 @@ use super::envelope_fetch::envelope;
 use super::primitives::*;
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use bifrost_types::mime::decode_rfc2231_params;
+use bifrost_mime::decode_rfc2231_params;
 
 /// Maximum nesting depth for BODYSTRUCTURE parsing (defense-in-depth).
 ///

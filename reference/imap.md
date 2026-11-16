@@ -1090,7 +1090,7 @@ Generic `Projection` hydration and PIM `HydrationProjection` share
 `account/hydration.rs` for FETCH attribute selection and body-byte decoding.
 Their outer results intentionally differ: generic hydration can return raw MIME
 and has flags-only/metadata/text-only modes, while PIM hydration always carries
-message metadata and parses selected bytes through `bifrost-types::mime`.
+message metadata and parses selected bytes through `bifrost-mime`.
 
 `capabilities.rs` fills `AccountCapabilities::pim_methods` and `conveniences` at open time, and sets `AccountCapabilities::discovers_foreign_namespaces_on_rediscovery` from the open-time NAMESPACE response (`namespaces_advertise_foreign`, pure, `factory.rs`): true when any `other`/`shared` descriptor carries a non-empty prefix, independent of whether any folders are currently shared; also true when NAMESPACE fails, since the foreign surface is then unknown. IMAP emits no scope-lifecycle events and discovers foreign folders only at open, so consumers read this flag to decide whether a periodic `SyncEngine::reattach` (the only way a post-open ACL grant becomes visible) can ever surface anything on this server. IMAP advertises real support for:
 
@@ -1175,7 +1175,7 @@ race cannot be closed by this client.
 - Search paging (`search::SearchPager`): every page call re-runs the search, so the page cursor is a position, never an offset - an offset into a re-run result skips the boundary survivor whenever an earlier result is expunged between pages. The walk is ordered by folder (`MailboxName::cmp_account_order`) and then by key UID ascending (the message UID; for threads, the lowest member UID), and the cursor (`imapsearch1:` plus the canonical `imap2` id of the last returned position) resumes strictly after it. Folders ordered before the cursor's are not searched again, and once one item past the page is known no later folder is searched. An undecodable cursor and a cursor outside the `SearchFilter::In` restriction are `Request(Malformed)` with cause `InvalidArgument { field: Some("page_cursor") }`, the shared signal (JMAP uses it too) to restart from page one. A changed UIDVALIDITY on the cursor's folder uses the shared `SyncState(CursorInvalid)` classification and `Engine(RestartScope(Folder))` recovery: re-inventory that folder and repeat the search from page one. An enterprise Outlook user expects a rebuilt folder to refresh and the action to retry against fresh identities. Stale message ids and part handles use the same recovery; an old UID must never be replayed against the new generation. A zero limit is `Request(Malformed)` without that cursor marker. `estimated_total` is set only when one call enumerated the whole result from the start. Not promised: items moved, or folders created or renamed, behind the cursor are not returned, and a thread whose membership changed between pages may repeat under a new id or be passed.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised. The account probes the Inbox role when it exists; otherwise it chooses the first selectable folder by display name, wire octets, and encoding mode. Hydration: one-shot message FETCH and synthetic thread hydration.
-- Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present (create returns the APPENDUID-derived id; a tagged OK without a usable APPENDUID, as RFC 4315 requires for a `UIDNOTSTICKY` mailbox, is still a saved draft and returns `Created` with no id and a `CreatedWithoutIdentity` warning carrying no error leaf, since the protocol permits it); discard is advertised on every server and removes through the shared removal path above. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
+- Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present (create returns the APPENDUID-derived id; a tagged OK without a usable APPENDUID, as RFC 4315 requires for a `UIDNOTSTICKY` mailbox, is still a saved draft and returns `Created` with no id and a `CreatedWithoutIdentity` warning carrying no error leaf, since the protocol permits it); discard is advertised on every server and removes through the shared removal path above. Draft bodies use the shared `bifrost-mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
 - Send / draft-send: real when `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` is set (see "Submission" below); `Unsupported` otherwise.
 
 Unsupported PIM methods return `Error::Unsupported` with false flags: attachment upload, `host_attachment` (Gmail/Graph only), draft update, Gmail label membership, Graph categories/extended properties, identities + identity update, vacation get/set, `scheduled_send` (cancel/reschedule too). `scheduled_send` is statically false even with submission because FUTURERELEASE is a per-connection EHLO truth unknown at open; the send is attempted and the relay's EHLO decides. SMTP send/draft-send are unsupported only without submission config. IMAP identities and vacation responders are not in Stage 1.
@@ -1218,7 +1218,7 @@ Unsupported PIM methods return `Error::Unsupported` with false flags: attachment
   verb, so `cancel_scheduled_send` / `reschedule_send` are `Unsupported`.
 - `pim_methods.send_as` is false, so a `Some(send_as)` request is the
   `Unsupported(Send)` branch of the rule stated on `SendRequest::send_as`.
-- MIME assembly is the shared `bifrost-types::mime` serializer
+- MIME assembly is the shared `bifrost-mime` serializer
   (`send_request_to_rfc5322` for send, `render_rfc5322` for drafts; shared with
   Google's `MailDocument`): text/html/`multipart/alternative` bodies, a
   `multipart/mixed` wrapper for inline attachments, RFC 2047 display names, a
@@ -1345,13 +1345,13 @@ Output ordering is therefore input-window order, then folder display-name order 
 - `Projection::Preview` and `Projection::TextOnly` both ask for `BODY.PEEK[]` (whole message, not the TEXT section) - preview bounded to a prefix, text-only unbounded. `BODY[TEXT]` is never requested by either: the hydrated value is raw MIME the consumer parses, and the TEXT section of a multipart message is boundaries and base64 with no headers to decode them by. `get.rs` and `message.rs` use the same 64 KiB preview floor (`hydration::PREVIEW_FETCH_BYTES`), raised to the caller's limit when that is larger.
 - A projection that asks for a body section runs through `uid_fetch_limited` under `HYDRATION_FETCH_BUDGET` (256 MiB per batch); metadata and flag projections keep the unbudgeted `uid_fetch`, being bounded by their own response shape. The budget is a guard against a corrupt or adversarial server, not a per-message limit: crossing the retained-object estimate surfaces as `ResultLimit::Fetch` after the tagged completion. A literal declaration above the remaining budget instead fails before payload accumulation with `ResultLimit::FetchLiteral` and retires the connection.
 - Full and preview hydration parse the fetched RFC 5322 source through
-  `bifrost-types::mime`. Full exposes text and HTML plus attachment metadata;
+  `bifrost-mime`. Full exposes text and HTML plus attachment metadata;
   `FullWithBlobs` carries decoded attachment bytes inline because IMAP has no
   redeemable per-part handle. Preview fetches a whole-message prefix (at least
   64 KiB, or the requested limit when larger) rather than `BODY[TEXT]`, so
   multipart framing is not shown as prose - in `message.rs` and `get.rs` alike.
   RFC 2047 and RFC 2231 decoding now
-  lives in `bifrost-types::mime`, shared with this parser.
+  lives in `bifrost-mime`, shared with this parser.
 
 ### Blob openers
 

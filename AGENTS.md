@@ -13,6 +13,7 @@ Crates present:
 - `crates/carddav/` → `bifrost-carddav` - CardDAV account crate for contacts.
 - `crates/caldav/` → `bifrost-caldav` - CalDAV account crate for calendars.
 - `crates/smtp/` → `bifrost-smtp` - SMTP and LMTP client. Lettre-derived. Native-tls only.
+- `crates/mime/` → `bifrost-mime` - RFC 5322 / MIME: tolerant inbound parser, header decoding, body selection, address-list parsing and the outbound renderer the account crates compose through. Depends on bifrost-types.
 - `crates/sasl/` → `bifrost-sasl` - published shared SASL clients, zeroizing `Secret` credential storage and policy layer (SCRAM, CRAM-MD5 and OAuth).
 
 All crates are pre-1.0, API stabilization phase.
@@ -203,6 +204,7 @@ Per-crate architecture and conventions. Single source of truth for current code 
 - `reference/carddav.md` - bifrost-carddav standalone contact Account implementation.
 - `reference/caldav.md` - bifrost-caldav standalone calendar Account implementation.
 - `reference/smtp.md` - bifrost-smtp transport types, PIPELINING, DSN, message builder, LMTP.
+- `reference/mime.md` - bifrost-mime: placement above bifrost-types, address-list parsing, header decoding bounds, Message-ID extraction, the submission-envelope resolver, the renderer and its current header-writer limits.
 - `reference/net.md` - bifrost-net shared HTTP transport: retry, rate-limiting, observability.
 - `reference/sasl.md` - bifrost-sasl published shared SASL crate: `Secret`, `SaslError`, `ScramHash`, the pure SCRAM/CRAM functions, and the error-mapping contract with the protocol crates.
 - `reference/sync.md` - bifrost-sync engine: scheduler, multiplexer, partitioned backfill, push reconciler, mutation pipeline, checkpoint envelope versioning, scope lifecycle.

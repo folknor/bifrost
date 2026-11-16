@@ -56,7 +56,7 @@ mod search_response;
 mod tests;
 
 // Re-export pub(crate) items that were visible from the original module.
-pub(crate) use bifrost_types::mime::decode_encoded_words as decode_rfc2047;
+pub(crate) use bifrost_mime::decode_encoded_words as decode_rfc2047;
 
 // Re-export sub-module items so they are visible within this module's namespace
 // (required for tests and cross-module function calls via `use super::*`).

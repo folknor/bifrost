@@ -1410,7 +1410,7 @@ the account translator; they preserve first-line ASCII-insensitive substring
 matching and apply only after recognized enhanced codes have been considered.
 
 Header-derived `Envelope::try_from` delegates reverse-path selection and
-checked recipient extraction to `bifrost_types::mime::HeaderMap::submission_envelope`.
+checked recipient extraction to `bifrost_mime::HeaderMap::submission_envelope`.
 A single From takes precedence over Sender so a shared mailbox receives its
 own bounces when a delegate sends on its behalf. Multiple authors require a
 single Sender; missing From and Sender retain the null reverse path.

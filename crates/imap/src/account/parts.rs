@@ -21,11 +21,11 @@
 //!    length-prefixed handle string that survives a round trip through a
 //!    consumer's storage.
 //!
-//! The decoded MIME part tree in `bifrost_types::mime` (`ParsedMessage` /
+//! The decoded MIME part tree in `bifrost_mime` (`ParsedMessage` /
 //! `MimePart`) is the *other* half of this story and is not duplicated here:
 //! that tree is built from octets we already hold, whereas BODYSTRUCTURE is
 //! the server's description of octets we have not fetched. This module reuses
-//! `bifrost_types::mime` for every piece of decoding the two share - RFC 2231
+//! `bifrost_mime` for every piece of decoding the two share - RFC 2231
 //! parameter reassembly, RFC 2047 encoded words, and the `TransferEncoding`
 //! vocabulary - so there is one definition of each, not two.
 //!
@@ -66,7 +66,7 @@
 //! complete, and one level deeper is refused by the parser rather than
 //! silently shortened by the walk.
 
-use bifrost_types::mime::{TransferEncoding, decode_encoded_words, decode_rfc2231_params};
+use bifrost_mime::{TransferEncoding, decode_encoded_words, decode_rfc2231_params};
 use bifrost_types::{AccountError, AccountOperation};
 
 use crate::types::body::ContentDisposition;

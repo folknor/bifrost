@@ -24,6 +24,7 @@ default = []
 async-stream = { workspace = true }
 base64 = { workspace = true }
 bifrost-types = { path = "../types" }
+bifrost-mime = { path = "../mime" }
 bifrost-net = { path = "../net" }
 bifrost-caldav = { path = "../caldav" }
 bifrost-carddav = { path = "../carddav" }

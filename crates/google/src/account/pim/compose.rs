@@ -54,7 +54,7 @@ pub(crate) fn send_raw_message(
         // base64url (no-pad) string and learns recipients + Bcc from the
         // message headers. It always files the result in Sent, so
         // `save_to_sent` has no Gmail-side toggle (matches send_message).
-        let headers = bifrost_types::mime::parse_message(&raw).headers;
+        let headers = bifrost_mime::parse_message(&raw).headers;
         validate_header_recipients(&headers, bifrost_types::AccountOperation::Send)?;
         let encoded = URL_SAFE_NO_PAD.encode(&raw);
         let message = client
@@ -229,18 +229,19 @@ fn checked_address_list(
         .iter()
         .filter(|header| header.name.eq_ignore_ascii_case(name))
     {
-        let parsed = Address::parse_list_checked(&header.value).map_err(|rejected| {
-            account_error_for(
-                crate::Error::invalid_request(
-                    operation,
-                    format!(
-                        "draft {name} header contains {} unsupported address item(s)",
-                        rejected.len()
+        let parsed =
+            bifrost_mime::parse_address_list_checked(&header.value).map_err(|rejected| {
+                account_error_for(
+                    crate::Error::invalid_request(
+                        operation,
+                        format!(
+                            "draft {name} header contains {} unsupported address item(s)",
+                            rejected.len()
+                        ),
                     ),
-                ),
-                error::GmailErrorContext::draft(operation),
-            )
-        })?;
+                    error::GmailErrorContext::draft(operation),
+                )
+            })?;
         addresses.extend(parsed);
     }
     Ok(addresses)
@@ -249,7 +250,7 @@ fn checked_address_list(
 // Gmail derives delivery recipients from these headers, including Bcc.
 // Reject lossy parsing rather than silently submitting to only some recipients.
 fn validate_header_recipients(
-    headers: &bifrost_types::mime::HeaderMap,
+    headers: &bifrost_mime::HeaderMap,
     operation: bifrost_types::AccountOperation,
 ) -> Result<(), AccountError> {
     let read = |name: &str| {
@@ -480,7 +481,7 @@ fn render_message(
     // supplied `Date` at that point is unverified, so a save-time stamp
     // could go out stale. Leaving it absent keeps what Gmail received
     // before.
-    let composed = bifrost_types::ComposedMessage {
+    let composed = bifrost_mime::ComposedMessage {
         date: require_recipient.then(jiff::Timestamp::now),
         from: Some(&from),
         to: &doc.to,
@@ -499,7 +500,7 @@ fn render_message(
         // the header in the sent MIME. `None` when unrequested.
         disposition_notification_to: doc.request_read_receipt.then_some(&from),
     };
-    let raw = bifrost_types::render_rfc5322(&composed)?;
+    let raw = bifrost_mime::render_rfc5322(&composed)?;
     Ok(URL_SAFE_NO_PAD.encode(&raw))
 }
 
@@ -669,9 +670,7 @@ mod tests {
         assert_eq!(doc.to[1].name.as_deref(), Some("Doe, Jane"));
         let encoded = render_message(&doc, "sender@test", true).expect("rendered draft");
         let raw = URL_SAFE_NO_PAD.decode(encoded).expect("base64url draft");
-        let parsed = bifrost_types::mime::parse_message(&raw)
-            .headers
-            .addresses("To");
+        let parsed = bifrost_mime::parse_message(&raw).headers.addresses("To");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].name, doc.to[0].name);
         assert_eq!(parsed[1].name, doc.to[1].name);
@@ -708,7 +707,7 @@ mod tests {
 
     #[test]
     fn address_list_respects_quoted_commas_and_escapes() {
-        let parsed = Address::parse_list(
+        let parsed = bifrost_mime::parse_address_list(
             "\"Doe, John\" <jd@example.com>, plain@example.com, \
              \"Escaped \\\"Nick\\\", Esq.\" <nick@example.com>",
         );

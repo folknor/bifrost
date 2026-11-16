@@ -1,8 +1,8 @@
 //! Account-oriented SMTP submission in shared address and error vocabulary.
 use crate::transport::smtp::{SendOptions, SubmissionStatus, submission_status};
 use crate::{Address as SmtpAddress, AsyncSmtpTransport};
+use bifrost_mime::SubmissionEnvelope;
 use bifrost_types::error::{AccountError, BatchItem, BatchItemId};
-use bifrost_types::mime::SubmissionEnvelope;
 use bifrost_types::{RecipientNotAccepted, RecipientOutcome};
 
 /// Shared stream encryption policy.

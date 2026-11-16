@@ -586,7 +586,7 @@ labels without ASCII case sensitivity, but compares opaque user label ids
 exactly. Moving between user ids that differ only in case removes the source;
 enterprise Outlook users expect filing out of one label to remove that label.
 
-Composition renders MIME through the shared `bifrost-types::mime`
+Composition renders MIME through the shared `bifrost-mime`
 serializer (`render_rfc5322`, shared with IMAP send) and sends the
 base64url message through Gmail. `MailDocument` keeps Gmail
 orchestration (draft-patch apply, hydration) and emits `Bcc:` so Gmail

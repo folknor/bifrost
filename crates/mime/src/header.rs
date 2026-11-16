@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use jiff::civil;
 use jiff::tz::Offset;
 
-use crate::compose::Address;
+use bifrost_types::compose::Address;
 
 use super::limits::{Defect, MimeLimits};
 use super::words::decode_encoded_words;
@@ -20,26 +20,25 @@ struct HeaderEntry {
     value: String,
 }
 
-impl Address {
-    /// Parse an unfolded address-list header value, decoding display names.
-    ///
-    /// Quoted local parts retain their quotes and quoted-pairs. This tolerant
-    /// convenience method returns accepted mailboxes only. Use
-    /// `parse_list_checked` before rewriting a draft or submitting recipients.
-    pub fn parse_list(value: &str) -> Vec<Self> {
-        parse_addresses(value).0
-    }
+/// Parse an unfolded address-list header value, decoding display names.
+///
+/// Quoted local parts retain their quotes and quoted-pairs. This tolerant
+/// convenience returns accepted mailboxes only. Use
+/// [`parse_address_list_checked`] before rewriting a draft or submitting
+/// recipients.
+pub fn parse_address_list(value: &str) -> Vec<Address> {
+    parse_addresses(value).0
+}
 
-    /// Parse an address list, failing with the original rejected items if any
-    /// mailbox cannot be represented. Empty groups and empty lists are valid.
-    /// No partial recipient list is returned on failure.
-    pub fn parse_list_checked(value: &str) -> Result<Vec<Self>, Vec<String>> {
-        let (addresses, rejected) = parse_addresses(value);
-        if rejected.is_empty() {
-            Ok(addresses)
-        } else {
-            Err(rejected)
-        }
+/// Parse an address list, failing with the original rejected items if any
+/// mailbox cannot be represented. Empty groups and empty lists are valid.
+/// No partial recipient list is returned on failure.
+pub fn parse_address_list_checked(value: &str) -> Result<Vec<Address>, Vec<String>> {
+    let (addresses, rejected) = parse_addresses(value);
+    if rejected.is_empty() {
+        Ok(addresses)
+    } else {
+        Err(rejected)
     }
 }
 
@@ -81,7 +80,7 @@ impl HeaderMap {
     }
 
     pub fn addresses(&self, name: &str) -> Vec<Address> {
-        self.get_all(name).flat_map(Address::parse_list).collect()
+        self.get_all(name).flat_map(parse_address_list).collect()
     }
 
     /// Parse every occurrence of a field without silently losing recipients.
@@ -126,8 +125,13 @@ impl HeaderMap {
         let bcc = self
             .addresses_checked("bcc")
             .map_err(|_| "unsupported Bcc address")?;
-        crate::compose::validate_send_recipients(&to, &cc, &bcc, crate::Protocol::Unknown)
-            .map_err(|_| "send requires at least one recipient")?;
+        bifrost_types::compose::validate_send_recipients(
+            &to,
+            &cc,
+            &bcc,
+            bifrost_types::Protocol::Unknown,
+        )
+        .map_err(|_| "send requires at least one recipient")?;
         // Multiple authors have no single author mailbox; retain the explicit
         // transmitting agent as the only unambiguous reverse path in that case.
         let reverse_path = if from.len() > 1 {

@@ -1,0 +1,23 @@
+[package]
+name = "bifrost-mime"
+description = "RFC 5322 / MIME parsing, header decoding, body selection and message rendering for the bifrost workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bifrost-types = { path = "../types" }
+base64 = { workspace = true }
+encoding_rs = { workspace = true }
+jiff = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true, features = ["std"] }

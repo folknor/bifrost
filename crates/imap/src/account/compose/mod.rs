@@ -99,7 +99,7 @@ pub(crate) fn send_message(
     account: ImapAccount,
     request: SendRequest,
 ) -> AccountFuture<Result<SendReceipt, AccountError>> {
-    send_message_with_render(account, request, bifrost_types::send_request_to_rfc5322)
+    send_message_with_render(account, request, bifrost_mime::send_request_to_rfc5322)
 }
 
 /// `send_message` with the renderer injected. The shared renderer mints the
@@ -117,7 +117,7 @@ where
     R: FnOnce(
             &SendRequest,
             &bifrost_types::Address,
-        ) -> Result<bifrost_types::RenderedMessage, AccountError>
+        ) -> Result<bifrost_mime::RenderedMessage, AccountError>
         + Send
         + 'static,
 {
@@ -545,7 +545,7 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
     let empty_strings: Vec<String> = Vec::new();
     let empty_attachments: Vec<bifrost_types::AttachmentInline> = Vec::new();
 
-    let composed = bifrost_types::ComposedMessage {
+    let composed = bifrost_mime::ComposedMessage {
         // Provisional save-time stamp so a stored draft is a conforming
         // message; `draft_send` replaces it with the send time.
         date: Some(jiff::Timestamp::now()),
@@ -569,7 +569,7 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
         // on SendRequest, not DraftPatch).
         disposition_notification_to: None,
     };
-    bifrost_types::render_rfc5322(&composed).map_err(stamp_imap_protocol)
+    bifrost_mime::render_rfc5322(&composed).map_err(stamp_imap_protocol)
 }
 
 #[cfg(test)]

@@ -141,8 +141,8 @@ fn header_missing_separator_bare_body_input_is_all_body() {
 fn address_list_round_trips_rendered_quoted_pairs_and_encoded_words() {
     for name in ["a\", b", "a\\, b", "a\\\", b", "Doe, Jane", "Janne \u{e4}"] {
         let address = Address::named(name, "x@y");
-        let value = crate::mime::format_address(&address);
-        let parsed = Address::parse_list(&value);
+        let value = crate::format_address(&address);
+        let parsed = crate::parse_address_list(&value);
         assert_eq!(parsed.len(), 1, "{value}");
         assert_eq!(parsed[0].address, address.address);
         assert_eq!(parsed[0].name, address.name);
@@ -171,7 +171,7 @@ fn address_split_keeps_commas_inside_angle_brackets() {
 #[test]
 fn address_group_colons_respect_quoted_names_comments_and_angles() {
     let value = r#"Team (nested (label: ignored), still ignored): "Role: more text" <role@example.test>, "local:part"@example.test; "Angle" <"angle:part"@example.test>"#;
-    let parsed = Address::parse_list_checked(value).expect("valid mailboxes");
+    let parsed = crate::parse_address_list_checked(value).expect("valid mailboxes");
     assert_eq!(parsed.len(), 3);
     assert_eq!(parsed[0].name.as_deref(), Some("Role: more text"));
     assert_eq!(parsed[0].address, "role@example.test");
@@ -197,10 +197,10 @@ fn address_quoted_local_parts_preserve_whitespace_and_quoted_pairs() {
     ] {
         let address = format!("{local}@example.test");
         for value in [address.clone(), format!("Mailbox <{address}>")] {
-            let parsed = Address::parse_list_checked(&value).expect("quoted local part");
+            let parsed = crate::parse_address_list_checked(&value).expect("quoted local part");
             assert_eq!(parsed.len(), 1, "{value}");
             assert_eq!(parsed[0].address, address);
-            let tolerant = Address::parse_list(&value);
+            let tolerant = crate::parse_address_list(&value);
             assert_eq!(tolerant.len(), 1);
             assert_eq!(tolerant[0].address, address);
         }
@@ -211,7 +211,7 @@ fn address_quoted_local_parts_preserve_whitespace_and_quoted_pairs() {
 fn address_checked_parser_reports_rejected_items_instead_of_partial_success() {
     let value = "good@example.test, missing-at, bad local@example.test, <missing@example.test";
     assert_eq!(
-        Address::parse_list_checked(value).expect_err("must not return a reduced list"),
+        crate::parse_address_list_checked(value).expect_err("must not return a reduced list"),
         [
             "missing-at",
             "bad local@example.test",
@@ -224,7 +224,10 @@ fn address_checked_parser_reports_rejected_items_instead_of_partial_success() {
         "@example.test",
         "local@",
     ] {
-        assert_eq!(Address::parse_list_checked(value).unwrap_err(), [value]);
+        assert_eq!(
+            crate::parse_address_list_checked(value).unwrap_err(),
+            [value]
+        );
     }
 }
 
@@ -238,7 +241,7 @@ fn header_checked_addresses_collect_rejections_across_repeated_fields() {
     );
     assert!(headers.addresses_checked("bcc").unwrap().is_empty());
     assert!(
-        Address::parse_list_checked("Undisclosed:;")
+        crate::parse_address_list_checked("Undisclosed:;")
             .unwrap()
             .is_empty()
     );
@@ -254,27 +257,24 @@ fn message_id_lists_ignore_quoted_and_nested_commented_decoys() {
         ["first@test", "second@test", "third@test"]
     );
     assert_eq!(
-        crate::mime::first_message_id(parsed.get("references").unwrap()),
+        crate::first_message_id(parsed.get("references").unwrap()),
         Some("first@test")
     );
 }
 
 #[test]
 fn single_message_id_preserves_bare_fallback_and_rejects_empty_angles() {
-    assert_eq!(
-        crate::mime::first_message_id(" bare@test "),
-        Some("bare@test")
-    );
-    assert_eq!(crate::mime::first_message_id("(comment) <>"), None);
-    assert_eq!(crate::mime::first_message_id("<unfinished"), None);
+    assert_eq!(crate::first_message_id(" bare@test "), Some("bare@test"));
+    assert_eq!(crate::first_message_id("(comment) <>"), None);
+    assert_eq!(crate::first_message_id("<unfinished"), None);
 }
 
 #[test]
 fn standalone_message_id_parser_borrows_the_raw_value() {
     let raw = String::from("\"<quoted@test>\" (outer (<comment@test>)) <> <actual@test>");
-    let id = crate::mime::first_message_id(&raw).expect("structural identifier");
+    let id = crate::first_message_id(&raw).expect("structural identifier");
     assert_eq!(id, "actual@test");
     let start = raw.find("actual@test").unwrap();
     assert!(std::ptr::eq(id, &raw[start..start + id.len()]));
-    assert_eq!(crate::mime::first_message_id("  "), None);
+    assert_eq!(crate::first_message_id("  "), None);
 }

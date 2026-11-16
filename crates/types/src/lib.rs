@@ -36,7 +36,6 @@ pub mod flag;
 pub use flag::{Flag, FlagSet};
 pub mod hydration;
 pub mod ids;
-pub mod mime;
 pub mod mutation;
 pub mod page;
 pub mod push;
@@ -95,14 +94,6 @@ pub use compose::{
     Address, AttachmentHandle, AttachmentInline, DraftDiscardFailure, DraftHandle, DraftPatch,
     IdentityId, RecipientNotAccepted, RecipientOutcome, SendAs, SendReceipt, SendRequest, SentCopy,
     SentCopyNotFiled, validate_scheduled,
-};
-
-// Shared RFC 5322 / MIME assembler.
-pub use mime::{
-    ComposedMessage, DecodedAttachment, DecodedBody, Defect, MimeLimits, MimePart, ParsedMessage,
-    PartBody, RenderedMessage, SelectOptions, SubmissionEnvelope, TransferEncoding,
-    decode_encoded_words, format_rfc5322_date, parse_message, render_rfc5322, select_body,
-    select_body_with, send_request_to_rfc5322,
 };
 
 // Container / label / mutation-target types.

@@ -5,7 +5,7 @@ use bifrost_types::{AccountErrorKind, Address, RequestErrorKind};
 fn draft_send_round_trips_escaped_and_encoded_display_names() {
     for name in ["a\", b", "a\\, b", "Janne \u{e4}"] {
         let address = bifrost_types::Address::named(name, "x@y");
-        let wire_address = bifrost_types::mime::format_address(&address);
+        let wire_address = bifrost_mime::format_address(&address);
         let raw = format!(
             "From: {wire_address}\r\nTo: {wire_address}\r\nBcc: {wire_address}\r\nMessage-ID: <id@test>\r\n\r\nbody"
         );
@@ -303,7 +303,7 @@ fn draft_send_collects_folded_repeated_headers_in_order() {
 fn parse_address_list_respects_quoted_commas() {
     // A display name this crate's own assembler quotes (`"Last, First"`)
     // must not split into a phantom recipient.
-    let parsed = bifrost_types::Address::parse_list("\"Doe, Jane\" <jane@to.test>, bob@to.test");
+    let parsed = bifrost_mime::parse_address_list("\"Doe, Jane\" <jane@to.test>, bob@to.test");
     let addrs: Vec<&str> = parsed.iter().map(|a| a.address.as_str()).collect();
     assert_eq!(addrs, ["jane@to.test", "bob@to.test"]);
     assert_eq!(parsed[0].name.as_deref(), Some("Doe, Jane"));

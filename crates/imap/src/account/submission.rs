@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bifrost_mime::SubmissionEnvelope;
 #[cfg(test)]
 use bifrost_net::TokenSource;
 use bifrost_smtp::transport::smtp::PoolConfig;
@@ -26,7 +27,6 @@ use bifrost_types::RecipientNotAccepted;
 #[cfg(test)]
 use bifrost_types::RecipientOutcome;
 use bifrost_types::error::AccountError;
-use bifrost_types::mime::SubmissionEnvelope;
 
 use crate::types::Credentials;
 

@@ -7,12 +7,12 @@ use super::{
     DecodedObjectId, ImapAccount, decode_object_id, encode_object_id, selected_uidvalidity,
 };
 use crate::types::{FetchAttr, MailboxName};
+use bifrost_mime::{Defect, MimeLimits, SelectOptions, parse_message, select_body_with};
 use bifrost_types::compose::Address;
 use bifrost_types::hydration::{
     AttachmentSource, HydrationProjection, Importance, Message, MessageAttachment, ThreadHydration,
 };
 use bifrost_types::ids::{ObjectId, ThreadId};
-use bifrost_types::mime::{Defect, MimeLimits, SelectOptions, parse_message, select_body_with};
 use bifrost_types::{AccountError, AccountFuture, AccountOperation};
 
 pub(crate) fn thread_hydrate(

@@ -595,9 +595,10 @@ suggests kinship:
   caller hands the serializer to send.
 - `hydration::MessageAttachment` / `AttachmentSource::Inline` - INBOUND, what a
   hydrated `Message` carries to a consumer.
-- `mime::DecodedAttachment` - the MIME selector's intermediate attachment
-  representation, which consumers can project into `MessageAttachment`. It
-  knows nothing about blobs.
+- `bifrost_mime::DecodedAttachment` - the MIME selector's intermediate
+  attachment representation (in the `bifrost-mime` crate, see
+  `reference/mime.md`), which consumers can project into `MessageAttachment`.
+  It knows nothing about blobs.
 
 `AttachmentInline` and `AttachmentSource::Inline` are not related.
 
@@ -605,34 +606,11 @@ Blob methods return byte streams. `open_blob_range` is only usable when
 advertised by `blob_range`; `open_raw_rfc822` returns verbatim
 server-assembled message bytes.
 
-`Address::parse_list` parses unfolded address-list values using the same
-parser as `HeaderMap::addresses`: quoted commas and quoted-pairs are handled
-before display-name RFC 2047 decoding. Group colons and list separators count
-only outside quoted strings, nested comments, angle addresses and domain
-literals. Quoted local parts retain spaces, tabs, colons and quoted-pairs
-verbatim. This remains tolerant parsing, not complete RFC 5322 validation.
-`Address::parse_list_checked` and `HeaderMap::addresses_checked` return
-`Result<Vec<Address>, Vec<String>>`: any rejected mailbox makes the whole
-result an error containing the original rejected items, rather than a partial
-recipient list. Empty lists and empty groups succeed. Unsupported syntax must
-be treated as a rejection, not evidence that the mailbox is invalid.
-The existing `parse_list` and `addresses` convenience methods return only
-accepted mailboxes. IMAP submission uses the checked methods through `submission_envelope`;
-Google draft hydration also propagates rejected addresses before rewriting.
-`HeaderMap::parse` accepts a standalone header block, unfolding continuations
-and preserving repeated fields in wire order. Its caller bounds the input;
-unlike full MIME parsing, it applies no header-size limit itself.
-
-Header decoding is bounded on two independent axes. `ENCODED_WORD_SCAN_LIMIT`
-(998, the RFC 5322 line limit) caps what a SINGLE RFC 2047 candidate may scan,
-so an overlong word is never recognized and is echoed verbatim.
-`DECODED_OUTPUT_LIMIT` (64 KiB) caps the TOTAL decoded output of one
-`decode_encoded_words` call, because chained in-window words in a legacy
-single-byte charset expand about 2.2x with base64 contraction already applied.
-Past the total cap the remaining words are emitted verbatim rather than
-truncated - the RFC 2047 Section 6.3 display rule for a word the decoder will
-not decode - so no bytes are lost and output stays under the cap plus the input
-length.
+Address-list parsing, header decoding, the MIME parser and the outbound
+renderer live in `bifrost-mime` (`reference/mime.md`), which depends on this
+crate. `compose::Address` stays here as contract vocabulary; the parsers that
+produce it are `bifrost_mime::parse_address_list` and
+`parse_address_list_checked`.
 
 ## File map
 
@@ -663,8 +641,6 @@ crates/types/src/
   directory.rs        directory search and groups
   calendar.rs         calendars and events
   cloud.rs            hosted attachment vocabulary
-  mime/               outgoing renderer plus inbound RFC 5322/MIME parser,
-                      header decoding, transfer decoding, and selection
   ids.rs              typed identifiers
   page.rs             Page envelope + SkippedScope skip lane
   error/              structured error, recovery, batch, warning model
@@ -775,16 +751,6 @@ account-owned tasks or actors. SessionStop resolves on explicit stop or
 stopper drop. `bifrost-sync::WatchEvent` is the external receiver-to-sink
 vocabulary.
 
-## MIME Message-ID extraction
-
-`mime::HeaderMap::message_ids` extracts nonempty structural angle-delimited
-identifiers across all occurrences of a header, preserving order and ignoring
-angle brackets inside quoted strings and nested comments. The free function
-`mime::first_message_id(raw)` borrows its result from the raw value, uses the
-same scanner and retains a trimmed bare-value
-fallback when there is no structural opening angle bracket. Empty or unfinished
-structural brackets do not become bare identifiers.
-
 `ContainerRights::may_share` reports authority to change folder sharing. JMAP
 projects `mayShare`, IMAP projects ACL administration, and EWS EffectiveRights
 leaves it unknown. `PushCapability::Webhook` describes Graph webhooks; EWS
@@ -852,19 +818,9 @@ whose overlap cannot be established locally.
 own the requirement for at least one To, Cc or Bcc recipient. Draft patches
 are partial updates, so validate the resolved draft rather than a patch alone.
 The MIME send renderer, Google send renderer, JMAP send boundary and shared
-header submission resolver use this rule before submitting.
-
-`mime::HeaderMap::submission_envelope` checks every From, Sender, To, Cc and
-Bcc address and returns an optional reverse path plus ordered recipients.
-For one author, From wins over Sender: an enterprise user sending on behalf
-of a shared mailbox expects bounces at that mailbox rather than the delegate.
-Without From, Sender wins; without either the caller chooses its default or
-SMTP's null reverse path. Multiple authors require one Sender and use it as
-the only unambiguous reverse path. Multiple Senders are refused. Unsupported
-addresses and missing recipients are refused without dropping any address.
-SMTP header conversion and IMAP raw/draft submission share this owner.
-`mime::generate_message_id` owns fresh sender-domain correlation ids for both
-composed messages and raw IMAP submissions missing a structural Message-ID.
+header submission resolver use this rule before submitting. The header
+resolver (`HeaderMap::submission_envelope`) and Message-ID minting live in
+`bifrost-mime`; see `reference/mime.md`.
 
 ## Read-minted mutation versions
 
@@ -1033,7 +989,7 @@ its numeric rate when applying account policy.
 `CloudUploadMeta` carries name, declared MIME type and share scope. Upload
 length comes from the payload bytes; consumers cannot supply a conflicting size.
 Attachment media-type strings preserve the declared wire value. The existing
-`mime::parse_content_type` is deliberately tolerant and substitutes text/plain
+`bifrost_mime::parse_content_type` is deliberately tolerant and substitutes text/plain
 on malformed input, so it cannot validate outbound declarations or replace raw
 inbound evidence without losing information. The attachment fields therefore
 retain their strings rather than silently adopting that parser's fallback.

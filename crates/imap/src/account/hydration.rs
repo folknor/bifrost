@@ -84,7 +84,7 @@ pub(super) fn push_native_thread_attrs(
 
 /// Decode the bytes selected from the shared FETCH surface. Both account
 /// hydration APIs start here; one returns these bytes and the other parses
-/// them through `bifrost_types::mime`.
+/// them through `bifrost_mime`.
 pub(super) fn decode_body(fetch: &mut FetchResponse) -> Option<bytes::Bytes> {
     decode_selected_body(fetch, BodySelection::Whole)
 }
