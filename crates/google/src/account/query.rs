@@ -107,11 +107,76 @@ fn search_condition(filter: &SearchFilter) -> Result<FilterCondition, AccountErr
     })
 }
 
+enum Reduced {
+    Constant(bool),
+    Condition(FilterCondition),
+}
+
+fn reduce(condition: &FilterCondition) -> Reduced {
+    match condition {
+        FilterCondition::DateRange {
+            after: None,
+            before: None,
+        } => Reduced::Constant(true),
+        FilterCondition::And(items) | FilterCondition::Or(items) => {
+            let and = matches!(condition, FilterCondition::And(_));
+            let mut kept = Vec::new();
+            for item in items {
+                match reduce(item) {
+                    Reduced::Constant(value) if value != and => return Reduced::Constant(value),
+                    Reduced::Constant(_) => {}
+                    Reduced::Condition(item) => kept.push(item),
+                }
+            }
+            match kept.len() {
+                0 => Reduced::Constant(and),
+                1 => Reduced::Condition(kept.remove(0)),
+                _ => Reduced::Condition(if and {
+                    FilterCondition::And(kept)
+                } else {
+                    FilterCondition::Or(kept)
+                }),
+            }
+        }
+        FilterCondition::Not(item) => match reduce(item) {
+            Reduced::Constant(value) => Reduced::Constant(!value),
+            Reduced::Condition(item) => Reduced::Condition(FilterCondition::Not(Box::new(item))),
+        },
+        other => Reduced::Condition(other.clone()),
+    }
+}
+
 pub(super) fn condition_query(
     condition: &FilterCondition,
     op: AccountOperation,
 ) -> Result<String, AccountError> {
-    match condition {
+    match reduce(condition) {
+        // Gmail has no Boolean literals. A predicate and its complement keep
+        // constants explicit without widening the mailbox scope with in:anywhere.
+        // Users expect an all/none query to compose with provider terms too.
+        Reduced::Constant(true) => Ok("(has:attachment OR -has:attachment)".into()),
+        Reduced::Constant(false) => Ok("has:attachment -has:attachment".into()),
+        Reduced::Condition(condition) => compile_condition(&condition, op, true),
+    }
+}
+
+fn nonempty(fragment: String, op: AccountOperation) -> Result<String, AccountError> {
+    if fragment.is_empty() {
+        Err(invalid(
+            op,
+            "empty Gmail query fragment or unfolded Boolean constant",
+        ))
+    } else {
+        Ok(fragment)
+    }
+}
+
+fn compile_condition(
+    condition: &FilterCondition,
+    op: AccountOperation,
+    positive: bool,
+) -> Result<String, AccountError> {
+    let fragment = match condition {
         FilterCondition::From(value) => Ok(format!("from:{}", query_term(value))),
         FilterCondition::To(value)
         | FilterCondition::Cc(value)
@@ -128,13 +193,29 @@ pub(super) fn condition_query(
             if let Some(after) = after {
                 parts.push(format!(
                     "after:{}",
-                    gmail_date(*after, BoundSide::After, op)?
+                    gmail_date(
+                        *after,
+                        if positive {
+                            BoundSide::After
+                        } else {
+                            BoundSide::Before
+                        },
+                        op
+                    )?
                 ));
             }
             if let Some(before) = before {
                 parts.push(format!(
                     "before:{}",
-                    gmail_date(*before, BoundSide::Before, op)?
+                    gmail_date(
+                        *before,
+                        if positive {
+                            BoundSide::Before
+                        } else {
+                            BoundSide::After
+                        },
+                        op
+                    )?
                 ));
             }
             Ok(parts.join(" "))
@@ -144,7 +225,7 @@ pub(super) fn condition_query(
             expression,
         } => {
             if *provider == Provider::Gmail {
-                Ok(sanitize_term(expression))
+                nonempty(sanitize_term(expression), op)
             } else {
                 Err(invalid(
                     op,
@@ -155,21 +236,23 @@ pub(super) fn condition_query(
         }
         FilterCondition::And(items) => items
             .iter()
-            .map(|item| condition_query(item, op))
+            .map(|item| compile_condition(item, op, positive))
             .collect::<Result<Vec<_>, _>>()
             .map(|items| items.join(" ")),
         FilterCondition::Or(items) => items
             .iter()
-            .map(|item| condition_query(item, op))
+            .map(|item| compile_condition(item, op, positive))
             .collect::<Result<Vec<_>, _>>()
-            .map(|items| format!("({})", items.join(" OR "))),
-        FilterCondition::Not(item) => Ok(format!("-({})", condition_query(item, op)?)),
+            .and_then(|items| nonempty(items.join(" OR "), op))
+            .map(|items| format!("({items})")),
+        FilterCondition::Not(item) => Ok(format!("-({})", compile_condition(item, op, !positive)?)),
         FilterCondition::HeaderContains { .. } => Err(invalid(
             op,
             "Gmail filters do not support arbitrary header conditions",
         )),
         _ => Err(invalid(op, "unsupported Gmail filter condition")),
-    }
+    }?;
+    nonempty(fragment, op)
 }
 
 pub(super) fn sanitize_term(value: &str) -> String {
@@ -202,8 +285,8 @@ pub(super) fn container_query(id: &str) -> String {
         .unwrap_or_else(|| format!("label:{}", query_term(id)))
 }
 
-/// Which side of a range a bound is. A fractional bound is rounded outward:
-/// `After` floors and `Before` ceils to whole seconds.
+/// Positive range sides: `After` floors and `Before` ceils to whole seconds.
+/// The compiler swaps them under odd negation to round inward.
 #[derive(Clone, Copy)]
 pub(super) enum BoundSide {
     After,
@@ -215,12 +298,8 @@ pub(super) fn gmail_date(
     side: BoundSide,
     op: AccountOperation,
 ) -> Result<String, AccountError> {
-    // Users expect a time bound to keep its time of day, and a search built
-    // from SystemTime::now() to work. Gmail takes whole Unix seconds, so a
-    // fractional bound is rounded outward (after floors, before ceils). That
-    // widens the range by under one second and never drops a matching
-    // message. Only bounds Gmail cannot represent at all (before the epoch,
-    // or past signed seconds) are refused.
+    // Round outward when asserted, inward beneath odd negation: an enterprise
+    // user expects rounding to preserve every real match of the whole query.
     let elapsed = time.duration_since(SystemTime::UNIX_EPOCH).map_err(|_| {
         invalid(
             op,
@@ -242,6 +321,88 @@ pub(super) fn gmail_date(
 mod tests {
     use super::*;
     use bifrost_types::ContainerId;
+
+    #[test]
+    fn compiler_refuses_unfolded_constants() {
+        for condition in [
+            FilterCondition::DateRange {
+                after: None,
+                before: None,
+            },
+            FilterCondition::And(vec![]),
+            FilterCondition::Or(vec![]),
+        ] {
+            let err = compile_condition(&condition, AccountOperation::Search, true)
+                .expect_err("constant must have been folded");
+            assert!(matches!(
+                err.kind(),
+                bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn constants_fold_before_gmail_rendering() {
+        let all = SearchFilter::DateRange {
+            after: None,
+            before: None,
+        };
+        let leaf = SearchFilter::Subject("x".into());
+        for constant in [all, SearchFilter::And(vec![])] {
+            assert_eq!(
+                filter_query(&SearchFilter::Or(vec![constant.clone(), leaf.clone()])).unwrap(),
+                "(has:attachment OR -has:attachment)"
+            );
+            assert_eq!(
+                filter_query(&SearchFilter::Not(Box::new(constant))).unwrap(),
+                "has:attachment -has:attachment"
+            );
+        }
+        assert_eq!(
+            filter_query(&SearchFilter::Or(vec![])).unwrap(),
+            "has:attachment -has:attachment"
+        );
+        assert_eq!(
+            filter_query(&SearchFilter::Or(vec![SearchFilter::Or(vec![]), leaf])).unwrap(),
+            "subject:x"
+        );
+    }
+
+    #[test]
+    fn negated_dates_round_inward_and_double_negation_outward() {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(131_696_250);
+        let range = SearchFilter::DateRange {
+            after: Some(t),
+            before: Some(t),
+        };
+        let negated = SearchFilter::Not(Box::new(range));
+        assert_eq!(
+            filter_query(&negated).unwrap(),
+            "-(after:131697 before:131696)"
+        );
+        assert_eq!(
+            filter_query(&SearchFilter::Not(Box::new(negated))).unwrap(),
+            "-(-(after:131696 before:131697))"
+        );
+    }
+
+    #[test]
+    fn empty_provider_fragment_is_malformed() {
+        let err = condition_query(
+            &FilterCondition::ProviderExpression {
+                provider: Provider::Gmail,
+                expression: " \r\n ".into(),
+            },
+            AccountOperation::FilterCreate,
+        )
+        .expect_err("empty fragment");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    }
 
     #[test]
     fn date_bounds_keep_time_of_day_on_both_surfaces() {

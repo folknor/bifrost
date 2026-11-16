@@ -233,7 +233,6 @@ fn gmail_filter_from_rule(
 struct CriteriaBuilder {
     criteria: GmailFilterCriteria,
     query: Vec<String>,
-    negated_query: Vec<String>,
 }
 
 fn criteria_from_condition(
@@ -244,9 +243,6 @@ fn criteria_from_condition(
     apply_condition(&mut builder, condition, op)?;
     if !builder.query.is_empty() {
         builder.criteria.query = Some(builder.query.join(" "));
-    }
-    if !builder.negated_query.is_empty() {
-        builder.criteria.negated_query = Some(builder.negated_query.join(" "));
     }
     Ok(builder.criteria)
 }
@@ -314,8 +310,10 @@ fn apply_condition(
                 apply_condition(builder, item, op)?;
             }
         }
-        FilterCondition::Not(item) => {
-            builder.negated_query.push(condition_query(item, op)?);
+        FilterCondition::Not(_) => {
+            // Compile the negation itself so fractional bounds round inward.
+            // Compiling its child into negatedQuery would lose that polarity.
+            builder.query.push(condition_query(condition, op)?);
         }
         FilterCondition::HeaderContains { .. } => {
             return Err(invalid(
@@ -421,6 +419,18 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negated_date_criteria_keep_rounding_polarity() {
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1250);
+        let condition = FilterCondition::Not(Box::new(FilterCondition::DateRange {
+            after: Some(t),
+            before: Some(t),
+        }));
+        let criteria = criteria_from_condition(&condition, AccountOperation::FilterCreate).unwrap();
+        assert_eq!(criteria.query.as_deref(), Some("-(after:2 before:1)"));
+        assert!(criteria.negated_query.is_none());
+    }
 
     #[test]
     fn container_queries_share_case_insensitive_system_vocabulary() {

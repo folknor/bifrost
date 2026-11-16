@@ -94,19 +94,6 @@ contract across bifrost-types (structured payload and its export tier),
 bifrost-net (do not silent-refresh a claims 401; keep the claims), the token
 source, and ratatoskr's MSAL call. Covers both the 401 and 403 paths.
 
-## BUG-211 - Gmail query encoder renders constants as nothing and rounds dates outward beneath Not
-
-**Reported by:** the Graph KQL constant-folding fix (spar, lateral).
-
-`crates/google/src/account/query.rs` `condition_query` (shared by search and
-stored filters) has the empty-fragment shape the Graph compilers had: an
-unbounded `DateRange` renders `""`, so `Or` gives `( OR x)`, `Not` gives
-`-()`, and an empty `Or` gives `()`. Separately, `gmail_date` rounds a
-fractional bound outward (after floors, before ceils) regardless of Boolean
-polarity, so beneath an odd number of `Not`s the negated range widens and its
-complement drops messages inside the sub-second gap. Graph folds constants
-before compiling and rounds by polarity; Gmail should do the same.
-
 ## BUG-200 - JMAP has no attachment-name search
 
 **Reported by:** the attachment-search contract fix (spar, lateral).

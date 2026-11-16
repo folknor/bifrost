@@ -2034,13 +2034,21 @@ deliberately does not use this cursor proof.
 
 Structured Gmail search and stored-filter date bounds use Unix seconds,
 preserving time of day without timezone-dependent calendar-date interpretation.
-A fractional-second bound is rounded outward: `after` floors and `before` ceils
-to whole seconds. That widens the interval by under one second and never drops
-a matching message, so a range built from `SystemTime::now()` works, which is
+Fractional bounds round by Boolean polarity: outward (`after` floors,
+`before` ceils) when asserted, inward beneath an odd number of `Not`s.
+Rounding therefore never drops a real match of the whole query, which is
 what a user typing a search expects. Only bounds Gmail cannot represent at all
-(pre-epoch, or past signed Unix seconds) are refused, as malformed caller
-input, before the request they would shape is sent. Both surfaces use the
-same encoder.
+(pre-epoch, or past signed Unix seconds) are refused as `Request(Malformed)`
+before sending. Stored negations compile into `query` with their polarity,
+rather than compiling a positive child into `negatedQuery`.
+
+An unbounded `DateRange` and an empty `And` are true; an empty `Or` is false.
+These constants fold through the tree before rendering. Fully constant queries
+use `has:attachment` paired with its complement (OR for true, AND for false),
+so they compose with provider terms without changing the mailbox search scope.
+The compiler refuses an unfolded constant or an empty fragment as
+`Request(Malformed)` instead of emitting empty groups or OR operands.
+Both search and stored filters use this encoder.
 
 ## API attribution and organization sharing validation
 
