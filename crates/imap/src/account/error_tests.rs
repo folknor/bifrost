@@ -212,6 +212,39 @@ fn sieve_quota_is_quota_exhausted_and_throttles_the_account() {
 }
 
 #[test]
+fn sieve_quota_maxscripts_is_quota_exhausted() {
+    let account = sieve_error(
+        Some(SieveResponseCode::QuotaMaxScripts),
+        AccountOperation::FilterCreate,
+    );
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Server(ServerErrorKind::QuotaExhausted)
+    ));
+    assert_eq!(
+        account.telemetry_fields().native_code,
+        Some("QUOTA/MAXSCRIPTS")
+    );
+}
+
+#[test]
+fn sieve_quota_maxsize_is_payload_too_large_and_terminal() {
+    let account = sieve_error(
+        Some(SieveResponseCode::QuotaMaxSize),
+        AccountOperation::FilterCreate,
+    );
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Request(RequestErrorKind::PayloadTooLarge)
+    ));
+    assert!(!account.recovery().is_retryable());
+    assert_eq!(
+        account.telemetry_fields().native_code,
+        Some("QUOTA/MAXSIZE")
+    );
+}
+
+#[test]
 fn sieve_nonexistent_is_a_missing_filter() {
     let account = sieve_error(
         Some(SieveResponseCode::NonExistent),

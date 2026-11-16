@@ -180,8 +180,11 @@ pub(crate) enum GmailLocalError {
         operation: AccountOperation,
         detail: String,
     },
+    /// Persisted cursor state that cannot be resumed. Carries the shared
+    /// fault itself, so a cursor written by a newer bifrost reads as
+    /// `FutureVersion`, never as retired.
     InvalidCursor {
-        kind: GmailCursorFailure,
+        fault: bifrost_types::CursorDecodeFault,
         detail: String,
     },
     AccountIdentityMismatch {
@@ -288,15 +291,6 @@ impl From<PageRefusal> for Error {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub(crate) enum GmailCursorFailure {
-    ProtocolMismatch,
-    EnvelopeMismatch,
-    SchemaMismatch,
-    MalformedPayload,
-}
-
 impl Display for GmailLocalError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -307,8 +301,8 @@ impl Display for GmailLocalError {
             Self::InvalidRequest { operation, detail } => {
                 write!(f, "invalid request for {operation:?}: {detail}")
             }
-            Self::InvalidCursor { kind, detail } => {
-                write!(f, "invalid cursor ({kind:?}): {detail}")
+            Self::InvalidCursor { fault, detail } => {
+                write!(f, "invalid cursor ({fault:?}): {detail}")
             }
             Self::AccountIdentityMismatch {
                 cursor_email,

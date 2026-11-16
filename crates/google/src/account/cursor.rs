@@ -10,7 +10,9 @@
 use bifrost_types::{ChangeCursor, CursorScope, OpaqueChangeState, ProtocolKind};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, GmailCursorFailure, GmailLocalError};
+use bifrost_types::CursorDecodeFault;
+
+use crate::error::{Error, GmailLocalError};
 
 /// Gmail inventory samples its history cursor before listing, so any deletion
 /// after that point is carried by the change stream. Users expect a
@@ -79,32 +81,44 @@ pub(crate) fn decode_gmail_state(state: &OpaqueChangeState) -> Result<GmailChang
             bifrost_types::PayloadVersion::new(GMAIL_ENVELOPE_VERSION),
         )
         .map_err(|fault| {
-            cursor_error(
-                match fault {
-                    bifrost_types::CursorDecodeFault::ProtocolMismatch => {
-                        GmailCursorFailure::ProtocolMismatch
-                    }
-                    _ => GmailCursorFailure::EnvelopeMismatch,
-                },
-                format!("Gmail cursor header: {fault:?}"),
-            )
+            let detail = format!("Gmail cursor header: {fault:?}");
+            cursor_error(fault, detail)
         })?;
-    let decoded: GmailChangeState = serde_json::from_slice(bytes).map_err(|err| {
-        cursor_error(
-            GmailCursorFailure::MalformedPayload,
-            format!("cursor JSON decode failed: {err}"),
-        )
-    })?;
-    if decoded.schema_version != GMAIL_SCHEMA_VERSION {
-        return Err(cursor_error(
-            GmailCursorFailure::SchemaMismatch,
-            format!(
-                "expected schema version {GMAIL_SCHEMA_VERSION}, got {}",
-                decoded.schema_version
-            ),
-        ));
+    // Read the payload's schema discriminator before the layout it selects:
+    // a newer schema may reshape the other fields, and must still report as
+    // a future version rather than as malformed bytes.
+    let probe: SchemaProbe = serde_json::from_slice(bytes).map_err(malformed)?;
+    match probe.schema_version.cmp(&GMAIL_SCHEMA_VERSION) {
+        std::cmp::Ordering::Equal => {}
+        direction => {
+            let fault = if direction == std::cmp::Ordering::Greater {
+                bifrost_types::CursorDecodeFault::FutureVersion
+            } else {
+                bifrost_types::CursorDecodeFault::RetiredVersion
+            };
+            return Err(cursor_error(
+                fault,
+                format!(
+                    "expected schema version {GMAIL_SCHEMA_VERSION}, got {}",
+                    probe.schema_version
+                ),
+            ));
+        }
     }
-    Ok(decoded)
+    serde_json::from_slice(bytes).map_err(malformed)
+}
+
+/// The schema discriminator alone; serde ignores the remaining fields.
+#[derive(Deserialize)]
+struct SchemaProbe {
+    schema_version: u8,
+}
+
+fn malformed(err: serde_json::Error) -> Error {
+    cursor_error(
+        bifrost_types::CursorDecodeFault::Malformed,
+        format!("cursor JSON decode failed: {err}"),
+    )
 }
 
 pub(crate) fn decode_gmail_state_for_profile(
@@ -149,8 +163,8 @@ pub(crate) fn cursor_for_history(history_id: u64, profile_email: &str) -> Change
     )))
 }
 
-fn cursor_error(kind: GmailCursorFailure, detail: String) -> Error {
-    Error::Local(GmailLocalError::InvalidCursor { kind, detail })
+fn cursor_error(fault: CursorDecodeFault, detail: String) -> Error {
+    Error::Local(GmailLocalError::InvalidCursor { fault, detail })
 }
 
 #[cfg(test)]
@@ -159,10 +173,10 @@ mod tests {
 
     use super::*;
 
-    fn assert_cursor_kind(err: Error, kind: GmailCursorFailure) {
+    fn assert_cursor_kind(err: Error, kind: CursorDecodeFault) {
         match err {
-            Error::Local(GmailLocalError::InvalidCursor { kind: k, .. }) => {
-                assert_eq!(k, kind);
+            Error::Local(GmailLocalError::InvalidCursor { fault, .. }) => {
+                assert_eq!(fault, kind);
             }
             other => panic!("expected cursor error, got {other:?}"),
         }
@@ -183,15 +197,35 @@ mod tests {
         let mut opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
         opaque.protocol = ProtocolKind::Jmap;
         let err = decode_gmail_state(&opaque).expect_err("wrong protocol");
-        assert_cursor_kind(err, GmailCursorFailure::ProtocolMismatch);
+        assert_cursor_kind(err, CursorDecodeFault::ProtocolMismatch);
     }
 
     #[test]
-    fn rejects_envelope_version_mismatch() {
+    fn rejects_envelope_version_mismatch_in_its_direction() {
         let mut opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
-        opaque.envelope_version = bifrost_types::PayloadVersion::new(2);
-        let err = decode_gmail_state(&opaque).expect_err("envelope mismatch");
-        assert_cursor_kind(err, GmailCursorFailure::EnvelopeMismatch);
+        opaque.envelope_version = bifrost_types::PayloadVersion::new(GMAIL_ENVELOPE_VERSION + 1);
+        let err = decode_gmail_state(&opaque).expect_err("future envelope");
+        assert_cursor_kind(err, CursorDecodeFault::FutureVersion);
+        opaque.envelope_version = bifrost_types::PayloadVersion::new(GMAIL_ENVELOPE_VERSION - 1);
+        let err = decode_gmail_state(&opaque).expect_err("retired envelope");
+        assert_cursor_kind(err, CursorDecodeFault::RetiredVersion);
+    }
+
+    /// A newer schema may reshape every other field; the discriminator is
+    /// read first, so it still reports as a future version.
+    #[test]
+    fn a_reshaped_future_schema_is_a_future_version_not_malformed() {
+        let payload = serde_json::json!({
+            "schema_version": GMAIL_SCHEMA_VERSION + 1,
+            "history": { "id": "7" },
+        });
+        let opaque = OpaqueChangeState {
+            protocol: GMAIL_PROTOCOL,
+            envelope_version: bifrost_types::PayloadVersion::new(GMAIL_ENVELOPE_VERSION),
+            bytes: serde_json::to_vec(&payload).expect("serialize"),
+        };
+        let err = decode_gmail_state(&opaque).expect_err("future schema");
+        assert_cursor_kind(err, CursorDecodeFault::FutureVersion);
     }
 
     #[test]
@@ -236,7 +270,7 @@ mod tests {
             bytes: serde_json::to_vec(&payload).expect("serialize"),
         };
         let err = decode_gmail_state(&opaque).expect_err("schema mismatch");
-        assert_cursor_kind(err, GmailCursorFailure::SchemaMismatch);
+        assert_cursor_kind(err, CursorDecodeFault::FutureVersion);
     }
 
     #[test]
@@ -244,7 +278,7 @@ mod tests {
         let mut opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
         opaque.bytes.truncate(opaque.bytes.len() / 2);
         let err = decode_gmail_state(&opaque).expect_err("truncated bytes");
-        assert_cursor_kind(err, GmailCursorFailure::MalformedPayload);
+        assert_cursor_kind(err, CursorDecodeFault::Malformed);
     }
 
     #[test]
@@ -255,7 +289,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let err = decode_gmail_state(&opaque).expect_err("empty bytes");
-        assert_cursor_kind(err, GmailCursorFailure::MalformedPayload);
+        assert_cursor_kind(err, CursorDecodeFault::Malformed);
     }
 
     #[test]

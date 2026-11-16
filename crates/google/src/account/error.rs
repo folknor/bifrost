@@ -33,10 +33,7 @@ use bifrost_types::{
 };
 use bifrost_types::{BatchFailure, BatchSuccess};
 
-use crate::error::{
-    Error, GmailCursorFailure, GmailErrorEnvelope, GmailLocalError, GmailResponseError,
-    ProviderFault,
-};
+use crate::error::{Error, GmailErrorEnvelope, GmailLocalError, GmailResponseError, ProviderFault};
 
 /// Resource hint that drives `NotFound` and `PermissionDenied` payloads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1118,19 +1115,10 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             new_ctx.operation = operation;
             malformed_request(&new_ctx, detail)
         }
-        GmailLocalError::InvalidCursor { kind, detail } => {
-            let fault = match kind {
-                GmailCursorFailure::ProtocolMismatch => {
-                    bifrost_types::CursorDecodeFault::ProtocolMismatch
-                }
-                GmailCursorFailure::EnvelopeMismatch | GmailCursorFailure::SchemaMismatch => {
-                    bifrost_types::CursorDecodeFault::RetiredVersion
-                }
-                // Shared cursor decoding rebuilds unreadable durable state,
-                // including dependent backfill state. Users expect a clean
-                // resync rather than repeated failures on a poisoned checkpoint.
-                GmailCursorFailure::MalformedPayload => bifrost_types::CursorDecodeFault::Malformed,
-            };
+        // Shared cursor decoding rebuilds unreadable durable state, including
+        // dependent backfill state. Users expect a clean resync rather than
+        // repeated failures on a poisoned checkpoint.
+        GmailLocalError::InvalidCursor { fault, detail } => {
             let mut builder = fault
                 .builder(protocol_for(ctx), ctx.operation)
                 .context(ctx.identity())
@@ -1140,11 +1128,16 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             // These retained labels are diagnostics, not message keys. The
             // shared builder derives the message key from CursorDecodeFault's
             // kind, so consumers must not branch recovery on these strings.
-            builder = builder.native_code(match kind {
-                GmailCursorFailure::ProtocolMismatch => "cursor_protocol_mismatch",
-                GmailCursorFailure::EnvelopeMismatch => "cursor_envelope_mismatch",
-                GmailCursorFailure::SchemaMismatch => "cursor_schema_mismatch",
-                GmailCursorFailure::MalformedPayload => "cursor_malformed",
+            // The label is derived from the fault, so the two cannot disagree.
+            builder = builder.native_code(match fault {
+                bifrost_types::CursorDecodeFault::ProtocolMismatch => "cursor_protocol_mismatch",
+                bifrost_types::CursorDecodeFault::FutureVersion => "cursor_future_version",
+                bifrost_types::CursorDecodeFault::RetiredVersion => "cursor_retired_version",
+                bifrost_types::CursorDecodeFault::ScopeMismatch { .. } => "cursor_scope_mismatch",
+                bifrost_types::CursorDecodeFault::IdentityMismatch => {
+                    "cursor_account_identity_mismatch"
+                }
+                _ => "cursor_malformed",
             });
             builder
                 .try_build()
@@ -1757,7 +1750,7 @@ mod tests {
     #[test]
     fn cursor_protocol_mismatch_maps_to_schema_incompatible() {
         let err = Error::Local(GmailLocalError::InvalidCursor {
-            kind: GmailCursorFailure::ProtocolMismatch,
+            fault: bifrost_types::CursorDecodeFault::ProtocolMismatch,
             detail: "expected gmail".to_owned(),
         });
         let acc = into_account_error(err, GmailErrorContext::establish_cursor());
@@ -1772,9 +1765,30 @@ mod tests {
     }
 
     #[test]
+    fn cursor_from_a_newer_bifrost_is_labelled_future_not_retired() {
+        let future = super::super::cursor::decode_gmail_state(&bifrost_types::OpaqueChangeState {
+            protocol: bifrost_types::ProtocolKind::Gmail,
+            envelope_version: bifrost_types::PayloadVersion::new(
+                super::super::cursor::GMAIL_ENVELOPE_VERSION + 1,
+            ),
+            bytes: Vec::new(),
+        })
+        .expect_err("future envelope");
+        let acc = into_account_error(future, GmailErrorContext::establish_cursor());
+        assert_eq!(
+            acc.telemetry_fields().native_code,
+            Some("cursor_future_version")
+        );
+        assert!(matches!(
+            acc.recovery(),
+            RecoveryClass::Engine(EngineDirective::SchemaIncompatible)
+        ));
+    }
+
+    #[test]
     fn cursor_malformed_payload_maps_to_schema_incompatible() {
         let err = Error::Local(GmailLocalError::InvalidCursor {
-            kind: GmailCursorFailure::MalformedPayload,
+            fault: bifrost_types::CursorDecodeFault::Malformed,
             detail: "truncated".to_owned(),
         });
         let acc = into_account_error(err, GmailErrorContext::establish_cursor());

@@ -906,9 +906,15 @@ impl SieveStatus {
 pub(crate) enum SieveResponseCode {
     AuthTooWeak,
     EncryptNeeded,
-    /// `QUOTA`, `QUOTA/MAXSCRIPTS`, `QUOTA/MAXSIZE`. The sub-kind rides
-    /// in the diagnostic text; all three are the same classification.
+    /// Bare `QUOTA`: a site-defined quota, with no sub-kind saying which.
     Quota,
+    /// `QUOTA/MAXSCRIPTS`: the user already stores the maximum number of
+    /// scripts. Shared account capacity, recovered by deleting a script.
+    QuotaMaxScripts,
+    /// `QUOTA/MAXSIZE`: this script exceeds the per-script size limit. A
+    /// fixed limit on the submitted item; the unchanged request never
+    /// succeeds, whatever else is deleted.
+    QuotaMaxSize,
     Referral,
     Sasl,
     TransitionNeeded,
@@ -930,16 +936,16 @@ pub(crate) enum SieveResponseCode {
 
 impl SieveResponseCode {
     fn parse(raw: &str) -> Self {
-        // `QUOTA/MAXSCRIPTS` and `SASL "..."` / `REFERRAL "..."` carry a
-        // payload after the code atom; key off the atom alone.
-        let atom = raw
-            .split(|c: char| c == '/' || c.is_whitespace())
-            .next()
-            .unwrap_or(raw);
+        // `SASL "..."` / `REFERRAL "..."` carry a payload after the code;
+        // key off the code alone. A hierarchical code (`QUOTA/MAXSIZE`) is
+        // kept whole: its sub-kind decides the classification.
+        let atom = raw.split(char::is_whitespace).next().unwrap_or(raw);
         match atom.to_ascii_uppercase().as_str() {
             "AUTH-TOO-WEAK" => Self::AuthTooWeak,
             "ENCRYPT-NEEDED" => Self::EncryptNeeded,
             "QUOTA" => Self::Quota,
+            "QUOTA/MAXSCRIPTS" => Self::QuotaMaxScripts,
+            "QUOTA/MAXSIZE" => Self::QuotaMaxSize,
             "REFERRAL" => Self::Referral,
             "SASL" => Self::Sasl,
             "TRANSITION-NEEDED" => Self::TransitionNeeded,
@@ -959,6 +965,8 @@ impl SieveResponseCode {
             Self::AuthTooWeak => "AUTH-TOO-WEAK",
             Self::EncryptNeeded => "ENCRYPT-NEEDED",
             Self::Quota => "QUOTA",
+            Self::QuotaMaxScripts => "QUOTA/MAXSCRIPTS",
+            Self::QuotaMaxSize => "QUOTA/MAXSIZE",
             Self::Referral => "REFERRAL",
             Self::Sasl => "SASL",
             Self::TransitionNeeded => "TRANSITION-NEEDED",
@@ -1409,14 +1417,26 @@ mod tests {
         assert_eq!(message, "Server busy, try again");
     }
 
-    /// `QUOTA/MAXSCRIPTS` and `QUOTA/MAXSIZE` are the same classification;
-    /// the sub-kind is diagnostic only.
+    /// The quota sub-kind is kept: `MAXSIZE` is a fixed per-script limit and
+    /// `MAXSCRIPTS` is account capacity, so they classify differently. An
+    /// unknown sub-kind is preserved whole rather than folded into `QUOTA`.
     #[test]
-    fn a_quota_subkind_parses_as_quota() {
+    fn a_quota_subkind_is_kept() {
         let (code, _) = no_status(r#"NO (QUOTA/MAXSCRIPTS) "Too many scripts""#);
+        assert_eq!(code, Some(SieveResponseCode::QuotaMaxScripts));
+        let (code, _) = no_status(r#"NO (quota/maxsize) "Script too large""#);
+        assert_eq!(code, Some(SieveResponseCode::QuotaMaxSize));
+        assert_eq!(
+            code.as_ref().map(SieveResponseCode::code),
+            Some("QUOTA/MAXSIZE")
+        );
+        let (code, _) = no_status(r#"NO (QUOTA) "Over quota""#);
         assert_eq!(code, Some(SieveResponseCode::Quota));
-        let (code, _) = no_status(r#"NO (QUOTA/MAXSIZE) "Script too large""#);
-        assert_eq!(code, Some(SieveResponseCode::Quota));
+        let (code, _) = no_status(r#"NO (QUOTA/MAXFROB) "?""#);
+        assert_eq!(
+            code,
+            Some(SieveResponseCode::Other("QUOTA/MAXFROB".to_owned()))
+        );
     }
 
     /// An unmodelled extension code must be preserved verbatim rather

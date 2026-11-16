@@ -38,31 +38,27 @@ or was refused; two design items remain.
   acknowledgement contract. The limitation is now in `supersede`'s rustdoc and
   `reference/sync.md`.
 
-## BUG-197 - ManageSieve `QUOTA/MAXSIZE` derives a same-request retry
+## BUG-202 - ManageSieve CHECKSCRIPT turns a `QUOTA` refusal into a validation verdict
 
-**Reported by:** the ManageSieve protocol-identity fix (spar review).
+**Reported by:** the ManageSieve quota sub-kind split (spar review).
 
-`classify_sieve` maps every RFC 5804 `QUOTA` code to
-`Server(QuotaExhausted)`, which derives `Retry(SameRequest)`. `QUOTA/MAXSIZE`
-means the script itself is over a fixed size limit: the unchanged request can
-never succeed, so retrying it is wrong; `QUOTA/MAXSCRIPTS` recovers only once
-the user deletes a script. The sub-kind is parsed away
-(`SieveResponseCode::Quota` covers all three, `crates/imap/src/sieve.rs`). The
-shared model needs a fixed-limit versus recoverable-capacity split that keeps
-the quota evidence; substituting another kind is not the fix. The IMAP
-`OVERQUOTA` mapping should be checked against the same split.
+`validation_outcome` (`crates/imap/src/sieve.rs`) treats every non-`TRYLATER`
+`NO` to CHECKSCRIPT as the script's validation verdict, so a `QUOTA`,
+`QUOTA/MAXSCRIPTS` or `QUOTA/MAXSIZE` response becomes `FilterValidation`
+diagnostics instead of an error. RFC 5804 section 2.12 forbids CHECKSCRIPT
+from checking quota, so such a response is not a syntax verdict. The fix
+should separate "validation happened" from "retryable" rather than marking the
+quota codes transient.
 
-## BUG-198 - Gmail reports a future-version cursor as a retired version
+## BUG-203 - JMAP labels a retired-version cursor `Malformed`
 
-**Reported by:** the closed bundle above (scout, re-checked at HEAD).
+**Reported by:** the Gmail cursor fault carry-through (scout).
 
-`decode_gmail_state` (`crates/google/src/account/cursor.rs`) turns every
-`OpaqueChangeState::open` fault other than `ProtocolMismatch` into
-`GmailCursorFailure::EnvelopeMismatch`, which `translate_local` maps to
-`CursorDecodeFault::RetiredVersion`. A cursor written by a newer bifrost
-(`FutureVersion`) is therefore labelled retired. The recovery class is the same
-(`SchemaIncompatible`), so only the diagnostic is wrong; carrying the shared
-fault through instead of the Gmail-local enum would fix it.
+`crates/jmap/src/sync/state.rs` folds `CursorDecodeFault::RetiredVersion` into
+`CursorError::SchemaIncompatible`, which `crates/jmap/src/sync/error.rs` maps
+back to `CursorDecodeFault::Malformed`. Recovery is identical
+(`SchemaIncompatible`); only the diagnostic label is wrong, as it was in
+Gmail. Graph keeps the distinction through its own enum.
 
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 

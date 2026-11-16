@@ -804,13 +804,30 @@ fn classify_sieve(
         Some(Sc::TryLater) => Translation::new(PrimaryCause::Server(ServerCause::Unavailable {
             retry_hint: None,
         })),
-        Some(Sc::Quota) => Translation::new(PrimaryCause::Server(ServerCause::QuotaExhausted {
-            throttle: bifrost_types::Throttle {
-                scope: Some(ThrottleScope::Account),
-                ..Default::default()
-            },
-            retry_hint: None,
-        })),
+        // A script over the per-script size limit can never be stored
+        // unchanged, so retrying it is wrong; like IMAP TOOBIG it is a
+        // fixed limit on the submitted item. An enterprise user expects
+        // "this rule is too large", not a silent retry. `native_code` keeps
+        // `QUOTA/MAXSIZE` as the quota evidence.
+        Some(Sc::QuotaMaxSize) => {
+            Translation::new(PrimaryCause::Request(RequestCause::PayloadTooLarge {
+                detail: DiagnosticText::support_only(
+                    "ManageSieve script exceeds the server's per-script size limit",
+                ),
+            }))
+        }
+        // Bare QUOTA and QUOTA/MAXSCRIPTS are stored-inventory capacity: the
+        // same request succeeds once a script is deleted, the shape of IMAP
+        // OVERQUOTA and HTTP 507, so they stay QuotaExhausted.
+        Some(Sc::Quota | Sc::QuotaMaxScripts) => {
+            Translation::new(PrimaryCause::Server(ServerCause::QuotaExhausted {
+                throttle: bifrost_types::Throttle {
+                    scope: Some(ThrottleScope::Account),
+                    ..Default::default()
+                },
+                retry_hint: None,
+            }))
+        }
         Some(Sc::NonExistent) => Translation::new(PrimaryCause::Request(RequestCause::NotFound {
             what: ResourceKind::Filter,
             id: None,
@@ -1082,7 +1099,10 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             }))
         }
 
-        // Quota / limits
+        // Quota / limits. RFC 5530 OVERQUOTA is mailbox storage capacity: it
+        // frees as mail is deleted or expunged, so the unchanged request can
+        // succeed later and QuotaExhausted is right. A fixed per-item limit
+        // has its own code (TOOBIG, below) and is PayloadTooLarge.
         ResponseCode::OverQuota => {
             Translation::new(PrimaryCause::Server(ServerCause::QuotaExhausted {
                 throttle: bifrost_types::Throttle {
