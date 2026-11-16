@@ -144,6 +144,17 @@ pub enum WarningKind {
     /// is absent or empty). The object exists; this call cannot address it.
     /// Explains every [`crate::Created`] without an id.
     CreatedWithoutIdentity,
+    /// A filter was saved, but the request to make it the active one did not
+    /// complete: the server refused it, or its answer never confirmed it. The
+    /// filter exists; its activation state is not established either way (a
+    /// replaced script may have kept its earlier active status). The attached
+    /// error is the activation leg's, and its recovery advice concerns that
+    /// leg, never the save.
+    FilterActivationIncomplete,
+    /// The server completed the request and attached advice of its own, such
+    /// as compiler warnings for a saved Sieve script. The request succeeded;
+    /// the protocol detail carries the server's text.
+    ServerAdvisory,
     Other,
 }
 

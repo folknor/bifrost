@@ -760,7 +760,13 @@ identity is a separate fact (`id() -> Option<&T>`). Uncertainty stays in
 `Err`. Private fields and two constructors keep the invariant that an
 unidentified create carries a `WarningKind::CreatedWithoutIdentity` warning
 saying why; `with_warning` adds advisory warnings to an identified create for
-an ancillary leg that degraded. Provider boundaries validate the native id
+an ancillary leg that degraded, or for advice the server attached to a
+successful create: `WarningKind::FilterActivationIncomplete` (a filter saved
+whose activation was refused or never confirmed; the activation leg's error
+attached, no claim about the resulting active state) and
+`WarningKind::ServerAdvisory` (the server completed the request with advice of
+its own, such as Sieve compiler warnings, its text in `protocol_detail`).
+IMAP ManageSieve is the producer of both. Provider boundaries validate the native id
 (absent or empty means unidentified) before wrapping or joining it.
 
 ## Partial write effects

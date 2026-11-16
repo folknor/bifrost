@@ -166,6 +166,28 @@ pub(crate) struct ListedScript {
     pub(crate) is_active: bool,
 }
 
+/// How a `SETACTIVE` ended.
+pub(crate) enum Activation {
+    /// The server answered `OK`, possibly with an advisory.
+    Done { advisory: Option<String> },
+    /// The server answered `NO`, or the request was refused before sending.
+    Refused(Error),
+    /// Nothing confirmed the outcome: `BYE`, a lost or timed-out connection,
+    /// or an answer that could not be read.
+    Unconfirmed(Error),
+}
+
+impl Activation {
+    /// The plain command result, for a caller with no use for the
+    /// refused-versus-unconfirmed distinction.
+    pub(crate) fn into_result(self) -> Result<Option<String>, Error> {
+        match self {
+            Self::Done { advisory } => Ok(advisory),
+            Self::Refused(error) | Self::Unconfirmed(error) => Err(error),
+        }
+    }
+}
+
 impl ManageSieveClient {
     pub(crate) async fn connect(
         config: &ManageSieveConfig,
@@ -194,7 +216,7 @@ impl ManageSieveClient {
         let mut capabilities = read_response(&mut stream, config.command_timeout)
             .await?
             .ensure_ok()?
-            .capabilities();
+            .capabilities()?;
         let mut tls_active = config.tls_mode.uses_implicit_tls();
 
         if config.tls_mode.uses_starttls() {
@@ -240,52 +262,63 @@ impl ManageSieveClient {
         let response = read_response(&mut self.stream, self.timeout)
             .await?
             .ensure_ok()?;
-        response
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                SieveResponseItem::Line(line) => parse_list_script(line),
-                SieveResponseItem::Literal(_) => None,
-            })
-            .collect()
+        list_scripts_from(response.records)
     }
 
     pub(crate) async fn get_script(&mut self, name: &str) -> Result<String, Error> {
         let command = format!("GETSCRIPT {}\r\n", script_name_arg(name)?);
         write_command(&mut self.stream, self.timeout, command.as_bytes()).await?;
+        let response = read_response_within(&mut self.stream, self.timeout, ResponseLimits::SCRIPT)
+            .await?
+            .ensure_ok()?;
+        script_from(response.records)
+    }
+
+    /// Store a script. `Ok` carries the server's advisory when it answered
+    /// `OK (WARNINGS)` (RFC 5804 2.6): the script is stored, and the user
+    /// saving it expects to see what the server warned about.
+    pub(crate) async fn put_script(
+        &mut self,
+        name: &str,
+        body: &str,
+    ) -> Result<Option<String>, Error> {
+        let command = literal_command("PUTSCRIPT", Some(name), body)?;
+        write_command(&mut self.stream, self.timeout, &command).await?;
         let response = read_response(&mut self.stream, self.timeout)
             .await?
             .ensure_ok()?;
-        for item in response.items {
-            if let SieveResponseItem::Literal(bytes) = item {
-                return String::from_utf8(bytes)
-                    .map_err(|error| Error::Parse(format!("Sieve script is not UTF-8: {error}")));
-            }
-        }
-        Err(Error::Parse(
-            "GETSCRIPT response did not include a script literal".into(),
-        ))
+        Ok(response.status.advisory())
     }
 
-    pub(crate) async fn put_script(&mut self, name: &str, body: &str) -> Result<(), Error> {
-        let command = literal_command("PUTSCRIPT", Some(name), body)?;
-        write_command(&mut self.stream, self.timeout, &command).await?;
-        read_response(&mut self.stream, self.timeout)
-            .await?
-            .ensure_ok()?;
-        Ok(())
-    }
-
-    pub(crate) async fn set_active(&mut self, name: Option<&str>) -> Result<(), Error> {
-        let command = match name {
-            Some(name) => format!("SETACTIVE {}\r\n", script_name_arg(name)?),
-            None => format!("SETACTIVE {}\r\n", quote_string("")?),
+    /// Make `name` the active script, or deactivate with `None`.
+    ///
+    /// Not a `Result`: a caller that has already stored the script needs to
+    /// tell a server refusal (`NO`) from an answer that never confirmed
+    /// anything (`BYE`, a lost connection, an unreadable reply), and
+    /// [`Error::Sieve`] does not keep that distinction.
+    pub(crate) async fn set_active(&mut self, name: Option<&str>) -> Activation {
+        let command = match name.map_or_else(|| quote_string(""), script_name_arg) {
+            Ok(arg) => format!("SETACTIVE {arg}\r\n"),
+            Err(error) => return Activation::Refused(error),
         };
-        write_command(&mut self.stream, self.timeout, command.as_bytes()).await?;
-        read_response(&mut self.stream, self.timeout)
-            .await?
-            .ensure_ok()?;
-        Ok(())
+        if let Err(error) = write_command(&mut self.stream, self.timeout, command.as_bytes()).await
+        {
+            return Activation::Unconfirmed(error);
+        }
+        match read_response(&mut self.stream, self.timeout).await {
+            Ok(response) => match response.status {
+                status @ SieveStatus::Ok { .. } => Activation::Done {
+                    advisory: status.advisory(),
+                },
+                SieveStatus::No { code, message } => {
+                    Activation::Refused(Error::Sieve { code, message })
+                }
+                SieveStatus::Bye { code, message } => {
+                    Activation::Unconfirmed(Error::Sieve { code, message })
+                }
+            },
+            Err(error) => Activation::Unconfirmed(error),
+        }
     }
 
     pub(crate) async fn delete_script(&mut self, name: &str) -> Result<(), Error> {
@@ -322,10 +355,10 @@ impl ManageSieveClient {
 /// per line. Any other `OK` text is informational and dropped.
 fn validation_outcome(status: SieveStatus) -> Result<FilterValidation, Error> {
     match status {
-        SieveStatus::Ok { code, message } => {
-            if code.as_ref().map(SieveResponseCode::meaning) != Some(SieveResponseCode::Warnings) {
+        status @ SieveStatus::Ok { .. } => {
+            let Some(message) = status.advisory() else {
                 return Ok(FilterValidation::default());
-            }
+            };
             let message = if message.trim().is_empty() {
                 "Script compiled with warnings".to_owned()
             } else {
@@ -355,10 +388,10 @@ async fn request_capability(
     timeout: Duration,
 ) -> Result<SieveCapabilities, Error> {
     write_command(stream, timeout, b"CAPABILITY\r\n").await?;
-    Ok(read_response(stream, timeout)
+    read_response(stream, timeout)
         .await?
         .ensure_ok()?
-        .capabilities())
+        .capabilities()
 }
 
 // Base64 uses no quoted-string metacharacters. Keep both credential-bearing
@@ -703,23 +736,313 @@ async fn write_command(
     .map_err(Error::from)
 }
 
+/// The most a `GETSCRIPT` body may occupy. A policy bound, not a server
+/// figure: far above any script a user writes by hand, and small enough that
+/// a server's literal count can never make the client allocate without
+/// limit. It is checked before the body is allocated.
+const SCRIPT_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+/// What one response's data records may pull off the wire. Every bound is
+/// charged before the bytes it covers are read or allocated, line
+/// terminators included; the status record keeps its own
+/// [`STATUS_RECORD_LIMIT`].
+#[derive(Clone, Copy, Debug)]
+struct ResponseLimits {
+    /// One data record: its lines plus the literals they pull in.
+    record: usize,
+    /// Every data record of the response together.
+    response: usize,
+    /// How many data records the response may hold.
+    records: usize,
+    /// One literal's octets, apart from the framing around it.
+    literal: usize,
+}
+
+impl ResponseLimits {
+    /// `CAPABILITY`, `LISTSCRIPTS` and every command answered by a status
+    /// alone.
+    const DEFAULT: Self = Self {
+        record: 64 * 1024,
+        response: 1024 * 1024,
+        records: 10_000,
+        literal: 64 * 1024,
+    };
+    /// `GETSCRIPT`: exactly one record, the script, so the larger body
+    /// allowance cannot be spent on a second one. The record allows the
+    /// body limit plus room for its framing, so a body exactly at the limit
+    /// fits and one octet over it does not.
+    const SCRIPT: Self = Self {
+        record: SCRIPT_BODY_LIMIT + 1024,
+        response: SCRIPT_BODY_LIMIT + 1024,
+        records: 1,
+        literal: SCRIPT_BODY_LIMIT,
+    };
+}
+
+/// Debit `cost` from an allowance, refusing once it is spent.
+fn charge(left: &mut usize, cost: usize) -> Result<(), Error> {
+    *left = left
+        .checked_sub(cost)
+        .ok_or_else(|| Error::Parse("ManageSieve response exceeded its size limit".into()))?;
+    Ok(())
+}
+
 async fn read_response(
     stream: &mut SieveStream,
     timeout: Duration,
 ) -> Result<SieveResponse, Error> {
-    let mut items = Vec::new();
+    read_response_within(stream, timeout, ResponseLimits::DEFAULT).await
+}
+
+/// Read one complete response: its data records, then the status record.
+///
+/// RFC 5804 lets every string in a data response be a literal (`{n}` CRLF
+/// then n octets) followed by more of the same record on the next line
+/// (`{4}` CRLF `main` ` ACTIVE` CRLF is one LISTSCRIPTS entry). Each record
+/// is framed whole before anything classifies it, so literal octets are
+/// never read as a line and a continuation line is never mistaken for the
+/// next record or for the status. A framing refusal leaves the stream
+/// unusable; every client is per-operation and dropped on error.
+async fn read_response_within(
+    stream: &mut SieveStream,
+    timeout: Duration,
+    limits: ResponseLimits,
+) -> Result<SieveResponse, Error> {
+    let mut left = limits.response;
+    let mut records = Vec::new();
     loop {
-        let line = read_line(stream, timeout).await?;
+        // The first byte says which allowance governs the line: a data
+        // record opens with a string (`"` or `{`), anything else may be the
+        // status and gets the status line's own bound. A data line gets
+        // only what its record and response have left, nothing once the
+        // command's record count is spent, so no bound is charged after
+        // the bytes it covers were read.
+        let data_cap = if records.len() < limits.records {
+            left.min(limits.record).min(LINE_LIMIT)
+        } else {
+            0
+        };
+        let (line, raw) = read_line_within(stream, timeout, |first| {
+            if matches!(first, b'"' | b'{') {
+                data_cap
+            } else {
+                LINE_LIMIT
+            }
+        })
+        .await?;
         if is_status_line(&line) {
             let status = read_status(stream, timeout, line).await?.status;
-            return Ok(SieveResponse { items, status });
+            return Ok(SieveResponse { records, status });
         }
-        if let Some(len) = literal_len(&line) {
-            let bytes = read_exact_len(stream, timeout, len).await?;
-            items.push(SieveResponseItem::Literal(bytes));
-        } else {
-            items.push(SieveResponseItem::Line(line));
+        if !matches!(line.as_bytes().first(), Some(b'"' | b'{')) {
+            return Err(Error::Parse(
+                "ManageSieve data record does not open with a string".into(),
+            ));
         }
+        if records.len() >= limits.records {
+            return Err(Error::Parse(
+                "ManageSieve response holds more data records than its command allows".into(),
+            ));
+        }
+        let mut record_left = left.min(limits.record);
+        let before = record_left;
+        charge(&mut record_left, raw)?;
+        let segments =
+            read_data_record(stream, timeout, line, &mut record_left, limits.literal).await?;
+        left -= before - record_left;
+        records.push(data_tokens(segments)?);
+    }
+}
+
+/// Read the rest of a data record whose first line is `first`, charging
+/// `left` for every literal and continuation line before reading it.
+async fn read_data_record(
+    stream: &mut SieveStream,
+    timeout: Duration,
+    first: String,
+    left: &mut usize,
+    literal_limit: usize,
+) -> Result<Vec<Segment>, Error> {
+    let mut segments = Vec::new();
+    let mut line = first;
+    loop {
+        let Some((prefix, len)) = data_literal(&line)? else {
+            segments.push(Segment::Text(line));
+            return Ok(segments);
+        };
+        if len > literal_limit {
+            return Err(Error::Parse(
+                "ManageSieve literal exceeded its size limit".into(),
+            ));
+        }
+        charge(left, len)?;
+        line.truncate(prefix);
+        segments.push(Segment::Text(line));
+        segments.push(Segment::Literal(
+            read_exact_len(stream, timeout, len).await?,
+        ));
+        let cap = (*left).min(LINE_LIMIT);
+        let (next, raw) = read_line_within(stream, timeout, |_| cap).await?;
+        charge(left, raw)?;
+        line = next;
+    }
+}
+
+/// The literal marker ending a data line, strictly: a line whose last byte
+/// is `}` is a literal or a refusal, never text. RFC 5804 4: a server
+/// literal is `{` number `}` CRLF, number a 32-bit count without leading
+/// zeros, preceded by SP or opening the record; `{n+}` is client-only.
+fn data_literal(line: &str) -> Result<Option<(usize, usize)>, Error> {
+    let Some(body) = line.strip_suffix('}') else {
+        return Ok(None);
+    };
+    let malformed = || Error::Parse(format!("malformed ManageSieve literal marker in {line:?}"));
+    let open = body.rfind('{').ok_or_else(malformed)?;
+    let digits = &body[open + 1..];
+    let well_formed = !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'))
+        && (open == 0 || line.as_bytes()[open - 1] == b' ');
+    if !well_formed {
+        return Err(malformed());
+    }
+    let len: u32 = digits.parse().map_err(|_| malformed())?;
+    Ok(Some((open, len as usize)))
+}
+
+/// A data-response token. Data responses carry no parenthesized lists.
+#[derive(Debug, PartialEq, Eq)]
+enum DataToken {
+    Str(String),
+    Atom(String),
+}
+
+/// Tokenize a framed data record strictly: tokens are separated by exactly
+/// one SP, a quoted string admits only the `\"` and `\\` escapes and no CR,
+/// LF or NUL, and its bytes are decoded as UTF-8 once. The tolerances
+/// status parsing keeps for human-readable text do not apply here: a data
+/// record is structure, and malformed structure is a refusal.
+fn data_tokens(segments: Vec<Segment>) -> Result<Vec<DataToken>, Error> {
+    let malformed = || Error::Parse("malformed ManageSieve data record".into());
+    let count = segments.len();
+    let mut tokens = Vec::new();
+    // Whether the next token must be preceded by SP.
+    let mut need_sep = false;
+    for (index, segment) in segments.into_iter().enumerate() {
+        let text = match segment {
+            Segment::Literal(bytes) => {
+                if need_sep {
+                    return Err(malformed());
+                }
+                tokens.push(DataToken::Str(String::from_utf8(bytes).map_err(|_| {
+                    Error::Parse("ManageSieve data literal is not UTF-8".into())
+                })?));
+                need_sep = true;
+                continue;
+            }
+            Segment::Text(text) => text,
+        };
+        let bytes = text.as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            if need_sep {
+                if bytes[at] != b' ' {
+                    return Err(malformed());
+                }
+                at += 1;
+                need_sep = false;
+                if at == bytes.len() {
+                    // A separator ending the text must introduce a literal.
+                    if index + 1 == count {
+                        return Err(malformed());
+                    }
+                    break;
+                }
+            }
+            if bytes[at] == b'"' {
+                let mut value = Vec::new();
+                at += 1;
+                loop {
+                    match bytes.get(at) {
+                        None | Some(0 | b'\r' | b'\n') => return Err(malformed()),
+                        Some(b'"') => break,
+                        Some(b'\\') => match bytes.get(at + 1) {
+                            Some(&escaped @ (b'"' | b'\\')) => {
+                                value.push(escaped);
+                                at += 1;
+                            }
+                            _ => return Err(malformed()),
+                        },
+                        Some(&byte) => value.push(byte),
+                    }
+                    at += 1;
+                }
+                at += 1;
+                tokens.push(DataToken::Str(String::from_utf8(value).map_err(|_| {
+                    Error::Parse("ManageSieve quoted string is not UTF-8".into())
+                })?));
+            } else {
+                let start = at;
+                while at < bytes.len() && bytes[at] != b' ' {
+                    if matches!(bytes[at], b'"' | b'\\' | b'(' | b')' | b'{' | b'}') {
+                        return Err(malformed());
+                    }
+                    at += 1;
+                }
+                tokens.push(DataToken::Atom(text[start..at].to_owned()));
+            }
+            need_sep = true;
+        }
+    }
+    if tokens.is_empty() {
+        return Err(malformed());
+    }
+    Ok(tokens)
+}
+
+/// LISTSCRIPTS records (RFC 5804 2.7): a non-empty name, optionally
+/// followed by `ACTIVE`; at most one script is active.
+fn list_scripts_from(records: Vec<Vec<DataToken>>) -> Result<Vec<ListedScript>, Error> {
+    let mut scripts = Vec::with_capacity(records.len());
+    for record in records {
+        let mut tokens = record.into_iter();
+        let (Some(DataToken::Str(name)), marker, None) =
+            (tokens.next(), tokens.next(), tokens.next())
+        else {
+            return Err(Error::Parse("invalid LISTSCRIPTS entry".into()));
+        };
+        let is_active = match marker {
+            None => false,
+            Some(DataToken::Atom(atom)) if atom.eq_ignore_ascii_case("ACTIVE") => true,
+            Some(_) => return Err(Error::Parse("invalid LISTSCRIPTS entry".into())),
+        };
+        if name.is_empty() {
+            return Err(Error::Parse("LISTSCRIPTS named an empty script".into()));
+        }
+        scripts.push(ListedScript { name, is_active });
+    }
+    if scripts.iter().filter(|script| script.is_active).count() > 1 {
+        return Err(Error::Parse(
+            "LISTSCRIPTS marked more than one script active".into(),
+        ));
+    }
+    Ok(scripts)
+}
+
+/// A GETSCRIPT answer (RFC 5804 2.9): exactly one record holding exactly
+/// one string, literal or quoted. An empty script is a script.
+fn script_from(records: Vec<Vec<DataToken>>) -> Result<String, Error> {
+    let mut records = records.into_iter();
+    match (records.next(), records.next()) {
+        (Some(record), None) => match <[DataToken; 1]>::try_from(record) {
+            Ok([DataToken::Str(body)]) => Ok(body),
+            _ => Err(Error::Parse(
+                "GETSCRIPT answer is not one script string".into(),
+            )),
+        },
+        _ => Err(Error::Parse(
+            "GETSCRIPT answer is not one script string".into(),
+        )),
     }
 }
 
@@ -751,12 +1074,18 @@ async fn read_status(
     timeout: Duration,
     first: String,
 ) -> Result<StatusRecord, Error> {
-    let mut used = first.len();
+    // Wire bytes, CRLF included, charged before each read.
+    let mut used = first.len().saturating_add(2);
+    if used > STATUS_RECORD_LIMIT {
+        return Err(Error::Parse(
+            "ManageSieve status response exceeded 64KiB".into(),
+        ));
+    }
     let mut segments = Vec::new();
     let mut line = first;
     loop {
         let Some((prefix, len)) = trailing_literal(&line)? else {
-            segments.push(StatusSegment::Text(line));
+            segments.push(Segment::Text(line));
             break;
         };
         used = used.saturating_add(len);
@@ -766,12 +1095,14 @@ async fn read_status(
             ));
         }
         line.truncate(prefix);
-        segments.push(StatusSegment::Text(line));
-        segments.push(StatusSegment::Literal(
+        segments.push(Segment::Text(line));
+        segments.push(Segment::Literal(
             read_exact_len(stream, timeout, len).await?,
         ));
-        line = read_line(stream, timeout).await?;
-        used = used.saturating_add(line.len());
+        let cap = STATUS_RECORD_LIMIT - used;
+        let (next, raw) = read_line_within(stream, timeout, |_| cap).await?;
+        line = next;
+        used = used.saturating_add(raw);
         if used > STATUS_RECORD_LIMIT {
             return Err(Error::Parse(
                 "ManageSieve status response exceeded 64KiB".into(),
@@ -819,10 +1150,10 @@ fn trailing_literal(line: &str) -> Result<Option<(usize, usize)>, Error> {
     Ok(Some((open, len)))
 }
 
-/// A status record as read off the wire: text runs with the literals that
-/// interrupt them, in order.
+/// A record (status or data) as read off the wire: text runs with the
+/// literals that interrupt them, in order.
 #[derive(Debug)]
-enum StatusSegment {
+enum Segment {
     Text(String),
     Literal(Vec<u8>),
 }
@@ -847,7 +1178,7 @@ enum StatusToken {
 /// Walks the segments of a status record token by token. A literal segment
 /// is one string token; text is split per RFC 5804 lexical rules.
 struct StatusCursor<'a> {
-    segments: &'a [StatusSegment],
+    segments: &'a [Segment],
     index: usize,
     offset: usize,
 }
@@ -859,8 +1190,8 @@ impl<'a> StatusCursor<'a> {
             return None;
         }
         match &self.segments[self.index] {
-            StatusSegment::Text(text) => Some(&text[self.offset.min(text.len())..]),
-            StatusSegment::Literal(_) => None,
+            Segment::Text(text) => Some(&text[self.offset.min(text.len())..]),
+            Segment::Literal(_) => None,
         }
     }
 
@@ -870,7 +1201,7 @@ impl<'a> StatusCursor<'a> {
                 return Ok(None);
             };
             let text = match segment {
-                StatusSegment::Literal(bytes) => {
+                Segment::Literal(bytes) => {
                     self.index += 1;
                     self.offset = 0;
                     let text = String::from_utf8(bytes.clone()).map_err(|_| {
@@ -878,7 +1209,7 @@ impl<'a> StatusCursor<'a> {
                     })?;
                     return Ok(Some(StatusToken::Str(text)));
                 }
-                StatusSegment::Text(text) => text,
+                Segment::Text(text) => text,
             };
             let bytes = text.as_bytes();
             while bytes.get(self.offset).is_some_and(u8::is_ascii_whitespace) {
@@ -934,7 +1265,7 @@ impl<'a> StatusCursor<'a> {
 /// text rather than an invented code, and an unquoted message is taken as
 /// trimmed raw text. Once a literal has been read the record is committed,
 /// and malformed structure is a refusal.
-fn parse_status(segments: &[StatusSegment]) -> Result<StatusRecord, Error> {
+fn parse_status(segments: &[Segment]) -> Result<StatusRecord, Error> {
     let lenient = segments.len() == 1;
     let mut cursor = StatusCursor {
         segments,
@@ -1130,10 +1461,35 @@ fn peer_read_error(error: std::io::Error) -> Error {
 }
 
 async fn read_line(stream: &mut SieveStream, timeout: Duration) -> Result<String, Error> {
+    Ok(read_line_within(stream, timeout, |_| LINE_LIMIT).await?.0)
+}
+
+/// The most one line may occupy: 64 KiB of content plus its LF.
+const LINE_LIMIT: usize = 64 * 1024 + 1;
+
+/// Read one line, refusing as soon as it would pass the bound `cap` gives
+/// for its first byte, terminator included. Returns the line without its
+/// terminator and the bytes it occupied on the wire.
+async fn read_line_within(
+    stream: &mut SieveStream,
+    timeout: Duration,
+    cap: impl Fn(u8) -> usize,
+) -> Result<(String, usize), Error> {
     let mut stream = metered_reader(stream, timeout);
     let mut buf = Vec::new();
     let mut byte = [0_u8; 1];
+    let mut max = LINE_LIMIT;
     loop {
+        if buf.len() == 1 {
+            max = cap(buf[0]);
+        }
+        if buf.len() >= max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ManageSieve response line exceeded its size limit",
+            )
+            .into());
+        }
         stream
             .read_exact(&mut byte)
             .await
@@ -1142,20 +1498,15 @@ async fn read_line(stream: &mut SieveStream, timeout: Duration) -> Result<String
         if byte[0] == b'\n' {
             break;
         }
-        if buf.len() > 64 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "ManageSieve response line exceeded 64KiB",
-            )
-            .into());
-        }
     }
+    let raw = buf.len();
     buf.pop();
     if buf.ends_with(b"\r") {
         buf.pop();
     }
-    String::from_utf8(buf)
-        .map_err(|error| Error::Parse(format!("ManageSieve response is not UTF-8: {error}")))
+    let line = String::from_utf8(buf)
+        .map_err(|error| Error::Parse(format!("ManageSieve response is not UTF-8: {error}")))?;
+    Ok((line, raw))
 }
 
 async fn read_exact_len(
@@ -1170,7 +1521,8 @@ async fn read_exact_len(
 }
 
 struct SieveResponse {
-    items: Vec<SieveResponseItem>,
+    /// The data records before the status, each tokenized whole.
+    records: Vec<Vec<DataToken>>,
     status: SieveStatus,
 }
 
@@ -1188,35 +1540,32 @@ impl SieveResponse {
         }
     }
 
-    fn capabilities(&self) -> SieveCapabilities {
+    /// Capability records (RFC 5804 1.7): a name string, optionally followed
+    /// by a value string, either of which may be a literal.
+    fn capabilities(&self) -> Result<SieveCapabilities, Error> {
         let mut capabilities = SieveCapabilities::default();
-        for item in &self.items {
-            let SieveResponseItem::Line(line) = item else {
-                continue;
+        for record in &self.records {
+            let (key, value) = match record.as_slice() {
+                [DataToken::Str(key)] => (key, None),
+                [DataToken::Str(key), DataToken::Str(value)] => (key, Some(value)),
+                _ => return Err(Error::Parse("invalid ManageSieve capability".into())),
             };
-            if let Some((key, rest)) = parse_quoted(line, 0) {
-                if key.eq_ignore_ascii_case("STARTTLS") {
-                    capabilities.starttls = true;
-                } else if key.eq_ignore_ascii_case("SASL")
-                    && let Some((mechanisms, _)) = parse_quoted(line, rest)
-                {
-                    capabilities.sasl = mechanisms.split_whitespace().map(str::to_string).collect();
-                }
+            if key.eq_ignore_ascii_case("STARTTLS") {
+                capabilities.starttls = true;
+            } else if key.eq_ignore_ascii_case("SASL")
+                && let Some(mechanisms) = value
+            {
+                capabilities.sasl = mechanisms.split_whitespace().map(str::to_string).collect();
             }
         }
-        capabilities
+        Ok(capabilities)
     }
-}
-
-enum SieveResponseItem {
-    Line(String),
-    Literal(Vec<u8>),
 }
 
 #[derive(Debug)]
 enum SieveStatus {
-    /// Success. The code and text are kept: `OK (WARNINGS)` on CHECKSCRIPT
-    /// carries the warnings the user must see.
+    /// Success. The code and text are kept: `OK (WARNINGS)` on CHECKSCRIPT,
+    /// PUTSCRIPT and SETACTIVE carries the warnings the user must see.
     Ok {
         code: Option<SieveResponseCode>,
         message: String,
@@ -1229,6 +1578,21 @@ enum SieveStatus {
         code: Option<SieveResponseCode>,
         message: String,
     },
+}
+
+impl SieveStatus {
+    /// The server's warning text on an `OK (WARNINGS)`, hierarchical
+    /// `WARNINGS/...` codes included; empty when it sent none. `None` for
+    /// any other answer: other `OK` text is informational.
+    fn advisory(&self) -> Option<String> {
+        match self {
+            Self::Ok {
+                code: Some(code),
+                message,
+            } if code.meaning() == SieveResponseCode::Warnings => Some(message.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// A ManageSieve response code (RFC 5804 1.3).
@@ -1396,21 +1760,12 @@ fn literal_len(line: &str) -> Option<usize> {
     inner.parse().ok()
 }
 
-fn parse_list_script(line: &str) -> Option<Result<ListedScript, Error>> {
-    let (name, offset) = match parse_quoted(line, 0) {
-        Some(parsed) => parsed,
-        None => {
-            return Some(Err(Error::Parse(format!(
-                "invalid LISTSCRIPTS line: {line}"
-            ))));
-        }
-    };
-    let is_active = line[offset..]
-        .split_whitespace()
-        .any(|token| token.eq_ignore_ascii_case("ACTIVE"));
-    Some(Ok(ListedScript { name, is_active }))
-}
-
+/// A quoted string at `start` (after optional whitespace), leniently: any
+/// escaped byte stands for itself. The bytes are collected and decoded as
+/// UTF-8 once, so a non-ASCII string survives; invalid UTF-8 is replaced
+/// rather than refused, since only human-readable status text and SASL
+/// base64 come through here. Data records use the strict lexer in
+/// `data_tokens`.
 fn parse_quoted(input: &str, start: usize) -> Option<(String, usize)> {
     let bytes = input.as_bytes();
     let mut index = start;
@@ -1421,18 +1776,17 @@ fn parse_quoted(input: &str, start: usize) -> Option<(String, usize)> {
         return None;
     }
     index += 1;
-    let mut out = String::new();
+    let mut out = Vec::new();
     while index < bytes.len() {
         match bytes[index] {
             b'\\' => {
                 index += 1;
-                let escaped = *bytes.get(index)?;
-                out.push(char::from(escaped));
+                out.push(*bytes.get(index)?);
                 index += 1;
             }
-            b'"' => return Some((out, index + 1)),
+            b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), index + 1)),
             byte => {
-                out.push(char::from(byte));
+                out.push(byte);
                 index += 1;
             }
         }
@@ -1770,7 +2124,7 @@ mod tests {
     use super::*;
 
     fn no_status(line: &str) -> (Option<SieveResponseCode>, String) {
-        match parse_status(&[StatusSegment::Text(line.to_owned())])
+        match parse_status(&[Segment::Text(line.to_owned())])
             .expect("status parses")
             .status
         {
@@ -1873,9 +2227,9 @@ mod tests {
     #[test]
     fn sasl_success_data_takes_exactly_one_string_argument() {
         let record = parse_status(&[
-            StatusSegment::Text("OK (SASL ".to_owned()),
-            StatusSegment::Literal(b"dj14".to_vec()),
-            StatusSegment::Text(") \"authenticated\"".to_owned()),
+            Segment::Text("OK (SASL ".to_owned()),
+            Segment::Literal(b"dj14".to_vec()),
+            Segment::Text(") \"authenticated\"".to_owned()),
         ])
         .unwrap();
         let SieveStatus::Ok { code, message } = &record.status else {
@@ -1887,7 +2241,7 @@ mod tests {
             Some(b"v=x".to_vec())
         );
         for line in ["OK (SASL)", "OK (SASL atom \"dj14\")"] {
-            let record = parse_status(&[StatusSegment::Text(line.to_owned())]).unwrap();
+            let record = parse_status(&[Segment::Text(line.to_owned())]).unwrap();
             let SieveStatus::Ok { code, .. } = &record.status else {
                 panic!("expected OK");
             };
@@ -1901,10 +2255,8 @@ mod tests {
     /// A quoted `)` inside a code argument does not close the code.
     #[test]
     fn a_quoted_paren_does_not_close_the_code() {
-        let record = parse_status(&[StatusSegment::Text(
-            r#"OK (TAG ")") "informational""#.to_owned(),
-        )])
-        .unwrap();
+        let record =
+            parse_status(&[Segment::Text(r#"OK (TAG ")") "informational""#.to_owned())]).unwrap();
         let SieveStatus::Ok { code, message } = record.status else {
             panic!("expected OK");
         };
@@ -2109,31 +2461,214 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_capabilities_extracts_starttls_and_sasl() {
-        let response = SieveResponse {
-            items: vec![
-                SieveResponseItem::Line("\"IMPLEMENTATION\" \"Example\"".to_string()),
-                SieveResponseItem::Line("\"SASL\" \"PLAIN XOAUTH2\"".to_string()),
-                SieveResponseItem::Line("\"STARTTLS\"".to_string()),
-            ],
-            status: SieveStatus::Ok {
-                code: None,
-                message: String::new(),
-            },
+    /// Feed `wire` to a reader with `limits` and return the whole response
+    /// plus whatever was left unread.
+    async fn read_records(
+        wire: &[u8],
+        limits: ResponseLimits,
+    ) -> (Result<SieveResponse, Error>, Vec<u8>) {
+        let (client, mut peer) = tokio::io::duplex(256 * 1024);
+        let mut stream = SieveStream {
+            transport: SieveTransport::Memory(client),
+            budget: bifrost_net::BandwidthBudget::default(),
+            sink: None,
         };
-        let caps = response.capabilities();
+        peer.write_all(wire).await.unwrap();
+        drop(peer);
+        let result = read_response_within(&mut stream, Duration::from_secs(5), limits).await;
+        let mut rest = Vec::new();
+        if let SieveTransport::Memory(client) = &mut stream.transport {
+            client.read_to_end(&mut rest).await.unwrap();
+        }
+        (result, rest)
+    }
+
+    async fn listed(wire: &[u8]) -> Result<Vec<(String, bool)>, Error> {
+        let (response, _) = read_records(wire, ResponseLimits::DEFAULT).await;
+        Ok(list_scripts_from(response?.records)?
+            .into_iter()
+            .map(|script| (script.name, script.is_active))
+            .collect())
+    }
+
+    #[tokio::test]
+    async fn capabilities_read_quoted_and_literal_values() {
+        let (response, rest) = read_records(
+            b"\"IMPLEMENTATION\" \"Example\"\r\n\"SASL\" {13}\r\nPLAIN XOAUTH2\r\n{8}\r\nSTARTTLS\r\nOK\r\nNEXT\r\n",
+            ResponseLimits::DEFAULT,
+        )
+        .await;
+        let caps = response.unwrap().capabilities().unwrap();
         assert!(caps.starttls);
         assert_eq!(caps.sasl, vec!["PLAIN".to_string(), "XOAUTH2".to_string()]);
+        assert_eq!(rest, b"NEXT\r\n");
+    }
+
+    /// A literal script name and the ` ACTIVE` continuing its record are one
+    /// entry, and literal octets that look like a status are data.
+    #[tokio::test]
+    async fn listscripts_reads_literal_names_as_records() {
+        let scripts = listed(
+            b"\"plain\"\r\n{4}\r\nmain ACTIVE\r\n{2}\r\nOK\r\n\"caf\xc3\xa9 \\\"q\\\"\"\r\nOK\r\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scripts,
+            vec![
+                ("plain".to_owned(), false),
+                ("main".to_owned(), true),
+                ("OK".to_owned(), false),
+                ("caf\u{e9} \"q\"".to_owned(), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn listscripts_refuses_malformed_entries() {
+        for wire in [
+            b"\"main\"ACTIVE\r\nOK\r\n".as_slice(),
+            b"\"main\"  ACTIVE\r\nOK\r\n",
+            b"\"\"\r\nOK\r\n",
+            b"\"a\" ACTIVE\r\n\"b\" ACTIVE\r\nOK\r\n",
+            b"\"a\\n\"\r\nOK\r\n",
+            b"\"a\" ACTIVE extra\r\nOK\r\n",
+            b"main\r\nOK\r\n",
+        ] {
+            assert!(
+                matches!(listed(wire).await, Err(Error::Parse(_))),
+                "{:?}",
+                String::from_utf8_lossy(wire)
+            );
+        }
+    }
+
+    /// A data line ending in `}` is a literal or a refusal: never text, and
+    /// never a count the client allocates unchecked.
+    #[tokio::test]
+    async fn data_literal_markers_are_strict() {
+        for wire in [
+            b"{4+}\r\nmain\r\nOK\r\n".as_slice(),
+            b"{}\r\nOK\r\n",
+            b"{04}\r\nmain\r\nOK\r\n",
+            b"{99999999999}\r\nOK\r\n",
+            b"\"a\"{4}\r\nmain\r\nOK\r\n",
+        ] {
+            let (response, _) = read_records(wire, ResponseLimits::DEFAULT).await;
+            assert!(
+                matches!(response, Err(Error::Parse(_))),
+                "{:?}",
+                String::from_utf8_lossy(wire)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn data_responses_are_bounded_before_reading() {
+        let limits = ResponseLimits {
+            record: 32,
+            response: 48,
+            records: 2,
+            literal: 32,
+        };
+        // A literal within its own bound that passes what its record has
+        // left: refused on the count, its octets unread.
+        let (response, rest) =
+            read_records(b"{30}\r\n012345678901234567890123456789\r\nNEXT", limits).await;
+        assert!(matches!(response, Err(Error::Parse(_))));
+        assert_eq!(rest, b"012345678901234567890123456789\r\nNEXT");
+        // Records within their own bound that together pass the response's:
+        // the second is refused before its line is read out.
+        let (response, rest) = read_records(
+            b"\"aaaaaaaaaaaaaaaaaaaa\"\r\n\"bbbbbbbbbbbbbbbbbbbbb\"\r\nOK\r\n",
+            limits,
+        )
+        .await;
+        assert!(response.is_err());
+        assert_eq!(rest, b"\nOK\r\n");
+        // More records than the command allows: refused at the first byte.
+        let (response, rest) = read_records(b"\"a\"\r\n\"b\"\r\n\"ccc\"\r\nOK\r\n", limits).await;
+        assert!(response.is_err());
+        assert_eq!(rest, b"ccc\"\r\nOK\r\n");
+        // A status line keeps its own bound even where a data record may
+        // be large.
+        let mut long_status = b"OK \"".to_vec();
+        long_status.extend(std::iter::repeat_n(b'a', 70 * 1024));
+        long_status.extend_from_slice(b"\"\r\n");
+        let (response, _) = read_records(&long_status, ResponseLimits::SCRIPT).await;
+        assert!(response.is_err());
+        // A status continuation gets only what the record has left, so it
+        // is refused before it is read out.
+        let mut continued = b"NO (FROB {65500}\r\n".to_vec();
+        continued.extend(std::iter::repeat_n(b'x', 65_500));
+        continued.extend_from_slice(b" \"");
+        continued.extend(std::iter::repeat_n(b'a', 1000));
+        continued.extend_from_slice(b"\")\r\nNEXT");
+        let (response, rest) = read_records(&continued, ResponseLimits::DEFAULT).await;
+        assert!(response.is_err());
+        assert!(
+            rest.ends_with(b"\")\r\nNEXT") && rest.len() > 900,
+            "{}",
+            rest.len()
+        );
+        let (response, _) = read_records(b"\"a\"\r\n\"b\"\r\nOK\r\n", limits).await;
+        assert_eq!(response.unwrap().records.len(), 2);
+        // A literal exactly at its own bound fits with its framing; one
+        // octet over is refused before it is read.
+        let tight = ResponseLimits {
+            record: 16,
+            response: 16,
+            records: 1,
+            literal: 8,
+        };
+        let (response, _) = read_records(b"{8}\r\n12345678\r\nOK\r\n", tight).await;
+        assert_eq!(response.unwrap().records.len(), 1);
+        let (response, rest) = read_records(b"{9}\r\n123456789\r\nOK\r\n", tight).await;
+        assert!(matches!(response, Err(Error::Parse(_))));
+        assert_eq!(rest, b"123456789\r\nOK\r\n");
+    }
+
+    #[tokio::test]
+    async fn getscript_takes_one_string_literal_or_quoted() {
+        let script = |wire: &'static [u8]| async move {
+            let (response, _) = read_records(wire, ResponseLimits::SCRIPT).await;
+            script_from(response?.records)
+        };
+        assert_eq!(script(b"{5}\r\nkeep;\r\nOK\r\n").await.unwrap(), "keep;");
+        assert_eq!(script(b"\"keep;\"\r\nOK\r\n").await.unwrap(), "keep;");
+        assert_eq!(script(b"{0}\r\n\r\nOK\r\n").await.unwrap(), "");
+        assert!(script(b"OK\r\n").await.is_err());
+        assert!(script(b"{1}\r\na\r\n{1}\r\nb\r\nOK\r\n").await.is_err());
+        assert!(script(b"{1}\r\na ACTIVE\r\nOK\r\n").await.is_err());
+        let oversized = format!("{{{}}}\r\n", SCRIPT_BODY_LIMIT + 1);
+        let (response, rest) = read_records(oversized.as_bytes(), ResponseLimits::SCRIPT).await;
+        assert!(matches!(response, Err(Error::Parse(_))));
+        assert!(rest.is_empty());
     }
 
     #[test]
-    fn parse_listscripts_line_reads_active_marker() {
-        let script = parse_list_script("\"main\" ACTIVE")
-            .expect("line parsed")
-            .expect("script parsed");
-        assert_eq!(script.name, "main");
-        assert!(script.is_active);
+    fn advisory_is_warnings_text_only() {
+        let ok = |code: Option<SieveResponseCode>, message: &str| SieveStatus::Ok {
+            code,
+            message: message.to_owned(),
+        };
+        assert_eq!(
+            ok(Some(SieveResponseCode::Warnings), "line 3: x").advisory(),
+            Some("line 3: x".to_owned())
+        );
+        assert_eq!(
+            ok(Some(SieveResponseCode::parse("WARNINGS/FROB")), "").advisory(),
+            Some(String::new())
+        );
+        assert_eq!(ok(None, "done").advisory(), None);
+        assert_eq!(
+            SieveStatus::No {
+                code: Some(SieveResponseCode::Warnings),
+                message: "x".to_owned()
+            }
+            .advisory(),
+            None
+        );
     }
 
     #[test]

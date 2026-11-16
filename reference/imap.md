@@ -1408,12 +1408,31 @@ loop alike) is read as a whole record by `read_status`: any string in it -
 the trailing message or a response-code argument - may be a literal (`{n}`
 CRLF, n octets), and the code ends at the `)` that balances its `(`, outside
 quoted strings, so nested extension data and quoted parens do not cut it
-short. One 64 KiB allowance covers the whole record, lines and literals
-together, and an oversized or unparseable literal count is `Error::Parse`;
+short. One 64 KiB allowance covers the whole record, lines (CRLF included)
+and literals together, each charged before it is read, and an oversized or unparseable literal count is `Error::Parse`;
 the per-operation client is dropped on any error, so nothing reads the
 stream past a refusal. A single-line record keeps two tolerances (an
 unbalanced `(` is message text, an unquoted message is trimmed raw text);
-once a literal has been read, malformed structure is refused. Certificate binding
+once a literal has been read, malformed structure is refused.
+Data responses (`CAPABILITY`, `LISTSCRIPTS`, `GETSCRIPT`) are read the same
+way: each record is framed whole - a line ending in a `{n}` marker pulls in
+n octets and the next line continues the record - before anything classifies
+it, so literal octets are never read as a line or a status, and a literal
+script name with its ` ACTIVE` is one entry. Data records get no tolerances:
+a data line ending in `}` is a literal marker (a 32-bit count without leading
+zeros, preceded by SP or opening the record; `{n+}` is client-only) or a
+refusal, tokens are separated by exactly one SP, quoted strings admit only the
+`\"` and `\\` escapes, and string bytes are decoded as UTF-8 once. Every bound
+is charged before the bytes it covers are read or allocated (a line's first
+byte picks its bound: a data record opens with a string, anything else gets
+the status line's bound, and a non-status line not opening with a string is
+refused): 64 KiB per record
+and per literal, 1 MiB and 10,000 records per response, and `GETSCRIPT`
+exactly one record whose script literal may reach 16 MiB (a policy bound,
+`SCRIPT_BODY_LIMIT`). A capability is a string with an optional string
+value; a `LISTSCRIPTS` entry is a non-empty name with an optional `ACTIVE`,
+at most one active per response; a `GETSCRIPT` answer is one string, literal
+or quoted, possibly empty. Certificate binding
 resolution preserves a present but unusable certificate as a hard error.
 
 
@@ -1794,7 +1813,9 @@ CHECKSCRIPT diagnostics are described below.
 
 Unrecognized hierarchical detail is read as its longest recognized ancestor (RFC 5804 1.3: `QUOTA/MAXFROB` is `QUOTA`, `QUOTA/MAXSIZE/X` is `QUOTA/MAXSIZE`), by whole slash-delimited segments of the code atom only; `native_code` still records the received spelling.
 
-CHECKSCRIPT is the one path where a `NO` is normally not an error: it IS the validation verdict, so it becomes `FilterValidation` diagnostics. `validation_outcome` keeps that reading only for a `NO` with no code, an advisory code (`WARNINGS`, `TAG`) or an unknown one. A `NO` whose (resolved) code names an operational condition - `TRYLATER`, any `QUOTA` form (RFC 5804 2.12 forbids CHECKSCRIPT from checking quota), authentication, `REFERRAL`, `NONEXISTENT`, `ALREADYEXISTS`, `ACTIVE` - and every `BYE` is an error classified by `classify_sieve`: the server did not judge the script, and reporting it as invalid would tell the user something false and discard the classification. `SieveResponseCode::is_verdict` is an exhaustive match, so a new code must be placed. An `OK` whose code resolves to `WARNINGS` is a valid script the server still has something to say about (RFC 5804 2.12); an enterprise user checking a rule expects to see those warnings rather than a clean result, so the text becomes one `Warning`-severity diagnostic (whole, not split per line, since server text is not a structured list; a generic text when the server sent none), which keeps `is_valid()` true. Any other `OK` text is informational and dropped. `PUTSCRIPT` / `SETACTIVE` warnings are not surfaced: their account operations return no diagnostics.
+CHECKSCRIPT is the one path where a `NO` is normally not an error: it IS the validation verdict, so it becomes `FilterValidation` diagnostics. `validation_outcome` keeps that reading only for a `NO` with no code, an advisory code (`WARNINGS`, `TAG`) or an unknown one. A `NO` whose (resolved) code names an operational condition - `TRYLATER`, any `QUOTA` form (RFC 5804 2.12 forbids CHECKSCRIPT from checking quota), authentication, `REFERRAL`, `NONEXISTENT`, `ALREADYEXISTS`, `ACTIVE` - and every `BYE` is an error classified by `classify_sieve`: the server did not judge the script, and reporting it as invalid would tell the user something false and discard the classification. `SieveResponseCode::is_verdict` is an exhaustive match, so a new code must be placed. An `OK` whose code resolves to `WARNINGS` is a valid script the server still has something to say about (RFC 5804 2.12); an enterprise user checking a rule expects to see those warnings rather than a clean result, so the text becomes one `Warning`-severity diagnostic (whole, not split per line, since server text is not a structured list; a generic text when the server sent none), which keeps `is_valid()` true. Any other `OK` text is informational and dropped.
+
+`filter_create` is `PUTSCRIPT`, then `SETACTIVE` when the script is active. Once `PUTSCRIPT` is answered `OK` the filter exists, so the answer is `Ok(Created)` whatever activation does: an enterprise Outlook user whose rule was saved expects "saved", never a failure that invites saving it again. A `SETACTIVE` answered `NO` (or refused locally) adds a `WarningKind::FilterActivationIncomplete` warning saying the server refused activation; a `BYE`, a lost or timed-out connection or an unreadable answer adds the same kind saying activation could not be confirmed. Neither claims the script is inactive (a replaced script may keep its earlier active status), and both attach the activation leg's classified `AccountError`, whose recovery advice concerns activation, not the save. An `OK (WARNINGS)` on `PUTSCRIPT` or `SETACTIVE` adds a `WarningKind::ServerAdvisory` warning: a user-safe local summary, with the server's text as user-safe `protocol_detail` when it sent any - the same compiler output `filter_validate` would have shown the same user about their own script. Warnings keep wire order. `filter_update` returns no success payload, so its `OK (WARNINGS)` text is still dropped, and a body stored before a failed `SETACTIVE` returns a bare error with no partial-commit record.
 
 A `Transport(_)` kind must never carry an `Acknowledged` attempt - `try_build` rejects the pair (`TransportAcknowledged`) and this boundary `.expect`s, so producing it panics. `into_account_error` demotes it to `InFlight` rather than dropping the cause, since dropping would leave `derive` on its `Unsent` default and blind-retry a non-idempotent operation. Nothing builds the pair today, but `Error::with_attempt` permits it on the transport variants and the driver stamps `Acknowledged` after a tagged response.
 

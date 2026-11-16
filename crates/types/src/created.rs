@@ -1,4 +1,4 @@
-//! The success of a single-request create.
+//! The success of a create the server acknowledged.
 
 use crate::{AccountError, DiagnosticText, Warning, WarningKind};
 

@@ -1,15 +1,16 @@
 //! Account filter-lane adapter for the sibling ManageSieve protocol.
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, FilterScript, FilterValidation, ScriptLanguage,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    AccountError, AccountFuture, AccountOperation, Created, DiagnosticText, FilterScript,
+    FilterValidation, ScriptLanguage, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, Warning, WarningKind,
 };
 
 use super::error::ImapErrorContext;
 use super::{ImapAccount, account_error_with};
 use crate::Error;
 pub use crate::sieve::ManageSieveConfig;
-use crate::sieve::{Error as SieveError, ManageSieveClient, validation_error};
+use crate::sieve::{Activation, Error as SieveError, ManageSieveClient, validation_error};
 
 pub(crate) fn filters_list(
     account: ImapAccount,
@@ -41,7 +42,7 @@ pub(crate) fn filters_list(
 pub(crate) fn filter_create(
     account: ImapAccount,
     filter: ServerFilterCreate,
-) -> AccountFuture<Result<bifrost_types::Created<ServerFilterId>, AccountError>> {
+) -> AccountFuture<Result<Created<ServerFilterId>, AccountError>> {
     Box::pin(async move {
         let ServerFilterCreate::Script(script) = filter else {
             return Err(shape_unsupported(&account, AccountOperation::FilterCreate));
@@ -59,18 +60,74 @@ pub(crate) fn filter_create(
             )
         })?;
         let mut client = open_client(&account, AccountOperation::FilterCreate).await?;
-        client
+        let advisory = client
             .put_script(&name, &script.body)
             .await
             .map_err(to_acct_err(AccountOperation::FilterCreate))?;
-        if script.is_active {
-            client
-                .set_active(Some(&name))
-                .await
-                .map_err(to_acct_err(AccountOperation::FilterCreate))?;
-        }
-        Ok(bifrost_types::Created::identified(ServerFilterId(name)))
+        let activation = if script.is_active {
+            Some(client.set_active(Some(&name)).await)
+        } else {
+            None
+        };
+        Ok(created_after_save(name, advisory, activation))
     })
+}
+
+/// The answer to a create whose PUTSCRIPT the server accepted.
+///
+/// From the save on the filter exists, so the answer is `Created` whatever
+/// activation does: an Outlook user whose rule was saved expects "saved",
+/// never a failure that invites saving it again. What did not go to plan
+/// rides along as warnings, in the order it happened.
+fn created_after_save(
+    name: String,
+    advisory: Option<String>,
+    activation: Option<Activation>,
+) -> Created<ServerFilterId> {
+    let mut created = Created::identified(ServerFilterId(name));
+    if let Some(text) = advisory {
+        created = created.with_warning(advisory_warning(text));
+    }
+    match activation {
+        None | Some(Activation::Done { advisory: None }) => created,
+        Some(Activation::Done {
+            advisory: Some(text),
+        }) => created.with_warning(advisory_warning(text)),
+        Some(Activation::Refused(error)) => created.with_warning(activation_warning(
+            "The filter was saved, but the server refused to make it the active filter",
+            error,
+        )),
+        Some(Activation::Unconfirmed(error)) => created.with_warning(activation_warning(
+            "The filter was saved, but whether it is now the active filter could not be \
+             confirmed",
+            error,
+        )),
+    }
+}
+
+/// A server's `OK (WARNINGS)` on a save. The user saving a rule expects to
+/// read the same warnings `filter_validate` would have shown, so the
+/// server's text is user-safe: it is compiler output about the user's own
+/// script, shown to that user.
+fn advisory_warning(text: String) -> Warning {
+    let warning = Warning::user_safe(
+        WarningKind::ServerAdvisory,
+        "The filter was saved, and the server reported warnings about it",
+    );
+    if text.trim().is_empty() {
+        warning
+    } else {
+        warning.with_protocol_detail(DiagnosticText::user_safe(text))
+    }
+}
+
+/// An activation that did not complete after the save did. No claim about
+/// the resulting active state is made: a replaced script may have kept its
+/// earlier status. The activation leg's error is attached; its recovery
+/// advice concerns activation, never the save.
+fn activation_warning(message: &str, error: SieveError) -> Warning {
+    Warning::user_safe(WarningKind::FilterActivationIncomplete, message)
+        .with_error(to_acct_err(AccountOperation::FilterCreate)(error))
 }
 
 pub(crate) fn filter_update(
@@ -88,6 +145,8 @@ pub(crate) fn filter_update(
                 "IMAP ManageSieve script names are filter ids and cannot be patched",
             ));
         }
+        // `filter_update` returns no success payload, so a server's
+        // `OK (WARNINGS)` on either leg has no channel here and is dropped.
         let mut client = open_client(&account, AccountOperation::FilterUpdate).await?;
         if let Some(body) = patch.body {
             client
@@ -100,6 +159,7 @@ pub(crate) fn filter_update(
             client
                 .set_active(active)
                 .await
+                .into_result()
                 .map_err(to_acct_err(AccountOperation::FilterUpdate))?;
         }
         Ok(())
@@ -184,4 +244,88 @@ fn invalid(op: AccountOperation, detail: impl Into<String>) -> AccountError {
         Error::LocalRefusal(crate::error::LocalRefusal::InvalidInput(detail.into())),
         ImapErrorContext::sieve(op),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sieve::SieveResponseCode;
+
+    fn kinds(created: &Created<ServerFilterId>) -> Vec<WarningKind> {
+        created
+            .warnings()
+            .iter()
+            .map(|warning| warning.kind.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_saved_filter_is_created_whatever_activation_does() {
+        let refused = SieveError::Sieve {
+            code: Some(SieveResponseCode::TryLater),
+            message: "busy".into(),
+        };
+        for (activation, expected) in [
+            (None, vec![]),
+            (Some(Activation::Done { advisory: None }), vec![]),
+            (
+                Some(Activation::Refused(refused)),
+                vec![WarningKind::FilterActivationIncomplete],
+            ),
+            (
+                Some(Activation::Unconfirmed(SieveError::Timeout)),
+                vec![WarningKind::FilterActivationIncomplete],
+            ),
+        ] {
+            let created = created_after_save("main".into(), None, activation);
+            assert_eq!(created.id().map(|id| id.0.as_str()), Some("main"));
+            assert_eq!(kinds(&created), expected);
+            for warning in created.warnings() {
+                let error = warning.error.as_ref().expect("activation error attached");
+                assert_eq!(error.operation(), Some(AccountOperation::FilterCreate));
+            }
+        }
+    }
+
+    #[test]
+    fn refused_and_unconfirmed_activation_say_different_things() {
+        let message = |activation| {
+            created_after_save("main".into(), None, Some(activation)).warnings()[0]
+                .message
+                .as_str()
+                .to_owned()
+        };
+        let refused = message(Activation::Refused(SieveError::Sieve {
+            code: None,
+            message: "no".into(),
+        }));
+        let unconfirmed = message(Activation::Unconfirmed(SieveError::Timeout));
+        assert!(refused.contains("refused"), "{refused}");
+        assert!(
+            unconfirmed.contains("could not be confirmed"),
+            "{unconfirmed}"
+        );
+    }
+
+    #[test]
+    fn server_warnings_on_save_and_activation_reach_the_user_in_order() {
+        let created = created_after_save(
+            "main".into(),
+            Some("line 2: deprecated".into()),
+            Some(Activation::Done {
+                advisory: Some(String::new()),
+            }),
+        );
+        assert_eq!(
+            kinds(&created),
+            vec![WarningKind::ServerAdvisory, WarningKind::ServerAdvisory]
+        );
+        let detail = created.warnings()[0]
+            .protocol_detail
+            .as_ref()
+            .expect("server text kept");
+        assert_eq!(detail.as_str(), "line 2: deprecated");
+        assert_eq!(detail.visibility, bifrost_types::DetailVisibility::UserSafe);
+        assert!(created.warnings()[1].protocol_detail.is_none());
+    }
 }

@@ -312,23 +312,26 @@ face.
   role. Whether a draft save that never yields an id is worth advertising is a
   product decision. The APPEND path also does not consult `UIDNOTSTICKY`
   (same RFC 4315 condition as BUG-048).
-- **IMAP ManageSieve filter_create is two requests with no record.**
-  `sieve.rs` `filter_create` runs `put_script` then `set_active`; a
-  `set_active` failure after a committed `put_script` returns a bare error for
-  a script that exists. `Created::with_warning` could report it as created
-  but not activated.
-- **ManageSieve data responses are read line by line, not as records.**
-  `read_response` (`crates/imap/src/sieve.rs`) pushes a data literal as an
-  item and the rest of its line (the CRLF, or ` ACTIVE` after a literal
-  LISTSCRIPTS name) as a separate `Line`, so `list_scripts` fails with
-  "invalid LISTSCRIPTS line" on a literal script name, and a GETSCRIPT literal
-  is allocated at the server's count with no cap. Status lines are already
-  read as whole records (`read_status`); data responses need the same.
-- **ManageSieve PUTSCRIPT / SETACTIVE `OK (WARNINGS)` text is discarded.**
-  `SieveStatus::Ok` now keeps the code and text, but `ensure_ok` drops them
-  and `filter_create` / `filter_update` have no channel for warnings
-  (`Created::with_warning` exists for create). Product question whether a
-  saved-with-warnings script should say so.
+- **filter_update has no channel for server warnings.** IMAP ManageSieve
+  `filter_create` now surfaces `OK (WARNINGS)` from PUTSCRIPT and SETACTIVE as
+  `WarningKind::ServerAdvisory` on `Created`, but `Account::filter_update`
+  returns `()` on every provider, so the same warnings on an edit are dropped
+  (`crates/imap/src/account/sieve.rs`). The yardstick answer is the same as
+  for create (an Outlook user editing a rule expects to see them); it needs a
+  return-type change across every provider's filter door.
+- **IMAP ManageSieve filter_update records nothing when SETACTIVE fails
+  after a stored body.** A patch with both body and `is_active` runs
+  PUTSCRIPT then SETACTIVE; a SETACTIVE failure returns a bare error although
+  the new body is stored. Unlike the warnings above, this needs no new
+  channel: the existing `Err` can carry a partial-commit record (committed
+  `Updated` step). `sieve::Activation` already tells refused from
+  unconfirmed.
+- **IMAP ManageSieve filter_create silently replaces a script of the same
+  name.** The caller-supplied name is the id and PUTSCRIPT replaces by name
+  (RFC 5804 2.6), so creating "main" over an existing "main" overwrites the
+  user's script and reports `Created`. No ALREADYEXISTS check or
+  list-before-put exists. Product question: an Outlook user creating a rule
+  with a taken name would expect a refusal, not a silent replacement.
 - **IMAP container operations return a refresh_folders failure after the
   write commits.** The partial-commit record makes this honest; whether to
   return success with a stale registry is a separate API decision.
