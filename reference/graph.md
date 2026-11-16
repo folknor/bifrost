@@ -863,9 +863,13 @@ features to use Exchange credentials without disclosing a Graph token there.
 ### Which URLs may carry the bearer (`origin.rs`)
 
 Graph supplies each credential leg's base to net's `TrustedOrigins`, which
-mints the `AdmittedUrl` proof wrapped by `origin.rs`. Account-wide origin
-restrictions are optional because a composed handle is not the credential
-authority for every leg; Graph still gates every target independently.
+mints the `AdmittedUrl` proof wrapped by `origin.rs`. The account attachment
+also sets `AccountSpec::trusted_origins` to the api-base origin, and REST sends
+the proof through `AccountNet::admitted_request`, so the transport refuses the
+account bearer anywhere else. That does not replace the per-target gate:
+Outlook credentials are selected by a `HopPolicy`, which the account set does
+not cover, and a handle injected through `with_account_net` keeps whatever
+restriction its owner gave it.
 Each configured base (the api-base, the Outlook origin) is parsed into
 a `Base` at construction: http or https, a host, and no userinfo, or it is
 stored as unusable and every request on that surface fails closed before any

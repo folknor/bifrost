@@ -359,6 +359,18 @@ impl GraphClient {
         if let Some(net) = self.inner.net.as_ref() {
             let token_source = Arc::clone(&self.inner.token_source);
             let mut spec = AccountSpec::new(Some(token_source));
+            // The account bearer goes only to the Graph api base: Outlook,
+            // EWS and Autodiscover select their own credential through a
+            // HopPolicy, and upload sessions suppress the bearer. The
+            // transport enforces that set too, so a funnel that skipped
+            // `Base::admit` still could not carry the bearer elsewhere. An
+            // unusable base trusts nothing. An injected handle
+            // (`with_account_net`) keeps the restriction its owner gave it.
+            let mut origins = bifrost_net::TrustedOrigins::default();
+            if let Some(base) = self.inner.cloud.graph.url() {
+                let _unusable_base_trusts_nothing = origins.trust(base.as_str());
+            }
+            spec.trusted_origins = Some(origins);
             spec.hosts = vec![
                 RateLimit::new(self.inner.rate_limit_host.clone(), 10.0, 1, 10).with_quota_scope(
                     bifrost_net::QuotaScope::namespaced("graph.quota", &[&account_id.0]),
@@ -1061,9 +1073,9 @@ impl GraphClient {
     /// above funnels through here, raw MIME included, so the scripted seam
     /// covers the whole surface and no path can quietly bypass it.
     ///
-    /// The URL must be an `AdmittedUrl`: bifrost-net attaches the
-    /// bearer to the first request whatever its host, so the origin decision
-    /// has to be made before this point, and the type proves it was.
+    /// The URL must be an `AdmittedUrl`: the origin decision is made before
+    /// this point, and the type proves it was. The attached `AccountNet`
+    /// re-checks the same Graph origin before attaching the bearer.
     #[allow(clippy::too_many_arguments)]
     async fn execute_wire(
         &self,
@@ -1079,14 +1091,13 @@ impl GraphClient {
             prefer,
             eventual_consistency,
         } = options;
-        let url = url.as_str();
         // Records the request in this crate's richer shape and does not
         // answer it: the response comes back from the scripted transport
         // below, through the production retry loop.
         #[cfg(test)]
         self.record_wire(
             method.as_str(),
-            url,
+            url.as_str(),
             if_match.map(GraphETag::as_str),
             prefer,
             body.as_ref(),
@@ -1097,7 +1108,7 @@ impl GraphClient {
         // knows the request and its payload, and declares its replay policy
         // (applied below). Batch POSTs, conditional PATCHes and absolute
         // updates all pass through here, so no verb-level default would do.
-        let mut builder = account_net.request(method, url);
+        let mut builder = account_net.admitted_request(method, url.as_net());
 
         for (limit, weight) in self.claims(&resource, &account_net) {
             builder = builder.concurrency_claim(limit, weight);

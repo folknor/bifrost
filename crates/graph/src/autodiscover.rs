@@ -457,8 +457,7 @@ impl GraphClient {
     /// redirect or refusal.
     ///
     /// A `RedirectUrl` endpoint must sit on the configured Outlook origin.
-    /// The request carries the account bearer, which bifrost-net attaches
-    /// whatever the host, and that token was issued for the configured
+    /// The request carries the Outlook bearer, and that token was issued for the configured
     /// resource: following a cross-origin endpoint with it could only hand
     /// it to another host. A hybrid tenant whose Autodiscover points at
     /// another origin needs trust this client does not establish, so that

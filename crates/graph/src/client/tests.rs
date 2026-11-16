@@ -895,6 +895,47 @@ fn attach_account_uses_engine_account_id() {
     );
 }
 
+/// The attachment restricts the account bearer to the Graph origin in the
+/// transport too, so a request that skipped `Base::admit` cannot carry it
+/// to another host.
+#[tokio::test]
+async fn attached_account_bearer_reaches_only_the_graph_origin() {
+    let wire =
+        bifrost_net::test_support::ScriptedDispatch::new([bifrost_net::test_support::canned(
+            reqwest::StatusCode::OK,
+            b"{}",
+        )]);
+    let mut client = GraphClient::with_api_base("https://graph.test/v1.0", "token");
+    Arc::get_mut(&mut client.inner)
+        .expect("new client is exclusive")
+        .net = Some(bifrost_net::test_support::scripted_net(
+        &wire,
+        bifrost_net::NetConfig::default(),
+    ));
+    client.attach_account(AccountId("graph-origins".to_string()));
+    let account_net = client.account_net().expect("account net attached");
+
+    let refused = account_net
+        .get("https://elsewhere.test/v1.0/me")
+        .send()
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(bifrost_net::Error::InvalidRequest { field: "url", .. })
+        ),
+        "an off-origin bearer request is refused before sending"
+    );
+    assert!(wire.requests().is_empty());
+
+    account_net
+        .get("https://graph.test/v1.0/me")
+        .send()
+        .await
+        .expect("the Graph origin carries the bearer");
+    assert_eq!(wire.requests().len(), 1);
+}
+
 fn opened_shape_account(client: &GraphClient) -> crate::account::GraphAccount {
     crate::account::GraphAccount::new_for_tests(
         client.clone(),

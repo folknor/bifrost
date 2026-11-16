@@ -1888,17 +1888,29 @@ fragment or credential text.
 `AccountSpec::trusted_origins` optionally restricts automatic account bearer
 injection and caller-supplied Authorization headers. A configured empty set refuses all destinations. The shared request
 loop checks it on every authenticated hop before token lookup, including after
-retagging. `None` retains protocol-owned admission for existing consumers.
+retagging. Graph's attachment sets it to the Graph api origin and Google's to
+the origins of its four configured bases (Gmail, People, Calendar, Drive);
+Graph REST sends its proof through `admitted_request`. `None` leaves admission
+to the protocol: DAV carries no account bearer at all (`DavHopPolicy` mints
+every credential after its own admission), and JMAP keeps it as described
+below. A handle the consumer injects keeps whatever restriction it was given.
 `HopPolicy` remains the admission authority for credentials it selects, including
 DAV credentials and Graph's separate Outlook audience. Its admission occurs
 before lookup; account-wide restrictions do not replace that leg's policy.
 
-Making every request constructor require a proof is not implemented: JMAP's
-initial discovery and authenticated session endpoints have independent origins,
-and existing composed handles do not carry a complete per-leg origin policy.
-Redirect trust cannot supply that missing authority. Enterprise users must retain
-working discovered endpoint authentication. Protocols opt into account-wide
-restrictions only when their full credential destination set is known.
+Making every request constructor require a proof is not implemented, and a
+bare `AdmittedUrl` would not be the right proof: anyone can build a
+`TrustedOrigins`, so the proof shows membership in some policy, not authority
+over this account's credential. The account set on the handle is the check
+that binds. JMAP is the protocol without one: its credential authority is the
+authenticated session document, whose `apiUrl`, upload, download, event-source
+and WebSocket URLs may sit on independent origins and are URL templates whose
+variables may fall in the host. A set filled once per session cannot express
+that, and one widened on every fetch would keep origins of superseded sessions.
+Redirect trust cannot supply the authority either. Enterprise users must retain
+working session endpoint authentication, so JMAP keeps protocol-owned admission
+until a session-scoped, template-aware set is designed. Protocols opt into
+account-wide restrictions when their full credential destination set is known.
 
 `TokenSnapshot::contention_account_error(protocol, operation)` classifies only
 `Contended` as transient authentication unavailability, without a transport cause

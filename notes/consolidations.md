@@ -26,23 +26,21 @@ this file's.
 
 **Reported by:** graph.
 
-Partly landed in wave 15: `crates/net/src/url.rs` has `TrustedOrigins` and a
-net-minted `AdmittedUrl`, Graph and DAV admit through them, and an optional
-`AccountSpec::trusted_origins` is checked before automatic bearer lookup.
-Residue: an `AccountSpec` without `trusted_origins` still relies on each
-protocol's own admission, because composed handles and JMAP session endpoints
-have no complete account-wide authority set yet, so bearer-carrying requests
-are not required to take an `AdmittedUrl`. The original account:
+Graph and Google now set `AccountSpec::trusted_origins` at attach (Graph api
+origin; the four Google bases), DAV carries no account bearer, so JMAP is the
+only bearer-carrying protocol whose account handle is unrestricted
+(`crates/jmap/src/transport_reqwest.rs`, `AccountSpec` construction). Its
+authority is the authenticated session document: `apiUrl`, upload, download,
+event-source and WebSocket URLs on possibly independent origins, as templates
+whose variables may fall in the host (`client.rs` accepts that). A set fixed at
+attach cannot describe it, and one widened per session fetch keeps origins of
+superseded sessions. Open question: a session-scoped, template-aware
+admission (replaced, not widened, on each session fetch; WebSocket door
+included) owned by net or by JMAP. Not a live leak: every JMAP URL comes from
+configuration or the session.
 
-net attaches the bearer to the first request whatever its host (stated in Graph's
-`origin.rs` module doc) and leaves admission to each crate: Graph (`origin.rs`)
-uses an exact-origin `AdmittedUrl` type and refuses everything off the base;
-dav-core (`DavDispatch::admit_discovered_urls` / `is_trusted_url`) uses a string
-allowlist consulted per request, admits a cross-origin HTTPS discovered home, and
-`resolve_url` decides "absolute" by the case-sensitive literal prefixes `http://`
-and `https://`; JMAP relies on the redirect policy's `same_origin()`. The
-transport attaches the credential, so it should own admission: `AccountSpec`
-carries trusted origins, bearer-carrying requests take an `AdmittedUrl` minted by
-net, and each crate contributes only its policy for widening the set (DAV's
-discovered homes, Graph's upload sessions). Related: BUG-075.
+Refused, with reasons in `reference/net.md` "Credential destination
+admission": requiring a bare `AdmittedUrl` on every bearer door. Anyone can
+build a `TrustedOrigins`, so the proof shows membership in some policy, not
+authority over this account's credential; the account set is what binds.
 

@@ -2149,6 +2149,13 @@ Provider URL admission remains local; the shared credential wrapper does not
 admit an origin. Users expect upload credentials and payloads to stay on the
 admitted destination. The shared resumable driver still owns chunk sequencing.
 
+The account bearer itself is restricted in the transport: `for_account` sets
+`AccountSpec::trusted_origins` to the origins of the four configured bases
+(Gmail, People, Calendar, Drive), so an account-bearer request to any other
+origin is refused before sending. Base overrides are applied before
+`for_account`, which is why the set is complete; a test client built over an
+injected `AccountNet` keeps that handle's own restriction.
+
 Mutation termination uses `ItemOutcome::from_submission_error` for dispatched
 ids without earlier acknowledged bodies. The per-id progress ledger still reports
 earlier accepted bodies as uncertain and leaves unattempted ids for re-issue;

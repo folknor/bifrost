@@ -829,8 +829,17 @@ fn default_account_net(
     })
     .collect();
 
+    // Every bearer request is built on one of the four configured bases, so
+    // the transport refuses the account bearer anywhere else. Drive upload
+    // session URLs suppress the bearer and keep their own admission. A base
+    // that does not parse trusts nothing; its requests fail before sending.
+    let mut origins = bifrost_net::TrustedOrigins::default();
+    for base in [gmail_base, people_base, calendar_base, drive_base] {
+        let _unusable_base_trusts_nothing = origins.trust(base);
+    }
     let mut spec = AccountSpec::new(Some(token_source));
     spec.hosts = hosts;
+    spec.trusted_origins = Some(origins);
     net.attach_account(account, spec)
 }
 
@@ -1232,5 +1241,44 @@ mod injected_net_tests {
         )
         .for_account(AccountId("google-injected-net".into()));
         assert!(client.account_net().shares_transport_with(&witness));
+    }
+
+    #[tokio::test]
+    async fn the_account_bearer_reaches_only_the_configured_bases() {
+        let wire =
+            bifrost_net::test_support::ScriptedDispatch::new([bifrost_net::test_support::canned(
+                reqwest::StatusCode::OK,
+                b"{}",
+            )]);
+        let net = bifrost_net::test_support::scripted_net(&wire, bifrost_net::NetConfig::default());
+        let client = GmailApi::with_api_base_source_and_net(
+            "https://gmail.test/gmail/v1",
+            Arc::new(StaticTokenSource::new("token", None)),
+            net,
+        )
+        .with_people_base("https://people.test/v1")
+        .for_account(AccountId("google-origins".into()));
+
+        let refused = client
+            .account_net()
+            .get("https://elsewhere.test/gmail/v1/profile")
+            .send()
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(bifrost_net::Error::InvalidRequest { field: "url", .. })
+            ),
+            "an unconfigured origin is refused before sending"
+        );
+        assert!(wire.requests().is_empty());
+
+        client
+            .account_net()
+            .get("https://people.test/v1/people/me")
+            .send()
+            .await
+            .expect("a configured base carries the bearer");
+        assert_eq!(wire.requests().len(), 1);
     }
 }

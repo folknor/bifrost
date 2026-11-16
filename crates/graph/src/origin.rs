@@ -2,8 +2,10 @@
 //!
 //! Net owns exact-origin admission and mints the URL proof used here. Graph
 //! supplies the configured base; upload sessions retain their separate policy.
-//! AccountNet's unrestricted default still requires this per-leg gate: a
-//! composed handle's account bearer authority cannot replace Outlook admission.
+//! The Graph attachment also restricts its account bearer to the Graph origin
+//! in net, but that does not replace this gate: Outlook credentials are chosen
+//! by a HopPolicy, which the account restriction does not cover, and an
+//! injected `AccountNet` carries whatever restriction its owner gave it.
 //!
 //! The rule is exact origin equality with the configured base (scheme, host
 //! and port, default ports normalized by the URL parser), with no userinfo in
@@ -85,6 +87,11 @@ impl AdmittedUrl {
     /// and the URL `reqwest` sends are the same.
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// The net-minted proof, for `AccountNet::admitted_request`.
+    pub(crate) fn as_net(&self) -> &bifrost_net::AdmittedUrl {
+        &self.0
     }
 }
 
