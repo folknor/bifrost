@@ -836,6 +836,8 @@ pub struct InvalidationHint {
 /// Which push transport originated the wake-up.
 /// This records delivery provenance, including synthetic coalescing, rather
 /// than the account's primary protocol or the protocol of a stored cursor.
+/// It is deliberately not folded into `Protocol`: `Coalesced` has no
+/// protocol, and one protocol can be delivered by several mechanisms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PushSource {

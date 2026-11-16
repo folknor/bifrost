@@ -14,16 +14,25 @@ The identity vocabularies describe different domains. `ProtocolKind` is the
 set of protocols that mint opaque change cursors; `Protocol` also names
 submission and auxiliary APIs and has `Unknown` for unavailable identity.
 `From<ProtocolKind> for Protocol` owns their exhaustive conversion here.
-Engine-local `bifrost_sync::mutation::ProtocolSalt::from(ProtocolKind)` owns
-default mutation bookkeeping salts exhaustively in `bifrost-sync`. The key and
-salt do not cross the Account boundary; custom salt payloads remain available
-in the engine's `MutationCounters::cohort_keys`.
+Engine-local `bifrost_sync::mutation::ProtocolSalt` is the campaign's
+`ProtocolKind` plus a consumer payload, not a parallel per-protocol enum, so
+no mapping from the non-exhaustive `ProtocolKind` (and no catch-all salt)
+exists. The key and salt do not cross the Account boundary; custom salt
+payloads remain available in the engine's `MutationCounters::cohort_keys`.
 
 `Provider` names a vendor or vendor API, including the expression language of
 `FilterCondition::ProviderExpression`. A vendor expression is not cursor
 provenance. `PushSource` identifies a delivery mechanism, including synthetic
 coalescing. DAV's private `DavProtocol` selects a closed dialect policy and its
 resource kinds; its exhaustive conversion belongs beside that policy.
+
+None of these folds into another. `ProtocolKind` is not `Protocol` restated:
+it is the closed set an opaque cursor may name, with persisted cursor tags, so
+widening it to `Protocol` would admit SMTP, EWS or `Unknown` as cursor
+provenance. `PushSource` is not `Protocol` restated: `Coalesced` has no
+protocol, and one protocol can be delivered by more than one mechanism, so its
+current one-to-one alignment with protocols is coincidental. `Protocol`
+(wire leg) and `Provider` (operator) answer different questions.
 
 `Account::protocol()` is required and names the primary account protocol for
 inherited refusals. Implementors can explicitly return `Unknown` when no
@@ -708,15 +717,6 @@ Google Calendar enforces the caller ETag on its attendee PATCH. CalDAV RSVP
 sends a scheduling reply before a local resource PUT, so it cannot promise
 one atomic caller precondition for the whole operation and refuses tokens.
 
-## Partial write effects
-
-`error/partial.rs` exports PartialCommit, PartialCommitBuilder, PrimaryLeg,
-Step, StepOutcome, Compensation, CompensationOutcome, StepId, StepEffect,
-StepReplay, Application, StepTargets, TargetRef, TargetRole, OperationPlan,
-Prerequisites, PlannedDirective and ReplaySafety, plus the export shapes
-PartialCommitTelemetry, PartialCommitExport, StepExport and CompensationExport,
-from the error module and crate root.
-AccountError exposes the record, failed-leg recovery and per-leg throttle
 ## Acknowledged creates
 
 `created.rs` exports `Created<T>`, the success of the five create doors
@@ -729,6 +729,15 @@ saying why; `with_warning` adds advisory warnings to an identified create for
 an ancillary leg that degraded. Provider boundaries validate the native id
 (absent or empty means unidentified) before wrapping or joining it.
 
+## Partial write effects
+
+`error/partial.rs` exports PartialCommit, PartialCommitBuilder, PrimaryLeg,
+Step, StepOutcome, Compensation, CompensationOutcome, StepId, StepEffect,
+StepReplay, Application, StepTargets, TargetRef, TargetRole, OperationPlan,
+Prerequisites, PlannedDirective and ReplaySafety, plus the export shapes
+PartialCommitTelemetry, PartialCommitExport, StepExport and CompensationExport,
+from the error module and crate root.
+AccountError exposes the record, failed-leg recovery and per-leg throttle
 observations. The builder validates application and compensation evidence before
 freezing the derived operation plan. Telemetry and support tiers export the
 record at their respective consent levels; see `reference/error-model.md`.

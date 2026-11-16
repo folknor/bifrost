@@ -705,9 +705,10 @@ fn response_to_account_error(
 }
 
 /// Classification rules. All decisions are made on `GraphSignal` plus
-/// HTTP status; no path inspects the `error.message` string. The
-/// match is exhaustive over `GraphSignal` so adding a wire-enum
-/// variant fails to compile here.
+/// HTTP status; no path inspects the `error.message` string. Every
+/// named `GraphSignal` variant is listed, but the enum is non-exhaustive
+/// in another crate, so a new variant still compiles and takes the
+/// status-based fallback until it is dispatched here.
 fn classify(
     ctx: &GraphErrorContext,
     code: u16,

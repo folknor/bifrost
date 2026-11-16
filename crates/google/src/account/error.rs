@@ -859,34 +859,30 @@ fn classify_response(
         {
             return PrimaryCause::Server(ServerCause::Unavailable { retry_hint });
         }
-        GmailSignal::Unknown { code } => {
-            // Specific stable Google reasons mapped explicitly per
-            // the Gmail plan; these intentionally use Unknown { code }
-            // and rely on `native_code` for downstream filters.
-            match code.as_str() {
-                "invalidArgument" | "INVALID_ARGUMENT" => {
-                    return malformed_cause(format!("HTTP {status} invalidArgument"));
-                }
-                "insufficientPermissions" | "ACCESS_TOKEN_SCOPE_INSUFFICIENT" => {
-                    return PrimaryCause::Access(AccessCause::InsufficientScope {
-                        needed: scope_for(ctx),
-                    });
-                }
-                "domainPolicy" => {
-                    return PrimaryCause::Access(AccessCause::PolicyBlocked);
-                }
-                "conditionNotMet" => {
-                    return PrimaryCause::State(StateCause::ConcurrencyConflict);
-                }
-                "notAuthorizedToAccessThisResource" => {
-                    return PrimaryCause::Access(AccessCause::PermissionDenied {
-                        resource: ctx.resource.and_then(GmailResource::to_resource_kind),
-                    });
-                }
-                _ => {}
-            }
-            // Fall through to HTTP status mapping.
+        GmailSignal::InvalidArgument => {
+            return malformed_cause(format!("HTTP {status} invalidArgument"));
         }
+        GmailSignal::InsufficientPermissions => {
+            return PrimaryCause::Access(AccessCause::InsufficientScope {
+                needed: scope_for(ctx),
+            });
+        }
+        GmailSignal::DomainPolicy => {
+            return PrimaryCause::Access(AccessCause::PolicyBlocked);
+        }
+        GmailSignal::ConditionNotMet => {
+            return PrimaryCause::State(StateCause::ConcurrencyConflict);
+        }
+        GmailSignal::NotAuthorizedToAccessThisResource => {
+            return PrimaryCause::Access(AccessCause::PermissionDenied {
+                resource: ctx.resource.and_then(GmailResource::to_resource_kind),
+            });
+        }
+        // An unrecognized reason classifies on the HTTP status; unknown
+        // vocabulary is never string-matched.
+        GmailSignal::Unknown { .. } => {}
+        // GmailSignal is non-exhaustive in another crate, so a variant added
+        // there compiles here and takes the status fallback until dispatched.
         _ => {}
     }
 
@@ -1268,27 +1264,12 @@ fn internal(
         .expect("valid account error classification")
 }
 
+/// Decode a Google reason (or `google.rpc` status spelling) through the
+/// shared vocabulary's own table; anything it does not name stays `Unknown`.
 fn map_reason_to_signal(reason: &str) -> GmailSignal {
-    match reason {
-        "invalidQuery" => GmailSignal::InvalidQuery,
-        "failedPrecondition" => GmailSignal::FailedPrecondition,
-        "invalidCredentials" => GmailSignal::InvalidCredentials,
-        "authError" => GmailSignal::AuthError,
-        "quotaExceeded" => GmailSignal::QuotaExceeded,
-        "dailyLimitExceeded" => GmailSignal::DailyLimitExceeded,
-        "rateLimitExceeded" => GmailSignal::RateLimitExceeded,
-        "userRateLimitExceeded" => GmailSignal::UserRateLimitExceeded,
-        "forbidden" => GmailSignal::Forbidden,
-        "notFound" => GmailSignal::NotFound,
-        "preconditionFailed" => GmailSignal::PreconditionFailed,
-        "backendError" => GmailSignal::BackendError,
-        "historyNotFound" => GmailSignal::HistoryNotFound,
-        "pubsubSubscriptionDeleted" => GmailSignal::PubSubSubscriptionDeleted,
-        "pubsubSubscriptionExpired" => GmailSignal::PubSubSubscriptionExpired,
-        other => GmailSignal::Unknown {
-            code: other.to_owned(),
-        },
-    }
+    GmailSignal::from_code(reason).unwrap_or_else(|| GmailSignal::Unknown {
+        code: reason.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -1469,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_argument_unknown_signal_is_malformed() {
+    fn invalid_argument_signal_is_malformed() {
         let err = gmail_response(400, &body_with_reason("invalidArgument"));
         let acc = into_account_error(err, GmailErrorContext::search());
         assert!(matches!(
@@ -1478,6 +1459,26 @@ mod tests {
         ));
         // The builder sets native_code on diagnostics; telemetry exposes it.
         assert_eq!(acc.telemetry_fields().native_code, Some("invalidArgument"));
+    }
+
+    /// A `google.rpc` status spelling decodes to the typed reason, while the
+    /// error's own native code keeps the spelling the server sent.
+    #[test]
+    fn rpc_status_spelling_is_a_typed_reason_with_its_received_native_code() {
+        let err = gmail_response(
+            400,
+            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad"}}"#,
+        );
+        let acc = into_account_error(err, GmailErrorContext::search());
+        assert!(matches!(
+            acc.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+        assert_eq!(acc.telemetry_fields().native_code, Some("INVALID_ARGUMENT"));
+        assert!(acc.chain().iter().any(|cause| matches!(
+            cause.wire(),
+            Some(WireCause::Gmail(GmailSignal::InvalidArgument))
+        )));
     }
 
     #[test]

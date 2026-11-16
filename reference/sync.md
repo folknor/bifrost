@@ -2747,10 +2747,12 @@ persist it; the consumer supplies the durable value.
 The campaign's explicit `ProtocolKind` selects the consumer's salt namespace;
 it does not override error identity or cursor provenance. `Account::protocol()`
 names the primary account protocol and is not a replacement for that policy on
-a composed account. `IdempotencyVendor` retains its custom salt factory and
-nonempty payload support. The default factory delegates to the exhaustive
-`ProtocolSalt::from(ProtocolKind)` conversion in `bifrost-sync`, so adding a
-cursor protocol cannot silently assign it the IMAP salt. `ProtocolSalt` lives
+a composed account. `ProtocolSalt` is that `ProtocolKind`, stamped by
+`IdempotencyVendor`, plus a payload from the consumer's `SaltPayloadFactory`;
+the factory returns only the payload and cannot substitute another protocol.
+The default factory returns an empty payload. With no per-protocol salt enum
+there is no conversion from the non-exhaustive `ProtocolKind`, so a new cursor
+protocol cannot fall through to another protocol's salt. `ProtocolSalt` lives
 beside the key under `mutation::idempotency`; both are re-exported by
 `mutation`. No Account bulk method receives a key. Consumers retain access to
 allocated cohort identities through `MutationCounters::cohort_keys`, including

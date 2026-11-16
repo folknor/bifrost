@@ -1675,7 +1675,9 @@ operation table without a local override.
 Mapping highlights:
 
 - Stable Gmail reason codes from `GmailErrorEnvelope.primary_reason()`
-  route to typed `WireCause::Gmail(GmailSignal::*)` variants and
+  route to typed `WireCause::Gmail(GmailSignal::*)` variants (decoded by
+  `GmailSignal::from_code`, which also accepts the `google.rpc` status
+  spellings Google sends in place of a reason) and
   the appropriate `AccountErrorKind` (e.g.
   `dailyLimitExceeded`/`quotaExceeded` -> `Server(QuotaExhausted)`;
   `rateLimitExceeded`/`userRateLimitExceeded` -> `Server(RateLimited)`).

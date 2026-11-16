@@ -22,16 +22,6 @@ Each entry names the hunt scope(s) that reported it. Where hunters disagreed,
 both readings are recorded. The raw reports are in the commit that precedes
 this file's.
 
-## CON-003 - Which protocol is this? (six vocabularies, mapped outside their crate)
-
-**Reported by:** types.
-
-Recovery reads the error's own `protocol` field, and each account stamps
-provider and protocol once through `AccountErrorContext`. Residue: collapsing
-the vocabularies (`ProtocolKind`, `Protocol`, `Provider`, `ProtocolSalt` -
-now in bifrost-sync - and `PushSource`) removes published items and needs the
-owner.
-
 ## CON-047 - May this URL carry the account credential?
 
 **Reported by:** graph.

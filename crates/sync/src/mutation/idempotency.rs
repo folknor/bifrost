@@ -32,49 +32,41 @@ pub struct IdempotencyKey {
 /// Protocol-tagged salt used by the engine's idempotency bookkeeping.
 ///
 /// Carried alongside `RunId` and `sequence` for protocol-specific correlation.
-/// The engine preserves the salt across retries without interpreting it;
-/// accounts never receive it. Custom factories may supply
-/// nonempty payloads as consumer bookkeeping identity, not cursor provenance.
+/// The protocol is the campaign's own, stamped by `IdempotencyVendor`; a
+/// consumer factory supplies only the payload, as bookkeeping identity, not
+/// cursor provenance. The engine preserves the salt across retries without
+/// interpreting it; accounts never receive it. No supported protocol has a
+/// wire replay token (JMAP `ifInState`, Gmail `X-Goog-Request-Id` and Graph
+/// `client-request-id` are not dedup primitives), so the salt never reaches
+/// the wire.
+///
+/// This is the protocol plus a payload rather than a parallel per-protocol
+/// enum: a parallel enum needs a mapping from the non-exhaustive
+/// `ProtocolKind`, and that mapping's mandatory catch-all would silently give
+/// a new protocol another protocol's salt.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ProtocolSalt {
-    /// JMAP has no documented wire replay token; `ifInState` is the
-    /// orthogonal concurrency primitive.
-    Jmap(String),
-    /// Gmail has no documented wire replay token; `X-Goog-Request-Id`
-    /// is not a dedup primitive on the messages endpoints.
-    Gmail(String),
-    /// Microsoft Graph has no documented wire replay token;
-    /// `client-request-id` is debugging correlation only.
-    Graph(String),
-    /// IMAP carries no replay token; the engine relies on read-back of
-    /// uncertain writes and declared desired-state reassertion.
-    Imap,
-    /// CardDAV carries no replay token; consumers use etags where
-    /// available and the engine keeps idempotency local.
-    CardDav,
-    /// CalDAV carries no replay token, on the same terms as CardDAV.
-    CalDav,
+pub struct ProtocolSalt {
+    protocol: ProtocolKind,
+    payload: String,
 }
 
-impl From<ProtocolKind> for ProtocolSalt {
-    /// Default bookkeeping salt. Custom factories can still supply payloads.
-    fn from(protocol: ProtocolKind) -> Self {
-        // Every known protocol is named explicitly below.
-        match protocol {
-            ProtocolKind::Jmap => Self::Jmap(String::new()),
-            ProtocolKind::Imap => Self::Imap,
-            ProtocolKind::Gmail => Self::Gmail(String::new()),
-            ProtocolKind::CardDav => Self::CardDav,
-            ProtocolKind::CalDav => Self::CalDav,
-            ProtocolKind::Graph => Self::Graph(String::new()),
-            // ProtocolKind is non_exhaustive and lives in another crate, so a
-            // wildcard is mandatory. An unknown protocol has no wire replay
-            // token either; the salt carries no meaning for it.
-            _ => Self::Imap,
-        }
+impl ProtocolSalt {
+    /// The campaign protocol the vendor stamped.
+    #[must_use]
+    pub fn protocol(&self) -> ProtocolKind {
+        self.protocol
+    }
+
+    /// The consumer factory's payload; empty under the default factory.
+    #[must_use]
+    pub fn payload(&self) -> &str {
+        &self.payload
     }
 }
+
+/// Consumer payload hook: given the campaign protocol, returns the salt
+/// payload. The protocol itself is not the hook's to choose.
+pub type SaltPayloadFactory = Box<dyn Fn(ProtocolKind) -> String + Send + Sync>;
 
 /// Consumer-facing campaign identifier. Wraps a `Uuid` so engine code
 /// can correlate vendor + retry queue + counters in one map.
@@ -98,9 +90,8 @@ impl MutationCampaignId {
 pub struct IdempotencyVendor {
     run_id: RunId,
     sequence: AtomicU64,
-    // A consumer hook, not a second protocol registry. Keep payload-bearing
-    // salts reachable for engine-side consumer bookkeeping.
-    salt_for: Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send + Sync>,
+    // A consumer payload hook, not a second protocol registry.
+    salt_for: SaltPayloadFactory,
 }
 
 impl IdempotencyVendor {
@@ -108,15 +99,12 @@ impl IdempotencyVendor {
     /// resume a campaign across process restarts must instead use
     /// `with_run_id`.
     #[must_use]
-    pub fn fresh(salt_for: Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send + Sync>) -> Self {
+    pub fn fresh(salt_for: SaltPayloadFactory) -> Self {
         Self::with_run_id(RunId(Uuid::new_v4().to_string()), salt_for)
     }
 
     #[must_use]
-    pub fn with_run_id(
-        run_id: RunId,
-        salt_for: Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send + Sync>,
-    ) -> Self {
+    pub fn with_run_id(run_id: RunId, salt_for: SaltPayloadFactory) -> Self {
         Self {
             run_id,
             sequence: AtomicU64::new(0),
@@ -134,15 +122,17 @@ impl IdempotencyVendor {
         IdempotencyKey {
             run_id: self.run_id.clone(),
             sequence: self.sequence.fetch_add(1, Ordering::AcqRel),
-            protocol_salt: (self.salt_for)(protocol),
+            protocol_salt: ProtocolSalt {
+                protocol,
+                payload: (self.salt_for)(protocol),
+            },
         }
     }
 }
 
-/// Default bookkeeping salt factory. Payload-bearing variants carry an empty
-/// string; accounts never receive the salt.
-pub fn default_salt_factory() -> Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send + Sync> {
-    Box::new(ProtocolSalt::from)
+/// Default bookkeeping salt factory: an empty payload for every protocol.
+pub fn default_salt_factory() -> SaltPayloadFactory {
+    Box::new(|_| String::new())
 }
 
 #[cfg(test)]
@@ -171,34 +161,30 @@ mod tests {
     fn custom_payload_is_preserved_for_consumer_bookkeeping() {
         let vendor = IdempotencyVendor::with_run_id(
             RunId("custom-run".into()),
-            Box::new(|_| ProtocolSalt::Jmap("consumer-correlation".into())),
+            Box::new(|_| "consumer-correlation".into()),
         );
         let key = vendor.next(ProtocolKind::Jmap);
         assert_eq!(key.run_id, RunId("custom-run".into()));
-        assert_eq!(
-            key.protocol_salt,
-            ProtocolSalt::Jmap("consumer-correlation".into()),
-        );
+        assert_eq!(key.protocol_salt.protocol(), ProtocolKind::Jmap);
+        assert_eq!(key.protocol_salt.payload(), "consumer-correlation");
     }
 
-    /// The default delegates to the exhaustive engine-owned conversion.
+    /// The vendor stamps the campaign's own protocol; no factory can
+    /// substitute another, and no protocol falls through to a shared salt.
     #[test]
-    fn every_live_protocol_has_its_own_salt() {
-        let factory = default_salt_factory();
-        let live = [
-            (ProtocolKind::Jmap, ProtocolSalt::Jmap(String::new())),
-            (ProtocolKind::Gmail, ProtocolSalt::Gmail(String::new())),
-            (ProtocolKind::Graph, ProtocolSalt::Graph(String::new())),
-            (ProtocolKind::Imap, ProtocolSalt::Imap),
-            (ProtocolKind::CardDav, ProtocolSalt::CardDav),
-            (ProtocolKind::CalDav, ProtocolSalt::CalDav),
-        ];
-        for (kind, expected) in live {
-            assert_eq!(
-                factory(kind),
-                expected,
-                "{kind:?} must map to its own salt, not fall through the catch-all"
-            );
+    fn every_protocol_salt_carries_the_campaign_protocol() {
+        let vendor = IdempotencyVendor::fresh(Box::new(|kind| format!("{kind:?}")));
+        for kind in [
+            ProtocolKind::Jmap,
+            ProtocolKind::Gmail,
+            ProtocolKind::Graph,
+            ProtocolKind::Imap,
+            ProtocolKind::CardDav,
+            ProtocolKind::CalDav,
+        ] {
+            let salt = vendor.next(kind).protocol_salt;
+            assert_eq!(salt.protocol(), kind);
+            assert_eq!(salt.payload(), format!("{kind:?}"));
         }
     }
 }

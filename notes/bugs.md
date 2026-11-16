@@ -98,6 +98,31 @@ behavior). The webhook arm owns subscriptions per handle, so two cases fail:
   resources (the only documented ones), so two calls over disjoint calendars
   hit it; before, only two calls over the same mail folder did.
 
+## BUG-177 - JMAP projects three distinct set-error types onto `JmapMethod::Forbidden`
+
+**Reported by:** the provider-vocabulary consolidation (spar review).
+
+`set_error_type_to_jmap_method` in `crates/jmap/src/sync/error.rs` maps
+`SetErrorType::ForbiddenFrom`, `ForbiddenMailFrom` and `ForbiddenToSend` to
+`JmapMethod::Forbidden`, although the shared vocabulary has a variant for each.
+The wire cause, and so `CauseSummary.native_code`, reports `forbidden` for a
+`forbiddenMailFrom` refusal; an admin reading support exports cannot tell a
+sender-identity refusal from a plain permission refusal. The primary
+classification may stay collapsed; the wire evidence should map each type to
+its own variant, with a test over every `SetErrorType` and `MethodErrorType`
+spelling against `JmapMethod::code()`. Not fixed with the vocabulary change
+because the file was mid-edit by another item.
+
+## BUG-178 - IMAP `[METADATA ...]` native codes fail the telemetry token check
+
+**Reported by:** the provider-vocabulary consolidation (scout, by reading).
+
+`ImapResponseCode::code()` spells the four METADATA codes with an embedded
+space (`METADATA LONGENTRIES` and so on), and IMAP account translation uses
+that as `native_code`. `TelemetryToken::new` admits only `is_ascii_graphic`
+bytes, so the code is dropped from telemetry and demoted to support text. Not
+executed; confirm with a test, then pick a token spelling for the telemetry
+field (the wire cause can keep the RFC spelling).
 `create_and_register` treats the 409 as whole-request failure with rollback,
 which keeps the old coverage alive but makes the second subscribe or the
 reattach fail. A fix needs subscription rows owned per account and shared by

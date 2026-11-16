@@ -837,162 +837,154 @@ impl fmt::Display for WireCause {
 
 impl StdError for WireCause {}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum GraphSignal {
-    Gone,
-    InvalidAuthenticationToken,
-    AccessDenied,
-    Forbidden,
-    AccessRestricted,
-    ConditionalAccessBlocked,
-    AdminConsentRequired,
-    MailboxNotEnabledForRestApi,
-    MailboxStoreUnavailable,
-    ResyncRequired,
-    InvalidDeltaToken,
-    SyncStateNotFound,
-    TooManyRequests,
-    GenericFileError,
-    PreconditionFailed,
-    NotFound,
-    Unknown { code: String },
+/// Declares one provider wire vocabulary in one place: each named variant,
+/// its canonical spelling, and any alias spellings the provider is known to
+/// send. The enum, `code()`, `from_code()` and `KNOWN` are all generated from
+/// the same list, so the two directions cannot drift apart and no variant can
+/// be missing from the decoder.
+///
+/// These enums stay in the neutral crate on purpose: they are the typed
+/// vocabulary consumers branch on without depending on each provider crate.
+/// A provider-owned code behind a trait object would cost consumers typed
+/// matching (and `Cause` its plain `Clone`/`Eq`), and an opaque string would
+/// lose it entirely. Adding a provider code is therefore a change here.
+macro_rules! wire_vocabulary {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            $( $variant:ident => $code:literal $(| $alias:literal)* , )*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        #[non_exhaustive]
+        pub enum $name {
+            $( $variant, )*
+            /// A code outside the named vocabulary, as the protocol crate
+            /// admitted it.
+            Unknown { code: String },
+        }
+
+        impl $name {
+            /// Every named variant, in declaration order.
+            pub const KNOWN: &'static [Self] = &[$( Self::$variant ),*];
+
+            /// Canonical spelling of the code. For a named variant this is the
+            /// documented spelling, not necessarily the one received: an alias
+            /// decodes to the same variant and reports the canonical form. The
+            /// received spelling is kept in the error's own `native_code`.
+            /// `Unknown` returns the admitted code as stored.
+            #[must_use]
+            pub fn code(&self) -> &str {
+                match self {
+                    $( Self::$variant => $code, )*
+                    Self::Unknown { code } => code.as_str(),
+                }
+            }
+
+            /// Decode a canonical or alias spelling to its named variant.
+            /// `None` for anything else: the protocol crate decides what an
+            /// unrecognized code becomes, including any shape check on it.
+            #[must_use]
+            pub fn from_code(code: &str) -> Option<Self> {
+                match code {
+                    $( $code $(| $alias)* => Some(Self::$variant), )*
+                    _ => None,
+                }
+            }
+
+            #[cfg(test)]
+            fn spellings() -> Vec<(&'static str, Self)> {
+                let mut all = Vec::new();
+                $(
+                    all.push(($code, Self::$variant));
+                    $( all.push(($alias, Self::$variant)); )*
+                )*
+                all
+            }
+        }
+    };
 }
 
-impl GraphSignal {
-    fn code(&self) -> &str {
-        match self {
-            Self::Gone => "Gone",
-            Self::InvalidAuthenticationToken => "InvalidAuthenticationToken",
-            Self::AccessDenied => "AccessDenied",
-            Self::Forbidden => "Forbidden",
-            Self::AccessRestricted => "AccessRestricted",
-            Self::ConditionalAccessBlocked => "ConditionalAccessBlocked",
-            Self::AdminConsentRequired => "AdminConsentRequired",
-            Self::MailboxNotEnabledForRestApi => "MailboxNotEnabledForRESTAPI",
-            Self::MailboxStoreUnavailable => "MailboxStoreUnavailable",
-            Self::ResyncRequired => "ResyncRequired",
-            Self::InvalidDeltaToken => "InvalidDeltaToken",
-            Self::SyncStateNotFound => "SyncStateNotFound",
-            Self::TooManyRequests => "TooManyRequests",
-            Self::GenericFileError => "GenericFileError",
-            Self::PreconditionFailed => "PreconditionFailed",
-            Self::NotFound => "NotFound",
-            Self::Unknown { code } => code.as_str(),
-        }
+wire_vocabulary! {
+    /// Microsoft Graph `error.code` vocabulary.
+    GraphSignal {
+        Gone => "Gone",
+        InvalidAuthenticationToken => "InvalidAuthenticationToken",
+        AccessDenied => "AccessDenied",
+        Forbidden => "Forbidden",
+        AccessRestricted => "AccessRestricted",
+        ConditionalAccessBlocked => "ConditionalAccessBlocked",
+        AdminConsentRequired => "AdminConsentRequired",
+        MailboxNotEnabledForRestApi => "MailboxNotEnabledForRESTAPI",
+        MailboxStoreUnavailable => "MailboxStoreUnavailable",
+        ResyncRequired => "ResyncRequired",
+        InvalidDeltaToken => "InvalidDeltaToken",
+        // Microsoft has shipped both capitalizations in the wild.
+        SyncStateNotFound => "SyncStateNotFound" | "syncStateNotFound",
+        TooManyRequests => "TooManyRequests",
+        GenericFileError => "GenericFileError",
+        PreconditionFailed => "PreconditionFailed",
+        NotFound => "NotFound",
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum JmapMethod {
-    // Method-level errors (RFC 8620 §3.6.2).
-    ServerUnavailable,
-    ServerFail,
-    ServerPartialFail,
-    UnknownMethod,
-    InvalidArguments,
-    InvalidResultReference,
-    Forbidden,
-    AccountNotFound,
-    AccountNotSupportedByMethod,
-    AccountReadOnly,
-    RequestTooLarge,
-    CannotCalculateChanges,
-    StateMismatch,
-    AlreadyExists,
-    FromAccountNotFound,
-    FromAccountNotSupportedByMethod,
-    AnchorNotFound,
-    UnsupportedSort,
-    UnsupportedFilter,
-    TooManyChanges,
-    UnknownCapability,
-    NotJson,
-    NotRequest,
-    Limit,
-    // Set-error vocabulary (RFC 8620 §5.3 / RFC 8621). `Forbidden` and
-    // `AlreadyExists` above are shared with the set-error vocabulary;
-    // the remaining set-error codes are listed here. Protocol crates
-    // pick the variant by wire code, not by JMAP method-vs-set context.
-    OverQuota,
-    TooLarge,
-    RateLimit,
-    NotFound,
-    InvalidPatch,
-    WillDestroy,
-    Singleton,
-    MailboxHasChild,
-    MailboxHasEmail,
-    BlobNotFound,
-    TooManyKeywords,
-    TooManyMailboxes,
-    ForbiddenFrom,
-    InvalidEmail,
-    TooManyRecipients,
-    NoRecipients,
-    InvalidRecipients,
-    ForbiddenMailFrom,
-    ForbiddenToSend,
-    CannotUnsend,
-    InvalidScript,
-    ScriptIsActive,
-    InvalidProperties,
-    Unknown { code: String },
-}
-
-impl JmapMethod {
-    fn code(&self) -> &str {
-        match self {
-            Self::ServerUnavailable => "serverUnavailable",
-            Self::ServerFail => "serverFail",
-            Self::ServerPartialFail => "serverPartialFail",
-            Self::UnknownMethod => "unknownMethod",
-            Self::InvalidArguments => "invalidArguments",
-            Self::InvalidResultReference => "invalidResultReference",
-            Self::Forbidden => "forbidden",
-            Self::AccountNotFound => "accountNotFound",
-            Self::AccountNotSupportedByMethod => "accountNotSupportedByMethod",
-            Self::AccountReadOnly => "accountReadOnly",
-            Self::RequestTooLarge => "requestTooLarge",
-            Self::CannotCalculateChanges => "cannotCalculateChanges",
-            Self::StateMismatch => "stateMismatch",
-            Self::AlreadyExists => "alreadyExists",
-            Self::FromAccountNotFound => "fromAccountNotFound",
-            Self::FromAccountNotSupportedByMethod => "fromAccountNotSupportedByMethod",
-            Self::AnchorNotFound => "anchorNotFound",
-            Self::UnsupportedSort => "unsupportedSort",
-            Self::UnsupportedFilter => "unsupportedFilter",
-            Self::TooManyChanges => "tooManyChanges",
-            Self::UnknownCapability => "unknownCapability",
-            Self::NotJson => "notJSON",
-            Self::NotRequest => "notRequest",
-            Self::Limit => "limit",
-            Self::OverQuota => "overQuota",
-            Self::TooLarge => "tooLarge",
-            Self::RateLimit => "rateLimit",
-            Self::NotFound => "notFound",
-            Self::InvalidPatch => "invalidPatch",
-            Self::WillDestroy => "willDestroy",
-            Self::Singleton => "singleton",
-            Self::MailboxHasChild => "mailboxHasChild",
-            Self::MailboxHasEmail => "mailboxHasEmail",
-            Self::BlobNotFound => "blobNotFound",
-            Self::TooManyKeywords => "tooManyKeywords",
-            Self::TooManyMailboxes => "tooManyMailboxes",
-            Self::ForbiddenFrom => "forbiddenFrom",
-            Self::InvalidEmail => "invalidEmail",
-            Self::TooManyRecipients => "tooManyRecipients",
-            Self::NoRecipients => "noRecipients",
-            Self::InvalidRecipients => "invalidRecipients",
-            Self::ForbiddenMailFrom => "forbiddenMailFrom",
-            Self::ForbiddenToSend => "forbiddenToSend",
-            Self::CannotUnsend => "cannotUnsend",
-            Self::InvalidScript => "invalidScript",
-            Self::ScriptIsActive => "scriptIsActive",
-            Self::InvalidProperties => "invalidProperties",
-            Self::Unknown { code } => code.as_str(),
-        }
+wire_vocabulary! {
+    /// JMAP method-level, request-level and set-error type vocabulary.
+    /// Protocol crates pick the variant by wire code, not by JMAP
+    /// method-vs-set context; `Forbidden` and `AlreadyExists` are shared by
+    /// both. `from_code` is a vocabulary lookup only: the JMAP crate decodes
+    /// through its own typed protocol enums.
+    JmapMethod {
+        // Method-level errors (RFC 8620 section 3.6.2).
+        ServerUnavailable => "serverUnavailable",
+        ServerFail => "serverFail",
+        ServerPartialFail => "serverPartialFail",
+        UnknownMethod => "unknownMethod",
+        InvalidArguments => "invalidArguments",
+        InvalidResultReference => "invalidResultReference",
+        Forbidden => "forbidden",
+        AccountNotFound => "accountNotFound",
+        AccountNotSupportedByMethod => "accountNotSupportedByMethod",
+        AccountReadOnly => "accountReadOnly",
+        RequestTooLarge => "requestTooLarge",
+        CannotCalculateChanges => "cannotCalculateChanges",
+        StateMismatch => "stateMismatch",
+        AlreadyExists => "alreadyExists",
+        FromAccountNotFound => "fromAccountNotFound",
+        FromAccountNotSupportedByMethod => "fromAccountNotSupportedByMethod",
+        AnchorNotFound => "anchorNotFound",
+        UnsupportedSort => "unsupportedSort",
+        UnsupportedFilter => "unsupportedFilter",
+        TooManyChanges => "tooManyChanges",
+        UnknownCapability => "unknownCapability",
+        NotJson => "notJSON",
+        NotRequest => "notRequest",
+        Limit => "limit",
+        // Set-error vocabulary (RFC 8620 section 5.3, RFC 8621).
+        OverQuota => "overQuota",
+        TooLarge => "tooLarge",
+        RateLimit => "rateLimit",
+        NotFound => "notFound",
+        InvalidPatch => "invalidPatch",
+        WillDestroy => "willDestroy",
+        Singleton => "singleton",
+        MailboxHasChild => "mailboxHasChild",
+        MailboxHasEmail => "mailboxHasEmail",
+        BlobNotFound => "blobNotFound",
+        TooManyKeywords => "tooManyKeywords",
+        TooManyMailboxes => "tooManyMailboxes",
+        ForbiddenFrom => "forbiddenFrom",
+        InvalidEmail => "invalidEmail",
+        TooManyRecipients => "tooManyRecipients",
+        NoRecipients => "noRecipients",
+        InvalidRecipients => "invalidRecipients",
+        ForbiddenMailFrom => "forbiddenMailFrom",
+        ForbiddenToSend => "forbiddenToSend",
+        CannotUnsend => "cannotUnsend",
+        InvalidScript => "invalidScript",
+        ScriptIsActive => "scriptIsActive",
+        InvalidProperties => "invalidProperties",
     }
 }
 
@@ -1167,47 +1159,31 @@ impl EnhancedStatusCode {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum GmailSignal {
-    InvalidQuery,
-    FailedPrecondition,
-    InvalidCredentials,
-    AuthError,
-    QuotaExceeded,
-    DailyLimitExceeded,
-    RateLimitExceeded,
-    UserRateLimitExceeded,
-    Forbidden,
-    NotFound,
-    PreconditionFailed,
-    BackendError,
-    HistoryNotFound,
-    PubSubSubscriptionDeleted,
-    PubSubSubscriptionExpired,
-    Unknown { code: String },
-}
-
-impl GmailSignal {
-    fn code(&self) -> &str {
-        match self {
-            Self::InvalidQuery => "invalidQuery",
-            Self::FailedPrecondition => "failedPrecondition",
-            Self::InvalidCredentials => "invalidCredentials",
-            Self::AuthError => "authError",
-            Self::QuotaExceeded => "quotaExceeded",
-            Self::DailyLimitExceeded => "dailyLimitExceeded",
-            Self::RateLimitExceeded => "rateLimitExceeded",
-            Self::UserRateLimitExceeded => "userRateLimitExceeded",
-            Self::Forbidden => "forbidden",
-            Self::NotFound => "notFound",
-            Self::PreconditionFailed => "preconditionFailed",
-            Self::BackendError => "backendError",
-            Self::HistoryNotFound => "historyNotFound",
-            Self::PubSubSubscriptionDeleted => "pubsubSubscriptionDeleted",
-            Self::PubSubSubscriptionExpired => "pubsubSubscriptionExpired",
-            Self::Unknown { code } => code.as_str(),
-        }
+wire_vocabulary! {
+    /// Google API error `reason` vocabulary, shared by every Google surface
+    /// (Gmail, Calendar, People, Drive). Aliases are the `google.rpc` status
+    /// spellings Google sends in place of a reason for the same condition.
+    GmailSignal {
+        InvalidQuery => "invalidQuery",
+        FailedPrecondition => "failedPrecondition",
+        InvalidCredentials => "invalidCredentials",
+        AuthError => "authError",
+        QuotaExceeded => "quotaExceeded",
+        DailyLimitExceeded => "dailyLimitExceeded",
+        RateLimitExceeded => "rateLimitExceeded",
+        UserRateLimitExceeded => "userRateLimitExceeded",
+        Forbidden => "forbidden",
+        NotFound => "notFound",
+        PreconditionFailed => "preconditionFailed",
+        BackendError => "backendError",
+        HistoryNotFound => "historyNotFound",
+        PubSubSubscriptionDeleted => "pubsubSubscriptionDeleted",
+        PubSubSubscriptionExpired => "pubsubSubscriptionExpired",
+        InvalidArgument => "invalidArgument" | "INVALID_ARGUMENT",
+        InsufficientPermissions => "insufficientPermissions" | "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+        DomainPolicy => "domainPolicy",
+        ConditionNotMet => "conditionNotMet",
+        NotAuthorizedToAccessThisResource => "notAuthorizedToAccessThisResource",
     }
 }
 
@@ -1269,6 +1245,62 @@ pub enum BatchInputInvalidReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every declared spelling decodes to its own variant, no spelling is
+    /// claimed by two variants, every named variant reports a canonical
+    /// spelling that decodes back to it, and `Unknown` never comes out of
+    /// the decoder.
+    macro_rules! assert_vocabulary {
+        ($name:ident) => {{
+            let spellings = $name::spellings();
+            for (index, (spelling, variant)) in spellings.iter().enumerate() {
+                assert_eq!(
+                    $name::from_code(spelling).as_ref(),
+                    Some(variant),
+                    "{spelling} must decode to {variant:?}"
+                );
+                assert!(
+                    spellings[index + 1..]
+                        .iter()
+                        .all(|(other, _)| other != spelling),
+                    "{spelling} is declared twice"
+                );
+            }
+            for variant in $name::KNOWN {
+                assert_eq!($name::from_code(variant.code()).as_ref(), Some(variant));
+            }
+            assert_eq!($name::from_code("notAKnownCodeAnywhere"), None);
+            let unknown = $name::Unknown {
+                code: "notAKnownCodeAnywhere".into(),
+            };
+            assert_eq!(unknown.code(), "notAKnownCodeAnywhere");
+        }};
+    }
+
+    #[test]
+    fn provider_vocabularies_decode_every_declared_spelling() {
+        assert_vocabulary!(GraphSignal);
+        assert_vocabulary!(JmapMethod);
+        assert_vocabulary!(GmailSignal);
+    }
+
+    #[test]
+    fn aliases_normalize_to_the_canonical_spelling() {
+        for (alias, canonical) in [
+            ("syncStateNotFound", "SyncStateNotFound"),
+            ("MailboxNotEnabledForRESTAPI", "MailboxNotEnabledForRESTAPI"),
+        ] {
+            let signal = GraphSignal::from_code(alias).expect("known Graph code");
+            assert_eq!(signal.code(), canonical);
+        }
+        for (alias, canonical) in [
+            ("INVALID_ARGUMENT", "invalidArgument"),
+            ("ACCESS_TOKEN_SCOPE_INSUFFICIENT", "insufficientPermissions"),
+        ] {
+            let signal = GmailSignal::from_code(alias).expect("known Google code");
+            assert_eq!(signal.code(), canonical);
+        }
+    }
 
     #[test]
     fn cause_chain_preserves_order() {

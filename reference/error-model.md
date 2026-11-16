@@ -536,8 +536,21 @@ refusals, unlike HTTP 5xx retries. Wire causes do not affect this decision. The 
 vocabulary preserved for support exports includes:
 `Graph(GraphSignal)`, `Jmap(JmapMethod)`, `Imap(ImapResponseCode)`,
 `Smtp(EnhancedStatusCode)`, `Gmail(GmailSignal)`, and
-`MalformedResponse { protocol, detail }`. Each provider enum exposes
-`code()` (the on-wire string) for telemetry. `Cause::summary()` projects any
+`MalformedResponse { protocol, detail }`. These provider vocabularies live in
+`bifrost-types` on purpose, as the typed vocabulary a consumer branches on
+without depending on each provider crate; a new provider code is a change
+there. `GraphSignal`, `JmapMethod` and `GmailSignal` are each declared once
+(variant, canonical spelling, known aliases), which generates their public
+`code()`, `from_code()` and `KNOWN`, so the two directions cannot drift; the
+Graph and Google crates decode through `from_code()` and keep only their own
+`Unknown` construction. `ImapResponseCode::code()` is public and hand-written,
+because the IMAP codec owns decoding. `code()` is the canonical spelling, not
+necessarily the received one: an alias (Graph `syncStateNotFound`, Google's
+`google.rpc` status spellings such as `INVALID_ARGUMENT`) decodes to the named
+variant, so a wire cause's summary carries the canonical code and no detail,
+while the error's own `native_code` keeps the spelling the server sent. A
+provider projection can still be lossier than the vocabulary: that is a defect
+in the projection, not a property of the vocabulary. `Cause::summary()` projects any
 cause into a flat `CauseSummary` for the internal export tier. Alongside kind,
 detail, transmission state, status, and native code, the projection preserves
 structured transport kind, access resource and needed scope, strategy

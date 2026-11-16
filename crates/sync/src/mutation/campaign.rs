@@ -1452,7 +1452,7 @@ mod campaign_tests {
         }));
         let vendor = super::super::IdempotencyVendor::with_run_id(
             RunId("declaration".into()),
-            Box::new(|_| ProtocolSalt::Imap),
+            Box::new(|_| String::new()),
         );
         let mut campaign = Campaign::new(
             targets.clone().into(),
@@ -1517,7 +1517,7 @@ mod campaign_tests {
         }));
         let vendor = super::super::IdempotencyVendor::with_run_id(
             RunId("frozen-cohorts".into()),
-            Box::new(|_| ProtocolSalt::Graph("custom-payload".into())),
+            Box::new(|_| "custom-payload".into()),
         );
         let targets = vec![ObjectId("a".into()), ObjectId("b".into())];
         let mut campaign = Campaign::new(
@@ -1601,7 +1601,7 @@ mod campaign_tests {
         let account = crate::test_common::StubAccount::new(Vec::new());
         let vendor = super::super::IdempotencyVendor::with_run_id(
             bifrost_types::RunId("unsubmitted".into()),
-            Box::new(|_| ProtocolSalt::Imap),
+            Box::new(|_| String::new()),
         );
         let requested = ObjectId("requested".into());
         let unrelated = ObjectId("not-submitted".into());
@@ -1692,7 +1692,7 @@ mod campaign_tests {
                 .expect("attach");
             let vendor = crate::mutation::IdempotencyVendor::with_run_id(
                 bifrost_types::RunId("contract".into()),
-                Box::new(|_| crate::mutation::idempotency::ProtocolSalt::Imap),
+                Box::new(|_| String::new()),
             );
             let counters = engine
                 .bulk_set_flags(
@@ -1745,7 +1745,7 @@ mod campaign_tests {
             .expect("attach");
         let vendor = crate::mutation::IdempotencyVendor::with_run_id(
             bifrost_types::RunId("duplicate".into()),
-            Box::new(|_| crate::mutation::idempotency::ProtocolSalt::Imap),
+            Box::new(|_| String::new()),
         );
         let counters = engine
             .bulk_set_flags(
@@ -1949,7 +1949,7 @@ mod campaign_tests {
             .expect("attach");
         let vendor = crate::mutation::IdempotencyVendor::with_run_id(
             bifrost_types::RunId("caller-version".into()),
-            Box::new(|_| crate::mutation::idempotency::ProtocolSalt::Imap),
+            Box::new(|_| String::new()),
         );
         let counters = engine
             .bulk_set_flags_if_version(

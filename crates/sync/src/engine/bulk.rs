@@ -549,7 +549,7 @@ mod tests {
         engine.accounts.get(&id).expect("slot").shutdown.cancel();
         let vendor = crate::mutation::IdempotencyVendor::with_run_id(
             bifrost_types::RunId("campaign-test".into()),
-            Box::new(|_| crate::mutation::idempotency::ProtocolSalt::Imap),
+            Box::new(|_| String::new()),
         );
         let outcome = engine
             .bulk_destroy(

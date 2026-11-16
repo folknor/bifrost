@@ -217,9 +217,8 @@ impl GraphResponseError {
     /// Parse a Graph error response from its raw status/headers/body.
     /// Best-effort decode: if the body is not a recognizable Graph
     /// error envelope, the result still carries the status and bytes
-    /// and the `signal` falls back to `GraphSignal::Unknown` keyed on
-    /// the HTTP status reason phrase, so downstream classification
-    /// falls through to status-based handling.
+    /// and `signal` is `None`; the account boundary turns that into
+    /// `WireCause::MalformedResponse` and classifies on the status.
     #[must_use]
     pub(crate) fn from_response(status: StatusCode, headers: HeaderMap, body: Bytes) -> Self {
         let envelope: Option<ErrorEnvelope> = if body.is_empty() {
@@ -259,34 +258,16 @@ impl GraphResponseError {
 }
 
 /// Map a Graph `error.code` token onto the typed wire signal. Stable
-/// Microsoft tokens land on named `GraphSignal` variants; unknown
+/// Microsoft tokens (and their known aliases) land on named `GraphSignal`
+/// variants through the vocabulary's own decoder in `bifrost-types`; unknown
 /// tokens (and the empty string) fall through to `Unknown { code }`
 /// carrying only a shape-checked provider string so the audit can flag stable
-/// codes that need to be promoted under the wire-enum escape hatch.
+/// codes that need to be promoted into the shared vocabulary.
 #[must_use]
 pub(crate) fn classify_code(code: &str) -> GraphSignal {
-    match code {
-        "Gone" => GraphSignal::Gone,
-        "InvalidAuthenticationToken" => GraphSignal::InvalidAuthenticationToken,
-        "AccessDenied" => GraphSignal::AccessDenied,
-        "Forbidden" => GraphSignal::Forbidden,
-        "AccessRestricted" => GraphSignal::AccessRestricted,
-        "ConditionalAccessBlocked" => GraphSignal::ConditionalAccessBlocked,
-        "AdminConsentRequired" => GraphSignal::AdminConsentRequired,
-        "MailboxNotEnabledForRESTAPI" => GraphSignal::MailboxNotEnabledForRestApi,
-        "MailboxStoreUnavailable" => GraphSignal::MailboxStoreUnavailable,
-        "ResyncRequired" => GraphSignal::ResyncRequired,
-        "InvalidDeltaToken" => GraphSignal::InvalidDeltaToken,
-        // Microsoft has shipped both capitalizations in the wild.
-        "SyncStateNotFound" | "syncStateNotFound" => GraphSignal::SyncStateNotFound,
-        "TooManyRequests" => GraphSignal::TooManyRequests,
-        "GenericFileError" => GraphSignal::GenericFileError,
-        "PreconditionFailed" => GraphSignal::PreconditionFailed,
-        "NotFound" => GraphSignal::NotFound,
-        other => GraphSignal::Unknown {
-            code: bifrost_net::account_error::correlation_id(other).unwrap_or_default(),
-        },
-    }
+    GraphSignal::from_code(code).unwrap_or_else(|| GraphSignal::Unknown {
+        code: bifrost_net::account_error::correlation_id(code).unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -371,32 +352,12 @@ mod tests {
 
     #[test]
     fn classifies_known_codes() {
-        for (token, want) in [
-            ("Gone", "Gone"),
-            ("ResyncRequired", "ResyncRequired"),
-            ("InvalidDeltaToken", "InvalidDeltaToken"),
-            ("SyncStateNotFound", "SyncStateNotFound"),
-            ("syncStateNotFound", "SyncStateNotFound"),
-            ("PreconditionFailed", "PreconditionFailed"),
-            ("TooManyRequests", "TooManyRequests"),
-            ("MailboxNotEnabledForRESTAPI", "MailboxNotEnabledForRESTAPI"),
-        ] {
-            // Round-trip through the GraphSignal::code accessor would
-            // require access to the inherent impl in bifrost-types,
-            // which is `pub` per crate. Match the discriminant via
-            // classification to lock in the mapping.
-            let signal = classify_code(token);
-            let label = match signal {
-                GraphSignal::Gone => "Gone",
-                GraphSignal::ResyncRequired => "ResyncRequired",
-                GraphSignal::InvalidDeltaToken => "InvalidDeltaToken",
-                GraphSignal::SyncStateNotFound => "SyncStateNotFound",
-                GraphSignal::PreconditionFailed => "PreconditionFailed",
-                GraphSignal::TooManyRequests => "TooManyRequests",
-                GraphSignal::MailboxNotEnabledForRestApi => "MailboxNotEnabledForRESTAPI",
-                other => panic!("token {token} classified as {other:?}"),
-            };
-            assert_eq!(label, want);
+        for signal in GraphSignal::KNOWN {
+            assert_eq!(&classify_code(signal.code()), signal);
         }
+        assert_eq!(
+            classify_code("syncStateNotFound"),
+            GraphSignal::SyncStateNotFound
+        );
     }
 }

@@ -118,6 +118,8 @@ pub enum ObjectType {
 /// This is narrower than `Protocol`: submission and auxiliary APIs do not
 /// mint change cursors. Convert with `Protocol::from` for error metadata;
 /// storage tags belong to each versioned codec, not to that conversion.
+/// It is deliberately not folded into `Protocol`: as a cursor's provenance
+/// it must not be able to name SMTP, EWS or an unknown protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProtocolKind {

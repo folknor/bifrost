@@ -25,7 +25,9 @@ pub(crate) mod campaign;
 pub mod idempotency;
 pub mod readback;
 
-pub use idempotency::{IdempotencyKey, IdempotencyVendor, MutationCampaignId, ProtocolSalt};
+pub use idempotency::{
+    IdempotencyKey, IdempotencyVendor, MutationCampaignId, ProtocolSalt, SaltPayloadFactory,
+};
 pub use readback::{
     ReadbackOutcome, run_destroy_readback_guard, run_move_readback_guard, run_readback_guard,
 };

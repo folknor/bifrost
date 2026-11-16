@@ -24,40 +24,6 @@ Each entry names the hunt scope(s) that reported it. Where hunters disagreed,
 both readings are recorded. The raw reports are in the commit that precedes
 this file's.
 
-## STR-013 - Provider wire vocabularies in the neutral crate
-
-**Reported by:** types.
-
-`GraphSignal`, `JmapMethod`, `ImapResponseCode`, `GmailSignal`,
-`EnhancedStatusCode` enumerate each provider's native error codes inside
-`bifrost-types`, so adding a Graph error code changes the contract crate. Only
-one central decision reads them (`smtp_reply`, CON-003). Options: a
-`WireCause::Native { protocol, code }` with a provider-supplied typed code
-behind a trait, or keep the enums and concede they are shared vocabulary; if
-they stay, `derive_server` should key on `protocol`, not on the `WireCause`
-variant.
-
-The graph hunter adds that the tables are split across crates: Graph's
-`error::classify_code` (string -> `GraphSignal`) lives in graph and
-`GraphSignal::code` (variant -> string) in types, the two directions of one
-bijection maintained by hand, with the `syncStateNotFound` alias in only one
-direction; JMAP and Gmail have the same split (`JmapMethod`, `GmailSignal`), and
-IMAP's three-table version is BUG-042. If the enums stay in types, their full
-tables move with them (`GraphSignal::from_code` beside `code()`, plus a round-trip
-test over every variant). It also lists `PushCapability::WebhookOrEwsStream`
-(whose "OrEwsStream" is false, BUG-078) and `PushSource::GraphSubscription` as
-Graph names in the neutral crate.
-
-The google hunter shows the cost from the other side: `GmailSignal::Unknown { code
-}` is used deliberately for reasons the crate RECOGNIZES - `invalidArgument`,
-`insufficientPermissions`, `domainPolicy`, `conditionNotMet` and
-`notAuthorizedToAccessThisResource` are routed by string match inside the `Unknown`
-arm of `classify_response` - so a consumer branching on `WireCause::Gmail` sees
-"unknown" for reasons Google documents; promoting them is a types change. It weighs
-an opaque `(Provider, code)` plus a crate-owned typed decode, but calls the current
-placement defensible if consumers branch on typed Gmail reasons, and the one place
-it would not move without asking who reads it.
-
 ## STR-014 - MIME lives in `bifrost-types`, and there are two RFC 5322 renderers
 
 **Reported by:** types.
