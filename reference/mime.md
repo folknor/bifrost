@@ -110,10 +110,28 @@ report an unrepresentable value rather than submit a line a relay may truncate.
 `format_address` remains a value-formatting convenience; `write_header` owns
 physical-line enforcement.
 
-`bifrost-smtp`'s `message` builder is a second, independent RFC 5322 writer
-with its own header encoding, folding, Message-ID (hostname-based) and Date
-policies; only envelope derivation is shared today (its
-`Envelope::try_from(&Headers)` delegates to `submission_envelope`).
+Control octets (C0 other than HTAB, and DEL) never reach the wire raw:
+unstructured text and phrases encode a word holding one, and structured
+values (`MessageIds`, `Structured`, a parameterized value token, an
+addr-spec) refuse it as `Request(Malformed)`; a parameter value holding one
+takes the RFC 2231 path.
+
+Three variants exist for the SMTP builder's needs. `Structured` is ASCII
+emitted verbatim and folded at whitespace outside quotes and angle brackets,
+never encoded, with controls and non-ASCII refused (Content-Type, URL lists,
+a minted date). `Raw` is the caller's own wire spelling for a grammar the
+caller did not declare: legal wire text (printable ASCII and WSP, CRLF only
+as a fold before WSP, every line within 998 octets including the name) is
+emitted byte-for-byte with no trim or inserted fold; otherwise words holding
+non-ASCII or control octets become encoded words and the result folds at
+78, while an ASCII word is never encoded, so one past 998 octets is refused.
+`PreEncoded` validates the same framing and refuses rather than normalizes.
+
+`bifrost-smtp`'s `message` builder writes every header through
+`write_header` (see `reference/smtp.md`), and mints its Date with
+`format_rfc5322_date`. Envelope derivation is shared as well (its
+`Envelope::try_from(&Headers)` delegates to `submission_envelope`). MIME
+entity serialization is still separate in the two composers.
 
 ## File map
 

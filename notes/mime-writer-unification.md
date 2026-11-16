@@ -82,10 +82,8 @@ Replacing the renderer with its pre-link implementation made all four
 `writer_renderer` regressions fail in both MIME sweeps; the implementation was
 restored afterward. No unscoped gate was run in the concurrently edited tree.
 
-Remaining work: link 2 (medium/large) adopts the writer in SMTP, including any
-adapter needed for its custom typed headers, implements author-domain ID
-precedence and shared minted Date formatting, and pins final-byte DKIM signing.
-Link 3 (large) shares MIME entity serialization. No decision handed back.
+Link 2 is now built (see below). Link 3 (large) shares MIME entity
+serialization.
 
 ## Link 2 - smtp builder consumes the header writer and the policies
 
@@ -118,3 +116,76 @@ re-roll, CRLF normalization) shared between the two composers. The renderer's
   (all-or-nothing, validates through `email_address` + IDNA). They have
   different contracts (tolerant inbound vs validated construction); merging
   them is a separate question from the writer.
+
+### Link 2 partial implementation and hand-back (2026-11-16)
+
+Built: deferred SMTP `message_id(None)` generation, resolved at build time,
+with `message_id_domain(String)` as an explicit override. Single From wins over
+Sender; multiple authors use their required Sender; envelope overrides never
+select the author domain. Explicit Message-ID headers win. As before, without
+a generation request the builder leaves Message-ID insertion to the relay.
+The random 36-character local part is retained; hostname stays for EHLO.
+
+Decision made: reject an unusable author domain rather than invent an identity.
+Generated domains must be nonempty dot-atoms, with nonempty components, and at
+most 947 octets (the Message-ID field prefix, 36 local octets, @ and angle
+brackets must fit 998 even before shared folding is adopted). Domain literals require an explicit usable domain override.
+An override is validated only when actually generating. This keeps a shared
+mailbox's identity intact and gives an enterprise send queue an actionable
+local failure rather than a machine-hostname identity or silently altered domain.
+
+### Link 2 completed (2026-11-16)
+
+The handed-back fallibility question was settled with codex (converged after
+five rounds) and link 2 is built. The binding contract now lives in
+`reference/smtp.md` ("Header encoding and its failure contract") and
+`reference/mime.md`; in short:
+
+- `Header::display` describes (name, raw value, grammar) and never encodes.
+  Encoding happens once, when a value enters a `Headers`; `set` and
+  `insert_raw` return `Result` and leave the old entry on refusal. So a
+  `Headers` holds only validated bytes and formatting stays infallible.
+  Rejected shapes: a fallible `display` (every chain breaks, even setters
+  that cannot fail), lazy encoding at `formatted()` (`Display` cannot carry
+  an error), and poisoned values carrying a deferred error.
+- `MessageBuilder` latches the first refusal and its build step reports it
+  first. Part builders end infallibly, so their `header` / `content_type`
+  and `Attachment::body` return `Result`.
+- The writer gained `Structured`, `Raw` (caller spelling, byte-for-byte
+  when legal, which is what keeps a caller Date exact) and `PreEncoded`
+  (framing only), and now encodes or refuses control octets everywhere.
+- Content-Type is structured, not parameterized (RFC 2231 continuations on
+  a 70-octet boundary break parsers). A boundary is added when a
+  Content-Type enters a multipart builder (fallible); later edits splice the
+  caller's spelling so every unit only shrinks and no parameter is lost.
+  Kind parameters are bounded at 900 octets.
+- Minted Date goes through `format_rfc5322_date`; `Date::new` is fallible
+  (1900..=9999). Parsing still uses `httpdate`.
+- DKIM signs the final bytes. Two real defects in the old model-based
+  signer were confirmed and fixed: simple canonicalization hashed the
+  configured name spelling (`h=from` against `From:`), and a multipart
+  root `Content-Type` was never hashed because it lives in the part headers.
+  The field is a fixed template with `b=` on its own line and a 72-octet
+  folded signature; `sign` returns `Result` and refuses unverifiable
+  configurations (non-DNS `d=`/`s=`, lookup name past 253, `;` in a signed
+  name, From not signed).
+- Message-ID: an IDN author domain is written as its A-label instead of
+  being refused; the 947-octet bound gave way to the writer's refusal.
+
+Validation: `brokkr check -p bifrost-mime -p bifrost-smtp` green, 2,461
+tests across five sweeps; imap `compose` and google `send` tests pass
+against the changed writer (their full scoped gate was red only on another
+agent's in-flight imap file). Ablations bit: hashing the model headers or the
+configured name spelling failed the independent final-byte verifier;
+disabling the Raw passthrough failed the folded-Date test; ignoring the
+builder latch failed the build-refusal test.
+
+Leftover, filed here with sizes:
+
+- Keywords and List-ID are stored unparsed and take the caller-spelling
+  rule, so a single phrase word past 998 octets is refused where a phrase
+  grammar could encode it. Typed phrase-list and List-ID grammars (small).
+- `MultiPart::headers_mut()` can still replace Content-Type with one lacking
+  a boundary, after which `boundary()` panics at format time; pre-existing,
+  not introduced here (small).
+- Link 3 below is unchanged (large).

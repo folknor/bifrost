@@ -54,8 +54,7 @@ impl Header for MimeVersion {
     }
 
     fn display(&self) -> HeaderValue {
-        let val = format!("{}.{}", self.major, self.minor);
-        HeaderValue::dangerous_new_pre_encoded(Self::name(), val.clone(), val)
+        HeaderValue::structured(Self::name(), format!("{}.{}", self.major, self.minor))
     }
 }
 
@@ -75,11 +74,11 @@ mod test {
     fn format_mime_version() {
         let mut headers = Headers::new();
 
-        headers.set(MIME_VERSION_1_0);
+        headers.set_known(MIME_VERSION_1_0);
 
         assert_eq!(headers.to_string(), "MIME-Version: 1.0\r\n");
 
-        headers.set(MimeVersion::new(0, 1));
+        headers.set_known(MimeVersion::new(0, 1));
 
         assert_eq!(headers.to_string(), "MIME-Version: 0.1\r\n");
     }
@@ -88,14 +87,14 @@ mod test {
     fn parse_mime_version() {
         let mut headers = Headers::new();
 
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("MIME-Version"),
             "1.0".to_owned(),
         ));
 
         assert_eq!(headers.get::<MimeVersion>(), Some(MIME_VERSION_1_0));
 
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("MIME-Version"),
             "0.1".to_owned(),
         ));

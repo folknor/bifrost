@@ -1,5 +1,3 @@
-use email_encoding::headers::writer::EmailWriter;
-
 use super::{Header, HeaderName, HeaderValue};
 use crate::{
     BoxError,
@@ -28,14 +26,7 @@ macro_rules! mailbox_header {
             }
 
             fn display(&self) -> HeaderValue {
-                let mut encoded_value = String::new();
-                let line_len = $header_name.len() + ": ".len();
-                {
-                    let mut w = EmailWriter::new(&mut encoded_value, line_len, 0, false);
-                    self.0.encode(&mut w).expect("writing `Mailbox` returned an error");
-                }
-
-                HeaderValue::dangerous_new_pre_encoded(Self::name(), self.0.to_string(), encoded_value)
+                HeaderValue::mailboxes(Self::name(), &Mailboxes::from(self.0.clone()))
             }
         }
 
@@ -78,14 +69,7 @@ macro_rules! mailboxes_header {
             }
 
             fn display(&self) -> HeaderValue {
-                let mut encoded_value = String::new();
-                let line_len = $header_name.len() + ": ".len();
-                {
-                    let mut w = EmailWriter::new(&mut encoded_value, line_len, 0, false);
-                    self.0.encode(&mut w).expect("writing `Mailboxes` returned an error");
-                }
-
-                HeaderValue::dangerous_new_pre_encoded(Self::name(), self.0.to_string(), encoded_value)
+                HeaderValue::mailboxes(Self::name(), &self.0)
             }
         }
 
@@ -185,7 +169,7 @@ mod test {
         let from = Mailboxes::new().with("kayo@example.com".parse().unwrap());
 
         let mut headers = Headers::new();
-        headers.set(From(from));
+        headers.set_known(From(from));
 
         assert_eq!(headers.to_string(), "From: kayo@example.com\r\n");
     }
@@ -195,7 +179,7 @@ mod test {
         let from = Mailboxes::new().with("Kayo <kayo@example.com>".parse().unwrap());
 
         let mut headers = Headers::new();
-        headers.set(From(from));
+        headers.set_known(From(from));
 
         assert_eq!(headers.to_string(), "From: Kayo <kayo@example.com>\r\n");
     }
@@ -205,7 +189,7 @@ mod test {
         let from = Mailboxes::new().with("John Smith <john@example.com>".parse().unwrap());
 
         let mut headers = Headers::new();
-        headers.set(From(from));
+        headers.set_known(From(from));
 
         assert_eq!(
             headers.to_string(),
@@ -218,7 +202,7 @@ mod test {
         let from = Mailboxes::new().with("User9 <user9@example.com>".parse().unwrap());
 
         let mut headers = Headers::new();
-        headers.set(From(from));
+        headers.set_known(From(from));
 
         assert_eq!(headers.to_string(), "From: User9 <user9@example.com>\r\n");
     }
@@ -228,7 +212,7 @@ mod test {
         let reply_to = Mailboxes::new().with("John Smith <john@example.com>".parse().unwrap());
 
         let mut headers = Headers::new();
-        headers.set(ReplyTo(reply_to));
+        headers.set_known(ReplyTo(reply_to));
 
         assert_eq!(
             headers.to_string(),
@@ -243,7 +227,7 @@ mod test {
             .with("pony@domain.tld".parse().unwrap());
 
         let mut headers = Headers::new();
-        headers.set(From(from));
+        headers.set_known(From(from));
 
         assert_eq!(
             headers.to_string(),
@@ -259,7 +243,7 @@ mod test {
         ];
 
         let mut headers = Headers::new();
-        headers.set(From(from.into()));
+        headers.set_known(From(from.into()));
 
         assert_eq!(
             headers.to_string(),
@@ -272,11 +256,11 @@ mod test {
         let from = vec!["Кайо <kayo@example.com>".parse().unwrap()];
 
         let mut headers = Headers::new();
-        headers.set(From(from.into()));
+        headers.set_known(From(from.into()));
 
         assert_eq!(
             headers.to_string(),
-            "From: =?utf-8?b?0JrQsNC50L4=?= <kayo@example.com>\r\n"
+            "From: =?UTF-8?B?0JrQsNC50L4=?= <kayo@example.com>\r\n"
         );
     }
 
@@ -285,7 +269,7 @@ mod test {
         let from = vec!["kayo@example.com".parse().unwrap()].into();
 
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("From"),
             "kayo@example.com".to_owned(),
         ));
@@ -298,7 +282,7 @@ mod test {
         let from = vec!["K. <kayo@example.com>".parse().unwrap()].into();
 
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("From"),
             "K. <kayo@example.com>".to_owned(),
         ));
@@ -314,7 +298,7 @@ mod test {
         ];
 
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("From"),
             "kayo@example.com, pony@domain.tld".to_owned(),
         ));
@@ -330,7 +314,7 @@ mod test {
         ];
 
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("From"),
             "K. <kayo@example.com>, Pony P. <pony@domain.tld>".to_owned(),
         ));
@@ -346,7 +330,7 @@ mod test {
         ];
 
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("From"),
             "\"Test, test\" <1@example.com>, \"Test2, test2\" <2@example.com>".to_owned(),
         ));
@@ -362,7 +346,7 @@ mod test {
         ];
 
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("From"),
             "\"Test, test\" <1@example.com>, \"Test2, \"test2\"\" <2@example.com>".to_owned(),
         ));
@@ -373,7 +357,7 @@ mod test {
     #[test]
     fn parse_multi_with_name_containing_comma_last_broken() {
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("From"),
             "\"Test, test\" <1@example.com>, \"Test2, test2\"".to_owned(),
         ));

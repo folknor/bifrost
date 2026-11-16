@@ -163,3 +163,55 @@ fn writer_text_encoding_and_structured_token_limits() {
     assert!(write_header("References", HeaderValue::MessageIds(&"a".repeat(998))).is_err());
     assert!(write_header("Invalid\r\nName", HeaderValue::Unstructured("value")).is_err());
 }
+
+/// Control octets never reach the wire raw: text and phrases encode them,
+/// structured values refuse them.
+#[test]
+fn writer_control_octets_are_encoded_or_refused() {
+    let subject = write_header("Subject", HeaderValue::Unstructured("a\u{0}b")).expect("text");
+    assert!(!subject.bytes().any(|b| b == 0), "{subject:?}");
+    assert_eq!(
+        crate::decode_encoded_words(subject.trim_start_matches("Subject:").trim().as_bytes()),
+        "a\u{0}b"
+    );
+    let named = address(Some("Bell\u{7}".into()), "a@example.com".into());
+    let to = write_header("To", HeaderValue::Addresses(std::slice::from_ref(&named))).expect("to");
+    assert!(!to.bytes().any(|b| b == 7), "{to:?}");
+    assert!(write_header("References", HeaderValue::MessageIds("<a\u{1}@b>")).is_err());
+    assert!(write_header("Content-Type", HeaderValue::Structured("text/plain\u{7f}")).is_err());
+    assert!(write_header("Content-Type", HeaderValue::Structured("text/pl\u{e9}in")).is_err());
+}
+
+/// Raw keeps legal caller bytes exactly; otherwise only words holding
+/// non-ASCII or controls are encoded, and an oversize ASCII token is
+/// refused rather than encoded.
+#[test]
+fn writer_raw_and_pre_encoded_policies() {
+    let spelled = "  Fri, 21 Nov 1997 (a  comment)\r\n\t(continued)  ";
+    assert_eq!(
+        write_header("Date", HeaderValue::Raw(spelled)).expect("legal wire text"),
+        format!("Date: {spelled}")
+    );
+    let mixed =
+        write_header("To", HeaderValue::Raw("Se\u{e1}n <sean@example.com>")).expect("mixed");
+    assert_eq!(mixed, "To: =?UTF-8?B?U2XDoW4=?= <sean@example.com>");
+    assert!(write_header("X", HeaderValue::Raw(&"t".repeat(1000))).is_err());
+    assert!(
+        write_header(
+            "X",
+            HeaderValue::Raw(&format!("\u{e9} {}", "t".repeat(1000)))
+        )
+        .is_err()
+    );
+    assert_eq!(
+        write_header("X", HeaderValue::PreEncoded("a\r\n b")).expect("folded"),
+        "X: a\r\n b"
+    );
+    for bad in ["a\r\nb", "a\nb", "a\r\n \r\n b", "\u{e9}"] {
+        assert!(
+            write_header("X", HeaderValue::PreEncoded(bad)).is_err(),
+            "{bad:?}"
+        );
+    }
+    assert!(write_header("X", HeaderValue::PreEncoded(&"t".repeat(996))).is_err());
+}

@@ -526,17 +526,17 @@ Narrow edge cases, audits with no known defect, and design work.
 - **Lateral findings from the review of the design-hunt batch, unverified.**
   Each wants its own check and, where marked, a ruling.
   - SMTP: a rejected batch DATA reports per-recipient RCPT rejections. Batch
-    sends have no BDAT entry point (ruling). The message builder does not
-    enforce the RFC 5322 998-octet line limit (the comments now say so).
-    Folding inside an unbreakable ASCII token changes its value and refusing
-    such a message changes what the builder accepts today, so enforcement
-    needs a ruling.
+    sends have no BDAT entry point (ruling). Header lines are settled: the
+    builder now writes through the shared `bifrost-mime` writer, which
+    encodes where RFC 2047 is legal and refuses an indivisible token past
+    998 octets. What remains open is body lines: a caller `7bit`/`8bit`
+    body line past 998 octets is not re-encoded or refused.
     **Recommendation (yardstick, not a ruling):** batch DATA rejection is
     reported against every recipient of that batch as a message rejection,
     not as their RCPT results. BDAT for batches: build when CHUNKING is
     advertised (it is the better path for large mail). 998 octets: encode an
-    over-long line (quoted-printable or base64 body, encoded-word header)
-    rather than refuse or fold inside a token; servers silently mangle or
+    over-long body line (quoted-printable or base64) rather than refuse it;
+    servers silently mangle or
     bounce over-long lines, which a user sees as a broken message.
   - sync: the operator-override warning moved from `user_safe` to
     `support_only` (ruling). **Recommendation (yardstick, not a ruling):** keep `support_only`. An

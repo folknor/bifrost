@@ -1,11 +1,8 @@
 use std::{
     fmt::{Display, Formatter, Result as FmtResult, Write},
-    mem,
     slice::Iter,
     str::FromStr,
 };
-
-use email_encoding::headers::writer::EmailWriter;
 
 use super::parsers;
 use crate::address::{Address, AddressError};
@@ -66,28 +63,6 @@ impl Mailbox {
     /// ```
     pub fn new(name: Option<String>, email: Address) -> Self {
         Mailbox { name, email }
-    }
-
-    pub(crate) fn encode(&self, w: &mut EmailWriter<'_>) -> FmtResult {
-        let mut has_display_name = false;
-
-        if let Some(name) = &self.name {
-            let name = name.trim();
-            if !name.is_empty() {
-                encode_display_name(name, w)?;
-                w.space();
-                w.write_char('<')?;
-                has_display_name = true;
-            }
-        }
-
-        w.write_str(self.email.as_ref())?;
-
-        if has_display_name {
-            w.write_char('>')?;
-        }
-
-        Ok(())
     }
 }
 
@@ -258,20 +233,6 @@ impl Mailboxes {
     pub fn iter(&self) -> Iter<'_, Mailbox> {
         self.0.iter()
     }
-
-    pub(crate) fn encode(&self, w: &mut EmailWriter<'_>) -> FmtResult {
-        let mut first = true;
-        for mailbox in self.iter() {
-            if !mem::take(&mut first) {
-                w.write_char(',')?;
-                w.space();
-            }
-
-            mailbox.encode(w)?;
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for Mailboxes {
@@ -357,22 +318,6 @@ impl FromStr for Mailboxes {
 
         Ok(Mailboxes(mailboxes))
     }
-}
-
-fn encode_display_name(name: &str, w: &mut EmailWriter<'_>) -> FmtResult {
-    if is_valid_phrase(name) {
-        w.write_str(name)
-    } else {
-        email_encoding::headers::quoted_string::encode(name, w)
-    }
-}
-
-fn is_valid_phrase(name: &str) -> bool {
-    name.as_bytes()
-        .iter()
-        .copied()
-        .all(|c| is_valid_atext_char(c) || matches!(c, b'\t' | b' '))
-        && name.as_bytes().iter().copied().any(is_valid_atext_char)
 }
 
 // https://datatracker.ietf.org/doc/html/rfc2822#section-3.2.6

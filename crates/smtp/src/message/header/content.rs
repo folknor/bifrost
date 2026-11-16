@@ -38,8 +38,7 @@ impl Header for ContentTransferEncoding {
     }
 
     fn display(&self) -> HeaderValue {
-        let val = self.to_string();
-        HeaderValue::dangerous_new_pre_encoded(Self::name(), val.clone(), val)
+        HeaderValue::structured(Self::name(), self.to_string())
     }
 }
 
@@ -79,11 +78,11 @@ mod test {
     fn format_content_transfer_encoding() {
         let mut headers = Headers::new();
 
-        headers.set(ContentTransferEncoding::SevenBit);
+        headers.set_known(ContentTransferEncoding::SevenBit);
 
         assert_eq!(headers.to_string(), "Content-Transfer-Encoding: 7bit\r\n");
 
-        headers.set(ContentTransferEncoding::Base64);
+        headers.set_known(ContentTransferEncoding::Base64);
 
         assert_eq!(headers.to_string(), "Content-Transfer-Encoding: base64\r\n");
     }
@@ -92,7 +91,7 @@ mod test {
     fn parse_content_transfer_encoding() {
         let mut headers = Headers::new();
 
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("Content-Transfer-Encoding"),
             "7bit".to_owned(),
         ));
@@ -102,7 +101,7 @@ mod test {
             Some(ContentTransferEncoding::SevenBit)
         );
 
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("Content-Transfer-Encoding"),
             "base64".to_owned(),
         ));

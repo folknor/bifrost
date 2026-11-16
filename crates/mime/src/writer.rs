@@ -22,6 +22,88 @@ pub enum HeaderValue<'a> {
         value: &'a str,
         parameters: &'a [(&'a str, &'a str)],
     },
+    /// An ASCII structured value (Content-Type, a URL list, a date) emitted
+    /// verbatim and folded only at whitespace outside quoted strings and
+    /// angle brackets. Never encoded: controls and non-ASCII are refused.
+    Structured(&'a str),
+    /// A value whose grammar the caller did not declare: the caller's own
+    /// wire spelling. Legal wire text (printable ASCII and WSP, CRLF only as
+    /// a fold before WSP, every physical line within 998 octets) is emitted
+    /// byte-for-byte, with no trim and no inserted fold, so a caller Date or
+    /// any hand-folded value survives exactly. Otherwise words carrying
+    /// non-ASCII or control octets become RFC 2047 encoded words and the
+    /// result folds at 78; an ASCII word is never encoded because the
+    /// grammar may forbid an encoded word there, so one that cannot fit 998
+    /// octets is refused.
+    Raw(&'a str),
+    /// An already folded value. Only framing is validated (printable ASCII
+    /// and WSP, CRLF only before WSP, lines within 998 octets); it is
+    /// refused rather than normalized, and emitted byte-for-byte.
+    PreEncoded(&'a str),
+}
+
+/// A control octet that may never appear raw in a header value: C0 other
+/// than HTAB, and DEL.
+fn is_control(b: u8) -> bool {
+    (b < 0x20 && b != b'\t') || b == 0x7f
+}
+
+/// Whether `value` is legal wire text for a field named `name`.
+fn is_wire_text(name: &str, value: &str) -> bool {
+    let mut lines = value.split("\r\n");
+    let first = lines.next().unwrap_or_default();
+    let line_ok = |line: &str| {
+        line.bytes()
+            .all(|b| b == b' ' || b == b'\t' || (0x21..=0x7e).contains(&b))
+    };
+    if !line_ok(first) || name.len() + 2 + first.len() > 998 {
+        return false;
+    }
+    lines.all(|line| {
+        line_ok(line)
+            && line.starts_with([' ', '\t'])
+            && !line.trim().is_empty()
+            && line.len() <= 998
+    })
+}
+
+/// Word-wise RFC 2047 for an undeclared grammar: only words that hold
+/// octets outside printable ASCII are encoded, ASCII words stay verbatim.
+fn encode_raw_words(value: &str) -> String {
+    let mut out = String::new();
+    let mut pending = String::new();
+    let flush = |out: &mut String, pending: &mut String| {
+        if pending.is_empty() {
+            return;
+        }
+        let prefix = pending.trim_end_matches(' ');
+        out.push_str(&encode_words(prefix));
+        out.push_str(&pending[prefix.len()..]);
+        pending.clear();
+    };
+    for word in value.split_inclusive(' ') {
+        let plain = word
+            .trim_end_matches(' ')
+            .bytes()
+            .all(|b| b == b'\t' || (0x21..=0x7e).contains(&b));
+        if plain {
+            flush(&mut out, &mut pending);
+            out.push_str(word);
+        } else {
+            pending.push_str(word);
+        }
+    }
+    flush(&mut out, &mut pending);
+    out
+}
+
+fn refuse_controls(value: &str, ascii_only: bool) -> Result<(), AccountError> {
+    if value.bytes().any(is_control) || (ascii_only && !value.is_ascii()) {
+        return Err(malformed(
+            "Structured header value holds control or non-ASCII octets",
+        ));
+    }
+    Ok(())
 }
 
 /// Encode a complete header without its terminating CRLF.
@@ -30,22 +112,50 @@ pub enum HeaderValue<'a> {
 /// indivisible structured token that cannot fit a 998-octet physical line
 /// fails as Request(Malformed). Enterprise send queues must report an
 /// unrepresentable header rather than submit bytes a relay can truncate.
-/// This policy also applies when the SMTP builder adopts this writer.
+/// The SMTP message builder writes every header through this function too.
 pub fn write_header(name: &str, value: HeaderValue<'_>) -> Result<String, AccountError> {
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic() && b != b':') {
         return Err(malformed("Invalid header field name"));
     }
-    let structured = !matches!(value, HeaderValue::Unstructured(_));
+    let structured = !matches!(value, HeaderValue::Unstructured(_) | HeaderValue::Raw(_));
     let value = match value {
         HeaderValue::Unstructured(text) => encode_header_value(text),
-        HeaderValue::Addresses(addresses) => addresses
-            .iter()
-            .map(format_address)
-            .collect::<Vec<_>>()
-            .join(", "),
-        HeaderValue::MessageIds(ids) => sanitize_header(ids),
+        HeaderValue::Addresses(addresses) => {
+            for address in addresses {
+                refuse_controls(&address.address, false)?;
+            }
+            addresses
+                .iter()
+                .map(format_address)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        HeaderValue::MessageIds(ids) => {
+            // RFC 6532 permits UTF-8 identifiers; controls are never legal.
+            let ids = sanitize_header(ids);
+            refuse_controls(&ids, false)?;
+            ids
+        }
+        HeaderValue::Structured(text) => {
+            let text = sanitize_header(text);
+            refuse_controls(&text, true)?;
+            text
+        }
+        HeaderValue::Raw(text) => {
+            if is_wire_text(name, text) {
+                return Ok(format!("{name}: {text}"));
+            }
+            encode_raw_words(text)
+        }
+        HeaderValue::PreEncoded(text) => {
+            if is_wire_text(name, text) {
+                return Ok(format!("{name}: {text}"));
+            }
+            return Err(malformed("Pre-encoded header value is not legal wire text"));
+        }
         HeaderValue::Parameterized { value, parameters } => {
             let mut text = sanitize_header(value);
+            refuse_controls(&text, true)?;
             for &(key, value) in parameters {
                 if key.is_empty()
                     || !key
@@ -56,7 +166,9 @@ pub fn write_header(name: &str, value: HeaderValue<'_>) -> Result<String, Accoun
                 }
                 let value = sanitize_header(value);
                 let quoted = value.replace('\\', "\\\\").replace('"', "\\\"");
-                if value.is_empty() || (value.is_ascii() && key.len() + quoted.len() < 60) {
+                // A control octet is only representable percent-encoded.
+                let plain = value.is_ascii() && !value.bytes().any(is_control);
+                if value.is_empty() || (plain && key.len() + quoted.len() < 60) {
                     text.push_str(&format!("; {key}=\"{quoted}\""));
                 } else {
                     // Percent triplets are indivisible; continuations may split
@@ -173,7 +285,7 @@ pub fn format_address(address: &Address) -> String {
 /// emitting identical From/To phrases.
 pub(crate) fn encode_phrase(value: &str) -> String {
     let sanitized = sanitize_header(value);
-    if !sanitized.is_ascii() || sanitized.len() > 70 {
+    if !sanitized.is_ascii() || sanitized.len() > 70 || sanitized.bytes().any(is_control) {
         return encode_words(&sanitized);
     }
     if is_atom_phrase(&sanitized) {
@@ -226,6 +338,7 @@ pub(crate) fn is_atext(b: u8) -> bool {
 pub(crate) fn encode_header_value(value: &str) -> String {
     let sanitized = sanitize_header(value);
     if sanitized.is_ascii()
+        && !sanitized.bytes().any(is_control)
         && !sanitized
             .split_ascii_whitespace()
             .any(|word| word.len() > 70)

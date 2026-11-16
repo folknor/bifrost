@@ -4,7 +4,7 @@ use super::{Header, HeaderName, HeaderValue};
 use crate::BoxError;
 
 macro_rules! text_header {
-    ($(#[$attr:meta])* Header($type_name: ident, $header_name: expr )) => {
+    ($(#[$attr:meta])* Header($type_name: ident, $header_name: expr, $grammar: ident )) => {
         $(#[$attr])*
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub struct $type_name(String);
@@ -19,7 +19,7 @@ macro_rules! text_header {
             }
 
             fn display(&self) -> HeaderValue {
-             HeaderValue::new(Self::name(),   self.0.clone())
+                HeaderValue::$grammar(Self::name(), self.0.clone())
             }
         }
 
@@ -63,7 +63,7 @@ macro_rules! list_url_header {
             }
 
             fn display(&self) -> HeaderValue {
-                HeaderValue::new(Self::name(), self.0.clone())
+                HeaderValue::structured(Self::name(), self.0.clone())
             }
         }
 
@@ -128,42 +128,45 @@ fn invalid_list_header(message: &'static str) -> BoxError {
 
 text_header!(
     /// `Subject` of the message, defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.5)
-    Header(Subject, "Subject")
+    Header(Subject, "Subject", unstructured)
 );
 text_header!(
     /// `Comments` of the message, defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.5)
-    Header(Comments, "Comments")
+    Header(Comments, "Comments", unstructured)
 );
 text_header!(
     /// `Keywords` header. Should contain a comma-separated list of one or more
     /// words or quoted-strings, defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.5)
-    Header(Keywords, "Keywords")
+    /// The phrase list is stored unparsed, so it takes the caller-spelling
+    /// rule of [`HeaderValue::new`].
+    Header(Keywords, "Keywords", new)
 );
 text_header!(
     /// `In-Reply-To` header. Contains one or more
     /// unique message identifiers,
     /// defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.4)
-    Header(InReplyTo, "In-Reply-To")
+    Header(InReplyTo, "In-Reply-To", message_ids)
 );
 text_header!(
     /// `References` header. Contains one or more
     /// unique message identifiers,
     /// defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.4)
-    Header(References, "References")
+    Header(References, "References", message_ids)
 );
 text_header!(
     /// `Message-Id` header. Contains a unique message identifier,
     /// defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.4)
-    Header(MessageId, "Message-ID")
+    Header(MessageId, "Message-ID", message_ids)
 );
 text_header!(
     /// `User-Agent` header. Contains information about the client,
     /// defined in [draft-melnikov-email-user-agent-00](https://tools.ietf.org/html/draft-melnikov-email-user-agent-00#section-3)
-    Header(UserAgent, "User-Agent")
+    Header(UserAgent, "User-Agent", new)
 );
 text_header!(
     /// `List-Id` header, defined in [RFC2919](https://www.rfc-editor.org/rfc/rfc2919)
-    Header(ListId, "List-ID")
+    /// Stored unparsed: the caller-spelling rule of [`HeaderValue::new`].
+    Header(ListId, "List-ID", new)
 );
 list_url_header!(
     /// `List-Help` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
@@ -199,7 +202,7 @@ impl Header for ListUnsubscribePost {
     }
 
     fn display(&self) -> HeaderValue {
-        HeaderValue::new(Self::name(), Self::VALUE.to_owned())
+        HeaderValue::structured(Self::name(), Self::VALUE.to_owned())
     }
 }
 
@@ -228,12 +231,12 @@ list_url_header!(
 text_header! {
     /// `Content-Id` header,
     /// defined in [RFC2045](https://tools.ietf.org/html/rfc2045#section-7)
-    Header(ContentId, "Content-ID")
+    Header(ContentId, "Content-ID", message_ids)
 }
 text_header! {
     /// `Content-Location` header,
     /// defined in [RFC2110](https://tools.ietf.org/html/rfc2110#section-4.3)
-    Header(ContentLocation, "Content-Location")
+    Header(ContentLocation, "Content-Location", structured)
 }
 
 #[cfg(test)]
@@ -245,7 +248,7 @@ mod test {
     #[test]
     fn format_ascii() {
         let mut headers = Headers::new();
-        headers.set(Subject("Sample subject".into()));
+        headers.set_known(Subject("Sample subject".into()));
 
         assert_eq!(headers.to_string(), "Subject: Sample subject\r\n");
     }
@@ -253,31 +256,31 @@ mod test {
     #[test]
     fn format_utf8() {
         let mut headers = Headers::new();
-        headers.set(Subject("Тема сообщения".into()));
+        headers.set_known(Subject("Тема сообщения".into()));
 
         assert_eq!(
             headers.to_string(),
-            "Subject: =?utf-8?b?0KLQtdC80LAg0YHQvtC+0LHRidC10L3QuNGP?=\r\n"
+            "Subject: =?UTF-8?B?0KLQtdC80LAg0YHQvtC+0LHRidC10L3QuNGP?=\r\n"
         );
     }
 
     #[test]
     fn format_utf8_word() {
         let mut headers = Headers::new();
-        headers.set(Subject("Administratör".into()));
+        headers.set_known(Subject("Administratör".into()));
 
         assert_eq!(
             headers.to_string(),
-            "Subject: =?utf-8?b?QWRtaW5pc3RyYXTDtnI=?=\r\n"
+            "Subject: =?UTF-8?B?QWRtaW5pc3RyYXTDtnI=?=\r\n"
         );
     }
 
     #[test]
     fn format_list_headers() {
         let mut headers = Headers::new();
-        headers.set(ListId("Users <users.example.com>".into()));
-        headers.set(ListUnsubscribe::new("<mailto:unsubscribe@example.com>").unwrap());
-        headers.set(ListUnsubscribePost);
+        headers.set_known(ListId("Users <users.example.com>".into()));
+        headers.set_known(ListUnsubscribe::new("<mailto:unsubscribe@example.com>").unwrap());
+        headers.set_known(ListUnsubscribePost);
 
         assert_eq!(
             headers.to_string(),
@@ -314,7 +317,7 @@ mod test {
     #[test]
     fn parse_ascii() {
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("Subject"),
             "Sample subject".to_owned(),
         ));

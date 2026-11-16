@@ -37,7 +37,7 @@ impl Attachment {
     /// let filename = String::from("invoice.pdf");
     /// let filebody = b"%PDF-1.7\n".to_vec();
     /// let content_type = ContentType::parse("application/pdf").unwrap();
-    /// let attachment = Attachment::new(filename).body(filebody, content_type);
+    /// let attachment = Attachment::new(filename).body(filebody, content_type)?;
     ///
     /// // The document `attachment` will show up as a normal attachment.
     /// # Ok(())
@@ -68,7 +68,7 @@ impl Attachment {
     /// let content_id = String::from("123");
     /// let filebody = vec![0xff, 0xd8, 0xff, 0xe0];
     /// let content_type = ContentType::parse("image/jpeg").unwrap();
-    /// let attachment = Attachment::new_inline(content_id).body(filebody, content_type);
+    /// let attachment = Attachment::new_inline(content_id).body(filebody, content_type)?;
     ///
     /// // The image `attachment` will display inline into the email.
     /// # Ok(())
@@ -104,7 +104,7 @@ impl Attachment {
     /// let filebody = vec![0xff, 0xd8, 0xff, 0xe0];
     /// let content_type = ContentType::parse("image/jpeg").unwrap();
     /// let attachment =
-    ///     Attachment::new_inline_with_name(content_id, file_name).body(filebody, content_type);
+    ///     Attachment::new_inline_with_name(content_id, file_name).body(filebody, content_type)?;
     ///
     /// // The image `attachment` will display inline into the email.
     /// # Ok(())
@@ -123,27 +123,35 @@ impl Attachment {
     ///
     /// Look at the [Complex MIME body example](crate::message#complex-mime-body)
     /// to see how [`SinglePart`] can be put into the email.
-    pub fn body<T: IntoBody>(self, content: T, content_type: ContentType) -> SinglePart {
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when the content id or content type cannot be encoded
+    /// as a header (an indivisible token past 998 octets, a control octet).
+    pub fn body<T: IntoBody>(
+        self,
+        content: T,
+        content_type: ContentType,
+    ) -> Result<SinglePart, crate::error::Error> {
         let mut builder = SinglePart::builder();
         builder = match self.disposition {
             Disposition::Attached(filename) => {
-                builder.header(header::ContentDisposition::attachment(&filename))
+                builder.header(header::ContentDisposition::attachment(&filename))?
             }
             Disposition::Inline {
                 content_id,
                 name: None,
             } => builder
-                .header(header::ContentId::from(format!("<{content_id}>")))
-                .header(header::ContentDisposition::inline()),
+                .header(header::ContentId::from(format!("<{content_id}>")))?
+                .header(header::ContentDisposition::inline())?,
             Disposition::Inline {
                 content_id,
                 name: Some(name),
             } => builder
-                .header(header::ContentId::from(format!("<{content_id}>")))
-                .header(header::ContentDisposition::inline_with_name(&name)),
+                .header(header::ContentId::from(format!("<{content_id}>")))?
+                .header(header::ContentDisposition::inline_with_name(&name))?,
         };
-        builder = builder.header(content_type);
-        builder.body(content)
+        Ok(builder.header(content_type)?.body(content))
     }
 }
 
@@ -153,10 +161,12 @@ mod tests {
 
     #[test]
     fn attachment() {
-        let part = super::Attachment::new(String::from("test.txt")).body(
-            String::from("Hello world!"),
-            ContentType::parse("text/plain").unwrap(),
-        );
+        let part = super::Attachment::new(String::from("test.txt"))
+            .body(
+                String::from("Hello world!"),
+                ContentType::parse("text/plain").unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             &String::from_utf8_lossy(&part.formatted()),
             concat!(
@@ -170,10 +180,12 @@ mod tests {
 
     #[test]
     fn attachment_inline() {
-        let part = super::Attachment::new_inline(String::from("id")).body(
-            String::from("Hello world!"),
-            ContentType::parse("text/plain").unwrap(),
-        );
+        let part = super::Attachment::new_inline(String::from("id"))
+            .body(
+                String::from("Hello world!"),
+                ContentType::parse("text/plain").unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             &String::from_utf8_lossy(&part.formatted()),
             concat!(
@@ -190,10 +202,12 @@ mod tests {
     fn attachment_inline_with_name() {
         let id = String::from("id");
         let name = String::from("test");
-        let part = super::Attachment::new_inline_with_name(id, name).body(
-            String::from("Hello world!"),
-            ContentType::parse("text/plain").unwrap(),
-        );
+        let part = super::Attachment::new_inline_with_name(id, name)
+            .body(
+                String::from("Hello world!"),
+                ContentType::parse("text/plain").unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             &String::from_utf8_lossy(&part.formatted()),
             concat!(

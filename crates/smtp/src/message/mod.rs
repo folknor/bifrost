@@ -226,8 +226,6 @@ use crate::{
     message::header::{ContentTransferEncoding, Header, HeaderValue, Headers, MailboxesHeader},
 };
 
-const DEFAULT_MESSAGE_ID_DOMAIN: &str = "localhost";
-
 /// Something that can be formatted as an email message
 trait EmailFormat {
     // Use a writer?
@@ -241,6 +239,12 @@ pub struct MessageBuilder {
     headers: Headers,
     envelope: Option<Envelope>,
     drop_bcc: bool,
+    generate_message_id: bool,
+    message_id_domain: Option<String>,
+    /// The first header that could not be encoded. Setters keep chaining;
+    /// the build step reports it before doing anything else, and it never
+    /// reaches a `Message`.
+    invalid: Option<String>,
 }
 
 impl MessageBuilder {
@@ -250,7 +254,19 @@ impl MessageBuilder {
             headers: Headers::new(),
             envelope: None,
             drop_bcc: true,
+            generate_message_id: false,
+            message_id_domain: None,
+            invalid: None,
         }
+    }
+
+    fn latch(mut self, result: Result<(), EmailError>) -> Self {
+        if let Err(error) = result
+            && self.invalid.is_none()
+        {
+            self.invalid = Some(error.to_string());
+        }
+        self
     }
 
     /// Set or add mailbox to `From` header
@@ -273,9 +289,13 @@ impl MessageBuilder {
 
     /// Add `Date` header to message
     ///
-    /// Shortcut for `self.header(header::Date::new(st))`.
+    /// Shortcut for `self.header(header::Date::new(st))`. A time outside the
+    /// RFC 5322 year range is reported by the build step.
     pub fn date(self, st: SystemTime) -> Self {
-        self.header(header::Date::new(st))
+        match header::Date::new(st) {
+            Ok(date) => self.header(date),
+            Err(error) => self.latch(Err(error)),
+        }
     }
 
     /// Set `Date` header using current date/time
@@ -348,25 +368,27 @@ impl MessageBuilder {
     /// Set [Message-ID
     /// header](https://tools.ietf.org/html/rfc5322#section-3.6.4)
     ///
-    /// Should generally be inserted by the mail relay.
-    ///
-    /// If `None` is provided, an id will be generated in the
-    /// `<UUID@HOSTNAME>`.
-    pub fn message_id(self, id: Option<String>) -> Self {
+    /// With `None`, request a fresh id at build time using the single From
+    /// author's domain, or Sender's domain when there are multiple authors.
+    /// An explicit envelope never chooses the author identity.
+    pub fn message_id(mut self, id: Option<String>) -> Self {
+        self.generate_message_id = id.is_none();
         match id {
-            Some(i) => self.header(header::MessageId::from(i)),
+            Some(id) => self.header(header::MessageId::from(id)),
             None => {
-                let hostname = hostname::get()
-                    .map_err(|_| ())
-                    .and_then(|s| s.into_string().map_err(|_| ()))
-                    .unwrap_or_else(|()| DEFAULT_MESSAGE_ID_DOMAIN.to_owned());
-
-                self.header(header::MessageId::from(
-                    // https://tools.ietf.org/html/rfc5322#section-3.6.4
-                    format!("<{}@{}>", make_message_id(), hostname),
-                ))
+                self.headers.remove::<header::MessageId>();
+                self
             }
         }
+    }
+
+    /// Override the domain used by a requested generated Message-ID.
+    ///
+    /// This does not itself request an id. Invalid dot-atom domains are
+    /// rejected at build time when generation is requested.
+    pub fn message_id_domain(mut self, domain: String) -> Self {
+        self.message_id_domain = Some(domain);
+        self
     }
 
     /// Set [User-Agent
@@ -376,15 +398,19 @@ impl MessageBuilder {
     }
 
     /// Set custom header to message
+    ///
+    /// A header that cannot be encoded is reported by the build step.
     pub fn header<H: Header>(mut self, header: H) -> Self {
-        self.headers.set(header);
-        self
+        let result = self.headers.set(header);
+        self.latch(result)
     }
 
     /// Set raw custom header to message
+    ///
+    /// A header that cannot be encoded is reported by the build step.
     pub fn raw_header(mut self, raw_header: HeaderValue) -> Self {
-        self.headers.insert_raw(raw_header);
-        self
+        let result = self.headers.insert_raw(raw_header);
+        self.latch(result)
     }
 
     /// Add mailbox to header
@@ -419,17 +445,19 @@ impl MessageBuilder {
     }
 
     /// Create message from body
-    fn build(self, body: MessageBody) -> Result<Message, EmailError> {
+    fn build(mut self, body: MessageBody) -> Result<Message, EmailError> {
+        if let Some(invalid) = self.invalid.take() {
+            return Err(EmailError::InvalidInput(invalid));
+        }
         // Check for missing required headers
         // https://tools.ietf.org/html/rfc5322#section-3.6
 
         // Any caller-supplied Date header wins, even if this crate cannot parse
         // it. Otherwise valid non-UTC dates would be replaced with "now".
-        let mut res = if self.headers.get_raw(&header::Date::name()).is_none() {
-            self.date_now()
-        } else {
-            self
-        };
+        if self.headers.get_raw(&header::Date::name()).is_none() {
+            self.headers.set(header::Date::now()?)?;
+        }
+        let mut res = self;
 
         // Fail is missing correct originator (Sender or From)
         match res.headers.get::<header::From>() {
@@ -442,6 +470,51 @@ impl MessageBuilder {
             None => {
                 return Err(EmailError::MissingFrom);
             }
+        }
+
+        if res.generate_message_id && res.headers.get_raw(&header::MessageId::name()).is_none() {
+            let from = res
+                .headers
+                .get::<header::From>()
+                .ok_or(EmailError::MissingFrom)?;
+            let authors: Vec<Mailbox> = from.0.into();
+            let author = if authors.len() == 1 {
+                &authors[0]
+            } else {
+                &Mailbox::from(
+                    res.headers
+                        .get::<header::Sender>()
+                        .ok_or(EmailError::TooManyFrom)?,
+                )
+            };
+            // A shared mailbox owns its identity even with a delegate Sender.
+            // Multiple authors instead need Sender to select one domain. Never
+            // substitute an envelope override or a machine hostname.
+            let domain = res
+                .message_id_domain
+                .as_deref()
+                .unwrap_or(author.email.domain());
+            // An internationalized author domain is spelled in its A-label
+            // form, so the id stays a plain dot-atom for every relay.
+            let domain = idna::domain_to_ascii(domain).unwrap_or_default();
+            if domain.is_empty()
+                || domain.split('.').any(|atom| {
+                    atom.is_empty()
+                        || !atom.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b)
+                        })
+                })
+            {
+                return Err(EmailError::InvalidInput(
+                    "Message-ID requires a usable dot-atom domain or an explicit domain override"
+                        .into(),
+                ));
+            }
+            // The shared writer refuses an id too long for one line.
+            res.headers.set(header::MessageId::from(format!(
+                "<{}@{domain}>",
+                make_message_id()
+            )))?;
         }
 
         let envelope = match res.envelope {
@@ -476,9 +549,9 @@ impl MessageBuilder {
         if self.headers.get::<header::ContentType>().is_none()
             && let Some(content_type) = body.default_content_type()
         {
-            self.headers.set(content_type);
+            self.headers.set_known(content_type);
         }
-        self.headers.set(body.encoding());
+        self.headers.set_known(body.encoding());
         self.build(MessageBody::Raw(body.into_vec()))
     }
 
@@ -545,18 +618,6 @@ impl Message {
         out
     }
 
-    #[cfg(feature = "dkim")]
-    /// Format body for signing
-    pub(crate) fn body_raw(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        match &self.body {
-            MessageBody::Mime(p) => p.format_body(&mut out),
-            MessageBody::Raw(r) => out.extend_from_slice(r),
-        }
-        out.extend_from_slice(b"\r\n");
-        out
-    }
-
     /// Sign the message using Dkim
     ///
     /// Example:
@@ -605,19 +666,26 @@ impl Message {
     /// I45fbR4l+3D/30WMfZlM6bzZbwPXEnr2s1mirmuQpjumY9wLhK25
     /// -----END RSA PRIVATE KEY-----";
     /// let signing_key = DkimSigningKey::new(key, DkimSigningAlgorithm::Rsa).unwrap();
-    /// message.sign(&DkimConfig::default_config(
-    ///     "dkimtest".to_owned(),
-    ///     "example.org".to_owned(),
-    ///     signing_key,
-    /// ));
+    /// message
+    ///     .sign(&DkimConfig::default_config(
+    ///         "dkimtest".to_owned(),
+    ///         "example.org".to_owned(),
+    ///         signing_key,
+    ///     ))
+    ///     .unwrap();
     /// println!(
     ///     "message: {}",
     ///     std::str::from_utf8(&message.formatted()).unwrap()
     /// );
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for a configuration no verifier could accept (see
+    /// [`dkim_sign`]); the message is left unchanged.
     #[cfg(feature = "dkim")]
-    pub fn sign(&mut self, dkim_config: &DkimConfig) {
-        dkim_sign(self, dkim_config);
+    pub fn sign(&mut self, dkim_config: &DkimConfig) -> Result<(), EmailError> {
+        dkim_sign(self, dkim_config)
     }
 }
 
@@ -656,6 +724,7 @@ mod test {
         Message, MultiPart, SinglePart, header,
         mailbox::{Mailbox, Mailboxes},
         make_message_id,
+        mimebody::{BodyOk, ChainOk},
     };
 
     #[test]
@@ -715,9 +784,9 @@ mod test {
             String::from_utf8(email.formatted()).unwrap(),
             concat!(
                 "Date: Tue, 15 Nov 1994 08:12:31 +0000\r\n",
-                "From: =?utf-8?b?0JrQsNC4?= <kayo@example.com>\r\n",
+                "From: =?UTF-8?B?0JrQsNC4?= <kayo@example.com>\r\n",
                 "To: \"Pony O.P.\" <pony@domain.tld>\r\n",
-                "Subject: =?utf-8?b?0Y/So9CwINC10Lsg0LHQtdC705nQvSE=?=\r\n",
+                "Subject: =?UTF-8?B?0Y/So9CwINC10Lsg0LHQtdC705nQvSE=?=\r\n",
                 "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
@@ -757,9 +826,9 @@ mod test {
             concat!(
                 "Date: Tue, 15 Nov 1994 08:12:31 +0000\r\n",
                 "Bcc: hidden@example.com\r\n",
-                "From: =?utf-8?b?0JrQsNC4?= <kayo@example.com>\r\n",
+                "From: =?UTF-8?B?0JrQsNC4?= <kayo@example.com>\r\n",
                 "To: \"Pony O.P.\" <pony@domain.tld>\r\n",
-                "Subject: =?utf-8?b?0Y/So9CwINC10Lsg0LHQtdC705nQvSE=?=\r\n",
+                "Subject: =?UTF-8?B?0Y/So9CwINC10Lsg0LHQtdC705nQvSE=?=\r\n",
                 "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
@@ -811,6 +880,78 @@ mod test {
         assert!(output.contains("Content-ID: <123>\r\n"));
         assert!(output.contains("Content-Transfer-Encoding: base64\r\n"));
         assert!(output.contains("iVBORw0KGgo=\r\n"));
+    }
+
+    #[test]
+    fn generated_id_resolves_author_at_build_time() {
+        let message = Message::builder()
+            .message_id(None)
+            .from("shared@author.example".parse().unwrap())
+            .sender("delegate@sender.example".parse().unwrap())
+            .to("recipient@example.com".parse().unwrap())
+            .envelope(
+                crate::address::Envelope::new(
+                    Some("bounce@envelope.example".parse().unwrap()),
+                    vec!["recipient@example.com".parse().unwrap()],
+                )
+                .unwrap(),
+            )
+            .body(String::new())
+            .unwrap();
+        assert!(
+            message
+                .formatted()
+                .windows(b"@author.example>".len())
+                .any(|window| window == b"@author.example>")
+        );
+    }
+
+    #[test]
+    fn generated_id_multiple_authors_and_domain_override() {
+        for (domain, expected) in [
+            (None, "sender.example"),
+            (Some("override.example"), "override.example"),
+        ] {
+            let mut builder = Message::builder()
+                .message_id(None)
+                .from("first@one.example".parse().unwrap())
+                .from("second@two.example".parse().unwrap())
+                .sender("delegate@sender.example".parse().unwrap())
+                .to("recipient@example.com".parse().unwrap());
+            if let Some(domain) = domain {
+                builder = builder.message_id_domain(domain.into());
+            }
+            let message = builder.body(String::new()).unwrap();
+            assert!(
+                String::from_utf8(message.formatted())
+                    .unwrap()
+                    .contains(&format!("@{expected}>"))
+            );
+        }
+    }
+
+    #[test]
+    fn generated_id_refuses_invalid_override_and_preserves_explicit_id() {
+        let builder = Message::builder()
+            .from("author@example.com".parse().unwrap())
+            .to("recipient@example.com".parse().unwrap())
+            .message_id_domain("bad..domain".into());
+        assert!(
+            builder
+                .clone()
+                .message_id(None)
+                .body(String::new())
+                .is_err()
+        );
+        let message = builder
+            .message_id(Some("<explicit@elsewhere.example>".into()))
+            .body(String::new())
+            .unwrap();
+        assert!(
+            String::from_utf8(message.formatted())
+                .unwrap()
+                .contains("Message-ID: <explicit@elsewhere.example>\r\n")
+        );
     }
 
     #[test]
@@ -872,16 +1013,75 @@ mod test {
         );
     }
 
-    #[cfg(feature = "dkim")]
+    /// A caller's Date spelling, hand-folded and longer than 78 octets,
+    /// is emitted byte-for-byte: no trim, no refold, no rewrite.
     #[test]
-    fn byte_message_body_normalization_matches_dkim_body_input() {
+    fn folded_long_raw_date_header_is_preserved_byte_for_byte() {
+        let spelled = format!(
+            "Fri, 21 Nov 1997 09:55:06 -0600 ({})\r\n\t(second  comment)",
+            "c".repeat(80)
+        );
         let email = Message::builder()
-            .from("sender@example.com".parse().unwrap())
-            .to("recipient@example.com".parse().unwrap())
-            .body(b"before\n.\nafter".to_vec())
+            .raw_header(header::HeaderValue::new(
+                header::HeaderName::new_from_ascii_str("Date"),
+                spelled.clone(),
+            ))
+            .from("NoBody <nobody@domain.tld>".parse().unwrap())
+            .to("NoBody <nobody@domain.tld>".parse().unwrap())
+            .body(String::new())
             .unwrap();
 
-        assert_eq!(email.body_raw(), b"before\r\n.\r\nafter\r\n");
+        assert!(
+            String::from_utf8(email.formatted())
+                .unwrap()
+                .starts_with(&format!("Date: {spelled}\r\n"))
+        );
+    }
+
+    /// An unencodable header does not stop the builder chain; the build
+    /// step reports it, and no message is produced.
+    #[test]
+    fn unencodable_headers_fail_the_build_step() {
+        let long_id = format!("<{}@example.com>", "a".repeat(1000));
+        let base = || {
+            Message::builder()
+                .from("NoBody <nobody@domain.tld>".parse().unwrap())
+                .to("NoBody <nobody@domain.tld>".parse().unwrap())
+        };
+        for builder in [
+            base().references(long_id.clone()),
+            base().message_id(Some(long_id.clone())),
+            base().raw_header(header::HeaderValue::new(
+                header::HeaderName::new_from_ascii_str("X-Token"),
+                "t".repeat(1000),
+            )),
+            base().date(SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_800)),
+            base()
+                .subject("ok")
+                .header(header::ContentLocation::from("x\u{1}".to_owned())),
+        ] {
+            assert!(matches!(
+                builder.body(String::new()),
+                Err(crate::error::Error::InvalidInput(_))
+            ));
+        }
+    }
+
+    /// An internationalized author domain is spelled as its A-label in a
+    /// generated Message-ID rather than refused.
+    #[test]
+    fn generated_id_uses_the_a_label_of_an_idn_author_domain() {
+        let message = Message::builder()
+            .message_id(None)
+            .from("user@b\u{fc}cher.example".parse().unwrap())
+            .to("recipient@example.com".parse().unwrap())
+            .body(String::new())
+            .unwrap();
+        assert!(
+            String::from_utf8(message.formatted())
+                .unwrap()
+                .contains("@xn--bcher-kva.example>")
+        );
     }
 
     #[test]

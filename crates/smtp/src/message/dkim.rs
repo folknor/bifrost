@@ -9,9 +9,12 @@ use ed25519_compact::{KeyPair, Seed};
 use rsa::{PrivateKey as RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs1v15::Pkcs1v15Sign};
 use sha2::{Digest, Sha256};
 
-use crate::message::{
-    Headers, Message,
-    header::{HeaderName, HeaderValue},
+use crate::{
+    error::Error,
+    message::{
+        Message,
+        header::{HeaderName, HeaderValue},
+    },
 };
 
 /// Describe Dkim Canonicalization to apply to either body or headers
@@ -215,34 +218,148 @@ impl DkimConfig {
     }
 }
 
-/// Create a Headers struct with a Dkim-Signature Header created from given parameters
-fn dkim_header_format(
+fn invalid(message: &str) -> Error {
+    Error::InvalidInput(format!("DKIM: {message}"))
+}
+
+/// Refuse a configuration whose signature no verifier could accept.
+fn validate_config(config: &DkimConfig) -> Result<(), Error> {
+    let labels_ok = |name: &str, minimum: usize| {
+        let labels: Vec<&str> = name.split('.').collect();
+        labels.len() >= minimum
+            && labels.iter().all(|label| {
+                (1..=63).contains(&label.len())
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+            })
+    };
+    // RFC 6376 3.5: d= is a domain name (two labels or more), s= one or
+    // more labels, and the key lookup name must be a usable DNS name.
+    if !labels_ok(&config.domain, 2) {
+        return Err(invalid("signing domain is not a multi-label domain name"));
+    }
+    if !labels_ok(&config.selector, 1) {
+        return Err(invalid("selector is not a sequence of DNS labels"));
+    }
+    if config.selector.len() + "._domainkey.".len() + config.domain.len() > 253 {
+        return Err(invalid("selector._domainkey.domain exceeds 253 octets"));
+    }
+    // A `;` would end the h= tag and smuggle a tag into the signature.
+    if config.headers.iter().any(|name| name.contains(';')) {
+        return Err(invalid("signed header name contains ';'"));
+    }
+    // RFC 6376 5.4: From must be signed.
+    if !config
+        .headers
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("From"))
+    {
+        return Err(invalid("signed header list must include From"));
+    }
+    Ok(())
+}
+
+/// The unsigned DKIM-Signature field: every tag folded at fixed points and
+/// `b=` always opening its own line, so the signature appended later never
+/// moves anything before it. Stripping the `b=` value from the final field
+/// yields exactly this template, which is what was hashed.
+fn dkim_template(
     config: &DkimConfig,
     timestamp: u64,
-    headers_list: &str,
+    headers_list: &[String],
     body_hash: &str,
-    signature: &str,
-) -> Headers {
-    let mut headers = Headers::new();
-    let header_name =
-        dkim_canonicalize_header_tag("DKIM-Signature", config.canonicalization.header);
-    let header_name = HeaderName::new_from_ascii(header_name.into()).unwrap();
-    let prefix = format!(
-        "v=1; a={signing_algorithm}-sha256; d={domain}; s={selector}; c={canon}; q=dns/txt; t={timestamp}; h={headers_list}; bh={body_hash};",
+) -> String {
+    let mut field = format!(
+        "DKIM-Signature: v=1; a={algorithm}-sha256; d={domain}; s={selector};\r\n c={canon}; q=dns/txt; t={timestamp};\r\n h=",
+        algorithm = config.private_key.get_signing_algorithm(),
         domain = config.domain,
         selector = config.selector,
         canon = config.canonicalization,
-        signing_algorithm = config.private_key.get_signing_algorithm(),
     );
-    let encoded_prefix = HeaderValue::new(header_name.clone(), prefix.clone())
-        .get_encoded()
-        .to_owned();
-    headers.insert_raw(HeaderValue::dangerous_new_pre_encoded(
-        header_name,
-        format!("{prefix} b={signature}"),
-        format!("{encoded_prefix}\r\n b={signature}"),
-    ));
-    headers
+    // FWS is legal around the colons of h= (RFC 6376 3.5).
+    let mut column = " h=".len();
+    for (index, name) in headers_list.iter().enumerate() {
+        if index > 0 {
+            if column + 1 + name.len() > 76 {
+                field.push_str("\r\n :");
+                column = 2;
+            } else {
+                field.push(':');
+                column += 1;
+            }
+        }
+        field.push_str(name);
+        column += name.len();
+    }
+    field.push_str(&format!(";\r\n bh={body_hash};\r\n b="));
+    field
+}
+
+/// Append the signature to the template, folded in 72-octet chunks; FWS
+/// inside the b= value is ignored by verifiers (RFC 6376 3.5).
+fn dkim_signed_field(template: &str, signature: &str) -> String {
+    let chunks: Vec<&str> = signature
+        .as_bytes()
+        .chunks(72)
+        .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ASCII"))
+        .collect();
+    format!("{template}{}", chunks.join("\r\n "))
+}
+
+/// Split serialized header bytes into physical fields, each with its CRLF.
+fn header_fields(block: &str) -> Vec<(&str, &str)> {
+    let mut fields: Vec<(&str, &str)> = Vec::new();
+    let mut start = 0;
+    let bytes = block.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let end = block[index..]
+            .find("\r\n")
+            .map_or(block.len(), |offset| index + offset + 2);
+        let continuation = matches!(bytes.get(end), Some(b' ' | b'\t'));
+        if !continuation {
+            let field = &block[start..end];
+            let name = field.split(':').next().unwrap_or_default().trim_end();
+            fields.push((name, field));
+            start = end;
+        }
+        index = end;
+    }
+    fields
+}
+
+/// Canonicalize the fields named in `headers_list`, selected from the
+/// emitted header block bottom-up per RFC 6376 5.4.2: a repeated name takes
+/// successive occurrences upward, an absent occurrence contributes nothing.
+/// Simple canonicalization keeps the emitted bytes, name spelling included.
+fn dkim_canonicalize_headers<'a>(
+    headers_list: impl IntoIterator<Item = &'a str>,
+    header_block: &str,
+    canonicalization: DkimCanonicalizationType,
+) -> String {
+    let fields = header_fields(header_block);
+    let mut used = vec![false; fields.len()];
+    let mut out = String::new();
+    for name in headers_list {
+        let Some(position) = (0..fields.len())
+            .rev()
+            .find(|&i| !used[i] && fields[i].0.eq_ignore_ascii_case(name))
+        else {
+            continue;
+        };
+        used[position] = true;
+        let field = fields[position].1;
+        match canonicalization {
+            DkimCanonicalizationType::Simple => out.push_str(field),
+            DkimCanonicalizationType::Relaxed => {
+                out.push_str(&dkim_canonicalize_headers_relaxed(field));
+            }
+        }
+    }
+    out
 }
 
 /// Canonicalize the body of an email
@@ -344,129 +461,114 @@ fn dkim_canonicalize_headers_relaxed(headers: &str) -> String {
     String::from_utf8(out).expect("serialized email headers are valid UTF-8")
 }
 
-/// Canonicalize header tag
-fn dkim_canonicalize_header_tag(
-    name: &str,
-    canonicalization: DkimCanonicalizationType,
-) -> Cow<'_, str> {
-    match canonicalization {
-        DkimCanonicalizationType::Simple => Cow::Borrowed(name),
-        DkimCanonicalizationType::Relaxed => Cow::Owned(name.to_lowercase()),
-    }
-}
-
-/// Canonicalize signed headers passed as `headers_list` among `mail_headers` using canonicalization
-fn dkim_canonicalize_headers<'a>(
-    headers_list: impl IntoIterator<Item = &'a str>,
-    mail_headers: &Headers,
-    canonicalization: DkimCanonicalizationType,
-) -> String {
-    let mut covered_headers = Headers::new();
-    for name in headers_list {
-        if let Some(h) = mail_headers.find_header(name) {
-            let name = dkim_canonicalize_header_tag(name, canonicalization);
-            covered_headers.insert_raw(HeaderValue::dangerous_new_pre_encoded(
-                HeaderName::new_from_ascii(name.into()).unwrap(),
-                h.get_raw().into(),
-                h.get_encoded().into(),
-            ));
-        }
-    }
-
-    let serialized = covered_headers.to_string();
-
-    match canonicalization {
-        DkimCanonicalizationType::Simple => serialized,
-        DkimCanonicalizationType::Relaxed => dkim_canonicalize_headers_relaxed(&serialized),
-    }
-}
-
 /// Sign with Dkim a message by adding Dkim-Signature header created with configuration expressed by
 /// `dkim_config`
-pub fn dkim_sign(message: &mut Message, dkim_config: &DkimConfig) {
-    dkim_sign_fixed_time(message, dkim_config, crate::time::now());
+///
+/// The signer reads the final serialized bytes, not the header model: the
+/// signed fields are selected from the emitted header block (message
+/// headers followed by the root MIME part's headers, as they go on the
+/// wire) and the body hash covers the emitted body. An existing message
+/// level DKIM-Signature, which this insert replaces, is left out of the
+/// snapshot so the signed set is exactly the delivered one.
+///
+/// # Errors
+///
+/// `InvalidInput` when the signing domain or selector is not a DNS name,
+/// the key lookup name exceeds 253 octets, a signed header name holds `;`,
+/// From is not signed, or the signature field cannot be encoded. The
+/// message is unchanged on error.
+pub fn dkim_sign(message: &mut Message, dkim_config: &DkimConfig) -> Result<(), Error> {
+    dkim_sign_fixed_time(message, dkim_config, crate::time::now())
 }
 
-fn dkim_sign_fixed_time(message: &mut Message, dkim_config: &DkimConfig, timestamp: SystemTime) {
+fn dkim_sign_fixed_time(
+    message: &mut Message,
+    dkim_config: &DkimConfig,
+    timestamp: SystemTime,
+) -> Result<(), Error> {
+    validate_config(dkim_config)?;
     // A pre-epoch clock yields t=0 rather than panicking the signer; DKIM
     // timestamps are advisory and a verifier treats a bad one as stale.
     let timestamp = timestamp
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    let headers = message.headers();
+
+    let mut snapshot = message.clone();
+    snapshot.headers.remove_raw("DKIM-Signature");
+    let bytes = snapshot.formatted();
+    let split = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| invalid("message has no header/body separator"))?;
+    let header_block = std::str::from_utf8(&bytes[..split + 2])
+        .map_err(|_| invalid("header block is not UTF-8"))?;
+    let body = &bytes[split + 4..];
+
     let body_hash = Sha256::digest(dkim_canonicalize_body(
-        &message.body_raw(),
+        body,
         dkim_config.canonicalization.body,
     ));
     let bh = crate::base64::encode(body_hash);
-    let mut signed_headers_list =
-        dkim_config
-            .headers
-            .iter()
-            .fold(String::new(), |mut list, header| {
-                if !list.is_empty() {
-                    list.push(':');
-                }
-
-                list.push_str(header);
-                list
-            });
-    if let DkimCanonicalizationType::Relaxed = dkim_config.canonicalization.header {
-        signed_headers_list.make_ascii_lowercase();
-    }
-    let dkim_header = dkim_header_format(dkim_config, timestamp, &signed_headers_list, &bh, "");
+    let headers_list: Vec<String> = dkim_config
+        .headers
+        .iter()
+        .map(|name| match dkim_config.canonicalization.header {
+            DkimCanonicalizationType::Relaxed => name.to_ascii_lowercase(),
+            DkimCanonicalizationType::Simple => name.to_string(),
+        })
+        .collect();
+    let template = dkim_template(dkim_config, timestamp, &headers_list, &bh);
     let signed_headers = dkim_canonicalize_headers(
         dkim_config.headers.iter().map(AsRef::as_ref),
-        headers,
+        header_block,
         dkim_config.canonicalization.header,
     );
-    let canonicalized_dkim_header = dkim_canonicalize_headers(
-        ["DKIM-Signature"],
-        &dkim_header,
-        dkim_config.canonicalization.header,
-    );
+    let canonicalized_template = match dkim_config.canonicalization.header {
+        DkimCanonicalizationType::Simple => template.clone(),
+        DkimCanonicalizationType::Relaxed => dkim_canonicalize_headers_relaxed(&template),
+    };
     let mut hashed_headers = Sha256::new();
     hashed_headers.update(signed_headers.as_bytes());
-    hashed_headers.update(canonicalized_dkim_header.trim_end().as_bytes());
+    hashed_headers.update(canonicalized_template.as_bytes());
     let hashed_headers = hashed_headers.finalize();
     let signature = match &dkim_config.private_key.0 {
         InnerDkimSigningKey::Rsa(private_key) => crate::base64::encode(
             private_key
                 .sign(Pkcs1v15Sign::new::<Sha256>(), &hashed_headers)
-                .unwrap(),
+                .map_err(|_| invalid("RSA signing failed"))?,
         ),
         InnerDkimSigningKey::Ed25519(keypair) => {
             crate::base64::encode(keypair.sk.sign(hashed_headers, None).as_ref())
         }
     };
-    let dkim_header = dkim_header_format(
-        dkim_config,
-        timestamp,
-        &signed_headers_list,
-        &bh,
-        &signature,
-    );
-    let header = dkim_header.find_header("DKIM-Signature").unwrap();
+    let field = dkim_signed_field(&template, &signature);
+    let value = field
+        .strip_prefix("DKIM-Signature: ")
+        .expect("the template starts with its field name");
+    // Inserted byte-for-byte: the pre-encoded path validates framing only
+    // and never refolds, so the emitted field is the hashed template plus
+    // the b= value.
     message
         .headers
         .insert_raw(HeaderValue::dangerous_new_pre_encoded(
             HeaderName::new_from_ascii_str("DKIM-Signature"),
-            header.get_raw().to_owned(),
-            header.get_encoded().to_owned(),
-        ));
+            value.replace("\r\n", ""),
+            value.to_owned(),
+        ))
 }
 
 #[cfg(test)]
 mod test {
     use rsa::{PrivateKey as RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
+    use sha2::{Digest, Sha256};
 
     use super::{
         super::{
             Header, Message,
-            header::{HeaderName, HeaderValue},
+            header::{HeaderName, HeaderValue, Headers},
         },
         DkimCanonicalization, DkimCanonicalizationType, DkimConfig, DkimSigningAlgorithm,
-        DkimSigningKey, Headers, KeyPair, Seed, dkim_canonicalize_body, dkim_canonicalize_headers,
+        DkimSigningKey, KeyPair, Seed, dkim_canonicalize_body, dkim_canonicalize_headers,
         dkim_canonicalize_headers_relaxed, dkim_sign_fixed_time,
     };
     use crate::StdError;
@@ -516,6 +618,13 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         }
     }
 
+    /// The emitted header block of a message, as the signer reads it.
+    fn block(message: &Message) -> String {
+        let bytes = String::from_utf8(message.formatted()).unwrap();
+        let end = bytes.find("\r\n\r\n").unwrap();
+        bytes[..end + 2].to_owned()
+    }
+
     fn test_message() -> Message {
         Message::builder()
             .from("Test O'Leary <test+ezrz@example.net>".parse().unwrap())
@@ -532,10 +641,10 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         assert_eq!(
             dkim_canonicalize_headers(
                 ["From", "Test"],
-                &message.headers,
+                &block(&message),
                 DkimCanonicalizationType::Simple
             ),
-            "From: Test O'Leary <test+ezrz@example.net>\r\nTest: test  test very very long with spaces and extra spaces   \twill be\r\n folded to several lines \r\n"
+            "From: Test O'Leary <test+ezrz@example.net>\r\nTest: test  test very very long with spaces and extra spaces   \twill be folded to several lines \r\n"
         );
     }
 
@@ -545,7 +654,7 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         assert_eq!(
             dkim_canonicalize_headers(
                 ["From", "Test"],
-                &message.headers,
+                &block(&message),
                 DkimCanonicalizationType::Relaxed
             ),
             "from:Test O'Leary <test+ezrz@example.net>\r\ntest:test test very very long with spaces and extra spaces will be folded to several lines\r\n"
@@ -589,13 +698,19 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
     #[test]
     fn simple_header_canonicalization_is_a_byte_identity() {
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
-            HeaderName::new_from_ascii_str("Subject"),
-            "hello".to_owned(),
-        ));
+        headers
+            .insert_raw(HeaderValue::new(
+                HeaderName::new_from_ascii_str("Subject"),
+                "hello".to_owned(),
+            ))
+            .unwrap();
 
         assert_eq!(
-            dkim_canonicalize_headers(["Subject"], &headers, DkimCanonicalizationType::Simple),
+            dkim_canonicalize_headers(
+                ["Subject"],
+                &headers.to_string(),
+                DkimCanonicalizationType::Simple
+            ),
             "Subject: hello\r\n"
         );
     }
@@ -611,7 +726,7 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         assert_eq!(
             dkim_canonicalize_headers(
                 ["Reply-To"],
-                &message.headers,
+                &block(&message),
                 DkimCanonicalizationType::Relaxed
             ),
             ""
@@ -624,17 +739,25 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         // same name is unsupported. `Headers::insert_raw` overwrites in place,
         // so the last write wins and the earlier value is not hashed at all.
         let mut headers = Headers::new();
-        headers.insert_raw(HeaderValue::new(
-            HeaderName::new_from_ascii_str("Received"),
-            "one".to_owned(),
-        ));
-        headers.insert_raw(HeaderValue::new(
-            HeaderName::new_from_ascii_str("Received"),
-            "two".to_owned(),
-        ));
+        headers
+            .insert_raw(HeaderValue::new(
+                HeaderName::new_from_ascii_str("Received"),
+                "one".to_owned(),
+            ))
+            .unwrap();
+        headers
+            .insert_raw(HeaderValue::new(
+                HeaderName::new_from_ascii_str("Received"),
+                "two".to_owned(),
+            ))
+            .unwrap();
 
         assert_eq!(
-            dkim_canonicalize_headers(["Received"], &headers, DkimCanonicalizationType::Relaxed),
+            dkim_canonicalize_headers(
+                ["Received"],
+                &headers.to_string(),
+                DkimCanonicalizationType::Relaxed
+            ),
             "received:two\r\n"
         );
     }
@@ -698,16 +821,16 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
                 body: DkimCanonicalizationType::Simple,
             },
         );
-        let empty = super::dkim_header_format(&config, 0, "Date", &"B".repeat(44), "");
-        let signed =
-            super::dkim_header_format(&config, 0, "Date", &"B".repeat(44), &"A".repeat(344));
-        let empty = empty.find_header("DKIM-Signature").unwrap().get_encoded();
-        let signed = signed.find_header("DKIM-Signature").unwrap().get_encoded();
-
-        assert_eq!(
-            empty.strip_suffix("b=").unwrap(),
-            signed.split_once("b=").unwrap().0
+        // An 8192-bit RSA signature is 1368 base64 octets.
+        let template = super::dkim_template(&config, 0, &["Date".to_owned()], &"B".repeat(44));
+        let signed = super::dkim_signed_field(&template, &"A".repeat(1368));
+        assert!(
+            signed.split("\r\n").all(|line| line.len() <= 78),
+            "{signed}"
         );
+        let (before, after) = signed.rsplit_once("\r\n b=").unwrap();
+        assert_eq!(format!("{before}\r\n b="), template);
+        assert_eq!(after.replace("\r\n ", ""), "A".repeat(1368));
     }
 
     #[test]
@@ -797,7 +920,8 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
                 },
             ),
             std::time::UNIX_EPOCH,
-        );
+        )
+        .unwrap();
         let signed = message.formatted();
         let signed = std::str::from_utf8(&signed).unwrap();
         assert!(signed.starts_with(TEST_MESSAGE_HEADERS), "{signed}");
@@ -832,7 +956,8 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
                 },
             ),
             std::time::UNIX_EPOCH,
-        );
+        )
+        .unwrap();
         let signed = message.formatted();
         let signed = std::str::from_utf8(&signed).unwrap();
         assert!(signed.starts_with(TEST_MESSAGE_HEADERS), "{signed}");
@@ -848,10 +973,11 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
     const TEST_MESSAGE_HEADERS: &str = std::concat!(
         "From: Test O'Leary <test+ezrz@example.net>\r\n",
         "To: Test2 <test2@example.org>\r\n",
-        "Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n",
-        "Test: test  test very very long with spaces and extra spaces   \twill be\r\n",
-        " folded to several lines \r\n",
-        "Subject: Test with utf-8 =?utf-8?b?w6s=?=\r\n",
+        // The shared formatter writes the day without padding (RFC 5322
+        // `day = 1*2DIGIT`).
+        "Date: Thu, 1 Jan 1970 00:00:00 +0000\r\n",
+        "Test: test  test very very long with spaces and extra spaces   \twill be folded to several lines \r\n",
+        "Subject: =?UTF-8?B?VGVzdCB3aXRoIHV0Zi04IMOr?=\r\n",
         "Content-Type: text/plain; charset=utf-8\r\n",
         "Content-Transfer-Encoding: 7bit\r\n",
     );
@@ -877,7 +1003,7 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         );
         assert!(
             signed.contains(&format!(
-                " c={canonicalization}; q=dns/txt; t=0; h={headers_list};\r\n"
+                " c={canonicalization}; q=dns/txt; t=0;\r\n h={headers_list};\r\n"
             )),
             "{signed}"
         );
@@ -891,5 +1017,201 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
             .find(|line| line.starts_with(" b="))
             .expect("signed message should contain a DKIM signature value");
         assert!(signature_line.trim_end().len() > " b=".len());
+    }
+
+    /// A verifier written against the delivered bytes alone, sharing nothing
+    /// with the signer but the RFC-pinned relaxed canonicalizer and the body
+    /// canonicalizer: it unfolds the DKIM-Signature itself, selects the
+    /// h= fields bottom-up from the bytes, and checks bh= and b=.
+    #[allow(clippy::unwrap_in_result)]
+    fn verify(signed: &[u8], key: &KeyPair) -> Result<(), String> {
+        let signed = std::str::from_utf8(signed).unwrap();
+        let (head, body) = signed.split_once("\r\n\r\n").unwrap();
+        let head = format!("{head}\r\n");
+        let mut fields: Vec<String> = Vec::new();
+        for line in head.split_inclusive("\r\n") {
+            if line.starts_with([' ', '\t']) {
+                fields.last_mut().unwrap().push_str(line);
+            } else {
+                fields.push(line.to_owned());
+            }
+        }
+        let name_of = |field: &str| field.split(':').next().unwrap().trim().to_ascii_lowercase();
+        let signature = fields
+            .iter()
+            .position(|field| name_of(field) == "dkim-signature")
+            .ok_or("no signature")?;
+        let dkim = fields.remove(signature);
+        let tags: std::collections::HashMap<String, String> = dkim
+            .split_once(':')
+            .unwrap()
+            .1
+            .split(';')
+            .filter_map(|tag| tag.split_once('='))
+            .map(|(k, v)| {
+                (
+                    k.split_whitespace().collect(),
+                    v.split_whitespace().collect::<String>(),
+                )
+            })
+            .collect();
+        let (header_c, body_c) = tags["c"].split_once('/').unwrap();
+        let canon = |c: &str| match c {
+            "simple" => DkimCanonicalizationType::Simple,
+            _ => DkimCanonicalizationType::Relaxed,
+        };
+        let body_hash = crate::base64::encode(Sha256::digest(dkim_canonicalize_body(
+            body.as_bytes(),
+            canon(body_c),
+        )));
+        if body_hash != tags["bh"] {
+            return Err(format!("bh mismatch: {body_hash} != {}", tags["bh"]));
+        }
+        let mut used = vec![false; fields.len()];
+        let mut input = String::new();
+        for name in tags["h"].split(':') {
+            if let Some(i) = (0..fields.len())
+                .rev()
+                .find(|&i| !used[i] && name_of(&fields[i]) == name.to_ascii_lowercase())
+            {
+                used[i] = true;
+                input.push_str(&match canon(header_c) {
+                    DkimCanonicalizationType::Simple => fields[i].clone(),
+                    DkimCanonicalizationType::Relaxed => {
+                        dkim_canonicalize_headers_relaxed(&fields[i])
+                    }
+                });
+            }
+        }
+        // The signature field with the b= value removed, no trailing CRLF.
+        let b_start = dkim
+            .match_indices("b=")
+            .map(|(i, _)| i)
+            .find(|&i| {
+                dkim[..i]
+                    .trim_end_matches([' ', '\t', '\r', '\n'])
+                    .ends_with(';')
+            })
+            .unwrap()
+            + 2;
+        let b_end = dkim[b_start..]
+            .find(';')
+            .map_or(dkim.len(), |o| b_start + o);
+        let unsigned = format!("{}{}", &dkim[..b_start], &dkim[b_end..]);
+        let unsigned = unsigned.trim_end_matches("\r\n");
+        input.push_str(&match canon(header_c) {
+            DkimCanonicalizationType::Simple => unsigned.to_owned(),
+            DkimCanonicalizationType::Relaxed => dkim_canonicalize_headers_relaxed(unsigned),
+        });
+        let digest = Sha256::digest(input.as_bytes());
+        let sig = crate::base64::decode(&tags["b"]).unwrap();
+        key.pk
+            .verify(
+                digest,
+                &ed25519_compact::Signature::from_slice(&sig).unwrap(),
+            )
+            .map_err(|error| format!("signature: {error}"))
+    }
+
+    fn multipart_message() -> Message {
+        Message::builder()
+            .from("Alice <alice@example.org>".parse().unwrap())
+            .to("Bob <bob@example.net>".parse().unwrap())
+            .subject("Quarterly report")
+            .date(std::time::UNIX_EPOCH)
+            .multipart(super::super::MultiPart::alternative_plain_html(
+                "plain".to_owned(),
+                "<p>html</p>".to_owned(),
+            ))
+            .unwrap()
+    }
+
+    fn ed25519_config(
+        names: &[&'static str],
+        canonicalization: DkimCanonicalizationType,
+    ) -> (DkimConfig, KeyPair) {
+        let key = KeyPair::from_seed(Seed::new([7; 32]));
+        let config = DkimConfig::new(
+            "sel".to_owned(),
+            "example.org".to_owned(),
+            DkimSigningKey::from(key.clone()),
+            names
+                .iter()
+                .map(|name| HeaderName::new_from_ascii_str(name))
+                .collect(),
+            DkimCanonicalization {
+                header: canonicalization,
+                body: canonicalization,
+            },
+        );
+        (config, key)
+    }
+
+    /// Final-byte verification: lowercase configured names under simple
+    /// canonicalization (the emitted spelling must be hashed) and the root
+    /// part's Content-Type (emitted after the message headers) both sign
+    /// what a verifier reads.
+    #[test]
+    fn signature_verifies_against_the_delivered_bytes() {
+        for canonicalization in [
+            DkimCanonicalizationType::Simple,
+            DkimCanonicalizationType::Relaxed,
+        ] {
+            let mut message = multipart_message();
+            let (config, key) = ed25519_config(
+                &[
+                    "from",
+                    "to",
+                    "subject",
+                    "date",
+                    "content-type",
+                    "mime-version",
+                ],
+                canonicalization,
+            );
+            dkim_sign_fixed_time(&mut message, &config, std::time::UNIX_EPOCH).unwrap();
+            verify(&message.formatted(), &key).unwrap();
+            // Re-signing replaces the field and still verifies.
+            dkim_sign_fixed_time(&mut message, &config, std::time::UNIX_EPOCH).unwrap();
+            verify(&message.formatted(), &key).unwrap();
+        }
+    }
+
+    #[test]
+    fn unverifiable_configurations_are_refused_without_mutation() {
+        let message = multipart_message();
+        let key = KeyPair::from_seed(Seed::new([7; 32]));
+        let config = |domain: &str, selector: &str, names: Vec<HeaderName>| {
+            DkimConfig::new(
+                selector.to_owned(),
+                domain.to_owned(),
+                DkimSigningKey::from(key.clone()),
+                names,
+                DkimCanonicalization::default(),
+            )
+        };
+        let from = || vec![HeaderName::new_from_ascii_str("From")];
+        for bad in [
+            config("localhost", "sel", from()),
+            config("example.org", "sel; t=0", from()),
+            config(
+                "example.org",
+                "sel",
+                vec![HeaderName::new_from_ascii_str("To")],
+            ),
+            config(
+                "example.org",
+                "sel",
+                vec![
+                    HeaderName::new_from_ascii_str("From"),
+                    HeaderName::new_from_ascii_str("X;z=1"),
+                ],
+            ),
+            config(&format!("{}.example.org", "a".repeat(64)), "sel", from()),
+        ] {
+            let mut signed = message.clone();
+            assert!(dkim_sign_fixed_time(&mut signed, &bad, std::time::UNIX_EPOCH).is_err());
+            assert_eq!(signed.formatted(), message.formatted());
+        }
     }
 }

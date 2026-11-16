@@ -30,7 +30,7 @@ getrandom = { workspace = true }
 
 tracing = { workspace = true, features = ["std"], optional = true }
 
-jiff = { workspace = true, optional = true }
+jiff = { workspace = true }
 httpdate = "1"
 mime = "0.3.4"
 fastrand = "2.0"
@@ -69,7 +69,6 @@ test-support = ["tokio"]
 account-error = []
 
 tokio = [
-    "dep:jiff",
     "dep:tokio",
     "tokio/rt",
     "tokio/time",

@@ -17,16 +17,6 @@ pub(super) enum Part {
     Multi(MultiPart),
 }
 
-impl Part {
-    #[cfg(feature = "dkim")]
-    pub(super) fn format_body(&self, out: &mut Vec<u8>) {
-        match self {
-            Part::Single(part) => part.format_body(out),
-            Part::Multi(part) => part.format_body(out),
-        }
-    }
-}
-
 impl EmailFormat for Part {
     fn format(&self, out: &mut Vec<u8>) {
         match self {
@@ -51,15 +41,23 @@ impl SinglePartBuilder {
     }
 
     /// Set the header to singlepart
-    pub fn header<H: Header>(mut self, header: H) -> Self {
-        self.headers.set(header);
-        self
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when the header cannot be encoded (see
+    /// [`Headers::set`]).
+    pub fn header<H: Header>(mut self, header: H) -> Result<Self, crate::error::Error> {
+        self.headers.set(header)?;
+        Ok(self)
     }
 
     /// Set the Content-Type header of the singlepart
-    pub fn content_type(mut self, content_type: ContentType) -> Self {
-        self.headers.set(content_type);
-        self
+    ///
+    /// # Errors
+    ///
+    /// As [`SinglePartBuilder::header`].
+    pub fn content_type(self, content_type: ContentType) -> Result<Self, crate::error::Error> {
+        self.header(content_type)
     }
 
     /// Build singlepart using body
@@ -70,9 +68,9 @@ impl SinglePartBuilder {
         if self.headers.get::<ContentType>().is_none()
             && let Some(content_type) = body.default_content_type()
         {
-            self.headers.set(content_type);
+            self.headers.set_known(content_type);
         }
-        self.headers.set(body.encoding());
+        self.headers.set_known(body.encoding());
 
         SinglePart {
             headers: self.headers,
@@ -97,7 +95,7 @@ impl Default for SinglePartBuilder {
 /// # use std::error::Error;
 /// # fn main() -> Result<(), Box<dyn Error>> {
 /// let part = SinglePart::builder()
-///     .header(header::ContentType::TEXT_PLAIN)
+///     .header(header::ContentType::TEXT_PLAIN)?
 ///     .body(String::from("Текст письма в уникоде"));
 /// # Ok(())
 /// # }
@@ -117,16 +115,18 @@ impl SinglePart {
 
     /// Directly create a `SinglePart` from a plain UTF-8 content
     pub fn plain<T: IntoBody>(body: T) -> Self {
-        Self::builder()
-            .header(header::ContentType::TEXT_PLAIN)
-            .body(body)
+        Self::with_known_type(header::ContentType::TEXT_PLAIN, body)
     }
 
     /// Directly create a `SinglePart` from a UTF-8 HTML content
     pub fn html<T: IntoBody>(body: T) -> Self {
-        Self::builder()
-            .header(header::ContentType::TEXT_HTML)
-            .body(body)
+        Self::with_known_type(header::ContentType::TEXT_HTML, body)
+    }
+
+    fn with_known_type<T: IntoBody>(content_type: ContentType, body: T) -> Self {
+        let mut builder = Self::builder();
+        builder.headers.set_known(content_type);
+        builder.body(body)
     }
 
     /// Get the headers from singlepart
@@ -192,33 +192,52 @@ pub enum MultiPartKind {
     Signed { protocol: String, micalg: String },
 }
 
-/// Rebuild `mime` with its `boundary` parameter replaced, keeping every other
-/// parameter - including ones this crate has no vocabulary for - exactly as
-/// the caller wrote it.
+/// Edit the caller's `Content-Type` spelling so its only `boundary` parameter
+/// is `boundary`, keeping every other parameter, the subtype and all other
+/// bytes as written.
 ///
-/// Returns `None` when a parameter value cannot be re-emitted losslessly as a
-/// quoted string (it contains a `"` or a `\`); the caller then falls back to
-/// rebuilding from `MultiPartKind`, which is what always happened before.
-fn replace_boundary_param(mime: &Mime, boundary: &str) -> Option<Mime> {
-    let mut rebuilt = format!("{}/{}", mime.type_(), mime.subtype());
-    if let Some(suffix) = mime.suffix() {
-        rebuilt.push('+');
-        rebuilt.push_str(suffix.as_str());
-    }
-    rebuilt.push_str(&format!("; boundary=\"{boundary}\""));
-
-    for (name, value) in mime.params() {
-        if name == mime::BOUNDARY {
-            continue;
+/// Every existing `boundary` parameter is removed (case-insensitive, quote
+/// aware), together with its own separator, then the new one is spliced in
+/// right after the first `;` as `; boundary="..";` followed by that `;`'s
+/// original whitespace. Folding units (a token and the whitespace run before
+/// it) therefore never grow: the type unit already owns its `;`, retained
+/// parameters keep their runs, and the new unit has a fresh single space and
+/// is at most 85 octets. A value that encoded before still encodes after,
+/// which is what lets the boundary re-roll stay infallible. With no
+/// parameter at all the type unit gains one `;` - that case only arises when
+/// a Content-Type first enters a multipart builder, where insertion is
+/// fallible.
+fn with_boundary(source: &str, boundary: &str) -> String {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in source.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if byte == b';' && !quoted {
+            segments.push(&source[start..index]);
+            start = index + 1;
         }
-        let value = value.as_str();
-        if value.contains('"') || value.contains('\\') {
-            return None;
-        }
-        rebuilt.push_str(&format!("; {name}=\"{value}\""));
     }
-
-    rebuilt.parse().ok()
+    segments.push(&source[start..]);
+    let type_unit = segments.remove(0);
+    let new = format!("boundary=\"{boundary}\"");
+    let kept: Vec<&str> = segments
+        .into_iter()
+        .filter(|segment| {
+            let name = segment.split('=').next().unwrap_or_default().trim();
+            !name.eq_ignore_ascii_case("boundary")
+        })
+        .collect();
+    if kept.is_empty() {
+        return format!("{type_unit}; {new}");
+    }
+    format!("{type_unit}; {new};{}", kept.join(";"))
 }
 
 /// Create a cryptographically random MIME boundary.
@@ -306,10 +325,15 @@ impl MultiPartKind {
     }
 }
 
+/// Longest kind parameter value accepted, so a kind-derived Content-Type,
+/// where each parameter is its own folding unit, always fits 998 octets.
+const KIND_PARAM_MAX: usize = 900;
+
 fn is_mime_token(value: &str) -> bool {
     const TSPECIALS: &[u8] = b"()<>@,;:\\\"/[]?=";
 
     !value.is_empty()
+        && value.len() <= KIND_PARAM_MAX
         && value
             .bytes()
             .all(|byte| byte > b' ' && byte < 0x7f && !TSPECIALS.contains(&byte))
@@ -328,6 +352,7 @@ fn is_mime_boundary(value: &str) -> bool {
 
 fn is_mime_quoted_value(value: &str) -> bool {
     !value.is_empty()
+        && value.len() <= KIND_PARAM_MAX
         && value
             .bytes()
             .all(|byte| (b' '..=b'~').contains(&byte) && !matches!(byte, b'"' | b'\\'))
@@ -348,14 +373,36 @@ impl MultiPartBuilder {
     }
 
     /// Set a header
-    pub fn header<H: Header>(mut self, header: H) -> Self {
-        self.headers.set(header);
-        self
+    ///
+    /// A `Content-Type` without a `boundary` gets a generated one here, so
+    /// every later boundary edit only replaces an existing parameter.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` when the header, or the Content-Type with its added
+    /// boundary, cannot be encoded (see [`Headers::set`]).
+    pub fn header<H: Header>(mut self, header: H) -> Result<Self, crate::error::Error> {
+        self.headers.set(header)?;
+        if let Some(content_type) = self.headers.get::<ContentType>()
+            && content_type.as_ref().get_param(mime::BOUNDARY).is_none()
+        {
+            let spelled = with_boundary(content_type.as_ref().as_ref(), &make_boundary());
+            let mime = spelled.parse::<Mime>().map_err(|_| {
+                crate::error::Error::InvalidInput(
+                    "multipart Content-Type does not accept a boundary parameter".to_owned(),
+                )
+            })?;
+            self.headers.set(ContentType::from_mime(mime))?;
+        }
+        Ok(self)
     }
 
     /// Set `Content-Type` header using [`MultiPartKind`]
-    pub fn kind(self, kind: MultiPartKind) -> Self {
-        self.header(ContentType::from_mime(kind.to_mime::<String>(None)))
+    pub fn kind(mut self, kind: MultiPartKind) -> Self {
+        // The kind's parameters are validated and bounded by `to_mime`.
+        self.headers
+            .set_known(ContentType::from_mime(kind.to_mime::<String>(None)));
+        self
     }
 
     /// Set custom boundary
@@ -376,29 +423,36 @@ impl MultiPartBuilder {
                     .to_owned(),
             ));
         }
-        let kind = self
-            .headers
-            .get::<ContentType>()
-            .and_then(|content_type| MultiPartKind::from_mime(content_type.as_ref()))
-            .unwrap_or(MultiPartKind::Mixed);
-        let mime = kind.to_mime(Some(boundary));
-        self.headers.set(ContentType::from_mime(mime));
+        match self.headers.get::<ContentType>() {
+            // A Content-Type here already carries a boundary (added when it
+            // was inserted), so this edit only replaces it and stays
+            // encodable; see `with_boundary`.
+            Some(content_type) => {
+                let mime = with_boundary(content_type.as_ref().as_ref(), &boundary)
+                    .parse::<Mime>()
+                    .map_err(|_| {
+                        crate::error::Error::InvalidInput(
+                            "multipart Content-Type does not accept a boundary parameter"
+                                .to_owned(),
+                        )
+                    })?;
+                self.headers.set(ContentType::from_mime(mime))?;
+            }
+            None => self.headers.set_known(ContentType::from_mime(
+                MultiPartKind::Mixed.to_mime(Some(boundary)),
+            )),
+        }
         Ok(self)
     }
 
     /// Creates multipart without parts
     pub fn build(mut self) -> MultiPart {
-        match self.headers.get::<ContentType>() {
-            None => self.headers.set(ContentType::from_mime(
+        // Any Content-Type set through `header` or `kind` already has a
+        // boundary; only the absent case remains.
+        if self.headers.get::<ContentType>().is_none() {
+            self.headers.set_known(ContentType::from_mime(
                 MultiPartKind::Mixed.to_mime::<String>(None),
-            )),
-            Some(content_type) if content_type.as_ref().get_param("boundary").is_none() => {
-                let kind =
-                    MultiPartKind::from_mime(content_type.as_ref()).unwrap_or(MultiPartKind::Mixed);
-                self.headers
-                    .set(ContentType::from_mime(kind.to_mime::<String>(None)));
-            }
-            Some(_) => {}
+            ));
         }
 
         MultiPart {
@@ -644,27 +698,21 @@ impl MultiPart {
             return;
         }
 
-        let existing = self.headers.get::<ContentType>();
-        let kind = existing
-            .as_ref()
-            .and_then(|content_type| MultiPartKind::from_mime(content_type.as_ref()))
-            .unwrap_or(MultiPartKind::Mixed);
+        let existing = self
+            .headers
+            .get::<ContentType>()
+            .expect("a built multipart has a Content-Type with a boundary");
         loop {
             let boundary = make_boundary();
             if !self.parts_contain_boundary(&boundary, 0) {
-                // Re-roll the BOUNDARY, not the whole Content-Type. Rebuilding
-                // from `MultiPartKind` alone reproduces only the parameters
-                // this crate knows about, so any parameter a caller set on the
-                // multipart Content-Type itself - a vendor param, a `charset`,
-                // anything outside the kind's own vocabulary - vanished the
-                // moment a part forced a re-roll.
-                let mime = existing
-                    .as_ref()
-                    .and_then(|content_type| {
-                        replace_boundary_param(content_type.as_ref(), &boundary)
-                    })
-                    .unwrap_or_else(|| kind.to_mime(Some(boundary)));
-                self.headers.set(ContentType::from_mime(mime));
+                // Re-roll the BOUNDARY, not the whole Content-Type: the edit
+                // keeps every other parameter and the subtype as the caller
+                // spelled them, and keeps the value encodable (see
+                // `with_boundary`), so no parameter is ever dropped.
+                let mime = with_boundary(existing.as_ref().as_ref(), &boundary)
+                    .parse::<Mime>()
+                    .expect("replacing a valid boundary keeps the Content-Type parseable");
+                self.headers.set_known(ContentType::from_mime(mime));
                 return;
             }
         }
@@ -681,6 +729,55 @@ impl MultiPart {
                     .windows(marker.len())
                     .any(|window| window == marker.as_bytes())
         })
+    }
+}
+
+/// Test-only chaining over the fallible part-builder `header` step, so the
+/// many fixtures that insert valid headers read as before; any refusal
+/// panics the test that hit it.
+#[cfg(test)]
+#[allow(clippy::unwrap_in_result)]
+pub(crate) trait ChainOk<B> {
+    fn header<H: Header>(self, header: H) -> Result<B, crate::error::Error>;
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_in_result)]
+impl ChainOk<SinglePartBuilder> for Result<SinglePartBuilder, crate::error::Error> {
+    fn header<H: Header>(self, header: H) -> Result<SinglePartBuilder, crate::error::Error> {
+        self.expect("valid fixture header").header(header)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_in_result)]
+impl ChainOk<MultiPartBuilder> for Result<MultiPartBuilder, crate::error::Error> {
+    fn header<H: Header>(self, header: H) -> Result<MultiPartBuilder, crate::error::Error> {
+        self.expect("valid fixture header").header(header)
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait BodyOk {
+    fn body<T: IntoBody>(self, body: T) -> SinglePart;
+}
+
+#[cfg(test)]
+impl BodyOk for Result<SinglePartBuilder, crate::error::Error> {
+    fn body<T: IntoBody>(self, body: T) -> SinglePart {
+        self.expect("valid fixture header").body(body)
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait PartsOk {
+    fn singlepart(self, part: SinglePart) -> MultiPart;
+}
+
+#[cfg(test)]
+impl PartsOk for Result<MultiPartBuilder, crate::error::Error> {
+    fn singlepart(self, part: SinglePart) -> MultiPart {
+        self.expect("valid fixture header").singlepart(part)
     }
 }
 
@@ -1207,6 +1304,28 @@ mod test {
         assert!(!is_mime_token("delivery\r\nstatus"));
         assert!(!is_mime_token("delivery/status"));
         assert!(!is_mime_token("delivery\u{80}status"));
+    }
+
+    /// The boundary edit drops every old boundary (quote and case aware),
+    /// keeps other parameters and their whitespace, and gives the new unit a
+    /// fresh single space, so a value that encoded keeps encoding.
+    #[test]
+    fn boundary_edit_replaces_every_boundary_and_keeps_spelling() {
+        assert_eq!(
+            with_boundary(
+                "multipart/x-vendor; BOUNDARY=a;  x=\"q;boundary=z\";boundary=\"b\"",
+                "new"
+            ),
+            "multipart/x-vendor; boundary=\"new\";  x=\"q;boundary=z\""
+        );
+        let edited = with_boundary(
+            &format!("multipart/mixed;{}boundary=b", " ".repeat(988)),
+            &make_boundary(),
+        );
+        let mut headers = Headers::new();
+        headers.set_known(ContentType::parse(&edited).unwrap());
+        let mime: Mime = edited.parse().unwrap();
+        assert_eq!(mime.get_param(mime::BOUNDARY).unwrap().as_str().len(), 40);
     }
 
     #[test]

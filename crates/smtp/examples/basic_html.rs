@@ -30,6 +30,7 @@ fn main() {
                 .singlepart(
                     SinglePart::builder()
                         .header(header::ContentType::TEXT_PLAIN)
+                        .expect("constant header")
                         .body(String::from(
                             "Hello from Bifrost SMTP! A mailer library for Rust",
                         )), // Every message should have a plain text fallback.
@@ -37,6 +38,7 @@ fn main() {
                 .singlepart(
                     SinglePart::builder()
                         .header(header::ContentType::TEXT_HTML)
+                        .expect("constant header")
                         .body(String::from(html)),
                 ),
         )

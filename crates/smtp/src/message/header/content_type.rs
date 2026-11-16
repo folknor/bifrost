@@ -69,7 +69,10 @@ impl Header for ContentType {
     }
 
     fn display(&self) -> HeaderValue {
-        HeaderValue::new(Self::name(), self.0.to_string())
+        // Structured, not Parameterized: the shared writer turns a long
+        // ASCII parameter into RFC 2231 continuations, and a 70-octet
+        // `boundary` written as `boundary*0*=` breaks many MIME parsers.
+        HeaderValue::structured(Self::name(), self.0.to_string())
     }
 }
 
@@ -168,28 +171,28 @@ mod test {
     fn format_content_type() {
         let mut headers = Headers::new();
 
-        headers.set(ContentType::TEXT_PLAIN);
+        headers.set_known(ContentType::TEXT_PLAIN);
 
         assert_eq!(
             headers.to_string(),
             "Content-Type: text/plain; charset=utf-8\r\n"
         );
 
-        headers.set(ContentType::TEXT_HTML);
+        headers.set_known(ContentType::TEXT_HTML);
 
         assert_eq!(
             headers.to_string(),
             "Content-Type: text/html; charset=utf-8\r\n"
         );
 
-        headers.set(ContentType::text_plain_flowed());
+        headers.set_known(ContentType::text_plain_flowed());
 
         assert_eq!(
             headers.to_string(),
             "Content-Type: text/plain; charset=utf-8; format=flowed\r\n"
         );
 
-        headers.set(ContentType::text_plain_flowed_delsp());
+        headers.set_known(ContentType::text_plain_flowed_delsp());
 
         assert_eq!(
             headers.to_string(),
@@ -201,14 +204,14 @@ mod test {
     fn parse_content_type() {
         let mut headers = Headers::new();
 
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("Content-Type"),
             "text/plain; charset=utf-8".to_owned(),
         ));
 
         assert_eq!(headers.get::<ContentType>(), Some(ContentType::TEXT_PLAIN));
 
-        headers.insert_raw(HeaderValue::new(
+        headers.insert_known(HeaderValue::new(
             HeaderName::new_from_ascii_str("Content-Type"),
             "text/html; charset=utf-8".to_owned(),
         ));

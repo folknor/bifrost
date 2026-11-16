@@ -800,7 +800,7 @@ For DATA the declared size is `message.len()` when the buffer already ends in CR
 
 The chunked writer (`message_iter`, and the LMTP equivalent) makes the same decision without buffering the message: it tracks the last two bytes written across chunk boundaries, so a CRLF split across two iterator items is still recognized as the message's final CRLF.
 
-A consequence: `Message::formatted()` is byte-identical to the delivered data section for any message ending in CRLF - delivery no longer appends an empty line the sender did not write. `body_raw()` still appends an unconditional CRLF before DKIM canonicalization, which is harmless in both directions because RFC 6376 simple and relaxed body canonicalization each strip trailing empty lines; signing and delivery still agree.
+A consequence: `Message::formatted()` is byte-identical to the delivered data section for any message ending in CRLF - delivery no longer appends an empty line the sender did not write. The DKIM signer hashes the body of those same formatted bytes, so signing and delivery agree by construction.
 
 ## Auth
 
@@ -903,16 +903,72 @@ public configuration options, not test-only APIs.
 
 `Message::builder()` produces a builder for typed headers (From, To, Cc, Bcc, Reply-To, Subject, Date, Message-Id, In-Reply-To, References, MIME-Version, Content-Type, ...). `reply_to_many(...)` for RFC 5322 address-list `Reply-To`.
 
-Display-name encoding emits RFC 5322 phrase text when the name is atom-shaped, quotes and escapes ASCII names that need it, and uses RFC 2047 encoded words for names requiring encoding.
+### Header encoding and its failure contract
 
-Header folding is space-driven, so an unbreakable all-ASCII token (no spaces,
-hundreds of characters) is written verbatim and its line can exceed 78 octets:
-the writer does not split such a token or enforce the RFC 5322 Section 2.1.1
-998-octet hard limit. A sufficiently long token can therefore exceed that limit
-as well as the recommended 78 octets. Folding inside an atom would change the
-value; callers must keep unbreakable tokens within the hard line limit. Long
-non-ASCII display names are unaffected - encoded words are individually short
-and the writer folds between them.
+Every header is written by the shared `bifrost-mime` writer
+(`write_header`, see `reference/mime.md`), so the builder and the
+`SendRequest` renderer apply one encoding, folding and hard-limit policy:
+prefer 78-octet lines, never exceed 998, RFC 2047 where it is legal, and an
+indivisible structured token that cannot fit is refused, never written long.
+
+`Header::display` describes, it does not encode: a `HeaderValue` is a name,
+the raw value typed getters parse back, and a declared grammar
+(`HeaderValue::new` for the caller's own spelling, `unstructured`,
+`message_ids`, `structured`, `mailboxes`, `parameterized`,
+`dangerous_new_pre_encoded`). Encoding happens once, when a value enters a
+`Headers`: `Headers::set` and `Headers::insert_raw` return `Result` and
+encode before replacing anything, so a refused value leaves the old entry.
+A `Headers` therefore only holds validated bytes, and `Display`,
+`formatted()` and the DKIM signer read exactly those bytes. Where the
+failure surfaces:
+
+- `MessageBuilder` setters keep chaining and latch the first refusal; the
+  build step (`body`, `singlepart`, `multipart`) reports it as
+  `InvalidInput` before anything else, and it never reaches a `Message`.
+- `SinglePartBuilder::header` / `content_type`, `MultiPartBuilder::header`
+  and `Attachment::body` return `Result`, since the part builders end in
+  infallible steps.
+- Headers the crate builds from constants or validated input (transfer
+  encoding, MIME-Version, kind-derived Content-Type, a boundary re-roll) go
+  through an internal path that cannot fail; kind parameters
+  (`report_type`, `protocol`, `micalg`) are bounded at 900 octets by the
+  same validators that already panic in the infallible constructors.
+
+Grammar per typed header: Subject and Comments are unstructured;
+From/Sender/To/Cc/Bcc/Reply-To are address lists; Message-ID, In-Reply-To,
+References and Content-ID are message ids; Content-Type, Content-Location,
+List-* URLs, Content-Transfer-Encoding, MIME-Version and a minted Date are
+structured ASCII, never encoded; Content-Disposition is parameterized
+(RFC 2231 for long or non-ASCII file names); Keywords, List-ID and User-Agent
+are stored unparsed and take the caller-spelling rule. Content-Type is
+structured rather than parameterized because the shared parameter rule
+turns a long ASCII value into RFC 2231 continuations, and a 70-octet
+`boundary*0*=` breaks many MIME parsers.
+
+The caller-spelling rule (`HeaderValue::new`): legal wire text (printable
+ASCII and WSP, CRLF only as a fold before WSP, every line within 998
+octets) is emitted byte-for-byte, with no trim and no inserted fold. That is
+how a caller's `Date` stays byte-for-byte. Otherwise words holding non-ASCII
+or control octets become encoded words and the value folds at 78; an ASCII
+word is never encoded, because the grammar is unknown, so one past 998
+octets is refused. A refused long phrase word in Keywords or List-ID is the
+cost of those headers being unparsed.
+
+`dangerous_new_pre_encoded` validates framing only; that its raw and encoded
+values mean the same thing stays the caller's responsibility.
+
+Display-name encoding emits RFC 5322 phrase text when the name is atom-shaped, quotes and escapes ASCII names that need it, and uses RFC 2047 encoded words for long or non-ASCII names or names holding control octets.
+
+A minted `Date` (`date`, `date_now`, the automatic one) comes from the shared
+`format_rfc5322_date`: UTC, whole seconds, `+0000`, unpadded day. `Date::new`
+returns `Result` and refuses a year outside `1900..=9999`.
+
+A multipart `Content-Type` gets its `boundary` when it enters a multipart
+builder. Later boundary edits (`try_boundary`, the collision re-roll) edit
+the caller's spelling: every existing `boundary` parameter is removed and the
+new one is spliced after the first `;` with a fresh single space, so no other
+parameter, no subtype and no whitespace run changes, and a value that encoded
+keeps encoding.
 
 `MultiPart` kinds: `Mixed`, `Alternative`, `Related`, `Signed`, `Encrypted`, `Report { report_type }`. `Mixed` is the default for `MultiPart::builder().build()`.
 
@@ -923,12 +979,12 @@ parameter on the multipart `Content-Type` verbatim, including ones outside this
 crate's vocabulary. Rebuilding the header from `MultiPartKind` alone would
 reproduce only the kind's own parameters, and since a re-roll is data-driven,
 the same message would keep or lose a caller's vendor parameter depending on
-its body. The fallback to a kind-rebuilt header remains for the one case a
-lossless rebuild cannot cover: a parameter value containing a `"` or a `\`.
+its body. The edit works on the caller's spelling, so there is no fallback
+case that loses parameters.
 
 `SinglePartBuilder::body(String)` and `MessageBuilder::body(String)` infer `Content-Type: text/plain; charset=utf-8` when no content type is set.
 
-`MessageBuilder::body` CRLF-normalizes bare LF at the builder boundary, so a byte body never reaches the DATA writer's defensive bare-LF dot-stuffing and gains a literal extra dot on a CRLF-strict relay. Normalization is scoped by the encoding that will actually be emitted: `String` input always normalizes, and `Vec<u8>` input normalizes only when it goes on the wire as literal `7bit`/`8bit` text. Byte input that is re-encoded (base64, `binary`) is opaque payload and is passed through untouched, so `0x0A` inside a binary attachment survives the round trip. `body_raw()` (DKIM) and the DATA writer both see the normalized buffer, so signing and delivery still agree. A pre-encoded `Body` is never rewritten.
+`MessageBuilder::body` CRLF-normalizes bare LF at the builder boundary, so a byte body never reaches the DATA writer's defensive bare-LF dot-stuffing and gains a literal extra dot on a CRLF-strict relay. Normalization is scoped by the encoding that will actually be emitted: `String` input always normalizes, and `Vec<u8>` input normalizes only when it goes on the wire as literal `7bit`/`8bit` text. Byte input that is re-encoded (base64, `binary`) is opaque payload and is passed through untouched, so `0x0A` inside a binary attachment survives the round trip. The DKIM signer and the DATA writer both read the formatted bytes, so they see the same normalized buffer. A pre-encoded `Body` is never rewritten.
 
 One encoding decision governs both steps: the encoding chosen from the input
 decides whether the buffer is normalized, and that same encoding is what the
@@ -955,7 +1011,24 @@ Batch builders: `MultiPart::multiparts(...)` and `.singleparts(...)`.
 
 Default canonicalization is `relaxed/relaxed`. `DkimSigningKey` implements `From<rsa::RsaPrivateKey>` and `From<ed25519_compact::KeyPair>`; `new` also parses an RSA PKCS#1 PEM or a base64-encoded Ed25519 seed. RSA signing passes `sha2::Sha256` to `rsa::pkcs1v15::Pkcs1v15Sign::new`, so compatibility follows the digest traits required by that API rather than a fixed pair of crate versions.
 
-Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Relaxed headers are normalized iteratively, and `DKIM-Signature` is folded before `b=` before hashing so simple header canonicalization signs the exact emitted bytes. The signer intentionally does not support the `l=` body-length tag because it enables content-append attacks.
+Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Relaxed headers are normalized iteratively. The signer intentionally does not support the `l=` body-length tag because it enables content-append attacks.
+
+The signer reads the final bytes, not the header model. It serializes the
+message once (with any existing message-level `DKIM-Signature` removed, since
+the insert replaces it), selects the `h=` fields from the emitted header
+block bottom-up (RFC 6376 5.4.2), which includes the root MIME part's
+headers such as a multipart `Content-Type`, and hashes the emitted body.
+Simple canonicalization hashes the emitted field spelling, not the
+configured name. The `DKIM-Signature` field is a fixed template - tags
+folded at fixed points, `b=` always opening its own line - plus the
+signature in 72-octet folded chunks, so an 8192-bit RSA signature fits and
+stripping the `b=` value yields exactly the hashed template; it is inserted
+byte-for-byte. `Message::sign` / `dkim_sign` return `Result` and refuse,
+without touching the message, a `d=` that is not a multi-label DNS name, an
+`s=` that is not DNS labels, a lookup name past 253 octets, a signed header
+name holding `;`, and an `h=` list without From.
+`signature_verifies_against_the_delivered_bytes` verifies a signature with an
+independent verifier over the delivered bytes.
 
 ## Pool
 
@@ -1469,3 +1542,16 @@ original shared `Address`, including its display name, so failed and uncertain
 recipients are returned directly even when LMTP skips RCPT refusals during its
 final-status drain. Enterprise users receive the intended recipient on each
 failure receipt instead of a recipient inferred from lane position.
+
+## Builder-generated Message-ID
+
+`message_id(None)` requests generation at build time, after resolving authors.
+A single From supplies the domain even with Sender; multiple From authors use
+the required Sender. An explicit envelope does not select the identity. This
+keeps shared-mailbox messages associated with the mailbox an enterprise user
+selected. `message_id_domain` overrides the generated domain without requesting
+generation itself. An internationalized domain is written as its A-label,
+so an IDN mailbox keeps its identity. Empty and non-dot-atom domains fail as
+local `InvalidInput`, as does an id the shared writer cannot fit on one line;
+callers can provide an explicit usable domain for domain-literal authors. No machine-hostname fallback is used. Explicit Message-ID headers win,
+and omitting `message_id(None)` still leaves generation to the relay.
