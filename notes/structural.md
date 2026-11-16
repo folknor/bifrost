@@ -42,17 +42,6 @@ flattened, non-ASCII attachment filenames go out as raw UTF-8. The chain
 it plus Message-ID and Date policy, then one entity serializer) is in
 `notes/mime-writer-unification.md`. The builder is published and stays.
 
-## STR-062 - Protocol-value behaviour lives in IMAP `account/`, and account identity lives in `types/`
-
-**Reported by:** imap-protocol, imap-account.
-
-The set algebra, the FETCH merge and the `~imap-wire:` mailbox identity moved
-to their owners. What remains is the registry side: `FolderEntry` bundles LIST
-facts, ownership, MYRIGHTS, a cursor hint, a MODSEQ cache and a last-seen
-instant behind four locks, and is the implicit owner of folder roles; making
-roles, ownership and the shared-error mapping explicit registry
-responsibilities (BUG-028, BUG-046) gives those decisions a home.
-
 ## STR-071 - The IMAP pipeline has one production caller; the rest of discovery is still sequential
 
 **Reported by:** imap-connection. Narrowed 2026-11-16: the gate bypass and the

@@ -1104,3 +1104,117 @@ async fn the_final_batch_and_done_carry_the_same_checkpoint() {
     );
     let _server = script.await.unwrap();
 }
+
+fn shared_box() -> crate::types::MailboxName {
+    crate::types::MailboxName::new("Shared/Box").unwrap()
+}
+
+fn shared_box_registry() -> FolderRegistry {
+    FolderRegistry::from_lists(
+        Vec::new(),
+        vec![crate::account::folder_registry::SharedFolderEntry {
+            info: MailboxInfo {
+                name: shared_box(),
+                ..MailboxInfo::default()
+            },
+            owner: bifrost_types::PrincipalId("alice".to_owned()),
+            rights: None,
+            namespace_prefix: "Shared/".to_owned(),
+        }],
+    )
+}
+
+fn shared_box_cursor() -> ChangeCursor {
+    crate::account::encode_cursor(
+        crate::account::folder_scope(&shared_box()),
+        &FolderCursor::Basic {
+            uidvalidity: crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(10),
+            known_uids: UidSet::from_numbers([1, 2]),
+        },
+    )
+}
+
+fn deleted(name: crate::types::MailboxName) -> MailboxInfo {
+    MailboxInfo {
+        name,
+        attributes: vec![crate::types::MailboxAttribute::NonExistent],
+        ..MailboxInfo::default()
+    }
+}
+
+/// The share's owner is captured before EXAMINE goes out. A mailbox event
+/// that drops the entry while the command is in flight must not turn the
+/// denial into an account-wide permission loss: an enterprise user whose
+/// share was withdrawn loses that folder, not the account.
+#[tokio::test]
+async fn a_share_deleted_during_select_still_quarantines_only_that_folder() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, shared_box_registry());
+    let folders = std::sync::Arc::clone(&account.folders);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("EXAMINE \"Shared/Box\""), "{select}");
+        folders.apply_mailbox_event(deleted(shared_box()));
+        respond(
+            &mut server,
+            &format!("{} NO [NOPERM] access revoked\r\n", tag_of(&select)),
+        )
+        .await;
+        server
+    });
+    let events = collect_changes(account, shared_box_cursor()).await;
+    let Some(SyncEvent::Terminated(error)) = events.last() else {
+        panic!("a denied EXAMINE terminates the stream, got {events:?}");
+    };
+    assert_eq!(
+        error.kind(),
+        &bifrost_types::AccountErrorKind::SyncState(
+            bifrost_types::SyncStateErrorKind::ScopeRevoked
+        )
+    );
+    let _server = script.await.unwrap();
+}
+
+/// SELECT observations land on the incarnation that was selected. A folder
+/// deleted and recreated while the command is in flight is a new folder the
+/// account has not seen.
+#[tokio::test]
+async fn a_folder_recreated_during_select_is_not_marked_seen() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_sync_account(conn, 1, false, None, inbox_registry());
+    let selected = account.folders.get(&inbox()).unwrap();
+    let folders = std::sync::Arc::clone(&account.folders);
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        folders.apply_mailbox_event(deleted(inbox()));
+        folders.apply_mailbox_event(MailboxInfo {
+            name: inbox(),
+            ..MailboxInfo::default()
+        });
+        respond(
+            &mut server,
+            &format!(
+                "{SELECT_PREAMBLE}* 2 EXISTS\r\n* OK [UIDVALIDITY 3] ok\r\n\
+                 * OK [UIDNEXT 10] ok\r\n{} OK [READ-ONLY] EXAMINE done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+        server
+    });
+    let _events = collect_changes(
+        account.clone(),
+        cursor_for(&FolderCursor::Basic {
+            uidvalidity: crate::types::UidValidity::new(3).expect("nonzero epoch"),
+            uidnext: crate::types::Uid::new(10),
+            known_uids: UidSet::from_numbers([1, 2]),
+        }),
+    )
+    .await;
+    let recreated = account.folders.get(&inbox()).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&selected, &recreated));
+    assert!(selected.last_seen().is_some());
+    assert!(recreated.last_seen().is_none());
+    let _server = script.await.unwrap();
+}

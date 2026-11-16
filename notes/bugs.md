@@ -101,4 +101,32 @@ top-level conjunct against `bodyStructure` names. Verification is only exact
 in that position, and `hasAttachment` is not a proven candidate superset of
 named parts, so neither path is a drop-in.
 
+## BUG-212 - IMAP cursor writes resolve the folder by name after the command
+
+**Reported by:** the folder-registry entry's spar (lateral).
+
+`changes.rs` and `inventory.rs` finish by calling
+`account.folders.set_cursor(&folder, cursor)`, a fresh name lookup. A folder
+deleted and recreated while the walk was in flight receives the old
+incarnation's cursor. The cursor carries its UIDVALIDITY, so
+`inventory_partitioning` falls back to Full on an epoch mismatch, but a
+recreated folder whose server reuses the epoch would inherit a baseline it never
+had. Fix shape: write through the `Arc<FolderEntry>` the walk began on, as
+`select_folder` now does for its observations. This changes a lifetime, so check
+what a late write on an orphaned entry means for the reader before landing.
+
+## BUG-213 - A shared IMAP folder deleted then created again registers as personal
+
+**Reported by:** the folder-registry entry's spar (lateral).
+
+`FolderRegistry::apply_mailbox_event` inherits owner and MYRIGHTS only from an
+entry still in the map. A delete event removes the shared entry, so a later
+create at the same path installs `shared_owner: None`: a permission denial on
+it then escalates account-wide instead of quarantining the folder, and the role
+resolver treats it as a personal candidate. The existing recreate test passes
+`old_name` equal to the name, which keeps the superseded entry and does not
+exercise delete-then-create. Ownership needs a source that survives the
+incarnation (the NAMESPACE prefixes discovery already read); rights should not
+carry over, since they were observed for a different mailbox.
+
 

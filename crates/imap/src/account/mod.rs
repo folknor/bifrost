@@ -242,6 +242,16 @@ impl ImapAccount {
         self.pool.checkout_for_folder(folder).await
     }
 
+    /// The registry's shared-ownership fact for `folder`. A SELECT error
+    /// boundary captures this before issuing the command: an entry removed or
+    /// replaced while SELECT is in flight must not erase the command's known
+    /// shared identity.
+    pub(crate) fn folder_owner(&self, folder: &MailboxName) -> Option<bifrost_types::PrincipalId> {
+        self.folders
+            .get(folder)
+            .and_then(|entry| entry.shared_owner.clone())
+    }
+
     /// Classify every mailbox command, including failures after selection.
     /// Outlook users expect a revoked share to disable only that folder.
     pub(crate) fn folder_error(
@@ -250,10 +260,7 @@ impl ImapAccount {
         folder: &MailboxName,
         ctx: error::ImapErrorContext,
     ) -> AccountError {
-        let owner = self
-            .folders
-            .get(folder)
-            .and_then(|entry| entry.shared_owner.clone());
+        let owner = self.folder_owner(folder);
         error::folder_error(error, folder, owner.as_ref(), ctx)
     }
 
@@ -309,10 +316,13 @@ impl ImapAccount {
         // deselected it, or followed a tagged OK with an incomplete response.
         conn.set_selected_affinity(conn.connection().selected_mailbox());
         let result = result?;
+        // Both observations land on the incarnation that was SELECTed. A
+        // fresh name lookup here could mark a folder recreated during the
+        // command as seen; an entry first registered mid-SELECT stays unseen.
         if let Some((entry, sequence)) = observation {
             entry.observe_selection(sequence, &result.mailbox);
+            entry.mark_seen();
         }
-        self.folders.mark_seen(folder);
         Ok(result)
     }
 

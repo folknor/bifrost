@@ -183,16 +183,21 @@ impl From<AccountError> for ChangeError {
 /// `ScopeRevoked` (quarantine just this folder) when it is a permission
 /// denial; otherwise return the raw error for the normal mapping. A
 /// personal folder (`shared_owner == None`) always returns the raw error.
-fn select_error(account: &ImapAccount, folder: &MailboxName, err: crate::Error) -> ChangeError {
-    let shared_owner = account
-        .folders
-        .get(folder)
-        .and_then(|entry| entry.shared_owner.clone());
+///
+/// The owner is captured before the SELECT is issued, never looked up after
+/// it fails: a concurrent mailbox event can remove or replace the entry while
+/// the command is in flight, and a lookup afterwards would then lose the
+/// shared identity and escalate a withdrawn share account-wide.
+fn select_error(
+    folder: &MailboxName,
+    shared_owner: Option<&bifrost_types::PrincipalId>,
+    err: crate::Error,
+) -> ChangeError {
     if shared_owner.is_some() {
         return ChangeError::Account(super::error::shared_folder_error(
             err,
             folder,
-            shared_owner.as_ref(),
+            shared_owner,
             super::error::ImapErrorContext::operation(bifrost_types::AccountOperation::SyncChanges)
                 .with_folder_scope(folder),
         ));
@@ -280,6 +285,7 @@ async fn run_qresync(
     };
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
+    let shared_owner = account.folder_owner(&folder);
     let selected = match account
         .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
         .await
@@ -325,7 +331,7 @@ async fn run_qresync(
             )
             .await;
         }
-        Err(err) => return Err(select_error(&account, &folder, err)),
+        Err(err) => return Err(select_error(&folder, shared_owner.as_ref(), err)),
     };
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, expected_uidvalidity, uidvalidity)?;
@@ -468,10 +474,11 @@ async fn run_condstore_with_baseline(
     };
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
+    let shared_owner = account.folder_owner(&folder);
     let selected = account
         .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
         .await
-        .map_err(|err| select_error(&account, &folder, err))?;
+        .map_err(|err| select_error(&folder, shared_owner.as_ref(), err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
     if selected.mailbox.modseq().is_none() {
@@ -620,10 +627,11 @@ async fn run_basic(
     };
     let mut conn = account.checkout_for_folder(&folder).await?;
     let mut previous_bytes_in = conn.connection().bytes_in();
+    let shared_owner = account.folder_owner(&folder);
     let selected = account
         .select_folder(&mut conn, &folder, super::SelectPurpose::Sync(&cursor))
         .await
-        .map_err(|err| select_error(&account, &folder, err))?;
+        .map_err(|err| select_error(&folder, shared_owner.as_ref(), err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
     let uidnext_unchanged = cursor_uidnext.is_some()

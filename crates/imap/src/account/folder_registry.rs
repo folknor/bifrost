@@ -9,6 +9,13 @@ use crate::types::{MailboxAttribute, MailboxInfo, MailboxName, UidRange};
 
 use super::FolderCursor;
 
+/// One folder incarnation. The per-concern state stays bundled behind one
+/// `Arc` on purpose: a delete or recreate replaces the entry, dropping
+/// cursor, selection observation, MODSEQ cache and last-seen together, so
+/// splitting them into parallel per-concern maps would restate that lifetime
+/// rule once per map. Each concern keeps its own private lock and accessors.
+/// Work that began on an entry records its observations on that entry, not
+/// on whatever a later name lookup returns.
 pub(crate) struct FolderEntry {
     pub(crate) name: MailboxName,
     /// The LIST-derived facts that a mid-session LIST/IDLE announcement can
@@ -145,6 +152,16 @@ impl FolderEntry {
             modseq_by_uid: RwLock::new(ModSeqCache::default()),
             last_seen: Mutex::new(None),
         }
+    }
+
+    /// One coherent copy of the LIST projection. A decision that reads more
+    /// than one listing fact takes this once: separate accessor calls can
+    /// straddle a `refresh_listing` and combine facts no announcement held.
+    pub(crate) fn listing(&self) -> FolderListing {
+        self.listing
+            .read()
+            .expect("folder listing lock poisoned")
+            .clone()
     }
 
     pub(crate) fn selectable(&self) -> bool {
@@ -482,25 +499,35 @@ pub(crate) fn role_folder_from_entries(
     role: FolderRole,
 ) -> Option<MailboxName> {
     entries
-        .into_iter()
-        .filter(|entry| {
-            entry.shared_owner.is_none()
-                && entry.selectable()
-                && folder_role(&entry.attributes(), entry.name.as_str(), entry.delimiter())
-                    == Some(role)
-        })
+        .iter()
+        .filter(|entry| entry.shared_owner.is_none())
+        .filter_map(|entry| role_candidate(&entry.name, &entry.listing(), role))
         .min_by(|left, right| {
-            let left_rank = u8::from(folder_role_from_attributes(&left.attributes()) != Some(role));
-            let right_rank =
-                u8::from(folder_role_from_attributes(&right.attributes()) != Some(role));
             // Distinct wire addresses can decode to the same display name.
             // Use the stable mailbox order last so registry iteration cannot
             // decide which address represents the role.
-            left_rank
-                .cmp(&right_rank)
-                .then_with(|| left.name.cmp_account_order(&right.name))
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp_account_order(right.1))
         })
-        .map(|entry| entry.name.clone())
+        .map(|(_, name)| name.clone())
+}
+
+/// Eligibility and rank of one personal entry for `role`, decided from ONE
+/// listing snapshot so selectability, role and rank describe the same
+/// announcement. Rank 0 is a SPECIAL-USE match, 1 the name fallback.
+fn role_candidate<'a>(
+    name: &'a MailboxName,
+    listing: &FolderListing,
+    role: FolderRole,
+) -> Option<(u8, &'a MailboxName)> {
+    if !listing.selectable
+        || folder_role(&listing.attributes, name.as_str(), listing.delimiter) != Some(role)
+    {
+        return None;
+    }
+    let rank = u8::from(folder_role_from_attributes(&listing.attributes) != Some(role));
+    Some((rank, name))
 }
 
 impl FolderRegistry {
@@ -1749,6 +1776,42 @@ mod tests {
 mod role_resolution_tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn role_candidates_decide_from_one_listing_snapshot() {
+        let name = MailboxName::new("Outbox").unwrap();
+        let listing = |selectable, attributes| FolderListing {
+            selectable,
+            delimiter: Some('/'),
+            attributes,
+        };
+        // An unselectable SPECIAL-USE Sent never qualifies, whatever it is called.
+        assert_eq!(
+            role_candidate(
+                &name,
+                &listing(false, vec![MailboxAttribute::Sent]),
+                FolderRole::Sent
+            ),
+            None
+        );
+        assert_eq!(
+            role_candidate(
+                &name,
+                &listing(true, vec![MailboxAttribute::Sent]),
+                FolderRole::Sent
+            ),
+            Some((0, &name))
+        );
+        let sent = MailboxName::new("Sent").unwrap();
+        assert_eq!(
+            role_candidate(&sent, &listing(true, Vec::new()), FolderRole::Sent),
+            Some((1, &sent))
+        );
+        assert_eq!(
+            role_candidate(&name, &listing(true, Vec::new()), FolderRole::Sent),
+            None
+        );
+    }
 
     #[test]
     fn roles_exclude_shared_and_nested_inboxes() {
