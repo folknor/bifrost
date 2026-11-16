@@ -113,6 +113,12 @@ pub enum WarningKind {
     NotifyRefused,
     Engine(EngineNotice),
     OperatorAttentionNeeded,
+    /// No built-in producer currently emits this variant. Throttling reaches
+    /// consumers as classified `AccountError` recovery (throttle scope and
+    /// retry advice), and an injected push watch's retryable failure as
+    /// `Engine(EngineNotice::PushRetrying)` carrying that error; a throttle
+    /// absorbed by transport retries is not a consumer warning at all. Kept
+    /// as published surface; removing it is the owner's call.
     Throttled,
     /// A server clock observed to differ from the local clock by more than the
     /// consumer's threshold. No producer in this workspace emits it yet: no
@@ -120,6 +126,9 @@ pub enum WarningKind {
     /// an eventual producer may carry the signed offset and its uncertainty.
     ClockSkew,
     BlobNotByteStream,
+    /// No built-in producer currently emits this variant, and what would
+    /// count as a skipped read-back is not defined here. Kept as published
+    /// surface; removing it is the owner's call.
     ReadbackSkipped,
     /// The change-stream broadcast ring overflowed and batches were lost;
     /// the consumer must reconcile from its last durable checkpoint.

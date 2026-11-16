@@ -3666,7 +3666,11 @@ mod tests {
             reports: vec![clean(), clean()],
             generation,
         });
-        let shape: Vec<bool> = claim.reports.iter().map(InventoryCoverageReport::is_complete).collect();
+        let shape: Vec<bool> = claim
+            .reports
+            .iter()
+            .map(InventoryCoverageReport::is_complete)
+            .collect();
         assert_eq!(shape, vec![true, false, false, true]);
     }
 

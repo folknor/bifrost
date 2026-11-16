@@ -1506,8 +1506,14 @@ pub trait Account: Send + Sync {
     /// push cleanup. Admitted read streams terminate with `AccountClosed`
     /// without completion when close wins their next poll. Synchronous accessors
     /// and cursor classification (`inventory_resume_stream`'s `Some`/`None`
-    /// answer) stay live. Awaiting `close` awaits this provider invocation
-    /// only. See the `closing` module for the full statement.
+    /// answer) stay live. See the `closing` module for the full statement.
+    ///
+    /// Provider contract for completion: every awaited `close` observes the
+    /// completion of the provider's shutdown attempt, within that provider's
+    /// documented cancellation, timeout and late-work limits. A concurrent or
+    /// repeated caller never bypasses cleanup still pending merely because
+    /// another caller owns its wait: an enterprise client that exits after
+    /// awaiting any close expects teardown to be over, not still running.
     #[admission(close)]
     fn close(&self) -> AccountFuture<Result<(), AccountError>>;
 }

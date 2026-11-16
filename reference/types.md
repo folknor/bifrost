@@ -550,11 +550,13 @@ shapes. It is distinct from bytes, change cursors and inventory progress.
 Consumers pass it back to the same surface; `as_bytes` / `into_bytes` and
 `from_bytes` support storage, and transparent serde preserves the byte-array
 representation. Debug output reports only its length. Restoring bytes does not
-validate them: the owning provider does that when resuming. Graph and Google
-use versioned surface tags and refuse foreign or retired formats through
+validate them: the owning provider does that when resuming. Each provider
+versions its own payload and decides what a cursor is bound to (the query,
+the folder scope, the owning account, a pinned query state); that binding is
+stated in the provider's reference. IMAP, JMAP, Graph and Google refuse
+foreign, retired or mismatched cursors through
 `AccountError::invalid_page_cursor`, so an enterprise user's stale results
-reload without clearing durable account state. Other providers retain their
-existing payload formats and validation.
+reload without clearing durable account state.
 
 `Page<T>` (`page.rs`) is the envelope `search`, `search_messages`, and the
 other paged list surfaces return: `items`, an opaque protocol-owned

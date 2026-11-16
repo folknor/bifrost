@@ -446,6 +446,9 @@ without ever being polled. A stop
 failure is classified and logged but cannot keep a closing account alive. The
 one thing a dropped close future cannot guarantee is the remote half: Gmail
 may keep delivering until the 7-day watch expires.
+Every later `close()` waits on a completion flag the same drop guard publishes,
+so a concurrent close returns only once the first close's teardown completed
+or its owner dropped it, never while `users.stop` is still in flight.
 `Drop` also cancels and detaches as a fallback when a consumer omits
 `close()`. The watch actor and `push_stream` both select on
 `shutdown.cancelled()` and retire cleanly. The scope lifecycle stream selects

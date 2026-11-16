@@ -35,8 +35,10 @@
 //! - **Close.** `close` shuts admission synchronously when it is CALLED, so a
 //!   close future dropped unpolled still closes the account, then calls the
 //!   provider's `close` and returns that future. The wrapper certifies only
-//!   admission closure; awaiting `close` awaits that provider invocation, and
-//!   whether concurrent closes share one teardown is the provider's contract.
+//!   admission closure; awaiting `close` awaits that provider invocation.
+//!   Teardown completion is the provider's, and `Account::close` states what
+//!   every provider promises about it: a concurrent or repeated close waits
+//!   for the pending shutdown attempt instead of answering early.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

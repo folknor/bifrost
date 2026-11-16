@@ -448,9 +448,6 @@ face.
 
 Narrow edge cases, audits with no known defect, and design work.
 
-- **`reference/types.md` implies IMAP search cursors are unbound.** It says
-  other providers keep their existing cursor formats, which reads as though
-  IMAP does not bind its cursors to the query; it does. Reword.
 - **SMTP builder: a single-part root whose payload ends in CRLF gains a blank
   line** (small). `Message` with a `SinglePart` body, `SinglePart::formatted`
   and `MultiPart::formatted` append one CRLF after the root entity
@@ -466,28 +463,13 @@ Narrow edge cases, audits with no known defect, and design work.
   versus validated construction). Whether they should share a grammar is a
   separate question from the now-unified writer.
 
-- **Concurrent `close` calls do not share one teardown.** Found in the spar of
-  the closed-account gate. Google's `close` swaps its closed flag and returns
-  `Ok` at once on every later call, while the first may still be awaiting its
-  watch teardown; Graph's `PushTasks::join` takes the task handles out, so a
-  concurrent close sees an empty registry and finishes without waiting, and
-  dropping the first waiter detaches the rest. Not a defect under the current
-  `Account::close` contract (idempotent, safe to call more than once), which
-  promises nothing about completion. Decide whether awaiting any `close` should
-  certify that teardown has finished; if so, it is a provider contract plus a
-  per-provider fix, since `ClosingAccount` does not own teardown.
-
-- **`WarningKind::Throttled` may have no producer.** Noted by the scout of the
-  clock-skew warning item, unverified. If confirmed, it is the same shape as
-  `ClockSkew`: a published warning nothing emits. Check before treating it as
-  wired.
-
-- **`advertised_partitioning_maps_to_its_windows` does not bite on its
-  time-window arm.** In `crates/sync/src/backfill/plan.rs`, the time arm
-  compares `backfill_plan_for`'s result against `time_windows` itself, so a
-  broken `time_windows` passes it (forcing `time_windows` to return an empty
-  Vec left it green; the UID arm did fail under the same ablation). Pin the
-  time arm to literal expected windows. The planner's own unit tests do bite.
+- **Graph `close` cannot certify late EWS releases.** A `PushTasks::join`
+  covers the tasks tracked when it starts and gives up waiting after five
+  seconds while the tasks keep running; a Subscribe answered after close
+  tracks its release later, collected only by a later close. Certifying all
+  account cleanup would need Graph to own admitted subscription creation
+  through release, plus an explicit timeout outcome. Rule on whether that is
+  wanted.
 
 - **JMAP local transport failures lost their reason in diagnostics.**
   `convert_transport` in `crates/jmap/src/sync/error.rs` exports a fixed

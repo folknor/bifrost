@@ -438,14 +438,24 @@ mod tests {
             }),
             vec![page(0, 3), page(3, 6)]
         );
-        let time = fixed(InventoryPartitioning::TimeWindowed);
-        assert_eq!(
-            time,
-            crate::backfill::partitioner::time_windows(
-                &crate::backfill::partitioner::default_time_boundaries(),
-                now
-            )
-        );
+        // Literal edges, not `time_windows` itself: comparing against the
+        // planner would pass a broken planner. Days back from `now`, then an
+        // open tail below five years.
+        const DAY: i64 = 86_400;
+        let now_s = 1_800_000_000;
+        let mut expected = Vec::new();
+        let mut to = now_s;
+        for days in [7, 30, 90, 180, 365, 730, 1095, 1460, 1825] {
+            let from = now_s - days * DAY;
+            expected.push(InventoryPartition::Time(
+                bifrost_types::TimeWindow::new(Some(from), Some(to)).unwrap(),
+            ));
+            to = from;
+        }
+        expected.push(InventoryPartition::Time(
+            bifrost_types::TimeWindow::new(None, Some(to)).unwrap(),
+        ));
+        assert_eq!(fixed(InventoryPartitioning::TimeWindowed), expected);
         assert!(matches!(
             backfill_plan_for(
                 InventoryPartitioning::PageCount {

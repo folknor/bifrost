@@ -2058,7 +2058,12 @@ Every renewal step (renew, recreate install-or-undo, terminal flag) runs in an
 account-owned task tracked in `push_tasks`, holding the exchange through its
 commit. A dropped session cannot cancel the task or erase a committed gap or
 verdict. Close awaits tracked tasks under one bounded join, dropping remaining
-handles without aborting the effects if the bound expires.
+handles without aborting the effects if the bound expires. The registry holds
+shared wrappers over the handles and a join clones them rather than taking
+them, so concurrent closes wait on the same tasks (each under its own bound)
+and dropping one close future detaches nothing another is waiting on. A join
+covers the tasks tracked when it starts; a task tracked later, such as the
+release of a late EWS Subscribe answer, is collected by a later close.
 
 ### EWS streaming mode (`PushConfig::EwsStreaming`)
 

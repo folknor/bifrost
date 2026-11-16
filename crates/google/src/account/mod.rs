@@ -242,6 +242,10 @@ struct GoogleAccount {
     lifecycle_baseline: scopes::LifecycleBaseline,
     shutdown: CancellationToken,
     closed: AtomicBool,
+    /// Flipped by the first close's `DetachOnDrop`, so a later `close()`
+    /// waits for the first one's teardown instead of answering `Ok` while
+    /// `users.stop` is still in flight.
+    close_done: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl GoogleAccount {
@@ -276,6 +280,7 @@ impl GoogleAccount {
             lifecycle_baseline: Default::default(),
             shutdown,
             closed: AtomicBool::new(false),
+            close_done: Arc::new(tokio::sync::watch::channel(false).0),
         }))
     }
 
@@ -393,16 +398,22 @@ fn account_closed_error(operation: AccountOperation) -> AccountError {
 
 /// Runs the transport detach when the close future finishes OR is
 /// dropped. Without it a cancelled `close()` would leave the account
-/// marked closed - every later `close()` returns `Ok(())` at once - while
-/// its rate-limiter registration stayed attached with no way to reclaim
-/// it short of dropping the account.
+/// marked closed while its rate-limiter registration stayed attached with
+/// no way to reclaim it short of dropping the account. It also publishes
+/// completion to every later `close()`, which waits for it: an enterprise
+/// client that shuts down after awaiting any close expects the teardown to
+/// be over, not still holding the transport.
 struct DetachOnDrop {
     client: Arc<GmailClient>,
+    done: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Drop for DetachOnDrop {
     fn drop(&mut self) {
         self.client.detach_account();
+        // `send_replace`, not `send`: with no receiver yet, `send` fails and
+        // a later subscriber would still read `false`.
+        self.done.send_replace(true);
     }
 }
 
@@ -1347,7 +1358,15 @@ impl Account for GoogleAccount {
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         if self.closed.swap(true, Ordering::AcqRel) {
-            return Box::pin(async { Ok(()) });
+            // A later close waits on the first close's teardown: it returns
+            // once that teardown completed, or its owner dropped the future
+            // (the accepted residual below). A first close future held
+            // forever without polling or dropping holds every later one too.
+            let mut done = self.close_done.subscribe();
+            return Box::pin(async move {
+                let _ = done.wait_for(|done| *done).await;
+                Ok(())
+            });
         }
         // Linearization point. `closed` is now observable, so everything a
         // closed account promises must already hold before the caller can
@@ -1379,6 +1398,7 @@ impl Account for GoogleAccount {
         // never-polled drop alike.
         let detach = DetachOnDrop {
             client: Arc::clone(&client),
+            done: Arc::clone(&self.close_done),
         };
         Box::pin(async move {
             let _detach = detach;
@@ -1569,6 +1589,7 @@ mod tests {
             lifecycle_baseline: Default::default(),
             shutdown,
             closed: AtomicBool::new(false),
+            close_done: Arc::new(tokio::sync::watch::channel(false).0),
         });
         (account, net)
     }
@@ -1725,7 +1746,7 @@ mod tests {
     }
 
     /// `close()` flips `closed` before it is awaited, so every later
-    /// `close()` short-circuits to `Ok(())`. A caller that drops the
+    /// `close()` only waits for this one's teardown. A caller that drops the
     /// future while `users.stop` is in flight must therefore not be left
     /// holding an account that reports itself closed while its shutdown
     /// token, streams and rate-limiter registration are all still live -
@@ -1812,6 +1833,38 @@ mod tests {
         assert!(account.shutdown.is_cancelled());
         assert_eq!(net.governor().cost_default_for(TEST_HOST), None);
         assert!(!account.pubsub.has_handles().await);
+    }
+
+    /// A second close does not answer while the first is still inside
+    /// `users.stop`; it returns once the first's teardown ends, here by the
+    /// first caller dropping it mid-stop.
+    #[tokio::test]
+    async fn a_later_close_waits_for_the_first_close_teardown() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let (account, net) = scripted_account(&script);
+        account
+            .pubsub
+            .insert_handle(&SubscriptionHandle("watch-handle".to_owned()))
+            .await;
+
+        let mut first = account.close();
+        for _ in 0..8 {
+            assert!(futures::future::poll_immediate(&mut first).await.is_none());
+            tokio::task::yield_now().await;
+        }
+        let mut second = account.close();
+        for _ in 0..8 {
+            assert!(
+                futures::future::poll_immediate(&mut second).await.is_none(),
+                "a later close must wait while the first is still in users.stop",
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(first);
+        second.await.expect("later close reports success");
+        assert_eq!(net.governor().cost_default_for(TEST_HOST), None);
+        // A close after teardown finished answers at once.
+        account.close().await.expect("closed account closes again");
     }
 
     /// A profile whose `historyId` is present but not a number did not
