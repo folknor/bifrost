@@ -1027,6 +1027,18 @@ scripted fixtures live in `scripted/test_support.rs`. The layout split is not a 
 audit: the earlier bug hunt did not line-audit the former PIM module's long tail
 beyond membership, keyword and search entry points.
 
+Inventory retains one selection and walks descending bands of 65,536 UID
+positions, freezing the ceiling at SELECT UIDNEXT minus one. When UIDNEXT is
+absent, UID SEARCH ALL supplies the maximum (zero for an empty result).
+UIDNEXT 1 sends no FETCH. Non-final bands flush checkpoint-free pages even
+when sparse: an enterprise user expects later-assigned mail promptly. Response
+order inside each band is server-defined, not date order. The known-UID baseline
+and object obligations remain complete across the walk; only terminal completion
+publishes and commits the folder cursor. A failed band cannot commit a partial
+baseline. UIDNOTSTICKY retains the existing unbounded walk pending recurring
+inventory support. Bounded requests do not bound baseline memory or provide
+durable positional resume.
+
 ### CONDSTORE / QRESYNC strategy
 
 `FolderCursor` has three variants and `changes_stream()` dispatches diff strategy by variant:

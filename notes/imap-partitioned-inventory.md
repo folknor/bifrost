@@ -1,6 +1,6 @@
 # IMAP partitioned inventory - design and link plan
 
-Status: design, not built. Tracks the STR-082 entry in `notes/structural.md`.
+Status: link 1 built; links 2 and 3 remain. Tracks the STR-082 entry in `notes/structural.md`.
 Sparred with codex 2026-11-16; the recommendation below is the converged
 position.
 
@@ -92,7 +92,7 @@ request whose failure throws away the whole walk.
 
 ## Link plan
 
-1. bifrost-imap: bounded descending UID bands inside `run_inventory` (shape 1),
+1. DONE (2026-11-16). bifrost-imap: bounded descending UID bands inside `run_inventory` (shape 1),
    with a scripted-transcript test that the walk issues bounded bands and
    publishes the cursor only after the last band.
 2. bifrost-imap: registry-held UIDNEXT/UIDVALIDITY hint satisfying the ceiling
@@ -102,3 +102,31 @@ request whose failure throws away the whole walk.
    refused, no cursor written by a partition walk.
 3. reference/imap.md: record both behaviours and the ceiling rule at the code
    sites.
+
+## Link 1 implementation rulings (2026-11-16)
+
+- Bands span 65,536 UID positions, descending from the frozen SELECT UIDNEXT
+  minus one. The selection stays checked out throughout. UIDNEXT 1 completes
+  without FETCH. Missing UIDNEXT uses UID SEARCH ALL and its maximum as the
+  ceiling (zero for an empty result), rather than guessing or sending `*`.
+  This keeps tolerated missing metadata working while bounding FETCH requests.
+- Each non-final band's residual entries are flushed as a checkpoint-free
+  page, so sparse bands also deliver later-assigned mail before older requests.
+  Response order within a band stays server-defined; no date ordering is promised.
+- UIDNOTSTICKY retains the existing `1:*` walk, per the existing recurring
+  inventory limitation. The complete known-UID baseline and obligations remain
+  accumulated across bands. Only the existing terminal finalizer writes a cursor.
+- Scripted duplex tests cover explicit and absent UIDNEXT, descending requests,
+  complete baseline publication, and failure in a later band without a cursor.
+
+Remaining work: link 2 is a medium implementation link (registry hint provenance,
+partition producer and hermetic tests). Link 3 is a small documentation link for
+those partition behaviours and ceiling provenance; link 1's inventory behaviour
+is already recorded in the durable reference. No decision handed back.
+
+Validation for link 1: `brokkr test -p bifrost-imap inventory_descending_bands`
+passed all three tests in workspace and install-shape resolution. Reverting the
+production inventory change made all three fail in both resolutions; production
+was restored. `brokkr check -p bifrost-imap -p bifrost-sync` stopped at gremlins
+in a concurrent MIME test edit (U+2603 in `crates/mime/src/writer_tests.rs`), before
+compilation. The separate gate agent still owns final validation and commit.

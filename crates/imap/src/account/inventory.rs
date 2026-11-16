@@ -243,6 +243,8 @@ impl From<ChannelDropped> for InventoryError {
     }
 }
 
+const INVENTORY_UID_BAND: u32 = 65_536;
+
 async fn run_inventory(
     account: ImapAccount,
     scope: CursorScope,
@@ -306,85 +308,129 @@ async fn run_inventory(
     let include_modseq = selected.mailbox.modseq().is_some();
     let mut attrs = inventory_attrs(include_modseq);
     super::hydration::push_native_thread_attrs(&mut attrs, &conn.connection().server_profile());
-    let all_uids = UidSetExpr::all();
-    let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_stream(
-        all_uids.as_sequence_set(),
-        &attrs,
-        account.command_timeout(),
-    )?;
-    tokio::pin!(fetch_fut);
-
+    // Freeze enumeration at this selection's ceiling. Enterprise users expect
+    // later-assigned mail promptly, without publishing a partial folder cursor.
+    // UIDNOTSTICKY retains the existing walk until recurring inventory exists.
+    let mut ceiling = if selected.mailbox.uid_not_sticky {
+        None
+    } else {
+        Some(match selected.mailbox.uid_next {
+            Some(next) => next.get() - 1,
+            None => conn
+                .connection()
+                .uid_search("ALL", account.command_timeout())
+                .await?
+                .ids
+                .into_iter()
+                .max()
+                .unwrap_or(0),
+        })
+    };
     let mut batch_items = Vec::with_capacity(BATCH_ITEMS);
     let mut known = Vec::new();
-    let mut fetch_result = None;
-
     loop {
-        tokio::select! {
-            result = &mut fetch_fut, if fetch_result.is_none() => {
-                fetch_result = Some(result);
+        let (uids, lower) = match ceiling {
+            Some(0) => break,
+            Some(hi) => {
+                let lo = hi.saturating_sub(INVENTORY_UID_BAND - 1).max(1);
+                (
+                    UidSetExpr::range(
+                        crate::types::Uid::new(lo).expect("band starts above zero"),
+                        crate::types::Uid::new(hi).expect("band ends above zero"),
+                    ),
+                    lo,
+                )
             }
-            item = fetch_rx.recv() => {
-                match item {
-                    Some(Ok(fetch)) => {
-                        // A response without a nonzero UID cannot be
-                        // attributed to any message and is ignored.
-                        if let Some(uid) = fetch.uid.filter(|uid| *uid != 0) {
-                            if let Some(modseq) = fetch.mod_seq {
-                                account
-                                    .folders
-                                    .record_modseq(&folder, uidvalidity, uid, modseq)?;
-                            }
-                            known.push(uid);
-                            // One response missing FLAGS fails only that
-                            // message: an enterprise user expects the rest
-                            // of the folder to sync, and that message's
-                            // cached read/flagged state to stay as it was
-                            // rather than be cleared. The obligation tells
-                            // the engine this walk did not represent it.
-                            match fetch_to_inventory(
-                                &folder,
-                                uidvalidity,
-                                fetch,
-                                shared_owner.as_ref(),
-                            ) {
-                                Ok(entry) => batch_items.push(entry),
-                                Err(error) => obligations.record(unrepresented_object(
+            None => (UidSetExpr::all(), 1),
+        };
+        let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_stream(
+            uids.as_sequence_set(),
+            &attrs,
+            account.command_timeout(),
+        )?;
+        tokio::pin!(fetch_fut);
+        let mut fetch_result = None;
+        loop {
+            tokio::select! {
+                result = &mut fetch_fut, if fetch_result.is_none() => {
+                    fetch_result = Some(result);
+                }
+                item = fetch_rx.recv() => {
+                    match item {
+                        Some(Ok(fetch)) => {
+                            // A response without a nonzero UID cannot be
+                            // attributed to any message and is ignored.
+                            if let Some(uid) = fetch.uid.filter(|uid| *uid != 0) {
+                                if let Some(modseq) = fetch.mod_seq {
+                                    account
+                                        .folders
+                                        .record_modseq(&folder, uidvalidity, uid, modseq)?;
+                                }
+                                known.push(uid);
+                                // One response missing FLAGS fails only that
+                                // message: an enterprise user expects the rest
+                                // of the folder to sync, and that message's
+                                // cached read/flagged state to stay as it was
+                                // rather than be cleared. The obligation tells
+                                // the engine this walk did not represent it.
+                                match fetch_to_inventory(
                                     &folder,
                                     uidvalidity,
-                                    uid,
-                                    error,
-                                )),
-                            }
-                            if batch_items.len() >= BATCH_ITEMS {
-                                let out = std::mem::take(&mut batch_items);
-                                let bytes_in = super::measured_bytes_in(
-                                    conn.connection(),
-                                    &mut previous_bytes_in,
-                                );
-                                tx.send(batch(out, PageBoundary::Page, None, bytes_in))
-                                    .await
-                                    .map_err(|_| ChannelDropped)?;
+                                    fetch,
+                                    shared_owner.as_ref(),
+                                ) {
+                                    Ok(entry) => batch_items.push(entry),
+                                    Err(error) => obligations.record(unrepresented_object(
+                                        &folder,
+                                        uidvalidity,
+                                        uid,
+                                        error,
+                                    )),
+                                }
+                                if batch_items.len() >= BATCH_ITEMS {
+                                    let out = std::mem::take(&mut batch_items);
+                                    let bytes_in = super::measured_bytes_in(
+                                        conn.connection(),
+                                        &mut previous_bytes_in,
+                                    );
+                                    tx.send(batch(out, PageBoundary::Page, None, bytes_in))
+                                        .await
+                                        .map_err(|_| ChannelDropped)?;
+                                }
                             }
                         }
-                    }
-                    Some(Err(err)) => return Err(err.into()),
-                    None => {
-                        // The driver drops the item sender before it answers
-                        // the oneshot, so a failed FETCH closes `fetch_rx`
-                        // first and this arm can win the race against
-                        // `fetch_fut`. Awaiting the future here (rather than
-                        // reading whatever `select!` happened to store) is
-                        // what makes the failure unconditional: without it a
-                        // tagged NO, a read error, or a timeout would break on
-                        // the success path and checkpoint a truncated mailbox.
-                        match fetch_result.take() {
-                            Some(result) => result?,
-                            None => (&mut fetch_fut).await?,
+                        Some(Err(err)) => return Err(err.into()),
+                        None => {
+                            // The driver drops the item sender before it answers
+                            // the oneshot, so a failed FETCH closes `fetch_rx`
+                            // first and this arm can win the race against
+                            // `fetch_fut`. Awaiting the future here (rather than
+                            // reading whatever `select!` happened to store) is
+                            // what makes the failure unconditional: without it a
+                            // tagged NO, a read error, or a timeout would break on
+                            // the success path and checkpoint a truncated mailbox.
+                            match fetch_result.take() {
+                                Some(result) => result?,
+                                None => (&mut fetch_fut).await?,
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }
+        }
+        // Flush even a sparse band before requesting older UIDs. These pages
+        // cannot certify the baseline; only finish_inventory can do that.
+        if !batch_items.is_empty() && ceiling.is_some() && lower > 1 {
+            let out = std::mem::take(&mut batch_items);
+            let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+            tx.send(batch(out, PageBoundary::Page, None, bytes_in))
+                .await
+                .map_err(|_| ChannelDropped)?;
+        }
+        match ceiling {
+            Some(_) => ceiling = Some(lower - 1),
+            None => break,
         }
     }
 

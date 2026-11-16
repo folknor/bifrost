@@ -15,6 +15,8 @@ mod draft_send;
 
 mod hydration;
 
+mod inventory;
+
 mod lifecycle;
 
 mod mutations;
