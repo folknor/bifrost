@@ -53,6 +53,23 @@ const EVENT_SEARCH_FIELDS: &[&str] = &[
 ];
 
 pub(crate) async fn calendars_list(account: GraphAccount) -> Result<Vec<Calendar>, AccountError> {
+    let mut calendars: Vec<Calendar> = primary_calendars(&account)
+        .await?
+        .into_iter()
+        .map(calendar_from_graph)
+        .collect();
+    calendars.extend(public::calendars(&account).await);
+    Ok(calendars)
+}
+
+/// The primary mailbox's REST calendars as wire records, without the EWS
+/// public-folder leg. Cursor-scope discovery reads this: public calendars
+/// are typed read-only doors, not sync scopes, and their namespaced ids
+/// would parse as primary calendar ids. The wire record is returned so
+/// discovery can see `isSharedWithMe`, which `Calendar` does not carry.
+pub(crate) async fn primary_calendars(
+    account: &GraphAccount,
+) -> Result<Vec<GraphCalendar>, AccountError> {
     let prefix = account.mailboxes.primary().api_path_prefix();
     let mut calendars = Vec::new();
     let mut walk = crate::paging::PageWalk::new("calendars");
@@ -61,7 +78,7 @@ pub(crate) async fn calendars_list(account: GraphAccount) -> Result<Vec<Calendar
             .mailboxes
             .primary()
             .api_url(&format!(
-                "{prefix}/calendars?$select=id,name,canEdit,isDefaultCalendar&$top=250"
+                "{prefix}/calendars?$select=id,name,canEdit,isDefaultCalendar,isSharedWithMe&$top=250"
             ))
             .map_err(|error| into_error(error, AccountOperation::CalendarsList))?,
     );
@@ -74,14 +91,13 @@ pub(crate) async fn calendars_list(account: GraphAccount) -> Result<Vec<Calendar
             .get(Resource::Outlook, &url)
             .await
             .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
-        calendars.extend(page.value.into_iter().map(calendar_from_graph));
+        calendars.extend(page.value);
         next = account
             .mailboxes
             .primary()
             .admit_next(page.next_link.as_ref())
             .map_err(|error| into_error(error, AccountOperation::CalendarsList))?;
     }
-    calendars.extend(public::calendars(&account).await);
     Ok(calendars)
 }
 
@@ -1597,6 +1613,7 @@ mod tests {
             name: Some("Calendar".to_string()),
             can_edit: Some(true),
             is_default_calendar: Some(true),
+            is_shared_with_me: None,
         });
 
         assert_eq!(calendar.id.0, "cal");

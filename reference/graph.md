@@ -685,7 +685,8 @@ exhaustion. REST and unscoped search behavior is unchanged.
 ### Public contact books (EWS)
 
 `contacts/public.rs` implements the read-only public contact leg. After its
-REST contact-folder walk, `address_books_list` appends discovery-seeded,
+REST contact-folder walk (recursive through `childFolders`, so nested books
+are listed), `address_books_list` appends discovery-seeded,
 readable public folders whose `FolderClass` is `IPF.Contact` or a
 dot-separated subclass. `HierarchyOnly` and pins govern background sync,
 not this discoverability. Every public book has all three write flags false;
@@ -1379,7 +1380,11 @@ Supported scopes:
   [event GET documentation](https://learn.microsoft.com/en-us/graph/api/event-get?view=graph-rest-1.0)
   defines the UTC timezone preference.
 - `FolderType { folder, Contact }` -> initial URL
-  `/{prefix}/contactFolders/{folder}/contacts/delta?$select=...&$top=250`
+  `/{prefix}/contactFolders/{folder}/contacts/delta?$select=...&$top=250`,
+  or `/{prefix}/contacts/delta?...` for the default book's synthetic
+  `contacts` id. A contact's membership is always its scope folder, since a
+  folder's delta returns only that folder's contacts and the default book's
+  `parentFolderId` is its real id, never the synthetic one
   (`CONTACT_SYNC_SELECT`, the identity projection; typed contact reads use
   their own detail projection in `account/contacts.rs`).
 - `Folder(folder)` in the public-folder routing map -> the
@@ -1547,7 +1552,18 @@ No new `CursorScope` variant. `client_for_scope(scope)` selects the
 client; `GraphScope::owner()` retains the owner for a foreign
 scope, `None` for primary. `discover_cursor_scopes_inner` lists the primary
 then each shared mailbox's folders, emitting foreign-namespaced `FolderType`
-scopes; a per-mailbox permission denial skips with a `Warning`.
+scopes; a per-mailbox permission denial skips with a `Warning`. It then
+emits a `FolderType { _, CalendarEvent }` scope per primary REST calendar
+that is not `isSharedWithMe` (`calendar::primary_calendars`) and a `FolderType { _, Contact }` scope per
+primary REST book (`contacts::primary_address_books`: the synthetic default
+`contacts` book plus every contact folder, walked recursively through
+`childFolders`), because an Outlook user expects calendars and contacts to
+sync like mail. The REST-only listers keep public calendars and books, which
+are typed read-only doors, out of sync. A permission denial on either
+listing (no Calendars.Read or Contacts.Read consent) skips that type with a
+`Warning`; any other listing failure fails discovery, so an outage never
+reads as every calendar removed. The default book is refused on the EWS
+push arm, since its synthetic id cannot be translated, and is polled.
 `discover_memberships_inner` emits the foreign `MembershipScope::Owner(owner)`
 tag with the folder membership, and `inventory_stream` stamps it onto every
 foreign-scope item (the engine covering rule cannot form it).
@@ -1771,7 +1787,16 @@ subscription resource, files any scope with no subscribable resource into the
 failed lane, creates one server
 subscription per resource, and best-effort deletes any already-created
 subscriptions if a later create fails or the outcome ledger cannot be closed
-(`roll_back_created`). Closing the ledger (`finalize_push_outcomes`) is the
+(`roll_back_created`). The one exception is a create refused as
+`Authorization(PermissionDenied)` (a token that lists calendars with
+Calendars.ReadBasic but lacks the Calendars.Read an `/events` subscription
+needs): that group's scopes go to the failed lane, scope-correlated, and the
+other groups' subscriptions stand, because an Outlook user missing calendar
+consent still expects live mail. Only a permission refusal is laned: it stays
+true until consent changes, while a transient failure filed per lane would
+drop those scopes from the engine's accepted push set with nothing to retry
+them. When every group is refused, the arm returns no handle and the
+dispatcher raises the whole-request refusal. Closing the ledger (`finalize_push_outcomes`) is the
 webhook arm's own step, taken after the last create and BEFORE the group is
 registered or visible to a renewal session. It used to run in the dispatcher
 after the arm returned, so a `finalize` failure returned `Err` - no handle -
@@ -1864,13 +1889,24 @@ The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the
 engine `InvalidationSink`; `push_stream` maintains registrations and reports session progress and failures.
 
-`resource_for_scope` builds one resource per scope, and for calendars that
-means `{prefix}/calendars/{native}/events` - the same calendar id
-`inventory.rs` builds `calendarView/delta` from. A bare `{prefix}/events` is
-the DEFAULT calendar: it both mis-targets every secondary calendar (whose
-notifications would never arrive while the engine believed the scope
-push-covered) and, because `subscribe_graph` groups on the resource string,
-collapses every calendar scope into one subscription.
+`GraphScope::subscription_resource` builds a mail scope's resource as
+`{prefix}/mailFolders/{native}/messages`, but every calendar scope maps to
+`{prefix}/events` and every contact scope to `{prefix}/contacts`. Graph's
+[change-notification resource list](https://learn.microsoft.com/en-us/graph/api/resources/change-notifications-api-overview)
+documents only those mailbox-wide resources for events (all calendars) and
+personal contacts, and a create rejected for anything but permission rolls
+back the whole subscribe group, mail included, so an undocumented
+per-calendar path would risk mail push. Calendars another user shared into
+the mailbox (`isSharedWithMe`) are not discovered at all: `/events` does not
+notify for shared folders, so their scopes would be falsely push-covered. Because `subscribe_graph` groups on the resource string, all calendar
+scopes in one subscribe share one subscription, as do all contact scopes,
+and renewal and recreation carry the whole covered scope list. A
+notification on `/events` or `/contacts` is therefore evidence for every
+calendar or contact scope that subscription covers: the consumer's receiver
+should invalidate each of them (or send an unscoped hint), not try to map
+the notification's resource text to one calendar. Over-coverage costs extra
+changes polls; it never leaves a scope believed push-covered with nothing
+arriving.
 
 Subscription expiry is parsed with `jiff` and `parse_iso8601_to_unix` is
 FALLIBLE. It drives the renewal tick, so an infallible parser that coerced an
@@ -2917,8 +2953,12 @@ exhausted" without them.
 
 ## Known limitations
 
-- Discovery is mail-only (+ opt-in public folders); event/contact cursors
-  are engine-constructed.
+- Discovery covers primary and shared mail, primary calendars and primary
+  contact books (nested books included), plus opt-in public folders.
+  Calendars and contact books of configured shared mailboxes are not
+  discovered, because their typed reads use the primary client, and neither
+  are calendars shared into the primary mailbox, which `/events`
+  notifications do not cover.
 - `scope_lifecycle_stream` is empty; folder creates/renames/deletes are
   observed only at reopen. Shared-mailbox routing is otherwise complete:
   send-as (C-3), read paths and message mutations (flag/move/destroy,

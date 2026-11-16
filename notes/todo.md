@@ -86,6 +86,13 @@ Nothing hermetic can settle these.
   unsupported on event delta) and receive Graph's default delta property set.
   If that set omits `changeKey` or `recurrence`, the event fingerprint degrades
   to `Unavailable`.
+- **Graph default contacts book syncs through `/me/contacts/delta`.** Discovery
+  now emits the default book under its synthetic `contacts` id, and
+  `GraphScope::delta_path` maps it to `{prefix}/contacts/delta`. Graph's
+  contact delta page documents only `contactFolders/{id}/contacts/delta`; the
+  SDK metadata binds `delta` to the contacts collection, but it is unprobed.
+  If it 400s, resolve the default folder's real id (for example from a
+  child folder's `parentFolderId`) and use the folder path.
 
 ## 3. Blocked on downstream
 

@@ -42,33 +42,36 @@ fn graph_subscription_resource_uses_folder_messages() {
     );
 }
 
-/// Each calendar scope must subscribe to its own calendar. `{prefix}/events`
-/// is the default calendar, so a shared resource string both mis-targets
-/// secondary calendars and collapses them together in `subscribe_graph`'s
-/// resource-keyed grouping.
+/// Graph documents only the mailbox-wide `/events` and `/contacts`
+/// notification resources (all calendars, all personal contacts). A
+/// per-collection path is undocumented, and one rejected create rolls back
+/// the whole subscribe group, mail included, so every calendar scope maps to
+/// `/events` and every contact scope to `/contacts`, and the resource-keyed
+/// grouping folds each type into one subscription.
 #[test]
-fn graph_event_subscription_names_the_scope_calendar() {
+fn graph_event_and_contact_scopes_share_the_mailbox_wide_resources() {
     let account =
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
-    let scope = |id: &str| CursorScope::FolderType {
+    let scope = |id: &str, ty| CursorScope::FolderType {
         folder: FolderId(id.to_string()),
-        ty: ObjectType::CalendarEvent,
+        ty,
     };
-    assert_eq!(
-        resource_for_scope(&account, &scope("calendar-id"))
-            .expect("primary")
-            .as_deref(),
-        Some("/me/calendars/calendar-id/events")
-    );
-    assert_ne!(
-        resource_for_scope(&account, &scope("secondary")).expect("primary"),
-        resource_for_scope(&account, &scope("calendar-id")).expect("primary"),
-    );
-    let opaque = resource_for_scope(&account, &scope("AAMk/GI2="))
-        .expect("primary")
-        .expect("subscribable");
-    assert!(!opaque.contains("AAMk/GI2="), "{opaque}");
-    assert!(opaque.ends_with("/events"), "{opaque}");
+    for id in ["calendar-id", "secondary", "AAMk/GI2="] {
+        assert_eq!(
+            resource_for_scope(&account, &scope(id, ObjectType::CalendarEvent))
+                .expect("primary")
+                .as_deref(),
+            Some("/me/events")
+        );
+    }
+    for id in ["contacts", "nested"] {
+        assert_eq!(
+            resource_for_scope(&account, &scope(id, ObjectType::Contact))
+                .expect("primary")
+                .as_deref(),
+            Some("/me/contacts")
+        );
+    }
 }
 
 #[test]
@@ -93,6 +96,71 @@ fn graph_subscription_resource_routes_foreign_scope_to_owner() {
         "/users/shared%40contoso.com/mailFolders/AAMk/messages"
     );
     assert!(!resource.contains("%1F"));
+}
+
+/// A token that lists calendars (Calendars.ReadBasic) may still be refused
+/// an `/events` subscription. That refusal is the calendar group's lane
+/// failure: the other group's subscription survives and nothing is deleted.
+/// Both orders are driven (refusal first, refusal second), and the failed
+/// lane is matched to the scope whose resource was actually refused.
+#[tokio::test]
+async fn a_permission_refused_create_fails_its_lane_and_keeps_the_rest() {
+    let denied = || {
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::FORBIDDEN,
+            serde_json::json!({"error":{"code":"ExtensionError","message":"refused"}}),
+        )
+    };
+    for refuse_first in [true, false] {
+        let client = GraphClient::new("token");
+        if refuse_first {
+            client.script_rest([denied(), created("kept")]);
+        } else {
+            client.script_rest([created("kept"), denied()]);
+        }
+        let account = webhook_account(&client);
+        let inbox = email_scope("inbox");
+        let calendar = CursorScope::FolderType {
+            folder: FolderId("cal".to_string()),
+            ty: ObjectType::CalendarEvent,
+        };
+        let subscription = push_subscribe(account.clone(), vec![inbox.clone(), calendar.clone()])
+            .await
+            .expect("the surviving group is a partial success");
+        let requests = client.take_rest_requests();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() == "POST")
+        );
+        let refused_index = usize::from(!refuse_first);
+        let refused_resource = requests[refused_index]
+            .body
+            .as_ref()
+            .and_then(|body| body.get("resource"))
+            .and_then(serde_json::Value::as_str)
+            .expect("a subscription body")
+            .to_string();
+        let (refused, kept) = if refused_resource.ends_with("/events") {
+            (calendar, inbox)
+        } else {
+            (inbox, calendar)
+        };
+        assert!(subscription.handle().is_some());
+        assert_eq!(subscription.outcomes().succeeded().len(), 1);
+        assert_eq!(subscription.outcomes().succeeded()[0].output, kept);
+        let failed = subscription.outcomes().failed();
+        assert_eq!(failed.len(), 1);
+        assert!(matches!(
+            failed[0].error.kind(),
+            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied)
+        ));
+        assert_eq!(
+            failed[0].error.scope(),
+            Some(&bifrost_types::ErrorScope::Cursor(refused))
+        );
+        assert_eq!(account.webhooks.groups_for_tests().read().await.len(), 1);
+    }
 }
 
 #[tokio::test]
@@ -222,22 +290,6 @@ async fn unsubscribe_tolerates_a_subscription_the_server_already_dropped() {
     let requests = client.take_rest_requests();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].url.ends_with("/subscriptions/live"));
-}
-
-#[test]
-fn contact_scope_subscribes_to_the_contact_folder_collection() {
-    let account =
-        GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
-    let scope = CursorScope::FolderType {
-        folder: FolderId("contacts".to_string()),
-        ty: ObjectType::Contact,
-    };
-    assert_eq!(
-        resource_for_scope(&account, &scope)
-            .expect("primary")
-            .as_deref(),
-        Some("/me/contactFolders/contacts/contacts")
-    );
 }
 
 #[test]

@@ -150,6 +150,10 @@ impl GraphScope {
                     Some(end_at.as_second()),
                 ))
             }
+            GraphScope::Contacts { .. } if self.is_default_contacts() => Ok((
+                format!("{prefix}/contacts/delta?$select={CONTACT_SYNC_SELECT}&$top=250"),
+                None,
+            )),
             GraphScope::Contacts { .. } => Ok((
                 format!(
                     "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SYNC_SELECT}&$top=250"
@@ -164,25 +168,44 @@ impl GraphScope {
         &self,
         account: &GraphAccount,
     ) -> Result<Option<String>, crate::error::GraphError> {
-        // Calendar ids stay in the resource: using /events for every
-        // calendar would subscribe every scope to the default calendar.
-        let (collection, items) = match self {
-            Self::Mail { .. } => ("mailFolders", "messages"),
-            Self::Events { .. } => ("calendars", "events"),
-            Self::Contacts { .. } => ("contactFolders", "contacts"),
-            Self::PublicFolder(_) => return Ok(None),
-        };
+        // Graph's change-notification contract lists only the mailbox-wide
+        // `/events` (every event in the mailbox, all calendars) and
+        // `/contacts` (every personal contact) resources for these types;
+        // a per-calendar or per-contact-folder path is undocumented, and one
+        // rejected create rolls back the whole subscribe group, mail included.
+        // So every calendar scope shares one `/events` subscription and every
+        // contact scope one `/contacts` subscription: `subscribe_graph` groups
+        // on this string. That over-covers - a notification about one
+        // calendar is evidence for each grouped calendar scope - but never
+        // leaves a scope believed push-covered with no notifications arriving.
+        // https://learn.microsoft.com/en-us/graph/api/resources/change-notifications-api-overview
         let prefix = self.client(account)?.api_path_prefix();
-        let id = bifrost_net::url::encode_path_component(self.native_id());
-        Ok(Some(format!("{prefix}/{collection}/{id}/{items}")))
+        match self {
+            Self::Mail { .. } => {
+                let id = bifrost_net::url::encode_path_component(self.native_id());
+                Ok(Some(format!("{prefix}/mailFolders/{id}/messages")))
+            }
+            Self::Events { .. } => Ok(Some(format!("{prefix}/events"))),
+            Self::Contacts { .. } => Ok(Some(format!("{prefix}/contacts"))),
+            Self::PublicFolder(_) => Ok(None),
+        }
     }
 
     pub(crate) fn ews_folder_id(&self) -> Option<String> {
         // The EWS session translates and subscribes in the primary mailbox.
         // Shared mail remains readable and webhook-capable, but pretending it
         // has EWS coverage would leave an Outlook user with silently stale mail.
-        (!matches!(self, Self::PublicFolder(_)) && self.owner().is_none())
-            .then(|| self.native_id().to_string())
+        // The default Contacts book's id is synthetic, which
+        // translateExchangeIds cannot convert; that one scope is refused on
+        // the EWS arm and stays on its poll cadence.
+        (!matches!(self, Self::PublicFolder(_))
+            && self.owner().is_none()
+            && !self.is_default_contacts())
+        .then(|| self.native_id().to_string())
+    }
+
+    fn is_default_contacts(&self) -> bool {
+        matches!(self, Self::Contacts { folder } if folder.0 == super::contacts::DEFAULT_CONTACTS_ID)
     }
 
     pub(crate) fn mint_object_id(&self, id: &str) -> ObjectId {
@@ -202,6 +225,14 @@ impl GraphScope {
         // Graph returns native parent ids. Discovery uses owner-qualified
         // shared folder ids; emit that same identity so membership coverage
         // cannot conflate a shared inbox with the primary inbox.
+        //
+        // A contact folder's delta returns only that folder's contacts, so
+        // the scope IS the membership. Its `parentFolderId` would name the
+        // default book by its real id, which never matches the synthetic
+        // `contacts` id discovery emits for it.
+        if let Self::Contacts { folder } = self {
+            return MembershipScope::Folder(folder.clone());
+        }
         let native = native
             .filter(|id| !id.is_empty())
             .unwrap_or(self.native_id());
@@ -299,18 +330,12 @@ mod tests {
             ),
             (
                 ObjectType::CalendarEvent,
-                "/me/calendars/collection/events",
+                "/me/events",
                 "collection::item",
                 false,
                 Some("odata.maxpagesize=50, outlook.timezone=\"UTC\""),
             ),
-            (
-                ObjectType::Contact,
-                "/me/contactFolders/collection/contacts",
-                "item",
-                false,
-                None,
-            ),
+            (ObjectType::Contact, "/me/contacts", "item", false, None),
         ] {
             let scope =
                 GraphScope::parse(&typed(FolderId("collection".into()), ty)).expect("primary");
@@ -327,6 +352,38 @@ mod tests {
             assert_eq!(scope.delta_prefer(), prefer);
             assert!(scope.kind().is_ok());
         }
+    }
+
+    /// `/contactFolders` never lists the default book, so its scope carries
+    /// the synthetic id the typed door uses. That id must never reach a
+    /// `contactFolders/contacts` path or an id translation, and its contacts
+    /// must claim the discovered membership rather than the real parent id.
+    #[test]
+    fn default_contacts_scope_reads_the_mailbox_contacts_collection() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let folder = FolderId(super::super::contacts::DEFAULT_CONTACTS_ID.into());
+        let scope =
+            GraphScope::parse(&typed(folder.clone(), ObjectType::Contact)).expect("primary");
+        let (path, _) = scope
+            .delta_path(&account, jiff::Timestamp::UNIX_EPOCH)
+            .expect("delta");
+        assert!(path.starts_with("/me/contacts/delta?"), "{path}");
+        assert_eq!(scope.ews_folder_id(), None);
+        assert_eq!(
+            scope.membership(Some("AAMkRealDefaultId")),
+            MembershipScope::Folder(folder)
+        );
+        let nested = GraphScope::parse(&typed(FolderId("nested".into()), ObjectType::Contact))
+            .expect("primary");
+        let (path, _) = nested
+            .delta_path(&account, jiff::Timestamp::UNIX_EPOCH)
+            .expect("delta");
+        assert!(
+            path.starts_with("/me/contactFolders/nested/contacts/delta?"),
+            "{path}"
+        );
+        assert_eq!(nested.ews_folder_id().as_deref(), Some("nested"));
     }
 
     #[test]

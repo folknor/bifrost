@@ -997,11 +997,11 @@ mod tests {
     fn initial_delta_url_supports_contact_scope() {
         let account = test_account();
         let scope = CursorScope::FolderType {
-            folder: FolderId("contacts".to_string()),
+            folder: FolderId("team-folder".to_string()),
             ty: ObjectType::Contact,
         };
         let url = initial_delta_url(&account, &scope).expect("contact scope is supported");
-        assert!(url.starts_with("/me/contactFolders/contacts/contacts/delta?"));
+        assert!(url.starts_with("/me/contactFolders/team-folder/contacts/delta?"));
     }
 
     #[test]

@@ -340,20 +340,43 @@ async fn create_and_register(
                 });
             }
             Err(error) => {
-                // The handle is never registered on the account and never
-                // returned on this path, so nothing downstream could ever
-                // reach these subscriptions to tear them down. Retain none
-                // of them. Cleanup is best effort: preserve the create
-                // error the caller needs to act on even if a DELETE fails.
-                //
-                // This rolls back only what we hold ids for. THIS create may
-                // itself have succeeded on Graph (a timeout after the server
-                // acted): its id is unknowable, see `run_subscribe`.
-                roll_back_created(account, &subscriptions).await;
-                return Err(into_account_error(
+                let error = into_account_error(
                     error,
                     GraphErrorContext::graph(AccountOperation::PushSubscribe),
-                ));
+                );
+                if !is_standing_resource_refusal(&error) {
+                    // The handle is never registered on the account and never
+                    // returned on this path, so nothing downstream could ever
+                    // reach these subscriptions to tear them down. Retain none
+                    // of them. Cleanup is best effort: preserve the create
+                    // error the caller needs to act on even if a DELETE fails.
+                    //
+                    // This rolls back only what we hold ids for. THIS create may
+                    // itself have succeeded on Graph (a timeout after the server
+                    // acted): its id is unknowable, see `run_subscribe`.
+                    roll_back_created(account, &subscriptions).await;
+                    return Err(error);
+                }
+                // A permission refusal names THIS resource: a token that can
+                // list calendars with Calendars.ReadBasic still cannot
+                // subscribe to `/events` without Calendars.Read. It is that
+                // group's lane failure, so mail subscriptions created
+                // beside it survive; an Outlook user missing calendar
+                // consent still expects live mail. Only a permission refusal
+                // is a lane failure: it stays true until consent changes,
+                // so recording the scopes as unaccepted loses nothing,
+                // whereas a transient failure filed per lane would drop
+                // those scopes from the engine's accepted set and never be
+                // retried. Everything else keeps the whole-request rollback.
+                for (item, scope) in covered {
+                    let scoped = error
+                        .clone()
+                        .into_builder()
+                        .scope(bifrost_types::ErrorScope::Cursor(scope))
+                        .try_build()
+                        .unwrap_or_else(|_| error.clone());
+                    outcomes.push_failed(item, scoped);
+                }
             }
         }
     }
@@ -368,6 +391,11 @@ async fn create_and_register(
             return Err(error);
         }
     };
+    // Every group refused on permission: the handle-less outcome, which the
+    // dispatcher turns into the whole-request refusal carrying each cause.
+    if subscriptions.is_empty() {
+        return Ok((None, outcomes));
+    }
 
     // Mint before registration; the handle carries the original server ids.
     let handle = graph_handle(
@@ -388,6 +416,32 @@ async fn create_and_register(
         return Err(account_closed_error());
     }
     Ok((Some(handle), outcomes))
+}
+
+/// Whether a subscription create was refused for lack of permission on its
+/// resource, a standing fact rather than a transport, throttle or server
+/// fault.
+///
+/// A 409 duplicate-subscription refusal is deliberately NOT laned. Graph
+/// refuses a second subscription with the same resource and changeType, and
+/// reattach creates replacements before deleting the old handle's rows, so a
+/// laned 409 would let reattach commit the other groups and then delete the
+/// old row, dropping coverage that was working. Whole-request failure keeps
+/// the old handle alive instead.
+///
+/// This trusts the classifier's `PermissionDenied`. A Conditional Access
+/// claims challenge (403 with `insufficient_claims`) is recoverable by
+/// re-authenticating, but the classifier currently has no signal for it and
+/// falls back to the 403 status, so a challenge confined to one resource
+/// would be laned here as if consent were missing. The fix belongs in the
+/// classifier, which should map the challenge to an authentication kind.
+fn is_standing_resource_refusal(error: &AccountError) -> bool {
+    matches!(
+        error.kind(),
+        bifrost_types::AccountErrorKind::Authorization(
+            bifrost_types::AccessErrorKind::PermissionDenied
+        )
+    )
 }
 
 /// Best-effort DELETE of subscriptions this request created but will never

@@ -17,12 +17,33 @@ use crate::types::ODataCollection;
 use super::GraphAccount;
 use super::graph_error::{self, GraphErrorContext};
 
-const DEFAULT_CONTACTS_ID: &str = "contacts";
+/// The synthetic id of the default Contacts folder, which `/contactFolders`
+/// never lists. Typed doors and the sync scope share it, so one book has one
+/// identity; REST paths map it to `{prefix}/contacts`.
+pub(crate) const DEFAULT_CONTACTS_ID: &str = "contacts";
 // Typed contact reads need detail fields omitted from the sync identity projection.
 const CONTACT_READ_SELECT: &str = "id,displayName,emailAddresses,businessPhones,homePhones,mobilePhone,homeAddress,businessAddress,otherAddress,companyName,jobTitle,personalNotes,parentFolderId";
 
 pub(crate) async fn address_books_list(
     account: GraphAccount,
+) -> Result<Vec<AddressBook>, AccountError> {
+    let mut books = primary_address_books(&account).await?;
+    books.extend(public::books(&account).await);
+    Ok(books)
+}
+
+/// The primary mailbox's REST address books, without the EWS public leg: the
+/// synthetic default book, then every contact folder at any depth.
+///
+/// `/contactFolders` lists only the folders directly inside the default
+/// Contacts folder, and contact delta is per folder, so a book nested as
+/// `Contacts / Customers / Europe` is reached only by walking `childFolders`.
+/// An Outlook user sees nested contact folders and expects them listed and
+/// synced. One `PageWalk` bounds the whole tree, and a visited set stops a
+/// server that reports a folder twice from looping. Cursor-scope discovery
+/// reads this: public books are typed read-only doors, not sync scopes.
+pub(crate) async fn primary_address_books(
+    account: &GraphAccount,
 ) -> Result<Vec<AddressBook>, AccountError> {
     let prefix = account.mailboxes.primary().api_path_prefix();
     let mut books = vec![AddressBook {
@@ -42,24 +63,36 @@ pub(crate) async fn address_books_list(
     }];
     let operation = AccountOperation::AddressBooksList;
     let mut walk = crate::paging::PageWalk::new("contactFolders");
-    let mut next = Some(
-        account
-            .mailboxes
-            .primary()
-            .api_url(&format!(
-                "{prefix}/contactFolders?$select=id,displayName,parentFolderId&$top=250"
-            ))
-            .map_err(|error| into_error(error, operation))?,
-    );
-    while let Some(url) = next {
-        walk.enter(&url)
-            .map_err(|error| into_error(error, operation))?;
-        let page: ODataCollection<GraphContactFolder> =
-            get_page(&account, Resource::Outlook, &url, operation).await?;
-        next = admit_next(&account, &page, operation)?;
-        books.extend(page.value.into_iter().map(folder_to_address_book));
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = std::collections::VecDeque::from([format!(
+        "{prefix}/contactFolders?$select=id,displayName,parentFolderId&$top=250"
+    )]);
+    while let Some(first) = pending.pop_front() {
+        let mut next = Some(
+            account
+                .mailboxes
+                .primary()
+                .api_url(&first)
+                .map_err(|error| into_error(error, operation))?,
+        );
+        while let Some(url) = next {
+            walk.enter(&url)
+                .map_err(|error| into_error(error, operation))?;
+            let page: ODataCollection<GraphContactFolder> =
+                get_page(account, Resource::Outlook, &url, operation).await?;
+            next = admit_next(account, &page, operation)?;
+            for folder in page.value {
+                if !visited.insert(folder.id.clone()) {
+                    continue;
+                }
+                let encoded = bifrost_net::url::encode_path_component(&folder.id);
+                pending.push_back(format!(
+                    "{prefix}/contactFolders/{encoded}/childFolders?$select=id,displayName,parentFolderId&$top=250"
+                ));
+                books.push(folder_to_address_book(folder));
+            }
+        }
     }
-    books.extend(public::books(&account).await);
     Ok(books)
 }
 

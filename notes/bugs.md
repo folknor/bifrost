@@ -89,3 +89,45 @@ repeated authoritative inventory (today `NoCursor` schedules no further poll),
 plus safe hydration and mutation semantics for UID handles that do not survive
 a re-SELECT. A wave of one owning types, sync and imap.
 
+
+## BUG-190 - Graph webhook subscriptions collide with Graph's duplicate rule across handles and on reattach
+
+**Reported by:** the Graph calendar and contact scope discovery work (spar review).
+
+Graph refuses a second subscription with the same `resource` and `changeType`
+with 409 Conflict ("Subscription Id <> already exists for the requested
+combination", subscription-post-subscriptions, Duplicate subscription
+behavior). The webhook arm owns subscriptions per handle, so two cases fail:
+
+- Reattach (`crates/sync/src/engine/reattach/transaction.rs`) creates the
+  replacement subscriptions BEFORE deleting the old handle's rows, so every
+  replacement create is a duplicate of a live row and 409s; the whole request
+  fails and the old handle survives. Affects mail folder resources too, not
+  only calendars. Not reproduced live; inferred from the documented rule.
+- Two subscribe calls whose scopes share a resource collide. Calendar and
+  contact scopes now all map to the mailbox-wide `/events` and `/contacts`
+  resources (the only documented ones), so two calls over disjoint calendars
+  hit it; before, only two calls over the same mail folder did.
+
+`create_and_register` treats the 409 as whole-request failure with rollback,
+which keeps the old coverage alive but makes the second subscribe or the
+reattach fail. A fix needs subscription rows owned per account and shared by
+handles (reference-counted teardown, renewal once per row), or a reattach that
+adopts the old rows instead of recreating them. Laning the 409 per resource
+was tried and rejected: reattach would then commit the other groups and delete
+the old row, silently dropping working coverage.
+
+## BUG-191 - Graph classifies a Conditional Access claims challenge as `PermissionDenied`
+
+**Reported by:** the Graph calendar and contact scope discovery work (spar review).
+
+Graph answers 403 with `insufficient_claims` (and a `WWW-Authenticate` claims
+challenge) when the token needs extra claims; that is recovered by
+re-authenticating, not by consent. `GraphSignal` has no variant for it, so it
+falls to the 403 status and becomes `Authorization(PermissionDenied)`, which
+reads to the engine and to the user as missing permission. Since the webhook
+arm now files a `PermissionDenied` create as a per-resource lane failure, a
+challenge confined to one resource would drop that resource's push coverage
+until the next subscribe. Fix in `crates/graph/src/account/graph_error.rs`:
+recognise the challenge and map it to an authentication kind. Not fixed with
+the discovery change because that file was mid-edit by another item.

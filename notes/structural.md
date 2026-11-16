@@ -226,20 +226,6 @@ hunter's reading is that the generic is unnecessary because a scripted
 `ReqwestTransport` already exists; both readings agree the current pin is what
 makes `JmapAccount` hard to drive.
 
-## STR-119 - Graph event and contact sync lanes have no scope producer
-
-**Reported by:** graph (needs a ruling, not a deletion: the published-API rule applies to the behaviour these lanes promise).
-
-`scopes::discover_cursor_scopes_inner` emits only `ObjectType::Email` folder scopes
-plus public folders, and the engine drives only discovered scopes. Reachable only
-through a scope nothing in production discovers: `GraphCursorKind::Events` and
-`Contacts`; the calendarView and contacts delta paths;
-`CursorError::CalendarWindowExpired` and the reseed logic; `EVENT_DELTA_PREFER`;
-`resource_for_scope`'s events and contacts arms; `sync_object_id`'s event and
-contact arms; and the inventory tests for all of these. Either calendar and contact
-folder discovery is missing, or the lanes are built ahead of a producer; either
-way a large surface compiles and is tested with no path to it.
-
 ## STR-138 - Smaller SMTP axes and placement notes
 
 **Reported by:** smtp-sasl.

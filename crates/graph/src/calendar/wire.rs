@@ -11,6 +11,11 @@ pub(crate) struct GraphCalendar {
     pub(crate) name: Option<String>,
     pub(crate) can_edit: Option<bool>,
     pub(crate) is_default_calendar: Option<bool>,
+    /// Set on a calendar another user shared into this mailbox. Cursor-scope
+    /// discovery reads it: `/events` notifications do not cover shared
+    /// folders, so such a calendar must not become a push-covered scope.
+    #[serde(default)]
+    pub(crate) is_shared_with_me: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

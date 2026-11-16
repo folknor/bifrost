@@ -183,6 +183,44 @@ async fn discover_cursor_scopes_inner(
         }
     }
 
+    // Primary calendars and contact books. An Outlook user expects calendars
+    // and contacts to sync like mail, so each REST collection becomes a
+    // typed scope the engine drives through the calendarView and contact
+    // delta lanes. Only the primary mailbox: shared non-mail collections are
+    // refused at admission (`GraphScope::parse`), and public calendars and
+    // books are typed read-only doors, so the REST-only listers are used. A
+    // token without Calendars.Read or Contacts.Read is a permanent state,
+    // not an outage: that type is skipped with a warning and mail still
+    // syncs, matching the shared-mailbox rule above. Any other listing
+    // failure fails discovery like the primary mail listing does, because a
+    // discovery that silently dropped every calendar would read as the
+    // calendars being gone.
+    //
+    // `/calendars` also returns calendars other users shared into this
+    // mailbox (`isSharedWithMe`). Their reads would work, but `/events`
+    // notifications do not cover shared folders, so a scope for one would
+    // be reported push-covered while its changes never arrive. They stay on
+    // the typed calendar doors only.
+    match super::calendar::primary_calendars(account).await {
+        Ok(calendars) => scopes.extend(
+            calendars
+                .into_iter()
+                .filter(|calendar| calendar.is_shared_with_me != Some(true))
+                .map(|calendar| CursorScope::FolderType {
+                    folder: FolderId(calendar.id),
+                    ty: ObjectType::CalendarEvent,
+                }),
+        ),
+        Err(error) => warnings.push(skip_if_denied(error)?),
+    }
+    match super::contacts::primary_address_books(account).await {
+        Ok(books) => scopes.extend(books.into_iter().map(|book| CursorScope::FolderType {
+            folder: FolderId(book.native_id),
+            ty: ObjectType::Contact,
+        })),
+        Err(error) => warnings.push(skip_if_denied(error)?),
+    }
+
     // Public folders (opt-in via `with_public_folders`): browse the
     // Exchange public-folder hierarchy, seed each readable folder's
     // content-mailbox routing, and surface it as a `CursorScope::Folder`
@@ -199,6 +237,19 @@ async fn discover_cursor_scopes_inner(
     }
 
     Ok((scopes, warnings))
+}
+
+/// A collection listing's permission denial becomes a skip warning; anything
+/// else stays discovery-fatal.
+fn skip_if_denied(error: AccountError) -> Result<Warning, AccountError> {
+    if matches!(
+        error.kind(),
+        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+    ) {
+        Ok(Warning::skipped(None, error))
+    } else {
+        Err(error)
+    }
 }
 
 async fn discover_memberships_inner(
@@ -262,13 +313,26 @@ mod tests {
     #[tokio::test]
     async fn discovery_reuses_the_listing_open_seeded_and_lists_again_on_re_run() {
         let client = GraphClient::new("token");
-        // Exactly ONE listing response is scripted. A discovery that walks
-        // the hierarchy while the seed is present would take it, and the
-        // re-run below would then hit the exhausted-script panic.
-        client.script_rest([crate::client::ScriptedRestResponse::json(
-            reqwest::StatusCode::OK,
-            serde_json::json!({ "value": [{ "id": "relisted", "displayName": "Relisted" }] }),
-        )]);
+        // Exactly ONE mail listing response is scripted, between the two
+        // empty calendar and contact-folder listings each pass makes. A
+        // discovery that walked the mail hierarchy while the seed is present
+        // would issue a mailFolders request, which the URL check below sees.
+        let empty = || {
+            crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({ "value": [] }),
+            )
+        };
+        client.script_rest([
+            empty(),
+            empty(),
+            crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({ "value": [{ "id": "relisted", "displayName": "Relisted" }] }),
+            ),
+            empty(),
+            empty(),
+        ]);
         let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
         *account.open_folder_seed.write().await = Some(vec![crate::types::GraphMailFolder {
             id: "seeded".to_string(),
@@ -281,17 +345,27 @@ mod tests {
             .await
             .expect("discovery succeeds from the seeded listing");
 
+        let contacts = CursorScope::FolderType {
+            folder: FolderId(crate::account::contacts::DEFAULT_CONTACTS_ID.to_string()),
+            ty: ObjectType::Contact,
+        };
         assert_eq!(
             scopes,
-            vec![CursorScope::FolderType {
-                folder: FolderId("seeded".to_string()),
-                ty: ObjectType::Email,
-            }],
+            vec![
+                CursorScope::FolderType {
+                    folder: FolderId("seeded".to_string()),
+                    ty: ObjectType::Email,
+                },
+                contacts.clone(),
+            ],
             "the first discovery answers from open's listing"
         );
         assert!(
-            client.take_rest_requests().is_empty(),
-            "the first discovery must issue no folder listing of its own"
+            client
+                .take_rest_requests()
+                .iter()
+                .all(|request| !request.url.contains("mailFolders")),
+            "the first discovery must issue no mail folder listing of its own"
         );
         assert!(
             account.open_folder_seed.read().await.is_none(),
@@ -304,16 +378,132 @@ mod tests {
 
         assert_eq!(
             scopes,
-            vec![CursorScope::FolderType {
-                folder: FolderId("relisted".to_string()),
-                ty: ObjectType::Email,
-            }],
+            vec![
+                CursorScope::FolderType {
+                    folder: FolderId("relisted".to_string()),
+                    ty: ObjectType::Email,
+                },
+                contacts,
+            ],
             "a second discovery walks the hierarchy so new folders are noticed"
         );
         assert!(
-            !client.take_rest_requests().is_empty(),
+            client
+                .take_rest_requests()
+                .iter()
+                .any(|request| request.url.contains("mailFolders")),
             "the re-run issues the listing"
         );
+    }
+
+    fn seeded_account(client: &GraphClient) -> GraphAccount {
+        GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions)
+    }
+
+    async fn seed_inbox(account: &GraphAccount) {
+        *account.open_folder_seed.write().await = Some(vec![crate::types::GraphMailFolder {
+            id: "inbox".to_string(),
+            display_name: Some("Inbox".to_string()),
+            child_folder_count: Some(0),
+            parent_folder_id: None,
+        }]);
+    }
+
+    /// Calendars and contact books are discovered alongside mail, so the
+    /// engine drives the calendarView and contact delta lanes. Contact books
+    /// nested below the first level are reached through `childFolders`.
+    #[tokio::test]
+    async fn discovery_emits_calendar_and_nested_contact_scopes() {
+        let client = GraphClient::new("token");
+        let json =
+            |value| crate::client::ScriptedRestResponse::json(reqwest::StatusCode::OK, value);
+        client.script_rest([
+            json(serde_json::json!({ "value": [
+                { "id": "cal-default", "name": "Calendar", "isDefaultCalendar": true },
+                { "id": "cal-team", "name": "Team" },
+                { "id": "cal-boss", "name": "Boss", "isSharedWithMe": true }
+            ] })),
+            json(
+                serde_json::json!({ "value": [{ "id": "customers", "displayName": "Customers" }] }),
+            ),
+            json(serde_json::json!({ "value": [{ "id": "europe", "displayName": "Europe" }] })),
+            json(serde_json::json!({ "value": [] })),
+        ]);
+        let account = seeded_account(&client);
+        seed_inbox(&account).await;
+
+        let (scopes, warnings) = discover_cursor_scopes_inner(&account)
+            .await
+            .expect("discovery succeeds");
+
+        let typed = |id: &str, ty| CursorScope::FolderType {
+            folder: FolderId(id.to_string()),
+            ty,
+        };
+        assert_eq!(
+            scopes,
+            vec![
+                typed("inbox", ObjectType::Email),
+                typed("cal-default", ObjectType::CalendarEvent),
+                typed("cal-team", ObjectType::CalendarEvent),
+                typed(
+                    crate::account::contacts::DEFAULT_CONTACTS_ID,
+                    ObjectType::Contact
+                ),
+                typed("customers", ObjectType::Contact),
+                typed("europe", ObjectType::Contact),
+            ]
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let requests = client.take_rest_requests();
+        assert!(
+            requests.iter().any(|request| request
+                .url
+                .contains("/contactFolders/customers/childFolders")),
+            "{requests:?}"
+        );
+    }
+
+    /// A token without calendar consent must not cost the account its mail:
+    /// the denied type is skipped with a warning. A non-permission failure
+    /// stays fatal, so a transient outage never reads as calendars removed.
+    #[tokio::test]
+    async fn a_denied_collection_listing_skips_while_other_failures_stay_fatal() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::FORBIDDEN,
+                serde_json::json!({ "error": { "code": "ErrorAccessDenied", "message": "denied" } }),
+            ),
+            crate::client::ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                serde_json::json!({ "value": [] }),
+            ),
+        ]);
+        let account = seeded_account(&client);
+        seed_inbox(&account).await;
+        let (scopes, warnings) = discover_cursor_scopes_inner(&account)
+            .await
+            .expect("a denied calendar listing is not discovery-fatal");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(scopes.iter().all(|scope| !matches!(
+            scope,
+            CursorScope::FolderType {
+                ty: ObjectType::CalendarEvent,
+                ..
+            }
+        )));
+        assert!(scopes.contains(&CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        }));
+
+        client.script_rest([crate::client::ScriptedRestResponse::json(
+            reqwest::StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": { "code": "BadRequest", "message": "bad" } }),
+        )]);
+        seed_inbox(&account).await;
+        assert!(discover_cursor_scopes_inner(&account).await.is_err());
     }
 
     /// Each foreign folder contributes an owner tag the engine's covering
