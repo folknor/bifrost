@@ -105,19 +105,30 @@ contract across bifrost-types (structured payload and its export tier),
 bifrost-net (do not silent-refresh a claims 401; keep the claims), the token
 source, and ratatoskr's MSAL call. Covers both the 401 and 403 paths.
 
-## BUG-199 - Graph's KQL search route has two pre-existing gaps
+## BUG-206 - Graph search sends `$filter` and `$search` together
 
-**Reported by:** the attachment-search contract fix (spar, lateral). More
-filters now take the route (`Attachment(Name)` and `ProviderQuery` leaves join
-`From`/`To`), so these bite more often. (Its KQL date range, which used the
-received clock, was moved to send time in the same fix.)
+**Reported by:** the Graph folder-scoped search fix (spar, lateral).
 
-In `crates/graph/src/account/pim/search.rs`: (1) `In` plus any KQL-only leaf
-is refused `Request(Malformed)`, yet Graph supports `$search` on a folder's
-own message collection (`/mailFolders/{id}/messages`), so a positive `In`
-conjunct could become the endpoint scope; (2) `$search` returns at most 1,000
-results, and the search pages hardcode `truncated: false`, so hitting the
-ceiling reads as an exhaustive end.
+In `crates/graph/src/account/pim/search.rs` `mailbox_search_url`, a request
+with a structured filter that stays on the OData path (say `Subject`) and a
+`provider_query` emits both `$filter=` and `$search=`, which the comment two
+lines above says Graph answers with 400. Commit 6940bb98 claimed to close
+this; it closed it only when the filter forces KQL. Candidates: route any
+request carrying a `provider_query` through KQL (every OData leaf the path
+emits has a KQL form except a residual `In`), or refuse the pair.
+
+## BUG-207 - A Graph search cursor is not bound to the request's filter
+
+**Reported by:** the Graph folder-scoped search fix (spar, lateral, filed
+under the scope fence).
+
+The search cursor pins the shared-mailbox set and now the lifted folder
+scope, but not the rest of the request: a cursor resumed with a different
+filter or `provider_query` re-issues the old `nextLink` and answers the old
+query as if it were the new one. Candidate: pin a stable digest of the
+effective filter and query (not `limit`) and reject a mismatch as
+`invalid_page_cursor`, as the set and scope checks do. `reference/types.md`
+also never mentions `Page::truncated`, which Graph search now sets.
 
 ## BUG-200 - JMAP has no attachment-name search
 
@@ -132,17 +143,4 @@ top-level conjunct against `bodyStructure` names. Verification is only exact
 in that position, and `hasAttachment` is not a proven candidate superset of
 named parts, so neither path is a drop-in.
 
-## BUG-201 - IMAP search counts named inline parts as attachments; raw-query literal doc mismatch
-
-**Reported by:** the attachment-search contract fix (spar, lateral).
-
-`parts::attachment_entities` counts any part with a filename, so a signature
-logo sent `inline` with a name makes `Attachment(Any)` match on IMAP, while
-Graph's `hasAttachments` excludes inline attachments (an Outlook user's
-paperclip). Whether IMAP should follow the paperclip is a product decision
-over the entity rule ruled on for the BODYSTRUCTURE evaluator. Separately,
-`reference/imap.md` says raw SEARCH criteria "retain caller-written
-literals", but `validate_provider_query` in `crates/imap/src/account/search.rs`
-refuses any IMAP literal in `provider_query` (and now in a `ProviderQuery`
-leaf); one of the two is wrong.
 

@@ -5,7 +5,7 @@
 //! stays `BlobRangeSupport::No` until a projection actually mints these
 //! handles: a capability that claims a byte path before handles exist is a
 //! promise the crate cannot keep. (The separate [`attachment_entities`]
-//! visitor is wired: attachment search evaluates `SearchFilter::Has` with it.)
+//! visitor is wired: attachment search evaluates `SearchFilter::Attachment` with it.)
 //!
 //! Two pieces:
 //!
@@ -467,39 +467,52 @@ pub(crate) struct AttachmentEntity {
 /// its inner root is an entity inside an attachment and is judged by the
 /// same rule as any other node.
 ///
+/// A body resource is not an attachment: a non-root direct child of a
+/// multipart/related that carries a Content-ID and no `attachment`
+/// disposition (an HTML signature logo) is left out, whatever its name. This
+/// approximates the Outlook paperclip from metadata alone; see the comment
+/// at the exclusion for the two directions it can err in.
+///
 /// Descent stops at [`MAX_PART_DEPTH`], which a wire-parsed structure cannot
 /// reach (the parser refuses deeper input); a hand-built deeper structure
 /// reports only the entities above the bound.
 pub(crate) fn attachment_entities(structure: &BodyStructure) -> Vec<AttachmentEntity> {
     let mut out = Vec::new();
-    let mut pending = vec![(structure, true, 0usize)];
-    while let Some((node, outer_root, depth)) = pending.pop() {
+    // (node, is the outer root, is a non-root direct child of a
+    // multipart/related, depth)
+    let mut pending = vec![(structure, true, false, 0usize)];
+    while let Some((node, outer_root, related_resource, depth)) = pending.pop() {
         if depth > MAX_PART_DEPTH {
             continue;
         }
-        let (media_type, media_subtype, params, disposition) = match node {
+        let (media_type, media_subtype, params, disposition, content_id) = match node {
             BodyStructure::Basic {
                 media_type,
                 media_subtype,
                 params,
                 disposition,
+                id,
                 ..
-            } => (media_type.as_str(), media_subtype, params, disposition),
+            } => (media_type.as_str(), media_subtype, params, disposition, id),
             BodyStructure::Text {
                 media_subtype,
                 params,
                 disposition,
+                id,
                 ..
-            } => ("text", media_subtype, params, disposition),
+            } => ("text", media_subtype, params, disposition, id),
             BodyStructure::Message {
                 media_subtype,
                 params,
                 disposition,
+                id,
                 body,
                 ..
             } => {
-                pending.push((body, false, depth + 1));
-                ("message", media_subtype, params, disposition)
+                // An embedded message's own root is judged afresh: the
+                // related-resource mark never crosses a message boundary.
+                pending.push((body, false, false, depth + 1));
+                ("message", media_subtype, params, disposition, id)
             }
             BodyStructure::Multipart {
                 media_subtype,
@@ -508,14 +521,19 @@ pub(crate) fn attachment_entities(structure: &BodyStructure) -> Vec<AttachmentEn
                 bodies,
                 ..
             } => {
-                // Reverse so the stack pops children in document order.
-                for child in bodies.iter().rev() {
-                    pending.push((child, false, depth + 1));
+                let related_root = media_subtype
+                    .eq_ignore_ascii_case("related")
+                    .then(|| related_root_index(params, bodies));
+                // Reverse so the stack pops children in document order. The
+                // mark is for DIRECT children only; it is not inherited.
+                for (index, child) in bodies.iter().enumerate().rev() {
+                    let resource = related_root.is_some_and(|root| root != index);
+                    pending.push((child, false, resource, depth + 1));
                 }
                 if outer_root {
                     continue;
                 }
-                ("multipart", media_subtype, params, disposition)
+                ("multipart", media_subtype, params, disposition, &None)
             }
         };
         let media_type = media_type.to_ascii_lowercase();
@@ -524,6 +542,20 @@ pub(crate) fn attachment_entities(structure: &BodyStructure) -> Vec<AttachmentEn
         let attached = disposition
             .as_ref()
             .is_some_and(|d| d.disposition_type.eq_ignore_ascii_case("attachment"));
+        // A body resource - an image the HTML shows by `cid:`, such as a
+        // signature logo - is not what an Outlook user sees as an attachment
+        // (Graph's `hasAttachments` excludes inline attachments, and the
+        // paperclip with it). BODYSTRUCTURE cannot show whether the HTML
+        // actually references the Content-ID, so this is the structural
+        // approximation: a Content-ID-addressable, non-root direct child of a
+        // multipart/related the sender did not mark `attachment`. It errs both
+        // ways, and the choice to search metadata only accepts that: an
+        // unreferenced file placed in a related part is missed, and a
+        // referenced image under multipart/mixed still counts. Its children
+        // are still visited, so an explicit attachment nested inside counts.
+        if related_resource && content_id.is_some() && !attached {
+            continue;
+        }
         let embedded =
             media_type == "message" && (media_subtype == "rfc822" || media_subtype == "global");
         if attached || filename.is_some() || embedded {
@@ -535,6 +567,36 @@ pub(crate) fn attachment_entities(structure: &BodyStructure) -> Vec<AttachmentEn
         }
     }
     out
+}
+
+/// The root of a multipart/related (RFC 2387 Section 3.2): the child whose
+/// Content-ID the `start` parameter names, else the first child.
+fn related_root_index(params: &[(String, String)], bodies: &[BodyStructure]) -> usize {
+    let bare = |id: &str| {
+        id.trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string()
+    };
+    let Some(start) = params
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("start"))
+        .map(|(_, value)| bare(value))
+    else {
+        return 0;
+    };
+    bodies
+        .iter()
+        .position(|body| {
+            let id = match body {
+                BodyStructure::Basic { id, .. }
+                | BodyStructure::Text { id, .. }
+                | BodyStructure::Message { id, .. } => id.as_deref(),
+                BodyStructure::Multipart { .. } => None,
+            };
+            id.is_some_and(|id| bare(id) == start)
+        })
+        .unwrap_or(0)
 }
 
 /// Whether a message's attachments satisfy one `SearchFilter::Attachment`.

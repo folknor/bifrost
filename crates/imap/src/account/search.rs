@@ -318,6 +318,14 @@ fn search_plan(
     })
 }
 
+/// Structural guard for caller-written raw criteria at the account surface:
+/// unbalanced parentheses, an unterminated quote, or an IMAP literal marker
+/// are `Request(Malformed)`. Refusing literals here is deliberate, not a gap
+/// in the connection-level literal support: a literal is the only context in
+/// which the encoder lets a CRLF through inside criteria, so refusing it
+/// keeps every account caller's CRLF off the wire. (Connection-level raw
+/// `SearchCriteria` keeps caller-written literals; typed operands still go
+/// out as literals when the writer chooses one.)
 fn validate_provider_query(raw: &str, op: AccountOperation) -> Result<(), AccountError> {
     let bytes = raw.as_bytes();
     let mut depth = 0usize;

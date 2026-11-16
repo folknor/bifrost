@@ -664,6 +664,56 @@ fn a_named_multipart_container_is_an_attachment_but_the_root_wrapper_is_not() {
 }
 
 #[test]
+fn a_named_body_resource_of_a_related_part_is_not_an_attachment() {
+    // An HTML body with a cid-addressed, named signature logo (inline), an
+    // explicitly attached spreadsheet inside the same related part, and an
+    // Apple-Mail-style inline PDF beside it under multipart/mixed.
+    let s = parse(
+        b"(((\"text\" \"html\" NIL NIL NIL \"7bit\" 10 1)\
+          (\"image\" \"png\" (\"name\" \"logo.png\") \"<logo@x>\" NIL \"base64\" 10 NIL \
+          (\"inline\" (\"filename\" \"logo.png\")) NIL NIL)\
+          (\"application\" \"vnd.ms-excel\" NIL \"<sheet@x>\" NIL \"base64\" 10 NIL \
+          (\"attachment\" (\"filename\" \"q3.xls\")) NIL NIL) \
+          \"related\" (\"boundary\" \"r\") NIL NIL NIL)\
+          (\"application\" \"pdf\" NIL NIL NIL \"base64\" 10 NIL \
+          (\"inline\" (\"filename\" \"report.pdf\")) NIL NIL) \
+          \"mixed\" (\"boundary\" \"m\") NIL NIL NIL)",
+    );
+    let entities = attachment_entities(&s);
+    assert_eq!(
+        names(&entities),
+        [
+            "application/vnd.ms-excel:q3.xls",
+            "application/pdf:report.pdf"
+        ]
+    );
+    assert!(!attachments_match(&entities, &name("logo")));
+    assert!(!attachments_match(&entities, &media("image/*")));
+
+    // A logo-only message has no attachment at all; and `start` picks the
+    // related root, so the HTML named by it is the root and the image that
+    // comes first is the resource.
+    let logo_only = parse(
+        b"((\"image\" \"png\" (\"name\" \"logo.png\") \"<logo@x>\" NIL \"base64\" 10 NIL \
+          (\"inline\" (\"filename\" \"logo.png\")) NIL NIL)\
+          (\"text\" \"html\" NIL \"<root@x>\" NIL \"7bit\" 10 1) \
+          \"related\" (\"boundary\" \"r\" \"start\" \"<root@x>\") NIL NIL NIL)",
+    );
+    assert!(!attachments_match(&attachment_entities(&logo_only), &any()));
+
+    // Without a Content-ID nothing marks a named part as a body resource.
+    let unaddressed = parse(
+        b"((\"text\" \"html\" NIL NIL NIL \"7bit\" 10 1)\
+          (\"image\" \"png\" (\"name\" \"chart.png\") NIL NIL \"base64\" 10) \
+          \"related\" (\"boundary\" \"r\") NIL NIL NIL)",
+    );
+    assert_eq!(
+        names(&attachment_entities(&unaddressed)),
+        ["image/png:chart.png"]
+    );
+}
+
+#[test]
 fn embedded_messages_count_and_their_inner_parts_are_judged_too() {
     let s = parse(
         b"((\"text\" \"plain\" NIL NIL NIL \"7bit\" 1 1)\

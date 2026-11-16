@@ -9,8 +9,8 @@ use crate::client::Resource;
 use crate::types::ODataCollection;
 use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, AttachmentFilter,
-    ErrorScope, LabelId, ObjectId, Page, SearchFilter, SearchRequest, SkippedScope, ThreadId,
-    balanced_raw_query,
+    ContainerId, ErrorScope, LabelId, ObjectId, Page, SearchFilter, SearchRequest, SkippedScope,
+    ThreadId, balanced_raw_query,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,7 +32,7 @@ pub(crate) async fn search(
         }
     }
     Ok(Page {
-        truncated: false,
+        truncated: page.truncated,
         items: threads,
         next_cursor: page.next_cursor,
         estimated_total: page.estimated_total,
@@ -47,7 +47,7 @@ pub(crate) async fn search_messages(
 ) -> Result<Page<ObjectId>, AccountError> {
     let page = search_message_rows(&account, request, AccountOperation::SearchMessages).await?;
     Ok(Page {
-        truncated: false,
+        truncated: page.truncated,
         items: page.items.into_iter().map(|row| row.id).collect(),
         next_cursor: page.next_cursor,
         estimated_total: page.estimated_total,
@@ -85,6 +85,166 @@ pub(super) struct SearchCursor {
     pub(super) mailboxes: Vec<String>,
     pub(super) owner: Option<String>,
     pub(super) next_link: Option<String>,
+    /// The owner-qualified folder the request lifted into this mailbox's
+    /// endpoint (`/mailFolders/{id}/messages`), if any. A `nextLink` carries
+    /// its endpoint with it, so resuming it under a request scoped to another
+    /// folder would silently answer the old folder; the mismatch is refused.
+    #[serde(default)]
+    pub(super) scope: Option<String>,
+    /// Rows already returned from `owner` by this walk, saturating at the
+    /// `$search` ceiling. Required, not defaulted: a cursor minted before
+    /// the count existed is refused rather than resumed at zero, which would
+    /// report a capped mailbox as exhausted.
+    pub(super) returned: u32,
+}
+
+/// Graph answers a `$search` request with at most this many results in
+/// total, across all of its pages; a walk that reaches it with no further
+/// `nextLink` was (or may have been) cut short.
+pub(super) const SEARCH_RESULT_CEILING: u32 = 1_000;
+
+/// One mailbox's share of a search: the folder lifted into its endpoint and
+/// the filter left to compile into `$filter` or `$search`.
+pub(super) struct MailboxPlan {
+    /// Native folder id for `/mailFolders/{id}/messages`.
+    pub(super) folder: Option<String>,
+    /// Owner-qualified form of `folder`, as pinned in the cursor.
+    pub(super) scope: Option<String>,
+    pub(super) filter: Option<SearchFilter>,
+}
+
+/// A filter reduced against one mailbox. Folder identity is (owner, native
+/// id), so an `In` naming another mailbox's folder is constant false there,
+/// and an `In` naming this mailbox's folder keeps only its native id.
+enum Reduced {
+    True,
+    False,
+    Filter(SearchFilter),
+}
+
+fn reduce_for_owner(filter: &SearchFilter, owner: Option<&str>) -> Reduced {
+    match filter {
+        SearchFilter::In(container) => {
+            let parsed = crate::account::foreign::parse_folder(&bifrost_types::FolderId(
+                container.0.clone(),
+            ));
+            let folder_owner = parsed.foreign().map(|foreign| foreign.mailbox.as_str());
+            if crate::account::foreign::same_owner(folder_owner, owner) {
+                Reduced::Filter(SearchFilter::In(ContainerId(
+                    parsed.native_id().to_string(),
+                )))
+            } else {
+                Reduced::False
+            }
+        }
+        SearchFilter::And(filters) => {
+            let mut kept = Vec::new();
+            for filter in filters {
+                match reduce_for_owner(filter, owner) {
+                    Reduced::False => return Reduced::False,
+                    Reduced::True => {}
+                    Reduced::Filter(SearchFilter::And(inner)) => kept.extend(inner),
+                    Reduced::Filter(filter) => kept.push(filter),
+                }
+            }
+            match kept.len() {
+                0 => Reduced::True,
+                1 => Reduced::Filter(kept.remove(0)),
+                _ => Reduced::Filter(SearchFilter::And(kept)),
+            }
+        }
+        SearchFilter::Or(filters) => {
+            let mut kept = Vec::new();
+            for filter in filters {
+                match reduce_for_owner(filter, owner) {
+                    Reduced::True => return Reduced::True,
+                    Reduced::False => {}
+                    Reduced::Filter(SearchFilter::Or(inner)) => kept.extend(inner),
+                    Reduced::Filter(filter) => kept.push(filter),
+                }
+            }
+            match kept.len() {
+                0 => Reduced::False,
+                1 => Reduced::Filter(kept.remove(0)),
+                _ => Reduced::Filter(SearchFilter::Or(kept)),
+            }
+        }
+        SearchFilter::Not(inner) => match reduce_for_owner(inner, owner) {
+            Reduced::True => Reduced::False,
+            Reduced::False => Reduced::True,
+            Reduced::Filter(filter) => Reduced::Filter(SearchFilter::Not(Box::new(filter))),
+        },
+        other => Reduced::Filter(other.clone()),
+    }
+}
+
+/// Plan the search of one mailbox, or `None` when the request's folder
+/// restrictions rule the whole mailbox out (it is then not requested).
+///
+/// The first positive top-level `In` becomes the endpoint: KQL has no folder
+/// property, but Graph searches a folder's own message collection, so the
+/// folder restriction is carried by the URL instead of the query. Every exact
+/// repeat of that conjunct is redundant and dropped. Any other `In` stays in
+/// the filter: `parentFolderId` on the `$filter` path, refused on the KQL
+/// path. Two different folder strings are NOT read as an empty intersection,
+/// because a well-known name (`inbox`) and the native id of the same folder
+/// are different strings for one folder.
+pub(super) fn plan_for_owner(request: &SearchRequest, owner: Option<&str>) -> Option<MailboxPlan> {
+    let filter = match request.filter.as_ref().map(|f| reduce_for_owner(f, owner)) {
+        None | Some(Reduced::True) => None,
+        Some(Reduced::False) => return None,
+        Some(Reduced::Filter(filter)) => Some(filter),
+    };
+    let (folder, filter) = match filter {
+        Some(SearchFilter::In(container)) => (Some(container.0), None),
+        Some(SearchFilter::And(conjuncts)) => {
+            let lifted = conjuncts.iter().find_map(|conjunct| match conjunct {
+                SearchFilter::In(container) => Some(container.0.clone()),
+                _ => None,
+            });
+            match lifted {
+                Some(folder) => {
+                    let mut rest: Vec<SearchFilter> = conjuncts
+                        .into_iter()
+                        .filter(|c| !matches!(c, SearchFilter::In(other) if other.0 == folder))
+                        .collect();
+                    let rest = match rest.len() {
+                        0 => None,
+                        1 => Some(rest.remove(0)),
+                        _ => Some(SearchFilter::And(rest)),
+                    };
+                    (Some(folder), rest)
+                }
+                None => (None, Some(SearchFilter::And(conjuncts))),
+            }
+        }
+        other => (None, other),
+    };
+    let scope = folder
+        .as_deref()
+        .map(|folder| crate::account::foreign::qualify_with_owner(owner, folder));
+    Some(MailboxPlan {
+        folder,
+        scope,
+        filter,
+    })
+}
+
+/// The mailbox the walk visits after `owner` (`None` = after the primary),
+/// skipping every mailbox the request's folder restrictions rule out.
+fn next_planned_owner(
+    account: &GraphAccount,
+    request: &SearchRequest,
+    owner: Option<&str>,
+) -> Option<String> {
+    let mut current = owner.map(str::to_string);
+    loop {
+        let next = next_search_owner(account, current.as_deref())?;
+        if plan_for_owner(request, Some(&next)).is_some() {
+            return Some(next);
+        }
+        current = Some(next);
+    }
 }
 
 pub(super) async fn search_message_rows(
@@ -93,16 +253,54 @@ pub(super) async fn search_message_rows(
     operation: AccountOperation,
 ) -> Result<Page<SearchRow>, AccountError> {
     let cursor = decode_search_cursor(account, request.page_cursor.as_deref(), operation)?;
-    let mut owner = cursor
-        .as_ref()
-        .and_then(|cursor| cursor.owner.as_deref())
-        .map(str::to_string);
-    let mut next_link = cursor.and_then(|cursor| cursor.next_link);
+    let (mut owner, mut next_link, mut returned) = match cursor {
+        // Validated against THIS request before the walk moves anywhere: a
+        // cursor positioned in a mailbox the request rules out, or minted
+        // for another lifted folder, would otherwise resume (or restart) a
+        // different search and report it as this one.
+        Some(cursor) => {
+            let plan = plan_for_owner(&request, cursor.owner.as_deref());
+            if plan.as_ref().map(|plan| plan.scope.as_deref()) != Some(cursor.scope.as_deref()) {
+                return Err(AccountError::invalid_page_cursor(
+                    operation,
+                    bifrost_types::Protocol::Graph,
+                    "Graph search cursor was minted for a different folder scope",
+                ));
+            }
+            (cursor.owner, cursor.next_link, cursor.returned)
+        }
+        None if plan_for_owner(&request, None).is_some() => (None, None, 0),
+        None => match next_planned_owner(account, &request, None) {
+            Some(first) => (Some(first), None, 0),
+            // Every mailbox is ruled out by the request's folder
+            // restrictions (a folder of a mailbox this account does not
+            // configure): no message of this account can match.
+            None => {
+                return Ok(Page {
+                    truncated: false,
+                    items: Vec::new(),
+                    next_cursor: None,
+                    estimated_total: None,
+                    failed_ids: Vec::new(),
+                    skipped_scopes: Vec::new(),
+                });
+            }
+        },
+    };
     // Shared mailboxes the walk quarantined instead of searching, reported
     // on the returned page. See the skip arm below for why they are not the
     // call's `Err`.
     let mut skipped_scopes: Vec<SkippedScope> = Vec::new();
-    let (client, page) = loop {
+    let (client, page, plan) = loop {
+        // Every owner the walk reaches was chosen (or its cursor validated)
+        // because its plan exists.
+        let Some(plan) = plan_for_owner(&request, owner.as_deref()) else {
+            return Err(AccountError::invalid_page_cursor(
+                operation,
+                bifrost_types::Protocol::Graph,
+                "Graph search cursor names a mailbox this search excludes",
+            ));
+        };
         let client = account
             .mailboxes
             .client_for_owner(owner.as_deref())
@@ -123,12 +321,16 @@ pub(super) async fn search_message_rows(
             // either the whole search, or the mailbox after one whose own
             // pagination ran out.
             None => client
-                .api_url(&search_url(&client.api_path_prefix(), &request)?)
+                .api_url(&mailbox_search_url(
+                    &client.api_path_prefix(),
+                    &request,
+                    &plan,
+                )?)
                 .map_err(|error| into_account_error(error, ctx.clone()))?,
         };
         let result: Result<ODataCollection<Value>, _> = client.get(Resource::Outlook, &url).await;
         match result {
-            Ok(page) => break (client, page),
+            Ok(page) => break (client, page, plan),
             Err(error) => {
                 // A shared mailbox this account has lost delegate access to
                 // must not end the walk for the mailboxes behind it. The
@@ -158,10 +360,13 @@ pub(super) async fn search_message_rows(
                 ) {
                     return Err(error);
                 }
-                let next_owner = next_search_owner(account, Some(mailbox));
+                let next_owner = next_planned_owner(account, &request, Some(mailbox));
                 skipped_scopes.push(SkippedScope { scope, error });
                 match next_owner {
-                    Some(next_owner) => owner = Some(next_owner),
+                    Some(next_owner) => {
+                        owner = Some(next_owner);
+                        returned = 0;
+                    }
                     // The dead mailbox was the walk's last: the search is
                     // complete, minus the quarantined scopes it reports.
                     None => {
@@ -201,18 +406,48 @@ pub(super) async fn search_message_rows(
     let next_link = client
         .admit_next(page.next_link.as_ref())
         .map_err(|error| into_account_error(error, GraphErrorContext::graph(operation)))?;
+    // Raw rows, counted before any thread deduplication, because the
+    // ceiling is Graph's count of messages. Cursor bytes are caller input,
+    // so the sum saturates rather than wrapping below the ceiling.
+    let returned = returned
+        .saturating_add(u32::try_from(rows.len()).unwrap_or(u32::MAX))
+        .min(SEARCH_RESULT_CEILING);
+    // A `$search` mailbox that runs out of pages AT the ceiling was cut
+    // short by Graph, not exhausted (exactly 1,000 genuine matches cannot be
+    // told apart, and reads as possibly incomplete, as Outlook's "there may
+    // be more results" does). Reported on THIS page even when the walk
+    // continues into the next shared mailbox: the cut part has no
+    // continuation, so a consumer ORs `truncated` across the walk's pages.
+    let truncated = next_link.is_none()
+        && plan_uses_search(&plan, &request)
+        && returned >= SEARCH_RESULT_CEILING;
     let next_cursor = match next_link {
         Some(next_link) => Some(encode_search_cursor(
             account,
             operation,
-            owner.as_deref(),
-            Some(next_link.as_str().to_string()),
+            SearchPosition {
+                owner: owner.as_deref(),
+                next_link: Some(next_link.as_str().to_string()),
+                scope: plan.scope.clone(),
+                returned,
+            },
         )),
-        None => next_search_owner(account, owner.as_deref())
-            .map(|owner| encode_search_cursor(account, operation, Some(&owner), None)),
+        None => next_planned_owner(account, &request, owner.as_deref()).map(|next| {
+            let scope = plan_for_owner(&request, Some(&next)).and_then(|plan| plan.scope);
+            encode_search_cursor(
+                account,
+                operation,
+                SearchPosition {
+                    owner: Some(&next),
+                    next_link: None,
+                    scope,
+                    returned: 0,
+                },
+            )
+        }),
     };
     Ok(Page {
-        truncated: false,
+        truncated,
         items: rows,
         next_cursor,
         estimated_total: None,
@@ -264,16 +499,25 @@ pub(super) fn decode_search_cursor(
     Ok(Some(cursor))
 }
 
+/// Where a search walk resumes; see [`SearchCursor`] for each field.
+pub(super) struct SearchPosition<'a> {
+    pub(super) owner: Option<&'a str>,
+    pub(super) next_link: Option<String>,
+    pub(super) scope: Option<String>,
+    pub(super) returned: u32,
+}
+
 pub(super) fn encode_search_cursor(
     account: &GraphAccount,
     operation: AccountOperation,
-    owner: Option<&str>,
-    next_link: Option<String>,
+    position: SearchPosition<'_>,
 ) -> bifrost_types::PageCursor {
     let cursor = SearchCursor {
         mailboxes: search_mailboxes(account),
-        owner: owner.map(str::to_string),
-        next_link,
+        owner: position.owner.map(str::to_string),
+        next_link: position.next_link,
+        scope: position.scope,
+        returned: position.returned,
     };
     crate::paging::encode_cursor(operation, &cursor)
 }
@@ -298,11 +542,37 @@ pub(super) fn next_search_owner(account: &GraphAccount, owner: Option<&str>) -> 
     }
 }
 
+/// Whether this mailbox's request goes through `$search`, and so is subject
+/// to [`SEARCH_RESULT_CEILING`].
+pub(super) fn plan_uses_search(plan: &MailboxPlan, request: &SearchRequest) -> bool {
+    plan.filter.as_ref().is_some_and(filter_requires_search) || request.provider_query.is_some()
+}
+
+/// The first-page URL for the primary mailbox. Test convenience over
+/// [`mailbox_search_url`]; a request whose folder restrictions rule the
+/// primary out has no URL there.
+#[cfg(test)]
+pub(super) fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountError> {
+    let plan = plan_for_owner(request, None).expect("the request searches the primary mailbox");
+    mailbox_search_url(prefix, request, &plan)
+}
+
 /// Build the FIRST-page URL for one mailbox. Continuations never come
 /// through here: `request.page_cursor` is decoded once, by
 /// `decode_search_cursor`, and a decoded cursor either carries the
 /// mailbox's own `nextLink` or asks for this mailbox's first page.
-pub(super) fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountError> {
+pub(super) fn mailbox_search_url(
+    prefix: &str,
+    request: &SearchRequest,
+    plan: &MailboxPlan,
+) -> Result<String, AccountError> {
+    let collection = match &plan.folder {
+        Some(folder) => format!(
+            "{prefix}/mailFolders/{}/messages",
+            bifrost_net::url::encode_path_component(folder)
+        ),
+        None => format!("{prefix}/messages"),
+    };
     let mut params = vec![
         "$select=id,conversationId".to_string(),
         format!("$top={}", request.limit.unwrap_or(50).clamp(1, 250)),
@@ -315,10 +585,12 @@ pub(super) fn search_url(prefix: &str, request: &SearchRequest) -> Result<String
     // expressed as KQL and AND-combined with any raw `provider_query`.
     // Otherwise the OData `$filter` path stays in force, and a bare
     // `provider_query` (no structured filter) still goes through `$search`.
-    let needs_search = request.filter.as_ref().is_some_and(filter_requires_search);
+    // The plan's filter, not the request's: folder restrictions are already
+    // reduced against this mailbox and the endpoint folder lifted out.
+    let needs_search = plan.filter.as_ref().is_some_and(filter_requires_search);
     if needs_search {
         let mut kql_parts = Vec::new();
-        if let Some(filter) = &request.filter {
+        if let Some(filter) = &plan.filter {
             let kql = kql_filter(filter)?;
             if !kql.is_empty() {
                 kql_parts.push(kql);
@@ -341,7 +613,7 @@ pub(super) fn search_url(prefix: &str, request: &SearchRequest) -> Result<String
             bifrost_net::url::encode_query_value(&format!("\"{search}\""))
         ));
     } else {
-        if let Some(filter) = &request.filter {
+        if let Some(filter) = &plan.filter {
             let filter = odata_filter(filter)?;
             if !filter.is_empty() {
                 params.push(format!(
@@ -360,7 +632,7 @@ pub(super) fn search_url(prefix: &str, request: &SearchRequest) -> Result<String
             ));
         }
     }
-    Ok(format!("{prefix}/messages?{}", params.join("&")))
+    Ok(format!("{collection}?{}", params.join("&")))
 }
 
 /// True if any leaf of the filter tree exists only in KQL: a `From`/`To`
@@ -388,11 +660,13 @@ pub(super) fn filter_requires_search(filter: &SearchFilter) -> bool {
 /// Used only when `filter_requires_search` holds, because Graph cannot mix
 /// `$search` with `$filter`. KQL property restrictions cover sender,
 /// recipient, subject, body, attachment presence and name, category, and a
-/// date range, plus raw KQL leaves; KQL terms are AND/OR/NOT-composed. The one structured leaf with no
-/// KQL equivalent on `/messages?$search` is `In` (folder scoping), which has
-/// no KQL property - rather than silently drop it (returning matches from
-/// other folders) or emit an invalid mixed request, it is a clean
-/// `Request(Malformed)` so the caller learns the combination is unsupported.
+/// date range, plus raw KQL leaves; KQL terms are AND/OR/NOT-composed. KQL
+/// has no folder property: a positive top-level `In` never reaches here
+/// (`plan_for_owner` lifts it into the `/mailFolders/{id}/messages`
+/// endpoint), and any other `In` - under `Or`/`Not`, or a second different
+/// top-level folder - is a clean `Request(Malformed)` rather than silently
+/// dropped (returning matches from other folders) or sent as an invalid
+/// mixed request.
 pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> {
     match filter {
         SearchFilter::From(value) => Ok(format!("from:{}", kql_quoted(value))),
@@ -460,13 +734,15 @@ pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> 
         SearchFilter::And(filters) => kql_join(filters, "AND"),
         SearchFilter::Or(filters) => kql_join(filters, "OR"),
         SearchFilter::Not(filter) => Ok(format!("NOT ({})", kql_filter(filter)?)),
-        // `In` (folder scoping) has no KQL property; failing cleanly beats
-        // shipping a request that would silently search every folder.
+        // A folder restriction the endpoint cannot carry has no KQL
+        // property; failing cleanly beats shipping a request that would
+        // silently search every folder.
         SearchFilter::In(_) => Err(invalid_account_error(
             AccountOperation::Search,
-            "Graph search cannot combine a folder restriction with a \
-             sender/recipient, attachment-name or raw KQL term (no KQL \
-             folder property); drop the folder or that term",
+            "Graph search can scope a sender/recipient, attachment-name or \
+             raw KQL term to one folder only as a top-level AND condition \
+             (KQL has no folder property); a folder under OR or NOT, or a \
+             second folder, cannot be combined with such a term",
         )),
         _ => Err(unsupported_account_error(AccountOperation::Search)),
     }
@@ -514,6 +790,9 @@ pub(super) fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError
         SearchFilter::Attachment(_) | SearchFilter::ProviderQuery(_) => {
             Err(unsupported_account_error(AccountOperation::Search))
         }
+        // Already reduced against the searched mailbox by `plan_for_owner`,
+        // so the id is native (owner qualification stripped) and belongs to
+        // this mailbox; another mailbox's folder became constant false.
         SearchFilter::In(container) => {
             Ok(format!("parentFolderId eq {}", odata_quoted(&container.0)))
         }

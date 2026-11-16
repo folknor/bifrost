@@ -609,20 +609,215 @@ fn from_filter_and_provider_query_combine_in_kql() {
 }
 
 #[test]
-fn from_combined_with_folder_restriction_is_malformed() {
-    // `In` has no KQL property; combining it with a From substring is an
-    // inexpressible query and must fail cleanly rather than ship an
-    // invalid request or silently search every folder.
+fn a_top_level_folder_becomes_the_search_endpoint() {
+    // KQL has no folder property, but Graph searches a folder's own message
+    // collection: a positive top-level `In` scopes the endpoint, and an exact
+    // repeat of it is redundant rather than a second refused restriction.
     let req = SearchRequest::filter(SearchFilter::And(vec![
         SearchFilter::From("alice".to_string()),
         SearchFilter::In(ContainerId("inbox".to_string())),
+        SearchFilter::And(vec![SearchFilter::In(ContainerId("inbox".to_string()))]),
     ]));
-    let err = search_url("/me", &req).expect_err("inexpressible combination");
-    assert!(matches!(
-        err.kind(),
-        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
-    ));
-    assert_eq!(err.operation(), Some(AccountOperation::Search));
+    let url = search_url("/me", &req).expect("url builds");
+    assert!(url.starts_with("/me/mailFolders/inbox/messages?"), "{url}");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value("\"from:\"alice\"\"")
+    );
+
+    // The `$filter` path lifts it the same way instead of `parentFolderId`.
+    let req = SearchRequest::filter(SearchFilter::And(vec![
+        SearchFilter::In(ContainerId("inbox".to_string())),
+        SearchFilter::Subject("q3".to_string()),
+    ]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert!(url.starts_with("/me/mailFolders/inbox/messages?"), "{url}");
+    assert!(!url.contains("parentFolderId"), "{url}");
+
+    // A folder the endpoint cannot carry stays inexpressible in KQL and
+    // fails cleanly rather than silently searching every folder.
+    for filter in [
+        SearchFilter::Or(vec![
+            SearchFilter::From("alice".to_string()),
+            SearchFilter::In(ContainerId("inbox".to_string())),
+        ]),
+        SearchFilter::And(vec![
+            SearchFilter::From("alice".to_string()),
+            SearchFilter::In(ContainerId("inbox".to_string())),
+            SearchFilter::In(ContainerId("archive".to_string())),
+        ]),
+    ] {
+        let err = search_url("/me", &SearchRequest::filter(filter)).expect_err("inexpressible");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert_eq!(err.operation(), Some(AccountOperation::Search));
+    }
+}
+
+/// Folder identity is (owner, native id). A search restricted to a shared
+/// mailbox's folder visits only that mailbox, through its folder endpoint;
+/// the primary is armed EMPTY, so requesting it would panic.
+#[tokio::test]
+async fn a_shared_folder_scope_searches_only_its_mailbox() {
+    let primary = GraphClient::new("token");
+    primary.script_rest([]);
+    let mailbox = "shared@contoso.com";
+    let shared_root = GraphClient::new("token");
+    shared_root.script_rest([ScriptedRestResponse::json(
+        reqwest::StatusCode::OK,
+        json!({ "value": [{ "id": "m1", "conversationId": "t1" }] }),
+    )]);
+    // `other@` is armed empty too: it sorts before `shared@`, so a walk
+    // that did not skip ruled-out mailboxes would request it first.
+    let mut clients = shared_clients_for_tests(&["other@contoso.com"]);
+    clients.insert(mailbox.to_string(), shared_root.for_shared_mailbox(mailbox));
+    let account = GraphAccount::new_for_tests_with_shared_clients(
+        primary,
+        PushMode::GraphSubscriptions,
+        clients,
+    );
+    let request = SearchRequest::filter(SearchFilter::And(vec![
+        SearchFilter::From("alice".to_string()),
+        SearchFilter::In(ContainerId(format!("{mailbox}\u{1f}FolderX"))),
+    ]));
+    let page = search_message_rows(&account, request, AccountOperation::Search)
+        .await
+        .expect("scoped search succeeds");
+    assert_eq!(page.items[0].id, ObjectId(format!("{mailbox}\u{1f}m1")));
+    assert!(page.next_cursor.is_none(), "no other mailbox can match");
+    assert!(!page.truncated);
+    let requests = shared_root.take_rest_requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .url
+            .contains("/users/shared%40contoso.com/mailFolders/FolderX/messages?"),
+        "{}",
+        requests[0].url
+    );
+}
+
+fn rows(count: usize, prefix: &str) -> serde_json::Value {
+    serde_json::Value::Array(
+        (0..count)
+            .map(|index| json!({ "id": format!("{prefix}{index}"), "conversationId": "t" }))
+            .collect(),
+    )
+}
+
+/// Graph's `$search` stops at 1,000 results with no further `nextLink`.
+/// A mailbox that runs out AT the ceiling reports `truncated`, on the page
+/// where it ran out, even though the walk continues into the next mailbox;
+/// the same count short of the ceiling, or a `$filter` search, does not.
+#[tokio::test]
+async fn a_search_mailbox_exhausted_at_the_ceiling_is_truncated() {
+    let primary = GraphClient::new("token");
+    primary.script_rest([
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": rows(250, "a"),
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=250"
+            }),
+        ),
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": rows(250, "b"),
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=500"
+            }),
+        ),
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": rows(250, "c"),
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=750"
+            }),
+        ),
+        ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "value": rows(250, "d") })),
+    ]);
+    let account = GraphAccount::new_for_tests_with_shared_clients(
+        primary,
+        PushMode::GraphSubscriptions,
+        shared_clients_for_tests(&["shared@contoso.com"]),
+    );
+    let search = || SearchRequest::filter(SearchFilter::From("alice".to_string()));
+    let mut cursor = None;
+    let mut flags = Vec::new();
+    for _ in 0..4 {
+        let mut request = search();
+        request.page_cursor = cursor;
+        let page = search_message_rows(&account, request, AccountOperation::Search)
+            .await
+            .expect("page succeeds");
+        flags.push(page.truncated);
+        cursor = page.next_cursor;
+    }
+    assert_eq!(flags, [false, false, false, true]);
+    assert!(
+        cursor.is_some(),
+        "the walk still continues into the shared mailbox"
+    );
+
+    // 999 rows is an exhaustive answer, and a `$filter` search has no ceiling.
+    for (filter, count) in [
+        (SearchFilter::From("alice".to_string()), 999),
+        (SearchFilter::Subject("q3".to_string()), 1_000),
+    ] {
+        let primary = GraphClient::new("token");
+        primary.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({ "value": rows(count, "x") }),
+        )]);
+        let account = GraphAccount::new_for_tests(primary, PushMode::GraphSubscriptions);
+        let page = search_message_rows(
+            &account,
+            SearchRequest::filter(filter),
+            AccountOperation::Search,
+        )
+        .await
+        .expect("page succeeds");
+        assert!(!page.truncated, "{count}");
+    }
+}
+
+/// A `nextLink` carries its endpoint, so a cursor minted for one folder
+/// scope must not resume under a request scoped to another; the resuming
+/// account is armed EMPTY, so a resumed request would panic.
+#[tokio::test]
+async fn a_search_cursor_from_another_folder_scope_is_rejected() {
+    let scoped = |folder: &str| {
+        SearchRequest::filter(SearchFilter::And(vec![
+            SearchFilter::From("alice".to_string()),
+            SearchFilter::In(ContainerId(folder.to_string())),
+        ]))
+    };
+    let primary = GraphClient::new("token");
+    primary.script_rest([ScriptedRestResponse::json(
+        reqwest::StatusCode::OK,
+        json!({
+            "value": rows(1, "a"),
+            "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skip=1"
+        }),
+    )]);
+    let account = GraphAccount::new_for_tests(primary, PushMode::GraphSubscriptions);
+    let cursor = search_message_rows(&account, scoped("inbox"), AccountOperation::Search)
+        .await
+        .expect("page succeeds")
+        .next_cursor
+        .expect("continues");
+    for mut request in [scoped("archive"), SearchRequest::default()] {
+        request.page_cursor = Some(cursor.clone());
+        let error = search_message_rows(&account, request, AccountOperation::Search)
+            .await
+            .expect_err("another scope refuses the cursor");
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
 }
 
 #[test]
@@ -657,9 +852,10 @@ fn attachment_presence_stays_odata_and_a_name_routes_to_kql() {
         ));
     };
     malformed(SearchFilter::Attachment(AttachmentFilter::Name(" ".into())));
-    // No KQL folder property: In plus a name is refused, as with From.
+    // No KQL folder property: a negated folder beside a name is refused, as
+    // with From (a positive top-level one becomes the endpoint instead).
     malformed(SearchFilter::And(vec![
-        SearchFilter::In(ContainerId("inbox".to_string())),
+        SearchFilter::Not(Box::new(SearchFilter::In(ContainerId("inbox".to_string())))),
         SearchFilter::Attachment(AttachmentFilter::Name("report".into())),
     ]));
 

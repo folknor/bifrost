@@ -155,7 +155,7 @@ is conjoined with the structured filter using IMAP implicit AND. Blank queries
 are ignored. A `SearchFilter::ProviderQuery` leaf takes the same raw criteria
 under the same validation, trimmed and wrapped in one explicit group so a
 multi-key operand stays a single operand of the surrounding `OR` / `NOT`; a
-blank leaf is `Request(Malformed)` rather than ignored. This escape accepts IMAP SEARCH syntax, not Sieve syntax. Raw criteria retain arbitrary extension grammar, caller-written literals and explicit additional capability requirements, so no existing search expression is removed. An enterprise user searching message text expects the same bytes to be searched regardless of connection encoding.
+blank leaf is `Request(Malformed)` rather than ignored. This escape accepts IMAP SEARCH syntax, not Sieve syntax, and keeps arbitrary extension grammar. It does NOT accept caller-written literal syntax: the account's structural check (`validate_provider_query` in `account/search.rs`) refuses an unquoted `{n}` / `{n+}` marker (and so `~{n}`) as `Request(Malformed)`, because a literal is the one place the encoder lets a CRLF through inside criteria, and refusing it keeps every account caller's CRLF off the wire. A `{4}` inside a quoted string is data. This refusal is about raw text only: typed operands the account compiles from `SearchFilter` still reach the wire as literals when `CommandWriter::string` chooses one, so an enterprise user searching message text gets the same bytes searched regardless of connection encoding. The connection-level surface is different: raw `SearchCriteria` built through its public `From<String>` / `From<&str>` conversions keeps caller-written literals, as the next paragraph describes.
 
 Caller-written literals in raw SEARCH-family criteria are the one place literal syntax enters from outside the encoder. `validate_search_criteria_crlf` judges the caller's ORIGINAL markers first (a `{n+}` the connection cannot take is `MissingCapability`, never silently rewritten); the walk (`write_criteria`) then copies every non-marker byte and every payload verbatim, skipping each payload by its declared length, and re-emits only the marker through the writer - a `~{n}` as literal8, so the literal8 rule applies. Two spellings can therefore differ from the caller's: a count with leading zeros is written canonically, and a `~{n+}` the connection may not send non-synchronizing loses its `+` and becomes a real segment boundary.
 
@@ -1141,7 +1141,19 @@ race cannot be closed by this client.
   the only provider that evaluates `MediaType`. An attachment entity (`parts::attachment_entities`) is any
   MIME node with `Content-Disposition: attachment`, a filename, or an embedded
   message type, including named `multipart/*` containers and a single-part
-  root; only the outer root `multipart/*` wrapper is excluded. Message search
+  root. Two kinds of node are excluded: the outer root `multipart/*` wrapper,
+  and a body resource - a non-root direct child of a `multipart/related`
+  (root by the `start` parameter, else the first child) that carries a
+  Content-ID and no `attachment` disposition, such as a named HTML signature
+  logo. Ruling: an enterprise Outlook user's paperclip does not count inline
+  images (Graph's `hasAttachments` excludes them), while an Apple-Mail-style
+  `inline` PDF under `multipart/mixed` is a file the user attached and still
+  counts, so disposition alone cannot decide. BODYSTRUCTURE cannot show
+  whether the HTML references the Content-ID, so the rule is a structural
+  approximation that errs both ways (an unreferenced file in a related part
+  is missed; a referenced image under `multipart/mixed` still counts). It
+  applies to `Any`, `Name` and `MediaType` alike, and a resource's own
+  children are still judged. Message search
   issues its SEARCHes as `UID SEARCH`, thread search as `UID THREAD REFERENCES
   UTF-8` flattened, so each surface keeps its charset handling. Thread search
   with `Has` threads the whole folder and keeps each thread's matching members

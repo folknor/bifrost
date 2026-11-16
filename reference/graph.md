@@ -2330,7 +2330,8 @@ with `field: Some("send_as.mailbox")` - the capability is present, so the
 mailbox is a bad argument rather than a missing feature. The rustdoc on
 `SendRequest::send_as` is the governing statement of that split.
 
-Search uses `/messages` (`$filter`/`$search`/`$top`). It walks the primary
+Search uses `/messages`, or a folder's `/mailFolders/{id}/messages` (see
+below), with `$filter`/`$search`/`$top`. It walks the primary
 mailbox first, then configured shared mailboxes in sorted routing-key
 order. Its opaque cursor (`SearchCursor`, `bifrost-graph-search-v1:` +
 JSON) carries the current mailbox owner, that mailbox's Graph
@@ -2368,8 +2369,34 @@ rejects `$filter` `contains()` on sender/recipient (400), so any
 KQL-only leaf (`filter_requires_search`: `From`, `To`, `Attachment(Name)`,
 `ProviderQuery`, at any depth including under `Not`) routes the whole
 filter onto `$search`/KQL (`kql_filter`), AND-combining any `provider_query`;
-`In` plus a KQL-only leaf is `Request(Malformed)` (no KQL folder property).
-Other searches keep the `$filter` path. A `DateRange` is send time on both
+Other searches keep the `$filter` path.
+Folder restrictions are planned per mailbox (`plan_for_owner`) before either
+path compiles. Folder identity is (owner, native id): against each walked
+mailbox an `In` naming another mailbox's folder reduces to false and one
+naming this mailbox's folder to its native id, then the tree is
+boolean-simplified; a mailbox the reduction rules out entirely is never
+requested, so a search scoped to a shared folder visits only that mailbox.
+The first positive top-level `In` (after flattening nested `And`) becomes the
+endpoint, `/mailFolders/{id}/messages`, on both paths, and exact repeats of it
+are dropped; KQL has no folder property, but Graph searches a folder's own
+message collection. Any other `In` stays in the filter: `parentFolderId eq`
+the native id on the `$filter` path, `Request(Malformed)` on the KQL path. Two
+different folder strings are not read as an empty intersection, because a
+well-known name (`inbox`) and the native id of that folder name one folder.
+The cursor also pins the owner-qualified lifted folder (`scope`), checked
+against the request before the walk moves: a `nextLink` carries its endpoint,
+so resuming it under another folder scope would answer the old folder.
+Graph answers one `$search` with at most 1,000 results across its pages
+(the documented ceiling), then stops offering a `nextLink`. The cursor counts
+raw rows returned from the current mailbox (`returned`, reset per mailbox,
+saturating; required, so a cursor minted before it existed is rejected rather
+than resumed at zero). A `$search` mailbox that runs out of pages at the
+ceiling marks that page `truncated: true`, even when `next_cursor` continues
+into the next shared mailbox, since the cut part has no continuation: a
+consumer ORs `truncated` across a walk's pages. Exactly 1,000 genuine matches
+are indistinguishable and read as possibly incomplete, as Outlook's "there
+may be more results" does. `$filter` searches have no such ceiling and
+never set it. A `DateRange` is send time on both
 paths (`sentDateTime` in OData, `sent` in KQL); KQL takes whole dates, so its
 bounds round outward (after floors, before ceils). `Attachment(Any)` is
 `hasAttachments eq true` / KQL `hasattachment:true` (Graph's flag, which
