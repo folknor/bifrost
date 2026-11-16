@@ -303,6 +303,9 @@ impl ImapAccount {
         // deselected it, or followed a tagged OK with an incomplete response.
         conn.set_selected_affinity(conn.connection().selected_mailbox());
         let result = result?;
+        if let Some(entry) = self.folders.get(folder) {
+            entry.observe_selection(&result.mailbox);
+        }
         self.folders.mark_seen(folder);
         Ok(result)
     }
@@ -528,6 +531,18 @@ impl Account for ImapAccount {
     // Account: emits engine inventory batches; direct users compose UID SEARCH/FETCH.
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<InventoryEvent> {
         inventory::inventory_stream(self.clone(), scope)
+    }
+
+    fn inventory_partitioning(&self, scope: &CursorScope) -> bifrost_types::InventoryPartitioning {
+        inventory::inventory_partitioning(self, scope)
+    }
+
+    fn inventory_partition_stream(
+        &self,
+        scope: CursorScope,
+        partition: bifrost_types::InventoryPartition,
+    ) -> AccountStream<InventoryEvent> {
+        inventory::inventory_partition_stream(self.clone(), scope, partition)
     }
 
     // Account: hydrates bifrost ObjectIds; direct users call uid_fetch* with native UIDs.

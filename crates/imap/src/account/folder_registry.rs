@@ -31,6 +31,7 @@ pub(crate) struct FolderEntry {
     /// authoritative per-operation gate is still the live `NO [ACL]`.
     pub(crate) rights: Option<crate::types::MailboxRights>,
     cursor: RwLock<Option<FolderCursor>>,
+    inventory_hint: RwLock<Option<(crate::types::UidValidity, u32)>>,
     modseq_by_uid: RwLock<ModSeqCache>,
     last_seen: Mutex<Option<Instant>>,
 }
@@ -120,6 +121,7 @@ impl FolderEntry {
             shared_owner,
             rights,
             cursor: RwLock::new(None),
+            inventory_hint: RwLock::new(None),
             modseq_by_uid: RwLock::new(ModSeqCache::default()),
             last_seen: Mutex::new(None),
         }
@@ -157,6 +159,50 @@ impl FolderEntry {
     pub(crate) fn refresh_listing(&self, info: &MailboxInfo) {
         *self.listing.write().expect("folder listing lock poisoned") =
             listing_from_info(info, self.rights.as_ref());
+    }
+
+    pub(crate) fn observe_selection(&self, selected: &crate::types::SelectedMailbox) {
+        // Only observations made by this account incarnation qualify. A resumed
+        // attach starts without a hint, so an old cached ceiling cannot omit
+        // unchanged mail from its stored baseline. UIDNEXT never goes backwards
+        // within an epoch on a conforming server.
+        *self
+            .inventory_hint
+            .write()
+            .expect("inventory hint lock poisoned") = if selected.uid_not_sticky {
+            None
+        } else {
+            selected
+                .uid_validity
+                .zip(selected.uid_next)
+                .map(|(epoch, next)| (epoch, next.get() - 1))
+        };
+    }
+
+    pub(crate) fn inventory_partitioning(&self) -> bifrost_types::InventoryPartitioning {
+        let hint = *self
+            .inventory_hint
+            .read()
+            .expect("inventory hint lock poisoned");
+        match hint {
+            Some((epoch, mut max_uid)) => {
+                if let Some(cursor) = self.cursor() {
+                    if cursor.uidvalidity() != epoch {
+                        return bifrost_types::InventoryPartitioning::Full;
+                    }
+                    // A FETCH/SEARCH after SELECT can discover arrivals above
+                    // its ceiling. Retain every UID in our completed baseline.
+                    if let Some(known_max) = cursor.known_uids().typed_ranges().last() {
+                        max_uid = max_uid.max(known_max.end().get());
+                    }
+                }
+                bifrost_types::InventoryPartitioning::UidRange {
+                    max_uid: Some(max_uid),
+                    uid_validity: epoch.get(),
+                }
+            }
+            None => bifrost_types::InventoryPartitioning::Full,
+        }
     }
 
     pub(crate) fn cursor(&self) -> Option<FolderCursor> {
@@ -1682,5 +1728,38 @@ mod role_resolution_tests {
             folder_role(&[], "INBOX", Some('/')),
             Some(FolderRole::Inbox)
         );
+    }
+}
+
+#[cfg(test)]
+mod inventory_hint_tests {
+    use super::*;
+
+    #[test]
+    fn inventory_partition_hint_covers_completed_baseline_and_requires_observation() {
+        use bifrost_types::InventoryPartitioning;
+        let entry = FolderEntry::from_mailbox(MailboxInfo::default());
+        let cursor = |epoch| FolderCursor::Basic {
+            uidvalidity: crate::types::UidValidity::new(epoch).unwrap(),
+            uidnext: crate::types::Uid::new(201),
+            known_uids: UidSet::from_numbers([1, 200]),
+        };
+        entry.set_cursor(cursor(5));
+        assert_eq!(entry.inventory_partitioning(), InventoryPartitioning::Full);
+        let selected = crate::types::SelectedMailbox {
+            uid_validity: crate::types::UidValidity::new(5),
+            uid_next: crate::types::Uid::new(101),
+            ..Default::default()
+        };
+        entry.observe_selection(&selected);
+        assert_eq!(
+            entry.inventory_partitioning(),
+            InventoryPartitioning::UidRange {
+                max_uid: Some(200),
+                uid_validity: 5,
+            }
+        );
+        entry.set_cursor(cursor(6));
+        assert_eq!(entry.inventory_partitioning(), InventoryPartitioning::Full);
     }
 }

@@ -31,9 +31,45 @@ pub(crate) fn establish_initial_cursor(
     })
 }
 
+pub(crate) fn inventory_partitioning(
+    account: &ImapAccount,
+    scope: &CursorScope,
+) -> bifrost_types::InventoryPartitioning {
+    match route_scope(
+        account,
+        scope,
+        bifrost_types::AccountOperation::SyncInventory,
+    ) {
+        Ok(ScopeHandler::Delegate(sub)) => sub.inventory_partitioning(scope),
+        Ok(ScopeHandler::Folder(folder)) => account
+            .folders
+            .get(&folder.into_mailbox())
+            .map_or(bifrost_types::InventoryPartitioning::Full, |entry| {
+                entry.inventory_partitioning()
+            }),
+        Err(_) => bifrost_types::InventoryPartitioning::Full,
+    }
+}
+
+pub(crate) fn inventory_partition_stream(
+    account: ImapAccount,
+    scope: CursorScope,
+    partition: bifrost_types::InventoryPartition,
+) -> AccountStream<bifrost_types::InventoryEvent> {
+    inventory_walk(account, scope, partition)
+}
+
 pub(crate) fn inventory_stream(
     account: ImapAccount,
     scope: CursorScope,
+) -> AccountStream<bifrost_types::InventoryEvent> {
+    inventory_walk(account, scope, bifrost_types::InventoryPartition::Full)
+}
+
+fn inventory_walk(
+    account: ImapAccount,
+    scope: CursorScope,
+    partition: bifrost_types::InventoryPartition,
 ) -> AccountStream<bifrost_types::InventoryEvent> {
     // Route first: a typed scope owned by a sub-account delegates the
     // whole inventory stream rather than checking out an IMAP folder.
@@ -45,7 +81,12 @@ pub(crate) fn inventory_stream(
         // The sub-account already speaks the inventory envelope, so its stream
         // passes straight through. Converting here instead would relabel
         // whatever coverage the delegate reported as COMPLETE.
-        Ok(ScopeHandler::Delegate(sub)) => return sub.inventory_stream(scope),
+        Ok(ScopeHandler::Delegate(sub)) => {
+            return match partition {
+                bifrost_types::InventoryPartition::Full => sub.inventory_stream(scope),
+                partition => sub.inventory_partition_stream(scope, partition),
+            };
+        }
         Ok(ScopeHandler::Folder(folder)) => folder,
         Err(error) => {
             return Box::pin(futures::stream::iter([
@@ -53,7 +94,17 @@ pub(crate) fn inventory_stream(
             ]));
         }
     };
-    let domain = bifrost_types::CoverageDomain::full(scope.clone());
+    let window = match &partition {
+        bifrost_types::InventoryPartition::Full => None,
+        bifrost_types::InventoryPartition::Uid(window) => Some(*window),
+        _ => {
+            return bifrost_types::unsupported_inventory_stream(
+                bifrost_types::AccountOperation::SyncInventory,
+                bifrost_types::Protocol::Imap,
+            );
+        }
+    };
+    let domain = bifrost_types::CoverageDomain::for_partition(scope.clone(), &partition);
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let ticket = QresyncWarningTicket::new(account.clone(), tx.clone());
     let ledger = ObligationLedger::default();
@@ -66,6 +117,7 @@ pub(crate) fn inventory_stream(
             tx.clone(),
             &ticket,
             &task_ledger,
+            window,
         )
         .await
         {
@@ -252,6 +304,7 @@ async fn run_inventory(
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
     qresync_warning: &QresyncWarningTicket,
     obligations: &ObligationLedger,
+    window: Option<bifrost_types::UidWindow>,
 ) -> Result<(), InventoryError> {
     if let Some(reason) = qresync_warning.take() {
         tx.send(SyncEvent::Warning(
@@ -305,13 +358,31 @@ async fn run_inventory(
     // with authoritative replacement on each poll and generation-scoped
     // object handles, before this site can stop minting UID cursors safely.
     let uidvalidity = super::selected_uidvalidity(&selected.mailbox)?;
+    if let Some(window) = window
+        && (window.uid_validity() != uidvalidity.get() || selected.mailbox.uid_not_sticky)
+    {
+        return Err(InventoryError::Account(
+            super::error::uidvalidity_changed_error(
+                bifrost_types::AccountOperation::SyncInventory,
+                &folder,
+            ),
+        ));
+    }
+    if window.is_some_and(|window| window.from() == window.to() || window.to() <= 1) {
+        tx.send(SyncEvent::Done(None))
+            .await
+            .map_err(|_| ChannelDropped)?;
+        return Ok(());
+    }
     let include_modseq = selected.mailbox.modseq().is_some();
     let mut attrs = inventory_attrs(include_modseq);
     super::hydration::push_native_thread_attrs(&mut attrs, &conn.connection().server_profile());
     // Freeze enumeration at this selection's ceiling. Enterprise users expect
     // later-assigned mail promptly, without publishing a partial folder cursor.
     // UIDNOTSTICKY retains the existing walk until recurring inventory exists.
-    let mut ceiling = if selected.mailbox.uid_not_sticky {
+    let mut ceiling = if let Some(window) = window {
+        Some(u32::try_from(window.to() - 1).expect("UID window endpoint fits UID"))
+    } else if selected.mailbox.uid_not_sticky {
         None
     } else {
         Some(match selected.mailbox.uid_next {
@@ -328,11 +399,18 @@ async fn run_inventory(
     };
     let mut batch_items = Vec::with_capacity(BATCH_ITEMS);
     let mut known = Vec::new();
+    let floor = window.map_or(1, |window| {
+        u32::try_from(window.from().max(1)).expect("nonempty UID window starts within UID space")
+    });
     loop {
         let (uids, lower) = match ceiling {
-            Some(0) => break,
+            Some(hi) if hi < floor => break,
             Some(hi) => {
-                let lo = hi.saturating_sub(INVENTORY_UID_BAND - 1).max(1);
+                let lo = if window.is_some() {
+                    floor
+                } else {
+                    hi.saturating_sub(INVENTORY_UID_BAND - 1).max(floor)
+                };
                 (
                     UidSetExpr::range(
                         crate::types::Uid::new(lo).expect("band starts above zero"),
@@ -360,13 +438,17 @@ async fn run_inventory(
                         Some(Ok(fetch)) => {
                             // A response without a nonzero UID cannot be
                             // attributed to any message and is ignored.
-                            if let Some(uid) = fetch.uid.filter(|uid| *uid != 0) {
+                            if let Some(uid) = fetch.uid.filter(|uid| {
+                                *uid != 0 && window.is_none_or(|w| u64::from(*uid) >= w.from() && u64::from(*uid) < w.to())
+                            }) {
                                 if let Some(modseq) = fetch.mod_seq {
                                     account
                                         .folders
                                         .record_modseq(&folder, uidvalidity, uid, modseq)?;
                                 }
-                                known.push(uid);
+                                if window.is_none() {
+                                    known.push(uid);
+                                }
                                 // One response missing FLAGS fails only that
                                 // message: an enterprise user expects the rest
                                 // of the folder to sync, and that message's
@@ -421,7 +503,7 @@ async fn run_inventory(
         }
         // Flush even a sparse band before requesting older UIDs. These pages
         // cannot certify the baseline; only finish_inventory can do that.
-        if !batch_items.is_empty() && ceiling.is_some() && lower > 1 {
+        if !batch_items.is_empty() && window.is_none() && ceiling.is_some() && lower > 1 {
             let out = std::mem::take(&mut batch_items);
             let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
             tx.send(batch(out, PageBoundary::Page, None, bytes_in))
@@ -434,6 +516,19 @@ async fn run_inventory(
         }
     }
 
+    if window.is_some() {
+        // A partial baseline must never replace the folder change cursor.
+        if !batch_items.is_empty() {
+            let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
+            tx.send(batch(batch_items, PageBoundary::Final, None, bytes_in))
+                .await
+                .map_err(|_| ChannelDropped)?;
+        }
+        tx.send(SyncEvent::Done(None))
+            .await
+            .map_err(|_| ChannelDropped)?;
+        return Ok(());
+    }
     let known_uids = UidSet::from_numbers(known);
     let cursor = account.cursor_from_select(&selected.mailbox, Some(known_uids))?;
     let bytes_in = super::measured_bytes_in(conn.connection(), &mut previous_bytes_in);
