@@ -604,8 +604,170 @@ fn from_filter_and_provider_query_combine_in_kql() {
     assert!(!url.contains("$filter="), "{url}");
     assert_eq!(
         search_param(&url),
-        bifrost_net::url::encode_query_value("\"(from:\"alice\") AND (importance:high)\"")
+        bifrost_net::url::encode_query_value("\"(from:\"alice\") AND ((importance:high))\"")
     );
+}
+
+#[test]
+fn a_provider_query_takes_an_odata_filter_onto_kql() {
+    // Graph answers `$filter` beside `$search` with a 400, so a filter that
+    // would stay on OData moves whole onto KQL once a raw query joins it.
+    let mut req = SearchRequest::filter(SearchFilter::And(vec![
+        SearchFilter::In(ContainerId("inbox".to_string())),
+        SearchFilter::Subject("q3".to_string()),
+    ]));
+    req.provider_query = Some("  importance:high ".to_string());
+    let url = search_url("/me", &req).expect("url builds");
+    assert!(url.starts_with("/me/mailFolders/inbox/messages?"), "{url}");
+    assert!(!url.contains("$filter="), "{url}");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value("\"(subject:\"q3\") AND ((importance:high))\"")
+    );
+
+    // A bare raw query is one grouped leaf; a blank one is no query at all,
+    // as on every other provider.
+    let url = search_url("/me", &SearchRequest::provider("importance:high")).expect("bare");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value("\"(importance:high)\"")
+    );
+    let mut blank = SearchRequest::filter(SearchFilter::Subject("q3".to_string()));
+    blank.provider_query = Some("   ".to_string());
+    let url = search_url("/me", &blank).expect("blank");
+    assert!(url.contains("$filter="), "{url}");
+    assert!(!url.contains("$search="), "{url}");
+
+    // Spliced into a grouped AND, the raw query must not escape its group.
+    let mut unbalanced = SearchRequest::filter(SearchFilter::Subject("q3".to_string()));
+    unbalanced.provider_query = Some("a) OR (b".to_string());
+    let err = search_url("/me", &unbalanced).expect_err("unbalanced");
+    assert!(matches!(
+        err.kind(),
+        AccountErrorKind::Request(RequestErrorKind::Malformed)
+    ));
+}
+
+#[test]
+fn a_negated_kql_date_range_rounds_inward() {
+    // NOT of an outward-rounded range would exclude whole days the exact
+    // complement keeps; beneath a Not the range narrows instead.
+    let day = std::time::Duration::from_secs(86_400);
+    let midday = SystemTime::UNIX_EPOCH + day + std::time::Duration::from_secs(43_200);
+    let range = || SearchFilter::DateRange {
+        after: Some(midday),
+        before: Some(midday + day),
+    };
+    let req = SearchRequest::filter(SearchFilter::And(vec![
+        SearchFilter::From("alice".to_string()),
+        SearchFilter::Not(Box::new(range())),
+    ]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value(
+            "\"(from:\"alice\") AND (NOT (sent>=1970-01-03 AND sent<1970-01-03))\""
+        )
+    );
+    // A double negation is positive again: outward.
+    let req = SearchRequest::filter(SearchFilter::And(vec![
+        SearchFilter::From("alice".to_string()),
+        SearchFilter::Not(Box::new(SearchFilter::Not(Box::new(range())))),
+    ]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value(
+            "\"(from:\"alice\") AND (NOT (NOT (sent>=1970-01-02 AND sent<1970-01-04)))\""
+        )
+    );
+}
+
+/// A cursor answers the search that minted it. Resumed under a changed
+/// filter or raw query, whether it holds a `nextLink` or only names the next
+/// mailbox, it is refused; the resuming account is armed EMPTY, so a resumed
+/// request would panic. Page size and raw-query whitespace are not the search.
+#[tokio::test]
+async fn a_search_cursor_is_bound_to_its_filter_and_query() {
+    let minted = || {
+        let mut request = SearchRequest::filter(SearchFilter::Subject("q3".to_string()));
+        request.provider_query = Some("importance:high".to_string());
+        request
+    };
+    let primary = GraphClient::new("token");
+    primary.script_rest([
+        ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": rows(1, "a"),
+                "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skip=1"
+            }),
+        ),
+        ScriptedRestResponse::json(reqwest::StatusCode::OK, json!({ "value": rows(1, "b") })),
+    ]);
+    let account = GraphAccount::new_for_tests_with_shared_clients(
+        primary,
+        PushMode::GraphSubscriptions,
+        shared_clients_for_tests(&["shared@contoso.com"]),
+    );
+    let link_cursor = search_message_rows(&account, minted(), AccountOperation::Search)
+        .await
+        .expect("first page")
+        .next_cursor
+        .expect("continues in the primary");
+    let mut same = minted();
+    same.limit = Some(7);
+    same.provider_query = Some(" importance:high  ".to_string());
+    same.page_cursor = Some(link_cursor.clone());
+    let mailbox_cursor = search_message_rows(&account, same, AccountOperation::Search)
+        .await
+        .expect("page size and whitespace are not the search")
+        .next_cursor
+        .expect("continues into the shared mailbox");
+
+    let changed_filter = || {
+        let mut request = minted();
+        request.filter = Some(SearchFilter::Subject("q4".to_string()));
+        request
+    };
+    let changed_query = || {
+        let mut request = minted();
+        request.provider_query = Some("importance:low".to_string());
+        request
+    };
+    let dropped_query = || SearchRequest::filter(SearchFilter::Subject("q3".to_string()));
+    // A cursor minted before the binding existed is refused, not trusted.
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(link_cursor.as_bytes()).expect("cursor is JSON");
+    legacy["cursor"]["position"]
+        .as_object_mut()
+        .expect("position object")
+        .remove("query")
+        .expect("cursor carries its binding");
+    let mut request = minted();
+    request.page_cursor = Some(bifrost_types::PageCursor::from_bytes(
+        serde_json::to_vec(&legacy).expect("serializes"),
+    ));
+    let error = search_message_rows(&account, request, AccountOperation::Search)
+        .await
+        .expect_err("an unbound cursor is refused");
+    assert!(matches!(
+        error.kind(),
+        AccountErrorKind::Request(RequestErrorKind::Malformed)
+    ));
+
+    for cursor in [link_cursor, mailbox_cursor] {
+        for mut request in [changed_filter(), changed_query(), dropped_query()] {
+            request.page_cursor = Some(cursor.clone());
+            let error = search_message_rows(&account, request, AccountOperation::Search)
+                .await
+                .expect_err("another search refuses the cursor");
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::Request(RequestErrorKind::Malformed)
+            ));
+        }
+    }
 }
 
 #[test]

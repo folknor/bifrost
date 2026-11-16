@@ -111,30 +111,43 @@ contract across bifrost-types (structured payload and its export tier),
 bifrost-net (do not silent-refresh a claims 401; keep the claims), the token
 source, and ratatoskr's MSAL call. Covers both the 401 and 403 paths.
 
-## BUG-206 - Graph search sends `$filter` and `$search` together
+## BUG-208 - Graph KQL compiler drops empty fragments and clamps dates
 
-**Reported by:** the Graph folder-scoped search fix (spar, lateral).
+**Reported by:** the Graph search request-binding fix (spar, lateral).
 
-In `crates/graph/src/account/pim/search.rs` `mailbox_search_url`, a request
-with a structured filter that stays on the OData path (say `Subject`) and a
-`provider_query` emits both `$filter=` and `$search=`, which the comment two
-lines above says Graph answers with 400. Commit 6940bb98 claimed to close
-this; it closed it only when the filter forces KQL. Candidates: route any
-request carrying a `provider_query` through KQL (every OData leaf the path
-emits has a KQL form except a residual `In`), or refuse the pair.
+In `crates/graph/src/account/pim/search.rs` `kql_compile`, an unbounded
+`DateRange { after: None, before: None }` (constant true) compiles to an
+empty string. `kql_join` drops empty parts, which is right under `And` but
+wrong under `Or` (a true disjunct vanishes, narrowing the result), and a
+bare `Not` of it emits `NOT ()`. The `$filter` path's `join_filters` has the
+same shape. Separately, `utc_civil` in `pim/common.rs` clamps an
+unrepresentable instant to the epoch, which can move a KQL date bound in the
+direction that drops matches. Candidate: Boolean constants through
+composition, and refusing unrepresentable bounds as `Request(Malformed)`.
 
-## BUG-207 - A Graph search cursor is not bound to the request's filter
+## BUG-209 - Graph KQL `category:` equivalence to `Labeled` is unverified
 
-**Reported by:** the Graph folder-scoped search fix (spar, lateral, filed
-under the scope fence).
+**Reported by:** the Graph search request-binding fix (spar, lateral).
 
-The search cursor pins the shared-mailbox set and now the lifted folder
-scope, but not the rest of the request: a cursor resumed with a different
-filter or `provider_query` re-issues the old `nextLink` and answers the old
-query as if it were the new one. Candidate: pin a stable digest of the
-effective filter and query (not `limit`) and reject a mismatch as
-`invalid_page_cursor`, as the set and scope checks do. `reference/types.md`
-also never mentions `Page::truncated`, which Graph search now sets.
+On the `$filter` path `Labeled` is exact category membership
+(`categories/any(c:c eq ...)`); on the KQL path, which a raw query or a
+From/To sibling forces, it is `category:"..."`. Graph's searchable-property
+table does not list category and Exchange's KQL docs describe it loosely, so
+whether `category:` matches exactly the same messages (and so stays correct
+beneath `Not`) is unestablished. Needs a live probe or a documented
+statement; refuse `Labeled` on KQL if it is not exact.
+
+## BUG-210 - Gmail search cursor is not bound to the query
+
+**Reported by:** the Graph search request-binding fix (spar, lateral).
+
+`crates/google/src/account/page_cursor.rs` records only the surface tag and
+Gmail's `pageToken`; `search` rebuilds `q` from the resuming request. A
+cursor resumed under a changed filter or `provider_query` sends the old
+query's `pageToken` with a new `q`, whose meaning Gmail does not define.
+IMAP (`imapsearch3:` binding) and now Graph refuse that as
+`invalid_page_cursor`; Gmail should bind the same way (filter plus trimmed
+raw query, not `limit`).
 
 ## BUG-200 - JMAP has no attachment-name search
 

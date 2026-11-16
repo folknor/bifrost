@@ -2333,10 +2333,10 @@ mailbox is a bad argument rather than a missing feature. The rustdoc on
 Search uses `/messages`, or a folder's `/mailFolders/{id}/messages` (see
 below), with `$filter`/`$search`/`$top`. It walks the primary
 mailbox first, then configured shared mailboxes in sorted routing-key
-order. Its opaque cursor (`SearchCursor`, `bifrost-graph-search-v1:` +
-JSON) carries the current mailbox owner, that mailbox's Graph
-`@odata.nextLink`, and the sorted shared-mailbox set the cursor was minted
-against. The set is load-bearing, not decoration: the cursor is a position
+order. Its opaque cursor (`SearchCursor`, inside the versioned,
+surface-tagged Graph page-cursor envelope) carries the current mailbox owner,
+that mailbox's Graph `@odata.nextLink`, and the sorted shared-mailbox set the
+cursor was minted against. The set is load-bearing, not decoration: the cursor is a position
 in a WALK, so resuming it against a different set silently skips a mailbox
 that now sorts before the position, or ends the walk early. A version
 mismatch, a decode failure, or a set mismatch is therefore REJECTED as
@@ -2365,11 +2365,16 @@ no cursor scope for the engine to disable.
 Message and thread ids from shared mailboxes are owner-qualified, while
 primary ids remain bare; thread search dedups `conversationId` within each
 page. Graph forbids `$search`+`$filter` together and
-rejects `$filter` `contains()` on sender/recipient (400), so any
-KQL-only leaf (`filter_requires_search`: `From`, `To`, `Attachment(Name)`,
-`ProviderQuery`, at any depth including under `Not`) routes the whole
-filter onto `$search`/KQL (`kql_filter`), AND-combining any `provider_query`;
-Other searches keep the `$filter` path.
+rejects `$filter` `contains()` on sender/recipient (400), so a request sends
+one or the other, never both: any KQL-only leaf (`filter_requires_search`:
+`From`, `To`, `Attachment(Name)`, `ProviderQuery`, at any depth including
+under `Not`) routes the whole filter onto `$search`/KQL (`kql_filter`); other
+searches keep the `$filter` path. A nonblank request-level `provider_query`
+is the same raw KQL as a `ProviderQuery` leaf and is folded into the planned
+filter as an AND-ed leaf (after folder planning), so it forces KQL exactly as
+the leaf does and is `Request(Malformed)` when unbalanced; a blank one is no
+query, as on the other providers. A `Subject` or `Body` beside it therefore
+matches as KQL does, not as OData `contains()`.
 Folder restrictions are planned per mailbox (`plan_for_owner`) before either
 path compiles. Folder identity is (owner, native id): against each walked
 mailbox an `In` naming another mailbox's folder reduces to false and one
@@ -2383,9 +2388,16 @@ message collection. Any other `In` stays in the filter: `parentFolderId eq`
 the native id on the `$filter` path, `Request(Malformed)` on the KQL path. Two
 different folder strings are not read as an empty intersection, because a
 well-known name (`inbox`) and the native id of that folder name one folder.
-The cursor also pins the owner-qualified lifted folder (`scope`), checked
-against the request before the walk moves: a `nextLink` carries its endpoint,
-so resuming it under another folder scope would answer the old folder.
+The cursor also pins the search it answers (`query`: a private structural
+rendering of the filter and the trimmed `provider_query`, not `limit`),
+checked against the request before the walk moves: a `nextLink` carries its
+endpoint and query, and a next-mailbox position builds its first page from
+the resuming request, so a cursor resumed under another filter, folder or raw
+query would answer the old search, or half of each, as the new one. A
+mismatch is `invalid_page_cursor`; an enterprise user who changes a query
+expects fresh results. The lifted folder is a function of the filter and the
+owner, so this one check covers folder scope. The field is required, so a
+cursor minted before it existed is refused.
 Graph answers one `$search` with at most 1,000 results across its pages
 (the documented ceiling), then stops offering a `nextLink`. The cursor counts
 raw rows returned from the current mailbox (`returned`, reset per mailbox,
@@ -2398,13 +2410,15 @@ are indistinguishable and read as possibly incomplete, as Outlook's "there
 may be more results" does. `$filter` searches have no such ceiling and
 never set it. A `DateRange` is send time on both
 paths (`sentDateTime` in OData, `sent` in KQL); KQL takes whole dates, so its
-bounds round outward (after floors, before ceils). `Attachment(Any)` is
+bounds round by Boolean polarity: outward where the range is asserted (after
+floors, before ceils), inward beneath an odd number of `Not`s, so date
+rounding never excludes an exact match. `Attachment(Any)` is
 `hasAttachments eq true` / KQL `hasattachment:true` (Graph's flag, which
 excludes inline attachments); `Attachment(Name)` is KQL `attachment:`
 (Exchange word matching; blank is `Request(Malformed)`);
 `Attachment(MediaType)` is `Unsupported` (no property carries the type). A
-`ProviderQuery` leaf is raw KQL escaped as `provider_query` is, grouped,
-and `Request(Malformed)` when blank or unbalanced.
+`ProviderQuery` leaf is raw KQL, escaped, grouped, and `Request(Malformed)`
+when blank or unbalanced.
 
 Both `pim_methods.directory_search` (non-empty lookup) and
 `pim_methods.directory_enumerate` (empty-query enumeration) are true.

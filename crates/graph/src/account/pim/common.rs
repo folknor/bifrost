@@ -53,10 +53,6 @@ pub(super) fn graph_iso8601_utc(at: std::time::SystemTime) -> String {
 }
 
 /// KQL date literal (`YYYY-MM-DD`) for the `sent` range predicates.
-pub(super) fn system_time_date(value: SystemTime) -> String {
-    utc_civil(value).strftime("%Y-%m-%d").to_string()
-}
-
 pub(super) fn parse_graph_datetime(value: &str) -> Option<SystemTime> {
     if let Ok(ts) = value.parse::<Timestamp>() {
         return Some(ts.into());

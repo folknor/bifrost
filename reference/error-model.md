@@ -882,7 +882,10 @@ crates/types/src/error/
 ## Page completeness
 
 `Page::truncated` defaults to false at every constructor. It signals a result
-limit that left a terminal page non-exhaustive, independent of `failed_ids`
+limit that cut results short with no continuation for the cut part. That page
+need not be terminal: a Graph search walk sets it where one mailbox hit the
+`$search` ceiling and still continues into the next, so consumers OR it across
+a walk's pages. It is independent of `failed_ids`
 (resources that could not materialize) and `skipped_scopes` (scopes that failed).
 A missing `next_cursor` means terminal, not necessarily complete. CardDAV
 directory gateways use this signal for collection-level 507 truncation and

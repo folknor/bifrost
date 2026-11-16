@@ -516,7 +516,14 @@ scope went unsearched) plus the classified `AccountError` that caused the
 skip (for Graph, a shared mailbox whose delegate access was revoked:
 terminal `NoPermission`). A skip entry is advisory - the walk continued
 and `items` remain valid - but absence of results from a skipped scope is
-not evidence of absence. Both `Page` and `SkippedScope` are deliberately
+not evidence of absence. `truncated` (false at every constructor) says a
+provider result limit cut this page's results short with no continuation
+for the cut part, so a terminal page is not necessarily exhaustive. It can
+coexist with `next_cursor` (Graph search sets it on the page where one
+mailbox hit the `$search` ceiling while the walk continues into the next), so
+a consumer ORs it across a walk's pages; a later page cannot recover what an
+earlier one capped. It is independent of both degradation lanes
+(`reference/error-model.md`, "Page completeness"). Both `Page` and `SkippedScope` are deliberately
 NOT `#[non_exhaustive]`: protocol impls construct them directly, and a new
 lane must break every constructor so each one answers the new question
 instead of silently defaulting it.

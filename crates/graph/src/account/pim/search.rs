@@ -85,12 +85,13 @@ pub(super) struct SearchCursor {
     pub(super) mailboxes: Vec<String>,
     pub(super) owner: Option<String>,
     pub(super) next_link: Option<String>,
-    /// The owner-qualified folder the request lifted into this mailbox's
-    /// endpoint (`/mailFolders/{id}/messages`), if any. A `nextLink` carries
-    /// its endpoint with it, so resuming it under a request scoped to another
-    /// folder would silently answer the old folder; the mismatch is refused.
-    #[serde(default)]
-    pub(super) scope: Option<String>,
+    /// The request this walk answers (`search_binding`). A `nextLink`
+    /// carries its endpoint and query with it, and a mailbox's first page is
+    /// built from the resuming request, so a cursor resumed under another
+    /// filter, folder or raw query would answer the old search (or half of
+    /// each) as the new one; the mismatch is refused. Required: a cursor
+    /// minted before the binding existed is refused rather than trusted.
+    pub(super) query: String,
     /// Rows already returned from `owner` by this walk, saturating at the
     /// `$search` ceiling. Required, not defaulted: a cursor minted before
     /// the count existed is refused rather than resumed at zero, which would
@@ -108,8 +109,8 @@ pub(super) const SEARCH_RESULT_CEILING: u32 = 1_000;
 pub(super) struct MailboxPlan {
     /// Native folder id for `/mailFolders/{id}/messages`.
     pub(super) folder: Option<String>,
-    /// Owner-qualified form of `folder`, as pinned in the cursor.
-    pub(super) scope: Option<String>,
+    /// The reduced filter with any request-level `provider_query` folded in
+    /// as a `ProviderQuery` conjunct.
     pub(super) filter: Option<SearchFilter>,
 }
 
@@ -220,14 +221,48 @@ pub(super) fn plan_for_owner(request: &SearchRequest, owner: Option<&str>) -> Op
         }
         other => (None, other),
     };
-    let scope = folder
+    // The request-level raw query is the same KQL a `ProviderQuery` leaf
+    // carries, so it joins the filter as one: Graph cannot send `$search`
+    // beside `$filter` (400), and the leaf forces the whole filter onto KQL,
+    // checked for blankness and balance like every spliced raw string.
+    // Folded after folder reduction and lifting, which it takes no part in.
+    let filter = match (filter, normalized_provider_query(request)) {
+        (filter, None) => filter,
+        (None, Some(raw)) => Some(SearchFilter::ProviderQuery(raw.to_string())),
+        (Some(SearchFilter::And(mut conjuncts)), Some(raw)) => {
+            conjuncts.push(SearchFilter::ProviderQuery(raw.to_string()));
+            Some(SearchFilter::And(conjuncts))
+        }
+        (Some(filter), Some(raw)) => Some(SearchFilter::And(vec![
+            filter,
+            SearchFilter::ProviderQuery(raw.to_string()),
+        ])),
+    };
+    Some(MailboxPlan { folder, filter })
+}
+
+/// The request-level raw query, trimmed; blank means none, as on every
+/// other provider.
+fn normalized_provider_query(request: &SearchRequest) -> Option<&str> {
+    request
+        .provider_query
         .as_deref()
-        .map(|folder| crate::account::foreign::qualify_with_owner(owner, folder));
-    Some(MailboxPlan {
-        folder,
-        scope,
-        filter,
-    })
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+}
+
+/// What a search cursor is bound to: the structured filter and the
+/// normalized raw query, everything that decides which messages match and
+/// in which folder (the lifted endpoint folder is a function of the filter
+/// and the cursor's owner). Not `limit`, which is presentation only and rides
+/// in the `nextLink`'s `$top`. `Debug` is a private structural rendering, not
+/// wire syntax; a change to it only refuses cursors minted by an older build,
+/// which costs a search restart and nothing else.
+fn search_binding(request: &SearchRequest) -> String {
+    format!(
+        "{:?}",
+        (&request.filter, normalized_provider_query(request))
+    )
 }
 
 /// The mailbox the walk visits after `owner` (`None` = after the primary),
@@ -255,16 +290,17 @@ pub(super) async fn search_message_rows(
     let cursor = decode_search_cursor(account, request.page_cursor.as_deref(), operation)?;
     let (mut owner, mut next_link, mut returned) = match cursor {
         // Validated against THIS request before the walk moves anywhere: a
-        // cursor positioned in a mailbox the request rules out, or minted
-        // for another lifted folder, would otherwise resume (or restart) a
-        // different search and report it as this one.
+        // cursor minted for another search would otherwise resume (or
+        // restart) it and report it as this one. An enterprise user who
+        // changes a query expects fresh results, never a continuation of
+        // the old ones. (A cursor positioned in a mailbox the request rules
+        // out is refused by the loop below.)
         Some(cursor) => {
-            let plan = plan_for_owner(&request, cursor.owner.as_deref());
-            if plan.as_ref().map(|plan| plan.scope.as_deref()) != Some(cursor.scope.as_deref()) {
+            if cursor.query != search_binding(&request) {
                 return Err(AccountError::invalid_page_cursor(
                     operation,
                     bifrost_types::Protocol::Graph,
-                    "Graph search cursor was minted for a different folder scope",
+                    "Graph search cursor was minted for a different search",
                 ));
             }
             (cursor.owner, cursor.next_link, cursor.returned)
@@ -418,9 +454,9 @@ pub(super) async fn search_message_rows(
     // be more results" does). Reported on THIS page even when the walk
     // continues into the next shared mailbox: the cut part has no
     // continuation, so a consumer ORs `truncated` across the walk's pages.
-    let truncated = next_link.is_none()
-        && plan_uses_search(&plan, &request)
-        && returned >= SEARCH_RESULT_CEILING;
+    let truncated =
+        next_link.is_none() && plan_uses_search(&plan) && returned >= SEARCH_RESULT_CEILING;
+    let query = search_binding(&request);
     let next_cursor = match next_link {
         Some(next_link) => Some(encode_search_cursor(
             account,
@@ -428,19 +464,18 @@ pub(super) async fn search_message_rows(
             SearchPosition {
                 owner: owner.as_deref(),
                 next_link: Some(next_link.as_str().to_string()),
-                scope: plan.scope.clone(),
+                query,
                 returned,
             },
         )),
         None => next_planned_owner(account, &request, owner.as_deref()).map(|next| {
-            let scope = plan_for_owner(&request, Some(&next)).and_then(|plan| plan.scope);
             encode_search_cursor(
                 account,
                 operation,
                 SearchPosition {
                     owner: Some(&next),
                     next_link: None,
-                    scope,
+                    query,
                     returned: 0,
                 },
             )
@@ -503,7 +538,7 @@ pub(super) fn decode_search_cursor(
 pub(super) struct SearchPosition<'a> {
     pub(super) owner: Option<&'a str>,
     pub(super) next_link: Option<String>,
-    pub(super) scope: Option<String>,
+    pub(super) query: String,
     pub(super) returned: u32,
 }
 
@@ -516,7 +551,7 @@ pub(super) fn encode_search_cursor(
         mailboxes: search_mailboxes(account),
         owner: position.owner.map(str::to_string),
         next_link: position.next_link,
-        scope: position.scope,
+        query: position.query,
         returned: position.returned,
     };
     crate::paging::encode_cursor(operation, &cursor)
@@ -543,9 +578,10 @@ pub(super) fn next_search_owner(account: &GraphAccount, owner: Option<&str>) -> 
 }
 
 /// Whether this mailbox's request goes through `$search`, and so is subject
-/// to [`SEARCH_RESULT_CEILING`].
-pub(super) fn plan_uses_search(plan: &MailboxPlan, request: &SearchRequest) -> bool {
-    plan.filter.as_ref().is_some_and(filter_requires_search) || request.provider_query.is_some()
+/// to [`SEARCH_RESULT_CEILING`]. A request-level `provider_query` is already
+/// a `ProviderQuery` conjunct of the plan's filter.
+pub(super) fn plan_uses_search(plan: &MailboxPlan) -> bool {
+    plan.filter.as_ref().is_some_and(filter_requires_search)
 }
 
 /// The first-page URL for the primary mailbox. Test convenience over
@@ -578,42 +614,22 @@ pub(super) fn mailbox_search_url(
         format!("$top={}", request.limit.unwrap_or(50).clamp(1, 250)),
     ];
     // Graph `/messages` forbids combining `$search` with `$filter` in one
-    // request (it answers 400). A structured filter that needs `$search`
-    // (any From/To substring leaf, since `$filter` `contains()` on the
-    // sender/recipient navigation properties is rejected) therefore forces
-    // the *whole* request onto `$search`/KQL: the structured filter is
-    // expressed as KQL and AND-combined with any raw `provider_query`.
-    // Otherwise the OData `$filter` path stays in force, and a bare
-    // `provider_query` (no structured filter) still goes through `$search`.
+    // request (it answers 400), so a request is one or the other, never
+    // both. A filter with any KQL-only leaf (From/To, since `$filter`
+    // `contains()` on the sender/recipient navigation properties is
+    // rejected; an attachment name; raw KQL, including the request-level
+    // `provider_query` that `plan_for_owner` folded in as a leaf) goes
+    // *whole* onto `$search`/KQL. Everything else stays on `$filter`.
     // The plan's filter, not the request's: folder restrictions are already
     // reduced against this mailbox and the endpoint folder lifted out.
-    let needs_search = plan.filter.as_ref().is_some_and(filter_requires_search);
-    if needs_search {
-        let mut kql_parts = Vec::new();
-        if let Some(filter) = &plan.filter {
-            let kql = kql_filter(filter)?;
-            if !kql.is_empty() {
-                kql_parts.push(kql);
-            }
-        }
-        if let Some(provider_query) = &request.provider_query {
-            kql_parts.push(graph_search_escape(provider_query));
-        }
-        let search = if kql_parts.len() == 1 {
-            kql_parts.remove(0)
+    if let Some(filter) = &plan.filter {
+        if filter_requires_search(filter) {
+            let search = kql_filter(filter)?;
+            params.push(format!(
+                "$search={}",
+                bifrost_net::url::encode_query_value(&format!("\"{search}\""))
+            ));
         } else {
-            kql_parts
-                .into_iter()
-                .map(|part| format!("({part})"))
-                .collect::<Vec<_>>()
-                .join(" AND ")
-        };
-        params.push(format!(
-            "$search={}",
-            bifrost_net::url::encode_query_value(&format!("\"{search}\""))
-        ));
-    } else {
-        if let Some(filter) = &plan.filter {
             let filter = odata_filter(filter)?;
             if !filter.is_empty() {
                 params.push(format!(
@@ -621,15 +637,6 @@ pub(super) fn mailbox_search_url(
                     bifrost_net::url::encode_query_value(&filter)
                 ));
             }
-        }
-        if let Some(provider_query) = &request.provider_query {
-            params.push(format!(
-                "$search={}",
-                bifrost_net::url::encode_query_value(&format!(
-                    "\"{}\"",
-                    graph_search_escape(provider_query)
-                ))
-            ));
         }
     }
     Ok(format!("{collection}?{}", params.join("&")))
@@ -668,6 +675,12 @@ pub(super) fn filter_requires_search(filter: &SearchFilter) -> bool {
 /// dropped (returning matches from other folders) or sent as an invalid
 /// mixed request.
 pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> {
+    kql_compile(filter, true)
+}
+
+/// `positive` is the leaf's Boolean polarity: true at the root and through
+/// `And`/`Or`, flipped by each `Not`. Only date rounding reads it.
+fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountError> {
     match filter {
         SearchFilter::From(value) => Ok(format!("from:{}", kql_quoted(value))),
         // KQL `to:` and `cc:` cover the recipient set; there is no KQL
@@ -689,8 +702,8 @@ pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> 
         }
         // No KQL or OData property carries an attachment's MIME type.
         SearchFilter::Attachment(_) => Err(unsupported_account_error(AccountOperation::Search)),
-        // Raw KQL, escaped as the request-level `provider_query` is and
-        // grouped by `kql_join`/`NOT (...)` like every other leaf; the balance
+        // Raw KQL (a leaf, or the request-level `provider_query` that
+        // `plan_for_owner` folded in as one), escaped and grouped by `kql_join`/`NOT (...)` like every other leaf; the balance
         // check stops an unmatched `)` or quote from escaping that group.
         SearchFilter::ProviderQuery(raw) => {
             let raw = raw.trim();
@@ -714,26 +727,25 @@ pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> 
         // The shared range is against send time, as the `$filter` path's
         // `sentDateTime` is, so KQL uses `sent`, not `received`: a sibling
         // leaf forcing KQL must not move the clock. KQL takes whole dates, so
-        // the range is rounded outward (after floors, before ceils), which
-        // widens it by under a day and never drops a matching message.
+        // each bound is rounded by polarity: outward where the range is
+        // asserted (after floors, before ceils), inward beneath an odd number
+        // of `Not`s (after ceils, before floors), so the negation of the
+        // narrowed range still covers the exact complement. Either way the
+        // date approximation never drops a matching message; each bound moves
+        // by under a day.
         SearchFilter::DateRange { after, before } => {
             let mut parts = Vec::new();
             if let Some(after) = after {
-                parts.push(format!("sent>={}", system_time_date(*after)));
+                parts.push(format!("sent>={}", kql_day(*after, !positive)));
             }
             if let Some(before) = before {
-                let ceiled = before
-                    .checked_add(
-                        std::time::Duration::from_secs(86_400) - std::time::Duration::from_nanos(1),
-                    )
-                    .unwrap_or(*before);
-                parts.push(format!("sent<{}", system_time_date(ceiled)));
+                parts.push(format!("sent<{}", kql_day(*before, positive)));
             }
             Ok(parts.join(" AND "))
         }
-        SearchFilter::And(filters) => kql_join(filters, "AND"),
-        SearchFilter::Or(filters) => kql_join(filters, "OR"),
-        SearchFilter::Not(filter) => Ok(format!("NOT ({})", kql_filter(filter)?)),
+        SearchFilter::And(filters) => kql_join(filters, "AND", positive),
+        SearchFilter::Or(filters) => kql_join(filters, "OR", positive),
+        SearchFilter::Not(filter) => Ok(format!("NOT ({})", kql_compile(filter, !positive)?)),
         // A folder restriction the endpoint cannot carry has no KQL
         // property; failing cleanly beats shipping a request that would
         // silently search every folder.
@@ -748,10 +760,21 @@ pub(super) fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> 
     }
 }
 
-pub(super) fn kql_join(filters: &[SearchFilter], op: &str) -> Result<String, AccountError> {
+/// The UTC date of `time`, rounded up to the next date when `ceil` is set
+/// and `time` is not exactly midnight (sub-second precision included).
+fn kql_day(time: std::time::SystemTime, ceil: bool) -> String {
+    let civil = utc_civil(time);
+    let mut date = civil.date();
+    if ceil && civil.time() != jiff::civil::Time::midnight() {
+        date = date.tomorrow().unwrap_or(date);
+    }
+    date.strftime("%Y-%m-%d").to_string()
+}
+
+fn kql_join(filters: &[SearchFilter], op: &str, positive: bool) -> Result<String, AccountError> {
     let mut parts = Vec::new();
     for filter in filters {
-        let part = kql_filter(filter)?;
+        let part = kql_compile(filter, positive)?;
         if !part.is_empty() {
             parts.push(format!("({part})"));
         }
@@ -768,11 +791,11 @@ pub(super) fn kql_quoted(value: &str) -> String {
 pub(super) fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError> {
     // `From`/`To` are never reached here: any filter tree containing a
     // sender/recipient substring leaf is detected by `filter_requires_search`
-    // in `search_url` and routed onto `$search`/KQL instead (Graph `$filter`
-    // rejects `contains()` on those navigation properties with a 400). The
-    // arms below are kept as a defensive fallback for a direct `odata_filter`
-    // call and use the rejected `contains()` shape, but the live `search_url`
-    // path no longer emits them.
+    // in `mailbox_search_url` and routed onto `$search`/KQL instead (Graph
+    // `$filter` rejects `contains()` on those navigation properties with a
+    // 400). The arms below are kept as a defensive fallback for a direct
+    // `odata_filter` call and use the rejected `contains()` shape, but the
+    // live path never emits them.
     match filter {
         SearchFilter::From(value) => Ok(format!(
             "(contains(from/emailAddress/address,{0}) or contains(from/emailAddress/name,{0}))",
