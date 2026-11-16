@@ -807,15 +807,12 @@ impl ChangeDelivery {
         // receiver read is settled by its departure; a page it never read stops
         // being charged to it, so a producer parked behind a slow reader that
         // walked away resumes instead of waiting out the attachment. The sweep
-        // below then judges what no remaining receiver can acknowledge at all.
-        if let Some(coverage) = coverage {
-            coverage.receiver_departed(seq);
-        }
-        let min_live = state.min_live();
-        // Swept while still holding the lock, so no concurrent subscribe can
-        // make this answer stale and no concurrent publish can stamp a batch
-        // against a numbering this sweep has not seen.
-        let retired = coverage.map_or(0, |coverage| coverage.release_undelivered(min_live));
+        // The sweep then judges, in the same ledger transition, what no
+        // remaining receiver can acknowledge at all. Run while still holding
+        // this lock, so no concurrent subscribe can make that answer stale and
+        // no concurrent publish can stamp a batch against a numbering the sweep
+        // has not seen.
+        let retired = coverage.map_or(0, |coverage| coverage.receiver_departed(seq));
         drop(state);
         retired
     }

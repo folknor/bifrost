@@ -1684,9 +1684,9 @@ reader sequences, and `backfill_in_flight` counts a page while any live receiver
 numbered below its `delivered_at` is absent from that set. Eligibility is the
 numbering, because a broadcast receiver joins at the ring's TAIL: a later
 subscriber never held the page and can never re-charge it, and a departing
-receiver stops charging what it was holding (`PendingCoverage::receiver_departed`,
-called from the departure sweep under the delivery lock) so a slow reader that
-walks away does not park the producer for the life of the attachment. The
+receiver stops charging what it was holding
+(`PendingCoverage::receiver_departed`, which is also the departure sweep,
+called under the delivery lock) so a slow reader that walks away does not park the producer for the life of the attachment. The
 producer therefore follows the slowest eligible consumer's READS while the
 registration survives, subject to the removal caveat above. The consumer may
 acknowledge on any schedule it likes - including never, at the
@@ -1810,7 +1810,9 @@ leaves pages nobody can answer for, and a subscriber count never sees it. So
 `ChangeDelivery` numbers every receiver it hands out, stamps each backfill
 publication with the numbering at send time (`delivered_at`), and on a
 receiver's drop retires every entry, and every subsumed page, whose stamp is at
-or beyond the lowest live number (`release_undelivered`). The retirement
+or beyond the lowest live number (`PendingCoverage::receiver_departed`, which
+removes the departing number and sweeps against the ledger's own live set in
+one ledger transition). The retirement
 carries the pages' debt forward exactly as a lag does, in the same ledger
 transition that removes the entries, and announces the same
 `ChangeStreamLagged` warning on the stream. A page registered but not yet sent
@@ -1938,17 +1940,18 @@ departure sweep that used to wake such a waiter by accident is inert.
 
 **Every page that reaches nobody is recorded, per scope.** `PendingCoverage`
 keeps a monotonic undelivered counter keyed by scope
-(`undelivered_watermark`, bumped by `note_undelivered`). Three paths feed it:
-the runner's send that reached only the sentinel receiver, the receiver-drop
-sweep (`release_undelivered`, attributing each retired entry through its own
-lane), and a lag abandonment (`abandon_checkpoints`). The last two judge one
+(`undelivered_watermark`, bumped by `note_undelivered_publication`). Three
+paths feed it: the runner's send that reached only the sentinel receiver, the
+receiver-drop sweep (`receiver_departed`, attributing each retired entry
+through its own lane), and a lag abandonment (`abandon_checkpoints`). The last two judge one
 page at a time and count only pages that were actually sent, since a survivor
 can be unsent while the pages folded into it were delivered, and an unsent
 page is about to reach whoever subscribes next. Keyed by scope rather than
 counted per account because the reading is a verdict on one walk; a shared
 counter would re-walk scope Y for scope X's losses for as long as X kept
-losing pages. It has its own mutex because the sweep records after dropping
-the ledger lock.
+losing pages. Every writer records while holding the primary ledger lock, so
+reset fences and loss attribution share one ordering; the counter keeps its
+own mutex only so readers of the watermark need no primary ledger lock.
 
 **A walk is judged whole by comparing two readings.** `BackfillScan::begin_walk`
 takes the scope's reading as each walk starts, not when the batch was
@@ -4712,7 +4715,7 @@ crates/sync/src/
                           // boundary entries, the backfill lane's
                           // capacity (`backfill_in_flight`,
                           // `await_backfill_capacity`,
-                          // `release_undelivered`)
+                          // `receiver_departed`)
     envelope.rs           // types-owned cursor codec + engine error translation
     ledger.rs             // DebtLedger: entries, barriers, retained proofs,
                           // compacted discharge audit, folded parent links
@@ -4764,10 +4767,20 @@ alias is removed. Its guarded state separates `Claims` (pending claims,
 carry-forward and persisted/folded watermarks), `RingCharge` (boundary entries
 and numbered readers) and `Fences`, plus `PublicationMint` for identities and
 reset bounds. Transitions spanning them still use one primary mutex.
-`LossLedger` groups the existing independent loss-watermark, discard-request
-and teardown state; this refactor does not change their locks
-or the delivery-to-coverage lock order. Publication ids still mint under the
-primary guard, atomically with registration or fencing.
+`LossLedger` groups the loss-watermark, discard-request and teardown state
+behind their own locks, which writers take only after the primary ledger lock;
+delivery locks come before both. Publication ids still mint under the primary
+guard, atomically with registration or fencing.
+
+The ledger is deliberately not wrapped in a facade of named transitions
+(register page, register marker, acknowledge, retire, invalidate scope,
+receiver read, receiver departed). Each such name maps onto one existing
+method, except acknowledgement, whose claim, durable write and settlement are
+phases the writer already orchestrates around an await; a facade of renames
+would add a hop without consolidating any rule. The one transition that was
+split across calls, departure plus the undeliverable sweep, is a single method
+judged against the ledger's own live set. Walk-generation issuance stays here
+too (see "Counter ownership").
 
 Delivery stamping, receipt recording, receiver membership, teardown, departure
 sweeping, loss recording and discard drains are crate-private, as are the

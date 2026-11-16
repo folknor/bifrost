@@ -87,20 +87,6 @@ builder becomes a typed facade over bifrost-types' header and body writers (it
 already depends on bifrost-types), with the DKIM signer staying in bifrost-smtp, so
 header encoding, folding, Message-ID, Date and Bcc stripping are decided once.
 
-## STR-042 - `PendingCoverage` is five subsystems behind one lock and one public surface
-
-**Reported by:** sync-lanes.
-
-Residue. The guarded state is split into sub-structs (`Claims`, `RingCharge`,
-`Fences`, `LossLedger`, `PublicationMint`) under one mutex, and the ordering-
-sensitive methods are `pub(crate)`. Not done: the named transition facade
-(`register_page`, `register_marker`, `acknowledge`, `retire`,
-`invalidate_scope`, `on_receiver_read`, `on_receiver_departed`) was not built,
-so the crate-internal surface is still about forty methods; and walk-generation
-minting (`PendingCoverage::next_generation`, still `pub`) did not move to the
-writer. Worth doing only if a new ordering defect shows the wide internal
-surface is the cause.
-
 ## STR-046 - A partitioning framework with no producer imposes its costs on every consumer
 
 **Reported by:** sync-lanes (published; not a deletion recommendation).

@@ -462,7 +462,7 @@ struct BoundaryEntry {
     /// capacity, an acknowledgement retires the registration (and with it the
     /// boundary waiter and the coverage claim). A page that was read and never
     /// acknowledged is still an unanswered page, so it is still a recorded loss
-    /// if its reader departs - see [`PendingCoverage::release_undelivered`],
+    /// if its reader departs - see [`PendingCoverage::receiver_departed`],
     /// which does not consult this list.
     readers: Vec<crate::delivery::ReceiverSequence>,
     /// Publications this entry SUPERSEDED that the consumer has still not
@@ -857,7 +857,7 @@ struct LossLedger {
     undelivered: Mutex<HashMap<CursorScope, UndeliveredMark>>,
     /// Set by `detach` the moment teardown begins, and never cleared: the
     /// ledger dies with the attachment. Read by the departure sweep
-    /// ([`PendingCoverage::release_undelivered`]), which is inert once this is
+    /// ([`PendingCoverage::receiver_departed`]), which is inert once this is
     /// set - see the ruling recorded there.
     tearing_down: AtomicBool,
 }
@@ -1265,7 +1265,8 @@ impl PendingCoverage {
     /// nothing, and hands the claim back so its debt can be preserved.
     ///
     /// The scope comes from the checkpoint's stream; every caller passes a change
-    /// or backfill checkpoint, so a scope-less stream is a caller bug and panics.
+    /// or backfill checkpoint, and a scope-less stream is refused like a stale
+    /// fence: nothing registers and the claim comes back.
     ///
     /// Deliberately excludes `fenced_backfill`: that is a receipt bound, not a
     /// producer generation. An unbounded discard runs after the orchestrator
@@ -1405,7 +1406,7 @@ impl PendingCoverage {
     /// many receivers the account had ever handed out by then.
     ///
     /// Only receivers created before that point can hold the batch, so this is
-    /// what lets [`PendingCoverage::release_undelivered`] tell a page whose
+    /// what lets [`PendingCoverage::receiver_departed`] tell a page whose
     /// readers have all gone from one a newly-arrived reader is about to
     /// acknowledge. Recorded AFTER the send rather than at registration for
     /// exactly that reason: a receiver that subscribes between the two really
@@ -1497,16 +1498,38 @@ impl PendingCoverage {
     /// This is the recompute the departure sweep needs. A slow reader that walks
     /// away while holding pages in the ring must stop charging them the instant it
     /// is no longer live, or a producer parked behind it stays parked for the life
-    /// of the attachment - the same failure the sweep in
-    /// [`PendingCoverage::release_undelivered`] exists to prevent, one step
-    /// earlier. Called under the delivery gate's lock, ahead of that sweep.
-    pub(crate) fn receiver_departed(&self, receiver_seq: crate::delivery::ReceiverSequence) {
+    /// of the attachment - the same failure the sweep that follows (documented
+    /// on `sweep_undelivered`, with the teardown ruling) exists to prevent, one
+    /// step earlier.
+    ///
+    /// Departure and the sweep are ONE transition under one ledger guard, and
+    /// the sweep judges reachability against this ledger's own live set rather
+    /// than a caller-supplied minimum, so it cannot be run against a membership
+    /// other than the authoritative one. Called under the delivery gate's lock,
+    /// which orders it against sends and subscriptions. Membership is removed
+    /// even once teardown has begun; only the sweep goes inert. The wake fires
+    /// when the departing receiver was live OR something was retired: an older
+    /// receiver may keep every page charged while the departing one's removal
+    /// still frees capacity.
+    ///
+    /// Returns how many publications were retired, for the caller's warning.
+    pub(crate) fn receiver_departed(
+        &self,
+        receiver_seq: crate::delivery::ReceiverSequence,
+    ) -> usize {
         let mut ledger = self.guard();
         let was_live = ledger.ring.live.remove(&receiver_seq);
+        let retired = if self.loss.tearing_down.load(Ordering::Acquire) {
+            0
+        } else {
+            let min_live = ledger.ring.live.iter().next().copied();
+            self.sweep_undelivered(&mut ledger, min_live)
+        };
         drop(ledger);
-        if was_live {
+        if was_live || retired > 0 {
             self.wake_capacity();
         }
+        retired
     }
 
     /// Backfill capacity currently in flight: published pages some live numbered
@@ -1619,6 +1642,28 @@ impl PendingCoverage {
         self.loss.tearing_down.store(true, Ordering::Release);
     }
 
+    /// Test door to the departure sweep with an injected minimum, so fixtures
+    /// can judge reachability without staging membership. Production reaches
+    /// the sweep only through [`PendingCoverage::receiver_departed`], which
+    /// reads the minimum from the ledger's own live set.
+    #[cfg(test)]
+    pub(crate) fn release_undelivered(
+        &self,
+        min_live: Option<crate::delivery::ReceiverSequence>,
+    ) -> usize {
+        if self.loss.tearing_down.load(Ordering::Acquire) {
+            return 0;
+        }
+        let count = {
+            let mut ledger = self.guard();
+            self.sweep_undelivered(&mut ledger, min_live)
+        };
+        if count > 0 {
+            self.wake_capacity();
+        }
+        count
+    }
+
     /// Retire every published backfill boundary that no live receiver can still
     /// acknowledge, carrying its debt forward exactly as a lag does.
     ///
@@ -1657,19 +1702,20 @@ impl PendingCoverage {
     /// sweep goes inert the moment teardown begins, which makes a drop in the
     /// window behave exactly like a drop after it, and `reference/sync.md`
     /// states the contract. Do not re-file the window as a defect; what would
-    /// reopen it is a downstream store willing to pay for the row.
-    pub(crate) fn release_undelivered(
+    /// reopen it is a downstream store willing to pay for the row. The inert
+    /// check lives in the callers, `receiver_departed` and the test door.
+    ///
+    /// Run under the caller's ledger guard. Does not wake; the caller wakes
+    /// after dropping the guard.
+    fn sweep_undelivered(
         &self,
+        ledger: &mut Ledger,
         min_live: Option<crate::delivery::ReceiverSequence>,
     ) -> usize {
-        if self.loss.tearing_down.load(Ordering::Acquire) {
-            return 0;
-        }
         // Which scope each retirement belongs to, so the record lands on the
         // walk it is evidence about and on no other.
         let mut by_scope: HashMap<CursorScope, usize> = HashMap::new();
-        let count = {
-            let mut ledger = self.guard();
+        {
             let mut retired = Vec::new();
             // First, PER PAGE within each surviving entry. A page and the page
             // that superseded it can have different readers, so a survivor whose
@@ -1755,11 +1801,7 @@ impl PendingCoverage {
                 );
             }
             retired.len()
-        };
-        if count > 0 {
-            self.wake_capacity();
         }
-        count
     }
 
     /// Record that this backfill publication reached nobody who could
