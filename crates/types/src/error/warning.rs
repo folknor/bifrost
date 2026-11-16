@@ -114,6 +114,10 @@ pub enum WarningKind {
     Engine(EngineNotice),
     OperatorAttentionNeeded,
     Throttled,
+    /// A server clock observed to differ from the local clock by more than the
+    /// consumer's threshold. No producer in this workspace emits it yet: no
+    /// code measures server clock skew. The unit shape is not a commitment;
+    /// an eventual producer may carry the signed offset and its uncertainty.
     ClockSkew,
     BlobNotByteStream,
     ReadbackSkipped,

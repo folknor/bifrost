@@ -1405,7 +1405,16 @@ for `UidRange` (newest-first chunks of `BackfillConfig::uid_range_chunk`), and
 `Full` falls through as a single partition. There is no engine-side policy
 object: the account is the only party that knows which dimension its
 inventory can be cut along, and server clock skew, where a consumer calls a
-planner itself, is applied by shifting the instant it passes in. No protocol
+planner itself, is applied by shifting the instant it passes in. The engine
+itself plans from the local clock unshifted: nothing in the workspace measures
+server clock skew, so `BackfillConfig::clock_skew_warn` is currently read by
+nothing and no producer emits `WarningKind::ClockSkew`. Both are kept for a
+measured-skew advisory that is not built. A plain HTTP `Date` header is not a
+sufficient source on its own (intermediaries may add or replace it, and a
+cached response's `Date` predates the request), and a frontend's clock need
+not be the clock that stamps the inventory's timestamps, so a measured offset
+must not shift backfill planning unless the account binds it to that
+inventory's time semantics. No protocol
 crate in this workspace currently advertises `PageCount`: JMAP Email used to,
 and now reports `Full`, because its inventory pages `Email/query` by
 `anchor` rather than by integer position and an engine partition

@@ -89,16 +89,34 @@ wrong: `reference/types.md` never tied the UID vocabulary to IMAP, and the
 bounded lane counts unread pages, not partitions, so it already applies to a
 `Full` plan.
 
-## STR-147 - `BackfillConfig::clock_skew_warn` has no reader and `Warning::ClockSkew` no producer
+## STR-147 - Server clock-skew advisory is unbuilt (`clock_skew_warn` unread, `WarningKind::ClockSkew` unproduced)
 
 **Reported by:** the STR-046 collapse (2026-11-16).
 
-`BackfillConfig::clock_skew_warn` (crates/sync/src/types.rs) is documented as
-the threshold above which a `Warning::ClockSkew` is emitted, but nothing reads
-it and nothing constructs `Warning::ClockSkew`. The planners take skew by
-shifting the planning instant, and the engine has no measured server skew to
-shift by (the original design read it from a STATUS timestamp at account open).
-Either measure skew and emit the warning, or say plainly the knob is reserved.
+Docs corrected 2026-11-16: the knob and `WarningKind::ClockSkew` now say
+plainly they have no reader and no producer (no producer ever existed in
+history). The feature itself is unbuilt and needs its own ruling before
+implementation. Accepted design direction (sparred, not authorized):
+
+- bifrost-net captures per-attempt observations: response `Date`, send and
+  header-receipt instants (excluding governor waits and backoff), cache
+  evidence, source origin. It declares no account-wide offset. Cached
+  responses are not clock samples, and `Date + Age` is not independent.
+- The account assigns meaning: which service responses are eligible, per
+  service, published as a retained observable (initial snapshot plus
+  updates), not a bare getter.
+- The engine owns policy and delivery: healthy / skewed / unknown, warn when
+  the estimate's interval lies wholly past the threshold, hysteresis to
+  rearm, expiry to unknown; delivered on the account change stream outside
+  backfill. `ClockSkew` gains signed offset and uncertainty; the knob moves
+  out of `BackfillConfig` to that owner.
+- Backfill planning shifts its instant only when an account binds an estimate
+  to its inventory's time semantics, and a backward shift must be shown not to
+  open a gap at the newest window's upper bound. No production account
+  advertises `TimeWindowed` today.
+
+Open decisions: endpoint eligibility per provider, the policy constants, and
+whether IMAP has any usable server-time source.
 
 ## STR-138 - Smaller SMTP axes and placement notes
 

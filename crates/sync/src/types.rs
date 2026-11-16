@@ -113,8 +113,13 @@ pub struct BackfillConfig {
     /// Items per window when an account advertises
     /// `InventoryPartitioning::PageCount` without its own page size.
     pub page_count_chunk: u32,
-    /// Clock-skew threshold above which a `Warning::ClockSkew` is
-    /// emitted.
+    /// Intended threshold for a server clock-skew advisory
+    /// (`WarningKind::ClockSkew`). Currently read by nothing: no code measures
+    /// server clock skew, so no clock-skew warning is ever emitted and backfill
+    /// plans from the unshifted local clock. Kept for that advisory; this field
+    /// is not necessarily its final home, since the warning is account health
+    /// rather than backfill policy. See `reference/sync.md` (backfill planning)
+    /// for why an HTTP `Date` header alone is not an adequate measurement.
     pub clock_skew_warn: Duration,
     /// How many backfill pages may be published but UNREAD before the
     /// cold-start producer parks.
