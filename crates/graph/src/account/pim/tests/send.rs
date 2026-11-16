@@ -65,7 +65,7 @@ async fn raw_mime_import_posts_the_base64_octets_as_text_plain() {
 fn scheduled_send_deferred_body_shape() {
     // 1970-01-01T00:00:00Z plus one day -> a stable ISO-8601 UTC value.
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
-    let body = deferred_send_time_body(at);
+    let body = deferred_send_time_body(at, AccountOperation::Send).expect("representable");
     let props = body
         .get("singleValueExtendedProperties")
         .and_then(serde_json::Value::as_array)
@@ -237,7 +237,7 @@ fn scheduled_send_handle_without_mailbox_is_bare_draft_id() {
 #[test]
 fn the_deferred_send_property_is_the_pidtag_deferred_send_time_proptag() {
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
-    let body = deferred_send_time_body(at);
+    let body = deferred_send_time_body(at, AccountOperation::Send).expect("representable");
     let props = body
         .get("singleValueExtendedProperties")
         .and_then(Value::as_array)
@@ -248,7 +248,25 @@ fn the_deferred_send_property_is_the_pidtag_deferred_send_time_proptag() {
     let value = props[0]["value"].as_str().expect("string value");
     assert!(value.ends_with('Z'), "{value}");
     assert!(!value.contains('.'), "{value}");
-    assert_eq!(value, graph_iso8601_utc(at));
+    assert_eq!(
+        value,
+        graph_iso8601_utc(at, AccountOperation::Send).expect("representable")
+    );
+}
+
+#[test]
+fn an_unrepresentable_deferred_send_time_is_refused_not_clamped() {
+    // Year 10000 and beyond is outside Graph's date-time range. Clamping it to
+    // the epoch would turn a far-future deferred send into an immediate one.
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(400_000_000_000);
+    for operation in [AccountOperation::Send, AccountOperation::RescheduleSend] {
+        let error = deferred_send_time_body(at, operation).expect_err("unrepresentable");
+        assert_eq!(error.operation(), Some(operation));
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    }
 }
 
 #[test]
@@ -342,11 +360,12 @@ async fn deferred_send_stamping_evicts_only_the_owning_mailbox_after_success() {
                 }
                 // Exercise the stamping seam without consulting the wall clock.
                 let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+                let body = deferred_send_time_body(at, operation).expect("representable");
                 let result = stamp_deferred_send_time(
                     &account,
                     owner,
                     &bifrost_types::DraftHandle("draft".into()),
-                    at,
+                    &body,
                     operation,
                 )
                 .await;
@@ -370,10 +389,7 @@ async fn deferred_send_stamping_evicts_only_the_owning_mailbox_after_success() {
                         .url
                         .ends_with(&format!("{prefix}/messages/draft"))
                 );
-                assert_eq!(
-                    requests[0].body.as_ref().unwrap(),
-                    &deferred_send_time_body(at)
-                );
+                assert_eq!(requests[0].body.as_ref().unwrap(), &body);
             }
         }
     }

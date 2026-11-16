@@ -683,6 +683,107 @@ fn a_negated_kql_date_range_rounds_inward() {
     );
 }
 
+/// An unbounded range is constant true and folds before either compiler:
+/// as a disjunct it widens its `Or` to everything (it must not vanish and
+/// narrow the `Or` to its sibling), negated it rules the mailbox out, and as
+/// a conjunct it disappears. Empty `And`/`Or` fold the same way.
+#[test]
+fn an_unbounded_date_range_is_a_constant_not_an_empty_fragment() {
+    use crate::account::pim::search::plan_for_owner;
+    let unbounded = || SearchFilter::DateRange {
+        after: None,
+        before: None,
+    };
+    let from = || SearchFilter::From("alice".to_string());
+
+    let req = SearchRequest::filter(SearchFilter::Or(vec![from(), unbounded()]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert!(
+        !url.contains("$search") && !url.contains("$filter"),
+        "{url}"
+    );
+
+    let req = SearchRequest::filter(SearchFilter::And(vec![
+        from(),
+        SearchFilter::Not(Box::new(unbounded())),
+    ]));
+    assert!(plan_for_owner(&req, None).is_none());
+
+    let req = SearchRequest::filter(SearchFilter::And(vec![from(), unbounded()]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value("\"from:\"alice\"\"")
+    );
+
+    // With only the raw query left, the search is that query alone.
+    let mut req = SearchRequest::filter(unbounded());
+    req.provider_query = Some("importance:high".to_string());
+    let url = search_url("/me", &req).expect("url builds");
+    assert_eq!(
+        search_param(&url),
+        bifrost_net::url::encode_query_value("\"(importance:high)\"")
+    );
+
+    // `$filter` path: the sibling must not narrow the disjunction either.
+    let req = SearchRequest::filter(SearchFilter::Or(vec![
+        SearchFilter::Subject("q3".to_string()),
+        SearchFilter::Not(Box::new(SearchFilter::Or(vec![]))),
+    ]));
+    let url = search_url("/me", &req).expect("url builds");
+    assert!(!url.contains("$filter"), "{url}");
+
+    // A constant that reaches a compiler unfolded is refused, never rendered.
+    for filter in [
+        unbounded(),
+        SearchFilter::Or(vec![]),
+        SearchFilter::Not(Box::new(SearchFilter::And(vec![]))),
+    ] {
+        let err = odata_filter(&filter).expect_err("unfolded constant");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
+}
+
+/// A bound outside the representable range is refused on both paths rather
+/// than clamped to the epoch, which would move it and drop matches.
+#[test]
+fn unrepresentable_date_bounds_are_refused() {
+    let far = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(400_000_000_000);
+    let long_ago = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(400_000_000_000);
+    let cases = [
+        // `$filter` path.
+        SearchFilter::DateRange {
+            after: Some(far),
+            before: None,
+        },
+        // KQL path, outward `before` ceils.
+        SearchFilter::And(vec![
+            SearchFilter::From("alice".to_string()),
+            SearchFilter::DateRange {
+                after: None,
+                before: Some(far),
+            },
+        ]),
+        SearchFilter::And(vec![
+            SearchFilter::From("alice".to_string()),
+            SearchFilter::Not(Box::new(SearchFilter::DateRange {
+                after: Some(long_ago),
+                before: None,
+            })),
+        ]),
+    ];
+    for filter in cases {
+        let err = search_url("/me", &SearchRequest::filter(filter)).expect_err("refused");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
+}
+
 /// A cursor answers the search that minted it. Resumed under a changed
 /// filter or raw query, whether it holds a `nextLink` or only names the next
 /// mailbox, it is refused; the resuming account is armed EMPTY, so a resumed

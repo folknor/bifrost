@@ -15,7 +15,8 @@ pub(crate) fn search(
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
         let query = gmail_query(&request)?;
-        let page_token = page_token(&request, bifrost_types::AccountOperation::Search)?;
+        let binding = query.as_deref().unwrap_or_default();
+        let page_token = page_token(&request, bifrost_types::AccountOperation::Search, binding)?;
         let max = request
             .limit
             .unwrap_or(MAX_GMAIL_PAGE_SIZE)
@@ -43,7 +44,11 @@ pub(crate) fn search(
                 .map(|thread| ThreadId(thread.id))
                 .collect(),
             next_cursor: next.map(|token| {
-                super::super::page_cursor::encode(bifrost_types::AccountOperation::Search, &token)
+                super::super::page_cursor::encode_search(
+                    bifrost_types::AccountOperation::Search,
+                    binding,
+                    &token,
+                )
             }),
             estimated_total: None,
             failed_ids: Vec::new(),
@@ -58,7 +63,12 @@ pub(crate) fn search_messages(
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
         let query = gmail_query(&request)?;
-        let page_token = page_token(&request, bifrost_types::AccountOperation::SearchMessages)?;
+        let binding = query.as_deref().unwrap_or_default();
+        let page_token = page_token(
+            &request,
+            bifrost_types::AccountOperation::SearchMessages,
+            binding,
+        )?;
         let max = request
             .limit
             .unwrap_or(MAX_GMAIL_PAGE_SIZE)
@@ -87,8 +97,9 @@ pub(crate) fn search_messages(
                 .map(|message| ObjectId(message.id))
                 .collect(),
             next_cursor: response.next_page_token.map(|token| {
-                super::super::page_cursor::encode(
+                super::super::page_cursor::encode_search(
                     bifrost_types::AccountOperation::SearchMessages,
+                    binding,
                     &token,
                 )
             }),
@@ -112,11 +123,14 @@ fn gmail_query(request: &SearchRequest) -> Result<Option<String>, AccountError> 
     Ok((!parts.is_empty()).then(|| parts.join(" ")))
 }
 
+/// The resumed provider token, refused unless the cursor was minted for this
+/// surface and exactly this `q` (`binding`, the query this request sends).
 fn page_token(
     request: &SearchRequest,
     operation: bifrost_types::AccountOperation,
+    binding: &str,
 ) -> Result<Option<String>, AccountError> {
-    super::super::page_cursor::decode(request.page_cursor.clone(), operation)
+    super::super::page_cursor::decode_search(request.page_cursor.as_ref(), operation, binding)
 }
 
 #[cfg(test)]

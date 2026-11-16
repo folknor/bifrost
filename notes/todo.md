@@ -98,6 +98,19 @@ Nothing hermetic can settle these.
   SDK metadata binds `delta` to the contacts collection, but it is unprobed.
   If it 400s, resolve the default folder's real id (for example from a
   child folder's `parentFolderId`) and use the folder path.
+- **Graph KQL `category:` may not be exact category membership.**
+  `crates/graph/src/account/pim/search.rs`. `SearchFilter::Labeled` is
+  `categories/any(c:c eq ...)` on `$filter` but `category:"..."` on `$search`
+  (forced by a From/To, attachment-name or raw-KQL sibling). Graph's message
+  `$search` property list does not name `category`. Probe a mailbox with
+  categories such as "Red", "Dark Red", "red" and a multi-word name, and
+  record for `category:"Red"` and `NOT category:"Red"`: exact, false
+  positives (phrase or word match), false negatives, or inconclusive (a few
+  passing cases do not prove arbitrary names exact). Exact: nothing to do.
+  Otherwise the remedies are refusing `Labeled` on the KQL path (removes the
+  "from X with category Y" search, so the owner's call) or a superset query
+  that drops the label restriction, fetches `categories` and evaluates the
+  original tree exactly, counting raw rows against the 1,000-result cap.
 
 ## 3. Blocked on downstream
 

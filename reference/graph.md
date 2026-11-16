@@ -2422,7 +2422,18 @@ never set it. A `DateRange` is send time on both
 paths (`sentDateTime` in OData, `sent` in KQL); KQL takes whole dates, so its
 bounds round by Boolean polarity: outward where the range is asserted (after
 floors, before ceils), inward beneath an odd number of `Not`s, so date
-rounding never excludes an exact match. `Attachment(Any)` is
+rounding never excludes an exact match. An unbounded range (no bound on
+either side) is constant true and, like an empty `And` (true) or empty `Or`
+(false), is folded with the folder constants before either compiler runs: a
+true disjunct makes its `Or` true, a negated one rules the mailbox out. A
+compiler never renders a fragment as nothing (one would vanish from an `Or`,
+narrowing it, or become `NOT ()`), and refuses such a constant if one reaches
+it. A bound outside the representable instant range is `Request(Malformed)`,
+never clamped; the same holds for a deferred-send time (checked before the
+draft is created) and vacation start/end. `Labeled` is
+`categories/any(c:c eq ...)` on `$filter` and `category:"..."` on KQL; whether
+the KQL form is exact membership is unverified (Graph's `$search` property
+list does not name it) and awaits a live probe. `Attachment(Any)` is
 `hasAttachments eq true` / KQL `hasattachment:true` (Graph's flag, which
 excludes inline attachments); `Attachment(Name)` is KQL `attachment:`
 (Exchange word matching; blank is `Request(Malformed)`);

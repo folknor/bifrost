@@ -94,43 +94,18 @@ contract across bifrost-types (structured payload and its export tier),
 bifrost-net (do not silent-refresh a claims 401; keep the claims), the token
 source, and ratatoskr's MSAL call. Covers both the 401 and 403 paths.
 
-## BUG-208 - Graph KQL compiler drops empty fragments and clamps dates
+## BUG-211 - Gmail query encoder renders constants as nothing and rounds dates outward beneath Not
 
-**Reported by:** the Graph search request-binding fix (spar, lateral).
+**Reported by:** the Graph KQL constant-folding fix (spar, lateral).
 
-In `crates/graph/src/account/pim/search.rs` `kql_compile`, an unbounded
-`DateRange { after: None, before: None }` (constant true) compiles to an
-empty string. `kql_join` drops empty parts, which is right under `And` but
-wrong under `Or` (a true disjunct vanishes, narrowing the result), and a
-bare `Not` of it emits `NOT ()`. The `$filter` path's `join_filters` has the
-same shape. Separately, `utc_civil` in `pim/common.rs` clamps an
-unrepresentable instant to the epoch, which can move a KQL date bound in the
-direction that drops matches. Candidate: Boolean constants through
-composition, and refusing unrepresentable bounds as `Request(Malformed)`.
-
-## BUG-209 - Graph KQL `category:` equivalence to `Labeled` is unverified
-
-**Reported by:** the Graph search request-binding fix (spar, lateral).
-
-On the `$filter` path `Labeled` is exact category membership
-(`categories/any(c:c eq ...)`); on the KQL path, which a raw query or a
-From/To sibling forces, it is `category:"..."`. Graph's searchable-property
-table does not list category and Exchange's KQL docs describe it loosely, so
-whether `category:` matches exactly the same messages (and so stays correct
-beneath `Not`) is unestablished. Needs a live probe or a documented
-statement; refuse `Labeled` on KQL if it is not exact.
-
-## BUG-210 - Gmail search cursor is not bound to the query
-
-**Reported by:** the Graph search request-binding fix (spar, lateral).
-
-`crates/google/src/account/page_cursor.rs` records only the surface tag and
-Gmail's `pageToken`; `search` rebuilds `q` from the resuming request. A
-cursor resumed under a changed filter or `provider_query` sends the old
-query's `pageToken` with a new `q`, whose meaning Gmail does not define.
-IMAP (`imapsearch3:` binding) and now Graph refuse that as
-`invalid_page_cursor`; Gmail should bind the same way (filter plus trimmed
-raw query, not `limit`).
+`crates/google/src/account/query.rs` `condition_query` (shared by search and
+stored filters) has the empty-fragment shape the Graph compilers had: an
+unbounded `DateRange` renders `""`, so `Or` gives `( OR x)`, `Not` gives
+`-()`, and an empty `Or` gives `()`. Separately, `gmail_date` rounds a
+fractional bound outward (after floors, before ceils) regardless of Boolean
+polarity, so beneath an odd number of `Not`s the negated range widens and its
+complement drops messages inside the sub-second gap. Graph folds constants
+before compiling and rounds by polarity; Gmail should do the same.
 
 ## BUG-200 - JMAP has no attachment-name search
 

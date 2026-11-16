@@ -1,7 +1,7 @@
 //! Helpers shared by more than one PIM module: id and error
 //! construction, extended-property naming, and the Graph time formats.
 
-use crate::account::graph_error::protocol_violation;
+use crate::account::graph_error::{invalid_account_error, protocol_violation};
 use bifrost_types::{AccountError, AccountOperation, ErrorScope, ObjectId, ProtocolErrorKind};
 use jiff::tz::Offset;
 use jiff::{Timestamp, civil};
@@ -48,11 +48,16 @@ pub(super) fn graph_extended_property_id(property_id: &str) -> String {
 /// Format an absolute instant as ISO-8601 UTC for the Graph
 /// `singleValueExtendedProperty` value (matches Graph's PT_SYSTIME wire
 /// shape, e.g. `2026-06-16T10:00:00Z`).
-pub(super) fn graph_iso8601_utc(at: std::time::SystemTime) -> String {
-    utc_civil(at).strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+pub(super) fn graph_iso8601_utc(
+    at: std::time::SystemTime,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    Ok(utc_civil(at, operation)?
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string())
 }
 
-/// KQL date literal (`YYYY-MM-DD`) for the `sent` range predicates.
+/// Parse a Graph date-time (offset or zoneless UTC) into an instant.
 pub(super) fn parse_graph_datetime(value: &str) -> Option<SystemTime> {
     if let Ok(ts) = value.parse::<Timestamp>() {
         return Some(ts.into());
@@ -62,18 +67,41 @@ pub(super) fn parse_graph_datetime(value: &str) -> Option<SystemTime> {
     Offset::UTC.to_timestamp(naive).ok().map(SystemTime::from)
 }
 
-/// A `SystemTime` as the UTC wall clock it names. Instants outside the
-/// representable range clamp to the epoch rather than failing the caller.
-pub(super) fn utc_civil(value: SystemTime) -> civil::DateTime {
-    Offset::UTC.to_datetime(Timestamp::try_from(value).unwrap_or(Timestamp::UNIX_EPOCH))
+/// A `SystemTime` as the UTC wall clock it names. An instant outside the
+/// representable range (beyond years -9999..=9999) is refused as malformed
+/// input for `operation`, never substituted: a clamped instant would move a
+/// search bound so it drops matches, or turn a far-future deferred send into
+/// an immediate one, and an Outlook user expects neither.
+pub(super) fn utc_civil(
+    value: SystemTime,
+    operation: AccountOperation,
+) -> Result<civil::DateTime, AccountError> {
+    Timestamp::try_from(value)
+        .map(|timestamp| Offset::UTC.to_datetime(timestamp))
+        .map_err(|_| {
+            invalid_account_error(
+                operation,
+                "instant is outside the range Graph date-times can represent",
+            )
+        })
 }
 
-pub(super) fn system_time_rfc3339(value: SystemTime) -> String {
-    utc_civil(value).strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+pub(super) fn system_time_rfc3339(
+    value: SystemTime,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    Ok(utc_civil(value, operation)?
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+        .to_string())
 }
 
-pub(super) fn system_time_naive_utc(value: SystemTime) -> String {
-    utc_civil(value).strftime("%Y-%m-%dT%H:%M:%S").to_string()
+pub(super) fn system_time_naive_utc(
+    value: SystemTime,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
+    Ok(utc_civil(value, operation)?
+        .strftime("%Y-%m-%dT%H:%M:%S")
+        .to_string())
 }
 
 pub(super) fn finish_partial(

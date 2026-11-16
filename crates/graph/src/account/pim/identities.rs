@@ -80,8 +80,10 @@ pub(crate) async fn vacation_set(
             "internalReplyMessage": body,
             "externalReplyMessage": body,
             "externalAudience": "all",
-            "scheduledStartDateTime": graph_datetime_or_default(config.starts_at),
-            "scheduledEndDateTime": graph_datetime_or_default(config.ends_at)
+            "scheduledStartDateTime":
+                graph_datetime_or_default(config.starts_at, AccountOperation::VacationSet)?,
+            "scheduledEndDateTime":
+                graph_datetime_or_default(config.ends_at, AccountOperation::VacationSet)?
         }
     });
     let path = format!(
@@ -144,13 +146,20 @@ pub(super) fn vacation_from_graph(setting: AutomaticRepliesSetting) -> VacationC
     }
 }
 
-pub(super) fn graph_datetime_or_default(time: Option<SystemTime>) -> Value {
-    json!({
-        "dateTime": time
-            .map(system_time_naive_utc)
-            .unwrap_or_else(|| "0001-01-01T00:00:00".to_string()),
+/// An absent bound keeps Graph's default; a present one Graph cannot
+/// represent is `Request(Malformed)`, never replaced by that default.
+pub(super) fn graph_datetime_or_default(
+    time: Option<SystemTime>,
+    operation: AccountOperation,
+) -> Result<Value, AccountError> {
+    let date_time = match time {
+        Some(time) => system_time_naive_utc(time, operation)?,
+        None => "0001-01-01T00:00:00".to_string(),
+    };
+    Ok(json!({
+        "dateTime": date_time,
         "timeZone": "UTC"
-    })
+    }))
 }
 
 pub(super) fn graph_datetime_to_system_time(value: &DateTimeTimeZone) -> Option<SystemTime> {

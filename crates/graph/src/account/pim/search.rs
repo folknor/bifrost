@@ -175,6 +175,14 @@ fn reduce_for_owner(filter: &SearchFilter, owner: Option<&str>) -> Reduced {
             Reduced::False => Reduced::True,
             Reduced::Filter(filter) => Reduced::Filter(SearchFilter::Not(Box::new(filter))),
         },
+        // An unbounded range matches every message. Neither KQL nor `$filter`
+        // has a literal for that, so it folds here like any other constant
+        // (a true disjunct makes its `Or` true, a negation makes it false),
+        // and the compilers never see a fragment that renders as nothing.
+        SearchFilter::DateRange {
+            after: None,
+            before: None,
+        } => Reduced::True,
         other => Reduced::Filter(other.clone()),
     }
 }
@@ -630,13 +638,12 @@ pub(super) fn mailbox_search_url(
                 bifrost_net::url::encode_query_value(&format!("\"{search}\""))
             ));
         } else {
+            // Never empty: constants were folded out of the plan.
             let filter = odata_filter(filter)?;
-            if !filter.is_empty() {
-                params.push(format!(
-                    "$filter={}",
-                    bifrost_net::url::encode_query_value(&filter)
-                ));
-            }
+            params.push(format!(
+                "$filter={}",
+                bifrost_net::url::encode_query_value(&filter)
+            ));
         }
     }
     Ok(format!("{collection}?{}", params.join("&")))
@@ -721,6 +728,16 @@ fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountE
             }
             Ok(format!("({})", graph_search_escape(raw)))
         }
+        // Unverified: `$filter` matches a label as exact category membership,
+        // but Graph's message `$search` property list does not name
+        // `category`, and KQL text properties are usually phrase-matched, so
+        // `category:"Red"` may also match "Dark Red" (and then, beneath
+        // `NOT`, drop real matches) or miss some. Only a live probe can say.
+        // Kept rather than refused because refusing removes the Outlook
+        // search "from X with category Y". If the probe shows it inexact, the
+        // remedies are refusal on this path or a superset query (drop the
+        // label restriction), fetching `categories` and evaluating the
+        // original tree exactly, with raw rows counted against the 1,000 cap.
         SearchFilter::Labeled(label) => {
             Ok(format!("category:{}", kql_quoted(&label_id_native(label))))
         }
@@ -736,12 +753,12 @@ fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountE
         SearchFilter::DateRange { after, before } => {
             let mut parts = Vec::new();
             if let Some(after) = after {
-                parts.push(format!("sent>={}", kql_day(*after, !positive)));
+                parts.push(format!("sent>={}", kql_day(*after, !positive)?));
             }
             if let Some(before) = before {
-                parts.push(format!("sent<{}", kql_day(*before, positive)));
+                parts.push(format!("sent<{}", kql_day(*before, positive)?));
             }
-            Ok(parts.join(" AND "))
+            nonempty_fragment(parts.join(" AND "))
         }
         SearchFilter::And(filters) => kql_join(filters, "AND", positive),
         SearchFilter::Or(filters) => kql_join(filters, "OR", positive),
@@ -761,25 +778,46 @@ fn kql_compile(filter: &SearchFilter, positive: bool) -> Result<String, AccountE
 }
 
 /// The UTC date of `time`, rounded up to the next date when `ceil` is set
-/// and `time` is not exactly midnight (sub-second precision included).
-fn kql_day(time: std::time::SystemTime, ceil: bool) -> String {
-    let civil = utc_civil(time);
+/// and `time` is not exactly midnight (sub-second precision included). A
+/// bound outside the representable range, or a ceiling past its last date,
+/// is refused: substituting another date would move the bound the wrong
+/// way and drop matches.
+fn kql_day(time: std::time::SystemTime, ceil: bool) -> Result<String, AccountError> {
+    let civil = utc_civil(time, AccountOperation::Search)?;
     let mut date = civil.date();
     if ceil && civil.time() != jiff::civil::Time::midnight() {
-        date = date.tomorrow().unwrap_or(date);
+        date = date.tomorrow().map_err(|_| {
+            invalid_account_error(
+                AccountOperation::Search,
+                "date bound rounds past the last date KQL can represent",
+            )
+        })?;
     }
-    date.strftime("%Y-%m-%d").to_string()
+    Ok(date.strftime("%Y-%m-%d").to_string())
+}
+
+/// Every compiled fragment is a real predicate. Constants (an unbounded
+/// range, an empty `And`/`Or`) are folded by `reduce_for_owner` before
+/// either compiler runs; an empty rendering here would silently vanish from
+/// a join (narrowing an `Or`) or produce `NOT ()`, so it is refused.
+fn nonempty_fragment(fragment: String) -> Result<String, AccountError> {
+    if fragment.is_empty() {
+        Err(invalid_account_error(
+            AccountOperation::Search,
+            "search filter holds a constant (an unbounded date range or an \
+             empty AND/OR) that was not folded before compiling",
+        ))
+    } else {
+        Ok(fragment)
+    }
 }
 
 fn kql_join(filters: &[SearchFilter], op: &str, positive: bool) -> Result<String, AccountError> {
-    let mut parts = Vec::new();
-    for filter in filters {
-        let part = kql_compile(filter, positive)?;
-        if !part.is_empty() {
-            parts.push(format!("({part})"));
-        }
-    }
-    Ok(parts.join(&format!(" {op} ")))
+    let parts = filters
+        .iter()
+        .map(|filter| kql_compile(filter, positive).map(|part| format!("({part})")))
+        .collect::<Result<Vec<_>, _>>()?;
+    nonempty_fragment(parts.join(&format!(" {op} ")))
 }
 
 /// KQL-quoted string value: wrap in double quotes (so multi-word values are
@@ -826,12 +864,18 @@ pub(super) fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError
         SearchFilter::DateRange { after, before } => {
             let mut parts = Vec::new();
             if let Some(after) = after {
-                parts.push(format!("sentDateTime ge {}", system_time_rfc3339(*after)));
+                parts.push(format!(
+                    "sentDateTime ge {}",
+                    system_time_rfc3339(*after, AccountOperation::Search)?
+                ));
             }
             if let Some(before) = before {
-                parts.push(format!("sentDateTime lt {}", system_time_rfc3339(*before)));
+                parts.push(format!(
+                    "sentDateTime lt {}",
+                    system_time_rfc3339(*before, AccountOperation::Search)?
+                ));
             }
-            Ok(parts.join(" and "))
+            nonempty_fragment(parts.join(" and "))
         }
         SearchFilter::And(filters) => join_filters(filters, "and"),
         SearchFilter::Or(filters) => join_filters(filters, "or"),
@@ -841,14 +885,11 @@ pub(super) fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError
 }
 
 pub(super) fn join_filters(filters: &[SearchFilter], op: &str) -> Result<String, AccountError> {
-    let mut parts = Vec::new();
-    for filter in filters {
-        let part = odata_filter(filter)?;
-        if !part.is_empty() {
-            parts.push(format!("({part})"));
-        }
-    }
-    Ok(parts.join(&format!(" {op} ")))
+    let parts = filters
+        .iter()
+        .map(|filter| odata_filter(filter).map(|part| format!("({part})")))
+        .collect::<Result<Vec<_>, _>>()?;
+    nonempty_fragment(parts.join(&format!(" {op} ")))
 }
 
 pub(super) fn label_id_native(label: &LabelId) -> String {

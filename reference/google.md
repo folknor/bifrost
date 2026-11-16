@@ -2262,8 +2262,19 @@ Untagged legacy bytes, foreign tags and malformed UTF-8 use
 GooglePeople or GoogleCalendar protocol. Contact/directory warmup requests
 validate that envelope before I/O. An enterprise Outlook user expects stale
 results to reload that caller-owned walk without resetting account sync state.
+
+Gmail thread and message search use a `google-page-2` envelope instead, which
+also binds the exact `q` the provider token was issued for (length-prefixed,
+empty when no query was sent). `search` compiles `q` once, checks a resumed
+cursor against it, sends that same `q`, and binds the next cursor to it. A
+mismatch is `invalid_page_cursor`: Gmail does not define a `pageToken` sent
+with a different `q`, and an enterprise user who changes a query expects fresh
+results. The binding is the emitted `q`, not the structured request, so two
+requests compiling to the same `q` continue each other; `limit` is not bound.
+Search cursors in the `google-page-1` layout are refused.
+
 Cross-calendar search retains its calendar-id/provider-token position inside
-the same envelope; disappearance of its calendar remains a state-refresh
+the `google-page-1` envelope; disappearance of its calendar remains a state-refresh
 conflict.
 
 HTTP resource fallback uses only the operation resource hint or typed scope.

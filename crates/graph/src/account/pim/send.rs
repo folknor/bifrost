@@ -45,6 +45,11 @@ pub(crate) async fn send_message(
                 send_as_rejection(account.capabilities.pim_methods.send_as, send_as.mailbox())
             })?,
     };
+    // Built before the draft exists, so an instant Graph cannot represent is
+    // refused without leaving a created draft behind.
+    let deferred = scheduled
+        .map(|at| deferred_send_time_body(at, AccountOperation::Send))
+        .transpose()?;
     let mut message = message_from_send_request(&request)?;
     if let Some(send_as) = &request.send_as {
         apply_send_as(&mut message, send_as, account.user_email.as_deref());
@@ -56,10 +61,10 @@ pub(crate) async fn send_message(
         .send_as
         .as_ref()
         .map(|send_as| send_as.mailbox().0.as_str());
-    if let Some(at) = scheduled {
+    if let Some(body) = &deferred {
         // Stamp PidTagDeferredSendTime on the draft before send so
         // Graph queues it for deferred delivery.
-        stamp_deferred_send_time(&account, owner, &draft, at, AccountOperation::Send)
+        stamp_deferred_send_time(&account, owner, &draft, body, AccountOperation::Send)
             .await
             .map_err(|e| send_progress_error(e, &draft, false, false))?;
     }
@@ -219,14 +224,16 @@ fn send_as_rejection(available: bool, mailbox: &PrincipalId) -> AccountError {
 /// the single-valued extended property Graph reads to defer a send.
 pub(super) const DEFERRED_SEND_TIME_PROPERTY_ID: &str = "SystemTime 0x3FEF";
 
-/// PATCH a draft's `PidTagDeferredSendTime` extended property to `at`,
-/// serialized as ISO-8601 UTC. Used both by the scheduled send path and
-/// by `reschedule_send` (Graph reschedule is an in-place PATCH).
+/// PATCH a draft's `PidTagDeferredSendTime` extended property with a body
+/// from `deferred_send_time_body`. Used both by the scheduled send path and
+/// by `reschedule_send` (Graph reschedule is an in-place PATCH). The body is
+/// built by the caller before any server write, so an unrepresentable
+/// instant fails first.
 pub(super) async fn stamp_deferred_send_time(
     account: &GraphAccount,
     owner: Option<&str>,
     draft: &DraftHandle,
-    at: std::time::SystemTime,
+    body: &Value,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
     let client = client_for_scheduled_send_handle(account, owner)?;
@@ -235,12 +242,11 @@ pub(super) async fn stamp_deferred_send_time(
         client.api_path_prefix(),
         bifrost_net::url::encode_path_component(&draft.0)
     );
-    let body = deferred_send_time_body(at);
     client
         .patch(
             Resource::Outlook,
             &path,
-            &body,
+            body,
             bifrost_net::ReplayPolicy::Idempotent,
         )
         .await
@@ -250,14 +256,18 @@ pub(super) async fn stamp_deferred_send_time(
 }
 
 /// The `MessagePatch` body that stamps `PidTagDeferredSendTime` on a
-/// Graph draft.
-pub(super) fn deferred_send_time_body(at: std::time::SystemTime) -> Value {
-    json!({
+/// Graph draft. An instant Graph cannot represent is `Request(Malformed)`
+/// for `operation`.
+pub(super) fn deferred_send_time_body(
+    at: std::time::SystemTime,
+    operation: AccountOperation,
+) -> Result<Value, AccountError> {
+    Ok(json!({
         "singleValueExtendedProperties": [{
             "id": DEFERRED_SEND_TIME_PROPERTY_ID,
-            "value": graph_iso8601_utc(at)
+            "value": graph_iso8601_utc(at, operation)?
         }]
-    })
+    }))
 }
 
 pub(crate) async fn cancel_scheduled_send(
@@ -299,11 +309,12 @@ pub(crate) async fn reschedule_send(
     // owning-mailbox discriminator) and patch the native draft id.
     let (mailbox, draft_id) = decode_scheduled_send_handle(&handle.0);
     let draft = DraftHandle(draft_id.to_string());
+    let body = deferred_send_time_body(scheduled, AccountOperation::RescheduleSend)?;
     stamp_deferred_send_time(
         &account,
         mailbox,
         &draft,
-        scheduled,
+        &body,
         AccountOperation::RescheduleSend,
     )
     .await?;
