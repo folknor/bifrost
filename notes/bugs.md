@@ -50,16 +50,6 @@ from checking quota, so such a response is not a syntax verdict. The fix
 should separate "validation happened" from "retryable" rather than marking the
 quota codes transient.
 
-## BUG-203 - JMAP labels a retired-version cursor `Malformed`
-
-**Reported by:** the Gmail cursor fault carry-through (scout).
-
-`crates/jmap/src/sync/state.rs` folds `CursorDecodeFault::RetiredVersion` into
-`CursorError::SchemaIncompatible`, which `crates/jmap/src/sync/error.rs` maps
-back to `CursorDecodeFault::Malformed`. Recovery is identical
-(`SchemaIncompatible`); only the diagnostic label is wrong, as it was in
-Gmail. Graph keeps the distinction through its own enum.
-
 ## BUG-048 - IMAP sync lanes cycle on a `UIDNOTSTICKY` folder
 
 **Reported by:** imap-account; reopened by the wave 1 review.

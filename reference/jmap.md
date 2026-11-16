@@ -2076,6 +2076,9 @@ both immediate and scheduled sends. Empty To, Cc and Bcc is Request(Malformed).
 ### Persisted cursor decoding
 
 Payload header validation uses `OpaqueChangeState::open` in bifrost-types.
+JMAP carries its shared `CursorDecodeFault` through error translation: older
+payload envelopes retain `RetiredVersion`, and newer ones retain `FutureVersion`.
+Both keep schema-incompatible recovery so durable state is rebuilt.
 `CursorDecodeFault::builder` owns recovery classification: wrong protocol,
 unreadable layout or malformed bytes require `SchemaIncompatible`; a readable
 payload under a different scope requires `CursorInvalid` with that scope.

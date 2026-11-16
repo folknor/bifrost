@@ -1140,12 +1140,7 @@ pub(super) fn change_cursor_error(
     scope: CursorScope,
 ) -> AccountError {
     let fault = match &error {
-        super::state::JmapCursorError::CursorProtocolMismatch => {
-            bifrost_types::CursorDecodeFault::ProtocolMismatch
-        }
-        super::state::JmapCursorError::CursorEnvelopeUnknown => {
-            bifrost_types::CursorDecodeFault::FutureVersion
-        }
+        super::state::JmapCursorError::DecodeFault(fault) => fault.clone(),
         // A readable scope disagreement restarts only that scope. Keep
         // this exhaustive so new faults cannot inherit that policy.
         super::state::JmapCursorError::ScopeMismatch => {

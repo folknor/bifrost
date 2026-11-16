@@ -21,7 +21,7 @@ use bifrost_types::{
 /// an unrelated PRIMARY thread through `Thread/get` on an id collision and
 /// apply the write to its messages - `delete_thread` destroys them.
 ///
-/// Bumping makes `decode` refuse a v1 cursor as `SchemaIncompatible`,
+/// Bumping makes `decode` refuse a v1 cursor as `RetiredVersion`,
 /// which derives `Engine(SchemaIncompatible)`: the engine drops every
 /// durable cursor and re-establishes each scope through a full
 /// `inventory_stream` pass, which re-mints the ids under the new
@@ -78,8 +78,7 @@ pub(crate) enum JmapScopeRepr {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JmapCursorError {
     UnsupportedScope,
-    CursorProtocolMismatch,
-    CursorEnvelopeUnknown,
+    DecodeFault(bifrost_types::CursorDecodeFault),
     SchemaIncompatible,
     ScopeMismatch,
 }
@@ -156,15 +155,7 @@ pub(crate) fn decode(raw: &OpaqueChangeState) -> Result<JmapCursorState, JmapCur
             ProtocolKind::Jmap,
             bifrost_types::PayloadVersion::new(PAYLOAD_ENVELOPE_VERSION),
         )
-        .map_err(|fault| match fault {
-            bifrost_types::CursorDecodeFault::ProtocolMismatch => {
-                JmapCursorError::CursorProtocolMismatch
-            }
-            bifrost_types::CursorDecodeFault::FutureVersion => {
-                JmapCursorError::CursorEnvelopeUnknown
-            }
-            _ => JmapCursorError::SchemaIncompatible,
-        })?;
+        .map_err(JmapCursorError::DecodeFault)?;
 
     decode_state(bytes)
 }
@@ -338,7 +329,9 @@ mod tests {
 
         assert!(matches!(
             decode(&raw),
-            Err(JmapCursorError::CursorProtocolMismatch)
+            Err(JmapCursorError::DecodeFault(
+                bifrost_types::CursorDecodeFault::ProtocolMismatch
+            ))
         ));
     }
 
@@ -352,7 +345,9 @@ mod tests {
 
         assert!(matches!(
             decode(&raw),
-            Err(JmapCursorError::CursorEnvelopeUnknown)
+            Err(JmapCursorError::DecodeFault(
+                bifrost_types::CursorDecodeFault::FutureVersion
+            ))
         ));
     }
 
@@ -362,7 +357,7 @@ mod tests {
         // BARE, and a bare foreign thread id is indistinguishable from a
         // primary one. Resuming a v1 cursor would skip the inventory pass
         // that re-mints them, so the payload must be refused as
-        // `SchemaIncompatible` (which derives
+        // `RetiredVersion` (which derives
         // `Engine(SchemaIncompatible)`), not as merely "unknown".
         let mut raw = encode(&JmapCursorState::V1 {
             scope: JmapScopeRepr::Folder {
@@ -375,8 +370,53 @@ mod tests {
 
         assert!(matches!(
             decode(&raw),
-            Err(JmapCursorError::SchemaIncompatible)
+            Err(JmapCursorError::DecodeFault(
+                bifrost_types::CursorDecodeFault::RetiredVersion
+            ))
         ));
+    }
+
+    fn assert_version_fault(version: u32, expected: bifrost_types::CursorDecodeFault) {
+        let scope = CursorScope::Type(ObjectType::Email);
+        let mut cursor = cursor_for_scope(scope.clone(), "state-1").expect("scope encodes");
+        cursor.server_state.envelope_version = bifrost_types::PayloadVersion::new(version);
+        // Header classification must precede reading a layout this build cannot know.
+        cursor.server_state.bytes.clear();
+        let error = decode_cursor(&cursor).expect_err("unsupported version");
+        assert_eq!(error, JmapCursorError::DecodeFault(expected));
+        let error = super::super::error::change_cursor_error(error, scope.clone());
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::SyncState(
+                bifrost_types::SyncStateErrorKind::SchemaIncompatible
+            )
+        );
+        assert_eq!(
+            error.recovery(),
+            &bifrost_types::RecoveryClass::Engine(
+                bifrost_types::EngineDirective::SchemaIncompatible
+            )
+        );
+        assert_eq!(
+            error.scope(),
+            Some(&bifrost_types::ErrorScope::Cursor(scope))
+        );
+    }
+
+    #[test]
+    fn retired_version_cursor_preserves_shared_fault_and_recovery() {
+        assert_version_fault(
+            PAYLOAD_ENVELOPE_VERSION - 1,
+            bifrost_types::CursorDecodeFault::RetiredVersion,
+        );
+    }
+
+    #[test]
+    fn future_version_cursor_preserves_shared_fault_and_recovery() {
+        assert_version_fault(
+            PAYLOAD_ENVELOPE_VERSION + 1,
+            bifrost_types::CursorDecodeFault::FutureVersion,
+        );
     }
 
     #[test]
