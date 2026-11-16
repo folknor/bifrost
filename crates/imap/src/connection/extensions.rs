@@ -386,7 +386,9 @@ impl ImapConnection {
     ///
     /// Returns the rights string for the current user on the given mailbox.
     ///
-    /// Requires the `ACL` capability (RFC 4314 Section 1).
+    /// Requires the `ACL` capability (RFC 4314 Section 1). Discovery probes
+    /// rights in batches through `my_rights_batch`.
+    #[cfg(test)]
     pub async fn my_rights(
         &self,
         mailbox: &(impl crate::types::MailboxInput + ?Sized),

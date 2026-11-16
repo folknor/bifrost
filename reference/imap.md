@@ -398,7 +398,9 @@ by both, since head routing would hand one's answer to the other. Distinct
 kinds share a key where `classify` makes a response `OnlySolicited` for both:
 GETQUOTA / GETQUOTAROOT / SETQUOTA (`QUOTA`), the three search forms (tagless
 `SEARCH`, uncorrelated `ESEARCH`), LIST / LIST-STATUS / STATUS (`LIST`,
-`STATUS`), and UID FETCH / EXPUNGE (`VANISHED (EARLIER)`). A classifier test checks
+`STATUS`), and UID FETCH / EXPUNGE (`VANISHED (EARLIER)`). The one exception,
+MYRIGHTS across distinct targets, is described with its mailbox correlator
+below. A classifier test checks
 every pair of pipelinable kinds with distinct keys against `classify`, so a new
 shared row fails until the key groups it.
 
@@ -476,6 +478,25 @@ ESEARCH" omission error for a server that merely interleaved two pipelined
 searches. Anything that fails a condition (a tagless ESEARCH, a tag from
 outside the batch, a tag naming a not-yet-received command, a tag naming a
 non-search command) takes the ordinary head-consumer path unchanged.
+
+A `* MYRIGHTS` is correlated the same way by its mailbox
+(`correlated_mailbox_owner`), because MYRIGHTS is the one same-key exception
+to sub-batch splitting: MYRIGHTS commands with distinct targets share a
+sub-batch, so a folder listing's rights probes cost one exchange. Two MYRIGHTS
+for one exact target still split, since the mailbox could not tell their
+answers apart; no other kind is exempt (STATUS shares its key with LIST and
+LIST-STATUS, whose answers name no single target, and a NOTIFY STATUS for the
+target looks like the answer). The match is exact mailbox identity
+(`MailboxName::matches_mailbox`), never case folding: the unique command whose
+target equals the response mailbox is found over the whole batch first, then
+its state decides - finalized drops the response as surplus, active and
+received delivers it, unsent or no unique match takes the head path, where
+each MYRIGHTS consumer still checks the mailbox itself. An answer spelled
+differently from the request therefore leaves that command's rights missing
+(`ProviderFailure::Missing`), never assigns another folder's. `classify` is
+unchanged. The account layer reaches this through
+`ImapConnection::my_rights_batch` (one runtime-sized batch, one deadline for
+the whole batch).
 
 The codec draws the line that decides which of those two buckets a bad
 response lands in. A response opening with a keyword the codec claims to
@@ -1536,7 +1557,7 @@ container/search snapshots, so sync consumers also receive the omission through
 the existing open skip lane. The container retains its shared identity and rights;
 it is excluded from cursor discovery. Discovery does not issue SELECT itself.
 
-`factory::open` issues NAMESPACE after the personal LIST and enumerates each non-personal `other`/`shared` prefix via `LIST "" "<prefix>*"` (`discover_shared_folders`, prefix in the PATTERN - RFC 3501 6.3.8 leaves reference/pattern concatenation implementation-defined and a server that ignores the reference answers the reference form with the personal namespace), tagging each with its owning `PrincipalId`. An other-user root (`#user/`) carries one descriptor for all users, so the principal is read per folder (`mailbox_owner_from_other_user_path`: the segment after the root, e.g. `#user/alice/INBOX` -> `alice`); a shared root collapses to itself (`mailbox_owner_for`). Under ACL, candidates are probed with MYRIGHTS and the parsed set rides out on the entry; a MYRIGHTS failure is non-fatal and defers to SELECT. Discovery no longer DROPS an unreadable candidate: the personal `LIST "" "*"` may echo the same path (RFC 2342), so dropping it left that echo behind as a bare personal entry and a read-only share presented downstream as a writable personal folder. The read decision moves one layer down to `shared_folder_is_selectable` (pure, `folder_registry.rs`): `\Noselect`/`\NonExistent` or a reported rights set without `l`+`r` clears `FolderEntry::selectable()`, which is exactly the flag `discover_cursor_scopes` filters on, so an unreadable share keeps its owner / `Shared` namespace / rights in `containers_list` and still never becomes a cursor scope. The owner rides on `FolderEntry.shared_owner` (via `FolderRegistry::from_lists`). Shared folders are ordinary `CursorScope::Folder` scopes (no new variant, no `route_typed_scope` change); discovery and inventory also emit `MembershipScope::Owner(owner)` per shared entry - explicitly, because `CursorScope::covers` never equates an owner with a folder.
+`factory::open` issues NAMESPACE after the personal LIST and enumerates each non-personal `other`/`shared` prefix via `LIST "" "<prefix>*"` (`discover_shared_folders`, prefix in the PATTERN - RFC 3501 6.3.8 leaves reference/pattern concatenation implementation-defined and a server that ignores the reference answers the reference form with the personal namespace), tagging each with its owning `PrincipalId`. An other-user root (`#user/`) carries one descriptor for all users, so the principal is read per folder (`mailbox_owner_from_other_user_path`: the segment after the root, e.g. `#user/alice/INBOX` -> `alice`); a shared root collapses to itself (`mailbox_owner_for`). Under ACL, a prefix's selectable candidates are probed with one pipelined MYRIGHTS batch (`my_rights_batch`) and each parsed set rides out on its entry; a per-folder failure (tagged NO, an uncorrelated answer) leaves that folder's rights unknown, and a batch failure (its one deadline, a disconnect) leaves the whole prefix's rights unknown. Every folder is still registered and SELECT stays authoritative: an enterprise user expects the share listed rather than missing because an advisory probe timed out. Discovery no longer DROPS an unreadable candidate: the personal `LIST "" "*"` may echo the same path (RFC 2342), so dropping it left that echo behind as a bare personal entry and a read-only share presented downstream as a writable personal folder. The read decision moves one layer down to `shared_folder_is_selectable` (pure, `folder_registry.rs`): `\Noselect`/`\NonExistent` or a reported rights set without `l`+`r` clears `FolderEntry::selectable()`, which is exactly the flag `discover_cursor_scopes` filters on, so an unreadable share keeps its owner / `Shared` namespace / rights in `containers_list` and still never becomes a cursor scope. The owner rides on `FolderEntry.shared_owner` (via `FolderRegistry::from_lists`). Shared folders are ordinary `CursorScope::Folder` scopes (no new variant, no `route_typed_scope` change); discovery and inventory also emit `MembershipScope::Owner(owner)` per shared entry - explicitly, because `CursorScope::covers` never equates an owner with a folder.
 
 Two registry rules keep the shared tagging (and therefore the owner and the rights) attached to the entry:
 
@@ -2516,8 +2537,9 @@ wire identity. Existing account ids and persisted envelopes retain their bytes.
 `types/`, `codec/` and `connection/` enable `warn(dead_code)` below the
 crate-wide allowance. Connection command adapters used only by hermetic
 transcripts and compression support compile only for tests. The pipeline is
-an explicit retained `allow(dead_code)` exception pending the separate decision
-on pipelined account transport. Protocol builders that support commands
+an explicit `allow(dead_code)` exception: shared-folder discovery drives it
+through `my_rights_batch`, and the typed builder methods without an account
+caller yet are kept and exercised by the pipeline tests. Protocol builders that support commands
 beyond the account strategy have local exceptions with their reasons. The
 backing-free FETCH parser adapter and address-marker inspection helpers compile
 only for tests. Unused backing-free untagged parser adapters, address constructors

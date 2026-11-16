@@ -923,7 +923,53 @@ pub(crate) async fn discover_shared_folders(
                 continue;
             }
         };
-        for info in listed {
+        let selectable = |info: &MailboxInfo| {
+            !info.attributes.iter().any(|attr| {
+                matches!(
+                    attr,
+                    crate::types::MailboxAttribute::NoSelect
+                        | crate::types::MailboxAttribute::NonExistent
+                )
+            })
+        };
+        // Pre-flight ACL probe, one pipelined MYRIGHTS batch per prefix so a
+        // large shared tree costs one exchange rather than one per folder.
+        // Advisory: it records what the server said, it does not decide
+        // membership of the shared set - a folder we cannot read is still a
+        // folder in this namespace, owned by this principal, and must reach
+        // the consumer with that identity rather than falling back to the
+        // personal listing's bare entry. Targets are the LIST spelling, which
+        // the server's MYRIGHTS answer echoes. A per-folder failure (tagged
+        // NO, an answer the batch could not correlate) leaves that folder's
+        // rights unknown; a batch failure (one shared deadline, a disconnect)
+        // leaves the whole prefix's rights unknown. Both keep every folder:
+        // an enterprise user expects the share listed, with SELECT staying
+        // authoritative, rather than missing because a probe timed out.
+        let mut probed: Vec<Option<Result<String, crate::Error>>> =
+            listed.iter().map(|_| None).collect();
+        if acl {
+            let targets: Vec<usize> = (0..listed.len())
+                .filter(|&i| selectable(&listed[i]))
+                .collect();
+            if !targets.is_empty() {
+                let names = targets.iter().map(|&i| listed[i].name.clone()).collect();
+                match conn.my_rights_batch(names, cfg.imap.command_timeout).await {
+                    Ok(results) => {
+                        for (i, result) in targets.into_iter().zip(results) {
+                            probed[i] = Some(result);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            prefix = %descriptor.prefix,
+                            error = %err,
+                            "MYRIGHTS batch failed; registering the prefix's folders and deferring to SELECT"
+                        );
+                    }
+                }
+            }
+        }
+        for (info, probe) in listed.into_iter().zip(probed) {
             let owner = if is_other_user {
                 mailbox_owner_from_other_user_path(
                     info.name.as_str(),
@@ -933,24 +979,9 @@ pub(crate) async fn discover_shared_folders(
             } else {
                 shared_owner.clone()
             };
-            let selectable = !info.attributes.iter().any(|attr| {
-                matches!(
-                    attr,
-                    crate::types::MailboxAttribute::NoSelect
-                        | crate::types::MailboxAttribute::NonExistent
-                )
-            });
             let mut rights = None;
-            if acl && selectable {
-                // Pre-flight ACL probe. Advisory: it records what the
-                // server said, it does not decide membership of the shared
-                // set - a folder we cannot read is still a folder in this
-                // namespace, owned by this principal, and must reach the
-                // consumer with that identity rather than falling back to
-                // the personal listing's bare entry. A per-folder MYRIGHTS
-                // failure is non-fatal (log + keep the folder; SELECT stays
-                // authoritative).
-                match conn.my_rights(&info.name, cfg.imap.command_timeout).await {
+            if let Some(probe) = probe {
+                match probe {
                     Ok(wire) => {
                         let parsed = MailboxRights::parse(&wire);
                         if !parsed.can_read() {
@@ -1891,6 +1922,75 @@ mod tests {
         assert_eq!(
             discovery.skipped_scopes[0].error.operation(),
             Some(AccountOperation::Discover)
+        );
+    }
+
+    /// Every MYRIGHTS probe of a prefix is on the wire before any answer (the
+    /// server reads all three before replying, so a probe per round trip
+    /// would stall), and answers interleaved out of order still reach their
+    /// own folders; a tagged NO leaves only its folder's rights unknown.
+    #[tokio::test]
+    async fn shared_rights_probes_are_one_pipelined_exchange() {
+        use crate::connection::test_support::{
+            driver_pair, preauth_greeting, read_line, respond, tag_of,
+        };
+        let (conn, mut peer) = driver_pair(&preauth_greeting("IMAP4rev1 NAMESPACE ACL")).await;
+        let server = tokio::spawn(async move {
+            let command = read_line(&mut peer).await;
+            respond(
+                &mut peer,
+                &format!(
+                    "* NAMESPACE NIL NIL ((\"Shared/\" \"/\"))\r\n{} OK done\r\n",
+                    tag_of(&command)
+                ),
+            )
+            .await;
+            let command = read_line(&mut peer).await;
+            respond(
+                &mut peer,
+                &format!(
+                    "* LIST () \"/\" \"Shared/A\"\r\n* LIST () \"/\" \"Shared/B\"\r\n\
+                     * LIST () \"/\" \"Shared/C\"\r\n{} OK done\r\n",
+                    tag_of(&command)
+                ),
+            )
+            .await;
+            let mut tags = Vec::new();
+            for _ in 0..3 {
+                let command = read_line(&mut peer).await;
+                assert!(command.contains("MYRIGHTS"), "{command}");
+                tags.push(tag_of(&command).to_owned());
+            }
+            respond(
+                &mut peer,
+                &format!(
+                    "* MYRIGHTS Shared/C lr\r\n* MYRIGHTS Shared/A l\r\n\
+                     {} NO no rights for you\r\n{} OK done\r\n{} OK done\r\n",
+                    tags[1], tags[2], tags[0]
+                ),
+            )
+            .await;
+        });
+        let discovery =
+            discover_shared_folders(&conn, &bandwidth_config(false), &conn.server_profile()).await;
+        server.await.unwrap();
+        let rights: Vec<(&str, Option<bool>)> = discovery
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.info.name.as_str(),
+                    e.rights.as_ref().map(MailboxRights::can_read),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rights,
+            vec![
+                ("Shared/A", Some(false)),
+                ("Shared/B", None),
+                ("Shared/C", Some(true)),
+            ]
         );
     }
 

@@ -10,7 +10,9 @@
 //! findings in this module is an absence of reading. Noted so a later
 //! auditor knows where coverage stops.
 
-// Retained pending the separate decision on pipelined account transport.
+// The account layer drives batches through `ImapConnection::my_rights_batch`;
+// most typed builder methods have no account caller yet and are exercised by
+// the pipeline tests, so the module keeps its local dead-code allowance.
 #![allow(dead_code)]
 
 use crate::types::{
@@ -653,6 +655,46 @@ impl super::ImapConnection {
     /// command whose `CommandKind::pipelinable` is false.
     pub fn pipeline(&self) -> Pipeline<'_, ()> {
         Pipeline::new(self)
+    }
+
+    /// MYRIGHTS for every mailbox in `mailboxes`, pipelined as one batch
+    /// (RFC 4314 Section 3.5). Results are in input order.
+    ///
+    /// Distinct targets share one sub-batch and so one exchange; a repeated
+    /// target runs in a later sub-batch, because the response mailbox is the
+    /// only correlator. A server answer that spells the mailbox differently
+    /// from the request matches no command, and that element fails with a
+    /// missing-response error rather than taking another mailbox's rights.
+    ///
+    /// The timeout covers the whole batch, not each command. A tagged `NO`
+    /// fails only its own element; a batch failure (timeout, disconnect, a
+    /// refusal before any byte) returns no per-command results.
+    ///
+    /// The typed tuple builder cannot express a batch sized at runtime, so
+    /// this goes through the same admission and submission path directly.
+    pub(crate) async fn my_rights_batch(
+        &self,
+        mailboxes: Vec<MailboxName>,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<Result<String, Error>>, PipelineError> {
+        let mut pipeline = Pipeline::new(self);
+        for mailbox in mailboxes {
+            let (command, consumer) = request::MyRights { mailbox }.into_parts();
+            pipeline.commands.push(command);
+            pipeline.pending.push(Box::new(consumer));
+        }
+        let results = pipeline.execute_raw(timeout).await?;
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| match result {
+                Ok(output) => output
+                    .downcast::<String>()
+                    .map(|rights| Ok(*rights))
+                    .map_err(|_| PipelineError::TypeMismatch { index }),
+                Err(error) => Ok(Err(error)),
+            })
+            .collect()
     }
 }
 

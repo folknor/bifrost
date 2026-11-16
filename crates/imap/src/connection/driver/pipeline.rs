@@ -32,10 +32,20 @@ pub(super) fn group_into_sub_batches(
     commands: Vec<Command>,
     consumers: Vec<Box<dyn ConsumerErased>>,
 ) -> Vec<Vec<SubBatchEntry>> {
+    // Per sub-batch: the routing keys taken, and the exact targets of the
+    // MYRIGHTS commands in it. MYRIGHTS is the one same-key exception: its
+    // answer names its mailbox, `correlated_mailbox_owner` routes on that, so
+    // MYRIGHTS commands with distinct targets share a sub-batch and a folder
+    // listing's rights probes cost one exchange rather than one per folder.
+    // Two MYRIGHTS for one target still split: the mailbox could not tell
+    // their answers apart. No other kind qualifies - STATUS shares its key
+    // with LIST and LIST-STATUS, whose answers a target does not name, and
+    // a NOTIFY STATUS for the target is indistinguishable from the answer.
     let mut sub_batches: Vec<(
         std::collections::HashSet<crate::types::CommandKind>,
+        Vec<MailboxName>,
         Vec<SubBatchEntry>,
-    )> = vec![(std::collections::HashSet::new(), Vec::new())];
+    )> = vec![(std::collections::HashSet::new(), Vec::new(), Vec::new())];
 
     // Tracks the highest batch index assigned so far. Commands are never
     // placed in a batch before max_batch, preserving their original order
@@ -44,29 +54,46 @@ pub(super) fn group_into_sub_batches(
 
     for (original_idx, (cmd, consumer)) in commands.into_iter().zip(consumers).enumerate() {
         let kind = cmd.kind().untagged_routing_key();
-        // Find the first sub-batch at or after max_batch that doesn't
-        // already have this kind. The max_batch constraint ensures
+        let rights_target = match &cmd {
+            Command::MyRights { mailbox } => Some(mailbox.clone()),
+            _ => None,
+        };
+        // Find the first sub-batch at or after max_batch that this command
+        // does not conflict with. The max_batch constraint ensures
         // commands are never placed in a batch before any preceding
         // command, preserving original pipeline order across sub-batches.
+        let fits = |kinds_seen: &std::collections::HashSet<_>, rights: &[MailboxName]| {
+            if !kinds_seen.contains(&kind) {
+                return true;
+            }
+            // The key is taken. Only MYRIGHTS joins a MYRIGHTS-only key
+            // holder, and only for a target none of them has.
+            rights_target.as_ref().is_some_and(|target| {
+                !rights.is_empty() && !rights.iter().any(|t| t.matches_mailbox(target))
+            })
+        };
         let batch_idx = sub_batches
             .iter()
             .enumerate()
             .skip(max_batch)
-            .find_map(|(i, (kinds_seen, _))| (!kinds_seen.contains(&kind)).then_some(i));
+            .find_map(|(i, (kinds_seen, rights, _))| fits(kinds_seen, rights).then_some(i));
         let batch_idx = if let Some(i) = batch_idx {
             i
         } else {
-            sub_batches.push((std::collections::HashSet::new(), Vec::new()));
+            sub_batches.push((std::collections::HashSet::new(), Vec::new(), Vec::new()));
             sub_batches.len() - 1
         };
         sub_batches[batch_idx].0.insert(kind);
+        if let Some(target) = rights_target {
+            sub_batches[batch_idx].1.push(target);
+        }
         max_batch = batch_idx;
-        sub_batches[batch_idx].1.push((original_idx, cmd, consumer));
+        sub_batches[batch_idx].2.push((original_idx, cmd, consumer));
     }
 
     sub_batches
         .into_iter()
-        .map(|(_, entries)| entries)
+        .map(|(_, _, entries)| entries)
         .collect()
 }
 
@@ -150,15 +177,65 @@ pub(super) enum Routed {
     Continue,
 }
 
-/// Where a tag-correlated ESEARCH goes when its correlator names a search
-/// command of this batch.
+/// Where a response goes when something in it names its command outright:
+/// an ESEARCH search-correlator tag, or a MYRIGHTS mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CorrelatedEsearch {
-    /// The named search is still active: deliver to its consumer.
+enum Correlated {
+    /// The named command is still active: deliver to its consumer.
     Deliver(usize),
-    /// The named search has already finalized: this is surplus solicited
+    /// The named command has already finalized: this is surplus solicited
     /// data for a completed command, and it is dropped.
     DropSurplus,
+}
+
+/// The MYRIGHTS command of this batch a `* MYRIGHTS` response names by its
+/// mailbox (RFC 4314 Section 3.8).
+///
+/// Several MYRIGHTS commands with distinct targets share one sub-batch (see
+/// `group_into_sub_batches`), so head routing alone would hand every answer
+/// to the first active one, whose consumer declines a foreign mailbox and
+/// surrenders it as an event while the command it answers finishes with no
+/// result. The mailbox is the only correlator the response carries.
+///
+/// The contract is exact mailbox identity, nothing looser. The unique command
+/// whose target equals the response mailbox is found FIRST, over the whole
+/// batch, and only then is its lifecycle consulted: finalized is
+/// `DropSurplus`, active and received by the server (below `bound`) is
+/// `Deliver`, unsent is `None`. Any other case - no exact match, or (which
+/// grouping prevents) more than one - is `None` and takes the head path, where
+/// every MYRIGHTS consumer still checks the mailbox itself, so an unmatched
+/// spelling is lost correlation (that folder's rights stay unknown), never
+/// another folder's rights. Case folding is deliberately not attempted: IMAP
+/// leaves mailbox-name case server-defined beyond INBOX, and a false match
+/// would assign one folder's permissions to another. Unlike an ESEARCH tag,
+/// a mailbox identifies a target, not an execution, so `DropSurplus` relies
+/// on the one-command-per-target rule grouping enforces.
+fn correlated_mailbox_owner(
+    routing: &PipelineRouting<'_>,
+    resp: &crate::types::response::UntaggedResponse,
+    bound: usize,
+) -> Option<Correlated> {
+    let crate::types::response::UntaggedResponse::MyRights { mailbox, .. } = resp else {
+        return None;
+    };
+    let mut candidates = routing
+        .kinds
+        .iter()
+        .zip(routing.targets)
+        .enumerate()
+        .filter(|(_, (kind, target))| {
+            **kind == crate::types::CommandKind::MyRights
+                && target.as_ref().is_some_and(|t| t.matches_mailbox(mailbox))
+        })
+        .map(|(idx, _)| idx);
+    let idx = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    if routing.consumers[idx].is_none() {
+        return Some(Correlated::DropSurplus);
+    }
+    (idx < bound).then_some(Correlated::Deliver(idx))
 }
 
 /// The command a tag-correlated ESEARCH names, when that command is a search
@@ -192,7 +269,7 @@ fn correlated_esearch_owner(
     resp: &crate::types::response::UntaggedResponse,
     bound: usize,
     notify: super::super::NotifyFlags,
-) -> Option<CorrelatedEsearch> {
+) -> Option<Correlated> {
     let crate::types::response::UntaggedResponse::Esearch(e) = resp else {
         return None;
     };
@@ -208,9 +285,9 @@ fn correlated_esearch_owner(
         return None;
     }
     if routing.consumers[idx].is_none() {
-        return Some(CorrelatedEsearch::DropSurplus);
+        return Some(Correlated::DropSurplus);
     }
-    (idx < bound).then_some(CorrelatedEsearch::Deliver(idx))
+    (idx < bound).then_some(Correlated::Deliver(idx))
 }
 
 /// Route a frame already processed by ReadLoop to its owning consumer.
@@ -318,8 +395,11 @@ pub(super) fn route_pipeline_response(
             // server that merely interleaved two pipelined searches.
             // One correlated to a search that has already finalized is
             // surplus data for a completed command and is dropped.
-            match correlated_esearch_owner(routing, &u, bound, notify_before) {
-                Some(CorrelatedEsearch::Deliver(owner)) => {
+            // A MYRIGHTS names its command by mailbox the same way.
+            let correlated = correlated_esearch_owner(routing, &u, bound, notify_before)
+                .or_else(|| correlated_mailbox_owner(routing, &u, bound));
+            match correlated {
+                Some(Correlated::Deliver(owner)) => {
                     let ctx = super::build_consumer_context(
                         state,
                         routing.targets[owner].as_ref(),
@@ -334,8 +414,8 @@ pub(super) fn route_pipeline_response(
                     }
                     return Ok(Routed::Continue);
                 }
-                Some(CorrelatedEsearch::DropSurplus) => {
-                    trace!("driver: dropping surplus ESEARCH for a finalized pipelined search");
+                Some(Correlated::DropSurplus) => {
+                    trace!("driver: dropping surplus correlated response for a finalized command");
                     return Ok(Routed::Continue);
                 }
                 None => {}

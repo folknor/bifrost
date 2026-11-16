@@ -134,23 +134,33 @@ instant behind four locks, and is the implicit owner of folder roles; making
 roles, ownership and the shared-error mapping explicit registry
 responsibilities (BUG-028, BUG-046) gives those decisions a home.
 
-## STR-071 - The IMAP pipeline has no production caller yet shapes the driver's hardest invariants
+## STR-071 - The IMAP pipeline has one production caller; the rest of discovery is still sequential
 
-**Reported by:** imap-connection (crate-private, but removal is an owner decision; flagged, not recommended).
+**Reported by:** imap-connection. Narrowed 2026-11-16: the gate bypass and the
+unbounded wait were already fixed (pipeline execution admits through
+`admit_commands` and takes one deadline), the second NOTIFY pre-effect copy is
+gone, routing keys are derived from the classifier, and shared-folder discovery
+now pipelines each prefix's MYRIGHTS probes through
+`ImapConnection::my_rights_batch` (one exchange per prefix, mailbox-correlated
+in the router). Removal is off the table (owner).
 
-`ImapConnection::pipeline()` (about 1,700 lines) has no caller in `account/` nor
-anywhere outside its own tests. It shapes the driver: `PipelineRouting` with
-`sending: Option<usize>` as an exclusive ownership bound,
-`route_pipeline_response` called from inside the sender's continuation wait,
-`correlated_esearch_owner`, `group_into_sub_batches` driven by
-`CommandKind::untagged_routing_key` (CON-032), the second NOTIFY pre-effect copy
-(BUG-035), and `SendOutcome::Rejected` / `ContinuationOutcome::Rejected` arms
-unreachable outside it. `pipeline/mod.rs` carries an "audit boundary: not
-line-audited" note. It bypasses every handle gate (BUG-029) and waits unbounded
-(BUG-041). Options: (a) keep it and route it through the request/admission layer
-(`connection/request.rs`, BUG-029) so it stops being a gate bypass; (b) remove it and simplify
-`wait_for_continuation` to one mode, dropping `PipelineRouting`,
-`untagged_routing_key` and the router.
+Residue: the other discovery round trips are still one command each. Personal
+LIST (or LIST-EXTENDED, with its MissingCapability fallback) and NAMESPACE have
+distinct routing keys and could share one write at open; GETMETADATA and
+GETQUOTAROOT have no discovery caller at all (quota is read lazily in
+`settings.rs::quota_get`). `pipeline/mod.rs` still carries its "not
+line-audited" note and a module-wide `allow(dead_code)` over the typed builder
+methods nobody in `account/` calls. Each further caller is a product question
+(what discovery should fetch at open), not a driver change.
+
+## STR-140 - reference/imap.md names NOTIFY effect functions that do not exist
+
+**Reported by:** spar on STR-071 (scout lateral). `reference/imap.md` cites
+`ProtocolState::arm_notify`, `disarm_notify` ("in the pipeline router") and
+`ProtocolState::disarm_pending_effects`; the code has `arm_effect` /
+`disarm_effect` (`connection/state.rs`), and the early-own-OK disarm happens in
+`ReadLoop` (`driver/read_loop.rs`), not in the pipeline router. The doc text
+needs checking against the code and rewording, not just renaming.
 
 ## STR-082 - IMAP does not partition inventory, so large folders get no bounded backfill
 
@@ -239,5 +249,3 @@ split, and the shared message-error strings landed. One residue needs a
 bifrost-net API first: `client/metering.rs`'s blocking admission loop belongs
 beside `BandwidthBudget` in bifrost-net as a blocking budget API, which does not
 exist yet. (The rest of `authentication.rs` moving to bifrost-sasl is STR-135.)
-
-

@@ -83,6 +83,23 @@ fn group_duplicate_kinds_split_into_two_batches() {
 }
 
 #[test]
+fn group_myrights_shares_a_batch_only_across_distinct_targets() {
+    // The response mailbox correlates MYRIGHTS, so distinct targets share a
+    // sub-batch; a repeated target cannot be told apart and splits.
+    let rights = |name: &str| Command::MyRights {
+        mailbox: crate::types::MailboxName::new(name).unwrap(),
+    };
+    let commands = vec![rights("A"), rights("B"), rights("A"), rights("C")];
+    let consumers = (0..4).map(|_| dummy_consumer()).collect();
+    let batches = group_into_sub_batches(commands, consumers);
+    let indices: Vec<Vec<usize>> = batches
+        .iter()
+        .map(|batch| batch.iter().map(|entry| entry.0).collect())
+        .collect();
+    assert_eq!(indices, vec![vec![0, 1], vec![2, 3]]);
+}
+
+#[test]
 fn group_three_same_kind_three_batches() {
     // Three STATUS commands -> three batches (one per STATUS).
     let commands = vec![
